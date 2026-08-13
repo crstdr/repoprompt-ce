@@ -43,9 +43,18 @@ struct AgentSessionRow: View {
     let onDelete: () -> Void
     let onRename: (String) -> Void
     var onDismissAttention: (() -> Void)?
+    /// Copies this row's exact canonical session UUID.
+    ///
+    /// Non-nil only for live, exactly-bound, top-level sessions. The closure revalidates the captured
+    /// generation-bearing target immediately before writing and returns `false` when it went stale,
+    /// so a stale row performs zero clipboard writes and shows no false success.
+    var onCopySessionID: (() -> Bool)? = nil
     let sessionIDCopyAction: AgentSidebarSessionIDCopyAction
 
     @State private var isHovered = false
+    @State private var isCopySessionIDHovered = false
+    @State private var copiedFeedbackGeneration: UInt64 = 0
+    @State private var showsCopiedFeedback = false
     @State private var isPinHovered = false
     @State private var isDeleteHovered = false
     @State private var isRenameHovered = false
@@ -125,6 +134,28 @@ struct AgentSessionRow: View {
 
     private var pinActionLabel: String {
         isPinned ? "Unpin chat" : "Pin chat"
+    }
+
+    private var copySessionIDActionLabel: String {
+        "Copy Session ID"
+    }
+
+    private var copySessionIDIconColor: Color {
+        if showsCopiedFeedback { return .green }
+        return isCopySessionIDHovered ? .accentColor : .secondary
+    }
+
+    /// Revision-guarded transient confirmation: a later copy always supersedes an in-flight reset.
+    private func performCopySessionID() {
+        guard let onCopySessionID, onCopySessionID() else { return }
+        copiedFeedbackGeneration &+= 1
+        let generation = copiedFeedbackGeneration
+        showsCopiedFeedback = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard copiedFeedbackGeneration == generation else { return }
+            showsCopiedFeedback = false
+        }
     }
 
     private var renameActionLabel: String {
@@ -254,6 +285,19 @@ struct AgentSessionRow: View {
                     .accessibilityLabel(dismissAttentionActionLabel)
                 }
 
+                if !showsSelectionPresentation, onCopySessionID != nil {
+                    Button(action: performCopySessionID) {
+                        Image(systemName: showsCopiedFeedback ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 11))
+                            .foregroundColor(copySessionIDIconColor)
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isCopySessionIDHovered = $0 }
+                    .hoverTooltip(showsCopiedFeedback ? "Session ID copied" : copySessionIDActionLabel)
+                    .accessibilityLabel(copySessionIDActionLabel)
+                    .accessibilityValue(showsCopiedFeedback ? "Session ID copied" : "")
+                }
+
                 if allowsDirectMutations {
                     Button(action: onTogglePin) {
                         Image(systemName: isPinned ? "pin.slash" : "pin")
@@ -327,10 +371,14 @@ struct AgentSessionRow: View {
                     Button(renameActionLabel, action: beginRename)
                 }
 
-                Button(AgentSidebarSessionIDCopyAction.menuTitle) {
-                    sessionIDCopyAction.perform()
+                if onCopySessionID != nil {
+                    Button(copySessionIDActionLabel, action: performCopySessionID)
+                } else {
+                    Button(AgentSidebarSessionIDCopyAction.menuTitle) {
+                        sessionIDCopyAction.perform()
+                    }
+                    .disabled(!sessionIDCopyAction.isEnabled)
                 }
-                .disabled(!sessionIDCopyAction.isEnabled)
 
                 if isInteractionEnabled, let onStash {
                     Button(stashActionLabel, action: onStash)

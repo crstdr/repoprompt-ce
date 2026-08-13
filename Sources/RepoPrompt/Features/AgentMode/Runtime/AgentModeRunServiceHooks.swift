@@ -107,6 +107,34 @@ extension AgentModeRunService {
         let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentTabSession) -> String
         /// Records whether a staged handoff payload was accepted by the provider send attempt.
         let recordPendingHandoffSendOutcome: (_ session: AgentTabSession, _ didSend: Bool) -> Void
+        /// Reserves the cross-window oversight supplement owed to one logical outbound dispatch.
+        ///
+        /// Runners call this immediately before the physical provider send, never at enqueue time: a
+        /// queued or requeued turn must render the membership revision that is current when it
+        /// actually dispatches.
+        let claimAgentSessionLinkPrompt: (
+            AgentTabSession,
+            AgentSessionLinkPromptDispatchID
+        ) -> AgentSessionLinkOutboundPromptClaim?
+        /// Acknowledges a claim at the provider's acceptance signal. Consuming is exactly-once; a
+        /// failed or unknown-outcome attempt simply never calls this and leaves the claim pending.
+        let acceptAgentSessionLinkPrompt: (AgentSessionLinkOutboundPromptClaim) -> Void
+
+        /// Attaches the cross-window oversight supplement to an already-built provider message.
+        ///
+        /// Applied after history, handoff, attachment, workflow, and file-map composition, so the
+        /// supplement is always the final RepoPrompt envelope in the user-message channel and never
+        /// displaces user-controlled content. `AgentMessage.systemPrompt` is untouched: resumed ACP
+        /// and headless providers deliberately omit it, and the base instructions are not a valid
+        /// channel for changing inventory.
+        func decoratedAgentMessage(
+            _ message: AgentMessage,
+            session: AgentTabSession,
+            dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> (message: AgentMessage, claim: AgentSessionLinkOutboundPromptClaim?) {
+            let claim = claimAgentSessionLinkPrompt(session, dispatchID)
+            return (AgentSessionLinkPromptComposer.decorated(message, with: claim), claim)
+        }
     }
 
     /// Cancellation of pending approvals/questions/reviews when a run settles.

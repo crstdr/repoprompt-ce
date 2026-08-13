@@ -73,6 +73,12 @@ final class ClaudeAgentModeCoordinator {
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Void
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
+        let decorateAgentSessionLinkProviderText: @MainActor (
+            _ text: String,
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> (text: String, claim: AgentSessionLinkOutboundPromptClaim?)
+        let acceptAgentSessionLinkPrompt: @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
 
         static var noOp: Self {
             Self(
@@ -80,7 +86,9 @@ final class ClaudeAgentModeCoordinator {
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
-                prependPendingHandoff: { text, _ in text }
+                prependPendingHandoff: { text, _ in text },
+                decorateAgentSessionLinkProviderText: { text, _, _ in (text, nil) },
+                acceptAgentSessionLinkPrompt: { _ in }
             )
         }
     }
@@ -912,6 +920,11 @@ final class ClaudeAgentModeCoordinator {
         var handler = toolHandler(for: session)
         handler.resetTurnState(for: session)
 
+        // One logical dispatch spans the whole bounded controller-retry loop below: a recycled
+        // controller is a transport retry of the *same* user turn, so every attempt must carry a
+        // byte-equivalent oversight supplement rather than re-deciding per attempt.
+        let promptDispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
+
         for _ in 0 ..< 3 {
             switch await ensureClaudeNativeSession(session: session, intent: intent) {
             case .ready:
@@ -1026,9 +1039,23 @@ final class ClaudeAgentModeCoordinator {
 
             do {
                 let outboundText = hostCapabilities.prependPendingHandoff(text, session)
+                // Applied after handoff composition and before delivery-mode packaging, so the
+                // oversight supplement remains the final RepoPrompt envelope in the user-message
+                // channel regardless of native-system or XML instruction delivery.
+                let monitoring = hostCapabilities.decorateAgentSessionLinkProviderText(
+                    outboundText,
+                    session,
+                    promptDispatchID
+                )
                 let instructions = agentModeInstructionInjection(for: session)
-                let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
+                let providerBoundText = providerBoundUserMessage(
+                    monitoring.text,
+                    instructions: instructions
+                )
                 let turnID = try await controller.sendUserMessage(providerBoundText)
+                // The returned provider turn ID is the acceptance signal. Acknowledge before the
+                // currency guard: even a locally superseded turn delivered this supplement.
+                hostCapabilities.acceptAgentSessionLinkPrompt(monitoring.claim)
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {

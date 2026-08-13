@@ -506,6 +506,19 @@ struct AgentModeSessionsListView: View {
                                         agentModeVM.dismissSidebarRunAttention(tabID: session.tabID)
                                     }
                                     : nil
+                                // Generation-bearing capture: offered only for live, exactly-bound,
+                                // top-level sessions, and revalidated again at click time so a row that
+                                // rebinds between render and click writes nothing.
+                                let copySessionIDTarget: AgentSessionCopyIDTarget? = session.sessionID.flatMap { sessionID in
+                                    agentModeVM.agentSessionCopyIDTarget(
+                                        tabID: session.tabID,
+                                        sessionID: sessionID,
+                                        tabName: session.title
+                                    )
+                                }
+                                let copySessionIDAction: (() -> Bool)? = copySessionIDTarget.map { target in
+                                    { agentModeVM.copyAgentSessionID(target: target) }
+                                }
 
                                 AgentSessionRow(
                                     title: session.title,
@@ -571,6 +584,7 @@ struct AgentModeSessionsListView: View {
                                         agentModeVM.renameSession(tabID: session.tabID, to: newName)
                                     },
                                     onDismissAttention: dismissAttentionAction,
+                                    onCopySessionID: copySessionIDAction,
                                     sessionIDCopyAction: .systemClipboard(sessionID: session.sessionID)
                                 )
                             }

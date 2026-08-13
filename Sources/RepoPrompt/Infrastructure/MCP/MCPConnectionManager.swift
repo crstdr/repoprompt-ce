@@ -2197,6 +2197,75 @@ actor ServerNetworkManager {
         return (restricted, additional, preassigned, purpose, taskLabelKind, allowsAgentExternalControlTools)
     }
 
+    /// Live additional grants that are **not** part of any installed run policy.
+    ///
+    /// `agent_session_link` is advertised and callable only while the exact caller Agent session
+    /// currently holds at least one active outbound oversight link. The grant is therefore recomputed
+    /// from the domain link authority on every `tools/list` and `tools/call` rather than cached in
+    /// connection policy: link membership changes at user speed and in another window, so a cached
+    /// grant would either linger after revocation or lag after an add.
+    ///
+    /// The caller endpoint is derived from server-owned run routing only (`connection → runID →
+    /// installed run policy window/tab → that tab's live binding`), never from tool arguments,
+    /// explicit bindings, or hints.
+    ///
+    /// The routed `(window, tab)` is resolved to the full endpoint incarnation rather than to its
+    /// session UUID. The same UUID can be live in two windows at once, so a UUID-scoped grant check
+    /// would advertise — and, on the `tools/call` path, admit — `agent_session_link` for an
+    /// incarnation the user never granted anything to.
+    private func liveSessionLinkAdditionalGrants(connectionID: UUID) async -> Set<String> {
+        guard let runID = runIDByConnectionID[connectionID],
+              let runState = runPolicyStateByRunID[runID],
+              runState.purpose == .agentModeRun,
+              let tabID = runState.tabID
+        else {
+            return []
+        }
+        let windowID = runState.windowID
+        guard let observerEndpoint = await MainActor.run(body: {
+            WindowStatesManager.shared.window(withID: windowID)?
+                .agentModeViewModel
+                .agentSessionLinkObserverEndpoint(tabID: tabID)
+        }) else {
+            return []
+        }
+        guard await AgentSessionLinkRuntimeBridge.shared
+            .hasActiveOutboundLink(observerEndpoint: observerEndpoint)
+        else {
+            return []
+        }
+        return [MCPWindowToolName.agentSessionLink]
+    }
+
+    /// Re-advertises the catalog for every live connection owned by one Agent session.
+    ///
+    /// Used when that session's outbound oversight links change. A target that merely gained an
+    /// inbound observer is deliberately not notified: being observed grants it nothing, so its own
+    /// advertised catalog is unchanged.
+    func notifyToolListChangedForAgentSession(_ sessionID: UUID) async {
+        let candidateRunIDs = runPolicyStateByRunID.compactMap { runID, state -> (UUID, Int, UUID)? in
+            guard state.purpose == .agentModeRun, let tabID = state.tabID else { return nil }
+            return (runID, state.windowID, tabID)
+        }
+        guard !candidateRunIDs.isEmpty else { return }
+        let matchingRunIDs: Set<UUID> = await MainActor.run {
+            var result: Set<UUID> = []
+            for (runID, windowID, tabID) in candidateRunIDs {
+                guard let window = WindowStatesManager.shared.window(withID: windowID),
+                      window.agentModeViewModel.sessions[tabID]?.activeAgentSessionID == sessionID
+                else { continue }
+                result.insert(runID)
+            }
+            return result
+        }
+        guard !matchingRunIDs.isEmpty else { return }
+        for (connectionID, runID) in runIDByConnectionID
+            where matchingRunIDs.contains(runID) && !connectionsBeingRemoved.contains(connectionID)
+        {
+            await notifyToolListChanged(connectionID: connectionID)
+        }
+    }
+
     private static func domainPolicySnapshot(
         restricted: Set<String>,
         additional: Set<String>,
@@ -10803,9 +10872,11 @@ actor ServerNetworkManager {
                 ToolAvailabilityStore.shared.effectiveDisabledTools
             }
             let policy = await effectivePolicyState(for: connectionID)
-            let domainPolicy = Self.domainPolicySnapshot(
+            let domainPolicy = await Self.domainPolicySnapshot(
                 restricted: policy.restricted,
-                additional: policy.additional,
+                additional: policy.additional.union(
+                    liveSessionLinkAdditionalGrants(connectionID: connectionID)
+                ),
                 taskLabelKind: policy.taskLabelKind,
                 allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
             )
@@ -11106,9 +11177,17 @@ actor ServerNetworkManager {
                 // Avoid repeating that work while a tool call is in-flight.
 
                 let effectivePolicy = await effectivePolicyState(for: connectionID)
+                // Recomputed live rather than read from the installed policy: a `list_changed`
+                // notification can lag a grant change in either direction, so stale advertisement
+                // must never decide execution. Scoped to the only tool whose grant is live link
+                // state, so no other tool call pays for the lookup or its actor hop.
+                let liveAdditional = toolName == MCPWindowToolName.agentSessionLink
+                    ? await effectivePolicy.additional
+                    .union(liveSessionLinkAdditionalGrants(connectionID: connectionID))
+                    : effectivePolicy.additional
                 let domainPolicy = Self.domainPolicySnapshot(
                     restricted: effectivePolicy.restricted,
-                    additional: effectivePolicy.additional,
+                    additional: liveAdditional,
                     taskLabelKind: effectivePolicy.taskLabelKind,
                     allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools
                 )
@@ -11117,6 +11196,18 @@ actor ServerNetworkManager {
                         toolName: toolName,
                         policy: domainPolicy
                     )
+                } catch MCPDomainCallPolicyDenial.missingAdditionalGrant
+                    where toolName == MCPWindowToolName.agentSessionLink
+                {
+                    #if DEBUG
+                        await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
+                            "toolName": toolName,
+                            "reason": "missing_session_link_grant"
+                        ])
+                    #endif
+                    // Identical to the ungranted-caller denial, so calling the hidden tool by name
+                    // reveals nothing beyond "you have no oversight authority".
+                    return CallTool.Result.err("Tool '\(toolName)' is not available for this session.")
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant {
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [

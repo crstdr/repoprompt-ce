@@ -839,7 +839,12 @@ class WindowState: ObservableObject {
         }
         return AgentChatOptionsMenuSnapshot(
             target: target,
-            isPinned: tab.isPinned
+            isPinned: tab.isPinned,
+            copySessionIDTarget: agentModeViewModel.agentSessionCopyIDTarget(
+                tabID: target.tabID,
+                sessionID: target.agentSessionID,
+                tabName: tab.name
+            )
         )
     }
 
@@ -872,10 +877,38 @@ class WindowState: ObservableObject {
                     copyToClipboard: copyToClipboard
                 )
             },
+            copySessionID: { [weak self] target in
+                self?.copyAgentSessionIDFromTitlebar(target: target, copyToClipboard: copyToClipboard)
+            },
             delete: { [weak self] target in
                 self?.confirmDeleteAgentChatFromTitlebar(target: target)
             }
         )
+    }
+
+    /// Titlebar Copy Session ID.
+    ///
+    /// Revalidates the generation-bearing capture immediately before writing. A stale capture writes
+    /// nothing to the clipboard and shows no confirmation, so the user is never told a copy happened
+    /// for a session that already rebound or closed.
+    @discardableResult
+    func copyAgentSessionIDFromTitlebar(
+        target: AgentSessionCopyIDTarget,
+        copyToClipboard: (String) -> Void = { value in
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(value, forType: .string)
+        }
+    ) -> Bool {
+        guard !isClosing, target.windowID == windowID else { return false }
+        let copied = agentModeViewModel.copyAgentSessionID(
+            target: target,
+            isWindowClosing: isClosing,
+            copyToClipboard: copyToClipboard
+        )
+        guard copied else { return false }
+        agentChatTitleCluster.showCopiedNotice("Session ID copied")
+        return true
     }
 
     private func refreshAgentChatTitleCluster() {

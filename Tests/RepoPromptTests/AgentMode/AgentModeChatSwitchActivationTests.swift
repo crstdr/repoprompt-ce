@@ -75,6 +75,83 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     }
 
+    func testHandoffDurablySavesThenInheritsBeforeSwitchAndReturn() async throws {
+        try await withFixture { fixture in
+            let cutoffItemID = try XCTUnwrap(fixture.sessionA.items.last?.id)
+            let capturedParentEndpoint = try XCTUnwrap(
+                fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabAID)
+            )
+            var events: [String] = []
+            fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+                XCTAssertEqual(
+                    fixture.window.promptManager.activeComposeTabID,
+                    fixture.tabAID,
+                    "The destination must not activate before its first durable save."
+                )
+                events.append("save")
+                return fixture.rootURL.appendingPathComponent("handoff-session.json")
+            }
+            fixture.viewModel.test_setAgentSessionLinkInheritanceHandler { parent, child in
+                XCTAssertEqual(parent, capturedParentEndpoint)
+                XCTAssertNotEqual(child, parent)
+                XCTAssertEqual(
+                    fixture.window.promptManager.activeComposeTabID,
+                    fixture.tabAID,
+                    "Inheritance must settle before the destination tab activates."
+                )
+                events.append("inherit")
+                return .empty
+            }
+
+            let destinationTabID = try await fixture.viewModel.prepareHandoffToNewTab(
+                upToItemID: cutoffItemID,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+
+            let destinationSession = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            let destinationToken = try XCTUnwrap(destinationSession.currentRestorationBindingToken)
+            XCTAssertEqual(events, ["save", "inherit"])
+            XCTAssertEqual(
+                destinationSession.restorationReadiness,
+                .authoritative(destinationToken, .freshBindingDurablyCreated)
+            )
+            XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, destinationTabID)
+        }
+    }
+
+    func testHandoffSaveFailureSkipsInheritanceSchedulesFallbackAndStillSwitches() async throws {
+        enum ExpectedSaveFailure: Error { case failed }
+
+        try await withFixture { fixture in
+            let cutoffItemID = try XCTUnwrap(fixture.sessionA.items.last?.id)
+            var inheritanceWasCalled = false
+            fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+                throw ExpectedSaveFailure.failed
+            }
+            fixture.viewModel.test_setAgentSessionLinkInheritanceHandler { _, _ in
+                inheritanceWasCalled = true
+                return .empty
+            }
+
+            let destinationTabID = try await fixture.viewModel.prepareHandoffToNewTab(
+                upToItemID: cutoffItemID,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+
+            let destinationSession = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            XCTAssertFalse(inheritanceWasCalled)
+            XCTAssertNotNil(
+                destinationSession.saveDebounceTask,
+                "A failed immediate save must schedule the existing deferred fallback once."
+            )
+            XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, destinationTabID)
+        }
+    }
+
     func testTokenMetricsCompletionWhileInitialModelLoadsSupersedesObsoleteGeneration() async throws {
         let fileID = UUID()
         let tabID = UUID()
