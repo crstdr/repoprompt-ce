@@ -813,6 +813,11 @@ final class ClaudeAgentModeCoordinator {
         viewModel?.setAgentRunActive(session.tabID, isActive: true)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
 
+        // One logical dispatch spans the whole bounded controller-retry loop below: a recycled
+        // controller is a transport retry of the *same* user turn, so every attempt must carry a
+        // byte-equivalent oversight supplement rather than re-deciding per attempt.
+        let promptDispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
+
         for _ in 0 ..< 3 {
             await ensureClaudeNativeSession(session: session)
             guard let controller = session.claudeController else {
@@ -902,9 +907,23 @@ final class ClaudeAgentModeCoordinator {
                 } else {
                     text
                 }
+                // Applied after handoff composition and before delivery-mode packaging, so the supplement
+                // is the final RepoPrompt envelope in the user-message channel regardless of whether this
+                // session delivers instructions natively or as XML. Native-system mode deliberately reuses
+                // this per-turn envelope instead of restarting the thread to refresh system text.
+                let monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
+                    outboundText,
+                    session: session,
+                    dispatchID: promptDispatchID
+                )
                 let instructions = agentModeInstructionInjection(for: session)
-                let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
+                let providerBoundText = providerBoundUserMessage(
+                    monitoring?.text ?? outboundText,
+                    instructions: instructions
+                )
                 let turnID = try await controller.sendUserMessage(providerBoundText)
+                // The returned provider turn ID is the acceptance signal.
+                viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
                 guard sessionOwnsClaudeController(controller, for: session) else {
                     await controller.shutdown()
                     return false

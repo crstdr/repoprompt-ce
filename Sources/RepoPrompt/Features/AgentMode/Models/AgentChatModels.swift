@@ -113,6 +113,35 @@ public struct AgentCodexGoalModeMetadata: Codable, Sendable, Equatable {
     }
 }
 
+// MARK: - Cross-Session Attribution
+
+/// Provenance for a user row that was delivered by another Agent session through a user-granted
+/// oversight link (`agent_session_link.send`).
+///
+/// It is metadata only: the row's `text` stays exactly what the sending session wrote, so the
+/// message reads identically whether it arrived locally or across a link. The badge and the
+/// provider envelope are both derived from this value rather than from parsing the text.
+///
+/// Every field is additive and optional at the persistence boundary, so sessions written before
+/// oversight existed decode with `nil` and sessions written after it remain readable by a build
+/// that does not know the key.
+public struct AgentCrossSessionAttribution: Codable, Sendable, Equatable, Hashable {
+    /// Persistent session ID of the session that sent this message.
+    public let sourceSessionID: UUID
+    /// Display name of the sending session at delivery time. Never re-resolved: the badge must keep
+    /// showing who sent it even after that session is renamed or closed.
+    public let sourceName: String?
+    /// The exact oversight link that authorized the delivery. Retained for auditability; it is never
+    /// treated as live authority, which ends with the link.
+    public let linkID: UUID
+
+    public init(sourceSessionID: UUID, sourceName: String?, linkID: UUID) {
+        self.sourceSessionID = sourceSessionID
+        self.sourceName = sourceName
+        self.linkID = linkID
+    }
+}
+
 // MARK: - Agent Chat Item
 
 /// A single item in an agent chat transcript (user message, assistant message, tool call, etc.)
@@ -155,6 +184,9 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// True for local control-plane echoes that should display in chat but are not provider-backed user turns.
     public var isLocalControlPlaneEcho: Bool
 
+    /// Set only on user rows delivered across a user-granted oversight link.
+    public var crossSessionAttribution: AgentCrossSessionAttribution?
+
     public init(
         id: UUID = UUID(),
         timestamp: Date = Date(),
@@ -172,7 +204,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         isStreaming: Bool = false,
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
-        isLocalControlPlaneEcho: Bool = false
+        isLocalControlPlaneEcho: Bool = false,
+        crossSessionAttribution: AgentCrossSessionAttribution? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -191,6 +224,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.workflow = workflow
         self.codexGoalMode = codexGoalMode
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
+        self.crossSessionAttribution = crossSessionAttribution
     }
 
     public var hasDisplayableAssistantBody: Bool {
@@ -204,6 +238,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case id, timestamp, kind, text, attachments, taggedFileAttachments
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
         case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, isLocalControlPlaneEcho
+        case crossSessionAttribution
     }
 
     public init(from decoder: Decoder) throws {
@@ -225,12 +260,16 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         workflow = try c.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
+        crossSessionAttribution = try c.decodeIfPresent(
+            AgentCrossSessionAttribution.self,
+            forKey: .crossSessionAttribution
+        )
     }
 
     // MARK: - Factory Methods
 
-    public static func user(_ text: String, attachments: [AgentImageAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false) -> AgentChatItem {
-        AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho)
+    public static func user(_ text: String, attachments: [AgentImageAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false, crossSessionAttribution: AgentCrossSessionAttribution? = nil) -> AgentChatItem {
+        AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho, crossSessionAttribution: crossSessionAttribution)
     }
 
     public static func assistant(_ text: String, reasoning: String? = nil, sequenceIndex: Int = 0, isStreaming: Bool = false) -> AgentChatItem {
@@ -281,7 +320,8 @@ extension AgentChatItem {
             isStreaming: isStreaming,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
-            isLocalControlPlaneEcho: isLocalControlPlaneEcho
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho,
+            crossSessionAttribution: crossSessionAttribution
         )
     }
 }
@@ -307,6 +347,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var isLocalControlPlaneEcho: Bool
+    public var crossSessionAttribution: AgentCrossSessionAttribution?
 
     public init(from item: AgentChatItem, sanitizeToolResults: Bool = true) {
         id = item.id
@@ -322,6 +363,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho
+        crossSessionAttribution = item.crossSessionAttribution
         toolResultStatus = nil
 
         if sanitizeToolResults, item.kind == .toolResult {
@@ -394,7 +436,8 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             isStreaming: false,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
-            isLocalControlPlaneEcho: isLocalControlPlaneEcho
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho,
+            crossSessionAttribution: crossSessionAttribution
         )
     }
 
@@ -441,6 +484,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case workflow
         case codexGoalMode
         case isLocalControlPlaneEcho
+        case crossSessionAttribution
     }
 
     public init(from decoder: Decoder) throws {
@@ -462,6 +506,10 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         workflow = try container.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try container.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try container.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
+        crossSessionAttribution = try container.decodeIfPresent(
+            AgentCrossSessionAttribution.self,
+            forKey: .crossSessionAttribution
+        )
     }
 }
 

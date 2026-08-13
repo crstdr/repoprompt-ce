@@ -57,10 +57,10 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: committed) as? [String: Any])
         let provenance = try XCTUnwrap(object["provenance"] as? [String: Any])
         XCTAssertEqual(provenance["authority"] as? String, "generated-review-projection-only")
-        XCTAssertEqual((object["tools"] as? [[String: Any]])?.count, 27)
+        XCTAssertEqual((object["tools"] as? [[String: Any]])?.count, 28)
     }
 
-    func testShippingAppRegistrationUsesCanonicalTwentySevenSchemaFingerprints() async throws {
+    func testShippingAppRegistrationUsesCanonicalTwentyEightSchemaFingerprints() async throws {
         let window = Self.makeWindowWithoutAutoStart()
         let expected = try Dictionary(uniqueKeysWithValues: MCPDomainCanonicalToolDefinitions.definitions.map {
             try ($0.name, MCPDomainToolFingerprint(definition: $0))
@@ -71,7 +71,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         )
         let snapshot = await AppDomainRuntimeComposition.shared.runtime.toolRegistry.snapshot()
 
-        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count, 27)
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count, 28)
         XCTAssertEqual(snapshot.fingerprintsByToolName, expected)
         XCTAssertEqual(Set(snapshot.toolNames), Set(MCPDomainToolCatalog.orderedToolNames))
         await AppDomainRuntimeComposition.shared.unregister(registration.handle)
@@ -1451,12 +1451,13 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
         "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=d367738ad179d8f6b39b98f73082d594f53c42d771c4f2e512790593c5b3f9f4",
-        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=2b5e211868964f961f2d369c2aa54da7035a92a83e900770ad433e4ceb00fd96|schema=0b4f819f3aa6624df0f54fdaba6f8717ac64667d07a0528240d26905ba480520",
+        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=5a14b923d477ca1a06a4d27092c6781ac9b7c1157ceac6a0f219bc64ce522c96|schema=0b4f819f3aa6624df0f54fdaba6f8717ac64667d07a0528240d26905ba480520",
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=80d302d4391d6136f8acfbe8fc0bafe394c5110c5e63aefcf8f4c59fcbdbf95f|schema=83f34927eacac4dc6352db72eae312ac3a5477b2f70c9031f09a2101dc8f2e97",
-        "20|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
-        "21|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
-        "22|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
-        "23|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=fdc6ec2292ef0962b5fcfadf8691d905849a28474a832042789f14c444f6b0b6|schema=584dfe4f4200b3c795505461c3889c23d455a3af97c761e3bb5dd40ae46a8d71"
+        "20|agent_session_link|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=4e1064233c9e930aa26551b190e678519156257a7d76116d2c345c0543f8f4c7|schema=0db2a3a0784ea6fc9f0419fc995a272009c158a5014f321fc68a794bf2640265",
+        "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
+        "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
+        "23|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
+        "24|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=fdc6ec2292ef0962b5fcfadf8691d905849a28474a832042789f14c444f6b0b6|schema=584dfe4f4200b3c795505461c3889c23d455a3af97c761e3bb5dd40ae46a8d71"
     ]
 
     private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {

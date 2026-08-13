@@ -347,10 +347,20 @@ final class ACPIntegratedAgentModeRunner {
             runID,
             attachments
         )
+        // Active ACP steering is its own logical dispatch. If this send returns `false` the batch is
+        // requeued as a follow-up, which composes again through `runPromptTurn` under a different
+        // dispatch ID — correct, because this attempt was never accepted and the follow-up must
+        // render whatever membership is current when it dispatches.
+        let monitoring = hooks.providerInput.decoratedAgentMessage(
+            agentMessage,
+            session: session,
+            dispatchID: .acpActiveSteering(runAttemptID: runAttemptID)
+        )
 
         do {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
-            try await controller.prompt(agentMessage, request: runRequest)
+            try await controller.prompt(monitoring.message, request: runRequest)
+            if let claim = monitoring.claim { hooks.providerInput.acceptAgentSessionLinkPrompt(claim) }
             log("active steering session/prompt completed attempt=\(runAttemptID)", runID: runID)
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
@@ -730,9 +740,24 @@ final class ACPIntegratedAgentModeRunner {
             )
         }
 
+        // Composed here, not next to `buildHeadlessAgentMessage`: `prepareForNextTurn()` and the
+        // event-stream acquisition above both suspend, and an oversight link can be added or revoked while
+        // they do. Reading membership before those awaits would ship enqueue-time inventory on every
+        // reused/follow-up turn. This covers the initial, resumed, reusable-session, and follow-up
+        // routes, which all converge here. Resumed providers still omit `AgentMessage.systemPrompt`;
+        // the supplement rides the user-message channel precisely because a resumed thread cannot
+        // refresh system text.
+        let monitoring = hooks.providerInput.decoratedAgentMessage(
+            agentMessage,
+            session: session,
+            dispatchID: .acpPromptTurn(runAttemptID: runAttemptID)
+        )
+
         do {
             log("controller.prompt begin", runID: runID)
-            try await controller.prompt(agentMessage, request: runRequest)
+            try await controller.prompt(monitoring.message, request: runRequest)
+            // A non-throwing `controller.prompt` return is ACP's acceptance signal.
+            if let claim = monitoring.claim { hooks.providerInput.acceptAgentSessionLinkPrompt(claim) }
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
             log("controller.prompt returned; awaiting event consumer", runID: runID)

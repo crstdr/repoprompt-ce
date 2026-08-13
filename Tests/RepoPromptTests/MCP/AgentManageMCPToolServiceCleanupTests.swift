@@ -738,6 +738,61 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
         XCTAssertEqual(recorder.persistedFinalizeWorkspaceIDs, [capturedWorkspace.id])
     }
 
+    /// Batch deletion must resolve every file to an *authoritative* session UUID before it deletes
+    /// anything.
+    ///
+    /// Deriving that UUID from the filename alone makes the conflict check unreachable — the same
+    /// path always yields the same filename-derived identity — so a record or stub whose content
+    /// names session A while its filename encodes B would delete the file and tombstone B, leaving
+    /// A's grants and saved oversight intent unfenced.
+    func testBatchDeletionRefusesAFileWhoseContentIdentityDisagreesWithItsFilename() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let tabID = UUID()
+        let filenameSessionID = UUID()
+        let contentSessionID = UUID()
+
+        let session = AgentSession(
+            id: filenameSessionID,
+            workspaceID: workspace.id,
+            composeTabID: tabID,
+            name: "Identity Drift Session",
+            savedAt: Date(timeIntervalSinceReferenceDate: 400),
+            itemCount: 0
+        )
+        try await AgentSessionDataService.shared.saveAgentSession(
+            session,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 0
+        )
+        let files = try await AgentSessionDataService.shared.listAgentSessions(for: workspace)
+        let fileURL = try XCTUnwrap(
+            files.first { $0.lastPathComponent.contains(filenameSessionID.uuidString) }
+        )
+        // Corrupt only the identity *inside* the document: the filename still encodes the other UUID.
+        let raw = try String(contentsOf: fileURL, encoding: .utf8)
+        let drifted = raw.replacingOccurrences(
+            of: filenameSessionID.uuidString,
+            with: contentSessionID.uuidString
+        )
+        try Data(drifted.utf8).write(to: fileURL, options: .atomic)
+
+        do {
+            try await AgentSessionDataService.shared.deleteAgentSessions(
+                forComposeTabID: tabID,
+                for: workspace
+            )
+            XCTFail("Expected the conflicting identity to be refused before any deletion")
+        } catch {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: fileURL.path),
+                "A file that cannot be named authoritatively must be preserved, not deleted."
+            )
+        }
+    }
+
     private func makeWindow() async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

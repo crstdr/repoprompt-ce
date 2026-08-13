@@ -142,6 +142,8 @@ actor AgentSessionDataService {
 
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
     private var deletedSessionFileURLs: Set<URL> = []
+    /// Overlapping reversible deletions share the local save fence; one failure cannot clear another.
+    private var deletionAttemptCountByFileURL: [URL: Int] = [:]
     #if DEBUG
         private var deletionTombstoneWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
     #endif
@@ -1334,15 +1336,21 @@ actor AgentSessionDataService {
     }
 
     /// Delete a particular agent session file.
+    ///
+    /// The file must be attributable to a session UUID before anything irreversible happens: the
+    /// deletion fence is keyed by session, and deleting a transcript we cannot name would leave
+    /// oversight unable to revoke grants or clear saved intent for it.
     func deleteAgentSessionFile(_ fileURL: URL) async throws {
         let fileURL = fileURL.standardizedFileURL
         let folder = fileURL.deletingLastPathComponent()
         let filename = fileURL.lastPathComponent
-        let parsedID = agentSessionID(fromFilename: filename)
-        try await deleteSessionFileDurably(fileURL)
+        guard let parsedID = agentSessionID(fromFilename: filename) else {
+            throw AgentSessionDataError.invalidFilename(filename)
+        }
+        try await deleteSessionFileDurably(sessionID: parsedID, fileURL: fileURL)
         await removeMetadataRecords(
             matching: { record in
-                record.filename == filename || parsedID.map { record.id == $0 } == true
+                record.filename == filename || record.id == parsedID
             },
             folder: folder
         )
@@ -1354,16 +1362,39 @@ actor AgentSessionDataService {
         let filename = agentSessionFilename(for: id)
         let fileURL = agentSessionsFolder.appendingPathComponent(filename).standardizedFileURL
 
-        try await deleteSessionFileDurably(fileURL)
+        try await deleteSessionFileDurably(sessionID: id, fileURL: fileURL)
         await removeMetadataRecords(matching: { $0.id == id || $0.filename == filename }, folder: agentSessionsFolder)
     }
 
     func deleteAgentSessions(forComposeTabID tabID: UUID, for workspace: WorkspaceModel) async throws {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
-        var candidateFilesByPath: [String: URL] = [:]
+        // Standardized path → UUID, built and conflict-checked *before* anything is deleted. A batch
+        // that could not name one of its files would otherwise delete it and leave oversight unable
+        // to fence that session.
+        var candidateSessionIDsByPath: [String: (sessionID: UUID, fileURL: URL)] = [:]
+        /// - Parameter sessionID: the *authoritative* identity of this candidate — the index record's
+        ///   or the loaded stub's own `id`. Deriving it from the filename alone would make the
+        ///   conflict check below unreachable: the same path always yields the same filename-derived
+        ///   UUID, so a corrupted record whose content names session A while its filename encodes B
+        ///   would delete the file and tombstone B, leaving A's grants and saved intent unfenced.
+        func note(sessionID: UUID, fileURL: URL) throws {
+            let standardized = fileURL.standardizedFileURL
+            guard let filenameSessionID = agentSessionID(fromFilename: standardized.lastPathComponent),
+                  filenameSessionID == sessionID
+            else {
+                throw AgentSessionDataError.invalidFilename(standardized.lastPathComponent)
+            }
+            if let existing = candidateSessionIDsByPath[standardized.path], existing.sessionID != sessionID {
+                throw AgentSessionDataError.invalidFilename(standardized.lastPathComponent)
+            }
+            candidateSessionIDsByPath[standardized.path] = (sessionID, standardized)
+        }
         if let index = await readMetadataIndexIfAvailable(folder: agentSessionsFolder) {
             for record in index.entries where record.composeTabID == tabID {
-                candidateFilesByPath[agentSessionsFolder.appendingPathComponent(record.filename).path] = agentSessionsFolder.appendingPathComponent(record.filename)
+                try note(
+                    sessionID: record.id,
+                    fileURL: agentSessionsFolder.appendingPathComponent(record.filename)
+                )
             }
         }
 
@@ -1377,17 +1408,33 @@ actor AgentSessionDataService {
                 ),
                 stub.composeTabID == tabID
             else { continue }
-            candidateFilesByPath[fileURL.path] = fileURL
+            try note(sessionID: stub.id, fileURL: fileURL)
         }
 
-        for fileURL in candidateFilesByPath.values.sorted(by: { $0.path < $1.path }) {
-            try await deleteSessionFileDurably(fileURL.standardizedFileURL)
+        for entry in candidateSessionIDsByPath.values.sorted(by: { $0.fileURL.path < $1.fileURL.path }) {
+            // Reported per file: a batch cancelled halfway must leave a committed tombstone for every
+            // session it actually deleted, not just for the batch as a whole.
+            try await deleteSessionFileDurably(sessionID: entry.sessionID, fileURL: entry.fileURL)
         }
         await removeMetadataRecords(matching: { $0.composeTabID == tabID }, folder: agentSessionsFolder)
     }
 
-    private func deleteSessionFileDurably(_ fileURL: URL) async throws {
+    /// Irreversible removal of one session file, bracketed by the durable-deletion reporter.
+    ///
+    /// Phase order is the contract:
+    ///
+    /// 1. **Begin** marks the session in-progress *before* waiting for pending writes or touching the
+    ///    file, so oversight already refuses it while the removal is in flight.
+    /// 2. **Failure** clears only this attempt and preserves durable intent — nothing was deleted.
+    /// 3. **Commit** happens on successful removal *or* an already-absent file, and before any later
+    ///    await, so no metadata cleanup, next batch file, or view-model teardown can run while the
+    ///    session still looks alive to oversight.
+    private func deleteSessionFileDurably(sessionID: UUID, fileURL: URL) async throws {
+        // The local tombstone is inserted synchronously on actor entry, exactly as before, so the
+        // reporter's actor hop cannot open a window in which a concurrent save is still accepted.
         deletedSessionFileURLs.insert(fileURL)
+        deletionAttemptCountByFileURL[fileURL, default: 0] += 1
+        let attempt = await AgentSessionDurableDeletionReporter.beginDurableDeletion(sessionID: sessionID)
         #if DEBUG
             let tombstoneWaiters = deletionTombstoneWaitersByURL.removeValue(forKey: fileURL) ?? []
             for waiter in tombstoneWaiters {
@@ -1400,9 +1447,18 @@ actor AgentSessionDataService {
                 try FileManager.default.removeItem(at: fileURL)
             }
         } catch {
-            deletedSessionFileURLs.remove(fileURL)
+            let remainingAttempts = max(0, (deletionAttemptCountByFileURL[fileURL] ?? 1) - 1)
+            if remainingAttempts == 0 {
+                deletionAttemptCountByFileURL.removeValue(forKey: fileURL)
+                deletedSessionFileURLs.remove(fileURL)
+            } else {
+                deletionAttemptCountByFileURL[fileURL] = remainingAttempts
+            }
+            await AgentSessionDurableDeletionReporter.didFailDurableDeletion(attempt)
             throw error
         }
+        await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
+        // Keep one permanent count with the tombstone. A later overlapping failure must not reopen saves.
     }
 
     private func discardSaveIfSessionWasDeleted(

@@ -31,6 +31,7 @@ package enum MCPWindowToolName {
     package static let agentExplore = "agent_explore"
     package static let agentRun = "agent_run"
     package static let agentManage = "agent_manage"
+    package static let agentSessionLink = "agent_session_link"
     package static let history = "history"
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
@@ -65,6 +66,10 @@ package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
     case userInteraction = "user_interaction"
     case agentExternalControl = "agent_external_control"
     case agentExploreControl = "agent_explore_control"
+    /// Cross-window oversight links. Deliberately independent of `agentExternalControl`: an
+    /// oversight grant never widens `agent_run` / `agent_manage`, and spawn provenance never creates
+    /// an oversight link.
+    case agentSessionLinkControl = "agent_session_link_control"
     case agentReasoningControl = "agent_reasoning_control"
     case fileContentEdit = "file_content_edit"
     case fileManagement = "file_management"
@@ -126,6 +131,7 @@ package enum MCPDomainToolCatalog {
         .init(name: MCPWindowToolName.agentExplore, scope: .window, capability: .agentExploreControl, admissionClass: .control),
         .init(name: MCPWindowToolName.agentRun, scope: .window, capability: .agentExternalControl, admissionClass: .control),
         .init(name: MCPWindowToolName.agentManage, scope: .window, capability: .agentExternalControl, admissionClass: .control),
+        .init(name: MCPWindowToolName.agentSessionLink, scope: .window, capability: .agentSessionLinkControl, admissionClass: .control),
         .init(name: MCPWindowToolName.shareThoughts, scope: .window, capability: .agentReasoningControl, admissionClass: .control),
         .init(name: MCPWindowToolName.setStatus, scope: .window, capability: .statusPublication, admissionClass: .control),
         .init(name: MCPWindowToolName.waitForNextInstruction, scope: .window, capability: .agentReasoningControl, admissionClass: .control),

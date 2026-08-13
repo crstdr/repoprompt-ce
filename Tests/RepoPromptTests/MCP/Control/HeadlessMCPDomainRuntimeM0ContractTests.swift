@@ -15,7 +15,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
 
         XCTAssertEqual(globals, MCPGlobalToolName.orderedToolNames)
         XCTAssertEqual(windows, MCPAppToolGroup.orderedToolNames)
-        XCTAssertEqual(allTools.count, 27)
+        XCTAssertEqual(allTools.count, 28)
         XCTAssertEqual(Set(allTools).count, allTools.count)
 
         let actionFixtures = try stringArrays(catalog, key: "actions")
@@ -23,8 +23,8 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(Set(actionFixtures.keys).union(actionlessFixtures.keys), Set(allTools))
         XCTAssertTrue(Set(actionFixtures.keys).isDisjoint(with: actionlessFixtures.keys))
         XCTAssertTrue(actionFixtures.values.allSatisfy { !$0.isEmpty })
-        XCTAssertEqual(actionFixtures.values.reduce(0) { $0 + $1.count }, 86)
-        XCTAssertEqual(try integer(catalog, key: "canonical_discriminated_action_count"), 86)
+        XCTAssertEqual(actionFixtures.values.reduce(0) { $0 + $1.count }, 92)
+        XCTAssertEqual(try integer(catalog, key: "canonical_discriminated_action_count"), 92)
         XCTAssertEqual(actionlessFixtures.count, try integer(catalog, key: "actionless_tool_count"))
 
         let actionEvidence = try dictionary(catalog, key: "action_execution_evidence")
@@ -464,7 +464,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         ).map(mainActorSiteKey).sorted()
         XCTAssertEqual(actualLocalSites, expectedLocalSites)
         XCTAssertEqual(actualLocalSites.count, try integer(actorInventory, key: "mcp_local_declaration_count"))
-        XCTAssertEqual(actualLocalSites.count, 42)
+        XCTAssertEqual(actualLocalSites.count, 44)
 
         let externalSites = try dictionaries(actorInventory, key: "external_collaborators")
         for site in externalSites {

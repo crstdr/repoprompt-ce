@@ -324,12 +324,13 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             "agent_explore": ["op": .string("poll"), "session_id": .string(UUID().uuidString)],
             "agent_run": ["op": .string("poll"), "session_id": .string(UUID().uuidString)],
             "agent_manage": ["op": .string("list_agents"), "roles_only": .bool(true)],
+            "agent_session_link": ["op": .string("poll"), "session_id": .string(UUID().uuidString)],
             "share_thoughts": ["text": .string("progress")],
             "set_status": ["session_name": .string("composition")],
             "wait_for_next_user_instruction": [:],
             "history": ["op": .string("list_sessions")]
         ]
-        XCTAssertEqual(arguments.count, 27)
+        XCTAssertEqual(arguments.count, 28)
         XCTAssertEqual(Set(arguments.keys), Set(MCPDomainCanonicalToolDefinitions.definitions.map(\.name)))
 
         var dispatched: Set<String> = []

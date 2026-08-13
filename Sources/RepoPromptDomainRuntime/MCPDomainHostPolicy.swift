@@ -72,6 +72,13 @@ package struct MCPDomainPreAdmissionDecision: Equatable, Sendable {
 }
 
 extension MCPDomainHost {
+    /// Capabilities whose role advertisement policy is also enforced at `tools/call` admission.
+    package static let executionRoleGatedCapabilities: Set<MCPToolCapability> = [
+        .agentExploreControl,
+        .agentExternalControl,
+        .agentSessionLinkControl,
+    ]
+
     package func advertisedCatalog(
         _ request: MCPDomainCatalogAdvertisementRequest
     ) async -> MCPDomainCatalogAdvertisementResult {
@@ -141,7 +148,11 @@ extension MCPDomainHost {
         if policy.restrictedToolNames.contains(toolName) {
             throw MCPDomainCallPolicyDenial.restricted(toolName: toolName)
         }
-        if MCPDomainToolCatalog.capabilities(for: toolName).contains(.agentExploreControl),
+        // Advertisement is never authority: a hidden tool stays callable by name unless execution
+        // mirrors the role filter. Both agent-control capability families are gated here so a
+        // non-orchestrator agent cannot reach `agent_run` / `agent_manage` simply by naming them.
+        let capabilities = MCPDomainToolCatalog.capabilities(for: toolName)
+        if !capabilities.isDisjoint(with: Self.executionRoleGatedCapabilities),
            !MCPClientToolPolicyCatalog.shouldAdvertise(
                toolName: toolName,
                role: policy.role,

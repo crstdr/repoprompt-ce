@@ -681,7 +681,9 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
                 augmentUserMessageForProviderSend: { text, _, _, _ in text },
                 stageResumeRecoveryHandoffIfNeeded: { _ in },
                 prependPendingHandoffIfNeeded: { text, _ in text },
-                recordPendingHandoffSendOutcome: { _, _ in }
+                recordPendingHandoffSendOutcome: { _, _ in },
+                claimAgentSessionLinkPrompt: { _, _ in nil },
+                acceptAgentSessionLinkPrompt: { _ in }
             ),
             interactions: .init(
                 cancelPendingQuestion: { _ in },

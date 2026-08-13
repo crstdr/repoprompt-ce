@@ -108,6 +108,9 @@ final class HeadlessAgentModeRunner {
                     return
                 }
 
+                // Undecorated: the oversight supplement is attached inside `executeHeadlessRun`,
+                // after the lease's provider-initialization hop, because that hop is a suspension
+                // during which link membership can change.
                 let agentMessage = self.hooks.providerInput.buildHeadlessAgentMessage(
                     session,
                     initialMessageForRun,
@@ -169,7 +172,18 @@ final class HeadlessAgentModeRunner {
         var providerInitializationCompleted = false
         do {
             await lease.providerInitializationStarted(provider: session.selectedAgent.rawValue)
-            let stream = try await provider.streamAgentMessage(initialMessage, runID: runID)
+            // Composed here, after the lease hop and immediately before stream creation: that hop is
+            // a suspension, so reading membership any earlier could dispatch inventory the user has
+            // already changed. This is the last point before the provider sees the turn.
+            let monitoring = hooks.providerInput.decoratedAgentMessage(
+                initialMessage,
+                session: session,
+                dispatchID: .headlessRun(runID: runID)
+            )
+            let stream = try await provider.streamAgentMessage(monitoring.message, runID: runID)
+            // Successful stream creation is the acceptance signal for every headless provider,
+            // including Claude headless. A throwing creation leaves the claim pending for the retry.
+            if let claim = monitoring.claim { hooks.providerInput.acceptAgentSessionLinkPrompt(claim) }
             providerInitializationCompleted = true
             await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "ready")
             hooks.providerInput.recordPendingHandoffSendOutcome(session, true)

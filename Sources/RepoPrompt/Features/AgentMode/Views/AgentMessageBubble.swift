@@ -337,8 +337,11 @@ struct AgentMessageBubble: View {
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
-                    if item.codexGoalMode != nil || item.workflow != nil {
+                    if item.codexGoalMode != nil || item.workflow != nil || item.crossSessionAttribution != nil {
                         HStack(spacing: 6) {
+                            if let attribution = item.crossSessionAttribution {
+                                crossSessionAttributionBadge(attribution)
+                            }
                             if let codexGoalMode = item.codexGoalMode {
                                 codexGoalModeBadge(codexGoalMode, hasWorkflow: item.workflow != nil)
                             }
@@ -400,6 +403,36 @@ struct AgentMessageBubble: View {
         .hoverTooltip(tooltip)
         .accessibilityLabel(Text(labelText))
         .accessibilityHint(Text(tooltip))
+    }
+
+    /// Marks a user row that another Agent session delivered through a user-granted oversight link.
+    ///
+    /// The name is the sender's name captured at delivery time, never re-resolved, so the badge stays
+    /// truthful after that session is renamed or closed. The full source UUID lives in the tooltip and
+    /// accessibility text rather than the label, which would otherwise dominate the bubble.
+    private func crossSessionAttributionBadge(_ attribution: AgentCrossSessionAttribution) -> some View {
+        let name = attribution.sourceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = (name?.isEmpty == false)
+            ? name!
+            : AgentMonitorSessionIDFormatter.short(attribution.sourceSessionID)
+        let label = "From \(displayName)"
+        let detail = "Sent by overseeing session \(attribution.sourceSessionID.uuidString) through an oversight link."
+
+        return HStack(spacing: 4) {
+            Image(systemName: "eye.fill")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            Text(label)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                .lineLimit(1)
+        }
+        .foregroundColor(.purple)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.purple.opacity(0.15))
+        .clipShape(Capsule())
+        .hoverTooltip(detail)
+        .accessibilityLabel(Text(label))
+        .accessibilityHint(Text(detail))
     }
 
     private func workflowBadge(_ workflow: AgentWorkflowDefinition) -> some View {

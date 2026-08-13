@@ -1725,7 +1725,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 augmentUserMessageForProviderSend: { text, _, _, _ in text },
                 stageResumeRecoveryHandoffIfNeeded: { _ in },
                 prependPendingHandoffIfNeeded: { text, _ in text },
-                recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") }
+                recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") },
+                claimAgentSessionLinkPrompt: { _, _ in nil },
+                acceptAgentSessionLinkPrompt: { _ in }
             ),
             interactions: .init(
                 cancelPendingQuestion: { _ in },

@@ -5,14 +5,14 @@ import XCTest
 
 final class MCPDomainToolCatalogTests: XCTestCase {
     func testCanonicalCatalogHasExplicitUniqueCapabilityAndAdmissionClassification() {
-        XCTAssertEqual(MCPDomainToolCatalog.entries.count, 27)
-        XCTAssertEqual(Set(MCPDomainToolCatalog.orderedToolNames).count, 27)
+        XCTAssertEqual(MCPDomainToolCatalog.entries.count, 28)
+        XCTAssertEqual(Set(MCPDomainToolCatalog.orderedToolNames).count, 28)
         XCTAssertEqual(MCPDomainToolCatalog.globalToolNames, [
             "app_settings",
             "bind_context",
             "manage_workspaces"
         ])
-        XCTAssertEqual(MCPDomainToolCatalog.windowToolNames.count, 24)
+        XCTAssertEqual(MCPDomainToolCatalog.windowToolNames.count, 25)
         XCTAssertEqual(Set(MCPDomainToolCatalog.classifications.keys), Set(MCPDomainToolCatalog.orderedToolNames))
         XCTAssertTrue(MCPDomainToolCatalog.entries.allSatisfy {
             MCPDomainToolCatalog.capabilities(for: $0.name) == [$0.capability]

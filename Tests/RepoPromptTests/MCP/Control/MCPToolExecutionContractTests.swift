@@ -48,7 +48,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPGlobalToolName.orderedToolNames + MCPAppToolGroup.orderedToolNames,
                 caseLabel
             )
-            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 27, caseLabel)
+            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 28, caseLabel)
             XCTAssertEqual(
                 Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames).count,
                 MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count,
@@ -120,7 +120,8 @@ final class MCPToolExecutionContractTests: XCTestCase {
             let caseLabel = "testAgentRunAndExploreUseLifecycleManagedExemption"
             XCTAssertEqual(names(for: .lifecycleManagedCancellable), [
                 MCPWindowToolName.agentExplore,
-                MCPWindowToolName.agentRun
+                MCPWindowToolName.agentRun,
+                MCPWindowToolName.agentSessionLink
             ], caseLabel)
             assertNoWatchdogDeadline(for: names(for: .lifecycleManagedCancellable), label: caseLabel)
         }

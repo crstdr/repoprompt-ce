@@ -504,6 +504,45 @@ final class MCPDomainHostTests: XCTestCase {
             XCTAssertEqual(denial, .roleUnavailable(toolName: MCPWindowToolName.agentExplore))
         }
 
+        // Advertisement is never authority: an engineer-role connection that cannot see the agent
+        // control tools must not be able to call them by name either.
+        let engineerPolicy = MCPDomainClientPolicySnapshot(
+            restrictedToolNames: [],
+            additionalToolNames: [],
+            role: .engineer,
+            allowsAgentExternalControlTools: false
+        )
+        for toolName in [MCPWindowToolName.agentRun, MCPWindowToolName.agentManage] {
+            do {
+                _ = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(
+                    toolName: toolName,
+                    policy: engineerPolicy
+                )
+                XCTFail("Role-hidden \(toolName) passed pre-admission policy")
+            } catch let denial as MCPDomainCallPolicyDenial {
+                XCTAssertEqual(denial, .roleUnavailable(toolName: toolName))
+            }
+        }
+        let orchestratorPolicy = MCPDomainClientPolicySnapshot(
+            restrictedToolNames: [],
+            additionalToolNames: [],
+            role: .engineer,
+            allowsAgentExternalControlTools: true
+        )
+        for toolName in [MCPWindowToolName.agentRun, MCPWindowToolName.agentManage] {
+            let decision = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(
+                toolName: toolName,
+                policy: orchestratorPolicy
+            )
+            XCTAssertEqual(decision.admissionClass, .control)
+            // Administrative direct clients keep their existing routed access.
+            let directDecision = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(
+                toolName: toolName,
+                policy: directPolicy
+            )
+            XCTAssertEqual(directDecision.admissionClass, .control)
+        }
+
         let readDecision = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(
             toolName: MCPWindowToolName.readFile,
             policy: directPolicy

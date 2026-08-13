@@ -15,7 +15,7 @@ import XCTest
                     MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.entries.count, 27, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.entries.count, 28, caseLabel)
                 XCTAssertEqual(
                     Set(MCPToolDurationInventory.entries.map(\.toolName)).count,
                     MCPToolDurationInventory.entries.count,
@@ -58,7 +58,7 @@ import XCTest
                 )
                 XCTAssertEqual(
                     MCPToolDurationInventory.lifecycleManagedToolNames,
-                    [MCPWindowToolName.agentExplore, MCPWindowToolName.agentRun],
+                    [MCPWindowToolName.agentExplore, MCPWindowToolName.agentRun, MCPWindowToolName.agentSessionLink],
                     caseLabel
                 )
                 XCTAssertEqual(
@@ -223,7 +223,7 @@ import XCTest
                 XCTAssertTrue((payload["timeout_semantics"] as? String)?.contains("separate dispatch-boundary") == true, caseLabel)
                 XCTAssertEqual(
                     payload["lifecycle_managed_tools"] as? [String],
-                    [MCPWindowToolName.agentExplore, MCPWindowToolName.agentRun],
+                    [MCPWindowToolName.agentExplore, MCPWindowToolName.agentRun, MCPWindowToolName.agentSessionLink],
                     caseLabel
                 )
                 XCTAssertEqual(
@@ -256,7 +256,7 @@ import XCTest
                     caseLabel
                 )
                 let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]], caseLabel)
-                XCTAssertEqual(tools.count, 27, caseLabel)
+                XCTAssertEqual(tools.count, 28, caseLabel)
                 let getCodeStructure = try XCTUnwrap(tools.first {
                     $0["tool"] as? String == MCPWindowToolName.getCodeStructure
                 }, caseLabel)

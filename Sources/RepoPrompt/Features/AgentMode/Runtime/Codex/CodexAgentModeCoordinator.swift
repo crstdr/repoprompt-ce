@@ -2550,14 +2550,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             return
         }
+        // The queue stored undecorated provider text. Compose here, immediately before the physical
+        // fallback dispatch, so an entry that sat in the queue while the user added or removed an oversight link
+        // ships the current membership revision rather than the one that was live at enqueue time.
+        let promptDispatchID = AgentSessionLinkPromptDispatchID.codexFallback(queueID: head.id)
+        let monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
+            head.providerText,
+            session: session,
+            dispatchID: promptDispatchID
+        )
         do {
             _ = try await controller.startUserTurn(
-                text: head.providerText,
+                text: monitoring?.text ?? head.providerText,
                 images: head.images,
                 model: head.model,
                 reasoningEffort: head.reasoningEffort,
                 serviceTier: head.serviceTier
             )
+            // Acceptance is the non-throwing `startUserTurn` return that produces the enclosing `.sent`
+            // path; the in-flight bookkeeping below is local state, not provider acceptance.
+            viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
             guard var inFlight = session.codexFallbackDispatchInFlight,
                   inFlight.id == head.id,
                   session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID
@@ -4325,13 +4337,36 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard replayTurn.expectedTurnID == nil else {
                 return false
             }
+            // This replay bypasses `sendCodexNativeMessage`, so it must reproduce that path's
+            // oversight composition itself. Two cases, both resolved against the *same* logical
+            // dispatch ID the failed attempt used:
+            //
+            // - Link membership changed since the failed attempt: a claim is owed again, so ship the
+            //   current revision and acknowledge it on success.
+            // - Membership is unchanged and the failed attempt already acknowledged it: nothing is
+            //   owed, so re-attach that exact fragment. Re-acknowledging would be wrong (the
+            //   revision is already consumed) and sending bare text would lose it permanently,
+            //   because no later turn will ever owe this revision again.
+            let monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
+                replayTurn.text,
+                session: session,
+                dispatchID: .codexNativeSend(runID)
+            )
+            let replayText: String = if let monitoring, monitoring.claim != nil {
+                monitoring.text
+            } else if let acknowledged = replayTurn.monitoringClaim {
+                AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: acknowledged)
+            } else {
+                replayTurn.text
+            }
             _ = try await controller.startUserTurn(
-                text: replayTurn.text,
+                text: replayText,
                 images: replayTurn.images,
                 model: replayTurn.model,
                 reasoningEffort: replayTurn.reasoningEffort,
                 serviceTier: replayTurn.serviceTier
             )
+            viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -5538,6 +5573,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         }
 
+        // Cross-window oversight supplement, composed at the last possible moment before the
+        // physical dispatch. Fallback plans returned above without composing, so a queued entry keeps
+        // undecorated provider text and renders against the membership revision that is current when
+        // it actually drains. Both the initial steer and its bounded expected-turn retry send this
+        // exact string, so a transport retry can never ship a different fragment.
+        let promptDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(sendRunID)
+        let monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
+            text,
+            session: session,
+            dispatchID: promptDispatchID
+        )
+        let dispatchText = monitoring?.text ?? text
+
         do {
             setRunningStatus("Sending message…", source: .transport, session: session, urgent: true)
             switch dispatchPlan {
@@ -5546,7 +5594,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 updateCodexStallWatchdogState(for: session)
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.startUserTurn")
                 _ = try await controller.startUserTurn(
-                    text: text,
+                    text: dispatchText,
                     images: attachments,
                     model: selection.model,
                     reasoningEffort: selection.reasoningEffort,
@@ -5556,7 +5604,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 do {
                     let receipt = try await controller.steerUserTurn(
-                        text: text,
+                        text: dispatchText,
                         images: attachments,
                         expectedTurnID: identity.turnID
                     )
@@ -5588,7 +5636,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session.codexPendingSteerLifecycleReconciliation = reconciliation
                     do {
                         let receipt = try await controller.steerUserTurn(
-                            text: text,
+                            text: dispatchText,
                             images: attachments,
                             expectedTurnID: actualTurnID
                         )
@@ -5627,6 +5675,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
             case .fallback:
                 preconditionFailure("Fallback dispatch plans return before provider dispatch")
+            }
+            // Acceptance for both Codex plans is a non-throwing controller return: a successful
+            // `startUserTurn`, or a `steerUserTurn` receipt carrying an accepted turn ID. Acknowledge
+            // before the staleness guard below, because a dispatch the provider accepted after the
+            // local run changed still delivered the supplement exactly once.
+            viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
+            // Managed-auth recovery can still replay this exact turn after acceptance. Hand it the
+            // acknowledged claim so the replay can re-attach the identical fragment instead of
+            // shipping the bare stored text and silently dropping the revision forever.
+            if let acceptedClaim = monitoring?.claim, session.codexPendingAuthRetryTurn != nil {
+                session.codexPendingAuthRetryTurn?.monitoringClaim = acceptedClaim
             }
             guard session.runID == sendRunID,
                   session.runState.isActive,
