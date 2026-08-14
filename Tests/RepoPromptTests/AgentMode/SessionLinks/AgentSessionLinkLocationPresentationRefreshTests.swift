@@ -23,6 +23,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
         var publishedInventoriesByEndpoint:
             [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkPromptInventory] = [:]
         private(set) var inventoryPublicationCount = 0
+        private(set) var passiveNoticePublicationCount = 0
         private(set) var observationSnapshotCount = 0
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
@@ -72,6 +73,15 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
         ) {
             inventoryPublicationCount += 1
             publishedInventoriesByEndpoint[endpoint] = inventory
+        }
+
+        /// Counted for the same reason the inventory is: the monitor-only repaint must publish rows
+        /// and nothing an agent could be told.
+        func agentSessionLinkPublishPassiveStatusNotices(
+            _: AgentSessionLinkPassiveStatusNotices.Snapshot,
+            to _: DomainAgentSessionLinkEndpointIdentity
+        ) {
+            passiveNoticePublicationCount += 1
         }
 
         func agentSessionLinkWithholdPromptInventory(

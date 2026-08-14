@@ -45,6 +45,23 @@ struct AgentSessionLinkPromptInventoryHold: Equatable {
 struct AgentSessionLinkPromptContext: Equatable {
     let epoch: AgentSessionLinkPromptEpoch
     let inventory: AgentSessionLinkPromptInventory
+    /// This session's latest published passive status queue, unfiltered.
+    ///
+    /// Deliberately handed over raw rather than pre-screened here: every condition that may join a
+    /// batch to a dispatch — endpoint match, eligibility, enablement, deliverability, revision match,
+    /// and grant membership — lives in one truth table inside the claim store, where it is testable
+    /// without a view model.
+    let passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?
+
+    init(
+        epoch: AgentSessionLinkPromptEpoch,
+        inventory: AgentSessionLinkPromptInventory,
+        passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil
+    ) {
+        self.epoch = epoch
+        self.inventory = inventory
+        self.passiveNotices = passiveNotices
+    }
 }
 
 extension AgentModeViewModel {
@@ -102,6 +119,45 @@ extension AgentModeViewModel {
         )
         if existing == published { return }
         agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID] = published
+        // An accepted publication names the incarnation this session UUID currently *is*, so a passive
+        // queue filed under that UUID for any other incarnation belongs to a retired one. Collected
+        // here rather than in the prune sweep because a rebind keeps the UUID alive: the sweep would
+        // never drop it, and the replacement incarnation starts with no queue of its own to overwrite
+        // it with.
+        if let passive = agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID],
+           passive.observerEndpoint != endpoint
+        {
+            agentSessionLinkPassiveNoticesBySessionID.removeValue(forKey: endpoint.sessionID)
+        }
+    }
+
+    /// Stores one exact incarnation's passive status-notice queue.
+    ///
+    /// Endpoint-matched twice, because the snapshot is the input to an agent-facing payload: it has
+    /// to name the incarnation it was reduced for, and that incarnation has to still be the one this
+    /// tab holds. A rebound tab reusing the same session UUID is therefore refused the previous
+    /// incarnation's queue rather than inheriting it.
+    ///
+    /// Queue revisions are monotonic within one epoch, so a late publication carrying an older
+    /// revision of the same epoch is dropped rather than allowed to resurrect entries a receipt has
+    /// already removed.
+    func agentSessionLinkPublishPassiveStatusNotices(
+        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
+        to endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) {
+        guard snapshot.observerEndpoint == endpoint,
+              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+        else {
+            return
+        }
+        if let existing = agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID],
+           existing.observerEndpoint == endpoint,
+           existing.queueEpoch == snapshot.queueEpoch,
+           existing.queueRevision > snapshot.queueRevision
+        {
+            return
+        }
+        agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID] = snapshot
     }
 
     /// Fences one exact incarnation's prompt inventory and retracts its published value.
@@ -234,6 +290,14 @@ extension AgentModeViewModel {
         {
             agentSessionLinkPromptInventoryHoldsByEndpoint.removeValue(forKey: endpoint)
         }
+        // Pruned on the same schedule as the inventory it is joined to: a queue left behind for a
+        // dead session would be matched against a later incarnation's revision by coincidence rather
+        // than by proof.
+        for sessionID in agentSessionLinkPassiveNoticesBySessionID.keys
+            where !liveSessionIDs.contains(sessionID)
+        {
+            agentSessionLinkPassiveNoticesBySessionID.removeValue(forKey: sessionID)
+        }
         agentSessionLinkPromptClaimStore.retainOnly(observerSessionIDs: liveSessionIDs)
     }
 
@@ -288,12 +352,18 @@ extension AgentModeViewModel {
         return AgentSessionLinkPromptContext(
             epoch: AgentSessionLinkPromptEpoch(
                 endpoint: endpoint,
-                allowsSupplement: AgentSessionLinkPromptEligibility.allowsSupplement(input)
+                allowsSupplement: AgentSessionLinkPromptEligibility.allowsSupplement(input),
+                // Computed once, here, and carried on the epoch: the provider decides the
+                // model-visible tool name a fragment must use, and it is also what makes a cached
+                // fragment stale when the session is rebound to a different runtime. Deriving it
+                // separately at render time is how the two could disagree.
+                agentKind: session.selectedAgent
             ),
             inventory: AgentSessionLinkPromptEligibility.effectiveInventory(
                 published.inventory,
                 input: input
-            )
+            ),
+            passiveNotices: agentSessionLinkPassiveNoticesBySessionID[sessionID]
         )
     }
 
@@ -316,18 +386,13 @@ extension AgentModeViewModel {
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkOutboundPromptClaim? {
         guard let context = agentSessionLinkPromptContext(for: session) else { return nil }
-        let toolReference = AgentSessionLinkPrompts.toolReference(agentKind: session.selectedAgent)
         return agentSessionLinkPromptClaimStore.claim(
             dispatchID: dispatchID,
             epoch: context.epoch,
-            inventory: context.inventory
-        ) { kind, inventory in
-            AgentSessionLinkPrompts.render(
-                kind: kind,
-                inventory: inventory,
-                toolReference: toolReference
-            )
-        }
+            inventory: context.inventory,
+            passiveNotices: context.passiveNotices,
+            render: AgentSessionLinkPrompts.rendered
+        )
     }
 
     /// Re-owes the supplement to a session whose **provider context** is being rebuilt from the app
@@ -362,9 +427,21 @@ extension AgentModeViewModel {
     }
 
     /// Acknowledges one accepted dispatch. Idempotent and safe with `nil`.
+    ///
+    /// The two components settle with their own owners and neither can block the other. Membership
+    /// goes to the claim store, which refuses a claim minted in a superseded epoch. The passive
+    /// receipt goes to the bridge-owned queue, which is deliberately *not* epoch-token gated: the
+    /// provider physically accepted that batch, and the queue's own epoch/revision fencing is what
+    /// decides whether it still applies. Gating it on the store's token instead would re-deliver a
+    /// batch the model already holds whenever a provider or eligibility flip raced the acceptance.
     func acceptAgentSessionLinkPromptClaim(_ claim: AgentSessionLinkOutboundPromptClaim?) {
         guard let claim else { return }
         agentSessionLinkPromptClaimStore.accept(claim)
+        guard let passive = claim.passive else { return }
+        AgentSessionLinkRuntimeBridge.shared.applyPassiveMonitorNoticeReceipt(
+            passive.receipt,
+            observerEndpoint: passive.observerEndpoint
+        )
     }
 
     /// Releases the claim of a definitively terminal logical dispatch. Idempotent and safe with
@@ -373,6 +450,9 @@ extension AgentModeViewModel {
     /// This is *not* an acknowledgement: the supplement stays owed to the next dispatch. Use it only
     /// when the dispatch will never be retried under the same logical ID, so its rendered fragment
     /// is not retained until some unrelated dispatch happens to be accepted.
+    ///
+    /// A passive batch the claim carried stays queued for exactly the same reason: an abandoned or
+    /// ambiguous pre-acceptance outcome acknowledges nothing at all.
     func abandonAgentSessionLinkPromptClaim(_ claim: AgentSessionLinkOutboundPromptClaim?) {
         guard let claim else { return }
         agentSessionLinkPromptClaimStore.abandon(claim)

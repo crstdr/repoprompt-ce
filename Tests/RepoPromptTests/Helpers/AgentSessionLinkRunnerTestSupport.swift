@@ -63,6 +63,10 @@ final class AgentSessionLinkRunnerHarness {
         allowsSupplement: true
     )
 
+    /// Passive status batch offered to each claim, or `nil` for the membership-only default every
+    /// pre-existing runner suite assumes.
+    var passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?
+
     init(
         stubSystemPrompt: String = "BASE INSTRUCTIONS",
         headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
@@ -182,13 +186,10 @@ final class AgentSessionLinkRunnerHarness {
                         return harnessBox.claimStore.claim(
                             dispatchID: dispatchID,
                             epoch: harnessBox.promptEpoch,
-                            inventory: harnessBox.inventory
-                        ) { kind, inventory in
-                            AgentSessionLinkPrompts.render(
-                                kind: kind,
-                                inventory: inventory,
-                                toolReference: "agent_session_link"
-                            )
+                            inventory: harnessBox.inventory,
+                            passiveNotices: harnessBox.passiveNotices
+                        ) { request in
+                            AgentSessionLinkPrompts.rendered(request)
                         }
                     }
                 },

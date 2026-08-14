@@ -77,6 +77,18 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         viewModel.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
     }
 
+    /// Routes one passive status-notice queue to the exact incarnation it was reduced for.
+    ///
+    /// Addressed like every other publication here: a session UUID is not an address, and a queue
+    /// handed to a namesake incarnation would let it claim notices about targets it never observed.
+    func agentSessionLinkPublishPassiveStatusNotices(
+        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
+        to endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
+        viewModel.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+    }
+
     func agentSessionLinkWithholdPromptInventory(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UInt64? {

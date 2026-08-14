@@ -32,7 +32,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let op = try XCTUnwrap(properties["op"]?.objectValue)
         XCTAssertEqual(
             op["enum"]?.arrayValue?.compactMap(\.stringValue),
-            ["list", "poll", "wait", "read", "send", "mark_done"]
+            ["list", "poll", "wait", "read", "send", "mark_done", "set_passive_updates"]
         )
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
         // `send` is the only target-mutating operation, so its two required inputs must be
@@ -43,6 +43,60 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertNotNil(properties["idempotency_key"])
         XCTAssertTrue(definition.description.contains("mark_done"))
         XCTAssertTrue(definition.description.contains("observer’s dashboard"))
+    }
+
+    /// `set_passive_updates` is observer-scoped by *construction*, and the schema has to show it.
+    ///
+    /// Its single argument is a native boolean, and it advertises no identity field of any kind: the
+    /// caller is resolved from server-owned run routing, so there is nothing here for one session to
+    /// address another session's preference with. `enabled` stays out of the top-level `required`
+    /// because it is mandatory for this operation only — the strict executor enforces that — and
+    /// hoisting it would demand it of `list`, `poll`, and every other operation.
+    func testPassiveUpdatesAdvertisesOneBooleanAndNoIdentityField() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+
+        let enabled = try XCTUnwrap(properties["enabled"]?.objectValue)
+        XCTAssertEqual(enabled["type"]?.stringValue, "boolean")
+        XCTAssertTrue(
+            try XCTUnwrap(enabled["description"]?.stringValue).contains("[set_passive_updates]")
+        )
+        XCTAssertFalse(
+            schema["required"]?.arrayValue?.compactMap(\.stringValue).contains("enabled") ?? true
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(schema["description"]?.stringValue)
+                .contains("**set_passive_updates**: enabled (required boolean); no session identifier is accepted")
+        )
+        // The description must teach the property that is easiest to assume wrongly: this never
+        // creates work.
+        XCTAssertTrue(definition.description.contains("takes no session identifier"))
+        XCTAssertTrue(definition.description.contains("never start, wake, or schedule one"))
+        XCTAssertTrue(definition.description.contains("moves no link authority"))
+    }
+
+    /// The canonicalization that adds the operation must be a no-op on an already-amended definition,
+    /// so a future refresh of the encoded blob needs no coordinated removal.
+    func testPassiveUpdatesCanonicalizationIsIdempotent() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        XCTAssertEqual(
+            definition.description.components(separatedBy: "- `set_passive_updates`:").count - 1,
+            1,
+            "the operation bullet must appear exactly once"
+        )
+        XCTAssertEqual(
+            definition.description.components(separatedBy: "| set_passive_updates").count - 1,
+            1,
+            "the operations line must name it exactly once"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue?["op"]?
+                .objectValue?["enum"]?.arrayValue)
+                .filter { $0.stringValue == "set_passive_updates" }
+                .count,
+            1
+        )
     }
 
     /// The description is the only place a model learns the send contract before calling it.

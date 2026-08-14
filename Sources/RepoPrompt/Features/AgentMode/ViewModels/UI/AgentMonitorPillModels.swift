@@ -6,12 +6,53 @@ import RepoPromptDomainRuntime
 /// Short display form for an overseen session ID.
 ///
 /// The full canonical UUID always remains available in tooltip/accessibility text; the short form is
-/// only a visual disambiguator for rows such as `→ Build API (8B91…E572)`.
+/// only a visual disambiguator for rows such as `← Planning (04CF…1A00)`.
 enum AgentMonitorSessionIDFormatter {
+    /// Characters kept at each end before collision widening.
+    private static let baseTokenLength = 4
+    /// Widening stops here: a token this long is no more scannable than the full UUID, so the
+    /// remaining collisions fall back to the UUID itself rather than growing without bound.
+    private static let maxTokenLength = 16
+
     static func short(_ sessionID: UUID) -> String {
+        token(sessionID, endLength: baseTokenLength)
+    }
+
+    /// Collision-free short tokens for one visible row set.
+    ///
+    /// Two overseen sessions may carry the same display name, so this token is the only at-a-glance
+    /// identity breaker the row has room for. It widens deterministically — the same visible set
+    /// always produces the same tokens — and falls back to the full UUID rather than ever rendering
+    /// two rows identically. Both ends are always preserved, so the value is never truncated by
+    /// layout either.
+    static func distinctShortTokens(for sessionIDs: [UUID]) -> [UUID: String] {
+        var tokens: [UUID: String] = [:]
+        var colliding = Array(Set(sessionIDs))
+        var endLength = baseTokenLength
+        // Length is a pure function of the *set*, not of iteration order: an ID resolved at one
+        // length can never collide with one resolved at another, because the rendered widths differ.
+        while !colliding.isEmpty, endLength <= maxTokenLength {
+            var next: [UUID] = []
+            for (_, ids) in Dictionary(grouping: colliding, by: { token($0, endLength: endLength) }) {
+                if ids.count == 1, let only = ids.first {
+                    tokens[only] = token(only, endLength: endLength)
+                } else {
+                    next.append(contentsOf: ids)
+                }
+            }
+            colliding = next
+            endLength += 1
+        }
+        for sessionID in colliding {
+            tokens[sessionID] = sessionID.uuidString
+        }
+        return tokens
+    }
+
+    private static func token(_ sessionID: UUID, endLength: Int) -> String {
         let raw = sessionID.uuidString
-        guard raw.count >= 8 else { return raw }
-        return "\(raw.prefix(4))…\(raw.suffix(4))"
+        guard raw.count > endLength * 2 else { return raw }
+        return "\(raw.prefix(endLength))…\(raw.suffix(endLength))"
     }
 }
 
@@ -63,12 +104,93 @@ enum AgentMonitorLinkStatus: String, Equatable {
         }
     }
 
-    var symbolName: String {
+    /// Hover detail. It explains what the state means for the user rather than repeating the label,
+    /// and names the one thing the compact label cannot: where a waiting session is waiting.
+    var tooltip: String {
         switch self {
-        case .idle: "pause.circle"
-        case .running: "play.circle"
-        case .awaitingUser: "questionmark.circle"
-        case .unavailable: "questionmark.circle.dashed"
+        case .idle: "This session is loaded and not working."
+        case .running: "This session is working right now."
+        case .awaitingUser: "This session is waiting for input in its own window."
+        case .unavailable: "RepoPrompt has no current status for this session."
+        }
+    }
+
+    /// Model-only description of the mark rendered beside the status word.
+    ///
+    /// Deliberately replaces the former transport symbols: a `play.circle`/`pause.circle` pair reads
+    /// as a control the user can press, and Idle is not “paused”. Shape and tone are named
+    /// semantically so the vocabulary stays testable and SwiftUI colours stay in the view layer.
+    var indicator: AgentMonitorStatusIndicatorDescriptor {
+        switch self {
+        case .idle:
+            AgentMonitorStatusIndicatorDescriptor(shape: .hollowRing, tone: .neutral, pulses: false)
+        case .running:
+            AgentMonitorStatusIndicatorDescriptor(shape: .haloedDot, tone: .live, pulses: true)
+        case .awaitingUser:
+            AgentMonitorStatusIndicatorDescriptor(shape: .attentionDot, tone: .attention, pulses: false)
+        case .unavailable:
+            AgentMonitorStatusIndicatorDescriptor(shape: .slashedRing, tone: .dimmed, pulses: false)
+        }
+    }
+}
+
+/// Shape, tone, and motion intent for one status mark.
+///
+/// Colour is never the only cue: the adjacent status word stays the primary semantic label, and the
+/// shape distinguishes every state on its own for grayscale, high-contrast, and colour-blind
+/// presentation.
+struct AgentMonitorStatusIndicatorDescriptor: Equatable {
+    enum Shape: String, Equatable {
+        /// Filled dot inside a thin halo ring. The halo is permanent geometry, not the pulse.
+        case haloedDot
+        /// Hollow ring: present, not working.
+        case hollowRing
+        /// Filled attention dot.
+        case attentionDot
+        /// Diagonally slashed hollow ring: nothing is currently observable.
+        case slashedRing
+    }
+
+    enum Tone: String, Equatable {
+        case live
+        case neutral
+        case attention
+        case dimmed
+    }
+
+    /// One drawn element of a mark.
+    ///
+    /// The composition lives here rather than in the view so "Running still looks different from
+    /// Waiting with motion off" is a fact a test can assert, instead of a claim about a `body` that
+    /// only a running app evaluates.
+    enum Mark: String, Hashable {
+        /// The expanding ring. The only element Reduce Motion removes.
+        case pulse
+        /// The static ring around a live dot.
+        case halo
+        case dot
+        case ring
+        case dashedRing
+        case slash
+    }
+
+    let shape: Shape
+    let tone: Tone
+    /// Running is the only state worth animating, and the view still suppresses the pulse under
+    /// Reduce Motion. This flag is the intent, not the animation itself.
+    let pulses: Bool
+
+    /// The elements this mark draws, back to front, for one motion setting.
+    ///
+    /// Reduce Motion removes the pulse and nothing else. Running keeps its halo, so it stays a dot
+    /// inside a ring while Waiting stays a bare dot: the shape-redundant contract holds for users who
+    /// suppress animation, not only for users who allow it.
+    func marks(reduceMotion: Bool) -> [Mark] {
+        switch shape {
+        case .haloedDot: (pulses && !reduceMotion ? [.pulse] : []) + [.halo, .dot]
+        case .hollowRing: [.ring]
+        case .attentionDot: [.dot]
+        case .slashedRing: [.dashedRing, .slash]
         }
     }
 }
@@ -93,20 +215,199 @@ enum AgentMonitorTriageOutcome: Equatable {
     }
 }
 
-/// Static localized freshness copy. Absolute timestamps need no timer-driven repaint.
-enum AgentMonitorActivityFormatter {
-    static let unavailable = "Activity unavailable."
+/// Result of acknowledging one generation-qualified row's newest activity.
+///
+/// Kept separate from `AgentMonitorTriageOutcome` because acknowledgement has no inverse the user
+/// can request: there is no “mark unread”, so there is no requested-state axis to report against.
+enum AgentMonitorSeenOutcome: Equatable {
+    case marked
+    case alreadySeen
+    case failed(message: String)
 
-    static func compact(_ date: Date?) -> String {
-        guard let date else { return unavailable }
-        return DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .short)
+    var failureMessage: String? {
+        guard case let .failed(message) = self else { return nil }
+        return message
+    }
+}
+
+/// Result of changing one exact observer endpoint's passive status-notice preference.
+///
+/// Observer-level rather than row-level: the preference is one process-memory switch covering every
+/// direct outbound link that endpoint holds, so it reports the resulting state and the link count it
+/// now applies to instead of a row identity. Both the dashboard toggle and the overseer's own tool
+/// render this value rather than assuming their request succeeded.
+enum AgentMonitorPassiveNoticeOutcome: Equatable {
+    case changed(enabled: Bool, activeLinkCount: Int)
+    case alreadyInRequestedState(enabled: Bool, activeLinkCount: Int)
+    case failed(message: String)
+
+    var failureMessage: String? {
+        guard case let .failed(message) = self else { return nil }
+        return message
     }
 
-    static func accessibility(_ date: Date?) -> String {
-        guard let date else { return "Last activity unavailable"
+    /// The authoritative preference after the request, or `nil` when nothing was changed because the
+    /// request failed.
+    var enabled: Bool? {
+        switch self {
+        case let .changed(enabled, _), let .alreadyInRequestedState(enabled, _): enabled
+        case .failed: nil
         }
-        let value = DateFormatter.localizedString(from: date, dateStyle: .full, timeStyle: .medium)
-        return "Last activity \(value)"
+    }
+
+    /// Direct outbound links the preference currently applies to.
+    var activeLinkCount: Int? {
+        switch self {
+        case let .changed(_, count), let .alreadyInRequestedState(_, count): count
+        case .failed: nil
+        }
+    }
+}
+
+/// Copy for the observer-level passive status-update switch.
+///
+/// Separate from `AgentMonitorRowActionCopy` because the control is not a row action: it is one
+/// preference covering every direct outbound link this exact incarnation holds.
+///
+/// The tooltip states the whole contract in the order that matters: what arrives, when it arrives,
+/// and — load-bearing — that nothing here ever creates work. A user who reads "updates" and imagines
+/// a background agent waking up has been mis-sold the feature.
+enum AgentMonitorPassiveUpdatesCopy {
+    static let label = "Passive updates"
+    static let tooltip = """
+    Attaches coalesced status updates for these sessions to this agent’s next turn that you start. \
+    It never starts, wakes, or schedules a turn by itself, and nothing is sent if no further turn \
+    happens. Off by default, and it turns off when the last link is removed.
+    """
+    static let accessibilityLabel = "Passive updates for overseen sessions"
+    static let accessibilityHint = """
+    Attaches status updates to this agent’s next turn that you start; it never starts a turn itself
+    """
+    static let unavailableMessage = "That Agent session is no longer active."
+}
+
+/// Copy for the inline row controls and the unread affordance.
+///
+/// Tooltips explain behaviour or reveal detail the row cannot show; they never merely repeat the
+/// visible label.
+enum AgentMonitorRowActionCopy {
+    static let unreadBadge = "New"
+    static let unreadTooltip = """
+    New activity since you last acknowledged this session. Click to mark it seen — opening this \
+    dashboard or viewing the agent does not.
+    """
+    static let viewTooltip = "Open this Agent session"
+    static let viewDisabledTooltip = "This Agent session’s location is unavailable."
+    static let doneTooltip = """
+    Your own triage marker. It reopens automatically when this session has newer activity, and it \
+    never changes what the session is doing.
+    """
+    static let doneHint = "Reopens automatically when this session has newer activity"
+    static let unlinkTooltip = """
+    Removes oversight immediately. Undo is offered briefly and creates a new link rather than \
+    restoring the old one.
+    """
+}
+
+/// Freshness copy in the three deterministic forms the dashboard needs: compact calendar-aware
+/// visible text, expanded accessibility wording, and a full absolute timestamp for hover detail.
+///
+/// Every operation takes an explicit reference date and calendar, so bucket selection is testable
+/// and one popover-scoped minute tick can render every row from the same instant.
+enum AgentMonitorActivityFormatter {
+    /// Rendered inside a `·`-joined line, so it deliberately carries no sentence punctuation.
+    static let unavailable = "Activity unavailable"
+    static let accessibilityUnavailable = "Last activity unavailable"
+    static let justNow = "just now"
+    static let yesterday = "Yesterday"
+
+    /// Compact visible freshness, first match wins from the top:
+    ///
+    /// | Age | Text |
+    /// |---|---|
+    /// | under a minute, or a future clock | `just now` |
+    /// | 1–59 minutes | `Nm ago` |
+    /// | earlier on the same local day | localized short time |
+    /// | the previous local day | `Yesterday` |
+    /// | older | compact localized date, with the year only when it is not the current one |
+    /// | missing | `Activity unavailable` |
+    ///
+    /// Minutes deliberately outrank the calendar buckets, so activity twenty minutes before local
+    /// midnight reads `20m ago` rather than jumping straight to `Yesterday`.
+    static func compact(
+        _ date: Date?,
+        now: Date = Date(),
+        calendar: Calendar = .current,
+        locale: Locale = .current
+    ) -> String {
+        guard let date else { return unavailable }
+        let elapsed = now.timeIntervalSince(date)
+        // Negative elapsed time is a target clock running slightly ahead of this one, which is a
+        // skew artefact rather than a scheduled future event: it reads as current, never as a date.
+        if elapsed < 60 { return justNow }
+        if elapsed < 3600 { return "\(Int(elapsed / 60))m ago" }
+        if calendar.isDate(date, inSameDayAs: now) {
+            return time(date, calendar: calendar, locale: locale)
+        }
+        if let previousDay = calendar.date(
+            byAdding: .day,
+            value: -1,
+            to: calendar.startOfDay(for: now)
+        ), calendar.isDate(date, inSameDayAs: previousDay) {
+            return yesterday
+        }
+        return day(date, now: now, calendar: calendar, locale: locale)
+    }
+
+    /// Full localized absolute date and time, for hover detail and accessibility.
+    static func absolute(
+        _ date: Date?,
+        calendar: Calendar = .current,
+        locale: Locale = .current
+    ) -> String {
+        guard let date else { return unavailable }
+        return date.formatted(
+            Date.FormatStyle(
+                date: .complete,
+                time: .standard,
+                locale: locale,
+                calendar: calendar,
+                timeZone: calendar.timeZone
+            )
+        )
+    }
+
+    /// Spoken freshness. VoiceOver gets the absolute instant rather than the compact ladder: a
+    /// listener cannot glance back at the row to resolve `15:07` into a day.
+    static func accessibility(
+        _ date: Date?,
+        calendar: Calendar = .current,
+        locale: Locale = .current
+    ) -> String {
+        guard date != nil else { return accessibilityUnavailable }
+        return "Last activity \(absolute(date, calendar: calendar, locale: locale))"
+    }
+
+    private static func time(_ date: Date, calendar: Calendar, locale: Locale) -> String {
+        date.formatted(
+            Date.FormatStyle(
+                date: .omitted,
+                time: .shortened,
+                locale: locale,
+                calendar: calendar,
+                timeZone: calendar.timeZone
+            )
+        )
+    }
+
+    private static func day(_ date: Date, now: Date, calendar: Calendar, locale: Locale) -> String {
+        let style = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: calendar.timeZone)
+            .month(.abbreviated)
+            .day()
+        guard calendar.component(.year, from: date) == calendar.component(.year, from: now) else {
+            return date.formatted(style.year())
+        }
+        return date.formatted(style)
     }
 }
 
@@ -192,6 +493,13 @@ struct AgentMonitorPillProps: Equatable {
         let status: AgentMonitorLinkStatus
         let lastActivityAt: Date?
         let triageState: AgentMonitorTriageState
+        /// True when this exact link has activity strictly newer than the watermark the user
+        /// acknowledged.
+        ///
+        /// Deliberately a separate record from `triageState`, not a derived view of it: Done answers
+        /// “have I triaged this lane as complete?” while unread answers “has it changed since I
+        /// acknowledged it?”, and their clearing rules differ.
+        let hasUnreadActivity: Bool
         let targetRoute: AgentSessionDeepLinkRoute?
 
         init(
@@ -204,6 +512,7 @@ struct AgentMonitorPillProps: Equatable {
             status: AgentMonitorLinkStatus,
             lastActivityAt: Date? = nil,
             triageState: AgentMonitorTriageState = .active,
+            hasUnreadActivity: Bool = false,
             targetRoute: AgentSessionDeepLinkRoute? = nil
         ) {
             self.linkID = linkID
@@ -215,6 +524,7 @@ struct AgentMonitorPillProps: Equatable {
             self.status = status
             self.lastActivityAt = lastActivityAt
             self.triageState = triageState
+            self.hasUnreadActivity = hasUnreadActivity
             self.targetRoute = targetRoute
         }
 
@@ -230,17 +540,22 @@ struct AgentMonitorPillProps: Equatable {
             targetSessionID.uuidString
         }
 
-        var rowLabel: String {
-            "→ \(displayName) (\(shortID))"
+        /// Identity hover detail: the truncatable display name plus the canonical UUID the fixed
+        /// short token stands in for.
+        var identityTooltip: String {
+            "\(displayName)\n\(fullID)"
         }
 
         /// Complete secondary detail retained for tooltips and non-layout consumers.
+        ///
+        /// Carries the *absolute* timestamp rather than the compact ladder, so it needs no reference
+        /// date and stays stable for consumers that are not driven by the popover's minute tick.
         var detailLine: String {
             AgentMonitorDetailLineFormatter.line(
                 location: locationLabel,
                 provider: providerDisplayName,
                 status: status,
-                activity: AgentMonitorActivityFormatter.compact(lastActivityAt)
+                activity: AgentMonitorActivityFormatter.absolute(lastActivityAt)
             )
         }
 
@@ -254,15 +569,29 @@ struct AgentMonitorPillProps: Equatable {
             )
         }
 
-        /// Protected, event-driven status and absolute freshness line. It intentionally contains no
+        /// Protected, event-driven status and relative freshness line. It intentionally contains no
         /// unbounded workspace, worktree, or provider text.
-        var statusActivityLine: String {
+        func statusActivityLine(
+            now: Date = Date(),
+            calendar: Calendar = .current,
+            locale: Locale = .current
+        ) -> String {
             AgentMonitorDetailLineFormatter.line(
                 location: nil,
                 provider: nil,
                 status: status,
-                activity: AgentMonitorActivityFormatter.compact(lastActivityAt)
+                activity: AgentMonitorActivityFormatter.compact(
+                    lastActivityAt,
+                    now: now,
+                    calendar: calendar,
+                    locale: locale
+                )
             )
+        }
+
+        /// Absolute instant behind the compact relative text, revealed on hover.
+        var activityTooltip: String {
+            AgentMonitorActivityFormatter.absolute(lastActivityAt)
         }
 
         var activityAccessibilityLabel: String {
@@ -271,16 +600,29 @@ struct AgentMonitorPillProps: Equatable {
 
         var accessibilityDescription: String {
             let location = AgentMonitorAccessibilityLocationPhrase.clause(locationLabel)
+            let unread = hasUnreadActivity ? ", New activity" : ""
             let triage = triageState == .done ? ", Done" : ""
             return "Overseeing \(displayName)\(location), session \(fullID), "
-                + "\(status.accessibilityLabel), \(activityAccessibilityLabel)\(triage)"
+                + "\(status.accessibilityLabel), \(activityAccessibilityLabel)\(unread)\(triage)"
         }
 
-        /// VoiceOver label for this row's Unlink control.
+        /// VoiceOver labels for this row's inline controls.
         ///
-        /// Lives on the model rather than inline in the view so the wording stays under test and
-        /// cannot drift from `accessibilityDescription`; a bare "Unlink" button repeated per row is
-        /// indistinguishable in the rotor.
+        /// They live on the model rather than inline in the view so the wording stays under test and
+        /// cannot drift from `accessibilityDescription`; four visually identical controls repeated
+        /// per row are indistinguishable in the rotor without the session name.
+        var viewActionLabel: String {
+            "View \(displayName)"
+        }
+
+        var doneActionLabel: String {
+            "Done for \(displayName)"
+        }
+
+        var markSeenActionLabel: String {
+            "Mark \(displayName) activity as seen"
+        }
+
         var unlinkActionLabel: String {
             "Unlink oversight of \(displayName)"
         }
@@ -365,6 +707,16 @@ struct AgentMonitorPillProps: Equatable {
     let recentNotices: [Notice]
     /// Non-nil when Add must stay disabled, carrying the exact user-facing reason.
     let canAddReason: String?
+    /// Whether this exact observer incarnation currently has passive status notices switched on.
+    ///
+    /// Observer-level and process-memory: it covers every direct outbound link this endpoint holds,
+    /// defaults off for each new incarnation, and is cleared when the last outbound link goes away.
+    /// It is authoritative bridge state — the dashboard toggle and the overseer's tool both request a
+    /// change and then render whatever comes back, so nothing here is optimistic.
+    ///
+    /// `var` for the same reason `endpoint` and `persistence` are: the bridge stamps the settled
+    /// value onto the rows it just built, after the queue for this pass has been reconciled.
+    var passiveNoticesEnabled: Bool
     /// Process-wide durable-oversight state, overlaid by the owning window rather than published by
     /// the bridge's per-endpoint projection.
     ///
@@ -380,6 +732,7 @@ struct AgentMonitorPillProps: Equatable {
         inbound: [Inbound],
         recentNotices: [Notice],
         canAddReason: String?,
+        passiveNoticesEnabled: Bool = false,
         persistence: AgentSessionOversightPersistencePresentation = AgentSessionOversightPersistencePresentation.noDurableLayer
     ) {
         self.sessionID = sessionID
@@ -388,6 +741,7 @@ struct AgentMonitorPillProps: Equatable {
         self.inbound = inbound
         self.recentNotices = recentNotices
         self.canAddReason = canAddReason
+        self.passiveNoticesEnabled = passiveNoticesEnabled
         self.persistence = persistence
     }
 
@@ -413,6 +767,7 @@ struct AgentMonitorPillProps: Equatable {
             inbound: inbound,
             recentNotices: recentNotices,
             canAddReason: reason,
+            passiveNoticesEnabled: passiveNoticesEnabled,
             persistence: persistence
         )
     }
@@ -435,6 +790,7 @@ struct AgentMonitorPillProps: Equatable {
             inbound: inbound,
             recentNotices: recentNotices,
             canAddReason: reason,
+            passiveNoticesEnabled: passiveNoticesEnabled,
             persistence: presentation
         )
     }
@@ -727,6 +1083,40 @@ enum AgentMonitorStopOutcome: Equatable {
         guard case let .failed(message) = self else { return nil }
         return message
     }
+}
+
+/// Copy and timing for the one-slot, time-bounded recovery offered after a successful Unlink.
+///
+/// Revocation is immediate and final: Undo runs the ordinary Add transaction and creates a *fresh*
+/// link, so the copy never claims the removed grant came back.
+enum AgentMonitorUnlinkUndo {
+    /// Measured from successful Stop completion rather than from the click, so a slow durable
+    /// removal cannot silently consume the user's recovery window.
+    static let window: Duration = .seconds(8)
+
+    enum Direction: Equatable {
+        case outbound
+        case inbound
+    }
+
+    static func message(direction: Direction, displayName: String) -> String {
+        switch direction {
+        case .outbound: "Oversight of \(displayName) was unlinked."
+        case .inbound: "\(displayName) no longer oversees this session."
+        }
+    }
+
+    static func undoAccessibilityLabel(direction: Direction, displayName: String) -> String {
+        switch direction {
+        case .outbound: "Undo unlinking oversight of \(displayName)"
+        case .inbound: "Undo unlinking \(displayName) from overseeing this session"
+        }
+    }
+
+    static let undoTooltip = """
+    Creates a new oversight link between the same two sessions. Done, unread, and delivery state \
+    from the removed link do not come back.
+    """
 }
 
 /// Outcome of the popover's resolve/add flow.
