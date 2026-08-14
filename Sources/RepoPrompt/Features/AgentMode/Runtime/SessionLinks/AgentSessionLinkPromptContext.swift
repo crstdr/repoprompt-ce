@@ -138,6 +138,49 @@ struct AgentSessionLinkPromptDispatchID: Hashable, CustomStringConvertible {
     static func waitingContinuation(waitID: UUID) -> Self {
         .init("waiting.continuation", waitID.uuidString)
     }
+
+    // MARK: Auto-wake
+
+    private static let autoWakeFamily = "lane.autowake"
+
+    /// One logical auto-wake follow-up, stable across every internal transport retry of that wake.
+    ///
+    /// Keyed by the wake ID rather than by the provider attempt it ends up using, because the wake is
+    /// decided before the route is: an idle observer starts a follow-up run, a waiting one resumes a
+    /// continuation, and both are the *same* logical dispatch that must never be delivered twice. It
+    /// is substituted for the provider's own dispatch ID at the single claim seam, so every provider
+    /// family produces a claim carrying this identity without knowing what a lane update is.
+    static func autoWake(wakeID: UUID, localInputEpoch: UInt64) -> Self {
+        .init(autoWakeFamily, "\(wakeID.uuidString):\(localInputEpoch)")
+    }
+
+    /// The wake this dispatch names, or `nil` for any ordinary dispatch.
+    ///
+    /// This is what lets acceptance be decided from the *claim* rather than from whatever the session
+    /// happens to hold at the moment the provider signals: a claim minted for wake A can never be
+    /// mistaken for wake B, even if the attempt was replaced in between.
+    var autoWakeID: UUID? {
+        autoWakeComponents?.wakeID
+    }
+
+    /// The local-input epoch captured by this wake. Acceptance from an older epoch may record
+    /// provenance, but can never reclaim turn ownership after a newer local instruction.
+    var autoWakeLocalInputEpoch: UInt64? {
+        autoWakeComponents?.localInputEpoch
+    }
+
+    private var autoWakeComponents: (wakeID: UUID, localInputEpoch: UInt64)? {
+        let prefix = "\(Self.autoWakeFamily):"
+        guard rawValue.hasPrefix(prefix) else { return nil }
+        let components = rawValue.dropFirst(prefix.count).split(separator: ":", maxSplits: 1)
+        guard components.count == 2,
+              let wakeID = UUID(uuidString: String(components[0])),
+              let localInputEpoch = UInt64(components[1])
+        else {
+            return nil
+        }
+        return (wakeID, localInputEpoch)
+    }
 }
 
 // MARK: - Claim epoch
@@ -457,17 +500,22 @@ struct AgentSessionLinkPromptRenderRequest {
     /// Handed to the renderer rather than resolved by it, so the reference a fragment names and the
     /// provider context that decides when that fragment goes stale are the same value by construction.
     let toolReference: String
+    /// How much lane-update trust guidance this render owes, decided by the store from the last
+    /// revision this observer physically accepted in this provider context.
+    let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode
 
     init(
         membershipKind: AgentSessionLinkPromptSupplementKind?,
         inventory: AgentSessionLinkPromptInventory,
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?,
-        toolReference: String = MCPWindowToolName.agentSessionLink
+        toolReference: String = MCPWindowToolName.agentSessionLink,
+        laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode = .full
     ) {
         self.membershipKind = membershipKind
         self.inventory = inventory
         self.passiveNotices = passiveNotices
         self.toolReference = toolReference
+        self.laneGuidanceMode = laneGuidanceMode
     }
 }
 
@@ -535,6 +583,12 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     struct PassiveStatusComponent: Hashable {
         let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
         let receipt: AgentSessionLinkPassiveStatusNotices.Receipt
+        /// The lane-guidance revision this fragment actually rendered.
+        ///
+        /// Travels in the lane component rather than in its own store so it advances at exactly the
+        /// same physical-acceptance boundary as the queue receipt: a batch that failed, was
+        /// abandoned, or was omitted by the byte budget acknowledges neither.
+        let guidanceRevision: UInt64
     }
 
     let observerSessionID: UUID
@@ -555,6 +609,11 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     let passiveQueue: PassiveQueueFingerprint?
     /// Present only when the batch was actually rendered into `fragment`.
     let passive: PassiveStatusComponent?
+    /// The guidance mode this fragment was rendered with, or `nil` when it carried no lane batch.
+    ///
+    /// Recorded even when the byte budget dropped the batch, for the same reason `passiveQueue` is:
+    /// it is part of what decides whether a retry of the same dispatch may reuse this fragment.
+    let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode?
     let fragment: String
 
     // MARK: Membership readers
@@ -576,6 +635,49 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     var hasLinks: Bool {
         membership?.hasLinks ?? false
     }
+}
+
+// MARK: - Claim outcome
+
+/// What the store could do for one logical dispatch.
+///
+/// Three cases rather than an optional because two of them are refusals that demand opposite
+/// behaviour: `nothingOwed` says "send the text you already had", `requiredLaneBatchUnavailable`
+/// says "make no provider call at all". A dispatch whose entire justification is the lane batch has
+/// nothing to say without it, and an optional cannot express that difference.
+enum AgentSessionLinkPromptClaimOutcome: Equatable {
+    case claimed(AgentSessionLinkOutboundPromptClaim)
+    /// Neither component is owed. The caller dispatches its own undecorated text.
+    case nothingOwed
+    /// The dispatch required a lane batch the store could not hand it — revoked, already
+    /// acknowledged, revision-mismatched, or dropped by the shared byte budget.
+    ///
+    /// Callers must abort before their physical provider call: no call, no transcript row, no error.
+    /// The batch stays owed to a later dispatch.
+    case requiredLaneBatchUnavailable
+
+    var claim: AgentSessionLinkOutboundPromptClaim? {
+        guard case let .claimed(claim) = self else { return nil }
+        return claim
+    }
+
+    /// Whether the caller must not make a physical provider call.
+    var mustAbortDispatch: Bool {
+        self == .requiredLaneBatchUnavailable
+    }
+}
+
+/// One composed provider-bound string plus what the caller owes and may do with it.
+///
+/// A named type rather than a tuple so `mustAbortDispatch` cannot be dropped by a call site that only
+/// destructures the two fields it already knew about: adding a third tuple element would compile
+/// everywhere it was ignored, which is exactly the failure this exists to prevent.
+struct AgentSessionLinkDecoratedProviderText {
+    let text: String
+    /// Acknowledge at this dispatch's own physical-acceptance signal, and only then.
+    let claim: AgentSessionLinkOutboundPromptClaim?
+    /// The dispatch required a lane batch it could not be given. Make no physical provider call.
+    let mustAbortDispatch: Bool
 }
 
 // MARK: - Claim store
@@ -612,6 +714,14 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         var pendingOrder: [AgentSessionLinkPromptDispatchID] = []
         var lastAcceptedRevision: UInt64?
         var lastAcceptedHadLinks = false
+        /// Newest lane-guidance revision this observer physically accepted in the current epoch.
+        ///
+        /// Kept here rather than in a second acknowledgement store so it is reset by exactly the
+        /// transitions that already invalidate acknowledged context — incarnation change, provider
+        /// change, `forget`, `retainOnly`, `invalidateAcknowledgedContext` — and by nothing else. A
+        /// temporary eligibility flip on the same resumable provider context deliberately keeps it:
+        /// the model still holds the wording.
+        var lastAcceptedLaneGuidanceRevision: UInt64?
         /// Newest revision whose link-naming fragment was handed to a dispatch without ever being
         /// acknowledged.
         ///
@@ -685,6 +795,10 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             guard previous.hasSameProviderIncarnation(as: identity) else {
                 lastAcceptedRevision = nil
                 lastAcceptedHadLinks = false
+                // The replacement context never saw the guidance, so it is owed in full again. The
+                // bridge-owned queue receipt is untouched: what the model was *told* and what the
+                // queue considers *delivered* are independent facts.
+                lastAcceptedLaneGuidanceRevision = nil
                 // Cleared on exactly the condition that clears the acknowledgement, and for the same
                 // reason: a new incarnation is a new agent, so nothing was ever delivered to *it* and
                 // it has no oversight context to close out.
@@ -779,11 +893,15 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         let membershipRevision: UInt64?
         let membershipKind: AgentSessionLinkPromptSupplementKind?
         let passiveQueue: AgentSessionLinkOutboundPromptClaim.PassiveQueueFingerprint?
+        /// Participates so a cached fragment rendered with the reminder cannot be reused after the
+        /// guidance is re-owed in full, and vice versa.
+        let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode?
 
         init(
             membershipKind: AgentSessionLinkPromptSupplementKind?,
             inventory: AgentSessionLinkPromptInventory,
-            passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?
+            passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?,
+            laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode?
         ) {
             membershipRevision = membershipKind == nil ? nil : inventory.linkSetRevision
             self.membershipKind = membershipKind
@@ -793,12 +911,14 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                     queueRevision: $0.queueRevision
                 )
             }
+            self.laneGuidanceMode = laneGuidanceMode
         }
 
         init(_ claim: AgentSessionLinkOutboundPromptClaim) {
             membershipRevision = claim.membership?.linkSetRevision
             membershipKind = claim.membership?.kind
             passiveQueue = claim.passiveQueue
+            laneGuidanceMode = claim.laneGuidanceMode
         }
     }
 
@@ -815,19 +935,37 @@ final class AgentSessionLinkOutboundPromptClaimStore {
     ///   - passiveNotices: the observer's latest published passive queue, if any. Fenced here rather
     ///     than at the call site so every condition that may join a status batch to a dispatch is one
     ///     truth table.
-    /// - Returns: `nil` when neither component is owed. Callers must send undecorated text in that
-    ///   case.
-    func claim(
+    /// - Returns: `.nothingOwed` when neither component is owed — callers send undecorated text —
+    ///   or `.requiredLaneBatchUnavailable` when an auto-wake dispatch could not be given its lane
+    ///   batch, which callers must never turn into a physical provider call.
+    ///
+    /// An auto-wake dispatch — identified by `dispatchID.autoWakeID`, not by a caller-supplied flag —
+    /// *requires* the lane batch, because that content is the entire justification for the turn. The
+    /// requirement is therefore a property of the dispatch identity itself and travels with the claim
+    /// through every retry and every provider family.
+    ///
+    /// The two refusals are separate cases rather than one `nil` precisely because they demand
+    /// opposite behaviour from the caller: one means "send the text you already had", the other means
+    /// "send nothing at all". Collapsing them is what let a budget omission or a queue race start an
+    /// empty system-only turn.
+    func claimOutcome(
         dispatchID: AgentSessionLinkPromptDispatchID,
         epoch: AgentSessionLinkPromptEpoch,
         inventory: AgentSessionLinkPromptInventory,
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
-    ) -> AgentSessionLinkOutboundPromptClaim? {
+    ) -> AgentSessionLinkPromptClaimOutcome {
+        let requiresLaneBatch = dispatchID.autoWakeID != nil
+        // Every refusal below means "send undecorated" for an ordinary dispatch and "do not dispatch"
+        // for a wake, so the mapping is decided once here instead of being restated — and possibly
+        // forgotten — at each exit.
+        let refused: AgentSessionLinkPromptClaimOutcome = requiresLaneBatch
+            ? .requiredLaneBatchUnavailable
+            : .nothingOwed
         let observerSessionID = inventory.observerSessionID
         // Fail closed on a mismatched pairing rather than filing one incarnation's claim under
         // another session's state.
-        guard epoch.endpoint.sessionID == observerSessionID else { return nil }
+        guard epoch.endpoint.sessionID == observerSessionID else { return refused }
         var state = states[observerSessionID] ?? ObserverState()
         defer { states[observerSessionID] = state }
 
@@ -858,17 +996,29 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             // Nothing owed: drop any claim still parked against this dispatch so a superseded
             // fragment can never be picked up by a later attempt.
             state.removePending(dispatchID)
-            return nil
+            return refused
+        }
+        guard !requiresLaneBatch || passiveBatch != nil else {
+            // The lane content a wake exists to deliver was revoked, already acknowledged, or fenced
+            // out between scheduling and dispatch. Park nothing and record nothing: any still-valid
+            // membership stays owed to a natural future turn.
+            state.removePending(dispatchID)
+            return .requiredLaneBatchUnavailable
         }
 
+        let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode? = passiveBatch.map { _ in
+            state.lastAcceptedLaneGuidanceRevision == AgentSessionLinkPrompts
+                .currentLaneGuidanceRevision ? .reminder : .full
+        }
         let fingerprint = ClaimFingerprint(
             membershipKind: membershipKind,
             inventory: inventory,
-            passiveNotices: passiveBatch
+            passiveNotices: passiveBatch,
+            laneGuidanceMode: laneGuidanceMode
         )
         if let existing = state.pending[dispatchID], ClaimFingerprint(existing) == fingerprint {
             state.recordPossibleDelivery(of: existing)
-            return existing
+            return .claimed(existing)
         }
 
         // One rendered result per fingerprint, shared by reference across every dispatch that owes
@@ -882,10 +1032,18 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                 membershipKind: membershipKind,
                 inventory: inventory,
                 passiveNotices: passiveBatch,
-                toolReference: epoch.toolReference
+                toolReference: epoch.toolReference,
+                laneGuidanceMode: laneGuidanceMode ?? .full
             ))
             state.renderedFingerprint = fingerprint
             state.renderedResult = rendered
+        }
+        guard !requiresLaneBatch || rendered.passiveBatch != nil else {
+            // Membership consumed the shared byte budget. Starting a wake on a membership-only turn
+            // would spend the observer's one automatic follow-up on content it did not need, so abort
+            // and leave the lane batch owed.
+            state.removePending(dispatchID)
+            return .requiredLaneBatchUnavailable
         }
 
         // A batch the renderer could not fit leaves no receipt, so acceptance acknowledges nothing
@@ -901,7 +1059,8 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                         AgentSessionLinkPassiveStatusNotices.DeliveredStatus.init
                     ),
                     overflowProducedThrough: renderedPassive.overflowProducedThrough
-                )
+                ),
+                guidanceRevision: AgentSessionLinkPrompts.currentLaneGuidanceRevision
             )
         }
 
@@ -918,13 +1077,35 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             },
             passiveQueue: fingerprint.passiveQueue,
             passive: passiveComponent,
+            laneGuidanceMode: laneGuidanceMode,
             fragment: rendered.fragment
         )
         state.setPending(claim)
         // Recorded at hand-off, not at dispatch: the store never learns whether the caller's transport
         // succeeded, so this is the only point where the possibility is knowable at all.
         state.recordPossibleDelivery(of: claim)
-        return claim
+        return .claimed(claim)
+    }
+
+    /// Optional-returning form for the dispatches that cannot fail closed.
+    ///
+    /// Every ordinary provider dispatch treats "nothing owed" and "could not render" identically, so
+    /// keeping this wrapper stops the typed outcome from leaking into call sites that have no
+    /// decision to make with it. A wake never uses it: its refusal is exactly the case this erases.
+    func claim(
+        dispatchID: AgentSessionLinkPromptDispatchID,
+        epoch: AgentSessionLinkPromptEpoch,
+        inventory: AgentSessionLinkPromptInventory,
+        passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
+        render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
+    ) -> AgentSessionLinkOutboundPromptClaim? {
+        claimOutcome(
+            dispatchID: dispatchID,
+            epoch: epoch,
+            inventory: inventory,
+            passiveNotices: passiveNotices,
+            render: render
+        ).claim
     }
 
     /// The passive batch, if any, that may ride along with this exact dispatch.
@@ -994,8 +1175,19 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         guard var state = states[claim.observerSessionID] else { return }
         guard state.epochToken == claim.epochToken else { return }
         state.removePending(claim.dispatchID)
-        // A passive-only claim settles nothing here. Its receipt belongs to the bridge-owned queue,
-        // which fences it on its own epoch and revision, so this store neither applies nor blocks it.
+        // The guidance the model was physically handed. Monotone, and advanced only for a batch that
+        // actually reached the provider, so a failed or budget-omitted render leaves the full block
+        // owed. Two claims rendered before the first acceptance may both carry it — harmless
+        // duplication, deliberately preferred over a lease.
+        if let laneRevision = claim.passive?.guidanceRevision {
+            state.lastAcceptedLaneGuidanceRevision = max(
+                state.lastAcceptedLaneGuidanceRevision ?? laneRevision,
+                laneRevision
+            )
+        }
+        // A passive-only claim settles nothing further here. Its receipt belongs to the bridge-owned
+        // queue, which fences it on its own epoch and revision, so this store neither applies nor
+        // blocks it.
         // That separation is what keeps a stale passive receipt from suppressing a valid membership
         // acknowledgement and vice versa.
         guard let membership = claim.membership else {
@@ -1059,16 +1251,23 @@ final class AgentSessionLinkOutboundPromptClaimStore {
     /// the inventory has nothing to close out, so a later empty revision must stay quiet rather than
     /// announce the end of oversight the model never heard about.
     ///
+    /// The accepted lane-guidance revision clears with it, and for the same reason: the rebuilt
+    /// context never saw the trust wording, so the next lane batch owes it in full.
+    ///
     /// Pending claims are deliberately left alone. They belong to dispatches that are still live and
     /// will be acknowledged or abandoned on their own terms.
     func invalidateAcknowledgedContext(observerSessionID: UUID) {
         guard var state = states[observerSessionID] else { return }
-        guard state.lastAcceptedRevision != nil || state.possiblyDeliveredLinkRevision != nil else {
+        guard state.lastAcceptedRevision != nil
+            || state.possiblyDeliveredLinkRevision != nil
+            || state.lastAcceptedLaneGuidanceRevision != nil
+        else {
             return
         }
         state.lastAcceptedRevision = nil
         state.lastAcceptedHadLinks = false
         state.possiblyDeliveredLinkRevision = nil
+        state.lastAcceptedLaneGuidanceRevision = nil
         states[observerSessionID] = state
     }
 
@@ -1095,6 +1294,10 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         observerSessionID: UUID
     ) -> AgentSessionLinkOutboundPromptClaim? {
         states[observerSessionID]?.pending[dispatchID]
+    }
+
+    func test_lastAcceptedLaneGuidanceRevision(observerSessionID: UUID) -> UInt64? {
+        states[observerSessionID]?.lastAcceptedLaneGuidanceRevision
     }
 
     func test_lastAcceptedRevision(observerSessionID: UUID) -> UInt64? {

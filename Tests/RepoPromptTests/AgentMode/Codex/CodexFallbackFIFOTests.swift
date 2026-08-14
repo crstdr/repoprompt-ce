@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
@@ -857,6 +858,133 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertNotEqual(session.activeRunAttemptID, originalAttemptID)
         XCTAssertEqual(inFlight.attachmentReservationID, reservationID)
         XCTAssertEqual(inFlight.images, [image])
+    }
+
+    func testQueuedAutoWakeFallbackRefusalSettlesReservationWithoutProviderCall() async throws {
+        let controller = FallbackFIFOController(
+            steerResults: [
+                .failure(CodexTurnSteerError.activeTurnNotSteerable(
+                    turnKind: "compact",
+                    failure: requestFailure(message: "cannot steer a compact turn")
+                ))
+            ]
+        )
+        let (viewModel, session) = makeRunningSession(controller: controller)
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel,
+            tabID: session.tabID,
+            name: "Codex queued auto-wake refusal"
+        )
+        _ = workspaceManager
+        session.hasLoadedPersistedState = true
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: session.tabID)
+        let targetSessionID = UUID()
+        let inventory = AgentSessionLinkPromptInventory(
+            observerSessionID: sessionID,
+            linkSetRevision: 1,
+            items: [
+                AgentSessionLinkPromptInventoryItem(
+                    targetSessionID: targetSessionID,
+                    displayName: "Build API",
+                    capabilityNames: ["poll", "read", "send_when_idle", "wait"]
+                )
+            ]
+        )
+        viewModel.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
+        let lane = AgentSessionLinkPassiveStatusNotices.Snapshot(
+            observerEndpoint: endpoint,
+            queueEpoch: UUID(),
+            queueRevision: 1,
+            linkSetRevision: 1,
+            isEnabled: true,
+            isDeliverable: true,
+            entries: [
+                AgentSessionLinkPassiveStatusNotices.PendingEntry(
+                    reference: DomainAgentSessionLinkReference(linkID: UUID(), generation: 1),
+                    targetEndpoint: DomainAgentSessionLinkEndpointIdentity(
+                        windowID: 2,
+                        workspaceID: UUID(),
+                        tabID: UUID(),
+                        sessionID: targetSessionID,
+                        persistentBindingGeneration: UUID(),
+                        bindingTransitionGeneration: 1
+                    ),
+                    targetSessionID: targetSessionID,
+                    displayName: "Build API",
+                    fromStatus: .running,
+                    toStatus: .idle,
+                    observedAt: Date(timeIntervalSince1970: 0),
+                    idleForSend: true,
+                    latestVisibleAssistantPreview: "Done.",
+                    changeSequence: 1
+                )
+            ],
+            unacknowledgedOverflowCount: 0,
+            overflowProduced: 0
+        )
+        viewModel.agentSessionLinkPublishPassiveStatusNotices(lane, to: endpoint)
+        let wakeID = UUID()
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "deliver lane update",
+            attachments: []
+        )
+        guard case let .queuedFallback(queueID, _) = outcome else {
+            return XCTFail("Expected a queued fallback, got \(outcome)")
+        }
+        XCTAssertEqual(session.codexFallbackQueue.count, 1)
+        session.pendingOversightAutoWake = AgentSessionLinkAutoWakeAttempt(
+            wakeID: wakeID,
+            observerEndpoint: endpoint,
+            queueEpoch: lane.queueEpoch,
+            localInputEpoch: session.agentSessionLinkLocalInputEpoch,
+            queueRevision: lane.queueRevision,
+            wakeFingerprint: lane.wakeEligibilityFingerprint,
+            attemptedFingerprint: nil,
+            physicalOutcome: .notAttempted,
+            phase: .preparingDispatch,
+            task: nil
+        )
+        let itemCount = session.items.count
+
+        // The lane stays queued, but its prompt inventory is fenced before the queued head reaches
+        // transport. The fallback must report a definite not-attempted outcome to the wake owner.
+        viewModel.agentSessionLinkPromptInventoryBySessionID.removeValue(forKey: sessionID)
+        session.runState = .completed
+        let dispatched = await viewModel.test_codexCoordinator.test_dispatchCodexFallbackHead(
+            session: session,
+            expectedQueueID: queueID,
+            beginsSuccessorAttempt: true
+        )
+        XCTAssertTrue(dispatched)
+        XCTAssertNil(session.pendingOversightAutoWake)
+
+        XCTAssertEqual(controller.startCount, 0)
+        XCTAssertEqual(session.items.count, itemCount, "quiet pre-call refusal writes no provider error or provenance row")
+        XCTAssertNil(session.suppressedOversightWakeFingerprint)
+        XCTAssertEqual(session.agentSessionLinkTurnOrigin, .localUser)
+        XCTAssertNotNil(
+            viewModel.agentSessionLinkPassiveNoticesBySessionID[sessionID],
+            "the refused lane batch remains owed"
+        )
+
+        XCTAssertFalse(session.runState.isActive)
+        XCTAssertFalse(session.terminalCommitInProgress)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        XCTAssertFalse(session.isComposerSubmissionInFlight)
+        XCTAssertFalse(session.isPreparingInitialWorktree)
+        XCTAssertFalse(session.isChangingExecutionLocation)
+        XCTAssertTrue(session.pendingInstructions.isEmpty)
+        XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+        let readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session,
+            endpointMatchesGrant: true,
+            isClosing: false,
+            observerTurnOrigin: session.agentSessionLinkTurnOrigin
+        )
+        XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness), .ready)
     }
 
     func testDurablyQueuedMCPFallbackInterruptsWaiterOnlyAfterQueueAck() async throws {

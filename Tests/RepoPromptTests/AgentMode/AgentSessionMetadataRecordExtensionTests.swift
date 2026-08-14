@@ -3,6 +3,95 @@ import Foundation
 import XCTest
 
 final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
+    // MARK: - Auto-wake setting
+
+    /// Every payload written before the setting existed decodes as off.
+    ///
+    /// The default matters more than usual here: the setting is the only thing standing between an
+    /// observer and an automatic turn, so a decode that guessed `true` would opt every restored
+    /// session into behaviour its user never asked for.
+    func testAutoWakeDefaultsOffForRecordsAndSessionsWrittenBeforeItExisted() throws {
+        let uuid = UUID()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let recordJSON = """
+        {
+            "id": "\(uuid.uuidString.lowercased())",
+            "filename": "AgentSession-test.json",
+            "name": "Test Session",
+            "savedAt": \(now.timeIntervalSince1970),
+            "itemCount": 5,
+            "hasUnknownConversationContent": false,
+            "autoEditEnabled": true,
+            "lastIndexedAt": \(now.timeIntervalSince1970)
+        }
+        """
+        let record = try JSONDecoder().decode(
+            AgentSessionMetadataRecord.self,
+            from: XCTUnwrap(recordJSON.data(using: .utf8))
+        )
+        XCTAssertFalse(record.autoWakeOnOversightUpdates)
+        // It is session configuration, not a transcript-derived field, so toggling it must not move
+        // the completeness signal that decides whether a record needs on-demand enrichment.
+        var toggled = record
+        toggled.autoWakeOnOversightUpdates = true
+        XCTAssertEqual(toggled.lacksTranscriptDerivedFields, record.lacksTranscriptDerivedFields)
+        // The projection into the sidebar/restore entry carries it, so a cold seed cannot resurrect a
+        // different value than the record holds.
+        XCTAssertEqual(record.sidebarEntry(tabID: UUID())?.autoWakeOnOversightUpdates, false)
+    }
+
+    /// Round-trip, plus the version bumps that make an older loader refuse rather than misread.
+    func testAutoWakeRoundTripsAndCarriesTheBumpedVersions() throws {
+        var session = AgentSession(id: UUID(), name: "Observer", savedAt: Date())
+        XCTAssertFalse(session.autoWakeOnOversightUpdates, "new sessions default off")
+        XCTAssertFalse(session.agentSessionLinkRequiresLocalUserInstruction)
+        session.autoWakeOnOversightUpdates = true
+        session.agentSessionLinkRequiresLocalUserInstruction = true
+
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(AgentSession.self, from: data)
+        XCTAssertTrue(decoded.autoWakeOnOversightUpdates)
+        XCTAssertTrue(
+            decoded.agentSessionLinkRequiresLocalUserInstruction,
+            "the anti-chain fence must survive relaunch even though its process-local wake ID cannot"
+        )
+        XCTAssertEqual(AgentSession.currentSerializationVersion, 8)
+        XCTAssertEqual(AgentSessionMetadataIndex.currentSchemaVersion, 6)
+
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: URL(fileURLWithPath: "/tmp/AgentSession-observer.json"),
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+        XCTAssertTrue(record.autoWakeOnOversightUpdates)
+        XCTAssertEqual(record.sidebarEntry(tabID: UUID())?.autoWakeOnOversightUpdates, true)
+    }
+
+    @MainActor
+    func testSavedAutomaticFenceHydratesAsRestoredAutomaticAndBlocksAnotherWake() throws {
+        var saved = AgentSession(id: UUID(), name: "Observer", savedAt: Date())
+        saved.autoWakeOnOversightUpdates = true
+        saved.agentSessionLinkRequiresLocalUserInstruction = true
+        let decoded = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(saved))
+
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let live = viewModel.session(for: UUID())
+        viewModel.restoreAgentSessionLinkState(from: decoded, to: live)
+
+        XCTAssertTrue(live.autoWakeOnOversightUpdates)
+        XCTAssertEqual(live.agentSessionLinkTurnOrigin, .restoredAutomatic)
+        XCTAssertTrue(live.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction)
+    }
+
     // MARK: - Codable Backward Compatibility
 
     func testDecodingMissingKeyPathsAndDurationFields() throws {

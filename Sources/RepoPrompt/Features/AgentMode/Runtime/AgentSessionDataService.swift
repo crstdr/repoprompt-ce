@@ -185,6 +185,12 @@ actor AgentSessionDataService {
         let providerSessionID: String?
         let providerCleanupHandle: ProviderConversationCleanupHandle?
         let autoEditEnabled: Bool
+        /// Optional because synthesized `Decodable` ignores property defaults: a pre-version-8 file
+        /// carries no key at all, and a non-optional would fail the whole header decode.
+        let autoWakeOnOversightUpdates: Bool?
+        /// Optional for the same reason, and read on the same restore path: the durable half of the
+        /// anti-chain fence has to survive the header-only cold load, not just a full hydration.
+        let agentSessionLinkRequiresLocalUserInstruction: Bool?
         let codexConversationID: String?
         let codexRolloutPath: String?
         let codexModel: String?
@@ -1118,6 +1124,9 @@ actor AgentSessionDataService {
                 providerSessionID: header.providerSessionID,
                 providerCleanupHandle: header.providerCleanupHandle,
                 autoEditEnabled: header.autoEditEnabled,
+                autoWakeOnOversightUpdates: header.autoWakeOnOversightUpdates ?? false,
+                agentSessionLinkRequiresLocalUserInstruction: header
+                    .agentSessionLinkRequiresLocalUserInstruction ?? false,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
                 codexModel: header.codexModel,

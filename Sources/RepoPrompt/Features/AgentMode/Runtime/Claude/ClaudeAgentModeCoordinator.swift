@@ -73,12 +73,24 @@ final class ClaudeAgentModeCoordinator {
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Void
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
-        let decorateAgentSessionLinkProviderText: @MainActor (
+        let decorateAgentSessionLinkPrompt: @MainActor (
             _ text: String,
             _ session: AgentTabSession,
             _ dispatchID: AgentSessionLinkPromptDispatchID
-        ) -> (text: String, claim: AgentSessionLinkOutboundPromptClaim?)
-        let acceptAgentSessionLinkPrompt: @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
+        ) -> AgentSessionLinkDecoratedProviderText
+        let acquireAgentSessionLinkPhysicalDispatch: @MainActor (
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> Bool
+        let recordAgentSessionLinkPhysicalDispatchNotAttempted: @MainActor (
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> Void
+        let recordAgentSessionLinkPhysicalDispatchFailure: @MainActor (
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> Void
+        let acceptAgentSessionLinkPromptClaim: @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
 
         static var noOp: Self {
             Self(
@@ -87,8 +99,13 @@ final class ClaudeAgentModeCoordinator {
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
                 prependPendingHandoff: { text, _ in text },
-                decorateAgentSessionLinkProviderText: { text, _, _ in (text, nil) },
-                acceptAgentSessionLinkPrompt: { _ in }
+                decorateAgentSessionLinkPrompt: { text, _, _ in
+                    .init(text: text, claim: nil, mustAbortDispatch: false)
+                },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
+                acceptAgentSessionLinkPromptClaim: { _ in }
             )
         }
     }
@@ -1042,11 +1059,25 @@ final class ClaudeAgentModeCoordinator {
                 // Applied after handoff composition and before delivery-mode packaging, so the
                 // oversight supplement remains the final RepoPrompt envelope in the user-message
                 // channel regardless of native-system or XML instruction delivery.
-                let monitoring = hostCapabilities.decorateAgentSessionLinkProviderText(
+                let monitoring = hostCapabilities.decorateAgentSessionLinkPrompt(
                     outboundText,
                     session,
                     promptDispatchID
                 )
+                // A lane-update dispatch has no base user instruction. If its required batch was
+                // revoked, acknowledged, revision-fenced, or omitted by the shared budget, stop before
+                // `sendUserMessage`; `.superseded` is the quiet no-provider-call outcome.
+                guard !monitoring.mustAbortDispatch else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
+                }
+                guard hostCapabilities.acquireAgentSessionLinkPhysicalDispatch(
+                    session,
+                    promptDispatchID
+                ) else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
+                }
                 let instructions = agentModeInstructionInjection(for: session)
                 let providerBoundText = providerBoundUserMessage(
                     monitoring.text,
@@ -1055,7 +1086,7 @@ final class ClaudeAgentModeCoordinator {
                 let turnID = try await controller.sendUserMessage(providerBoundText)
                 // The returned provider turn ID is the acceptance signal. Acknowledge before the
                 // currency guard: even a locally superseded turn delivered this supplement.
-                hostCapabilities.acceptAgentSessionLinkPrompt(monitoring.claim)
+                hostCapabilities.acceptAgentSessionLinkPromptClaim(monitoring.claim)
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {
@@ -1067,6 +1098,7 @@ final class ClaudeAgentModeCoordinator {
                 session.claudeExpectedTurnIDs.insert(turnID)
                 return .sent
             } catch {
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchFailure(session, promptDispatchID)
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {

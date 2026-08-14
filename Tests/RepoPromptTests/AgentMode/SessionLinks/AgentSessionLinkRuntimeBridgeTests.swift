@@ -1440,34 +1440,27 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         snapshot?.entries.map { "\($0.fromStatus.rawValue)->\($0.toStatus.rawValue)" } ?? []
     }
 
-    @discardableResult
-    private func setPassive(
-        _ fixture: Fixture,
-        _ enabled: Bool,
-        observer: AgentSessionLinkEndpointCandidate? = nil
-    ) async -> AgentMonitorPassiveNoticeOutcome {
-        let outcome = await fixture.bridge.setPassiveMonitorNoticesEnabled(
-            enabled,
-            observerEndpoint: (observer ?? fixture.observer).domainEndpoint
-        )
+    /// Collection is an always-on property of a live, eligible direct link, so there is nothing to
+    /// switch on: settling the authoritative pass is the whole setup.
+    private func settlePassive(_ fixture: Fixture) async {
         await fixture.bridge.test_settleMonitorLocationRefresh()
-        return outcome
     }
 
-    func testPassiveEnableBaselinesSilentlyAndOnlyTheAuthoritativePassSamplesTransitions() async throws {
+    func testFirstDirectLinkBaselinesSilentlyAndOnlyTheAuthoritativePassSamplesTransitions() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        await settlePassive(fixture)
 
-        let switchedOn = await setPassive(fixture, true)
-        XCTAssertEqual(switchedOn, .changed(enabled: true, activeLinkCount: 1))
+        // The observer never asked for this and the dashboard switch is a different setting entirely,
+        // so it stays off while collection runs.
         XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.passiveNoticesEnabled,
-            true
+            fixture.host.publishedProps[fixture.observer.sessionID]?.autoWakeOnUpdatesEnabled,
+            false
         )
         let baseline = try XCTUnwrap(passiveSnapshot(fixture))
         XCTAssertTrue(baseline.isEnabled)
         XCTAssertTrue(baseline.isDeliverable)
-        XCTAssertTrue(baseline.entries.isEmpty, "switching on is not a claim that past work is news")
+        XCTAssertTrue(baseline.entries.isEmpty, "the first link is not a claim that past work is news")
 
         // Ordinary Idle -> Running churn is never narrated.
         await publishTargetActivity(fixture, status: .running, activity: 200)
@@ -1510,47 +1503,18 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         // The next authoritative pass observes the same change from the *unadvanced* baseline, which
         // is what proves the repaint left the reducer's state alone rather than merely staying quiet.
+        // First-to-final coalescing then reports the whole still-pending interval, so the surviving
+        // entry opens at `running` — where the interval began — rather than at the intermediate idle.
         await publishTargetActivity(fixture, status: .awaitingUser, activity: 400)
-        XCTAssertEqual(passiveTransitions(passiveSnapshot(fixture)), ["idle->waiting"])
+        XCTAssertEqual(passiveTransitions(passiveSnapshot(fixture)), ["running->waiting"])
     }
 
-    func testPassiveEnableRequiresALinkedLiveObserverWhileDisableStaysAvailable() async throws {
+    /// An observer with no direct outbound link publishes no queue at all, so an unrelated endpoint
+    /// cannot be handed one by the always-on pass.
+    func testAnObserverWithNoDirectLinkGetsNoQueue() async {
         let fixture = makeFixture()
-
-        // Nothing to observe yet, and an endpoint that is not live at all.
-        let unlinked = await setPassive(fixture, true)
-        XCTAssertNil(unlinked.enabled)
-        XCTAssertNotNil(unlinked.failureMessage)
-        let ghost = await setPassive(fixture, true, observer: makeCandidate(windowID: 9))
-        XCTAssertNotNil(ghost.failureMessage)
+        await settlePassive(fixture)
         XCTAssertTrue(fixture.host.publishedPassiveNoticesByEndpoint.isEmpty)
-
-        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
-        let switchedOn = await setPassive(fixture, true)
-        XCTAssertEqual(switchedOn, .changed(enabled: true, activeLinkCount: 1))
-        let repeatedOn = await setPassive(fixture, true)
-        XCTAssertEqual(repeatedOn, .alreadyInRequestedState(enabled: true, activeLinkCount: 1))
-
-        await publishTargetActivity(fixture, status: .running, activity: 200)
-        await publishTargetActivity(fixture, status: .idle, activity: 300)
-        XCTAssertEqual(passiveTransitions(passiveSnapshot(fixture)), ["running->idle"])
-
-        // Disabling drops the backlog at once and changes no link authority: turning off narration is
-        // not unlinking.
-        let switchedOff = await setPassive(fixture, false)
-        XCTAssertEqual(switchedOff, .changed(enabled: false, activeLinkCount: 1))
-        let disabled = try XCTUnwrap(passiveSnapshot(fixture))
-        XCTAssertFalse(disabled.isEnabled)
-        XCTAssertTrue(disabled.entries.isEmpty)
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.passiveNoticesEnabled,
-            false
-        )
-        XCTAssertEqual(outboundRow(fixture)?.targetSessionID, fixture.target.sessionID)
-        let stillLinked = await fixture.authority.snapshot().activeLinkCount
-        XCTAssertEqual(stillLinked, 1)
-        let repeatedOff = await setPassive(fixture, false)
-        XCTAssertEqual(repeatedOff, .alreadyInRequestedState(enabled: false, activeLinkCount: 1))
     }
 
     func testPassiveQueueFollowsMembershipAndClearsWhenTheLastLinkGoesAway() async {
@@ -1566,8 +1530,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
               let firstReference = await linkReference(fixture)
         else { return XCTFail("missing active links") }
 
-        let switchedOn = await setPassive(fixture, true)
-        XCTAssertEqual(switchedOn, .changed(enabled: true, activeLinkCount: 2))
+        await settlePassive(fixture)
         for target in [fixture.target, secondTarget] {
             await publishActivity(fixture, for: target, status: .running, activity: 200)
             await publishActivity(fixture, for: target, status: .idle, activity: 300)
@@ -1596,8 +1559,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fixture.host.publishedPromptInventories[fixture.observer.sessionID]?.linkSetRevision
         )
 
-        // Losing the last link clears the preference itself, so no enabled state can survive hidden
-        // and start narrating again when a later link is added.
+        // Losing the last link publishes one terminal empty snapshot and drops the reducer, so no
+        // backlog can survive hidden and start narrating again when a later link is added.
         let stoppedFirst = await fixture.bridge.stopMonitorLink(
             observerSessionID: fixture.observer.sessionID,
             targetSessionID: fixture.target.sessionID,
@@ -1609,27 +1572,37 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(passiveSnapshot(fixture)?.isEnabled, false)
         XCTAssertEqual(passiveSnapshot(fixture)?.entries.isEmpty, true)
         XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.passiveNoticesEnabled,
+            fixture.host.publishedProps[fixture.observer.sessionID]?.autoWakeOnUpdatesEnabled,
             false
         )
 
+        // Re-adding a link restarts collection automatically, on a *fresh* queue epoch: the new
+        // relationship baselines silently and then narrates its own changes rather than resuming the
+        // retired queue's history.
+        let retiredEpoch = passiveSnapshot(fixture)?.queueEpoch
         guard case .added = await addLink(fixture) else { return XCTFail("re-add failed") }
         await fixture.bridge.test_settleMonitorLocationRefresh()
-        XCTAssertEqual(passiveSnapshot(fixture)?.isEnabled, false)
+        XCTAssertEqual(passiveSnapshot(fixture)?.isEnabled, true)
+        XCTAssertNotEqual(passiveSnapshot(fixture)?.queueEpoch, retiredEpoch)
+        XCTAssertEqual(passiveTransitions(passiveSnapshot(fixture)), [])
         XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.passiveNoticesEnabled,
-            false
+            fixture.host.publishedProps[fixture.observer.sessionID]?.autoWakeOnUpdatesEnabled,
+            false,
+            "the persisted setting is untouched by link churn"
         )
         await publishTargetActivity(fixture, status: .running, activity: 400)
         await publishTargetActivity(fixture, status: .idle, activity: 500)
-        XCTAssertEqual(passiveTransitions(passiveSnapshot(fixture)), [])
+        XCTAssertEqual(
+            passiveTransitions(passiveSnapshot(fixture)),
+            ["running->idle"],
+            "the fresh relationship collects from its own baseline"
+        )
     }
 
     func testPassiveReceiptAppliesOncePerQueueRevisionAndRepublishesImmediately() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
-        let switchedOn = await setPassive(fixture, true)
-        XCTAssertEqual(switchedOn, .changed(enabled: true, activeLinkCount: 1))
+        await settlePassive(fixture)
         await publishTargetActivity(fixture, status: .running, activity: 200)
         await publishTargetActivity(fixture, status: .idle, activity: 300)
 
@@ -1675,48 +1648,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(passiveTransitions(passiveSnapshot(fixture)), ["idle->waiting"])
     }
 
-    /// Regression: enabling reads membership across an actor hop, so a Stop can remove the observer's
-    /// last link while the mutation is suspended. The enable must not settle as a preference the
-    /// dashboard shows as on, and must not survive to be resumed by a later re-add.
-    func testEnableThatRacesTheLastLinkRemovalCannotLeaveAHiddenPreference() async {
-        let fixture = makeFixture()
-        guard case .added = await addLink(fixture),
-              let reference = await linkReference(fixture)
-        else { return XCTFail("missing active link") }
-
-        fixture.bridge.test_duringPassiveNoticePreferenceChange = { [weak bridge = fixture.bridge] in
-            guard let bridge else { return }
-            // Once: the repair pass this seam exists to prove must not itself be interfered with.
-            bridge.test_duringPassiveNoticePreferenceChange = nil
-            let stopped = await bridge.stopMonitorLink(
-                observerSessionID: fixture.observer.sessionID,
-                targetSessionID: fixture.target.sessionID,
-                linkID: reference.linkID,
-                generation: reference.generation
-            )
-            XCTAssertEqual(stopped, .stopped)
-        }
-
-        let raced = await setPassive(fixture, true)
-        XCTAssertNil(raced.enabled, "an enable decided against membership that is already gone")
-        XCTAssertNotNil(raced.failureMessage)
-        XCTAssertEqual(passiveSnapshot(fixture)?.isEnabled, false)
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.passiveNoticesEnabled,
-            false
-        )
-
-        guard case .added = await addLink(fixture) else { return XCTFail("re-add failed") }
-        await publishTargetActivity(fixture, status: .running, activity: 200)
-        await publishTargetActivity(fixture, status: .idle, activity: 300)
-        XCTAssertEqual(
-            passiveTransitions(passiveSnapshot(fixture)),
-            [],
-            "a preference that never took effect must not be resumed by a fresh link"
-        )
-    }
-
-    func testPassivePreferenceIsScopedToTheExactObserverIncarnation() async {
+    func testPassiveQueueIsScopedToTheExactObserverIncarnation() async {
         let fixture = makeFixture()
         let secondObserver = makeCandidate(windowID: 3, displayName: "Docs")
         fixture.host.candidates = [fixture.observer, fixture.target, secondObserver]
@@ -1727,22 +1659,22 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
               )
         else { return XCTFail("missing active links") }
 
-        let switchedOn = await setPassive(fixture, true)
-        XCTAssertEqual(switchedOn, .changed(enabled: true, activeLinkCount: 1))
+        await settlePassive(fixture)
         await publishTargetActivity(fixture, status: .running, activity: 200)
         await publishTargetActivity(fixture, status: .idle, activity: 300)
         XCTAssertEqual(passiveTransitions(passiveSnapshot(fixture)), ["running->idle"])
-        XCTAssertNil(
-            passiveSnapshot(fixture, observer: secondObserver),
-            "one overseer's preference must not observe on another's behalf"
+        XCTAssertEqual(
+            passiveTransitions(passiveSnapshot(fixture, observer: secondObserver)),
+            ["running->idle"],
+            "each overseer collects on its own behalf, from its own baseline"
         )
         XCTAssertEqual(
-            fixture.host.publishedProps[secondObserver.sessionID]?.passiveNoticesEnabled,
+            fixture.host.publishedProps[secondObserver.sessionID]?.autoWakeOnUpdatesEnabled,
             false
         )
 
-        // The tab rebinds: the retired incarnation's queue is dropped, and the replacement starts
-        // from off rather than resuming narration it was never granted.
+        // The tab rebinds: the retired incarnation's queue is dropped, and the replacement baselines
+        // fresh rather than resuming a backlog it was never granted.
         let retiredQueue = passiveSnapshot(fixture)
         let rebound = makeCandidate(
             windowID: fixture.observer.windowID,
@@ -1762,18 +1694,20 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             rawTargetSessionID: fixture.target.sessionID.uuidString
         ) else { return XCTFail("re-add from the replacement incarnation failed") }
 
-        XCTAssertNil(fixture.host.publishedPassiveNoticesByEndpoint[rebound.domainEndpoint])
+        // The replacement incarnation collects on its own behalf, from its own baseline and its own
+        // queue epoch. What must never happen is inheriting the retired incarnation's backlog.
+        let reboundQueue = fixture.host.publishedPassiveNoticesByEndpoint[rebound.domainEndpoint]
+        XCTAssertEqual(reboundQueue?.entries.isEmpty, true)
+        XCTAssertNotEqual(reboundQueue?.queueEpoch, retiredQueue?.queueEpoch)
         XCTAssertEqual(
-            fixture.host.publishedProps[rebound.sessionID]?.passiveNoticesEnabled,
+            fixture.host.publishedProps[rebound.sessionID]?.autoWakeOnUpdatesEnabled,
             false
         )
 
-        // Nothing publishes again for this observer at all: the retired queue was dropped rather
-        // than left paused, so a completion the replacement never subscribed to cannot be narrated.
-        let publicationsAfterRebind = fixture.host.passiveNoticePublicationCount
+        // Nothing publishes to the *retired* endpoint again: its queue was dropped rather than left
+        // paused, so a completion the replacement never subscribed to cannot reach it.
         await publishTargetActivity(fixture, status: .running, activity: 400)
         await publishTargetActivity(fixture, status: .idle, activity: 500)
-        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, publicationsAfterRebind)
         XCTAssertEqual(
             passiveSnapshot(fixture),
             retiredQueue,
@@ -2370,11 +2304,17 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         await fixture.bridge.revalidateLiveEndpoints()
 
-        // Status rendering must not materialize or redact transcript text.
-        XCTAssertEqual(
-            fixture.host.observationSnapshotCalls,
-            snapshotsBefore,
-            "Refreshing Oversee rows must not build a full observation snapshot"
+        // Row *rendering* still reads only the narrow projection. The authoritative pass does build
+        // one observation snapshot per outbound target, because the lane sample carries the redacted
+        // preview and send readiness the row knows nothing about — but it must never build more than
+        // one per target per pass, and the presentation-only repaint below builds none.
+        let snapshotDelta = fixture.host.observationSnapshotCalls.reduce(into: 0) { total, entry in
+            total += entry.value - (snapshotsBefore[entry.key] ?? 0)
+        }
+        XCTAssertLessThanOrEqual(
+            snapshotDelta,
+            3,
+            "one observation snapshot per outbound target per authoritative pass, and no more"
         )
         XCTAssertGreaterThan(
             fixture.host.statusProjectionCalls[fixture.target.sessionID] ?? 0,

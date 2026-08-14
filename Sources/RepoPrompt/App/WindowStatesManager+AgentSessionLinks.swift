@@ -44,6 +44,22 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         return window.agentModeViewModel.agentSessionLinkStatusProjection(for: candidate)
     }
 
+    func agentSessionLinkAutoWakeOnUpdatesEnabled(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> Bool {
+        guard let window = window(withID: candidate.windowID) else { return false }
+        return window.agentModeViewModel.agentSessionLinkAutoWakeOnUpdatesEnabled(for: candidate)
+    }
+
+    @discardableResult
+    func agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+        _ enabled: Bool,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
+        return viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(enabled, for: endpoint)
+    }
+
     func agentSessionLinkInstallObservation(
         for candidate: AgentSessionLinkEndpointCandidate,
         onChange: @escaping @MainActor () -> Void

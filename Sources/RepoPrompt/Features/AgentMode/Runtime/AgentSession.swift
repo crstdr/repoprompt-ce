@@ -125,7 +125,9 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
-    static let currentSerializationVersion = 7
+    // 8 adds the additive, default-false `autoWakeOnOversightUpdates` observer-session setting and
+    // the additive, default-false `agentSessionLinkRequiresLocalUserInstruction` anti-chain fence.
+    static let currentSerializationVersion = 8
     static let legacyUnversionedSerializationVersion = 0
 
     let id: UUID
@@ -172,6 +174,26 @@ struct AgentSession: Codable, Identifiable {
     /// a session ID may route cleanup, but does not imply remote deletion support.
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var autoEditEnabled: Bool
+    /// Whether this observer session may reserve one system-origin follow-up turn when sessions it
+    /// oversees change status.
+    ///
+    /// Session configuration rather than link or global state: it is scoped to this observer, saved
+    /// with it, and inert while the session oversees nothing. Nothing else about oversight is
+    /// gated on it — status collection and natural-turn delivery are always on for a live, eligible
+    /// direct link.
+    var autoWakeOnOversightUpdates: Bool
+
+    /// Whether the most recent input this session accepted was automatic rather than local-user.
+    ///
+    /// The durable half of the "automatic turns never chain" invariant. The live fence is
+    /// `AgentSessionLinkTurnOrigin`, whose non-local cases carry process-scoped identities (a wake
+    /// ID, a source session UUID) that are meaningless after a relaunch — so what persists is the
+    /// predicate, not the identity.
+    ///
+    /// Without it the fence silently reset to `.localUser` on restore, and an observer that was
+    /// auto-woken just before quitting could start a *second* autonomous turn on its first
+    /// post-restore status edge, with no local instruction in between.
+    var agentSessionLinkRequiresLocalUserInstruction: Bool
 
     /// Persisted per-turn token usage for non-Codex providers.
     /// Used to rebuild context usage after reopen/resume when tool payloads are pruned.
@@ -231,6 +253,8 @@ struct AgentSession: Codable, Identifiable {
         providerSessionID: String? = nil,
         providerCleanupHandle: ProviderConversationCleanupHandle? = nil,
         autoEditEnabled: Bool = true,
+        autoWakeOnOversightUpdates: Bool = false,
+        agentSessionLinkRequiresLocalUserInstruction: Bool = false,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
@@ -268,6 +292,8 @@ struct AgentSession: Codable, Identifiable {
         self.providerSessionID = providerSessionID
         self.providerCleanupHandle = providerCleanupHandle
         self.autoEditEnabled = autoEditEnabled
+        self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
+        self.agentSessionLinkRequiresLocalUserInstruction = agentSessionLinkRequiresLocalUserInstruction
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
@@ -307,6 +333,8 @@ struct AgentSession: Codable, Identifiable {
         case providerSessionID
         case providerCleanupHandle
         case autoEditEnabled
+        case autoWakeOnOversightUpdates
+        case agentSessionLinkRequiresLocalUserInstruction
         case providerTokenUsageByTurn
         case codexConversationID
         case codexRolloutPath
@@ -349,6 +377,19 @@ struct AgentSession: Codable, Identifiable {
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
         providerCleanupHandle = try container.decodeIfPresent(ProviderConversationCleanupHandle.self, forKey: .providerCleanupHandle)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
+        // Additive and `decodeIfPresent`: every session written before version 8 decodes as off,
+        // which is the same default a new session takes.
+        autoWakeOnOversightUpdates = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .autoWakeOnOversightUpdates
+        ) ?? false
+        // Additive and default-false: a session written before version 8 ended on whatever it ended
+        // on, and the safe reconstruction of an unknown origin is the unfenced one — those sessions
+        // predate automatic turns entirely, so none of them can have ended on one.
+        agentSessionLinkRequiresLocalUserInstruction = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .agentSessionLinkRequiresLocalUserInstruction
+        ) ?? false
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)

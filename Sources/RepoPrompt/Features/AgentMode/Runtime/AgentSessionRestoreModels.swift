@@ -12,6 +12,7 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var agentModelRaw: String?
     var agentReasoningEffortRaw: String?
     var autoEditEnabled: Bool
+    var autoWakeOnOversightUpdates: Bool = false
     var parentSessionID: UUID?
     var hasUnknownConversationContent: Bool
     var isMCPOriginated: Bool

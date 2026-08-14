@@ -110,39 +110,62 @@ extension AgentModeRunService {
         /// Reserves the cross-window oversight supplement owed to one logical outbound dispatch.
         ///
         /// Runners call this immediately before the physical provider send, never at enqueue time: a
-        /// queued or requeued turn must render the membership revision that is current when it
-        /// actually dispatches.
-        ///
-        /// One claim can carry membership context, a coalesced passive target-status batch, or both.
-        /// Runners deliberately cannot tell which: the claim is opaque here, there is no
-        /// status-specific API, and the passive half never starts, wakes, or schedules a turn — it
-        /// only rides along with a dispatch the runner was already making.
+        /// queued or requeued turn must render the membership revision and coalesced passive batch
+        /// current when it actually dispatches. The typed outcome distinguishes “nothing owed” from
+        /// the hard refusal required when an auto-wake exists only to carry an unavailable lane batch.
         let claimAgentSessionLinkPrompt: (
             AgentTabSession,
             AgentSessionLinkPromptDispatchID
-        ) -> AgentSessionLinkOutboundPromptClaim?
-        /// Acknowledges a claim at the provider's acceptance signal. Consuming is exactly-once; a
-        /// failed or unknown-outcome attempt simply never calls this and leaves the claim pending.
-        ///
-        /// Whichever components the claim carried are settled by their own owners behind this one
-        /// call, so a runner never has to know a passive batch was involved.
+        ) -> AgentSessionLinkPromptClaimOutcome
+        /// Acquires the physical provider boundary. Returns false when a prepared auto-wake lost
+        /// ownership before the transport call; ordinary dispatches always pass through.
+        let acquireAgentSessionLinkPhysicalDispatch: (
+            AgentTabSession,
+            AgentSessionLinkPromptDispatchID
+        ) -> Bool
+        /// Settles a prepared auto-wake after a definite final exit before the transport call.
+        let recordAgentSessionLinkPhysicalDispatchNotAttempted: (
+            AgentTabSession,
+            AgentSessionLinkPromptDispatchID
+        ) -> Void
+        /// Records a transport failure after the physical boundary but before acceptance.
+        let recordAgentSessionLinkPhysicalDispatchFailure: (
+            AgentTabSession,
+            AgentSessionLinkPromptDispatchID
+        ) -> Void
+        /// Acknowledges whichever opaque membership/passive components the provider accepted; their
+        /// respective owners settle them behind this one runner-neutral call.
         let acceptAgentSessionLinkPrompt: (AgentSessionLinkOutboundPromptClaim) -> Void
 
         /// Attaches the cross-window oversight supplement to an already-built provider message.
         ///
         /// Applied after history, handoff, attachment, workflow, and file-map composition, so the
-        /// supplement is always the final RepoPrompt envelope in the user-message channel and never
-        /// displaces user-controlled content. `AgentMessage.systemPrompt` is untouched: resumed ACP
-        /// and headless providers deliberately omit it, and the base instructions are not a valid
-        /// channel for changing inventory or for target status that changes between turns.
+        /// supplement remains the final RepoPrompt envelope. Every runner must also consult
+        /// `mustAbortDispatch` before transport; this shared seam prevents one provider family from
+        /// accidentally sending an auto-wake whose required lane batch was unavailable.
         func decoratedAgentMessage(
             _ message: AgentMessage,
             session: AgentTabSession,
             dispatchID: AgentSessionLinkPromptDispatchID
-        ) -> (message: AgentMessage, claim: AgentSessionLinkOutboundPromptClaim?) {
-            let claim = claimAgentSessionLinkPrompt(session, dispatchID)
-            return (AgentSessionLinkPromptComposer.decorated(message, with: claim), claim)
+        ) -> AgentSessionLinkDecoratedAgentMessage {
+            let outcome = claimAgentSessionLinkPrompt(session, dispatchID)
+            return AgentSessionLinkDecoratedAgentMessage(
+                message: AgentSessionLinkPromptComposer.decorated(message, with: outcome.claim),
+                claim: outcome.claim,
+                mustAbortDispatch: outcome.mustAbortDispatch
+            )
         }
+    }
+
+    /// One composed provider message plus what the caller owes and may do with it.
+    ///
+    /// Named for the same reason its text-shaped sibling is: a tuple would let a call site keep
+    /// compiling while silently ignoring the abort.
+    struct AgentSessionLinkDecoratedAgentMessage {
+        let message: AgentMessage
+        let claim: AgentSessionLinkOutboundPromptClaim?
+        /// The dispatch required a lane batch it could not be given. Make no physical provider call.
+        let mustAbortDispatch: Bool
     }
 
     /// Cancellation of pending approvals/questions/reviews when a run settles.

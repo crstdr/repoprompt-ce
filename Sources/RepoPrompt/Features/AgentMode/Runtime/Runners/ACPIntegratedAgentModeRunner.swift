@@ -429,6 +429,23 @@ final class ACPIntegratedAgentModeRunner {
             session: session,
             dispatchID: .acpActiveSteering(runAttemptID: runAttemptID)
         )
+        guard !monitoring.mustAbortDispatch else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpActiveSteering(runAttemptID: runAttemptID)
+            )
+            return false
+        }
+        guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+            session,
+            .acpActiveSteering(runAttemptID: runAttemptID)
+        ) else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpActiveSteering(runAttemptID: runAttemptID)
+            )
+            return false
+        }
 
         do {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
@@ -443,6 +460,10 @@ final class ACPIntegratedAgentModeRunner {
             // activeRunAttemptID to still be present here.
             return true
         } catch {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                session,
+                .acpActiveSteering(runAttemptID: runAttemptID)
+            )
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalized = await controller.normalizeError(error)
@@ -772,6 +793,25 @@ final class ACPIntegratedAgentModeRunner {
             session: session,
             dispatchID: .acpPromptTurn(runAttemptID: runAttemptID)
         )
+        // Required lane content is the turn's only new provider input. Refusal is a quiet
+        // pre-acceptance cancellation, not an ACP prompt failure.
+        guard !monitoring.mustAbortDispatch else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpPromptTurn(runAttemptID: runAttemptID)
+            )
+            return .cancelled
+        }
+        guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+            session,
+            .acpPromptTurn(runAttemptID: runAttemptID)
+        ) else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpPromptTurn(runAttemptID: runAttemptID)
+            )
+            return .cancelled
+        }
 
         do {
             log("controller.prompt begin", runID: runID)
@@ -782,6 +822,10 @@ final class ACPIntegratedAgentModeRunner {
             applyProviderSessionIdentity(identity, session: session)
             log("controller.prompt returned; awaiting event consumer", runID: runID)
         } catch {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                session,
+                .acpPromptTurn(runAttemptID: runAttemptID)
+            )
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalizedError = await controller.normalizeError(error)

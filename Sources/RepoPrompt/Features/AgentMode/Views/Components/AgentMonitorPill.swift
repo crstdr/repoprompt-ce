@@ -106,8 +106,8 @@ struct AgentMonitorPopoverView: View {
     @State private var isRetryingSave = false
     /// Observer-level, deliberately not part of `busyLinkIDs`: the passive preference covers every
     /// outbound link at once, so gating it on a row would disable an unrelated row's actions.
-    @State private var isChangingPassiveUpdates = false
-    @State private var passiveUpdatesFailureMessage: String?
+    @State private var isChangingAutoWake = false
+    @State private var autoWakeFailureMessage: String?
     /// The most recent successful Unlink, recoverable for a bounded window. One slot per open
     /// popover: a second Unlink replaces it, and closing the popover drops it.
     @State private var undoSlot: UndoSlot?
@@ -157,6 +157,11 @@ struct AgentMonitorPopoverView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     addSection
+                    // Unconditional, and above both lists on purpose: the setting is saved with this
+                    // observer session rather than with any link, so it has to stay reachable from the
+                    // state where the user is most likely to want it — before anything is overseen.
+                    Divider()
+                    observerControlsSection
                     if hasPersistenceContent {
                         Divider()
                         persistenceSection
@@ -264,11 +269,9 @@ struct AgentMonitorPopoverView: View {
             HStack(spacing: 6) {
                 sectionHeader("Overseeing")
                 Spacer(minLength: 0)
-                passiveUpdatesToggle
+                // Sorting stays here: it is a property of the list, and there is no list to sort
+                // until there are rows.
                 sortMenu
-            }
-            if let passiveUpdatesFailureMessage {
-                messageText(passiveUpdatesFailureMessage)
             }
             // One popover-scoped minute tick drives every row's relative timestamp from the same
             // instant. It exists only while the popover is open and performs no authority work.
@@ -422,22 +425,41 @@ struct AgentMonitorPopoverView: View {
 
     /// The observer-level passive status-update switch.
     ///
-    /// The binding reads `props`, never local state: the bridge is authoritative, and the same
-    /// preference can be changed by this session's own agent through `agent_session_link`. A checkbox
-    /// that flipped optimistically would show the user a preference the authority had refused, or
-    /// hide one the agent had just changed underneath them.
-    private var passiveUpdatesToggle: some View {
-        Toggle(AgentMonitorPassiveUpdatesCopy.label, isOn: Binding(
-            get: { props.passiveNoticesEnabled },
-            set: { setPassiveUpdates($0) }
+    /// Observer-session controls, rendered whether or not anything is overseen.
+    private var observerControlsSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            autoWakeToggle
+            if let reason = props.autoWakeUnavailableReason {
+                messageText(reason)
+            } else if props.outbound.isEmpty {
+                messageText(AgentMonitorAutoWakeCopy.noLinksNote)
+            }
+            if let autoWakeFailureMessage {
+                messageText(autoWakeFailureMessage)
+            }
+        }
+    }
+
+    /// The binding reads `props`, never local state: the setting lives on the session and is
+    /// republished after it settles. A checkbox that flipped optimistically would show the user a
+    /// value the session had refused to take.
+    private var autoWakeToggle: some View {
+        Toggle(AgentMonitorAutoWakeCopy.label, isOn: Binding(
+            get: { props.autoWakeOnUpdatesEnabled },
+            set: { setAutoWakeOnUpdates($0) }
         ))
         .toggleStyle(.checkbox)
         .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-        .disabled(isChangingPassiveUpdates)
+        // Disabled only while a write is in flight, or while the exact session cannot take one at
+        // all. A merely ineligible or unlinked observer keeps an editable, saved setting.
+        .disabled(isChangingAutoWake || props.autoWakeUnavailableReason != nil)
         .fixedSize()
-        .hoverTooltip(AgentMonitorPassiveUpdatesCopy.tooltip, .top)
-        .accessibilityLabel(AgentMonitorPassiveUpdatesCopy.accessibilityLabel)
-        .accessibilityHint(AgentMonitorPassiveUpdatesCopy.accessibilityHint)
+        .hoverTooltip(AgentMonitorAutoWakeCopy.tooltip, .top)
+        .accessibilityLabel(AgentMonitorAutoWakeCopy.accessibilityLabel)
+        .accessibilityValue(props.autoWakeOnUpdatesEnabled ? "On" : "Off")
+        .accessibilityHint(
+            props.autoWakeUnavailableReason ?? AgentMonitorAutoWakeCopy.accessibilityHint
+        )
     }
 
     private var sortMenu: some View {
@@ -827,27 +849,27 @@ struct AgentMonitorPopoverView: View {
         }
     }
 
-    /// Requests a passive-preference change and renders whatever the bridge settles on.
+    /// Requests an auto-wake change and renders whatever the session settles on.
     ///
     /// Addressed to the exact incarnation this projection was published to: a duplicate live
-    /// incarnation of the same session UUID must not have its preference changed from another
-    /// window's dashboard. Nothing here touches link authority — turning narration off is not
-    /// unlinking — and nothing starts a turn.
-    private func setPassiveUpdates(_ enabled: Bool) {
-        guard !isChangingPassiveUpdates else { return }
+    /// incarnation of the same session UUID must not have its setting changed from another window's
+    /// dashboard. Nothing here touches link authority, and turning it *on* starts nothing by itself —
+    /// it only permits the coordinator to reserve one follow-up when actionable content is pending.
+    private func setAutoWakeOnUpdates(_ enabled: Bool) {
+        guard !isChangingAutoWake else { return }
         guard let observerEndpoint = props.endpoint else {
-            passiveUpdatesFailureMessage = AgentMonitorPassiveUpdatesCopy.unavailableMessage
+            autoWakeFailureMessage = AgentMonitorAutoWakeCopy.unavailableMessage
             return
         }
-        isChangingPassiveUpdates = true
-        passiveUpdatesFailureMessage = nil
+        isChangingAutoWake = true
+        autoWakeFailureMessage = nil
         Task {
-            let outcome = await AgentSessionLinkRuntimeBridge.shared.setPassiveMonitorNoticesEnabled(
+            let outcome = await AgentSessionLinkRuntimeBridge.shared.setAutoWakeOnOversightUpdates(
                 enabled,
                 observerEndpoint: observerEndpoint
             )
-            isChangingPassiveUpdates = false
-            passiveUpdatesFailureMessage = outcome.failureMessage
+            isChangingAutoWake = false
+            autoWakeFailureMessage = outcome.failureMessage
         }
     }
 

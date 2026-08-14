@@ -96,7 +96,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         inbound: [AgentMonitorPillProps.Inbound] = [],
         notices: [AgentMonitorPillProps.Notice] = [],
         canAddReason: String? = nil,
-        passiveNoticesEnabled: Bool = false
+        autoWakeOnUpdatesEnabled: Bool = false
     ) -> AgentMonitorPillProps {
         AgentMonitorPillProps(
             sessionID: observerID,
@@ -104,7 +104,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             inbound: inbound,
             recentNotices: notices,
             canAddReason: canAddReason,
-            passiveNoticesEnabled: passiveNoticesEnabled
+            autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled
         )
     }
 
@@ -452,7 +452,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             inbound: [inbound()],
             notices: [notice],
             canAddReason: "Load this thread before adding sessions to oversee.",
-            passiveNoticesEnabled: true
+            autoWakeOnUpdatesEnabled: true
         )
 
         let overlaid = AgentModeViewModel.monitorPillProps(
@@ -467,7 +467,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(overlaid.recentNotices, published.recentNotices)
         XCTAssertNil(overlaid.canAddReason)
         XCTAssertTrue(
-            overlaid.passiveNoticesEnabled,
+            overlaid.autoWakeOnUpdatesEnabled,
             "a copy helper that dropped the preference would silently stop the toggle reflecting it"
         )
 
@@ -479,28 +479,36 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(withPersistence.outbound, published.outbound)
         XCTAssertEqual(withPersistence.inbound, published.inbound)
         XCTAssertEqual(withPersistence.recentNotices, published.recentNotices)
-        XCTAssertTrue(withPersistence.passiveNoticesEnabled)
-        XCTAssertTrue(published.withCanAddReason("changed").passiveNoticesEnabled)
+        XCTAssertTrue(withPersistence.autoWakeOnUpdatesEnabled)
+        XCTAssertTrue(published.withCanAddReason("changed").autoWakeOnUpdatesEnabled)
     }
 
-    /// The switch is the only place the user learns what passive updates do, so its copy has to carry
-    /// the whole contract — and in particular the half that is easy to assume wrongly.
-    func testPassiveUpdatesCopyStatesTheNeverStartsATurnContract() {
-        let tooltip = AgentMonitorPassiveUpdatesCopy.tooltip
-        XCTAssertTrue(tooltip.contains("next turn that you start"))
-        XCTAssertTrue(tooltip.contains("never starts, wakes, or schedules a turn"))
+    /// The switch is the only place the user learns what auto-wake does, so its copy has to carry the
+    /// whole contract — and in particular the three halves that are easy to assume wrongly: updates
+    /// arrive either way, a busy agent is never interrupted, and automatic turns do not chain.
+    func testAutoWakeCopyStatesTheAlwaysOnAndBoundedFollowUpContract() {
+        let tooltip = AgentMonitorAutoWakeCopy.tooltip
+        XCTAssertTrue(
+            tooltip.contains("always attached"),
+            "the user must learn that turning this off does not turn updates off"
+        )
+        XCTAssertTrue(tooltip.contains("one follow-up turn"))
+        XCTAssertTrue(tooltip.contains("already-accepted work first"))
+        XCTAssertTrue(tooltip.contains("never chain"))
+        XCTAssertTrue(
+            tooltip.contains("this session"),
+            "the scope is the observer session, not a link and not a global preference"
+        )
         XCTAssertTrue(
             tooltip.contains("Off by default"),
             "the default has to be visible where the control is"
         )
         XCTAssertTrue(
-            AgentMonitorPassiveUpdatesCopy.accessibilityHint.contains("never starts a turn"),
+            AgentMonitorAutoWakeCopy.accessibilityHint.contains("either way"),
             "VoiceOver users must get the same contract, not just the label"
         )
-        XCTAssertFalse(
-            AgentMonitorPassiveUpdatesCopy.accessibilityLabel == AgentMonitorPassiveUpdatesCopy.label,
-            "the accessibility label must say what the bare visible label cannot"
-        )
+        // Zero links is a real, saved state, and the note has to say so rather than read as an error.
+        XCTAssertTrue(AgentMonitorAutoWakeCopy.noLinksNote.contains("Saved with this session"))
     }
 
     func testOverlayStillDisablesAddWhenLiveStateSaysSo() {

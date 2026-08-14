@@ -32,7 +32,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let op = try XCTUnwrap(properties["op"]?.objectValue)
         XCTAssertEqual(
             op["enum"]?.arrayValue?.compactMap(\.stringValue),
-            ["list", "poll", "wait", "read", "send", "mark_done", "set_passive_updates"]
+            ["list", "poll", "wait", "read", "send", "mark_done"]
         )
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
         // `send` is the only target-mutating operation, so its two required inputs must be
@@ -45,58 +45,42 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertTrue(definition.description.contains("observer’s dashboard"))
     }
 
-    /// `set_passive_updates` is observer-scoped by *construction*, and the schema has to show it.
+    /// The superseded `set_passive_updates` operation must be absent everywhere a client can see it.
     ///
-    /// Its single argument is a native boolean, and it advertises no identity field of any kind: the
-    /// caller is resolved from server-owned run routing, so there is nothing here for one session to
-    /// address another session's preference with. `enabled` stays out of the top-level `required`
-    /// because it is mandatory for this operation only — the strict executor enforces that — and
-    /// hoisting it would demand it of `list`, `poll`, and every other operation.
-    func testPassiveUpdatesAdvertisesOneBooleanAndNoIdentityField() throws {
+    /// Collection and natural-turn delivery are now an always-on property of a live, eligible direct
+    /// link, and the one remaining choice is a user setting with deliberately no agent-facing
+    /// surface. A schema that still advertised the operation — or a stray `enabled` property, or the
+    /// prose that taught it — would promise configurability that no longer exists.
+    func testPassiveUpdatesOperationIsAbsentFromEverySchemaSurface() throws {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
         let schema = try XCTUnwrap(definition.inputSchema.objectValue)
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
 
-        let enabled = try XCTUnwrap(properties["enabled"]?.objectValue)
-        XCTAssertEqual(enabled["type"]?.stringValue, "boolean")
-        XCTAssertTrue(
-            try XCTUnwrap(enabled["description"]?.stringValue).contains("[set_passive_updates]")
+        XCTAssertNil(properties["enabled"], "the legacy top-level enabled property must be gone")
+        XCTAssertFalse(
+            definition.description.contains("set_passive_updates"),
+            "no operations line, bullet, or prose may name the removed operation"
         )
         XCTAssertFalse(
-            schema["required"]?.arrayValue?.compactMap(\.stringValue).contains("enabled") ?? true
+            try XCTUnwrap(schema["description"]?.stringValue).contains("set_passive_updates"),
+            "the field summary must not name the removed operation"
         )
-        XCTAssertTrue(
-            try XCTUnwrap(schema["description"]?.stringValue)
-                .contains("**set_passive_updates**: enabled (required boolean); no session identifier is accepted")
+        XCTAssertFalse(
+            try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue)
+                .contains(.string("set_passive_updates"))
         )
-        // The description must teach the property that is easiest to assume wrongly: this never
-        // creates work.
-        XCTAssertTrue(definition.description.contains("takes no session identifier"))
-        XCTAssertTrue(definition.description.contains("never start, wake, or schedule one"))
-        XCTAssertTrue(definition.description.contains("moves no link authority"))
     }
 
-    /// The canonicalization that adds the operation must be a no-op on an already-amended definition,
-    /// so a future refresh of the encoded blob needs no coordinated removal.
-    func testPassiveUpdatesCanonicalizationIsIdempotent() throws {
-        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
-        XCTAssertEqual(
-            definition.description.components(separatedBy: "- `set_passive_updates`:").count - 1,
-            1,
-            "the operation bullet must appear exactly once"
-        )
-        XCTAssertEqual(
-            definition.description.components(separatedBy: "| set_passive_updates").count - 1,
-            1,
-            "the operations line must name it exactly once"
-        )
-        XCTAssertEqual(
-            try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue?["op"]?
-                .objectValue?["enum"]?.arrayValue)
-                .filter { $0.stringValue == "set_passive_updates" }
-                .count,
-            1
-        )
+    /// The legacy-stripping migration is a no-op once the definition is clean.
+    ///
+    /// It is kept rather than deleted because the encoded blob is vendored: a refresh that bakes the
+    /// legacy shape back in must be stripped again rather than silently re-advertised. Running the
+    /// canonicalization repeatedly must therefore converge rather than oscillate.
+    func testPassiveUpdatesStrippingIsIdempotent() throws {
+        let first = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        let second = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        XCTAssertEqual(first.description, second.description)
+        XCTAssertEqual(first.inputSchema, second.inputSchema)
     }
 
     /// The description is the only place a model learns the send contract before calling it.
@@ -114,6 +98,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertTrue(
             definition.description.contains("cross_session_reply_requires_user_instruction")
         )
+        XCTAssertTrue(definition.description.contains("automatic status-update follow-up"))
     }
 
     /// Regression: the description promised oversight "never exposes … file paths, or worktree

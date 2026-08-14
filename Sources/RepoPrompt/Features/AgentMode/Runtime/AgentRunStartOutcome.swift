@@ -17,10 +17,28 @@ struct AgentDirectRunStartOptions: Equatable {
     /// continuity it was staged for.
     var ignoresPendingHandoff: Bool = false
 
+    /// Marks this run as RepoPrompt's own lane-update follow-up rather than any kind of user send.
+    ///
+    /// A typed identity, deliberately **not** an empty-string check: "the caller passed no text" is a
+    /// property a future refactor can produce by accident, whereas a wake ID can only come from the
+    /// auto-wake coordinator. It carries no user-authored base instruction, appends no `.user` row,
+    /// does not move `lastUserMessageAt`, and never consumes a staged handoff — the rendered lane
+    /// claim the ordinary supplement path attaches is its whole new provider input.
+    var laneUpdateWakeID: UUID?
+
+    var isLaneUpdate: Bool {
+        laneUpdateWakeID != nil
+    }
+
     static let `default` = AgentDirectRunStartOptions()
 
     /// Options for `agent_session_link.send`.
     static let crossSessionDelivery = AgentDirectRunStartOptions(ignoresPendingHandoff: true)
+
+    /// Options for one automatic lane-update follow-up.
+    static func laneUpdate(wakeID: UUID) -> AgentDirectRunStartOptions {
+        AgentDirectRunStartOptions(ignoresPendingHandoff: true, laneUpdateWakeID: wakeID)
+    }
 }
 
 // MARK: - Start outcome

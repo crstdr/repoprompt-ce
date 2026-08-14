@@ -21,13 +21,22 @@ struct AgentSessionLinkPassiveStatusNotices {
         let targetSessionID: UUID
         let displayName: String?
         let status: Status
+        /// The target's readiness at this observation. A point-in-time fact, never a reservation.
+        ///
+        /// Forced false unless the sample is idle: a running or waiting target is not sendable, and
+        /// letting an upstream projection assert otherwise would put a claim in the prompt that the
+        /// send admission matrix would immediately refuse.
+        let idleForSend: Bool
+        let latestVisibleAssistantPreview: String?
 
         init(
             reference: DomainAgentSessionLinkReference,
             targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
             targetSessionID: UUID,
             displayName: String?,
-            status: Status
+            status: Status,
+            idleForSend: Bool = false,
+            latestVisibleAssistantPreview: String? = nil
         ) {
             self.reference = reference
             self.targetEndpoint = targetEndpoint
@@ -37,6 +46,11 @@ struct AgentSessionLinkPassiveStatusNotices {
                 maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
             )
             self.status = status
+            self.idleForSend = status == .idle && idleForSend
+            self.latestVisibleAssistantPreview = DomainAgentSessionLinkTextBudget.normalized(
+                latestVisibleAssistantPreview,
+                maxBytes: DomainAgentSessionLinkTextBudget.assistantPreviewMaxBytes
+            )
         }
     }
 
@@ -45,9 +59,118 @@ struct AgentSessionLinkPassiveStatusNotices {
         let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
         let targetSessionID: UUID
         let displayName: String?
+        /// First status of the still-pending interval, never overwritten by a later edge.
         let fromStatus: Status
+        /// Status at the newest authoritative observation.
         let toStatus: Status
+        /// When this reducer processed the newest sample represented by the line.
+        ///
+        /// Deliberately the reducer's own clock rather than the target's `lastActivityAt`: the agent
+        /// is being told when RepoPrompt observed the status/readiness metadata it is about to use.
+        /// A same-status metadata refresh updates this time without changing `edgeSequence`.
+        let observedAt: Date
+        let idleForSend: Bool
+        let latestVisibleAssistantPreview: String?
         let changeSequence: UInt64
+        /// Identity of the *status edge* that created or last advanced this entry.
+        ///
+        /// Distinct from `changeSequence`, which also advances for a metadata-only refresh. This one
+        /// moves only when a status transition creates or advances the interval, so it answers the
+        /// question failure suppression actually asks: "is this the same occurrence I already failed
+        /// to deliver, or a genuinely new one that happens to have the same shape?"
+        ///
+        /// Without it, an acknowledged `running → idle` followed later by an independent
+        /// `running → idle` for the same target produces a byte-identical structural fingerprint
+        /// inside one queue epoch, and a single failed attempt would suppress every future identical
+        /// transition for the life of the link.
+        let edgeSequence: UInt64
+
+        /// Explicit rather than memberwise so the enriched fields can default.
+        ///
+        /// The reducer always supplies all of them; the defaults exist so a caller that only cares
+        /// about the transition — a renderer fixture, say — does not have to invent a timestamp and a
+        /// readiness bit to state one. `edgeSequence` defaults to `changeSequence` because a freshly
+        /// stated entry has had exactly one edge and no refresh.
+        init(
+            reference: DomainAgentSessionLinkReference,
+            targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetSessionID: UUID,
+            displayName: String?,
+            fromStatus: Status,
+            toStatus: Status,
+            observedAt: Date = Date(),
+            idleForSend: Bool = false,
+            latestVisibleAssistantPreview: String? = nil,
+            changeSequence: UInt64,
+            edgeSequence: UInt64? = nil
+        ) {
+            self.edgeSequence = edgeSequence ?? changeSequence
+            self.reference = reference
+            self.targetEndpoint = targetEndpoint
+            self.targetSessionID = targetSessionID
+            self.displayName = displayName
+            self.fromStatus = fromStatus
+            self.toStatus = toStatus
+            self.observedAt = observedAt
+            self.idleForSend = idleForSend
+            self.latestVisibleAssistantPreview = latestVisibleAssistantPreview
+            self.changeSequence = changeSequence
+        }
+
+        fileprivate func refreshed(
+            from sample: Sample,
+            observedAt: Date,
+            changeSequence: UInt64
+        ) -> PendingEntry {
+            PendingEntry(
+                reference: reference,
+                targetEndpoint: targetEndpoint,
+                targetSessionID: targetSessionID,
+                displayName: sample.displayName,
+                fromStatus: fromStatus,
+                toStatus: toStatus,
+                observedAt: observedAt,
+                idleForSend: sample.idleForSend,
+                latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
+                changeSequence: changeSequence,
+                // Preserve only edge occurrence; refreshed readiness uses the new sample time above.
+                edgeSequence: edgeSequence
+            )
+        }
+
+        fileprivate func hasSameFinalMetadata(as sample: Sample) -> Bool {
+            displayName == sample.displayName
+                && idleForSend == sample.idleForSend
+                && latestVisibleAssistantPreview == sample.latestVisibleAssistantPreview
+        }
+    }
+
+    /// The structural shape a failed auto-wake attempt is suppressed against.
+    ///
+    /// Deliberately excludes name, preview, timestamp, readiness, sequence, and queue revision: a
+    /// metadata refresh improves the payload a future dispatch would carry, but re-attempting a
+    /// provider call that already failed for the same set of edges would be a failure loop. A
+    /// structurally new edge, a new link generation, or newly produced overflow is a different
+    /// notice and may re-arm exactly one attempt.
+    ///
+    /// It deliberately *includes* `edgeSequence`, which is the difference between "the same failed
+    /// notice, refreshed" and "this target did the same thing again". Excluding it made suppression
+    /// permanent: once a `running → idle` failed, every later `running → idle` for that link inside
+    /// the same queue epoch hashed identically and stayed suppressed for the life of the link.
+    struct WakeEligibilityFingerprint: Hashable {
+        struct Edge: Hashable {
+            let reference: DomainAgentSessionLinkReference
+            let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+            let fromStatus: Status
+            let toStatus: Status
+            /// Occurrence identity of this exact transition. Stable across metadata refreshes,
+            /// strictly advancing for a genuinely new transition.
+            let edgeSequence: UInt64
+        }
+
+        let queueEpoch: UUID
+        let edges: [Edge]
+        let overflowProduced: UInt64
     }
 
     struct Snapshot: Hashable {
@@ -78,6 +201,23 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// some unrelated entry arrives would leave the count permanently unacknowledged.
         var hasDeliverableContent: Bool {
             !entries.isEmpty || unacknowledgedOverflowCount > 0
+        }
+
+        /// Structural identity of what this snapshot would ask a provider to be woken for.
+        var wakeEligibilityFingerprint: WakeEligibilityFingerprint {
+            WakeEligibilityFingerprint(
+                queueEpoch: queueEpoch,
+                edges: entries.map {
+                    WakeEligibilityFingerprint.Edge(
+                        reference: $0.reference,
+                        targetEndpoint: $0.targetEndpoint,
+                        fromStatus: $0.fromStatus,
+                        toStatus: $0.toStatus,
+                        edgeSequence: $0.edgeSequence
+                    )
+                },
+                overflowProduced: overflowProduced
+            )
         }
     }
 
@@ -178,11 +318,16 @@ struct AgentSessionLinkPassiveStatusNotices {
         )
     }
 
-    /// Enables passive notices and silently baselines the current authoritative target states.
+    /// Starts collecting and silently baselines the current authoritative target states.
+    ///
+    /// `isEnabled` is an internal "this exact endpoint currently has collectable direct links"
+    /// invariant, not a user preference: collection is an always-on property of a live, eligible
+    /// direct oversight relationship.
     mutating func enable(
         samples: [Sample],
         linkSetRevision: UInt64,
-        deliverable: Bool = true
+        deliverable: Bool = true,
+        observedAt: Date = Date()
     ) {
         guard !samples.isEmpty else {
             invalidateLastLink(linkSetRevision: linkSetRevision)
@@ -193,7 +338,8 @@ struct AgentSessionLinkPassiveStatusNotices {
             reconcile(
                 samples: samples,
                 linkSetRevision: linkSetRevision,
-                deliverable: deliverable
+                deliverable: deliverable,
+                observedAt: observedAt
             )
             return
         }
@@ -235,7 +381,8 @@ struct AgentSessionLinkPassiveStatusNotices {
     mutating func reconcile(
         samples: [Sample],
         linkSetRevision: UInt64,
-        deliverable: Bool
+        deliverable: Bool,
+        observedAt: Date = Date()
     ) {
         guard isEnabled else {
             if self.linkSetRevision != linkSetRevision {
@@ -308,27 +455,57 @@ struct AgentSessionLinkPassiveStatusNotices {
                 continue
             }
 
-            guard observation.status != sample.status else { continue }
+            guard observation.status != sample.status else {
+                // Same status: the pending edge is unchanged, but the metadata a reader would triage
+                // from may have settled after it. Refresh it in place — preserving the edge and its
+                // timestamp — and advance the sequence so a receipt rendered before the refresh can
+                // no longer clear it.
+                guard let entry = pendingByReference[sample.reference],
+                      !entry.hasSameFinalMetadata(as: sample)
+                else { continue }
+                nextChangeSequence += 1
+                pendingByReference[sample.reference] = entry.refreshed(
+                    from: sample,
+                    observedAt: observedAt,
+                    changeSequence: nextChangeSequence
+                )
+                changed = true
+                continue
+            }
 
             let precedingStatus = observation.status
             observation.status = sample.status
             lastObservedStatus[sample.reference] = observation
             changed = true
 
-            if isActionableTransition(from: precedingStatus, to: sample.status) {
-                nextChangeSequence += 1
-                pendingByReference[sample.reference] = PendingEntry(
-                    reference: sample.reference,
-                    targetEndpoint: sample.targetEndpoint,
-                    targetSessionID: sample.targetSessionID,
-                    displayName: sample.displayName,
-                    fromStatus: precedingStatus,
-                    toStatus: sample.status,
-                    changeSequence: nextChangeSequence
-                )
-            } else if pendingByReference[sample.reference]?.toStatus != sample.status {
+            // First-to-final coalescing: the origin of the still-pending interval outlives every
+            // intermediate edge, so `running → waiting → idle` is delivered as `running → idle`
+            // rather than losing the fact that the target had been working.
+            let originStatus = pendingByReference[sample.reference]?.fromStatus ?? precedingStatus
+            guard originStatus != sample.status,
+                  isActionableTransition(from: originStatus, to: sample.status)
+            else {
+                // Net reversion, or a net edge that was never worth a turn.
                 pendingByReference.removeValue(forKey: sample.reference)
+                continue
             }
+
+            nextChangeSequence += 1
+            pendingByReference[sample.reference] = PendingEntry(
+                reference: sample.reference,
+                targetEndpoint: sample.targetEndpoint,
+                targetSessionID: sample.targetSessionID,
+                displayName: sample.displayName,
+                fromStatus: originStatus,
+                toStatus: sample.status,
+                observedAt: observedAt,
+                idleForSend: sample.idleForSend,
+                latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
+                changeSequence: nextChangeSequence,
+                // A status edge, so this *is* a new occurrence: the wake fingerprint must not compare
+                // equal to the one a previous, already-settled edge of the same shape produced.
+                edgeSequence: nextChangeSequence
+            )
         }
 
         let overflowCount = enforcePendingBound()

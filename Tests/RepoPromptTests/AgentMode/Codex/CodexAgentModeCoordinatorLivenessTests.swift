@@ -2448,6 +2448,46 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         }
     }
 
+    func testCodexRequiredLaneRefusalMakesNoProviderCallOrErrorRow() async {
+        let controller = LivenessFakeCodexController(snapshot: .idle)
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.runState = .idle
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        let endpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: 1,
+            workspaceID: UUID(),
+            tabID: session.tabID,
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1
+        )
+        session.pendingOversightAutoWake = AgentSessionLinkAutoWakeAttempt(
+            wakeID: UUID(),
+            observerEndpoint: endpoint,
+            queueEpoch: UUID(),
+            localInputEpoch: 0,
+            queueRevision: 1,
+            wakeFingerprint: .init(queueEpoch: UUID(), edges: [], overflowProduced: 0),
+            attemptedFingerprint: .init(queueEpoch: UUID(), edges: [], overflowProduced: 0),
+            physicalOutcome: .ambiguous,
+            phase: .dispatching,
+            task: nil
+        )
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "",
+            attachments: []
+        )
+
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertFalse(session.items.contains(where: { $0.kind == .error }))
+    }
+
     func testActiveCodexNativeSendRejectsBeforeDispatchWhenAgentRunDrainFails() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller) { _, _, _, _ in false }

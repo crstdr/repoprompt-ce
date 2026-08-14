@@ -305,6 +305,30 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         AgentChatItem(kind: .system, text: text, sequenceIndex: sequenceIndex)
     }
 
+    /// The visible provenance row for one accepted automatic lane-update turn.
+    ///
+    /// Keyed by the wake ID so a duplicate acceptance callback is idempotent by identity rather than
+    /// by text matching, and stamped with the physical acceptance time so the row cannot claim the
+    /// model was told something before it was.
+    ///
+    /// Deliberately says nothing about *which* sessions changed: the target UUIDs, names, and
+    /// previews are agent-facing payload that belongs in the provider envelope, not in the local
+    /// user's transcript. It is `.system` rather than `.user` because RepoPrompt started this turn
+    /// and must not claim the user's authorship.
+    public static func laneUpdateAutoWake(
+        wakeID: UUID,
+        acceptedAt: Date,
+        sequenceIndex: Int = 0
+    ) -> AgentChatItem {
+        AgentChatItem(
+            id: wakeID,
+            timestamp: acceptedAt,
+            kind: .system,
+            text: "[lane-update] RepoPrompt auto-woke this session for overseen-session status updates.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
     public static func error(_ text: String, sequenceIndex: Int = 0) -> AgentChatItem {
         AgentChatItem(kind: .error, text: text, sequenceIndex: sequenceIndex)
     }
