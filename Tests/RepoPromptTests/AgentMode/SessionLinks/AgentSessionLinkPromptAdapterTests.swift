@@ -616,16 +616,27 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     // MARK: Claude native
 
+    private func installClaudeIntent(
+        on session: AgentTabSession
+    ) -> ClaudeAgentModeCoordinator.NativeSessionIntent {
+        let runID = UUID()
+        session.installRunID(runID)
+        let ownership = session.beginRunAttempt(source: "test.sessionLinkPrompt")
+        return .runAttempt(ownership: ownership, runID: runID)
+    }
+
     func testClaudeNativeSendCarriesExactlyOneSupplementThenGoesQuiet() async throws {
         let controller = MonitorFakeNativeController()
         let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 2)
         fixture.session.claudeController = controller
+        let intent = installClaudeIntent(on: fixture.session)
 
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "claude turn",
-            attachments: []
+            attachments: [],
+            intent: intent
         )
 
         let sent = await controller.sentMessages
@@ -640,7 +651,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "second turn",
-            attachments: []
+            attachments: [],
+            intent: intent
         )
         let after = await controller.sentMessages
         try MonitorSupplementAssertions.assertCarriesNoSupplement(XCTUnwrap(after.last))
@@ -651,17 +663,20 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 1)
         fixture.session.claudeController = controller
+        let intent = installClaudeIntent(on: fixture.session)
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "linked",
-            attachments: []
+            attachments: [],
+            intent: intent
         )
 
         fixture.inventory.publish(revision: 2, targetCount: 0)
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "after revoke",
-            attachments: []
+            attachments: [],
+            intent: intent
         )
 
         let sent = await controller.sentMessages

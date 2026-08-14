@@ -1367,38 +1367,61 @@ actor AgentSessionDataService {
     }
 
     func deleteAgentSessions(forComposeTabID tabID: UUID, for workspace: WorkspaceModel) async throws {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
-        // Standardized path → UUID, built and conflict-checked *before* anything is deleted. A batch
-        // that could not name one of its files would otherwise delete it and leave oversight unable
-        // to fence that session.
-        var candidateSessionIDsByPath: [String: (sessionID: UUID, fileURL: URL)] = [:]
-        /// - Parameter sessionID: the *authoritative* identity of this candidate — the index record's
-        ///   or the loaded stub's own `id`. Deriving it from the filename alone would make the
-        ///   conflict check below unreachable: the same path always yields the same filename-derived
-        ///   UUID, so a corrupted record whose content names session A while its filename encodes B
-        ///   would delete the file and tombstone B, leaving A's grants and saved intent unfenced.
-        func note(sessionID: UUID, fileURL: URL) throws {
+        let failures = await deleteAgentSessions(forComposeTabIDs: [tabID], for: workspace)
+        if let failure = failures[tabID] { throw failure }
+    }
+
+    func deleteAgentSessions(
+        forComposeTabIDs tabIDs: Set<UUID>,
+        for workspace: WorkspaceModel
+    ) async -> [UUID: Error] {
+        guard !tabIDs.isEmpty else { return [:] }
+        let agentSessionsFolder: URL
+        do {
+            agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        } catch {
+            return Dictionary(uniqueKeysWithValues: tabIDs.map { ($0, error) })
+        }
+
+        var failures: [UUID: Error] = [:]
+        var candidateByPath: [String: (sessionID: UUID, fileURL: URL, tabID: UUID)] = [:]
+        func note(sessionID: UUID, fileURL: URL, tabID: UUID) {
             let standardized = fileURL.standardizedFileURL
             guard let filenameSessionID = agentSessionID(fromFilename: standardized.lastPathComponent),
                   filenameSessionID == sessionID
             else {
-                throw AgentSessionDataError.invalidFilename(standardized.lastPathComponent)
+                failures[tabID] = AgentSessionDataError.invalidFilename(standardized.lastPathComponent)
+                return
             }
-            if let existing = candidateSessionIDsByPath[standardized.path], existing.sessionID != sessionID {
-                throw AgentSessionDataError.invalidFilename(standardized.lastPathComponent)
+            if let existing = candidateByPath[standardized.path],
+               existing.sessionID != sessionID || existing.tabID != tabID
+            {
+                let error = AgentSessionDataError.invalidFilename(standardized.lastPathComponent)
+                failures[tabID] = error
+                failures[existing.tabID] = error
+                candidateByPath.removeValue(forKey: standardized.path)
+                return
             }
-            candidateSessionIDsByPath[standardized.path] = (sessionID, standardized)
+            candidateByPath[standardized.path] = (sessionID, standardized, tabID)
         }
+
         if let index = await readMetadataIndexIfAvailable(folder: agentSessionsFolder) {
-            for record in index.entries where record.composeTabID == tabID {
-                try note(
+            for record in index.entries {
+                guard let tabID = record.composeTabID, tabIDs.contains(tabID) else { continue }
+                note(
                     sessionID: record.id,
-                    fileURL: agentSessionsFolder.appendingPathComponent(record.filename)
+                    fileURL: agentSessionsFolder.appendingPathComponent(record.filename),
+                    tabID: tabID
                 )
             }
         }
 
-        let files = try await listAgentSessions(for: workspace)
+        let files: [URL]
+        do {
+            files = try await listAgentSessions(for: workspace)
+        } catch {
+            return Dictionary(uniqueKeysWithValues: tabIDs.map { ($0, error) })
+        }
         for fileURL in files {
             guard
                 let stub = try? await loadAgentSessionStub(
@@ -1406,17 +1429,31 @@ actor AgentSessionDataService {
                     recoverMissingMetadata: false,
                     persistRecoveredMetadata: false
                 ),
-                stub.composeTabID == tabID
+                let tabID = stub.composeTabID,
+                tabIDs.contains(tabID)
             else { continue }
-            try note(sessionID: stub.id, fileURL: fileURL)
+            note(sessionID: stub.id, fileURL: fileURL, tabID: tabID)
         }
 
-        for entry in candidateSessionIDsByPath.values.sorted(by: { $0.fileURL.path < $1.fileURL.path }) {
-            // Reported per file: a batch cancelled halfway must leave a committed tombstone for every
-            // session it actually deleted, not just for the batch as a whole.
-            try await deleteSessionFileDurably(sessionID: entry.sessionID, fileURL: entry.fileURL)
+        for candidate in candidateByPath.values.sorted(by: { $0.fileURL.path < $1.fileURL.path }) {
+            guard failures[candidate.tabID] == nil else { continue }
+            do {
+                try await deleteSessionFileDurably(
+                    sessionID: candidate.sessionID,
+                    fileURL: candidate.fileURL
+                )
+            } catch {
+                failures[candidate.tabID] = error
+            }
         }
-        await removeMetadataRecords(matching: { $0.composeTabID == tabID }, folder: agentSessionsFolder)
+        let successfulTabIDs = tabIDs.subtracting(failures.keys)
+        await removeMetadataRecords(
+            matching: { record in
+                record.composeTabID.map { successfulTabIDs.contains($0) } == true
+            },
+            folder: agentSessionsFolder
+        )
+        return failures
     }
 
     /// Irreversible removal of one session file, bracketed by the durable-deletion reporter.
