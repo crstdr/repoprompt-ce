@@ -1126,6 +1126,9 @@ package enum MCPDomainCanonicalToolDefinitions {
                 isEnabledByDefault: definition.isEnabledByDefault
             )
         }
+        if definition.name == MCPWindowToolName.agentSessionLink {
+            return canonicalizeAgentSessionLink(definition)
+        }
         if definition.name == MCPWindowToolName.agentRun {
             let oldWaitDescription = "Returns `interaction_id` when input is pending."
             let currentWaitDescription = oldWaitDescription
@@ -1152,6 +1155,107 @@ package enum MCPDomainCanonicalToolDefinitions {
         return MCPDomainToolDefinition(
             name: definition.name,
             description: "List, inspect, and bind the canonical workspace context for this MCP connection. Bind by working_dirs (preferred) or context_id. This global tool never accepts an app window selector.",
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    // MARK: agent_session_link
+
+    private enum AgentSessionLinkPassiveUpdates {
+        static let operation = "set_passive_updates"
+        static let enabledProperty = "enabled"
+
+        static let operationsAnchor = "**Operations**: list | poll | wait | read | send | mark_done"
+        static let operations = operationsAnchor + " | " + operation
+
+        static let markDoneBulletAnchor = "- `mark_done`: mark the target Done only in this observer\u{2019}s dashboard when completion is clear for the current user instruction. It does not stop, cancel, message, acknowledge, or unlink the target; fresh target activity reopens the row."
+        static let bullets = markDoneBulletAnchor + "\n"
+            + "- `set_passive_updates`: turn coalesced status updates for your own overseen sessions on or off. It applies to all of your current links, changes only your own session\u{2019}s preference (it takes no session identifier and cannot address another session), and moves no link authority. Updates are attached to a future turn your user starts \u{2014} they never start, wake, or schedule one. Use `poll` \u{2192} `wait` when the current turn needs a change now. Enabling requires at least one active link; disabling is always allowed."
+
+        static let fieldSummaryAnchor = "**mark_done**: session_id (required)"
+        static let fieldSummary = fieldSummaryAnchor
+            + "\n**set_passive_updates**: enabled (required boolean); no session identifier is accepted"
+
+        static let enabledDescription = "[set_passive_updates] Required boolean. true starts coalesced status updates for your own current overseen sessions; false stops them and drops anything queued. Applies only to your own session."
+    }
+
+    /// Teaches the advertised `agent_session_link` schema its observer-scoped passive-update switch.
+    ///
+    /// Applied here rather than by re-encoding the blob, matching how `bind_context` already has a
+    /// property removed and its description replaced, and how `agent_run`'s help text is amended. What
+    /// clients bind is the output of this pass, so this *is* the schema authority for the operation,
+    /// not a test-only correction.
+    ///
+    /// Deliberately additive in the two places that decide whether a caller can discover the operation
+    /// at all — the `op` enum and a native Boolean `enabled` property — plus the three prose anchors
+    /// that teach its exact shape. `required` stays `["op"]`: `enabled` is mandatory *for this
+    /// operation only*, and the strict executor is what enforces that; hoisting it to the top level
+    /// would demand it of `list`, `poll`, and every other op.
+    ///
+    /// No identity property is added, and none may be: the caller is resolved from server-owned run
+    /// routing, so there is deliberately nothing here for one session to address another's preference
+    /// with.
+    ///
+    /// Idempotent, and loud about anything else. An already-amended definition is returned untouched
+    /// so a future blob refresh that bakes this in needs no coordinated removal; a definition that
+    /// matches neither shape means the encoded text moved out from under these anchors, and returning
+    /// a half-amended schema there would advertise an operation whose arguments cannot be described.
+    private static func canonicalizeAgentSessionLink(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"],
+              case var .object(operationProperty)? = properties["op"],
+              case let .array(operations)? = operationProperty["enum"],
+              case let .string(schemaDescription)? = schema["description"]
+        else {
+            preconditionFailure("agent_session_link canonical schema is not the expected object shape")
+        }
+
+        let alreadyAmended = operations.contains(.string(AgentSessionLinkPassiveUpdates.operation))
+            && properties[AgentSessionLinkPassiveUpdates.enabledProperty] != nil
+            && definition.description.contains(AgentSessionLinkPassiveUpdates.operations)
+            && schemaDescription.contains(AgentSessionLinkPassiveUpdates.fieldSummary)
+        if alreadyAmended { return definition }
+
+        guard definition.description.contains(AgentSessionLinkPassiveUpdates.operationsAnchor),
+              definition.description.contains(AgentSessionLinkPassiveUpdates.markDoneBulletAnchor),
+              schemaDescription.contains(AgentSessionLinkPassiveUpdates.fieldSummaryAnchor),
+              properties[AgentSessionLinkPassiveUpdates.enabledProperty] == nil,
+              !operations.contains(.string(AgentSessionLinkPassiveUpdates.operation))
+        else {
+            preconditionFailure("agent_session_link canonical definition no longer matches its passive-update anchors")
+        }
+
+        operationProperty["enum"] = .array(
+            operations + [.string(AgentSessionLinkPassiveUpdates.operation)]
+        )
+        properties["op"] = .object(operationProperty)
+        properties[AgentSessionLinkPassiveUpdates.enabledProperty] = .object([
+            "type": .string("boolean"),
+            "description": .string(AgentSessionLinkPassiveUpdates.enabledDescription)
+        ])
+        schema["properties"] = .object(properties)
+        schema["description"] = .string(schemaDescription.replacingOccurrences(
+            of: AgentSessionLinkPassiveUpdates.fieldSummaryAnchor,
+            with: AgentSessionLinkPassiveUpdates.fieldSummary
+        ))
+
+        let description = definition.description
+            .replacingOccurrences(
+                of: AgentSessionLinkPassiveUpdates.operationsAnchor,
+                with: AgentSessionLinkPassiveUpdates.operations
+            )
+            .replacingOccurrences(
+                of: AgentSessionLinkPassiveUpdates.markDoneBulletAnchor,
+                with: AgentSessionLinkPassiveUpdates.bullets
+            )
+
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: description,
             inputSchema: .object(schema),
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault

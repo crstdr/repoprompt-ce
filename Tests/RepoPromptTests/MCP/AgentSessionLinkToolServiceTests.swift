@@ -27,6 +27,15 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             ["op", "session_id", "message", "idempotency_key"]
         )
         XCTAssertEqual(AgentSessionLinkMCPToolService.markDoneKeys, ["op", "session_id"])
+        // The whole observer-scoping guarantee is structural: with no identity field of any kind
+        // there is nothing for one session to address another session's preference with.
+        XCTAssertEqual(AgentSessionLinkMCPToolService.setPassiveUpdatesKeys, ["op", "enabled"])
+        for forbidden in ["session_id", "session_ids", "observer_session_id", "link_id"] {
+            XCTAssertFalse(
+                AgentSessionLinkMCPToolService.setPassiveUpdatesKeys.contains(forbidden),
+                "set_passive_updates must accept no identity field (\(forbidden))"
+            )
+        }
         // `send` names exactly one target and never fans out; accepting `session_ids` would make one
         // invocation deliver several messages.
         XCTAssertFalse(AgentSessionLinkMCPToolService.sendKeys.contains("session_ids"))
@@ -367,6 +376,151 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - set_passive_updates
+
+    /// The tool changes the same authoritative preference the dashboard toggle does, and nothing else.
+    func testSetPassiveUpdatesSharesTheDashboardPreferenceAndReportsOnlyItsOwnState() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let observerEndpoint = fixture.observer.domainEndpoint
+
+        let enabledValue = try await fixture.service.execute(args: [
+            "op": .string("set_passive_updates"),
+            "enabled": .bool(true)
+        ])
+        let enabled = try XCTUnwrap(enabledValue.objectValue)
+        // Compact by contract: no target status, no queue contents, no counters the caller could
+        // mistake for delivery state.
+        XCTAssertEqual(Set(enabled.keys), ["result", "enabled", "active_link_count", "notice"])
+        XCTAssertEqual(enabled["result"], .string("changed"))
+        XCTAssertEqual(enabled["enabled"], .bool(true))
+        XCTAssertEqual(enabled["active_link_count"], .int(1))
+        let notice = try XCTUnwrap(enabled["notice"]?.stringValue)
+        XCTAssertTrue(notice.contains("never start"), "the result must state that nothing starts a turn")
+        XCTAssertFalse(
+            notice.contains(fixture.target.sessionID.uuidString),
+            "the result must not name a target"
+        )
+        XCTAssertEqual(
+            fixture.host.publishedProps[observerEndpoint]?.passiveNoticesEnabled,
+            true,
+            "the dashboard projection and the tool must read one authoritative preference"
+        )
+
+        let repeatedValue = try await fixture.service.execute(args: [
+            "op": .string("set_passive_updates"),
+            "enabled": .bool(true)
+        ])
+        let repeated = try XCTUnwrap(repeatedValue.objectValue)
+        XCTAssertEqual(repeated["result"], .string("unchanged"))
+        XCTAssertEqual(repeated["enabled"], .bool(true))
+
+        let disabledValue = try await fixture.service.execute(args: [
+            "op": .string("set_passive_updates"),
+            "enabled": .bool(false)
+        ])
+        let disabled = try XCTUnwrap(disabledValue.objectValue)
+        XCTAssertEqual(disabled["result"], .string("changed"))
+        XCTAssertEqual(disabled["enabled"], .bool(false))
+        XCTAssertEqual(
+            fixture.host.publishedProps[observerEndpoint]?.passiveNoticesEnabled,
+            false
+        )
+        // Turning narration off is not unlinking: the grant is untouched.
+        let stillLinked = await fixture.linkReference()
+        XCTAssertNotNil(stillLinked, "set_passive_updates must never move link authority")
+    }
+
+    /// Enabling asserts a caller that currently holds a link; disabling must stay reachable without
+    /// one, so a caller can always stop delivery.
+    func testSetPassiveUpdatesIsAsymmetricAboutLinks() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let existingReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(existingReference)
+        let stopped = await fixture.bridge.stopMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            targetSessionID: fixture.target.sessionID,
+            linkID: reference.linkID,
+            generation: reference.generation
+        )
+        XCTAssertEqual(stopped, .stopped)
+
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("set_passive_updates"),
+                "enabled": .bool(true)
+            ])
+            XCTFail("enabling passive updates without a link must be refused")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("Add a session to oversee"))
+        }
+
+        let disabledValue = try await fixture.service.execute(args: [
+            "op": .string("set_passive_updates"),
+            "enabled": .bool(false)
+        ])
+        let disabled = try XCTUnwrap(disabledValue.objectValue)
+        XCTAssertEqual(disabled["enabled"], .bool(false))
+        XCTAssertEqual(disabled["active_link_count"], .int(0))
+    }
+
+    /// One argument, and it has to be a real boolean: a coerced `"off"` would silently decide whether
+    /// the agent keeps receiving updates.
+    func testSetPassiveUpdatesRequiresANativeBooleanAndRejectsIdentityFields() async throws {
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parsePassiveUpdatesEnabled(nil))
+        XCTAssertThrowsError(
+            try AgentSessionLinkMCPToolService.parsePassiveUpdatesEnabled(.string("true"))
+        )
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parsePassiveUpdatesEnabled(.int(1)))
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parsePassiveUpdatesEnabled(.bool(true)), true)
+        XCTAssertEqual(
+            try AgentSessionLinkMCPToolService.parsePassiveUpdatesEnabled(.bool(false)),
+            false
+        )
+
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("set_passive_updates"),
+                "enabled": .bool(true),
+                "session_id": .string(fixture.target.sessionID.uuidString)
+            ])
+            XCTFail("set_passive_updates must reject every identity field")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("does not support 'session_id'"))
+            XCTAssertTrue("\(error)".contains("Supported fields: enabled, op"))
+        }
+        XCTAssertEqual(
+            fixture.host.publishedProps[fixture.observer.domainEndpoint]?.passiveNoticesEnabled,
+            false,
+            "a rejected call must leave the preference at its off default"
+        )
+    }
+
+    /// The missing-op and unsupported-op errors teach the same operation list the schema advertises.
+    func testOperationHelpNamesEverySupportedOperation() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        for op in ["list", "poll", "wait", "read", "send", "mark_done", "set_passive_updates"] {
+            XCTAssertTrue(
+                AgentSessionLinkMCPToolService.supportedOperationsSentence.contains(op),
+                "the supported-operation sentence must name \(op)"
+            )
+        }
+        for args in [[:], ["op": Value.string("set_passive")]] as [[String: Value]] {
+            do {
+                _ = try await fixture.service.execute(args: args)
+                XCTFail("an absent or unknown op must be refused")
+            } catch let error as MCPError {
+                XCTAssertTrue(
+                    "\(error)".contains(AgentSessionLinkMCPToolService.supportedOperationsSentence)
+                )
+            }
+        }
+    }
+
     // MARK: - Post-await release gate
 
     /// Regression (R4): a `read` that is authorized, suspends while its page is materialized off the
@@ -659,11 +813,15 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             AgentSessionLinkObservationToken {}
         }
 
+        /// Captured so a tool-driven preference change can be asserted against the *same* projection
+        /// the dashboard renders, rather than against a second copy of the state.
+        var publishedProps: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
+
         func agentSessionLinkPublishProjection(
-            _: AgentMonitorPillProps,
-            to _: DomainAgentSessionLinkEndpointIdentity
+            _ props: AgentMonitorPillProps,
+            to endpoint: DomainAgentSessionLinkEndpointIdentity
         ) {
-            // Oversee UI projection: nothing here reads it.
+            publishedProps[endpoint] = props
         }
 
         func agentSessionLinkPublishPromptInventory(
@@ -672,6 +830,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ) {
             // Prompt-supplement inventory: covered by the prompt renderer suite.
         }
+
+        func agentSessionLinkPublishPassiveStatusNotices(
+            _: AgentSessionLinkPassiveStatusNotices.Snapshot,
+            to _: DomainAgentSessionLinkEndpointIdentity
+        ) {}
 
         func agentSessionLinkWithholdPromptInventory(
             for _: DomainAgentSessionLinkEndpointIdentity

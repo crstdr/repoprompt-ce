@@ -38,6 +38,40 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    /// What the digest above is actually protecting for `agent_session_link`.
+    ///
+    /// The bound definition is the canonical one, not the provider's inline text, so this asserts on
+    /// the schema a real client receives: a caller can discover `set_passive_updates` and learn that
+    /// its one argument is a native boolean. `required` deliberately stays `["op"]` — `enabled` is
+    /// mandatory for this operation only, and the strict executor enforces that.
+    func testAgentSessionLinkAdvertisesThePassiveUpdatesOperationAndItsOnlyArgument() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentSessionLink })
+        let definition = try tool.domainBinding().definition
+        let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+
+        let operations = try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue)
+        XCTAssertEqual(
+            operations.compactMap(\.stringValue),
+            ["list", "poll", "wait", "read", "send", "mark_done", "set_passive_updates"]
+        )
+        XCTAssertEqual(properties["enabled"]?.objectValue?["type"]?.stringValue, "boolean")
+        XCTAssertEqual(
+            schema["required"]?.arrayValue?.compactMap(\.stringValue),
+            ["op"],
+            "`enabled` must not be demanded of every operation"
+        )
+        // No identity field may be advertised for it: the caller is resolved from run routing.
+        XCTAssertTrue(definition.description.contains("takes no session identifier"))
+        XCTAssertTrue(
+            try XCTUnwrap(schema["description"]?.stringValue)
+                .contains("**set_passive_updates**: enabled (required boolean); no session identifier is accepted")
+        )
+        XCTAssertTrue(definition.description.contains("never start, wake, or schedule one"))
+    }
+
     func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
         let generated = try MCPDomainCanonicalToolDefinitions.reviewSnapshotData()
         let repoRoot = try RepoRoot.url()
@@ -1453,7 +1487,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=d367738ad179d8f6b39b98f73082d594f53c42d771c4f2e512790593c5b3f9f4",
         "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=5a14b923d477ca1a06a4d27092c6781ac9b7c1157ceac6a0f219bc64ce522c96|schema=0b4f819f3aa6624df0f54fdaba6f8717ac64667d07a0528240d26905ba480520",
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=80d302d4391d6136f8acfbe8fc0bafe394c5110c5e63aefcf8f4c59fcbdbf95f|schema=83f34927eacac4dc6352db72eae312ac3a5477b2f70c9031f09a2101dc8f2e97",
-        "20|agent_session_link|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=4e1064233c9e930aa26551b190e678519156257a7d76116d2c345c0543f8f4c7|schema=0db2a3a0784ea6fc9f0419fc995a272009c158a5014f321fc68a794bf2640265",
+        "20|agent_session_link|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=116e119c9a8a4cefbeb9c0fb58568ab4c034e4f69bf7d70aff3ec2727614fce9|schema=d6718fb1fc8ecf6da00068b6b0f6f90e5d7b06428a4d83731b964828d791f369",
         "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
         "23|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",

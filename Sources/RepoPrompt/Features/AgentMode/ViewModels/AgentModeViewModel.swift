@@ -622,6 +622,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// still relying on.
     var agentSessionLinkNextPromptInventoryHoldToken: UInt64 = 0
 
+    /// Latest passive status-notice queue per endpoint session, published by the same bridge pass
+    /// that rebuilds `agentSessionLinkPromptInventoryBySessionID`.
+    ///
+    /// Cached beside the inventory rather than inside it: membership is authority state that decides
+    /// what the agent may be told, while this is observer-local delivery state that is joined to the
+    /// inventory at dispatch only while their link-set revisions still match.
+    ///
+    /// Each snapshot carries the exact incarnation it was reduced for, so a rebound tab reusing the
+    /// same session UUID is refused the previous incarnation's queue rather than inheriting it.
+    var agentSessionLinkPassiveNoticesBySessionID: [UUID: AgentSessionLinkPassiveStatusNotices.Snapshot] = [:]
+
     /// Ephemeral per-observer claim bookkeeping for the oversight prompt supplement.
     let agentSessionLinkPromptClaimStore = AgentSessionLinkOutboundPromptClaimStore()
 

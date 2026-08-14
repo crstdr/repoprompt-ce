@@ -156,23 +156,111 @@ struct AgentSessionLinkPromptEpochToken: Hashable {
     }
 }
 
-/// Identity of one observer *incarnation and eligibility state*.
+/// Exhaustive, nonlocalized identity of the **provider context** a supplement is rendered for.
 ///
-/// Acknowledgement bookkeeping keyed by session UUID alone is wrong twice over. An in-place rebind
-/// or a reopened tab reusing the same UUID is a different agent that must be taught oversight from
-/// scratch, and an eligibility flip changes what the observer is allowed to be told at an unchanged
-/// membership revision. Both transitions mint a new epoch, and a claim rendered in a prior epoch can
-/// never be acknowledged.
+/// Deliberately one case per `AgentProviderKind` rather than a collapsed "renders the same today"
+/// grouping, and deliberately not derived from a provider's localized display name. Two things ride
+/// on it: the model-visible tool reference the fragment names, and the fact that switching providers
+/// rebuilds the conversation the fragment was rendered into. Both are cheaper to over-report — one
+/// redundant supplement — than to miss, and the exhaustive switch below forces a new provider kind
+/// to state its own answer instead of inheriting one.
+enum AgentSessionLinkPromptProviderContext: String, Hashable, CaseIterable {
+    /// No provider has been selected for this session yet.
+    case unselected
+    case codexExec
+    case claudeCode
+    case claudeCodeGLM
+    case kimiCode
+    case customClaudeCompatible
+    case openCode
+    case cursor
+
+    init(agentKind: AgentProviderKind?) {
+        guard let agentKind else {
+            self = .unselected
+            return
+        }
+        switch agentKind {
+        case .codexExec: self = .codexExec
+        case .claudeCode: self = .claudeCode
+        case .claudeCodeGLM: self = .claudeCodeGLM
+        case .kimiCode: self = .kimiCode
+        case .customClaudeCompatible: self = .customClaudeCompatible
+        case .openCode: self = .openCode
+        case .cursor: self = .cursor
+        }
+    }
+}
+
+/// Identity of one observer *incarnation, provider context, and eligibility state*.
+///
+/// Acknowledgement bookkeeping keyed by session UUID alone is wrong three times over. An in-place
+/// rebind or a reopened tab reusing the same UUID is a different agent that must be taught oversight
+/// from scratch; a provider change hands the same agent a differently named tool inside a
+/// reconstructed context; and an eligibility flip changes what the observer is allowed to be told at
+/// an unchanged membership revision. Every one of those transitions mints a new epoch, and a claim
+/// rendered in a prior epoch can never be acknowledged.
 struct AgentSessionLinkPromptEpoch: Hashable {
     /// The exact live incarnation this claim state belongs to.
     let endpoint: DomainAgentSessionLinkEndpointIdentity
     /// Whether this incarnation may currently be told about its links at all.
     let allowsSupplement: Bool
+    /// Which provider runtime this incarnation is currently bound to.
+    let providerContext: AgentSessionLinkPromptProviderContext
+    /// The model-visible oversight tool name for `providerContext`.
+    ///
+    /// Carried on the epoch rather than recomputed at render time so the reference a fragment names
+    /// and the reference its cache is keyed by cannot disagree.
+    let toolReference: String
+
+    /// The defaults are the exact pair `agentKind: nil` produces, so an epoch built without provider
+    /// context is self-consistent rather than a mismatched discriminator/reference combination.
+    init(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        allowsSupplement: Bool,
+        providerContext: AgentSessionLinkPromptProviderContext = .unselected,
+        toolReference: String = MCPWindowToolName.agentSessionLink
+    ) {
+        self.endpoint = endpoint
+        self.allowsSupplement = allowsSupplement
+        self.providerContext = providerContext
+        self.toolReference = toolReference
+    }
+
+    /// Derives both provider-context fields from one agent kind, which is the only supported way to
+    /// build them in production.
+    init(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        allowsSupplement: Bool,
+        agentKind: AgentProviderKind?
+    ) {
+        self.init(
+            endpoint: endpoint,
+            allowsSupplement: allowsSupplement,
+            providerContext: AgentSessionLinkPromptProviderContext(agentKind: agentKind),
+            toolReference: AgentSessionLinkPrompts.toolReference(agentKind: agentKind)
+        )
+    }
+
+    /// Whether `other` names the same agent *and* the same provider context, differing at most in the
+    /// reversible eligibility bit.
+    ///
+    /// This is the line between a reset that clears acknowledgement bookkeeping and one that only
+    /// retires rendered fragments: eligibility flips back, an incarnation or provider change does not.
+    func hasSameProviderIncarnation(as other: AgentSessionLinkPromptEpoch) -> Bool {
+        endpoint == other.endpoint
+            && providerContext == other.providerContext
+            && toolReference == other.toolReference
+    }
 }
 
 // MARK: - Supplement decision
 
-/// What, if anything, the next accepted logical dispatch owes this observer.
+/// What, if anything, the next accepted logical dispatch owes this observer **about its membership**.
+///
+/// Deliberately not extended with a passive-status case. Membership context and a coalesced status
+/// batch can both be owed on one dispatch, so they are separate optional components of a single
+/// claim rather than mutually exclusive kinds.
 enum AgentSessionLinkPromptSupplementKind: String, Hashable {
     /// The current overseen-session inventory and its usage guidance.
     case inventory
@@ -351,24 +439,143 @@ enum AgentSessionLinkPromptSupplementDecision {
 
 // MARK: - Outbound claim
 
-/// A rendered supplement reserved for one logical dispatch and one membership revision.
+/// What one render was asked to produce for a single logical dispatch.
+///
+/// Membership context and a passive status batch can both be owed on one dispatch, so this is a pair
+/// of optionals rather than a single mutually exclusive kind. At least one is always present: the
+/// store never calls a renderer for a dispatch that owes nothing.
+struct AgentSessionLinkPromptRenderRequest {
+    /// The membership supplement owed, or `nil` when only passive status is owed.
+    let membershipKind: AgentSessionLinkPromptSupplementKind?
+    /// The membership this render may name. Always the *effective* inventory.
+    let inventory: AgentSessionLinkPromptInventory
+    /// The deliverable passive batch offered to this render, or `nil` when none is owed. Already
+    /// fenced by the store against endpoint, eligibility, revision, and grant membership.
+    let passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?
+    /// The model-visible tool name this fragment must use, taken from the epoch that keys its cache.
+    ///
+    /// Handed to the renderer rather than resolved by it, so the reference a fragment names and the
+    /// provider context that decides when that fragment goes stale are the same value by construction.
+    let toolReference: String
+
+    init(
+        membershipKind: AgentSessionLinkPromptSupplementKind?,
+        inventory: AgentSessionLinkPromptInventory,
+        passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?,
+        toolReference: String = MCPWindowToolName.agentSessionLink
+    ) {
+        self.membershipKind = membershipKind
+        self.inventory = inventory
+        self.passiveNotices = passiveNotices
+        self.toolReference = toolReference
+    }
+}
+
+/// One rendered fragment plus a truthful account of what of the passive batch it actually contains.
+///
+/// The renderer, not the store, owns the shared byte budget, so only the renderer can say whether the
+/// passive component fit. Reporting a `nil` `passiveBatch` is how it leaves that batch owed instead of
+/// letting an acceptance acknowledge content the model never received.
+struct AgentSessionLinkPromptRenderResult {
+    /// What one render actually put in front of the model for the batch it was offered.
+    ///
+    /// Empty `entries` with a non-`nil` value is a real, deliverable state — the overflow-only
+    /// envelope — which is why presence is modelled by the optional rather than by the entry count.
+    struct RenderedPassiveBatch: Equatable {
+        /// Entries actually rendered into `fragment`, in the order they appear.
+        let entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry]
+        /// The absolute producer-side overflow watermark the rendered envelope accounted for. Never
+        /// the displayed omitted delta, which cannot be acknowledged without under-counting.
+        let overflowProducedThrough: UInt64
+    }
+
+    let fragment: String
+    /// The passive component of `fragment`, or `nil` when the render carried none at all.
+    let passiveBatch: RenderedPassiveBatch?
+
+    init(
+        fragment: String,
+        passiveBatch: RenderedPassiveBatch? = nil
+    ) {
+        self.fragment = fragment
+        self.passiveBatch = passiveBatch
+    }
+}
+
+/// A rendered supplement reserved for one logical dispatch.
 ///
 /// The claim is provider-neutral: adapters differ only in *when* they compose and *what signal*
 /// counts as acceptance, never in what the fragment says.
+///
+/// One claim can carry a membership component, a passive status component, or both, because both can
+/// be owed on the same dispatch. They are acknowledged independently and by different owners: the
+/// claim store settles membership, while the bridge-owned queue settles the passive receipt.
 struct AgentSessionLinkOutboundPromptClaim: Hashable {
+    /// The membership half: what this fragment told the model about its overseen-session list.
+    struct MembershipComponent: Hashable {
+        let linkSetRevision: UInt64
+        let kind: AgentSessionLinkPromptSupplementKind
+        let hasLinks: Bool
+    }
+
+    /// Identity of the passive queue state one fragment was rendered *against*.
+    ///
+    /// Recorded even when the batch did not fit the byte budget, because it is what decides whether a
+    /// retry of the same dispatch may reuse this fragment: the fragment is only current while the
+    /// queue it was rendered against still is.
+    struct PassiveQueueFingerprint: Hashable {
+        let queueEpoch: UUID
+        let queueRevision: UInt64
+    }
+
+    /// The acknowledgement owed to the passive queue once the provider accepts this dispatch.
+    ///
+    /// Present only when the batch was actually rendered into `fragment`. It names the exact observer
+    /// incarnation whose queue produced it, so a receipt can never be applied to a replacement.
+    struct PassiveStatusComponent: Hashable {
+        let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+        let receipt: AgentSessionLinkPassiveStatusNotices.Receipt
+    }
+
     let observerSessionID: UUID
     let dispatchID: AgentSessionLinkPromptDispatchID
-    /// Store-minted, never-reused token for the incarnation/eligibility epoch this fragment was
-    /// rendered in. Any acknowledgement or abandonment carrying a superseded token is refused.
+    /// Store-minted, never-reused token for the incarnation/provider/eligibility epoch this fragment
+    /// was rendered in. Any membership acknowledgement or abandonment carrying a superseded token is
+    /// refused.
     ///
     /// A freshly minted `UUID` rather than a counter: `forget`/`retainOnly` delete an observer's whole
     /// state, so a counter would restart at the same value for the next incarnation of that session
     /// UUID and a late claim from the previous one would compare equal again.
     let epochToken: AgentSessionLinkPromptEpochToken
-    let linkSetRevision: UInt64
-    let kind: AgentSessionLinkPromptSupplementKind
+    /// `nil` for a passive-only claim: nothing about membership was said, so nothing about membership
+    /// may be acknowledged.
+    let membership: MembershipComponent?
+    /// Present whenever a deliverable batch was offered to the renderer, even if the budget omitted
+    /// it.
+    let passiveQueue: PassiveQueueFingerprint?
+    /// Present only when the batch was actually rendered into `fragment`.
+    let passive: PassiveStatusComponent?
     let fragment: String
-    let hasLinks: Bool
+
+    // MARK: Membership readers
+
+    /// The membership supplement this claim carries, or `nil` for a passive-only claim.
+    var kind: AgentSessionLinkPromptSupplementKind? {
+        membership?.kind
+    }
+
+    /// The membership revision this claim was rendered against, or `nil` for a passive-only claim.
+    var linkSetRevision: UInt64? {
+        membership?.linkSetRevision
+    }
+
+    /// Whether this claim's membership component named at least one target.
+    ///
+    /// `false` for a passive-only claim: it names sessions, but it does not hand the model an
+    /// inventory, so it is not what a closing notice would be closing out.
+    var hasLinks: Bool {
+        membership?.hasLinks ?? false
+    }
 }
 
 // MARK: - Claim store
@@ -383,6 +590,8 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
 ///    current revision instead — a queued turn never ships enqueue-time inventory.
 /// 4. Acceptance consumes the claim exactly once and acknowledges its revision.
 /// 5. A failed pre-acceptance attempt leaves the still-current claim pending.
+/// 6. A claim may also carry a passive status batch, whose acknowledgement this store deliberately
+///    does not own — the bridge-owned queue fences its receipt on its own epoch and revision.
 ///
 /// The pending table is explicitly bounded. A logical dispatch that fails before acceptance and is
 /// never retried under the same ID leaves its claim behind, and acceptance-driven pruning only runs
@@ -417,14 +626,14 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         var epochToken = AgentSessionLinkPromptEpochToken()
         /// The incarnation/eligibility pair `epochToken` currently stands for.
         var epochIdentity: AgentSessionLinkPromptEpoch?
-        /// The single rendered fragment for the current `(revision, kind)`.
+        /// The single rendered result for the current claim fingerprint.
         ///
-        /// Every claim at that revision stores this exact `String` instance, so N concurrent
+        /// Every claim with that fingerprint stores this exact `String` instance, so N concurrent
         /// dispatches share one buffer instead of duplicating a fragment that may approach the
-        /// renderer's byte budget.
-        var renderedRevision: UInt64?
-        var renderedKind: AgentSessionLinkPromptSupplementKind?
-        var renderedFragment: String?
+        /// renderer's byte budget. The fingerprint now includes the passive queue identity, so a queue
+        /// revision change invalidates the cache exactly as a membership revision change does.
+        var renderedFingerprint: ClaimFingerprint?
+        var renderedResult: AgentSessionLinkPromptRenderResult?
 
         mutating func removePending(_ dispatchID: AgentSessionLinkPromptDispatchID) {
             guard pending.removeValue(forKey: dispatchID) != nil else { return }
@@ -464,11 +673,16 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             epochIdentity = identity
             pending.removeAll()
             pendingOrder.removeAll()
-            renderedRevision = nil
-            renderedKind = nil
-            renderedFragment = nil
+            renderedFingerprint = nil
+            renderedResult = nil
             guard let previous else { return }
-            guard previous.endpoint == identity.endpoint else {
+            // A provider change is treated exactly like an incarnation change, and deliberately so.
+            // The fragment names a provider-specific tool reference, and the turn that carries it is
+            // assembled into a context the previous provider's history never entered — so nothing the
+            // old context acknowledged is evidence about the new one. The bridge-owned passive queue
+            // is untouched by this: it lives outside the store and is simply re-rendered against the
+            // new epoch.
+            guard previous.hasSameProviderIncarnation(as: identity) else {
                 lastAcceptedRevision = nil
                 lastAcceptedHadLinks = false
                 // Cleared on exactly the condition that clears the acknowledgement, and for the same
@@ -513,11 +727,16 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         ///
         /// Monotone: an older revision never lowers the mark, so a late retry of a superseded
         /// dispatch cannot rewind what the model may already hold.
+        ///
+        /// A passive-only claim deliberately records nothing here. The mark tracks *link-naming*
+        /// membership fragments, and a status envelope hands the model no inventory to retract. In
+        /// practice the distinction never fires: a dispatch that owes the inventory renders it in the
+        /// same claim, so a passive-only claim can only exist once membership was already settled.
         mutating func recordPossibleDelivery(of claim: AgentSessionLinkOutboundPromptClaim) {
-            guard claim.hasLinks else { return }
+            guard let membership = claim.membership, membership.hasLinks else { return }
             possiblyDeliveredLinkRevision = max(
-                possiblyDeliveredLinkRevision ?? claim.linkSetRevision,
-                claim.linkSetRevision
+                possiblyDeliveredLinkRevision ?? membership.linkSetRevision,
+                membership.linkSetRevision
             )
         }
 
@@ -526,15 +745,60 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         /// `claim(_:)` only reuses an existing entry when its revision matches the current one, so a
         /// pending claim rendered against a superseded revision is definitively terminal: even its
         /// own dispatch would re-render on retry.
+        ///
+        /// A passive-only claim is deliberately kept: it carries no membership revision, so membership
+        /// movement alone cannot make it stale. Its own passive fingerprint decides whether a retry
+        /// may reuse it, and the pending bound is what collects it if that retry never comes.
         mutating func retirePending(olderThan revision: UInt64) {
-            guard pendingOrder.contains(where: { pending[$0]?.linkSetRevision ?? 0 < revision })
+            guard pendingOrder.contains(where: { Self.isStale(pending[$0], olderThan: revision) })
             else { return }
             pendingOrder.removeAll { dispatchID in
                 guard let claim = pending[dispatchID] else { return true }
-                guard claim.linkSetRevision < revision else { return false }
+                guard Self.isStale(claim, olderThan: revision) else { return false }
                 pending.removeValue(forKey: dispatchID)
                 return true
             }
+        }
+
+        /// `static` so the predicate touches no other stored property while `pendingOrder` is being
+        /// mutated exclusively.
+        private static func isStale(
+            _ claim: AgentSessionLinkOutboundPromptClaim?,
+            olderThan revision: UInt64
+        ) -> Bool {
+            guard let membershipRevision = claim?.membership?.linkSetRevision else { return false }
+            return membershipRevision < revision
+        }
+    }
+
+    /// Everything that decides whether an already-rendered fragment is still the current one.
+    ///
+    /// Both halves are optional and both participate: a membership change, a queue change, or either
+    /// component appearing or disappearing all make a cached fragment stale.
+    private struct ClaimFingerprint: Hashable {
+        let membershipRevision: UInt64?
+        let membershipKind: AgentSessionLinkPromptSupplementKind?
+        let passiveQueue: AgentSessionLinkOutboundPromptClaim.PassiveQueueFingerprint?
+
+        init(
+            membershipKind: AgentSessionLinkPromptSupplementKind?,
+            inventory: AgentSessionLinkPromptInventory,
+            passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?
+        ) {
+            membershipRevision = membershipKind == nil ? nil : inventory.linkSetRevision
+            self.membershipKind = membershipKind
+            passiveQueue = passiveNotices.map {
+                AgentSessionLinkOutboundPromptClaim.PassiveQueueFingerprint(
+                    queueEpoch: $0.queueEpoch,
+                    queueRevision: $0.queueRevision
+                )
+            }
+        }
+
+        init(_ claim: AgentSessionLinkOutboundPromptClaim) {
+            membershipRevision = claim.membership?.linkSetRevision
+            membershipKind = claim.membership?.kind
+            passiveQueue = claim.passiveQueue
         }
     }
 
@@ -544,14 +808,21 @@ final class AgentSessionLinkOutboundPromptClaimStore {
 
     /// Reserves (or reuses) the supplement owed to `epoch.endpoint` for one logical dispatch.
     ///
-    /// - Parameter epoch: the caller's exact incarnation and current eligibility. A transition in
-    ///   either mints a new epoch, which retires every fragment rendered for the previous one.
-    /// - Returns: `nil` when nothing is owed. Callers must send undecorated text in that case.
+    /// - Parameters:
+    ///   - epoch: the caller's exact incarnation, provider context, and current eligibility. A
+    ///     transition in any of them mints a new epoch, which retires every fragment rendered for the
+    ///     previous one.
+    ///   - passiveNotices: the observer's latest published passive queue, if any. Fenced here rather
+    ///     than at the call site so every condition that may join a status batch to a dispatch is one
+    ///     truth table.
+    /// - Returns: `nil` when neither component is owed. Callers must send undecorated text in that
+    ///   case.
     func claim(
         dispatchID: AgentSessionLinkPromptDispatchID,
         epoch: AgentSessionLinkPromptEpoch,
         inventory: AgentSessionLinkPromptInventory,
-        render: (AgentSessionLinkPromptSupplementKind, AgentSessionLinkPromptInventory) -> String
+        passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
+        render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkOutboundPromptClaim? {
         let observerSessionID = inventory.observerSessionID
         // Fail closed on a mismatched pairing rather than filing one incarnation's claim under
@@ -570,58 +841,121 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         // caller builds the epoch flag and the effective inventory from a single eligibility
         // evaluation (`AgentModeViewModel.agentSessionLinkPromptContext`), so "suppressed" and
         // "collapsed to empty" cannot disagree.
-        guard let kind = AgentSessionLinkPromptSupplementDecision.decide(
+        let membershipKind = AgentSessionLinkPromptSupplementDecision.decide(
             currentRevision: inventory.linkSetRevision,
             hasLinks: !inventory.isEmpty,
             isEligibilitySuppressed: !epoch.allowsSupplement,
             lastAcceptedRevision: state.lastAcceptedRevision,
             lastAcceptedHadLinks: state.lastAcceptedHadLinks,
             possiblyDeliveredLinkRevision: state.possiblyDeliveredLinkRevision
-        ) else {
+        )
+        let passiveBatch = Self.deliverablePassiveBatch(
+            passiveNotices,
+            epoch: epoch,
+            inventory: inventory
+        )
+        guard membershipKind != nil || passiveBatch != nil else {
             // Nothing owed: drop any claim still parked against this dispatch so a superseded
             // fragment can never be picked up by a later attempt.
             state.removePending(dispatchID)
             return nil
         }
 
-        if let existing = state.pending[dispatchID],
-           existing.linkSetRevision == inventory.linkSetRevision,
-           existing.kind == kind
-        {
+        let fingerprint = ClaimFingerprint(
+            membershipKind: membershipKind,
+            inventory: inventory,
+            passiveNotices: passiveBatch
+        )
+        if let existing = state.pending[dispatchID], ClaimFingerprint(existing) == fingerprint {
             state.recordPossibleDelivery(of: existing)
             return existing
         }
 
-        // One rendered fragment per `(revision, kind)`, shared by reference across every dispatch
-        // that owes it, so the pending table's cost is its entry count rather than its entry count
-        // times the fragment size.
-        let fragment: String
-        if state.renderedRevision == inventory.linkSetRevision,
-           state.renderedKind == kind,
-           let cached = state.renderedFragment
-        {
-            fragment = cached
+        // One rendered result per fingerprint, shared by reference across every dispatch that owes
+        // it, so the pending table's cost is its entry count rather than its entry count times the
+        // fragment size.
+        let rendered: AgentSessionLinkPromptRenderResult
+        if state.renderedFingerprint == fingerprint, let cached = state.renderedResult {
+            rendered = cached
         } else {
-            fragment = render(kind, inventory)
-            state.renderedRevision = inventory.linkSetRevision
-            state.renderedKind = kind
-            state.renderedFragment = fragment
+            rendered = render(AgentSessionLinkPromptRenderRequest(
+                membershipKind: membershipKind,
+                inventory: inventory,
+                passiveNotices: passiveBatch,
+                toolReference: epoch.toolReference
+            ))
+            state.renderedFingerprint = fingerprint
+            state.renderedResult = rendered
+        }
+
+        // A batch the renderer could not fit leaves no receipt, so acceptance acknowledges nothing
+        // and the queue keeps it owed to a later dispatch. Partial acknowledgement is never offered.
+        var passiveComponent: AgentSessionLinkOutboundPromptClaim.PassiveStatusComponent?
+        if let passiveBatch, let renderedPassive = rendered.passiveBatch {
+            passiveComponent = AgentSessionLinkOutboundPromptClaim.PassiveStatusComponent(
+                observerEndpoint: epoch.endpoint,
+                receipt: AgentSessionLinkPassiveStatusNotices.Receipt(
+                    queueEpoch: passiveBatch.queueEpoch,
+                    queueRevision: passiveBatch.queueRevision,
+                    deliveredStatuses: renderedPassive.entries.map(
+                        AgentSessionLinkPassiveStatusNotices.DeliveredStatus.init
+                    ),
+                    overflowProducedThrough: renderedPassive.overflowProducedThrough
+                )
+            )
         }
 
         let claim = AgentSessionLinkOutboundPromptClaim(
             observerSessionID: observerSessionID,
             dispatchID: dispatchID,
             epochToken: state.epochToken,
-            linkSetRevision: inventory.linkSetRevision,
-            kind: kind,
-            fragment: fragment,
-            hasLinks: !inventory.isEmpty
+            membership: membershipKind.map {
+                AgentSessionLinkOutboundPromptClaim.MembershipComponent(
+                    linkSetRevision: inventory.linkSetRevision,
+                    kind: $0,
+                    hasLinks: !inventory.isEmpty
+                )
+            },
+            passiveQueue: fingerprint.passiveQueue,
+            passive: passiveComponent,
+            fragment: rendered.fragment
         )
         state.setPending(claim)
         // Recorded at hand-off, not at dispatch: the store never learns whether the caller's transport
         // succeeded, so this is the only point where the possibility is knowable at all.
         state.recordPossibleDelivery(of: claim)
         return claim
+    }
+
+    /// The passive batch, if any, that may ride along with this exact dispatch.
+    ///
+    /// Every condition fails closed and none of them relaxes authorization. In order: the observer
+    /// must currently be allowed a supplement at all; the snapshot must have been reduced for *this*
+    /// exact incarnation; passive updates must be on and currently deliverable; there must be
+    /// something to say — entries, or unacknowledged overflow on its own, which is how a dropped-change
+    /// count reaches the agent and gets acknowledged even when no entry survives to carry it; and the
+    /// queue's membership revision must equal the effective inventory's, so
+    /// a batch reduced across a membership change waits for the bridge to republish rather than
+    /// shipping against a list that has moved. The final grant check is belt-and-braces on top of that
+    /// revision match: a status notice may only ever name a session this dispatch is also allowed to
+    /// be told it oversees.
+    private static func deliverablePassiveBatch(
+        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot?,
+        epoch: AgentSessionLinkPromptEpoch,
+        inventory: AgentSessionLinkPromptInventory
+    ) -> AgentSessionLinkPassiveStatusNotices.Snapshot? {
+        guard let snapshot,
+              epoch.allowsSupplement,
+              snapshot.observerEndpoint == epoch.endpoint,
+              snapshot.isEnabled,
+              snapshot.isDeliverable,
+              snapshot.hasDeliverableContent,
+              !inventory.isEmpty,
+              snapshot.linkSetRevision == inventory.linkSetRevision
+        else { return nil }
+        let granted = Set(inventory.items.map(\.targetSessionID))
+        guard snapshot.entries.allSatisfy({ granted.contains($0.targetSessionID) }) else { return nil }
+        return snapshot
     }
 
     /// Releases the claim parked against a definitively terminal logical dispatch.
@@ -660,6 +994,14 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         guard var state = states[claim.observerSessionID] else { return }
         guard state.epochToken == claim.epochToken else { return }
         state.removePending(claim.dispatchID)
+        // A passive-only claim settles nothing here. Its receipt belongs to the bridge-owned queue,
+        // which fences it on its own epoch and revision, so this store neither applies nor blocks it.
+        // That separation is what keeps a stale passive receipt from suppressing a valid membership
+        // acknowledgement and vice versa.
+        guard let membership = claim.membership else {
+            states[claim.observerSessionID] = state
+            return
+        }
         // Resolving the ambiguity `claim(_:)` recorded cannot wait for the forward-acknowledgement
         // gate below. A closing notice acknowledged at an already-acknowledged empty state is not a
         // forward move — its `(revision, hadLinks)` pair is unchanged — yet that is exactly the
@@ -669,33 +1011,35 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         //
         // A confirmed closing notice only covers exposure at or below its own revision, so a newer
         // unacknowledged inventory keeps its mark and still earns its own notice.
-        if !claim.hasLinks,
+        if !membership.hasLinks,
            let exposedRevision = state.possiblyDeliveredLinkRevision,
-           exposedRevision <= claim.linkSetRevision
+           exposedRevision <= membership.linkSetRevision
         {
             state.possiblyDeliveredLinkRevision = nil
         }
         guard AgentSessionLinkPromptSupplementDecision.isForwardAcknowledgement(
             lastAcceptedRevision: state.lastAcceptedRevision,
             lastAcceptedHadLinks: state.lastAcceptedHadLinks,
-            claimRevision: claim.linkSetRevision,
-            claimHasLinks: claim.hasLinks
+            claimRevision: membership.linkSetRevision,
+            claimHasLinks: membership.hasLinks
         ) else {
             states[claim.observerSessionID] = state
             return
         }
-        state.lastAcceptedRevision = claim.linkSetRevision
-        state.lastAcceptedHadLinks = claim.hasLinks
+        state.lastAcceptedRevision = membership.linkSetRevision
+        state.lastAcceptedHadLinks = membership.hasLinks
         // A confirmed inventory pins the exposure at its own revision. The closing-notice half of
         // this rule ran above, before the gate, because it must also apply to an acknowledgement
         // that moves nothing else.
-        if claim.hasLinks {
-            state.possiblyDeliveredLinkRevision = claim.linkSetRevision
+        if membership.hasLinks {
+            state.possiblyDeliveredLinkRevision = membership.linkSetRevision
         }
         // Retires every other pending claim at or below the acknowledged revision, including the
-        // superseded inventory claims of a same-revision eligibility loss.
+        // superseded inventory claims of a same-revision eligibility loss. Passive-only claims carry
+        // no membership revision and are deliberately left alone: their dispatches are still live.
         for dispatchID in state.pendingOrder
-            where (state.pending[dispatchID]?.linkSetRevision ?? 0) <= claim.linkSetRevision
+            where (state.pending[dispatchID]?.membership?.linkSetRevision)
+            .map({ $0 <= membership.linkSetRevision }) == true
         {
             state.removePending(dispatchID)
         }

@@ -112,12 +112,20 @@ extension AgentModeRunService {
         /// Runners call this immediately before the physical provider send, never at enqueue time: a
         /// queued or requeued turn must render the membership revision that is current when it
         /// actually dispatches.
+        ///
+        /// One claim can carry membership context, a coalesced passive target-status batch, or both.
+        /// Runners deliberately cannot tell which: the claim is opaque here, there is no
+        /// status-specific API, and the passive half never starts, wakes, or schedules a turn — it
+        /// only rides along with a dispatch the runner was already making.
         let claimAgentSessionLinkPrompt: (
             AgentTabSession,
             AgentSessionLinkPromptDispatchID
         ) -> AgentSessionLinkOutboundPromptClaim?
         /// Acknowledges a claim at the provider's acceptance signal. Consuming is exactly-once; a
         /// failed or unknown-outcome attempt simply never calls this and leaves the claim pending.
+        ///
+        /// Whichever components the claim carried are settled by their own owners behind this one
+        /// call, so a runner never has to know a passive batch was involved.
         let acceptAgentSessionLinkPrompt: (AgentSessionLinkOutboundPromptClaim) -> Void
 
         /// Attaches the cross-window oversight supplement to an already-built provider message.
@@ -126,7 +134,7 @@ extension AgentModeRunService {
         /// supplement is always the final RepoPrompt envelope in the user-message channel and never
         /// displaces user-controlled content. `AgentMessage.systemPrompt` is untouched: resumed ACP
         /// and headless providers deliberately omit it, and the base instructions are not a valid
-        /// channel for changing inventory.
+        /// channel for changing inventory or for target status that changes between turns.
         func decoratedAgentMessage(
             _ message: AgentMessage,
             session: AgentTabSession,

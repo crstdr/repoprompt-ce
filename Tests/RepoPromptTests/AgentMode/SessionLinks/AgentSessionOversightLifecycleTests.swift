@@ -58,6 +58,11 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             to _: DomainAgentSessionLinkEndpointIdentity
         ) {}
 
+        func agentSessionLinkPublishPassiveStatusNotices(
+            _: AgentSessionLinkPassiveStatusNotices.Snapshot,
+            to _: DomainAgentSessionLinkEndpointIdentity
+        ) {}
+
         func agentSessionLinkWithholdPromptInventory(
             for _: DomainAgentSessionLinkEndpointIdentity
         ) -> UInt64? {
