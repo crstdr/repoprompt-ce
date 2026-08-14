@@ -108,22 +108,61 @@ extension AgentModeRunService {
         /// Records whether a staged handoff payload was accepted by the provider send attempt.
         let recordPendingHandoffSendOutcome: (_ session: AgentTabSession, _ didSend: Bool) -> Void
         /// Reserves the cross-window oversight supplement owed to one logical outbound dispatch.
+        ///
+        /// Typed rather than optional because one of its refusals is a hard abort: a dispatch that
+        /// exists only to carry a lane batch must make no provider call when that batch is
+        /// unavailable, and an optional cannot say that.
         let claimAgentSessionLinkPrompt: (
             AgentTabSession,
             AgentSessionLinkPromptDispatchID
-        ) -> AgentSessionLinkOutboundPromptClaim?
+        ) -> AgentSessionLinkPromptClaimOutcome
+        /// Acquires the physical provider boundary. Returns false when a prepared auto-wake lost
+        /// ownership before the transport call; ordinary dispatches always pass through.
+        let acquireAgentSessionLinkPhysicalDispatch: (
+            AgentTabSession,
+            AgentSessionLinkPromptDispatchID
+        ) -> Bool
+        /// Settles a prepared auto-wake after a definite final exit before the transport call.
+        let recordAgentSessionLinkPhysicalDispatchNotAttempted: (
+            AgentTabSession,
+            AgentSessionLinkPromptDispatchID
+        ) -> Void
+        /// Records a transport failure after the physical boundary but before acceptance.
+        let recordAgentSessionLinkPhysicalDispatchFailure: (
+            AgentTabSession,
+            AgentSessionLinkPromptDispatchID
+        ) -> Void
         /// Acknowledges a claim at the provider's acceptance signal.
         let acceptAgentSessionLinkPrompt: (AgentSessionLinkOutboundPromptClaim) -> Void
 
         /// Attaches the cross-window oversight supplement to an already-built provider message.
+        ///
+        /// Every runner must consult `mustAbortDispatch` before its transport call. This is the one
+        /// seam all four provider families share, so honouring it here is what makes the requirement
+        /// impossible to satisfy in one family and forget in another.
         func decoratedAgentMessage(
             _ message: AgentMessage,
             session: AgentTabSession,
             dispatchID: AgentSessionLinkPromptDispatchID
-        ) -> (message: AgentMessage, claim: AgentSessionLinkOutboundPromptClaim?) {
-            let claim = claimAgentSessionLinkPrompt(session, dispatchID)
-            return (AgentSessionLinkPromptComposer.decorated(message, with: claim), claim)
+        ) -> AgentSessionLinkDecoratedAgentMessage {
+            let outcome = claimAgentSessionLinkPrompt(session, dispatchID)
+            return AgentSessionLinkDecoratedAgentMessage(
+                message: AgentSessionLinkPromptComposer.decorated(message, with: outcome.claim),
+                claim: outcome.claim,
+                mustAbortDispatch: outcome.mustAbortDispatch
+            )
         }
+    }
+
+    /// One composed provider message plus what the caller owes and may do with it.
+    ///
+    /// Named for the same reason its text-shaped sibling is: a tuple would let a call site keep
+    /// compiling while silently ignoring the abort.
+    struct AgentSessionLinkDecoratedAgentMessage {
+        let message: AgentMessage
+        let claim: AgentSessionLinkOutboundPromptClaim?
+        /// The dispatch required a lane batch it could not be given. Make no physical provider call.
+        let mustAbortDispatch: Bool
     }
 
     /// Cancellation of pending approvals/questions/reviews when a run settles.

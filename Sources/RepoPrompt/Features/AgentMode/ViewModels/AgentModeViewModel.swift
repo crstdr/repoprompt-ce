@@ -1713,11 +1713,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
             },
             decorateAgentSessionLinkPrompt: { [weak self] text, session, dispatchID in
-                self?.agentSessionLinkDecoratedProviderText(
+                guard let self else {
+                    return .init(
+                        text: text,
+                        claim: nil,
+                        mustAbortDispatch: Self.dispatchRequiresLaneBatch(session, dispatchID)
+                    )
+                }
+                return agentSessionLinkDecoratedProviderText(
                     text,
                     session: session,
                     dispatchID: dispatchID
-                ) ?? (text, nil)
+                )
+            },
+            acquireAgentSessionLinkPhysicalDispatch: { [weak self] session, dispatchID in
+                guard let self else {
+                    return !Self.dispatchRequiresLaneBatch(session, dispatchID)
+                }
+                return agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
+            },
+            recordAgentSessionLinkPhysicalDispatchNotAttempted: { [weak self] session, dispatchID in
+                self?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+            },
+            recordAgentSessionLinkPhysicalDispatchFailure: { [weak self] session, dispatchID in
+                self?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
             },
             acceptAgentSessionLinkPromptClaim: { [weak self] claim in
                 self?.acceptAgentSessionLinkPromptClaim(claim)
@@ -2542,7 +2561,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     self?.recordPendingHandoffSendOutcome(for: session, didSend: didSend)
                 },
                 claimAgentSessionLinkPrompt: { [weak self] session, dispatchID in
-                    self?.agentSessionLinkPromptClaim(for: session, dispatchID: dispatchID)
+                    guard let self else {
+                        return Self.dispatchRequiresLaneBatch(session, dispatchID)
+                            ? .requiredLaneBatchUnavailable
+                            : .nothingOwed
+                    }
+                    return agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
+                },
+                acquireAgentSessionLinkPhysicalDispatch: { [weak self] session, dispatchID in
+                    guard let self else {
+                        return !Self.dispatchRequiresLaneBatch(session, dispatchID)
+                    }
+                    return agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
+                },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { [weak self] session, dispatchID in
+                    self?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                },
+                recordAgentSessionLinkPhysicalDispatchFailure: { [weak self] session, dispatchID in
+                    self?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
                 },
                 acceptAgentSessionLinkPrompt: { [weak self] claim in
                     self?.acceptAgentSessionLinkPromptClaim(claim)
@@ -4023,6 +4059,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.selectedModelRaw = normalizedSelection.modelRaw
         session.selectedReasoningEffortRaw = indexEntry.agentReasoningEffortRaw
         session.autoEditEnabled = indexEntry.autoEditEnabled
+        session.autoWakeOnOversightUpdates = indexEntry.autoWakeOnOversightUpdates
     }
 
     func applyTranscriptViewportBindingState(
@@ -4853,6 +4890,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    /// Applies the durable observer setting and conservative anti-chain predicate during hydration.
+    /// Kept as one seam so tests exercise the same restoration transition as the full payload path.
+    func restoreAgentSessionLinkState(from agentSession: AgentSession, to session: TabSession) {
+        session.autoWakeOnOversightUpdates = agentSession.autoWakeOnOversightUpdates
+        // Reconstructed before anything can publish a queue against this incarnation, so a session
+        // that was auto-woken just before quitting cannot start a second autonomous turn on its first
+        // post-restore status edge.
+        session.agentSessionLinkTurnOrigin = .restored(
+            requiresLocalUserInstruction: agentSession.agentSessionLinkRequiresLocalUserInstruction
+        )
+    }
+
     @discardableResult
     private func applyPersistedHydration(
         _ payload: AgentSessionHydrationPayload,
@@ -4920,6 +4969,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         session.autoEditEnabled = agentSession.autoEditEnabled
+        restoreAgentSessionLinkState(from: agentSession, to: session)
         codexCoordinator.normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
 
         session.runState = payload.normalizedRunState
@@ -7077,6 +7127,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 agentModelRaw: existingEntry.agentModelRaw,
                 agentReasoningEffortRaw: existingEntry.agentReasoningEffortRaw,
                 autoEditEnabled: existingEntry.autoEditEnabled,
+                autoWakeOnOversightUpdates: existingEntry.autoWakeOnOversightUpdates,
                 parentSessionID: parentSessionID,
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
@@ -7099,6 +7150,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentModelRaw: session.selectedModelRaw,
             agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
             autoEditEnabled: session.autoEditEnabled,
+            autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
             parentSessionID: parentSessionID,
             isMCPOriginated: session.isMCPOriginated
         )
@@ -11230,6 +11282,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         agentModelRaw: String?,
         agentReasoningEffortRaw: String?,
         autoEditEnabled: Bool,
+        autoWakeOnOversightUpdates: Bool = false,
         parentSessionID: UUID? = nil,
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
@@ -11248,6 +11301,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentModelRaw: agentModelRaw,
             agentReasoningEffortRaw: agentReasoningEffortRaw,
             autoEditEnabled: autoEditEnabled,
+            autoWakeOnOversightUpdates: autoWakeOnOversightUpdates,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
@@ -12841,6 +12895,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 codexRolloutPath: session.codexRolloutPath
             ),
             autoEditEnabled: session.autoEditEnabled,
+            autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
+            // The durable half of "automatic turns never chain". Only the predicate travels: the wake
+            // ID or source session behind a non-local origin dies with the process.
+            agentSessionLinkRequiresLocalUserInstruction: session.agentSessionLinkTurnOrigin
+                .persistedRequiresLocalUserInstruction,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
             parentSessionID: session.parentSessionID,
             pendingHandoffPayload: session.pendingHandoff.payload,
@@ -12890,6 +12949,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 agentModelRaw: agentSession.agentModel,
                 agentReasoningEffortRaw: agentSession.agentReasoningEffort,
                 autoEditEnabled: agentSession.autoEditEnabled,
+                autoWakeOnOversightUpdates: agentSession.autoWakeOnOversightUpdates,
                 parentSessionID: agentSession.parentSessionID,
                 isMCPOriginated: agentSession.isMCPOriginated,
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
@@ -13986,7 +14046,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // A locally accepted instruction always clears an earlier cross-session origin. This is the
         // single acceptance point for every local user turn, including waiting-instruction
         // continuations, so the mutual-link loop guard reopens exactly when the user speaks again.
+        session.agentSessionLinkLocalInputEpoch &+= 1
         session.agentSessionLinkTurnOrigin = .localUser
+        // Same point, and deliberately so: this is where the local user takes the submission gate.
+        // A wake that has not yet reached its own dispatch boundary loses here and is released with
+        // no provider call and no row — its queued content simply rides this turn instead. A wake
+        // that already owns the gate is left alone: its physical call may be in flight, so the user's
+        // turn queues behind it as the next accepted successor rather than racing it.
+        if let observerEndpoint = agentSessionLinkObserverEndpoint(tabID: tabID) {
+            cancelAgentSessionLinkAutoWake(for: observerEndpoint, reason: .localUserWon)
+        }
         updateBindingsFromSession(session)
         scheduleSave(for: tabID)
 
@@ -14194,7 +14263,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         agent: session.selectedAgent,
                         session: session
                     )
-                    guard let liveContinuation = session.instructionContinuation else { return }
+                    guard session.instructionContinuation != nil else { return }
                     // The waiting-instruction continuation is the provider's next turn for a run that
                     // is already in flight, so it needs the same supplement as an ordinary send. It is
                     // composed here, after augmentation and immediately before the atomic one-shot
@@ -14208,26 +14277,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         session: session,
                         dispatchID: waitDispatchID
                     )
-                    // Estimated from the decorated text, not the augmented text: `monitoring.text` is
-                    // what the provider is actually handed, and the supplement it may carry can run to
-                    // the renderer's full byte budget. Measuring the undecorated string would leave
-                    // that entirely outside usage accounting.
-                    let resumedTurnTokens = Self.estimateRuntimeTokens(for: monitoring.text)
-                    addUserInputTokensToActiveNonCodexTurn(resumedTurnTokens, for: session)
-                    session.instructionTimeoutTask?.cancel()
-                    session.instructionTimeoutTask = nil
-                    session.instructionContinuation = nil
-                    session.instructionWaitID = nil
-                    session.waitingPrompt = nil
-                    session.runState = .running
-                    updateBindingsFromSession(session)
-                    liveContinuation.resume(returning: UserInstructionResponse(
-                        text: monitoring.text,
-                        timedOut: false,
-                        elapsedSeconds: 0
-                    ))
-                    // Successful `resume(returning:)` is the acceptance boundary.
-                    acceptAgentSessionLinkPromptClaim(monitoring.claim)
+                    resumeWaitingInstructionContinuation(
+                        session: session,
+                        providerText: monitoring.text,
+                        claim: monitoring.claim,
+                        origin: .user
+                    )
                 }
                 return UserTurnSubmissionResult.submitted
             }
@@ -15520,16 +15575,48 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
         }
+        // The one provider-neutral fence for an automatic lane-update turn, placed here because this
+        // is the last app-owned instant before *every* provider family (Codex start/fallback, Claude
+        // native, ACP prompt, headless stream) is reached through `runService.startRun`.
+        //
+        // A lane update has no user-authored base instruction, so the rendered lane claim is its
+        // entire justification and its entire new provider input. The claim store refuses an
+        // auto-wake claim whose batch was revoked, already acknowledged, revision-mismatched, or
+        // omitted by the shared 24 KiB budget — and without this guard that refusal would surface as
+        // an empty, system-only turn rather than as no turn at all. Reserving here is idempotent: the
+        // provider's own claim later resolves to this same pending claim through
+        // `agentSessionLinkEffectiveDispatchID`, so nothing is rendered or acknowledged twice.
+        //
+        // Aborting quietly is the contract: no provider call, no error row, no provenance row, and
+        // the lane content stays owed to a natural future dispatch.
+        if let laneUpdateWakeID = directStartOptions.laneUpdateWakeID {
+            guard agentSessionLinkPromptClaim(
+                for: session,
+                dispatchID: .autoWake(
+                    wakeID: laneUpdateWakeID,
+                    localInputEpoch: session.agentSessionLinkLocalInputEpoch
+                )
+            ) != nil else {
+                startOutcome?.recordStartFailure(message: nil)
+                return nil
+            }
+        }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         await prepareMCPWaitTrackingForRunStart(session: session)
-        let augmentedInitialMessage = await augmentUserMessageForProviderSend(
-            initialMessage,
-            attachments: attachments,
-            taggedFileAttachments: taggedFileAttachments,
-            agent: session.selectedAgent,
-            session: session,
-            ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff
-        )
+        // A lane update has no user-authored base instruction, so every augmentation this applies —
+        // skill context, tagged-file expansion, attachment rendering, staged handoff — is user-only
+        // work with nothing to act on. Skipping it is what keeps the turn's only new provider input
+        // the rendered lane claim the supplement path attaches.
+        let augmentedInitialMessage = directStartOptions.isLaneUpdate
+            ? initialMessage
+            : await augmentUserMessageForProviderSend(
+                initialMessage,
+                attachments: attachments,
+                taggedFileAttachments: taggedFileAttachments,
+                agent: session.selectedAgent,
+                session: session,
+                ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff
+            )
 
         let initialMessageForRun = await buildInitialThreadMessageIfNeeded(
             tabID: tabID,
@@ -16912,6 +16999,73 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             timeoutSeconds: timeoutSeconds,
             lifecycleTarget: target
         )
+    }
+
+    /// The single consumption path for a one-shot waiting-instruction continuation.
+    ///
+    /// Two callers resume the same continuation — the local user's waiting-turn submission and
+    /// RepoPrompt's own lane-update follow-up — and they are deliberately *one* function rather than
+    /// two similar ones. The waiting-state teardown (timeout task, wait ID, waiting prompt, run
+    /// state) has to be identical or a resumed run is left describing a wait that no longer exists,
+    /// and the difference between the two callers has to be stated in one place instead of being a
+    /// property of which copy happened to be edited.
+    ///
+    /// `origin` is what that difference is: it is carried on the response rather than inferred from
+    /// the text, because a lane-update envelope is byte-wise indistinguishable from a user
+    /// instruction that happens to quote one.
+    ///
+    /// - `.user`: the resumed turn is the user's, so its provider text is charged to the user input
+    ///   budget exactly as an ordinary send is.
+    /// - `.laneUpdateAutoWake`: RepoPrompt authored the envelope. Nothing here attributes authorship
+    ///   to the user — no `.user` row, no `lastUserMessageAt` movement, no user token charge, and no
+    ///   staged handoff consumption — and the anti-chain origin is deliberately *not* reset to
+    ///   `.localUser`; `acceptAgentSessionLinkPromptClaim` moves it to the lane-update origin instead,
+    ///   which is what stops one automatic turn from arming the next.
+    ///
+    /// Successful `resume(returning:)` is the physical acceptance boundary for this route, exactly as
+    /// it already was for an ordinary instruction. No acceptance point moves earlier.
+    ///
+    /// - Returns: `false` when the continuation was already consumed or cancelled, in which case
+    ///   nothing was resumed and `claim` is deliberately left unacknowledged.
+    @discardableResult
+    func resumeWaitingInstructionContinuation(
+        session: TabSession,
+        providerText: String,
+        claim: AgentSessionLinkOutboundPromptClaim?,
+        origin: UserInstructionResponse.Origin
+    ) -> Bool {
+        guard let continuation = session.instructionContinuation else { return false }
+        switch origin {
+        case .user:
+            // Estimated from the decorated text, not the augmented text: this is what the provider is
+            // actually handed, and the supplement it may carry can run to the renderer's full byte
+            // budget. Measuring the undecorated string would leave that entirely outside accounting.
+            addUserInputTokensToActiveNonCodexTurn(
+                Self.estimateRuntimeTokens(for: providerText),
+                for: session
+            )
+        case .laneUpdateAutoWake:
+            // This is provider-consumed system-origin input, not user-authored input. Account it in
+            // the non-user input bucket so context/cost estimates stay truthful without impersonating
+            // the local user.
+            addToolInputTokens(providerText, for: session)
+        }
+        session.instructionTimeoutTask?.cancel()
+        session.instructionTimeoutTask = nil
+        session.instructionContinuation = nil
+        session.instructionWaitID = nil
+        session.waitingPrompt = nil
+        session.runState = .running
+        updateBindingsFromSession(session)
+        continuation.resume(returning: UserInstructionResponse(
+            text: providerText,
+            timedOut: false,
+            elapsedSeconds: 0,
+            origin: origin
+        ))
+        // Successful `resume(returning:)` is the acceptance boundary.
+        acceptAgentSessionLinkPromptClaim(claim)
+        return true
     }
 
     // MARK: - Ask User Question (MCP Tool Support)

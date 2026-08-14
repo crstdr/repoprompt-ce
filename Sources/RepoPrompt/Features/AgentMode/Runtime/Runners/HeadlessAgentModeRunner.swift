@@ -183,6 +183,26 @@ final class HeadlessAgentModeRunner {
                 session: session,
                 dispatchID: .headlessRun(runID: runID)
             )
+            // A dispatch that exists only to carry a lane batch has nothing to say without it, so it
+            // is retracted here rather than sent empty. Cancellation is the quiet terminal: no
+            // provider call, no error row, and the batch stays owed to a later dispatch.
+            guard !monitoring.mustAbortDispatch else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                    session,
+                    .headlessRun(runID: runID)
+                )
+                throw CancellationError()
+            }
+            guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+                session,
+                .headlessRun(runID: runID)
+            ) else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                    session,
+                    .headlessRun(runID: runID)
+                )
+                throw CancellationError()
+            }
             let stream = try await provider.streamAgentMessage(monitoring.message, runID: runID)
             // Successful stream creation is the acceptance signal for every headless provider,
             // including Claude headless. A throwing creation leaves the claim pending for the retry.
@@ -215,6 +235,12 @@ final class HeadlessAgentModeRunner {
         }
 
         guard case let .terminal(outcome) = report.result else { return }
+        if !providerInitializationCompleted {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                session,
+                .headlessRun(runID: runID)
+            )
+        }
         let terminalState: AgentSessionRunState
         let source: String
         let notifyTurnComplete: Bool

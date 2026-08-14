@@ -153,7 +153,67 @@ final class AgentTabSession: ObservableObject {
     /// Explicit change channel for cross-window oversight inputs that are not `@Published`.
     let monitorObservationSignal = PassthroughSubject<Void, Never>()
 
-    private func noteMonitorObservationInputsChanged() {
+    /// Every change channel that can move this session's send/wake readiness.
+    ///
+    /// The merged set is explicit and includes both review publishers. Non-`@Published` readiness
+    /// inputs reach it through `monitorObservationSignal`, which is the only way terminal-commit,
+    /// follow-up/steering/composer-queue, binding-transition, and hydration changes can wake an
+    /// observer.
+    ///
+    /// Owned here, beside the state it reports on, and shared by both readers: the cross-window
+    /// oversight observation and the auto-wake coordinator's settlement wait. Two copies of this list
+    /// would be two chances to forget a blocker — and the auto-wake copy forgetting one means an
+    /// attempt parks forever waiting for an event that is never published.
+    var monitorReadinessChangePublisher: AnyPublisher<Void, Never> {
+        Publishers.MergeMany([
+            $runState.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $items.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $waitingPrompt.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingAskUser.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingUserInputRequest.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingApproval.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingPermissionsRequest.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingMCPElicitationRequest.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingApplyEditsReview.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingWorktreeMergeReview.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            monitorObservationSignal.eraseToAnyPublisher()
+        ])
+        .eraseToAnyPublisher()
+    }
+
+    /// Monotonic ownership fence advanced at the single local-instruction acceptance point.
+    /// Auto-wake dispatch IDs carry the value they observed so late provider callbacks cannot
+    /// overwrite a newer local-user origin.
+    var agentSessionLinkLocalInputEpoch: UInt64 = 0
+
+    /// The one automatic lane-update follow-up this exact incarnation has reserved, if any.
+    ///
+    /// Ephemeral by construction: it lives beside the run lifecycle it competes with, is never
+    /// persisted, and dies with the incarnation. Appearing or clearing feeds the observation signal,
+    /// because another observer must not `send` into a session that has already reserved a turn.
+    var pendingOversightAutoWake: AgentSessionLinkAutoWakeAttempt? {
+        didSet {
+            if (oldValue == nil) != (pendingOversightAutoWake == nil) {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    /// The one structural wake shape this incarnation already failed to deliver, if any.
+    ///
+    /// Suppression rather than backoff: there is no timer and no retry loop, so a known pre-acceptance
+    /// failure simply parks that exact shape until a structurally new edge, generation, or overflow
+    /// arrives — or the user cycles the setting.
+    ///
+    /// A single slot rather than an accumulating set, and that is load-bearing rather than tidiness:
+    /// the fingerprint now carries per-edge occurrence identity, so a shape that has been superseded
+    /// can never recur. Keeping only the current one means suppression is released by exactly the
+    /// events that should release it — the failed content being acknowledged, removed, or replaced by
+    /// a genuinely new transition — instead of surviving indefinitely in a set nothing prunes.
+    var suppressedOversightWakeFingerprint:
+        AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
+
+    func noteMonitorObservationInputsChanged() {
         monitorObservationSignal.send(())
     }
 
@@ -530,6 +590,8 @@ final class AgentTabSession: ObservableObject {
     var selectedModelRaw: String = AgentModel.defaultModel.rawValue
     var selectedReasoningEffortRaw: String?
     var autoEditEnabled: Bool = true
+    /// Persisted with the session. Default off, and inert while this session oversees nothing.
+    var autoWakeOnOversightUpdates: Bool = false
     var selectedModel: AgentModel {
         get { AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent) ?? .defaultModel }
         set { selectedModelRaw = newValue.rawValue }

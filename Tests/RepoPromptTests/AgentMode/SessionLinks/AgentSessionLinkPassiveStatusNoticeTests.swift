@@ -87,18 +87,126 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         XCTAssertLessThanOrEqual(entry.displayName?.utf8.count ?? .max, 120)
     }
 
-    func testCoalescingRetainsOnlyTheActualLatestActionableEdge() {
+    /// Coalescing is first-to-final, not last-edge-wins.
+    ///
+    /// The delivered entry answers "what happened to this session since you last heard about it?",
+    /// so the origin of the pending interval outlives every intermediate edge and the net transition
+    /// is what decides whether the interval is worth reporting at all.
+    func testCoalescingKeepsTheFirstToFinalEdgeAndDropsNetReversions() {
+        // idle -> waiting -> idle is a round trip. There is nothing to tell the observer.
         var idleReducer = makeReducer()
         idleReducer.enable(samples: [sample(0, status: .idle)], linkSetRevision: 1)
         idleReducer.reconcile(samples: [sample(0, status: .waiting)], linkSetRevision: 1, deliverable: true)
         idleReducer.reconcile(samples: [sample(0, status: .idle)], linkSetRevision: 1, deliverable: true)
-        XCTAssertEqual(idleReducer.snapshot.entries.map(transition), ["waiting->idle"])
+        XCTAssertEqual(idleReducer.snapshot.entries.map(transition), [])
 
+        // running -> waiting -> idle must not lose the fact that the target had been working.
         var runningReducer = makeReducer()
         runningReducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
         runningReducer.reconcile(samples: [sample(0, status: .waiting)], linkSetRevision: 1, deliverable: true)
         runningReducer.reconcile(samples: [sample(0, status: .idle)], linkSetRevision: 1, deliverable: true)
-        XCTAssertEqual(runningReducer.snapshot.entries.map(transition), ["waiting->idle"])
+        XCTAssertEqual(runningReducer.snapshot.entries.map(transition), ["running->idle"])
+
+        // idle -> waiting -> running nets to a transition that was never worth a turn.
+        var runningEndReducer = makeReducer()
+        runningEndReducer.enable(samples: [sample(0, status: .idle)], linkSetRevision: 1)
+        runningEndReducer.reconcile(samples: [sample(0, status: .waiting)], linkSetRevision: 1, deliverable: true)
+        runningEndReducer.reconcile(samples: [sample(0, status: .running)], linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(runningEndReducer.snapshot.entries.map(transition), [])
+    }
+
+    /// A same-status metadata refresh keeps the edge identity, updates the sample timestamp, and
+    /// advances the sequence so a receipt rendered before the refresh can no longer clear it.
+    func testSameStatusMetadataRefreshPreservesTheEdgeAndOutrunsAnOlderReceipt() {
+        var reducer = makeReducer()
+        let edgeObservedAt = Date(timeIntervalSince1970: 1000)
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        reducer.reconcile(
+            samples: [sample(0, status: .idle)],
+            linkSetRevision: 1,
+            deliverable: true,
+            observedAt: edgeObservedAt
+        )
+        let claimed = tryUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(claimed.observedAt, edgeObservedAt)
+        XCTAssertFalse(claimed.idleForSend)
+        let staleReceipt = AgentSessionLinkPassiveStatusNotices.Receipt(snapshot: reducer.snapshot)
+
+        reducer.reconcile(
+            samples: [sample(0, status: .idle, idleForSend: true, preview: "Done.")],
+            linkSetRevision: 1,
+            deliverable: true,
+            observedAt: Date(timeIntervalSince1970: 5000)
+        )
+        let refreshed = tryUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(refreshed.fromStatus, .running)
+        XCTAssertEqual(refreshed.toStatus, .idle)
+        XCTAssertEqual(
+            refreshed.observedAt,
+            Date(timeIntervalSince1970: 5000),
+            "readiness and observed_at must describe the same sampled instant"
+        )
+        XCTAssertTrue(refreshed.idleForSend)
+        XCTAssertEqual(refreshed.latestVisibleAssistantPreview, "Done.")
+        XCTAssertGreaterThan(refreshed.changeSequence, claimed.changeSequence)
+
+        reducer.apply(staleReceipt)
+        XCTAssertEqual(
+            reducer.snapshot.entries.map(transition),
+            ["running->idle"],
+            "a receipt rendered before the refresh cannot acknowledge what it never carried"
+        )
+    }
+
+    /// Readiness is a point-in-time fact about an idle target, never an upstream assertion.
+    func testReadinessIsForcedFalseUnlessTheFinalStatusIsIdle() {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle)], linkSetRevision: 1)
+        reducer.reconcile(
+            samples: [sample(0, status: .waiting, idleForSend: true)],
+            linkSetRevision: 1,
+            deliverable: true
+        )
+        XCTAssertFalse(tryUnwrap(reducer.snapshot.entries.first).idleForSend)
+    }
+
+    /// Suppression is structural: metadata churn must not re-arm a wake that already failed, but a
+    /// genuinely new edge must.
+    func testWakeFingerprintIgnoresMetadataAndTracksStructuralChange() {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        reducer.reconcile(samples: [sample(0, status: .idle)], linkSetRevision: 1, deliverable: true)
+        let original = reducer.snapshot.wakeEligibilityFingerprint
+
+        reducer.reconcile(
+            samples: [sample(0, status: .idle, idleForSend: true, preview: "Done.")],
+            linkSetRevision: 1,
+            deliverable: true
+        )
+        XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint, original)
+
+        reducer.reconcile(samples: [sample(0, status: .waiting)], linkSetRevision: 1, deliverable: true)
+        XCTAssertNotEqual(reducer.snapshot.wakeEligibilityFingerprint, original)
+    }
+
+    func testAcknowledgedThenRepeatedIdenticalEdgeGetsANewWakeOccurrence() {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        reducer.reconcile(samples: [sample(0, status: .idle)], linkSetRevision: 1, deliverable: true)
+        let firstSnapshot = reducer.snapshot
+        let firstFingerprint = firstSnapshot.wakeEligibilityFingerprint
+
+        reducer.apply(AgentSessionLinkPassiveStatusNotices.Receipt(snapshot: firstSnapshot))
+        XCTAssertFalse(reducer.snapshot.hasDeliverableContent)
+        reducer.reconcile(samples: [sample(0, status: .running)], linkSetRevision: 1, deliverable: true)
+        reducer.reconcile(samples: [sample(0, status: .idle)], linkSetRevision: 1, deliverable: true)
+
+        XCTAssertTrue(reducer.snapshot.hasDeliverableContent)
+        XCTAssertNotEqual(
+            reducer.snapshot.wakeEligibilityFingerprint,
+            firstFingerprint,
+            "a later independent edge with the same statuses must recover from old suppression"
+        )
     }
 
     func testEnteringRunningClearsStaleCurrentStateAndLaterCompletionIsFresh() {
@@ -382,7 +490,9 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         _ index: Int,
         name: String? = nil,
         status: Status,
-        endpointGeneration: UInt64 = 1
+        endpointGeneration: UInt64 = 1,
+        idleForSend: Bool = false,
+        preview: String? = nil
     ) -> Reducer.Sample {
         let targetSessionID = sessionID(index)
         return Reducer.Sample(
@@ -393,7 +503,9 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
             targetEndpoint: endpoint(sessionID: targetSessionID, generation: endpointGeneration),
             targetSessionID: targetSessionID,
             displayName: name ?? "Target \(index)",
-            status: status
+            status: status,
+            idleForSend: idleForSend,
+            latestVisibleAssistantPreview: preview
         )
     }
 

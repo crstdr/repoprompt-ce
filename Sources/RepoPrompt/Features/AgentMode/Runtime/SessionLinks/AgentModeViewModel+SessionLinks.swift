@@ -293,6 +293,54 @@ extension AgentModeViewModel {
     /// This is the UI path. It deliberately does not touch `items`, the canonical row count, or the
     /// assistant preview, so rendering an Oversee row never scans a transcript or runs the redaction
     /// regexes.
+    /// The exact observer session's persisted **Auto-wake on updates** setting.
+    func agentSessionLinkAutoWakeOnUpdatesEnabled(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> Bool {
+        guard let session = sessions[candidate.tabID],
+              session.activeAgentSessionID == candidate.sessionID
+        else {
+            return false
+        }
+        return session.autoWakeOnOversightUpdates
+    }
+
+    /// Writes that setting to one exact observer incarnation.
+    ///
+    /// Endpoint-checked before the write, marked dirty so the existing scheduled persistence saves
+    /// it, and mirrored into the owner-validated index immediately so a sidebar rebuild or a cold
+    /// reseed cannot resurrect the previous value.
+    @discardableResult
+    func agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+        _ enabled: Bool,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = sessions[endpoint.tabID],
+              session.hasLoadedPersistedState
+        else {
+            return false
+        }
+        guard session.autoWakeOnOversightUpdates != enabled else { return true }
+        session.autoWakeOnOversightUpdates = enabled
+        session.isDirty = true
+        scheduleSave(for: endpoint.tabID)
+        if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
+            entry.autoWakeOnOversightUpdates = enabled
+            sessionIndexStore.applyLocalUpsert(entry)
+        }
+        // Disabling cancels not-yet-accepted wake work but never clears the lane queue: the content
+        // stays owed to a natural future turn. Re-enabling is an explicit recovery action and clears
+        // only failure suppression; it cannot bypass the durable non-local-origin fence.
+        if enabled {
+            agentSessionLinkClearAutoWakeSuppression(for: endpoint)
+        } else {
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .settingDisabled)
+        }
+        session.monitorObservationSignal.send(())
+        return true
+    }
+
     func agentSessionLinkStatusProjection(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> AgentSessionLinkStatusProjection? {
@@ -685,6 +733,7 @@ extension AgentModeViewModel {
             && session.pendingInstructions.isEmpty
             && session.pendingACPSteeringInstructions.isEmpty
             && session.pendingClaudeSteeringInstructions.isEmpty
+            && session.pendingOversightAutoWake == nil
             && !candidate.isClosing
     }
 

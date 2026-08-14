@@ -585,6 +585,51 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
     }
 
+    func testClaudeRequiredLaneRefusalMakesNoProviderCallOrErrorRow() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder, label: "required-lane")
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.providerSessionID = "lifecycle-claude-session"
+        let runID = UUID()
+        session.installRunID(runID)
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.requiredLaneRefusal")
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1,
+            workspacePathProvider: { _ in "/workspace" },
+            claudeControllerFactory: { _, _, _, _ in controller }
+        )
+        coordinator.installHostCapabilities(
+            .init(
+                isSessionCurrent: { $0 === session },
+                requestUIRefresh: { _, _ in },
+                scheduleSave: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in },
+                prependPendingHandoff: { text, _ in text },
+                decorateAgentSessionLinkPrompt: { text, _, _ in
+                    .init(text: text, claim: nil, mustAbortDispatch: true)
+                },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
+                acceptAgentSessionLinkPromptClaim: { _ in }
+            ),
+            providerBindingService: AgentModeProviderBindingService()
+        )
+
+        let outcome = await coordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "",
+            attachments: [],
+            intent: .runAttempt(ownership: ownership, runID: runID)
+        )
+
+        XCTAssertEqual(outcome, .superseded)
+        XCTAssertFalse(recorder.contains("required-lane:send"))
+        XCTAssertFalse(session.items.contains(where: { $0.kind == .error }))
+    }
+
     func testClaudeSendFailureReportsEvidenceWithoutTerminalizingSession() async {
         let recorder = LifecycleRecorder()
         let controller = LifecycleFakeNativeController(
@@ -621,7 +666,12 @@ extension AgentModeRunServiceLifecycleTests {
                 recorder.record("host:prepend")
                 return outboundText
             },
-            decorateAgentSessionLinkPrompt: { text, _, _ in (text, nil) },
+            decorateAgentSessionLinkPrompt: { text, _, _ in
+                .init(text: text, claim: nil, mustAbortDispatch: false)
+            },
+            acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+            recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+            recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
             acceptAgentSessionLinkPromptClaim: { _ in }
         )
         let providerBindingService = AgentModeProviderBindingService()

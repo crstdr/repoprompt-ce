@@ -1916,7 +1916,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 stageResumeRecoveryHandoffIfNeeded: { _ in },
                 prependPendingHandoffIfNeeded: { text, _ in text },
                 recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") },
-                claimAgentSessionLinkPrompt: { _, _ in nil },
+                claimAgentSessionLinkPrompt: { _, _ in .nothingOwed },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
                 acceptAgentSessionLinkPrompt: { _ in }
             ),
             interactions: .init(

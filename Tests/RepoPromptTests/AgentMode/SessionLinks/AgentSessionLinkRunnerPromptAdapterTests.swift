@@ -80,6 +80,24 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
         MonitorSupplementAssertions.assertNotPersisted(in: session)
     }
 
+    // MARK: Required lane refusal
+
+    func testHeadlessAutoWakeWithUnavailableRequiredBatchMakesNoProviderCall() async {
+        let provider = AgentSessionLinkCapturingHeadlessProvider()
+        let harness = makeHarness(provider: provider)
+        harness.publishInventory(revision: 1, targetCount: 1)
+        harness.forcedAutoWakeID = UUID()
+        harness.passiveNotices = nil
+        let session = harness.makeSession(agent: .openCode)
+
+        await startRun(harness, session: session, message: "")
+
+        let providerMessageCount = await provider.messageCount
+        XCTAssertEqual(providerMessageCount, 0)
+        XCTAssertTrue(harness.acceptedClaims.isEmpty)
+        XCTAssertFalse(session.items.contains(where: { $0.kind == .error }))
+    }
+
     // MARK: Stream-creation failure
 
     func testStreamCreationFailureLeavesTheClaimPendingForTheNextTurn() async throws {
@@ -310,6 +328,21 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
             attachments: []
         )
         await fixture.session.agentTask?.value
+    }
+
+    // MARK: Required lane refusal
+
+    func testACPAutoWakeWithUnavailableRequiredBatchMakesNoProviderCall() async throws {
+        let fixture = try makeFixture()
+        fixture.harness.publishInventory(revision: 1, targetCount: 1)
+        fixture.harness.forcedAutoWakeID = UUID()
+        fixture.harness.passiveNotices = nil
+
+        await startRun(fixture, message: "")
+
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
+        XCTAssertTrue(fixture.harness.acceptedClaims.isEmpty)
+        XCTAssertFalse(fixture.session.items.contains(where: { $0.kind == .error }))
     }
 
     // MARK: Initial, reuse, follow-up

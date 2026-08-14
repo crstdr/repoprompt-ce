@@ -77,7 +77,19 @@ final class ClaudeAgentModeCoordinator {
             _ text: String,
             _ session: AgentTabSession,
             _ dispatchID: AgentSessionLinkPromptDispatchID
-        ) -> (text: String, claim: AgentSessionLinkOutboundPromptClaim?)
+        ) -> AgentSessionLinkDecoratedProviderText
+        let acquireAgentSessionLinkPhysicalDispatch: @MainActor (
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> Bool
+        let recordAgentSessionLinkPhysicalDispatchNotAttempted: @MainActor (
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> Void
+        let recordAgentSessionLinkPhysicalDispatchFailure: @MainActor (
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> Void
         let acceptAgentSessionLinkPromptClaim: @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
 
         static var noOp: Self {
@@ -87,7 +99,12 @@ final class ClaudeAgentModeCoordinator {
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
                 prependPendingHandoff: { text, _ in text },
-                decorateAgentSessionLinkPrompt: { text, _, _ in (text, nil) },
+                decorateAgentSessionLinkPrompt: { text, _, _ in
+                    .init(text: text, claim: nil, mustAbortDispatch: false)
+                },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
                 acceptAgentSessionLinkPromptClaim: { _ in }
             )
         }
@@ -1044,6 +1061,20 @@ final class ClaudeAgentModeCoordinator {
                     session,
                     promptDispatchID
                 )
+                // A lane-update dispatch has no base user instruction. If its required batch was
+                // revoked, acknowledged, revision-fenced, or omitted by the shared budget, stop before
+                // `sendUserMessage`; `.superseded` is the quiet no-provider-call outcome.
+                guard !monitoring.mustAbortDispatch else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
+                }
+                guard hostCapabilities.acquireAgentSessionLinkPhysicalDispatch(
+                    session,
+                    promptDispatchID
+                ) else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
+                }
                 let instructions = agentModeInstructionInjection(for: session)
                 let providerBoundText = providerBoundUserMessage(
                     monitoring.text,
@@ -1063,6 +1094,7 @@ final class ClaudeAgentModeCoordinator {
                 session.claudeExpectedTurnIDs.insert(turnID)
                 return .sent
             } catch {
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchFailure(session, promptDispatchID)
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {

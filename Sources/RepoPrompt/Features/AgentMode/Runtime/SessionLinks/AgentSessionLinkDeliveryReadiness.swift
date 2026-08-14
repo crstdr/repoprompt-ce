@@ -14,10 +14,44 @@ enum AgentSessionLinkTurnOrigin: Equatable {
     /// The most recent accepted input arrived across an oversight link, and no local user instruction
     /// has been accepted since.
     case crossSessionMessage(sourceSessionID: UUID)
+    /// The most recent accepted input was RepoPrompt's own lane-update follow-up, and no local user
+    /// instruction has been accepted since.
+    case laneUpdateAutoWake(wakeID: UUID)
+    /// The session was restored from disk having last accepted an automatic input, and no local user
+    /// instruction has been accepted since.
+    ///
+    /// The wake ID and source session UUID of the pre-relaunch turn are ephemeral process identities
+    /// that mean nothing after a restart, so the fence is reconstructed as the *predicate* it exists
+    /// to enforce rather than as a fabricated identity. Without this case the fence silently reset to
+    /// `.localUser` on every relaunch, and a saved-on observer could start a second autonomous turn
+    /// with no intervening local instruction — exactly the chain the guard exists to forbid.
+    case restoredAutomatic
 
-    var isCrossSession: Bool {
-        if case .crossSessionMessage = self { return true }
-        return false
+    /// Whether this origin bars the session from *originating* further linked work.
+    ///
+    /// True for every non-local origin, and that is the whole cycle bound: an oversight loop can
+    /// produce at most one automatic turn per locally initiated origin epoch, because neither an
+    /// incoming cross-session message nor an auto-wake can send onward or wake again. `poll`, `wait`,
+    /// and `read` keep their ordinary authority — only origination is fenced.
+    var requiresNewLocalUserInstruction: Bool {
+        switch self {
+        case .localUser: false
+        case .crossSessionMessage, .laneUpdateAutoWake, .restoredAutomatic: true
+        }
+    }
+
+    /// The durable projection of this origin: one Boolean, which is all a later launch can act on.
+    ///
+    /// Restoring it as `.restoredAutomatic` reconstructs the fence exactly; restoring `false` as
+    /// `.localUser` preserves the documented behaviour that a saved-on observer may wake on its first
+    /// new post-baseline transition.
+    var persistedRequiresLocalUserInstruction: Bool {
+        requiresNewLocalUserInstruction
+    }
+
+    /// Rebuilds the fence for a session hydrated from disk.
+    static func restored(requiresLocalUserInstruction: Bool) -> AgentSessionLinkTurnOrigin {
+        requiresLocalUserInstruction ? .restoredAutomatic : .localUser
     }
 }
 
@@ -54,6 +88,12 @@ enum AgentSessionLinkDeliveryReadiness {
         var pendingInstructionCount: Int
         var pendingACPSteeringCount: Int
         var pendingClaudeSteeringCount: Int
+        /// This session has already reserved its one automatic lane-update follow-up.
+        ///
+        /// Source-compatible default `false`. A reservation is work the session is committed to, so
+        /// another observer must not `send` into it any more than into an active run — otherwise the
+        /// wake and the send race for the same terminal boundary.
+        var pendingOversightAutoWake: Bool = false
 
         // Target interactions. Waiting states are never ready: answering one would be a different
         // capability than sending a new instruction, and `send` never gains it.
@@ -83,6 +123,7 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingInstructionCount: Int,
             pendingACPSteeringCount: Int,
             pendingClaudeSteeringCount: Int,
+            pendingOversightAutoWake: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
             hasPendingUserInputRequest: Bool,
@@ -106,6 +147,7 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingInstructionCount = pendingInstructionCount
             self.pendingACPSteeringCount = pendingACPSteeringCount
             self.pendingClaudeSteeringCount = pendingClaudeSteeringCount
+            self.pendingOversightAutoWake = pendingOversightAutoWake
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser
             self.hasPendingUserInputRequest = hasPendingUserInputRequest
@@ -135,6 +177,7 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingInstructionCount: 0,
             pendingACPSteeringCount: 0,
             pendingClaudeSteeringCount: 0,
+            pendingOversightAutoWake: false,
             hasWaitingPrompt: false,
             hasPendingAskUser: false,
             hasPendingUserInputRequest: false,
@@ -155,7 +198,11 @@ enum AgentSessionLinkDeliveryReadiness {
         case targetLoading = "target_loading"
         /// The target is running, waiting, has a pending interaction, or has queued work.
         case targetNotIdle = "target_not_idle"
-        /// The caller's turn was started solely by an incoming cross-session message.
+        /// The caller's turn was started by something other than its own user — an incoming
+        /// cross-session message, or RepoPrompt's own lane-update follow-up.
+        ///
+        /// The case name and its wire-stable raw value are deliberately unchanged: the observer's
+        /// prompt guidance names this string, and broadening what can produce it is not a new refusal.
         case crossSessionReplyRequiresUserInstruction = "cross_session_reply_requires_user_instruction"
 
         var message: String {
@@ -169,8 +216,9 @@ enum AgentSessionLinkDeliveryReadiness {
                     + "until: \"sendable\" and send when a snapshot reports idle_for_send: true; "
                     + "until: \"idle\" is satisfied by targets this call still refuses."
             case .crossSessionReplyRequiresUserInstruction:
-                "This turn was started by an incoming cross-session message. Wait for a new instruction "
-                    + "from your own user before sending onward."
+                "This turn was not started by your own user — it came from an incoming cross-session "
+                    + "message or an automatic status update. Wait for a new instruction from your own "
+                    + "user before sending onward."
             }
         }
     }
@@ -204,7 +252,7 @@ enum AgentSessionLinkDeliveryReadiness {
         if isTargetBusy(snapshot) {
             return .blocked(.targetNotIdle)
         }
-        if snapshot.observerTurnOrigin.isCrossSession {
+        if snapshot.observerTurnOrigin.requiresNewLocalUserInstruction {
             return .blocked(.crossSessionReplyRequiresUserInstruction)
         }
         return .ready
@@ -222,6 +270,7 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingInstructionCount > 0
             || snapshot.pendingACPSteeringCount > 0
             || snapshot.pendingClaudeSteeringCount > 0
+            || snapshot.pendingOversightAutoWake
             || snapshot.hasWaitingPrompt
             || snapshot.hasPendingAskUser
             || snapshot.hasPendingUserInputRequest

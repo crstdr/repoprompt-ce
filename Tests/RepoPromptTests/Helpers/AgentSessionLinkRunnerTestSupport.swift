@@ -66,6 +66,10 @@ final class AgentSessionLinkRunnerHarness {
     /// Passive status batch offered to each claim, or `nil` for the membership-only default every
     /// pre-existing runner suite assumes.
     var passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?
+    /// When set, provider-shaped dispatch IDs are rewritten to this wake identity exactly as the live
+    /// view-model seam does. This lets adapter tests exercise required-claim refusal at the physical
+    /// provider boundary without duplicating runner logic.
+    var forcedAutoWakeID: UUID?
 
     init(
         stubSystemPrompt: String = "BASE INSTRUCTIONS",
@@ -182,9 +186,16 @@ final class AgentSessionLinkRunnerHarness {
                 recordPendingHandoffSendOutcome: { _, _ in },
                 claimAgentSessionLinkPrompt: { _, dispatchID in
                     MainActor.assumeIsolated {
-                        guard let harnessBox else { return nil }
-                        return harnessBox.claimStore.claim(
-                            dispatchID: dispatchID,
+                        guard let harnessBox else {
+                            return dispatchID.autoWakeID == nil
+                                ? .nothingOwed
+                                : .requiredLaneBatchUnavailable
+                        }
+                        let effectiveDispatchID = harnessBox.forcedAutoWakeID.map {
+                            AgentSessionLinkPromptDispatchID.autoWake(wakeID: $0, localInputEpoch: 0)
+                        } ?? dispatchID
+                        return harnessBox.claimStore.claimOutcome(
+                            dispatchID: effectiveDispatchID,
                             epoch: harnessBox.promptEpoch,
                             inventory: harnessBox.inventory,
                             passiveNotices: harnessBox.passiveNotices
@@ -193,6 +204,9 @@ final class AgentSessionLinkRunnerHarness {
                         }
                     }
                 },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
                 acceptAgentSessionLinkPrompt: { claim in
                     MainActor.assumeIsolated {
                         harnessBox?.claimStore.accept(claim)

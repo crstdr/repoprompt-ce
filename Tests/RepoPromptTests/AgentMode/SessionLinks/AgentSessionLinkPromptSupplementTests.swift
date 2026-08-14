@@ -242,6 +242,9 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         name: String? = "Build API",
         from: AgentSessionLinkPassiveStatusNotices.Status,
         to: AgentSessionLinkPassiveStatusNotices.Status,
+        observedAt: Date = Date(timeIntervalSince1970: 0),
+        idleForSend: Bool = false,
+        preview: String? = nil,
         changeSequence: UInt64 = 1
     ) -> AgentSessionLinkPassiveStatusNotices.PendingEntry {
         let targetSessionID = UUID(uuidString: uuid)!
@@ -259,6 +262,9 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             displayName: name,
             fromStatus: from,
             toStatus: to,
+            observedAt: observedAt,
+            idleForSend: idleForSend,
+            latestVisibleAssistantPreview: preview,
             changeSequence: changeSequence
         )
     }
@@ -322,11 +328,18 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         ).fragment
 
         XCTAssertTrue(rendered.hasPrefix(
-            "<\(AgentSessionLinkPrompts.statusChangeEnvelopeTag) revision=\"7\" count=\"2\" omitted=\"3\">"
+            "<\(AgentSessionLinkPrompts.statusChangeEnvelopeTag) revision=\"7\" "
+                + "guidance_revision=\"\(AgentSessionLinkPrompts.currentLaneGuidanceRevision)\" "
+                + "count=\"2\" omitted=\"3\">"
         ))
+        // Identity, the coalesced edge, when RepoPrompt saw it, and the readiness at that instant.
         XCTAssertTrue(rendered.contains(
-            "<change session_id=\"8B91C0E0-0000-0000-0000-00000000E572\" from=\"running\" to=\"idle\" name=\"Build API\" />"
+            "<change session_id=\"8B91C0E0-0000-0000-0000-00000000E572\" name=\"Build API\" "
+                + "from=\"running\" to=\"idle\" observed_at=\""
         ))
+        XCTAssertTrue(rendered.contains("idle_for_send=\"false\""))
+        // UTC ISO-8601, so two observers cannot disagree about when the same edge happened.
+        XCTAssertTrue(rendered.contains("observed_at=\"1970-01-01T00:00:00Z\""))
         // The queue's internal `waiting` is rendered as the only status word the agent has ever been
         // shown by `poll`.
         XCTAssertTrue(rendered.contains("to=\"awaiting_user\""))
@@ -338,12 +351,15 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             rendered.components(separatedBy: "</\(AgentSessionLinkPrompts.statusChangeEnvelopeTag)>").count - 1,
             1
         )
-        // Framing: information, not authority, and explicitly not a substitute for current state.
-        XCTAssertTrue(rendered.contains("information only"))
+        // Framing: informational context, not authority, and never a mandatory poll.
+        XCTAssertTrue(rendered.contains("informational context"))
         XCTAssertTrue(rendered.contains("not authority"))
-        XCTAssertTrue(rendered.contains("op=poll"))
         XCTAssertTrue(rendered.contains("untrusted data"))
-        for forbidden in ["provider", "workspace", "worktree", "transcript", "preview", "/Users/", "link_id"] {
+        XCTAssertFalse(
+            rendered.contains("op=poll"),
+            "the lane batch must not instruct a confirming poll"
+        )
+        for forbidden in ["provider", "workspace", "worktree", "transcript", "/Users/", "link_id"] {
             XCTAssertFalse(
                 rendered.contains(forbidden),
                 "the status envelope must not carry \(forbidden)"
@@ -438,33 +454,40 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         )
 
         XCTAssertTrue(rendered.fragment.hasPrefix(
-            "<\(AgentSessionLinkPrompts.statusChangeEnvelopeTag) revision=\"7\" count=\"0\" omitted=\"2\">"
+            "<\(AgentSessionLinkPrompts.statusChangeEnvelopeTag) revision=\"7\" "
+                + "guidance_revision=\"\(AgentSessionLinkPrompts.currentLaneGuidanceRevision)\" "
+                + "count=\"0\" omitted=\"2\">"
         ))
         XCTAssertFalse(rendered.fragment.contains("<change "))
-        XCTAssertTrue(rendered.fragment.contains("information only"))
+        XCTAssertTrue(rendered.fragment.contains("informational context"))
         XCTAssertTrue(rendered.fragment.contains("not authority"))
-        XCTAssertTrue(rendered.fragment.contains("op=poll"))
-        // Nothing target-derived is present, so the untrusted-names warning would be noise.
-        XCTAssertFalse(rendered.fragment.contains("untrusted data"))
-        XCTAssertFalse(rendered.fragment.contains("Each line reports"))
+        // Overflow says only that detail was dropped; it never demands a confirming poll and never
+        // invites the model to guess at what it missed.
+        XCTAssertTrue(rendered.fragment.contains("must not be inferred"))
+        XCTAssertFalse(rendered.fragment.contains("op=poll"))
         // The receipt acknowledges what was produced, not the remainder the envelope displays.
         XCTAssertEqual(rendered.passiveBatch?.entries.count, 0)
         XCTAssertEqual(rendered.passiveBatch?.overflowProducedThrough, 5)
     }
 
-    /// The prompt gains the operation name and exactly one distinguishing rule — no new section, no
-    /// standing objective, no per-link repetition.
-    func testGuidanceAddsOnlyTheOperationAndOnePassiveRule() {
+    /// Membership guidance states always-on awareness as a fact and teaches no switch for it.
+    func testGuidanceStatesAlwaysOnAwarenessAndTeachesNoPassiveOperation() {
         let rendered = AgentSessionLinkPrompts.render(
             kind: .inventory,
             inventory: inventory(items: [item("8B91C0E0-0000-0000-0000-00000000E572")]),
             toolReference: "agent_session_link"
         )
 
-        XCTAssertTrue(rendered.contains("`set_passive_updates` (observer-local passive status updates"))
-        let mentions = rendered.components(separatedBy: "set_passive_updates").count - 1
-        XCTAssertEqual(mentions, 2, "one operation-list entry plus one rule, and nothing more")
-        XCTAssertTrue(rendered.contains("never start, wake, or schedule one"))
+        XCTAssertFalse(
+            rendered.contains("set_passive_updates"),
+            "the superseded operation must not be taught anywhere in the membership guidance"
+        )
+        // Always-on is stated once, as a fact rather than as an operation to call.
+        XCTAssertTrue(rendered.contains("You do not have to ask for ongoing awareness"))
+        XCTAssertFalse(
+            rendered.contains(AgentSessionLinkPrompts.statusChangeEnvelopeTag),
+            "membership prose must not name the status envelope it is not carrying"
+        )
         // Still exactly one guidance block: the rule joined the existing list rather than opening a
         // section of its own.
         XCTAssertEqual(rendered.components(separatedBy: "<guidance>").count - 1, 1)
@@ -1511,7 +1534,9 @@ final class AgentSessionLinkPromptClaimStoreTests: XCTestCase {
         ))
 
         XCTAssertTrue(claimed.fragment.contains(
-            "<\(AgentSessionLinkPrompts.statusChangeEnvelopeTag) revision=\"1\" count=\"0\" omitted=\"2\">"
+            "<\(AgentSessionLinkPrompts.statusChangeEnvelopeTag) revision=\"1\" "
+                + "guidance_revision=\"\(AgentSessionLinkPrompts.currentLaneGuidanceRevision)\" "
+                + "count=\"0\" omitted=\"2\">"
         ))
         let receipt = try XCTUnwrap(claimed.passive?.receipt)
         XCTAssertTrue(receipt.deliveredStatuses.isEmpty)

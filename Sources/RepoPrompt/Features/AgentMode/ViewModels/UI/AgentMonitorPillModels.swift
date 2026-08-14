@@ -264,26 +264,34 @@ enum AgentMonitorPassiveNoticeOutcome: Equatable {
     }
 }
 
-/// Copy for the observer-level passive status-update switch.
+/// Copy for the observer-session **Auto-wake on updates** switch.
 ///
 /// Separate from `AgentMonitorRowActionCopy` because the control is not a row action: it is one
-/// preference covering every direct outbound link this exact incarnation holds.
+/// setting for this observer session, saved with it, covering every direct outbound link it holds.
 ///
-/// The tooltip states the whole contract in the order that matters: what arrives, when it arrives,
-/// and — load-bearing — that nothing here ever creates work. A user who reads "updates" and imagines
-/// a background agent waking up has been mis-sold the feature.
-enum AgentMonitorPassiveUpdatesCopy {
-    static let label = "Passive updates"
+/// The tooltip states the whole contract in the order that matters: that updates arrive either way,
+/// what this switch adds, and — load-bearing — the bound on what it can create. A user who reads
+/// "auto-wake" and imagines an autonomous background agent has been mis-sold the feature.
+enum AgentMonitorAutoWakeCopy {
+    static let label = "Auto-wake on updates"
     static let tooltip = """
-    Attaches coalesced status updates for these sessions to this agent’s next turn that you start. \
-    It never starts, wakes, or schedules a turn by itself, and nothing is sent if no further turn \
-    happens. Off by default, and it turns off when the last link is removed.
+    Status updates for these sessions are always attached to this agent’s next turn. Turning this on \
+    additionally lets RepoPrompt start one follow-up turn for them: a busy agent finishes its current \
+    and already-accepted work first, automatic turns never chain, and the setting applies to this \
+    session rather than to individual links. Off by default, and saved with this session even when \
+    it oversees nothing.
     """
-    static let accessibilityLabel = "Passive updates for overseen sessions"
+    static let accessibilityLabel = "Auto-wake on updates"
     static let accessibilityHint = """
-    Attaches status updates to this agent’s next turn that you start; it never starts a turn itself
+    Lets RepoPrompt start one follow-up turn when overseen sessions change status; status updates \
+    are attached to your own next turn either way
     """
     static let unavailableMessage = "That Agent session is no longer active."
+    /// Shown with zero links, where the setting is saved but has nothing to act on yet.
+    static let noLinksNote = "Saved with this session. It takes effect once you oversee something."
+    static let loadingReason = "This Agent session is still loading."
+    static let closingReason = "This Agent session is closing."
+    static let missingReason = "That Agent session is no longer active."
 }
 
 /// Copy for the inline row controls and the unread affordance.
@@ -707,16 +715,23 @@ struct AgentMonitorPillProps: Equatable {
     let recentNotices: [Notice]
     /// Non-nil when Add must stay disabled, carrying the exact user-facing reason.
     let canAddReason: String?
-    /// Whether this exact observer incarnation currently has passive status notices switched on.
+    /// This observer session's persisted **Auto-wake on updates** setting.
     ///
-    /// Observer-level and process-memory: it covers every direct outbound link this endpoint holds,
-    /// defaults off for each new incarnation, and is cleared when the last outbound link goes away.
-    /// It is authoritative bridge state — the dashboard toggle and the overseer's tool both request a
-    /// change and then render whatever comes back, so nothing here is optimistic.
+    /// Session-level and durable, unlike the process-memory preference it replaces: it survives
+    /// relaunch, stays editable and saved with zero links, and is read straight from the exact live
+    /// session rather than mirrored into the bridge. Authoritative — the dashboard requests a change
+    /// and renders whatever the republished props say, so nothing here is optimistic.
     ///
-    /// `var` for the same reason `endpoint` and `persistence` are: the bridge stamps the settled
-    /// value onto the rows it just built, after the queue for this pass has been reconciled.
-    var passiveNoticesEnabled: Bool
+    /// It gates only whether pending actionable content may reserve one system-origin follow-up.
+    /// Collection and natural-turn delivery are always on for a live, eligible direct link.
+    var autoWakeOnUpdatesEnabled: Bool
+    /// Why the setting cannot be changed right now, or `nil` when it can.
+    ///
+    /// Reserved for states where the exact session cannot take a write at all — missing, still
+    /// hydrating, closing, or shutting down. Deliberately *not* set for an observer that is merely
+    /// unlinked or temporarily prompt-ineligible: the setting is saved with the session and stays
+    /// editable there, it is simply inert until it has something to act on.
+    var autoWakeUnavailableReason: String?
     /// Process-wide durable-oversight state, overlaid by the owning window rather than published by
     /// the bridge's per-endpoint projection.
     ///
@@ -732,7 +747,8 @@ struct AgentMonitorPillProps: Equatable {
         inbound: [Inbound],
         recentNotices: [Notice],
         canAddReason: String?,
-        passiveNoticesEnabled: Bool = false,
+        autoWakeOnUpdatesEnabled: Bool = false,
+        autoWakeUnavailableReason: String? = nil,
         persistence: AgentSessionOversightPersistencePresentation = AgentSessionOversightPersistencePresentation.noDurableLayer
     ) {
         self.sessionID = sessionID
@@ -741,7 +757,8 @@ struct AgentMonitorPillProps: Equatable {
         self.inbound = inbound
         self.recentNotices = recentNotices
         self.canAddReason = canAddReason
-        self.passiveNoticesEnabled = passiveNoticesEnabled
+        self.autoWakeOnUpdatesEnabled = autoWakeOnUpdatesEnabled
+        self.autoWakeUnavailableReason = autoWakeUnavailableReason
         self.persistence = persistence
     }
 
@@ -767,7 +784,8 @@ struct AgentMonitorPillProps: Equatable {
             inbound: inbound,
             recentNotices: recentNotices,
             canAddReason: reason,
-            passiveNoticesEnabled: passiveNoticesEnabled,
+            autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled,
+            autoWakeUnavailableReason: autoWakeUnavailableReason,
             persistence: persistence
         )
     }
@@ -790,7 +808,8 @@ struct AgentMonitorPillProps: Equatable {
             inbound: inbound,
             recentNotices: recentNotices,
             canAddReason: reason,
-            passiveNoticesEnabled: passiveNoticesEnabled,
+            autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled,
+            autoWakeUnavailableReason: autoWakeUnavailableReason,
             persistence: presentation
         )
     }

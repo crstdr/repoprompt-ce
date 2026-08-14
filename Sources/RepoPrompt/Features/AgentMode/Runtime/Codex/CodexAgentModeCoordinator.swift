@@ -2549,6 +2549,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard let controller = session.codexController,
               ObjectIdentifier(controller) == head.originControllerInstanceID
         else {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                for: session,
+                dispatchID: .codexFallback(queueID: head.id)
+            )
             await failCodexFallbackDispatch(
                 session: session,
                 entry: head,
@@ -2565,6 +2569,28 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: session,
             dispatchID: promptDispatchID
         )
+        let requiredLaneUnavailable = monitoring?.mustAbortDispatch == true
+            || (monitoring == nil && AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID))
+        guard !requiredLaneUnavailable else {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                for: session,
+                dispatchID: promptDispatchID
+            )
+            await failCodexFallbackDispatch(session: session, entry: head, message: nil)
+            return
+        }
+        let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+            for: session,
+            dispatchID: promptDispatchID
+        ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID)
+        guard acquiredPhysicalDispatch else {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                for: session,
+                dispatchID: promptDispatchID
+            )
+            await failCodexFallbackDispatch(session: session, entry: head, message: nil)
+            return
+        }
         do {
             _ = try await controller.startUserTurn(
                 text: monitoring?.text ?? head.providerText,
@@ -2600,6 +2626,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
             }
         } catch {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                for: session,
+                dispatchID: promptDispatchID
+            )
             await failCodexFallbackDispatch(
                 session: session,
                 entry: head,
@@ -2611,7 +2641,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func failCodexFallbackDispatch(
         session: AgentTabSession,
         entry: AgentTabSession.CodexFallbackQueueEntry,
-        message: String
+        message: String?
     ) async {
         if session.codexFallbackQueue.first?.id == entry.id {
             session.codexFallbackQueue.removeFirst()
@@ -2626,7 +2656,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             reservationID: entry.attachmentReservationID,
             disposition: .restoreToPending
         )
-        session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
+        if let message {
+            session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
+        }
         if session.activeRunOwnership != nil {
             await finalizeCodexRun(
                 session,
@@ -4353,11 +4385,32 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             //   owed, so re-attach that exact fragment. Re-acknowledging would be wrong (the
             //   revision is already consumed) and sending bare text would lose it permanently,
             //   because no later turn will ever owe this revision again.
+            let replayDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(runID)
             let monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
                 replayTurn.text,
                 session: session,
-                dispatchID: .codexNativeSend(runID)
+                dispatchID: replayDispatchID
             )
+            let requiredLaneUnavailable = monitoring?.mustAbortDispatch == true
+                || (monitoring == nil && AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID))
+            guard !requiredLaneUnavailable else {
+                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                    for: session,
+                    dispatchID: replayDispatchID
+                )
+                return false
+            }
+            let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+                for: session,
+                dispatchID: replayDispatchID
+            ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID)
+            guard acquiredPhysicalDispatch else {
+                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                    for: session,
+                    dispatchID: replayDispatchID
+                )
+                return false
+            }
             let replayText: String = if let monitoring, monitoring.claim != nil {
                 monitoring.text
             } else if let acknowledged = replayTurn.monitoringClaim {
@@ -4382,6 +4435,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
             return true
         } catch {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                for: session,
+                dispatchID: .codexNativeSend(runID)
+            )
             _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-replay-failed")
             await finalizeCodexRun(
                 session,
@@ -5590,6 +5647,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: session,
             dispatchID: promptDispatchID
         )
+        let requiredLaneUnavailable = monitoring?.mustAbortDispatch == true
+            || (monitoring == nil && AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID))
+        guard !requiredLaneUnavailable else {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                for: session,
+                dispatchID: promptDispatchID
+            )
+            return .cancelled
+        }
+        let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+            for: session,
+            dispatchID: promptDispatchID
+        ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID)
+        guard acquiredPhysicalDispatch else {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                for: session,
+                dispatchID: promptDispatchID
+            )
+            return .cancelled
+        }
         let dispatchText = monitoring?.text ?? text
 
         do {
@@ -5740,6 +5817,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return .sent
         } catch let steerError as CodexTurnSteerError {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                for: session,
+                dispatchID: promptDispatchID
+            )
             session.codexPendingTurnKind = nil
             guard session.runID == sendRunID,
                   let activeController = session.codexController,
@@ -5771,6 +5852,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 controller: controller
             )
         } catch {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                for: session,
+                dispatchID: promptDispatchID
+            )
             session.codexPendingTurnKind = nil
             guard session.runID == sendRunID,
                   let activeController = session.codexController,
@@ -8223,6 +8308,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     #if DEBUG
+        @_spi(TestSupport)
+        public func test_dispatchCodexFallbackHead(
+            session: AgentTabSession,
+            expectedQueueID: UUID,
+            beginsSuccessorAttempt: Bool
+        ) async -> Bool {
+            await dispatchCodexFallbackHead(
+                session: session,
+                expectedQueueID: expectedQueueID,
+                beginsSuccessorAttempt: beginsSuccessorAttempt
+            )
+        }
+
         @_spi(TestSupport)
         public func test_setWorkspaceResolutionFailurePublicationGate(
             _ gate: (@Sendable () async -> Void)?

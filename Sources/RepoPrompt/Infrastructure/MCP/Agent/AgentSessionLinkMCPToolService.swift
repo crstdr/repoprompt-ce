@@ -101,9 +101,6 @@ struct AgentSessionLinkMCPToolService {
         case "mark_done":
             try validateAllowedKeys(args, op: op, allowed: Self.markDoneKeys)
             return try await executeMarkDone(args: args)
-        case "set_passive_updates":
-            try validateAllowedKeys(args, op: op, allowed: Self.setPassiveUpdatesKeys)
-            return try await executeSetPassiveUpdates(args: args)
         default:
             throw MCPError.invalidParams(
                 "Unsupported agent_session_link op '\(op)'. \(Self.supportedOperationsSentence)"
@@ -114,7 +111,7 @@ struct AgentSessionLinkMCPToolService {
     /// Single-sourced so the missing-op and unsupported-op errors can never drift apart, or from the
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
-        "Use list, poll, wait, read, send, mark_done, or set_passive_updates."
+        "Use list, poll, wait, read, send, or mark_done."
 
     // MARK: - Common authorizer
 
@@ -503,85 +500,6 @@ struct AgentSessionLinkMCPToolService {
         ])
     }
 
-    // MARK: - set_passive_updates
-
-    /// Switches this caller's own passive status updates on or off. Nothing else moves.
-    ///
-    /// The caller is the exact endpoint the server resolved from run routing; no observer, session, or
-    /// target identifier is accepted, so one session structurally cannot change another's preference.
-    /// It shares the dashboard toggle's bridge mutation rather than keeping a second preference, and
-    /// it mutates only observer-local runtime state: no target is polled or messaged, no link
-    /// authority moves, no capability is minted, and no turn is started, woken, or scheduled.
-    ///
-    /// Enable and disable are deliberately asymmetric. Enabling begins observing targets, so it
-    /// requires a live, eligible caller that currently holds at least one direct outbound link.
-    /// Disabling only requires the caller to still be live: stopping delivery has to stay reachable
-    /// from every state, including one whose links or eligibility have already gone away.
-    private func executeSetPassiveUpdates(args: [String: Value]) async throws -> Value {
-        let observerEndpoint = try await resolveObserverEndpointIdentity()
-        let enabled = try Self.parsePassiveUpdatesEnabled(args["enabled"])
-        let outcome = await bridge.setPassiveMonitorNoticesEnabled(
-            enabled,
-            observerEndpoint: observerEndpoint
-        )
-        switch outcome {
-        case let .changed(settledEnabled, activeLinkCount):
-            return Self.passiveUpdatesValue(
-                result: "changed",
-                enabled: settledEnabled,
-                activeLinkCount: activeLinkCount
-            )
-        case let .alreadyInRequestedState(settledEnabled, activeLinkCount):
-            return Self.passiveUpdatesValue(
-                result: "unchanged",
-                enabled: settledEnabled,
-                activeLinkCount: activeLinkCount
-            )
-        case let .failed(message) where message.contains("shutting down"):
-            throw MCPError.internalError("RepoPrompt is shutting down.")
-        case let .failed(message):
-            // Every failure here is a fact about the caller's own session, so reporting it verbatim
-            // reveals nothing about any other session.
-            throw MCPError.invalidParams(message)
-        }
-    }
-
-    /// Requires a genuine JSON boolean.
-    ///
-    /// Deliberately stricter than `AgentMCPToolHelpers.parseBool`, which also accepts `"false"`, `0`,
-    /// and `"no"`. This operation has exactly one argument and it decides whether the agent keeps
-    /// receiving updates, so a mistyped `"off"` must be a validation error the model can see rather
-    /// than a coerced value it cannot.
-    static func parsePassiveUpdatesEnabled(_ value: Value?) throws -> Bool {
-        guard case let .bool(enabled)? = value else {
-            throw MCPError.invalidParams(
-                "agent_session_link set_passive_updates requires a boolean enabled (true or false)."
-            )
-        }
-        return enabled
-    }
-
-    /// Deliberately compact: the settled preference, what it applies to, and the one property the
-    /// caller could otherwise get wrong. No target status, no queue contents, no counters.
-    private static func passiveUpdatesValue(
-        result: String,
-        enabled: Bool,
-        activeLinkCount: Int
-    ) -> Value {
-        .object([
-            "result": .string(result),
-            "enabled": .bool(enabled),
-            "active_link_count": .int(activeLinkCount),
-            "notice": .string(passiveUpdatesNotice)
-        ])
-    }
-
-    nonisolated static let passiveUpdatesNotice = """
-    Passive updates are attached to a future turn your user starts; they never start, wake, or \
-    schedule one, and nothing arrives if no further turn happens. They report what RepoPrompt \
-    observed when it observed it, so confirm current state with poll or read when it matters.
-    """
-
     // MARK: - send
 
     /// One attributed message, delivered only while the target is atomically admitted as fully idle.
@@ -858,9 +776,8 @@ struct AgentSessionLinkMCPToolService {
     ]
     static let sendKeys: Set<String> = ["op", "session_id", "message", "idempotency_key"]
     static let markDoneKeys: Set<String> = ["op", "session_id"]
-    /// No identity field of any kind: the caller is resolved from server-owned run routing, so there
-    /// is nothing here for one session to address another with.
-    static let setPassiveUpdatesKeys: Set<String> = ["op", "enabled"]
+    // No identity field of any kind: the caller is resolved from server-owned run routing, so there
+    // is nothing here for one session to address another with.
 
     // MARK: - Denials
 

@@ -158,6 +158,10 @@ extension AgentModeViewModel {
             return
         }
         agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID] = snapshot
+        // This is also the auto-wake scheduling hint. Deliberately the same endpoint-addressed hook
+        // rather than a second channel: whatever publishes deliverable content is exactly what a wake
+        // would be scheduled against, and whatever clears it is exactly what cancels one.
+        agentSessionLinkNoteAutoWakeOpportunity(snapshot, endpoint: endpoint)
     }
 
     /// Fences one exact incarnation's prompt inventory and retracts its published value.
@@ -298,6 +302,21 @@ extension AgentModeViewModel {
         {
             agentSessionLinkPassiveNoticesBySessionID.removeValue(forKey: sessionID)
         }
+        // An endpoint that disappeared or rebound must not keep a reservation: the replacement
+        // incarnation starts fresh, and a task still waiting on the dead one would otherwise hold
+        // `idle_for_send` false for a session nothing is going to wake.
+        for (tabID, session) in sessions {
+            guard let attempt = session.pendingOversightAutoWake else { continue }
+            guard !liveSessionIDs.contains(attempt.observerEndpoint.sessionID)
+                || agentSessionLinkObserverEndpoint(tabID: tabID) != attempt.observerEndpoint
+            else {
+                continue
+            }
+            cancelAgentSessionLinkAutoWake(
+                for: attempt.observerEndpoint,
+                reason: .endpointInvalidated
+            )
+        }
         agentSessionLinkPromptClaimStore.retainOnly(observerSessionIDs: liveSessionIDs)
     }
 
@@ -381,18 +400,82 @@ extension AgentModeViewModel {
     ///
     /// A revision-stable retry of the same `dispatchID` gets its existing claim back; a membership
     /// change since the claim was made abandons it and renders the current one instead.
+    /// A dispatch made *by* an auto-wake claims under that wake's own identity.
+    ///
+    /// This substitution is the single provider-neutral seam: the wake decides to start a turn before
+    /// it knows which route that turn will take, and each family mints its own dispatch ID inside the
+    /// run. Rewriting the ID here means Codex, Claude native, ACP, and headless all produce a claim
+    /// stamped `lane.autowake:<wakeID>` without any of them learning what a lane update is — and it is
+    /// that stamp, not mutable session state, that later decides what the acceptance signal settles.
+    ///
+    /// Substituting rather than adding a parallel ID is what keeps a transport retry idempotent: the
+    /// provider re-presents its own ID, this maps it back to the same wake, and the store returns the
+    /// already-reserved claim instead of rendering a second one.
     func agentSessionLinkPromptClaim(
         for session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkOutboundPromptClaim? {
-        guard let context = agentSessionLinkPromptContext(for: session) else { return nil }
-        return agentSessionLinkPromptClaimStore.claim(
-            dispatchID: dispatchID,
+        agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID).claim
+    }
+
+    /// The same reservation, with the wake's hard refusal still distinguishable.
+    ///
+    /// Every provider family goes through this rather than the optional-returning form above, because
+    /// the one decision only this can express — "a required lane batch is unavailable, so make no
+    /// physical call" — has to be made *before* the transport, and it has to be made identically by
+    /// Codex, Claude native, ACP, and headless alike.
+    func agentSessionLinkPromptClaimOutcome(
+        for session: TabSession,
+        dispatchID: AgentSessionLinkPromptDispatchID
+    ) -> AgentSessionLinkPromptClaimOutcome {
+        let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
+        guard let context = agentSessionLinkPromptContext(for: session) else {
+            // No prompt context at all still refuses a wake: the batch it exists to deliver cannot be
+            // rendered, so the turn has nothing to say.
+            return effectiveID.autoWakeID == nil ? .nothingOwed : .requiredLaneBatchUnavailable
+        }
+        return agentSessionLinkPromptClaimStore.claimOutcome(
+            dispatchID: effectiveID,
             epoch: context.epoch,
             inventory: context.inventory,
             passiveNotices: context.passiveNotices,
             render: AgentSessionLinkPrompts.rendered
         )
+    }
+
+    /// Rewrites an ordinary provider dispatch ID to the in-flight wake's, and nothing else.
+    ///
+    /// Only a wake that has passed the ownership boundary substitutes: before that it has not started
+    /// a run, so any claim being taken belongs to some other dispatch and must keep its own identity.
+    func agentSessionLinkEffectiveDispatchID(
+        for session: TabSession,
+        dispatchID: AgentSessionLinkPromptDispatchID
+    ) -> AgentSessionLinkPromptDispatchID {
+        guard dispatchID.autoWakeID == nil,
+              let attempt = session.pendingOversightAutoWake,
+              attempt.phase == .preparingDispatch
+              || attempt.phase == .cancelledBeforeDispatch
+              || attempt.phase == .dispatching
+        else {
+            return dispatchID
+        }
+        return .autoWake(wakeID: attempt.wakeID, localInputEpoch: attempt.localInputEpoch)
+    }
+
+    /// Whether this dispatch would carry a wake's identity, decided without a live view model.
+    ///
+    /// The same substitution rule as `agentSessionLinkEffectiveDispatchID`, restated only for the
+    /// hook closures that must still answer after the view model is gone. Failing closed there is the
+    /// point: a teardown mid-dispatch must not be the one path that lets an empty wake turn through.
+    static func dispatchRequiresLaneBatch(
+        _ session: TabSession,
+        _ dispatchID: AgentSessionLinkPromptDispatchID
+    ) -> Bool {
+        guard dispatchID.autoWakeID == nil else { return true }
+        guard let phase = session.pendingOversightAutoWake?.phase else { return false }
+        return phase == .preparingDispatch
+            || phase == .cancelledBeforeDispatch
+            || phase == .dispatching
     }
 
     /// Re-owes the supplement to a session whose **provider context** is being rebuilt from the app
@@ -419,11 +502,20 @@ extension AgentModeViewModel {
         _ providerText: String,
         session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
-    ) -> (text: String, claim: AgentSessionLinkOutboundPromptClaim?) {
-        guard let claim = agentSessionLinkPromptClaim(for: session, dispatchID: dispatchID) else {
-            return (providerText, nil)
+    ) -> AgentSessionLinkDecoratedProviderText {
+        let outcome = agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
+        guard let claim = outcome.claim else {
+            return AgentSessionLinkDecoratedProviderText(
+                text: providerText,
+                claim: nil,
+                mustAbortDispatch: outcome.mustAbortDispatch
+            )
         }
-        return (AgentSessionLinkPromptComposer.decorated(providerText, with: claim), claim)
+        return AgentSessionLinkDecoratedProviderText(
+            text: AgentSessionLinkPromptComposer.decorated(providerText, with: claim),
+            claim: claim,
+            mustAbortDispatch: false
+        )
     }
 
     /// Acknowledges one accepted dispatch. Idempotent and safe with `nil`.
@@ -434,10 +526,15 @@ extension AgentModeViewModel {
     /// provider physically accepted that batch, and the queue's own epoch/revision fencing is what
     /// decides whether it still applies. Gating it on the store's token instead would re-deliver a
     /// batch the model already holds whenever a provider or eligibility flip raced the acceptance.
+    ///
+    /// Ordering is load-bearing for an accepted auto-wake: the lane-update turn origin and its
+    /// visible provenance row are recorded *before* the receipt is applied, so the queue republication
+    /// the receipt triggers cannot schedule a second autonomous turn in the same origin epoch.
     func acceptAgentSessionLinkPromptClaim(_ claim: AgentSessionLinkOutboundPromptClaim?) {
         guard let claim else { return }
         agentSessionLinkPromptClaimStore.accept(claim)
         guard let passive = claim.passive else { return }
+        agentSessionLinkRecordAcceptedAutoWake(claim)
         AgentSessionLinkRuntimeBridge.shared.applyPassiveMonitorNoticeReceipt(
             passive.receipt,
             observerEndpoint: passive.observerEndpoint
