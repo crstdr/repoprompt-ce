@@ -2447,17 +2447,12 @@ struct AgentRunMCPToolService {
         return sessionID
     }
 
+    /// Parses and resolves in one step, which is all `agent_run` ever needs: it has no ledger to
+    /// consult between the two halves, so nothing here may observe them apart.
     private func resolveWorkflow(args: [String: Value]) throws -> AgentWorkflowDefinition? {
-        let workflowID = normalizedString(args["workflow_id"])
-        let workflowName = normalizedString(args["workflow_name"])
-        if workflowID != nil, workflowName != nil {
-            throw MCPError.invalidParams("Specify either workflow_id or workflow_name, not both.")
-        }
-        guard let reference = workflowID ?? workflowName else {
-            return nil
-        }
-        guard let workflow = AgentWorkflowStore.shared.resolveWorkflowReference(reference) else {
-            throw MCPError.invalidParams("Workflow '\(reference)' was not found.")
+        guard let reference = try AgentWorkflowReference.parse(args: args) else { return nil }
+        guard let workflow = reference.resolved() else {
+            throw MCPError.invalidParams(reference.notFoundMessage)
         }
         return workflow
     }

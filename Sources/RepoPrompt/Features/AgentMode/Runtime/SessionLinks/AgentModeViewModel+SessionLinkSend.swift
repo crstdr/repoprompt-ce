@@ -171,6 +171,11 @@ extension AgentModeViewModel {
         let userItem = AgentChatItem.user(
             request.message,
             sequenceIndex: liveSession.nextSequenceIndex,
+            // Badges the one-shot workflow the sender attached to *this* message through the row's
+            // existing metadata, so the standard pill renders beside the attribution badge with no
+            // new UI. It records what this turn ran under; it is not, and never becomes, the
+            // target's composer selection.
+            workflow: request.workflow,
             crossSessionAttribution: request.attribution
         )
         let anchorRollback = recordAgentTurnUserAnchor(for: liveSession, userItem: userItem)
@@ -253,28 +258,46 @@ extension AgentModeViewModel {
         }
 
         // 8. Provider dispatch. `startAgentRun` is used directly rather than `submitUserTurn` so the
-        //    target's Workflow, Interview, and native/skill slash-command handling are neither
+        //    target's *own* Workflow, Interview, and native/skill slash-command handling are neither
         //    applied nor consumed: those all live in `submitUserTurn`/`submitPreparedUserTurn`, and
         //    provider-send slash expansion only triggers when `/` is the first non-whitespace
-        //    character, which an envelope-wrapped message never is. `.crossSessionDelivery`
+        //    character, which a bare envelope never is. A one-shot workflow does put its own
+        //    template in front, so that guarantee narrows to exactly the one a local workflow turn
+        //    already has — `submitUserTurn` wraps before `startAgentRun` too — and never weakens to
+        //    a sender-controlled string, because the sender's words stay inside `<message>`.
+        //    `.crossSessionDelivery`
         //    additionally leaves any staged handoff untouched, so the target's next *local* send
         //    still receives the continuity it was staged for. Nothing focuses, activates, or
         //    switches the target window.
         let envelope = AgentSessionLinkMessageEnvelope.render(
             sourceSessionID: request.observerSessionID,
             sourceName: request.observerDisplayName,
+            linkID: request.linkID,
+            linkGeneration: request.linkGeneration,
             message: request.message
+        )
+        // A per-message workflow is applied to the provider payload only. `session.selectedWorkflow`
+        // is never read, written, or restored here, which is what makes preserving the target's own
+        // selection structural rather than a cleanup step some failure path could skip.
+        let providerMessage = AgentSessionLinkMessageEnvelope.providerPayload(
+            envelope: envelope,
+            workflow: request.workflow,
+            includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared
+                .showBuiltInWorkflowCleanupGuidance()
         )
         // The run service's `nil` return is "not a Codex native send", not "started", so the
         // recorder is what distinguishes a Claude/ACP/headless pre-start failure from success.
         let startRecorder = AgentRunStartOutcomeRecorder()
         _ = await startAgentRun(
             tabID: candidate.tabID,
-            initialMessage: envelope,
+            initialMessage: providerMessage,
             directStartOptions: .crossSessionDelivery,
             startOutcome: startRecorder
         )
         releaseComposerSubmitClaim(claim)
+        if startRecorder.outcome.didStart {
+            agentSessionLinkClearWaitingOnAfterAcceptedTurn(liveSession)
+        }
 
         let resultingRunState = sessions[candidate.tabID]?.runState ?? liveSession.runState
         return .delivered(AgentSessionLinkSendDelivery(

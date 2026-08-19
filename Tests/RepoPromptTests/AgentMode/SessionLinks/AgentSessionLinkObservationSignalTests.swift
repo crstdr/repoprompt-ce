@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 /// The explicit oversight wake signal for readiness inputs that publish nothing of their own.
@@ -58,6 +59,22 @@ final class AgentSessionLinkObservationSignalTests: XCTestCase {
 
         session.runLifecycle.completeTerminalCommit()
         XCTAssertEqual(received, 1)
+    }
+
+    func testAcceptedTurnClearsWaitingOnAndPublishesExactlyOnce() throws {
+        let (session, count, cancellable) = makeSession()
+        defer { cancellable.cancel() }
+        session.agentSessionLinkWaitingOn = try XCTUnwrap(DomainAgentSessionWaitingOn(
+            summary: "external review",
+            declaredAt: Date(timeIntervalSince1970: 1)
+        ))
+
+        session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()
+        XCTAssertNil(session.agentSessionLinkWaitingOn)
+        XCTAssertEqual(count(), 1)
+
+        session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()
+        XCTAssertEqual(count(), 1)
     }
 
     // MARK: - Readiness inputs

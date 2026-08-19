@@ -65,6 +65,171 @@ struct AgentSessionLinkPromptContext: Equatable {
 }
 
 extension AgentModeViewModel {
+    enum ProviderInputCatalogReadiness: Equatable {
+        case notRequired
+        case ready
+        case unavailable
+        case timedOut
+        case superseded
+        case cancelled
+    }
+
+    /// Codex retains provider context across turns, so active oversight input waits for the exact
+    /// server-observed catalog instead of treating client configuration as acknowledgement.
+    func ensureProviderInputCatalogReady(
+        for session: TabSession,
+        timeout: TimeInterval = 2.0
+    ) async -> ProviderInputCatalogReadiness {
+        guard session.selectedAgent == .codexExec else { return .notRequired }
+        guard sessions[session.tabID] === session,
+              let runID = session.runID,
+              let sessionID = session.activeAgentSessionID,
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              endpoint.sessionID == sessionID
+        else {
+            return .unavailable
+        }
+
+        let isRequired = await agentSessionLinkHasActiveOutboundLink(endpoint)
+        if Task.isCancelled { return .cancelled }
+        guard sessions[session.tabID] === session else { return .unavailable }
+        guard session.runID == runID,
+              agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
+        else {
+            return .superseded
+        }
+        guard isRequired else { return .notRequired }
+
+        let authoritativeRouteToken = await agentSessionLinkAuthoritativeRunCatalogRouteToken(
+            runID: runID,
+            windowID: endpoint.windowID,
+            tabID: session.tabID
+        )
+        if Task.isCancelled { return .cancelled }
+        guard sessions[session.tabID] === session else { return .unavailable }
+        guard session.runID == runID,
+              agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
+        else {
+            return .superseded
+        }
+        if let current = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+           current.runID == runID,
+           current.isReady,
+           current.routeToken == authoritativeRouteToken,
+           authoritativeRouteToken != nil
+        {
+            return .ready
+        }
+        let outcome = await ServerNetworkManager.shared.awaitRunCatalogReadiness(
+            runID: runID,
+            observerEndpoint: endpoint,
+            timeout: timeout
+        )
+        switch outcome {
+        case .cancelled:
+            return .cancelled
+        case .timedOut:
+            return .timedOut
+        case .superseded:
+            return .superseded
+        case let .ready(ready):
+            let remainsRequired = await agentSessionLinkHasActiveOutboundLink(endpoint)
+            if Task.isCancelled { return .cancelled }
+            guard sessions[session.tabID] === session else { return .unavailable }
+            guard session.runID == runID,
+                  agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
+            else {
+                return .superseded
+            }
+            guard remainsRequired else { return .notRequired }
+            let authoritativeRouteToken = await agentSessionLinkAuthoritativeRunCatalogRouteToken(
+                runID: runID,
+                windowID: endpoint.windowID,
+                tabID: session.tabID
+            )
+            if Task.isCancelled { return .cancelled }
+            guard sessions[session.tabID] === session else { return .unavailable }
+            guard session.runID == runID,
+                  agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
+            else {
+                return .superseded
+            }
+            guard let authoritativeRouteToken,
+                  let applied = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+                  applied.runID == runID,
+                  applied.projectionRevision >= ready.projectionRevision,
+                  applied.isReady,
+                  applied.routeToken == authoritativeRouteToken
+            else {
+                return .unavailable
+            }
+            return .ready
+        }
+    }
+
+    private func agentSessionLinkHasActiveOutboundLink(
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> Bool {
+        #if DEBUG
+            if let test_agentSessionLinkHasActiveOutboundLink {
+                return await test_agentSessionLinkHasActiveOutboundLink(endpoint)
+            }
+        #endif
+        return await AgentSessionLinkRuntimeBridge.shared.hasActiveOutboundLink(
+            observerEndpoint: endpoint
+        )
+    }
+
+    private func agentSessionLinkAuthoritativeRunCatalogRouteToken(
+        runID: UUID,
+        windowID: Int,
+        tabID: UUID
+    ) async -> AgentSessionLinkRunCatalogRouteToken? {
+        #if DEBUG
+            if let test_agentSessionLinkAuthoritativeRunCatalogRouteToken {
+                return await test_agentSessionLinkAuthoritativeRunCatalogRouteToken(runID, windowID, tabID)
+            }
+        #endif
+        return await ServerNetworkManager.shared.authoritativeRunCatalogRouteToken(
+            runID: runID,
+            windowID: windowID,
+            tabID: tabID
+        )
+    }
+
+    /// Synchronous final fence for Codex, whose retained MCP catalog can outlive a connection.
+    /// The async readiness query proves policy/lifecycle authority; this last check proves that the
+    /// exact connection it qualified still owns the MainActor route at composition time.
+    func agentSessionLinkHasCurrentProviderInputCatalogRoute(for session: TabSession) -> Bool {
+        guard session.selectedAgent == .codexExec else { return true }
+        guard sessions[session.tabID] === session,
+              let runID = session.runID,
+              let sessionID = session.activeAgentSessionID,
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              endpoint.sessionID == sessionID,
+              let projection = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+              projection.runID == runID,
+              projection.isReady,
+              let routeToken = projection.routeToken,
+              routeToken.observerEndpoint == endpoint
+        else { return false }
+        #if DEBUG
+            if let test_agentSessionLinkCurrentRunCatalogRouteToken {
+                return test_agentSessionLinkCurrentRunCatalogRouteToken(routeToken, session.tabID)
+            }
+            // Existing synthetic readiness fixtures replace the async authority query without
+            // installing a real MCP mapping. They may opt into the stricter synchronous seam when
+            // exercising handover behavior; otherwise the synthetic token is their authority.
+            if test_agentSessionLinkAuthoritativeRunCatalogRouteToken != nil {
+                return true
+            }
+        #endif
+        return hasCurrentRunCatalogRouteTokenInCurrentMCPServer(
+            routeToken,
+            tabID: session.tabID
+        )
+    }
+
     // MARK: - Inventory publication
 
     /// Stores the authoritative outbound inventory for one exact endpoint incarnation.
@@ -128,6 +293,39 @@ extension AgentModeViewModel {
            passive.observerEndpoint != endpoint
         {
             agentSessionLinkPassiveNoticesBySessionID.removeValue(forKey: endpoint.sessionID)
+        }
+    }
+
+    /// Applies a server-observed catalog projection without allowing a late callback to move backward.
+    func agentSessionLinkPublishRunCatalogProjection(
+        _ projection: AgentSessionLinkRunCatalogProjection,
+        to endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) {
+        guard projection.routeToken?.observerEndpoint == endpoint,
+              let session = sessions[endpoint.tabID],
+              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              session.runID == projection.runID
+        else {
+            return
+        }
+        let existing = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint]
+        if let existing,
+           existing.runID == projection.runID,
+           existing.projectionRevision > projection.projectionRevision
+        {
+            return
+        }
+        if existing == projection { return }
+        let becameReady = projection.isReady && !(existing?.runID == projection.runID && existing?.isReady == true)
+        agentSessionLinkRunCatalogProjectionByEndpoint[endpoint] = projection
+        if projection.isReady {
+            requestUIRefresh(tabID: endpoint.tabID, urgent: true)
+        }
+        if becameReady,
+           let passive = agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID],
+           passive.observerEndpoint == endpoint
+        {
+            agentSessionLinkNoteAutoWakeOpportunity(passive, endpoint: endpoint)
         }
     }
 
@@ -281,8 +479,8 @@ extension AgentModeViewModel {
     /// A re-opened session reusing the same UUID is a new incarnation: it must start from "never
     /// acknowledged" so it is taught oversight again rather than inheriting a stale acknowledgement.
     func agentSessionLinkPrunePromptState(liveSessionIDs: Set<UUID>) {
-        for sessionID in agentSessionLinkPromptInventoryBySessionID.keys
-            where !liveSessionIDs.contains(sessionID)
+        for (sessionID, published) in agentSessionLinkPromptInventoryBySessionID
+            where agentSessionLinkObserverEndpoint(tabID: published.endpoint.tabID) != published.endpoint
         {
             agentSessionLinkPromptInventoryBySessionID.removeValue(forKey: sessionID)
         }
@@ -290,15 +488,20 @@ extension AgentModeViewModel {
         // already fails closed on endpoint resolution. Dropping it keeps a dead endpoint from
         // permanently withholding a supplement from a session that reuses its slot.
         for endpoint in agentSessionLinkPromptInventoryHoldsByEndpoint.keys
-            where !liveSessionIDs.contains(endpoint.sessionID)
+            where agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) != endpoint
         {
             agentSessionLinkPromptInventoryHoldsByEndpoint.removeValue(forKey: endpoint)
+        }
+        for endpoint in agentSessionLinkRunCatalogProjectionByEndpoint.keys
+            where agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) != endpoint
+        {
+            agentSessionLinkRunCatalogProjectionByEndpoint.removeValue(forKey: endpoint)
         }
         // Pruned on the same schedule as the inventory it is joined to: a queue left behind for a
         // dead session would be matched against a later incarnation's revision by coincidence rather
         // than by proof.
-        for sessionID in agentSessionLinkPassiveNoticesBySessionID.keys
-            where !liveSessionIDs.contains(sessionID)
+        for (sessionID, passive) in agentSessionLinkPassiveNoticesBySessionID
+            where agentSessionLinkObserverEndpoint(tabID: passive.observerEndpoint.tabID) != passive.observerEndpoint
         {
             agentSessionLinkPassiveNoticesBySessionID.removeValue(forKey: sessionID)
         }
@@ -368,6 +571,23 @@ extension AgentModeViewModel {
                 taskLabelKind: session.mcpControlContext?.taskLabelKind
             )
         )
+        let effectiveInventory = AgentSessionLinkPromptEligibility.effectiveInventory(
+            published.inventory,
+            input: input
+        )
+        if !effectiveInventory.items.isEmpty {
+            guard let runID = session.runID,
+                  let catalog = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+                  catalog.runID == runID,
+                  catalog.isReady,
+                  catalog.routeToken?.observerEndpoint == endpoint
+            else {
+                return nil
+            }
+            guard agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) else {
+                return nil
+            }
+        }
         return AgentSessionLinkPromptContext(
             epoch: AgentSessionLinkPromptEpoch(
                 endpoint: endpoint,
@@ -378,10 +598,7 @@ extension AgentModeViewModel {
                 // separately at render time is how the two could disagree.
                 agentKind: session.selectedAgent
             ),
-            inventory: AgentSessionLinkPromptEligibility.effectiveInventory(
-                published.inventory,
-                input: input
-            ),
+            inventory: effectiveInventory,
             passiveNotices: agentSessionLinkPassiveNoticesBySessionID[sessionID]
         )
     }
@@ -440,6 +657,25 @@ extension AgentModeViewModel {
             inventory: context.inventory,
             passiveNotices: context.passiveNotices,
             render: AgentSessionLinkPrompts.rendered
+        )
+    }
+
+    /// Whether managed-auth recovery may reattach an accepted claim to this exact dispatch.
+    ///
+    /// A missing prompt context is a hard refusal: withholding is authority, not "nothing currently
+    /// owed." Non-empty contexts have already passed the exact current-catalog-route fence.
+    func agentSessionLinkCanReuseAcceptedPromptClaim(
+        _ claim: AgentSessionLinkOutboundPromptClaim,
+        for session: TabSession,
+        dispatchID: AgentSessionLinkPromptDispatchID
+    ) -> Bool {
+        let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
+        guard let context = agentSessionLinkPromptContext(for: session) else { return false }
+        return agentSessionLinkPromptClaimStore.canReuseAcceptedClaim(
+            claim,
+            dispatchID: effectiveID,
+            epoch: context.epoch,
+            inventory: context.inventory
         )
     }
 

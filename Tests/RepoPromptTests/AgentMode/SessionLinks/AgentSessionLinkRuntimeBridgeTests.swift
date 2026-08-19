@@ -17,6 +17,10 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var snapshotOverrides: [UUID: DomainAgentSessionObservationSnapshot] = [:]
         var installCountsBySession: [UUID: Int] = [:]
         var liveObservations: [UUID: () -> Void] = [:]
+        var waitingOnByEndpoint: [DomainAgentSessionLinkEndpointIdentity: DomainAgentSessionWaitingOn] = [:]
+        /// Per-observer saved Auto-wake selections, so a test can prove which session's set a write
+        /// actually read and replaced.
+        var autoWakeTargetsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: Set<UUID>] = [:]
         var publishedProps: [UUID: AgentMonitorPillProps] = [:]
         var publishedPromptInventories: [UUID: AgentSessionLinkPromptInventory] = [:]
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
@@ -40,6 +44,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         /// Runs after the reservation exists but before the commit fence, so a test can land a
         /// revocation exactly in the window the fence is designed to arbitrate.
         var beforeSendCommit: (() async -> Void)?
+        /// Runs immediately after the commit fence returned, which is the only window in which a
+        /// queued entry is past its cancellation cutoff but has not settled yet.
+        var afterSendCommit: (() async -> Void)?
         /// Per-session call counts, so a test can prove which projection path the UI actually uses.
         var observationSnapshotCalls: [UUID: Int] = [:]
         var statusProjectionCalls: [UUID: Int] = [:]
@@ -69,6 +76,30 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 visibleRowCount: 2,
                 lastActivityAt: Date(timeIntervalSince1970: 100)
             )
+        }
+
+        func agentSessionLinkSetWaitingOn(
+            _ waitingOn: DomainAgentSessionWaitingOn?,
+            for endpoint: DomainAgentSessionLinkEndpointIdentity
+        ) -> Bool {
+            guard candidates.contains(where: { $0.domainEndpoint == endpoint }) else { return false }
+            waitingOnByEndpoint[endpoint] = waitingOn
+            return true
+        }
+
+        func agentSessionLinkAutoWakeTargetSessionIDs(
+            for candidate: AgentSessionLinkEndpointCandidate
+        ) -> Set<UUID> {
+            autoWakeTargetsByEndpoint[candidate.domainEndpoint] ?? []
+        }
+
+        func agentSessionLinkSetAutoWakeTargetSessionIDs(
+            _ targetSessionIDs: Set<UUID>,
+            for endpoint: DomainAgentSessionLinkEndpointIdentity
+        ) -> Bool {
+            guard candidates.contains(where: { $0.domainEndpoint == endpoint }) else { return false }
+            autoWakeTargetsByEndpoint[endpoint] = targetSessionIDs
+            return true
         }
 
         func agentSessionLinkStatusProjection(
@@ -214,6 +245,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             if invokesSendCommit {
                 let commit = await commitAuthorization()
                 sendCommitOutcomes.append(commit)
+                await afterSendCommit?()
                 guard commit == .committed else {
                     return .blocked(commit == .shuttingDown ? .shuttingDown : .linkRevoked)
                 }
@@ -325,7 +357,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             host: host,
             toolAdvertisementInvalidator: { sessionID in
                 await advertisement.record(sessionID)
-            }
+            },
+            now: { Date(timeIntervalSince1970: 1000) }
         )
         return Fixture(
             authority: authority,
@@ -414,6 +447,46 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     }
 
     // MARK: - Add and synchronous seed
+
+    func testWaitingOnIsSelfScopedAppStampedBoundedReplaceableAndClearable() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+
+        let didSet = await fixture.bridge.setWaitingOn(
+            summary: "  blocked\n" + String(repeating: "é", count: 300),
+            for: fixture.target.domainEndpoint
+        )
+        XCTAssertTrue(didSet)
+        let first = try XCTUnwrap(fixture.host.waitingOnByEndpoint[fixture.target.domainEndpoint])
+        XCTAssertEqual(first.declaredAt, Date(timeIntervalSince1970: 1000))
+        XCTAssertLessThanOrEqual(first.summary.utf8.count, 280)
+        XCTAssertFalse(first.summary.contains("\n"))
+
+        let didReplace = await fixture.bridge.setWaitingOn(
+            summary: "review approval",
+            for: fixture.target.domainEndpoint
+        )
+        XCTAssertTrue(didReplace)
+        XCTAssertEqual(
+            fixture.host.waitingOnByEndpoint[fixture.target.domainEndpoint]?.summary,
+            "review approval"
+        )
+
+        let didClear = await fixture.bridge.setWaitingOn(
+            summary: nil,
+            for: fixture.target.domainEndpoint
+        )
+        XCTAssertTrue(didClear)
+        XCTAssertNil(fixture.host.waitingOnByEndpoint[fixture.target.domainEndpoint])
+
+        let unrelated = makeCandidate(windowID: 3)
+        fixture.host.candidates.append(unrelated)
+        let unrelatedResult = await fixture.bridge.setWaitingOn(
+            summary: "no link",
+            for: unrelated.domainEndpoint
+        )
+        XCTAssertFalse(unrelatedResult)
+    }
 
     func testAddSeedsTheFirstLinkBeforeItBecomesAuthorizable() async throws {
         let fixture = makeFixture()
@@ -1717,6 +1790,47 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     // MARK: - Unlink and fresh-link recovery
 
+    /// Undo restores the Auto-wake selection from the *observer's* saved set, whichever row it was
+    /// offered on.
+    ///
+    /// An inbound Unlink is presented on the overseen session's row, and that session's projection
+    /// carries its own selections rather than its observer's. Basing recovery on the invoking props
+    /// would write the wrong session's set back onto the observer, so both directions resolve the
+    /// observer by session ID instead.
+    func testRestoringAnUndoneSelectionUnionsOntoTheObserversOwnSavedSet() async {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        let unrelatedTarget = UUID()
+        fixture.host.autoWakeTargetsByEndpoint[fixture.observer.domainEndpoint] = [unrelatedTarget]
+        // Decoy: the overseen session's own selection must never become the union's base.
+        let decoy = UUID()
+        fixture.host.autoWakeTargetsByEndpoint[fixture.target.domainEndpoint] = [decoy]
+
+        XCTAssertFalse(
+            fixture.bridge.autoWakeTargetSelection(observerSessionID: fixture.observer.sessionID)
+                .contains(fixture.target.sessionID),
+            "a permanent unlink leaves the observer without this target selected"
+        )
+
+        let outcome = await fixture.bridge.restoreAutoWakeTargetSelection(
+            targetSessionID: fixture.target.sessionID,
+            observerSessionID: fixture.observer.sessionID
+        )
+        guard case .changed = outcome else {
+            return XCTFail("expected the restore to change the observer's saved selection")
+        }
+        XCTAssertEqual(
+            fixture.host.autoWakeTargetsByEndpoint[fixture.observer.domainEndpoint],
+            [unrelatedTarget, fixture.target.sessionID],
+            "the restore is additive against the observer's current set"
+        )
+        XCTAssertEqual(
+            fixture.host.autoWakeTargetsByEndpoint[fixture.target.domainEndpoint],
+            [decoy],
+            "the overseen session's own selection is neither read as the base nor written"
+        )
+    }
+
     /// The dashboard's Undo is not a restoration API: it runs the ordinary Add with the captured
     /// session pair, so the recovered relationship is a new link that inherits nothing.
     func testUnlinkThenUndoStyleReAddCreatesAFreshLinkCarryingNoTriageOrSeenState() async {
@@ -2749,6 +2863,900 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.host.sendRequests.count, 1)
     }
 
+    // MARK: - Per-message workflow
+
+    /// The ledger has to answer before a workflow is looked up, which is what lets a retry stay
+    /// idempotent across a workflow the user renamed or deleted in between.
+    ///
+    /// Proved through the conflict branch on purpose: the second call names a workflow that cannot
+    /// resolve, so `idempotency_conflict` rather than a workflow error is only possible if the digest
+    /// was compared first.
+    func testWorkflowSelectorBelongsToTheDeliveryIdentityAndIsComparedBeforeResolution() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        fixture.host.sendOutcome = delivered()
+
+        let resolvedTarget = await authorizedSendTarget(fixture)
+        let target = try XCTUnwrap(resolvedTarget)
+        guard case .receipt = await fixture.bridge.send(
+            target: target,
+            message: "ship it",
+            idempotencyKey: "key-1",
+            workflowReference: nil
+        ) else { return XCTFail("Expected the plain send to deliver") }
+
+        let resolvedRetryTarget = await authorizedSendTarget(fixture)
+        let retryTarget = try XCTUnwrap(resolvedRetryTarget)
+        let conflict = await fixture.bridge.send(
+            target: retryTarget,
+            message: "ship it",
+            idempotencyKey: "key-1",
+            workflowReference: .name("A workflow that does not exist \(UUID().uuidString)")
+        )
+
+        XCTAssertEqual(
+            conflict,
+            .rejected(.idempotencyConflict),
+            "Same key and text under a different workflow is a different payload, not a retry"
+        )
+        XCTAssertEqual(
+            fixture.host.sendRequests.count,
+            1,
+            "A conflicting key must deliver neither payload"
+        )
+    }
+
+    /// A workflow that stops existing after delivery must not turn a legitimate retry into an error:
+    /// the stored receipt is replayed without any lookup at all.
+    func testDuplicateRetryReplaysWithoutResolvingAWorkflowThatIsGone() async throws {
+        let store = AgentWorkflowStore.shared
+        let wasHidden = store.isBuiltInHidden(.deepPlan)
+        store.setBuiltInVisibility(.deepPlan, isVisible: true)
+        defer { store.setBuiltInVisibility(.deepPlan, isVisible: !wasHidden) }
+
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        fixture.host.sendOutcome = delivered()
+        let reference = AgentWorkflowReference.name(AgentWorkflow.deepPlan.displayName)
+        XCTAssertNotNil(reference.resolved(), "precondition: the workflow resolves before delivery")
+
+        let resolvedTarget = await authorizedSendTarget(fixture)
+        let target = try XCTUnwrap(resolvedTarget)
+        guard case let .receipt(first) = await fixture.bridge.send(
+            target: target,
+            message: "plan it",
+            idempotencyKey: "key-1",
+            workflowReference: reference
+        ) else { return XCTFail("Expected the workflow send to deliver") }
+        XCTAssertFalse(first.duplicate)
+        XCTAssertEqual(
+            fixture.host.sendRequests.first?.request.workflow,
+            AgentWorkflow.deepPlan.definition,
+            "The resolved one-shot workflow must reach the target transaction"
+        )
+
+        // The workflow disappears between the delivery and the retry.
+        store.setBuiltInVisibility(.deepPlan, isVisible: false)
+        XCTAssertNil(reference.resolved(), "precondition: the workflow no longer resolves")
+
+        let resolvedRetryTarget = await authorizedSendTarget(fixture)
+        let retryTarget = try XCTUnwrap(resolvedRetryTarget)
+        guard case let .receipt(replay) = await fixture.bridge.send(
+            target: retryTarget,
+            message: "plan it",
+            idempotencyKey: "key-1",
+            workflowReference: reference
+        ) else { return XCTFail("Expected the stored receipt to replay") }
+        XCTAssertTrue(replay.duplicate)
+        XCTAssertEqual(replay.targetItemID, first.targetItemID)
+        XCTAssertEqual(
+            fixture.host.sendRequests.count,
+            1,
+            "A duplicate retry must never reach the target transaction again"
+        )
+    }
+
+    /// A workflow nothing answers to is a caller mistake: nothing is delivered, nothing is staged,
+    /// and the key stays free for a corrected retry.
+    func testUnresolvableWorkflowRefusesWithoutTouchingTheTargetOrBurningTheKey() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        fixture.host.sendOutcome = delivered()
+
+        let resolvedTarget = await authorizedSendTarget(fixture)
+        let target = try XCTUnwrap(resolvedTarget)
+        let outcome = await fixture.bridge.send(
+            target: target,
+            message: "plan it",
+            idempotencyKey: "key-1",
+            workflowReference: .id("missing-workflow")
+        )
+
+        XCTAssertEqual(outcome, .workflowUnavailable(reference: "missing-workflow"))
+        XCTAssertTrue(fixture.host.sendRequests.isEmpty, "Nothing may reach the target transaction")
+        let inFlight = await fixture.authority.snapshot().inFlightSendCount
+        XCTAssertEqual(inFlight, 0, "The abandoned reservation must not hold a ledger slot")
+
+        let resolvedRetryTarget = await authorizedSendTarget(fixture)
+        let retryTarget = try XCTUnwrap(resolvedRetryTarget)
+        guard case .receipt = await fixture.bridge.send(
+            target: retryTarget,
+            message: "plan it",
+            idempotencyKey: "key-1"
+        ) else { return XCTFail("Expected the corrected retry to deliver under the same key") }
+    }
+
+    // MARK: - One pending send per link generation
+
+    /// The queue slot as this observer's own `poll` would report it.
+    private func pendingSend(
+        _ fixture: Fixture
+    ) async -> AgentSessionLinkPendingSendProjection? {
+        guard let target = await authorizedSendTarget(fixture) else { return nil }
+        return fixture.bridge.pendingSendProjection(for: target.lease)
+    }
+
+    /// Lets the bridge's detached drain tasks run.
+    ///
+    /// Drains are deliberately event-driven and detached — a readiness publication *schedules* one
+    /// rather than awaiting it, which is what keeps the design free of timers — so a test has to give
+    /// those tasks a turn. Condition-based and bounded rather than a sleep, so it returns the instant
+    /// the state settles and cannot pass by waiting long enough.
+    private func settleDrains(until condition: @MainActor () async -> Bool) async {
+        for _ in 0 ..< 500 {
+            if await condition() { return }
+            await Task.yield()
+        }
+    }
+
+    /// Mutable capture for a hook that runs inside the send transaction.
+    private final class QueueOutcomeBox {
+        var value: AgentSessionLinkRuntimeBridge.QueueOutcome?
+    }
+
+    private func queueSend(
+        _ fixture: Fixture,
+        message: String = "ship it",
+        key: String = "key-1",
+        workflowReference: AgentWorkflowReference? = nil,
+        replacePending: Bool = false
+    ) async -> AgentSessionLinkRuntimeBridge.QueueOutcome? {
+        guard let target = await authorizedSendTarget(fixture) else { return nil }
+        return await fixture.bridge.queueSend(
+            target: target,
+            message: message,
+            idempotencyKey: key,
+            workflowReference: workflowReference,
+            replacePending: replacePending
+        )
+    }
+
+    /// Models a target that refuses before the authorization fence.
+    ///
+    /// This is the ordinary busy case, and the fence placement is the point: the real transaction
+    /// evaluates readiness at admission and returns long before it commits anything, so the entry is
+    /// still cancellable and parks for the next readiness event.
+    private func stageBusyTarget(_ fixture: Fixture) {
+        fixture.host.invokesSendCommit = false
+        fixture.host.sendOutcome = .blocked(.targetNotIdle)
+    }
+
+    /// Models a target that accepts, including the commit fence the cancellation cutoff hangs off.
+    private func stageReadyTarget(_ fixture: Fixture) {
+        fixture.host.invokesSendCommit = true
+        fixture.host.sendOutcome = delivered()
+    }
+
+    /// `when_sendable` is not a second delivery mechanism: a target that is already ready takes the
+    /// message through the ordinary send path, in the same call, with the ordinary receipt.
+    func testQueuedSendDeliversImmediatelyWhenTheTargetAlreadyAcceptsIt() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageReadyTarget(fixture)
+
+        let outcome = await queueSend(fixture)
+
+        guard case let .send(.receipt(receipt)) = outcome else {
+            return XCTFail("Expected an immediate delivery, got \(String(describing: outcome))")
+        }
+        XCTAssertFalse(receipt.duplicate)
+        XCTAssertEqual(fixture.host.sendRequests.count, 1)
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending, "A delivered message must leave nothing queued")
+        XCTAssertEqual(
+            projection?.lastResult?.outcome,
+            .delivered(receipt),
+            "The terminal outcome stays readable through poll until the next queue mutation"
+        )
+    }
+
+    /// The field case: the target is busy, so the message waits and lands on the next readiness
+    /// publication rather than on a retry loop.
+    func testBusyTargetHoldsOneEntryAndDeliversOnTheNextReadinessPublication() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+
+        let queued = await queueSend(fixture, message: "review the diff")
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+        let queuedProjection = await pendingSend(fixture)
+        let pending = try XCTUnwrap(queuedProjection?.pending)
+        XCTAssertEqual(pending.idempotencyKey, "key-1")
+        XCTAssertEqual(pending.messagePreview, "review the diff")
+        XCTAssertEqual(pending.queuedAt, Date(timeIntervalSince1970: 1000))
+        XCTAssertNil(queuedProjection?.lastResult)
+
+        // Nothing is retried until the target actually reports it can take the message.
+        stageReadyTarget(fixture)
+        XCTAssertEqual(fixture.host.sendRequests.count, 1, "No polling between events")
+
+        await publishTargetActivity(fixture, status: .idle, activity: 2000)
+        await settleDrains { fixture.host.sendRequests.count > 1 }
+        let projection = await pendingSend(fixture)
+
+        XCTAssertNil(projection?.pending, "The entry must be consumed by the delivery")
+        guard case .delivered = try XCTUnwrap(projection?.lastResult?.outcome) else {
+            return XCTFail("Expected the retained outcome to be the delivery receipt")
+        }
+        XCTAssertEqual(projection?.lastResult?.idempotencyKey, "key-1")
+        XCTAssertEqual(
+            fixture.host.sendRequests.count,
+            2,
+            "Exactly one redelivery attempt, triggered by the readiness publication"
+        )
+        XCTAssertEqual(fixture.host.sendRequests.last?.request.message, "review the diff")
+    }
+
+    /// Queuing pre-authorizes a delivery the user is not present for, so it is reserved to a turn the
+    /// user actually started — exactly like sending now.
+    func testQueueAdmissionRefusesATurnTheObserversOwnUserDidNotStart() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        var automatic = fixture.observer
+        automatic.turnOrigin = .laneUpdateAutoWake(wakeID: UUID())
+        fixture.host.candidates = [automatic, fixture.target]
+
+        let outcome = await queueSend(fixture)
+
+        XCTAssertEqual(outcome, .send(.blocked(.crossSessionReplyRequiresUserInstruction)))
+        XCTAssertTrue(fixture.host.sendRequests.isEmpty, "Nothing may reach the target transaction")
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
+    }
+
+    /// The authorization captured at admission is the user's, and it is never recaptured.
+    ///
+    /// Reading the observer's *current* origin at delivery would refuse a message the user asked for
+    /// merely because the observer happened to be mid-automatic turn when the target freed up — and,
+    /// worse, would make the delivered/refused outcome depend on unrelated timing.
+    func testQueuedDeliveryUsesQueueTimeAuthorizationNotTheObserversLaterOrigin() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        let queued = await queueSend(fixture)
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+
+        // The observer's turn moves on to an automatic one while the message waits.
+        var automatic = fixture.observer
+        automatic.turnOrigin = .laneUpdateAutoWake(wakeID: UUID())
+        fixture.host.candidates = [automatic, fixture.target]
+        stageReadyTarget(fixture)
+
+        await publishTargetActivity(fixture, status: .idle, activity: 2000)
+        await settleDrains { fixture.host.sendRequests.count > 1 }
+
+        XCTAssertEqual(fixture.host.sendRequests.count, 2)
+        XCTAssertEqual(
+            fixture.host.sendRequests.last?.request.observerTurnOrigin,
+            .localUser,
+            "The drain must deliver under the origin that authorized the queue entry"
+        )
+        let drained = await pendingSend(fixture)
+        XCTAssertNil(drained?.pending)
+    }
+
+    /// One slot, and a second key has to say so explicitly.
+    func testSecondKeyNeedsReplacePendingAndReplacementSwapsTheEntryAtomically() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        let first = await queueSend(fixture, message: "first", key: "key-1")
+        XCTAssertEqual(first, .queued(replaced: false, duplicate: false))
+
+        let occupied = await queueSend(fixture, message: "second", key: "key-2")
+        XCTAssertEqual(
+            occupied,
+            .result(.pendingSendExists),
+            "A different key must not silently displace the message already queued"
+        )
+        let unchanged = await pendingSend(fixture)
+        XCTAssertEqual(unchanged?.pending?.idempotencyKey, "key-1")
+
+        let replaced = await queueSend(
+            fixture,
+            message: "second",
+            key: "key-2",
+            replacePending: true
+        )
+        XCTAssertEqual(replaced, .queued(replaced: true, duplicate: false))
+        let projection = await pendingSend(fixture)
+        let pending = try XCTUnwrap(projection?.pending)
+        XCTAssertEqual(pending.idempotencyKey, "key-2")
+        XCTAssertEqual(pending.messagePreview, "second")
+    }
+
+    /// Same key, same payload is a retry of the entry that already exists; same key, different
+    /// payload is a conflict that queues neither.
+    func testSameKeyReplaysAndADifferentPayloadUnderThatKeyConflicts() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        _ = await queueSend(fixture, message: "first", key: "key-1")
+
+        let replay = await queueSend(fixture, message: "first", key: "key-1")
+        XCTAssertEqual(replay, .queued(replaced: false, duplicate: true))
+        let conflict = await queueSend(fixture, message: "changed", key: "key-1")
+        XCTAssertEqual(conflict, .send(.rejected(.idempotencyConflict)))
+        let projection = await pendingSend(fixture)
+        let pending = try XCTUnwrap(projection?.pending)
+        XCTAssertEqual(
+            pending.messagePreview,
+            "first",
+            "A conflicting call must leave the queued message exactly as it was"
+        )
+    }
+
+    /// A same-key retry must not re-resolve anything: the entry already holds the workflow it was
+    /// admitted with, and a user who renamed that template in the meantime has not changed the
+    /// instruction they authorized.
+    func testIdempotentQueueRetryDoesNotReResolveAWorkflowThatIsGone() async {
+        let store = AgentWorkflowStore.shared
+        let wasHidden = store.isBuiltInHidden(.deepPlan)
+        store.setBuiltInVisibility(.deepPlan, isVisible: true)
+        defer { store.setBuiltInVisibility(.deepPlan, isVisible: !wasHidden) }
+
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        let reference = AgentWorkflowReference.name(AgentWorkflow.deepPlan.displayName)
+        let queued = await queueSend(fixture, workflowReference: reference)
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+        let admitted = await pendingSend(fixture)
+        XCTAssertEqual(
+            admitted?.pending?.workflow,
+            AgentWorkflow.deepPlan.definition,
+            "Admission resolves the workflow once and freezes it"
+        )
+
+        store.setBuiltInVisibility(.deepPlan, isVisible: false)
+        XCTAssertNil(reference.resolved(), "precondition: the workflow no longer resolves")
+
+        let retry = await queueSend(fixture, workflowReference: reference)
+        XCTAssertEqual(retry, .queued(replaced: false, duplicate: true))
+        let afterRetry = await pendingSend(fixture)
+        XCTAssertEqual(afterRetry?.pending?.workflow, AgentWorkflow.deepPlan.definition)
+    }
+
+    /// A replacement is validated in full before it is installed, so a bad one is a no-op rather than
+    /// a way to silently drop the message the user already queued.
+    func testFailedReplacementLeavesTheOriginalEntryUntouched() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        _ = await queueSend(fixture, message: "first", key: "key-1")
+
+        let outcome = await queueSend(
+            fixture,
+            message: "second",
+            key: "key-2",
+            workflowReference: .id("missing-workflow"),
+            replacePending: true
+        )
+
+        XCTAssertEqual(outcome, .send(.workflowUnavailable(reference: "missing-workflow")))
+        let projection = await pendingSend(fixture)
+        let pending = try XCTUnwrap(projection?.pending)
+        XCTAssertEqual(pending.idempotencyKey, "key-1")
+        XCTAssertEqual(pending.messagePreview, "first")
+    }
+
+    func testCancelMatchesTheCurrentEntryByKey() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+
+        let resolvedEmptyTarget = await authorizedSendTarget(fixture)
+        let emptyTarget = try XCTUnwrap(resolvedEmptyTarget)
+        let notPending = await fixture.bridge.cancelPendingSend(
+            target: emptyTarget,
+            idempotencyKey: "key-1"
+        )
+        XCTAssertEqual(notPending, .result(.notPending))
+
+        _ = await queueSend(fixture, key: "key-1")
+        let resolvedStaleTarget = await authorizedSendTarget(fixture)
+        let staleTarget = try XCTUnwrap(resolvedStaleTarget)
+        let mismatch = await fixture.bridge.cancelPendingSend(
+            target: staleTarget,
+            idempotencyKey: "key-0"
+        )
+        XCTAssertEqual(
+            mismatch,
+            .result(.pendingSendMismatch),
+            "A stale cancel must not remove a message it does not name"
+        )
+        let survived = await pendingSend(fixture)
+        XCTAssertNotNil(survived?.pending)
+
+        let resolvedCancelTarget = await authorizedSendTarget(fixture)
+        let target = try XCTUnwrap(resolvedCancelTarget)
+        let cancelled = await fixture.bridge.cancelPendingSend(
+            target: target,
+            idempotencyKey: "key-1"
+        )
+        XCTAssertEqual(cancelled, .result(.cancelled))
+        let afterCancel = await pendingSend(fixture)
+        XCTAssertNil(afterCancel?.pending)
+        XCTAssertTrue(fixture.host.sendRequests.count <= 1, "Cancelling delivers nothing")
+    }
+
+    /// Cancelling discards an instruction the user authorized, so an automatic turn may not do it.
+    func testCancelRefusesATurnTheObserversOwnUserDidNotStart() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        _ = await queueSend(fixture, key: "key-1")
+
+        let resolvedCancelTarget = await authorizedSendTarget(fixture)
+        let target = try XCTUnwrap(resolvedCancelTarget)
+        var automatic = fixture.observer
+        automatic.turnOrigin = .crossSessionMessage(sourceSessionID: UUID())
+        fixture.host.candidates = [automatic, fixture.target]
+
+        let refused = await fixture.bridge.cancelPendingSend(target: target, idempotencyKey: "key-1")
+        XCTAssertEqual(refused, .send(.blocked(.crossSessionReplyRequiresUserInstruction)))
+        let survived = await pendingSend(fixture)
+        XCTAssertNotNil(
+            survived?.pending,
+            "The queued instruction must survive an unauthorized cancel"
+        )
+    }
+
+    /// Before the cutoff, a cancel wins outright: the delivery unwinds with no transcript mutation at
+    /// all, exactly as a manual revocation in the same window does.
+    func testCancelBeforeTheCommitCutoffStopsTheDeliveryEntirely() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageReadyTarget(fixture)
+        fixture.host.beforeSendCommit = { [weak self] in
+            guard let self, let target = await authorizedSendTarget(fixture) else { return }
+            _ = await fixture.bridge.cancelPendingSend(target: target, idempotencyKey: "key-1")
+        }
+
+        let outcome = await queueSend(fixture, key: "key-1")
+
+        XCTAssertEqual(fixture.host.sendCommitOutcomes, [.linkRevoked])
+        XCTAssertEqual(
+            outcome,
+            .send(.rejected(.denied)),
+            "The entry the caller asked about no longer exists"
+        )
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
+        let snapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(snapshot.inFlightSendCount, 0)
+        XCTAssertEqual(
+            snapshot.retainedSendOutcomeCount,
+            0,
+            "A delivery stopped before the fence must retain no receipt"
+        )
+    }
+
+    /// After the cutoff, a cancel is answered truthfully rather than optimistically, and the delivery
+    /// settles on its own terms.
+    func testCancelAfterTheCommitCutoffReportsTooLateAndTheDeliverySettles() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageReadyTarget(fixture)
+        let cancelOutcome = QueueOutcomeBox()
+        fixture.host.afterSendCommit = { [weak self] in
+            guard let self, let target = await authorizedSendTarget(fixture) else { return }
+            cancelOutcome.value = await fixture.bridge.cancelPendingSend(
+                target: target,
+                idempotencyKey: "key-1"
+            )
+        }
+
+        let outcome = await queueSend(fixture, key: "key-1")
+
+        XCTAssertEqual(fixture.host.sendCommitOutcomes, [.committed])
+        XCTAssertEqual(cancelOutcome.value, .result(.tooLate))
+        guard case .send(.receipt) = outcome else {
+            return XCTFail("The committed delivery must still settle, got \(String(describing: outcome))")
+        }
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
+        guard case .delivered = try XCTUnwrap(projection?.lastResult?.outcome) else {
+            return XCTFail("Settlement owns the result once the cutoff is crossed")
+        }
+    }
+
+    /// A queued message belongs to the exact grant that admitted it. Stopping oversight ends it, and
+    /// re-adding the same pair starts empty rather than inheriting authority the user removed.
+    func testUnlinkDiscardsTheEntryAndReAddingTheSamePairStartsEmpty() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        _ = await queueSend(fixture, key: "key-1")
+        let queued = await pendingSend(fixture)
+        XCTAssertNotNil(queued?.pending)
+
+        let resolvedReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(resolvedReference)
+        await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        _ = await addLink(fixture)
+
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending, "A re-added pair must not inherit a queued message")
+        XCTAssertNil(projection?.lastResult, "Nor the outcome the previous generation retained")
+        stageReadyTarget(fixture)
+        await publishTargetActivity(fixture, status: .idle, activity: 2000)
+        await settleDrains { fixture.host.sendRequests.count > 1 }
+        XCTAssertEqual(
+            fixture.host.sendRequests.count,
+            1,
+            "Nothing may be delivered against the new generation"
+        )
+    }
+
+    /// Queued sends are pre-authorization for a delivery the user is not present for, so quitting
+    /// ends them rather than carrying them across a relaunch.
+    func testTerminationFreezeDiscardsQueuedSends() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        _ = await queueSend(fixture, key: "key-1")
+        let queued = await pendingSend(fixture)
+        XCTAssertNotNil(queued?.pending)
+        let resolvedCancelTarget = await authorizedSendTarget(fixture)
+        let target = try XCTUnwrap(resolvedCancelTarget)
+
+        fixture.bridge.freezeForTermination()
+
+        let afterFreeze = await pendingSend(fixture)
+        XCTAssertNil(afterFreeze?.pending)
+        let refused = await fixture.bridge.queueSend(
+            target: target,
+            message: "ship it",
+            idempotencyKey: "key-2",
+            workflowReference: nil,
+            replacePending: false
+        )
+        XCTAssertEqual(refused, .send(.rejected(.shuttingDown)))
+    }
+
+    /// A rejection the drain can never resolve ends the entry with a retained, non-retryable outcome
+    /// rather than parking it forever against something that can only be re-rejected.
+    func testAKeyTakenByAConflictingImmediateSendEndsTheQueuedEntryTruthfully() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        _ = await queueSend(fixture, message: "queued text", key: "key-1")
+
+        // An immediate send spends the same key on different text, so the ledger permanently holds a
+        // receipt whose payload identity the queued entry can never match.
+        stageReadyTarget(fixture)
+        let resolvedImmediateTarget = await authorizedSendTarget(fixture)
+        let immediate = try XCTUnwrap(resolvedImmediateTarget)
+        guard case .receipt = await fixture.bridge.send(
+            target: immediate,
+            message: "different text",
+            idempotencyKey: "key-1"
+        ) else { return XCTFail("precondition: the immediate send must deliver") }
+
+        await publishTargetActivity(fixture, status: .idle, activity: 2000)
+        await settleDrains { await self.pendingSend(fixture)?.pending == nil }
+
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
+        XCTAssertEqual(projection?.lastResult?.outcome, .rejected(.idempotencyConflict))
+        XCTAssertEqual(
+            fixture.host.sendRequests.count,
+            2,
+            "The queued text must never be delivered under a key that means something else"
+        )
+    }
+
+    /// Settlement — not readiness — is what releases an entry parked behind an in-flight send.
+    ///
+    /// Nothing about the *target* changes while another send under the same key settles, so no
+    /// readiness publication is coming to retrigger this drain. Without the ledger's own settlement
+    /// trigger the entry would wait forever behind a send that already finished.
+    func testAnEntryParkedBehindAnInFlightSendUnderItsKeyDrainsWhenThatSendSettles() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        _ = await queueSend(fixture, message: "review the diff", key: "key-1")
+        let admittedParkReason = await pendingSend(fixture)?.pending?.parkReason
+        XCTAssertEqual(
+            admittedParkReason,
+            .targetReadiness,
+            "precondition: a busy target parks the entry on the readiness event"
+        )
+
+        // An immediate retry of the very same delivery holds the ledger key the queued entry drains
+        // under. From inside that reservation window the key is genuinely in flight, so the drain
+        // this readiness publication schedules must park on the send rather than fail the entry.
+        stageReadyTarget(fixture)
+        fixture.host.beforeSendCommit = { [weak self] in
+            guard let self else { return }
+            await publishTargetActivity(fixture, status: .idle, activity: 2000)
+            await settleDrains {
+                await self.pendingSend(fixture)?.pending?.parkReason == .sendInProgress
+            }
+        }
+
+        let resolvedTarget = await authorizedSendTarget(fixture)
+        let immediate = try XCTUnwrap(resolvedTarget)
+        guard case let .receipt(receipt) = await fixture.bridge.send(
+            target: immediate,
+            message: "review the diff",
+            idempotencyKey: "key-1"
+        ) else { return XCTFail("precondition: the immediate send must deliver") }
+        XCTAssertFalse(receipt.duplicate)
+
+        await settleDrains { await self.pendingSend(fixture)?.pending == nil }
+
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(
+            projection?.pending,
+            "The settlement trigger must release an entry no readiness event would have retried"
+        )
+        XCTAssertEqual(projection?.lastResult?.idempotencyKey, "key-1")
+        guard case let .delivered(settled) = try XCTUnwrap(projection?.lastResult?.outcome) else {
+            return XCTFail("Expected the parked entry to settle on the delivery that overtook it")
+        }
+        XCTAssertTrue(settled.duplicate, "The queued text already landed under this key")
+        XCTAssertEqual(settled.targetItemID, receipt.targetItemID)
+        XCTAssertEqual(
+            fixture.host.sendRequests.count,
+            2,
+            "The parked entry must not reach the target transaction a second time"
+        )
+    }
+
+    // MARK: Mid-drain trigger fence
+
+    /// Mutable capture for the entry state a hook observes from inside the drain.
+    private final class MissedTriggerBox {
+        var value: Set<AgentSessionLinkPendingSend.ParkReason>?
+    }
+
+    /// The readiness edge a drain races is the only one its park will ever wait for.
+    ///
+    /// A drain reads the target once, at its start, and decides how to park several awaits later. A
+    /// publication that lands inside that window finds an entry that is not `.pending`, so it has
+    /// nothing to schedule — and with no timer and no polling behind the queue, dropping it strands
+    /// the message for good.
+    func testAReadinessEdgeThatLandsMidDrainIsNotLostByThePark() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        fixture.host.beforeSendCommit = { [weak self] in
+            guard let self else { return }
+            // The re-drain the fence owes must find a target that now accepts the message.
+            fixture.host.beforeSendCommit = { [weak self] in self?.stageReadyTarget(fixture) }
+            // The target reports it is ready while this drain is already `.draining`.
+            await publishTargetActivity(fixture, status: .idle, activity: 2000)
+        }
+
+        let queued = await queueSend(fixture, message: "review the diff", key: "key-1")
+
+        XCTAssertEqual(
+            queued,
+            .queued(replaced: false, duplicate: false),
+            "precondition: the drain that raced the edge still parked the entry"
+        )
+        await settleDrains { await self.pendingSend(fixture)?.pending == nil }
+
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending, "the edge that landed mid-drain must still be consumed")
+        guard case .delivered = try XCTUnwrap(projection?.lastResult?.outcome) else {
+            return XCTFail("Expected the re-drain to deliver the queued message")
+        }
+        XCTAssertEqual(
+            fixture.host.sendRequests.count,
+            2,
+            "exactly one re-drain, caused by the edge the first drain raced — not a retry loop"
+        )
+        XCTAssertEqual(fixture.host.sendRequests.last?.request.message, "review the diff")
+    }
+
+    /// A settlement that lands mid-drain is captured on the same fence, and releases only a park it
+    /// actually frees.
+    ///
+    /// Both halves matter. The capture is what stops an entry parked on the ledger from waiting for a
+    /// slot that was freed while it was suspended; the reason match is what stops a drain's own
+    /// settlement from re-driving every other draining entry, which would be a livelock rather than a
+    /// fence. This also covers the reservation the workflow-unavailable path releases: it stages no
+    /// target work at all, so the trigger it fires is the only evidence it settled the ledger.
+    func testASettlementEdgeThatLandsMidDrainIsRecordedAndReleasesOnlyAMatchingPark() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        let recorded = MissedTriggerBox()
+        fixture.host.beforeSendCommit = { [weak self] in
+            guard let self else { return }
+            fixture.host.beforeSendCommit = nil
+            guard let target = await authorizedSendTarget(fixture) else { return }
+            // A second key reserves and releases a ledger slot on this link while the queued entry is
+            // `.draining`, without ever reaching the target transaction.
+            let unavailable = await fixture.bridge.send(
+                target: target,
+                message: "unrelated",
+                idempotencyKey: "key-2",
+                workflowReference: .id("missing-workflow")
+            )
+            XCTAssertEqual(unavailable, .workflowUnavailable(reference: "missing-workflow"))
+            recorded.value = await pendingSend(fixture)?.pending?.missedDrainTriggers
+        }
+
+        let queued = await queueSend(fixture, message: "review the diff", key: "key-1")
+
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+        XCTAssertEqual(
+            recorded.value,
+            [.sendInProgress, .ledgerSaturated],
+            "a reservation released on this link must be recorded, not dropped, on a draining entry"
+        )
+        let projection = await pendingSend(fixture)
+        XCTAssertEqual(projection?.pending?.parkReason, .targetReadiness)
+        XCTAssertEqual(
+            projection?.pending?.missedDrainTriggers,
+            [],
+            "the record is spent by the park it raced, whether or not it released it"
+        )
+        await settleDrains { fixture.host.sendRequests.count > 1 }
+        XCTAssertEqual(
+            fixture.host.sendRequests.count,
+            1,
+            "a settlement must not re-drive an entry that is waiting on target readiness"
+        )
+    }
+
+    /// The fence's own rule, including the ledger interleavings the transaction stack cannot stage:
+    /// a park only re-drives itself when the exact edge it is waiting for already passed.
+    func testMidDrainTriggerRecordReleasesOnlyTheParkItMatchesAndIsSpentEitherWay() {
+        var entry = slotEntry(key: "a", digest: "d1", phase: .pending)
+        let otherLink = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
+
+        func note(settledOn settled: DomainAgentSessionLinkReference) {
+            entry.beginDrainWindow()
+            XCTAssertEqual(entry.phase, .draining)
+            entry.noteMissedDrainTriggers(AgentSessionLinkPendingSend.parkReasonsReleased(
+                bySendSettlementOn: settled,
+                forEntryOn: entry.reference
+            ))
+        }
+
+        // Same-link settlement: releases this link's in-flight-send park and the authority-wide one.
+        note(settledOn: entry.reference)
+        XCTAssertTrue(entry.park(reason: .ledgerSaturated))
+        XCTAssertEqual(entry.phase, .pending)
+        XCTAssertEqual(entry.parkReason, .ledgerSaturated)
+        XCTAssertTrue(entry.missedDrainTriggers.isEmpty, "the record is consumed by the park that used it")
+        note(settledOn: entry.reference)
+        XCTAssertTrue(entry.park(reason: .sendInProgress))
+
+        // The same edge against a park it does not free: the readiness publication this entry now
+        // waits for has not happened yet and will be delivered normally.
+        note(settledOn: entry.reference)
+        XCTAssertFalse(entry.park(reason: .targetReadiness))
+        XCTAssertTrue(entry.missedDrainTriggers.isEmpty, "a record that releases nothing is still spent")
+
+        // Another link's settlement frees an authority-wide slot but not this link's in-flight send.
+        note(settledOn: otherLink)
+        XCTAssertFalse(entry.park(reason: .sendInProgress))
+        note(settledOn: otherLink)
+        XCTAssertTrue(entry.park(reason: .ledgerSaturated))
+
+        // Readiness is the one trigger that is not park-reason specific: proof the target moved is
+        // worth re-evaluating whatever the entry parked on.
+        for reason in [
+            AgentSessionLinkPendingSend.ParkReason.targetReadiness,
+            .sendInProgress,
+            .ledgerSaturated
+        ] {
+            entry.beginDrainWindow()
+            entry.noteMissedDrainTriggers(
+                AgentSessionLinkPendingSend.parkReasonsReleasedByTargetReadiness
+            )
+            XCTAssertTrue(entry.park(reason: reason))
+        }
+    }
+
+    // MARK: Slot arbitration
+
+    private func slotEntry(key: String, digest: String, phase: AgentSessionLinkPendingSend.Phase) -> AgentSessionLinkPendingSend {
+        AgentSessionLinkPendingSend(
+            revision: UUID(),
+            reference: DomainAgentSessionLinkReference(linkID: UUID(), generation: 1),
+            observerEndpoint: makeCandidate(windowID: 1).domainEndpoint,
+            targetSessionID: UUID(),
+            message: "queued",
+            idempotencyKey: key,
+            requestDigest: digest,
+            workflow: nil,
+            authorizedTurnOrigin: .localUser,
+            queuedAt: Date(timeIntervalSince1970: 1000),
+            phase: phase
+        )
+    }
+
+    /// The arbitration runs twice per admission — once before anything is resolved and again after
+    /// those awaits — so it has to be one rule rather than two approximations of one.
+    func testSlotArbitrationCoversEveryAdmissionCase() {
+        XCTAssertEqual(
+            AgentSessionLinkPendingSend.slotDecision(
+                current: nil,
+                idempotencyKey: "a",
+                requestDigest: "d1",
+                replacePending: false
+            ),
+            .install(replaced: false)
+        )
+        let entry = slotEntry(key: "a", digest: "d1", phase: .pending)
+        XCTAssertEqual(
+            AgentSessionLinkPendingSend.slotDecision(
+                current: entry,
+                idempotencyKey: "a",
+                requestDigest: "d1",
+                replacePending: false
+            ),
+            .replay(revision: entry.revision)
+        )
+        XCTAssertEqual(
+            AgentSessionLinkPendingSend.slotDecision(
+                current: entry,
+                idempotencyKey: "a",
+                requestDigest: "d2",
+                replacePending: true
+            ),
+            .conflict,
+            "replace_pending must not turn a same-key payload change into a replacement"
+        )
+        XCTAssertEqual(
+            AgentSessionLinkPendingSend.slotDecision(
+                current: entry,
+                idempotencyKey: "b",
+                requestDigest: "d2",
+                replacePending: false
+            ),
+            .occupied
+        )
+        XCTAssertEqual(
+            AgentSessionLinkPendingSend.slotDecision(
+                current: entry,
+                idempotencyKey: "b",
+                requestDigest: "d2",
+                replacePending: true
+            ),
+            .install(replaced: true)
+        )
+        for phase in [AgentSessionLinkPendingSend.Phase.committing, .committed] {
+            XCTAssertEqual(
+                AgentSessionLinkPendingSend.slotDecision(
+                    current: slotEntry(key: "a", digest: "d1", phase: phase),
+                    idempotencyKey: "b",
+                    requestDigest: "d2",
+                    replacePending: true
+                ),
+                .tooLate,
+                "An entry past its cutoff cannot be displaced"
+            )
+        }
+    }
+
     func testSendFromADriftedObserverIsDeniedWithoutReachingTheTarget() async throws {
         let fixture = makeFixture()
         _ = await addLink(fixture)
@@ -3024,30 +4032,29 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         return await fixture.advertisement.drain().filter { $0 != fence.sessionID }
     }
 
-    /// Advertisement follows **outbound** authority only. The observer gained the ability to call
-    /// `agent_session_link`; the target gained nothing, so re-advertising its catalog would offer a
-    /// oversight tool to a window that holds no grant.
-    func testAddAndRevokeInvalidateOnlyTheObserversToolAdvertisement() async throws {
+    /// The first inbound link advertises the self-scoped waiting declaration to the target; the last
+    /// revocation removes it. Both endpoints therefore refresh exactly at those membership edges.
+    func testAddAndRevokeInvalidateObserverAndTargetsToolAdvertisement() async throws {
         let fixture = makeFixture()
         fixture.bridge.test_startChangeFeed()
         guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
 
         let afterAdd = try await awaitInvalidations(
             fixture,
-            count: Self.invalidationsPerMembershipChange,
+            count: Self.invalidationsPerMembershipChange * 2,
             "both add invalidations"
         )
-        XCTAssertEqual(Set(afterAdd), [fixture.observer.sessionID])
+        XCTAssertEqual(Set(afterAdd), [fixture.observer.sessionID, fixture.target.sessionID])
 
         guard let reference = await linkReference(fixture) else { return XCTFail("missing link") }
         await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
 
         let afterRevoke = try await awaitInvalidations(
             fixture,
-            count: Self.invalidationsPerMembershipChange,
+            count: Self.invalidationsPerMembershipChange * 2,
             "both revoke invalidations"
         )
-        XCTAssertEqual(Set(afterRevoke), [fixture.observer.sessionID])
+        XCTAssertEqual(Set(afterRevoke), [fixture.observer.sessionID, fixture.target.sessionID])
     }
 
     /// The inline notification is the half that survives a dropped change-feed event, so it has to
@@ -3057,18 +4064,18 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
         let afterAdd = await fixture.advertisement.drain()
         XCTAssertEqual(
-            afterAdd,
-            [fixture.observer.sessionID],
-            "an add with no feed running must still re-advertise the observer"
+            Set(afterAdd),
+            [fixture.observer.sessionID, fixture.target.sessionID],
+            "an add with no feed running must re-advertise both endpoints"
         )
 
         guard let reference = await linkReference(fixture) else { return XCTFail("missing link") }
         await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
         let afterRevoke = await fixture.advertisement.drain()
         XCTAssertEqual(
-            afterRevoke,
-            [fixture.observer.sessionID],
-            "a revoke with no feed running must still re-advertise the observer"
+            Set(afterRevoke),
+            [fixture.observer.sessionID, fixture.target.sessionID],
+            "a last revoke with no feed running must re-advertise both endpoints"
         )
     }
 
@@ -3086,9 +4093,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         let recorded = await fixture.advertisement.drain()
         XCTAssertEqual(
-            recorded,
-            [fixture.observer.sessionID],
-            "the sweep revoked the grant without telling the observer to re-advertise"
+            Set(recorded),
+            [fixture.observer.sessionID, fixture.target.sessionID],
+            "the sweep revoked the grant without telling both affected endpoints to re-advertise"
         )
     }
 
@@ -3120,9 +4127,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         let recorded = await fixture.advertisement.drain()
         XCTAssertEqual(
-            recorded,
-            [fixture.observer.sessionID, secondObserver.sessionID],
-            "the dispossessed observer kept advertising a grant the reservation had revoked"
+            Set(recorded),
+            [fixture.observer.sessionID, secondObserver.sessionID, fixture.target.sessionID],
+            "the rebound did not re-advertise every endpoint whose tool availability changed"
         )
         let activeLinks = await fixture.authority.snapshot().activeLinkCount
         XCTAssertEqual(activeLinks, 1, "only the new observer's link survives the drift")
@@ -3217,6 +4224,26 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 }
 
 // MARK: - Helpers
+
+private extension AgentSessionLinkRuntimeBridge {
+    /// Sends with no per-message workflow.
+    ///
+    /// Every case above this line predates the override and exercises the plain path; the workflow
+    /// cases call the full API. Deliberately a forwarding overload rather than a production default:
+    /// a real caller that forgets to pass a workflow must not silently drop the user's one.
+    func send(
+        target: AuthorizedTarget,
+        message: String,
+        idempotencyKey: String
+    ) async -> SendOutcome {
+        await send(
+            target: target,
+            message: message,
+            idempotencyKey: idempotencyKey,
+            workflowReference: nil
+        )
+    }
+}
 
 private extension Result {
     var failure: Failure? {

@@ -98,9 +98,15 @@ struct AgentSessionLinkMCPToolService {
         case "send":
             try validateAllowedKeys(args, op: op, allowed: Self.sendKeys)
             return try await executeSend(args: args)
+        case "cancel_pending_send":
+            try validateAllowedKeys(args, op: op, allowed: Self.cancelPendingSendKeys)
+            return try await executeCancelPendingSend(args: args)
         case "mark_done":
             try validateAllowedKeys(args, op: op, allowed: Self.markDoneKeys)
             return try await executeMarkDone(args: args)
+        case "set_waiting_on":
+            try validateAllowedKeys(args, op: op, allowed: Self.setWaitingOnKeys)
+            return try await executeSetWaitingOn(args: args)
         default:
             throw MCPError.invalidParams(
                 "Unsupported agent_session_link op '\(op)'. \(Self.supportedOperationsSentence)"
@@ -111,7 +117,33 @@ struct AgentSessionLinkMCPToolService {
     /// Single-sourced so the missing-op and unsupported-op errors can never drift apart, or from the
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
-        "Use list, poll, wait, read, send, or mark_done."
+        "Use list, poll, wait, read, send, cancel_pending_send, mark_done, or set_waiting_on."
+
+    private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
+        let endpoint = try await resolveObserverEndpointIdentity()
+        let summary = AgentMCPToolHelpers.normalizedString(args["summary"])
+        let clear: Bool
+        switch args["clear"] {
+        case let .bool(value): clear = value
+        case nil: clear = false
+        default:
+            throw MCPError.invalidParams("agent_session_link set_waiting_on clear must be a Boolean.")
+        }
+        guard (summary != nil) != clear else {
+            throw MCPError.invalidParams(
+                "agent_session_link set_waiting_on requires exactly one of non-empty summary or clear: true."
+            )
+        }
+        guard await bridge.setWaitingOn(summary: clear ? nil : summary, for: endpoint) else {
+            throw Self.unavailableError
+        }
+        return .object([
+            "result": .string(clear ? "cleared" : "set"),
+            "waiting_on": clear ? .null : .object([
+                "summary": .string(summary ?? "")
+            ])
+        ])
+    }
 
     // MARK: - Common authorizer
 
@@ -259,25 +291,39 @@ struct AgentSessionLinkMCPToolService {
         )
 
         var states: [DomainAgentSessionLinkTargetState] = []
+        var pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:]
         states.reserveCapacity(targets.count)
         for target in targets {
             guard let state = await bridge.targetState(for: target.lease) else {
                 throw Self.error(for: .denied, targetSessionID: target.lease.target.sessionID)
             }
             states.append(state)
+            // Read through this caller's own lease, so the queue state one observer staged is
+            // structurally unreachable from another observer of the same target.
+            pendingSends[state.sessionID] = bridge.pendingSendProjection(for: target.lease)
         }
 
         if request.isSingle, let state = states.first {
-            return .object([
+            var payload: [String: Value] = [
                 "notice": .string(Self.untrustedContentNotice),
                 "session_id": .string(state.sessionID.uuidString),
                 "snapshot": AgentSessionLinkResponseRenderer.snapshotValue(state),
                 "wait_cursor": .string(state.waitCursor)
-            ])
+            ]
+            payload.merge(AgentSessionLinkResponseRenderer.pendingSendFields(
+                pendingSends[state.sessionID] ?? .empty,
+                targetSessionID: state.sessionID
+            )) { _, new in new }
+            return .object(payload)
         }
         return .object([
             "notice": .string(Self.untrustedContentNotice),
-            "targets": .array(states.map(AgentSessionLinkResponseRenderer.targetEntryValue))
+            "targets": .array(states.map { state in
+                AgentSessionLinkResponseRenderer.targetEntryValue(
+                    state,
+                    pendingSend: pendingSends[state.sessionID] ?? .empty
+                )
+            })
         ])
     }
 
@@ -305,6 +351,9 @@ struct AgentSessionLinkMCPToolService {
         }
 
         let isSingle = request.isSingle
+        // Only the leases cross into the heartbeat closure. They are the whole authorization proof
+        // and are already `Sendable`, unlike the live candidates their `AuthorizedTarget`s carry.
+        let leases = targets.map(\.lease)
         return try await withHeartbeat(
             metadata.connectionID,
             toolName,
@@ -316,7 +365,14 @@ struct AgentSessionLinkMCPToolService {
                 until: predicate,
                 timeoutSeconds: timeoutSeconds
             )
-            return AgentSessionLinkResponseRenderer.waitValue(waitResult, isSingle: isSingle)
+            // Read after the wait resumes, so a queued send that drained while this call was parked
+            // reports its terminal outcome rather than the pending entry it had on entry.
+            let pendingSends = await bridge.pendingSendProjections(for: leases)
+            return AgentSessionLinkResponseRenderer.waitValue(
+                waitResult,
+                pendingSends: pendingSends,
+                isSingle: isSingle
+            )
         }
     }
 
@@ -517,17 +573,80 @@ struct AgentSessionLinkMCPToolService {
         }
         let message = try Self.parseSendMessage(args["message"])
         let idempotencyKey = try Self.parseIdempotencyKey(args["idempotency_key"])
+        // Parsed here, resolved much later. Syntax is the caller's business and can be refused
+        // before anything is authorized; *existence* is not, so the lookup itself waits until the
+        // link is authorized and the ledger has had its say.
+        let workflowReference = try AgentWorkflowReference.parse(args: args)
+        let delivery = try Self.parseDelivery(args["delivery"])
+        let replacePending = try Self.parseReplacePending(args["replace_pending"], delivery: delivery)
 
         let target = try await authorize(
             operation: .monitorSend,
             observerEndpoint: observerEndpoint,
             targetSessionID: targetSessionID
         )
-        switch await bridge.send(
-            target: target,
-            message: message,
-            idempotencyKey: idempotencyKey
-        ) {
+        switch delivery {
+        case .immediate:
+            return try await Self.sendOutcomeValue(
+                bridge.send(
+                    target: target,
+                    message: message,
+                    idempotencyKey: idempotencyKey,
+                    workflowReference: workflowReference
+                ),
+                targetSessionID: targetSessionID
+            )
+        case .whenSendable:
+            return try await Self.queueOutcomeValue(
+                bridge.queueSend(
+                    target: target,
+                    message: message,
+                    idempotencyKey: idempotencyKey,
+                    workflowReference: workflowReference,
+                    replacePending: replacePending
+                ),
+                targetSessionID: targetSessionID
+            )
+        }
+    }
+
+    // MARK: - cancel_pending_send
+
+    /// Removes this observer's own queued message for one target, if it is still cancellable.
+    ///
+    /// The key is required and matched exactly, so a cancel issued against an entry that has since
+    /// been replaced reports `pending_send_mismatch` instead of silently discarding the newer one.
+    private func executeCancelPendingSend(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveObserverEndpointIdentity()
+        guard let rawSessionID = AgentMCPToolHelpers.normalizedString(args["session_id"]),
+              let targetSessionID = UUID(uuidString: rawSessionID)
+        else {
+            throw MCPError.invalidParams(
+                "agent_session_link cancel_pending_send requires a canonical session_id."
+            )
+        }
+        let idempotencyKey = try Self.parseCancelIdempotencyKey(args["idempotency_key"])
+        let target = try await authorize(
+            operation: .monitorSend,
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        )
+        return try await Self.queueOutcomeValue(
+            bridge.cancelPendingSend(target: target, idempotencyKey: idempotencyKey),
+            targetSessionID: targetSessionID
+        )
+    }
+
+    /// Shared rendering for every outcome the ordinary send path can produce.
+    ///
+    /// Single-sourced because an immediate send, a `when_sendable` call that drained straight away,
+    /// and a queued admission that replayed a settled key must be indistinguishable to the caller:
+    /// all three are the same delivery reported the same way.
+    private static func sendOutcomeValue(
+        _ outcome: AgentSessionLinkRuntimeBridge.SendOutcome,
+        targetSessionID: UUID
+    ) throws -> Value {
+        switch outcome {
         case let .receipt(receipt):
             return AgentSessionLinkResponseRenderer.sendReceiptValue(receipt)
         case let .blocked(failure):
@@ -535,6 +654,11 @@ struct AgentSessionLinkMCPToolService {
                 failure,
                 targetSessionID: targetSessionID
             )
+        case let .workflowUnavailable(reference):
+            // Same wording `agent_run` produces for the same mistake, and deliberately an error
+            // rather than a result: nothing was delivered, nothing is pending, and the caller has to
+            // change its arguments rather than poll.
+            throw MCPError.invalidParams(AgentWorkflowReference.notFoundMessage(reference: reference))
         case let .rejected(rejection):
             switch rejection {
             case .denied:
@@ -549,6 +673,69 @@ struct AgentSessionLinkMCPToolService {
                 )
             }
         }
+    }
+
+    private static func queueOutcomeValue(
+        _ outcome: AgentSessionLinkRuntimeBridge.QueueOutcome,
+        targetSessionID: UUID
+    ) throws -> Value {
+        switch outcome {
+        case let .queued(replaced, duplicate):
+            AgentSessionLinkResponseRenderer.queuedValue(
+                targetSessionID: targetSessionID,
+                replaced: replaced,
+                duplicate: duplicate
+            )
+        case let .result(result):
+            AgentSessionLinkResponseRenderer.queueResultValue(
+                result,
+                targetSessionID: targetSessionID
+            )
+        case let .send(sendOutcome):
+            try sendOutcomeValue(sendOutcome, targetSessionID: targetSessionID)
+        }
+    }
+
+    /// When the message is delivered. `immediate` is the historical behaviour and stays the default,
+    /// so an existing caller's `send` is byte-for-byte the call it always was.
+    enum SendDelivery: String, CaseIterable, Equatable {
+        case immediate
+        case whenSendable = "when_sendable"
+    }
+
+    static func parseDelivery(_ value: Value?) throws -> SendDelivery {
+        guard let raw = AgentMCPToolHelpers.normalizedString(value)?.lowercased() else {
+            return .immediate
+        }
+        guard let delivery = SendDelivery(rawValue: raw) else {
+            throw MCPError.invalidParams(
+                "agent_session_link send delivery must be immediate or when_sendable."
+            )
+        }
+        return delivery
+    }
+
+    /// Rejected outright for an immediate send rather than ignored: `replace_pending` names a queue
+    /// slot an immediate call never touches, so accepting it would confirm an intent the call cannot
+    /// carry out.
+    static func parseReplacePending(_ value: Value?, delivery: SendDelivery) throws -> Bool {
+        let replacePending: Bool
+        switch value {
+        case let .bool(flag):
+            replacePending = flag
+        case .none, .some(.null):
+            replacePending = false
+        default:
+            throw MCPError.invalidParams(
+                "agent_session_link send replace_pending must be a Boolean."
+            )
+        }
+        guard !replacePending || delivery == .whenSendable else {
+            throw MCPError.invalidParams(
+                "agent_session_link send replace_pending is only valid with delivery: \"when_sendable\"."
+            )
+        }
+        return replacePending
     }
 
     /// Requires a genuine string. Coercing a number or bool into a message would let a malformed
@@ -603,6 +790,23 @@ struct AgentSessionLinkMCPToolService {
                     + "and reuse a key only to retry the same delivery."
             )
         }
+        return try boundedIdempotencyKey(key)
+    }
+
+    /// The key names *which* queued message to cancel, so it is required for the same reason the
+    /// cancel is matched on it: a keyless cancel would remove whatever happened to occupy the slot,
+    /// including a replacement the caller has not seen.
+    static func parseCancelIdempotencyKey(_ value: Value?) throws -> String {
+        guard let key = AgentMCPToolHelpers.normalizedString(value) else {
+            throw MCPError.invalidParams(
+                "agent_session_link cancel_pending_send requires the idempotency_key of the queued "
+                    + "message. Poll the session to see the current pending_send."
+            )
+        }
+        return try boundedIdempotencyKey(key)
+    }
+
+    private static func boundedIdempotencyKey(_ key: String) throws -> String {
         guard key.utf8.count <= DomainAgentSessionLinkTextBudget.idempotencyKeyMaxBytes else {
             throw MCPError.invalidParams(
                 "idempotency_key must be at most "
@@ -774,8 +978,13 @@ struct AgentSessionLinkMCPToolService {
     static let readKeys: Set<String> = [
         "op", "session_id", "cursor", "from", "max_items", "max_output_bytes"
     ]
-    static let sendKeys: Set<String> = ["op", "session_id", "message", "idempotency_key"]
+    static let sendKeys: Set<String> = [
+        "op", "session_id", "message", "idempotency_key", "workflow_id", "workflow_name",
+        "delivery", "replace_pending"
+    ]
+    static let cancelPendingSendKeys: Set<String> = ["op", "session_id", "idempotency_key"]
     static let markDoneKeys: Set<String> = ["op", "session_id"]
+    static let setWaitingOnKeys: Set<String> = ["op", "summary", "clear"]
     // No identity field of any kind: the caller is resolved from server-owned run routing, so there
     // is nothing here for one session to address another with.
 
@@ -825,6 +1034,13 @@ enum AgentSessionLinkResponseRenderer {
             "provider": AgentMCPToolHelpers.stringOrNull(snapshot.providerDisplayName),
             "status": .string(snapshot.status.rawValue),
             "idle_for_send": .bool(snapshot.idleForSend),
+            "idle_since": snapshot.idleSince.map { .string(AgentMCPToolHelpers.timestamp($0)) } ?? .null,
+            "waiting_on": snapshot.waitingOn.map { waitingOn in
+                .object([
+                    "summary": .string(waitingOn.summary),
+                    "declared_at": .string(AgentMCPToolHelpers.timestamp(waitingOn.declaredAt))
+                ])
+            } ?? .null,
             "has_pending_interaction": .bool(snapshot.hasPendingInteraction),
             "pending_interaction_kind": AgentMCPToolHelpers.stringOrNull(
                 snapshot.pendingInteractionKind?.rawValue
@@ -838,12 +1054,125 @@ enum AgentSessionLinkResponseRenderer {
         ])
     }
 
-    static func targetEntryValue(_ state: DomainAgentSessionLinkTargetState) -> Value {
-        .object([
+    static func targetEntryValue(
+        _ state: DomainAgentSessionLinkTargetState,
+        pendingSend projection: AgentSessionLinkPendingSendProjection = .empty
+    ) -> Value {
+        var payload: [String: Value] = [
             "session_id": .string(state.sessionID.uuidString),
             "snapshot": snapshotValue(state),
             "wait_cursor": .string(state.waitCursor)
+        ]
+        payload.merge(
+            pendingSendFields(projection, targetSessionID: state.sessionID)
+        ) { _, new in new }
+        return .object(payload)
+    }
+
+    /// The observer-only queue fields.
+    ///
+    /// Rendered beside `snapshot` rather than inside it, and that placement is the contract: the
+    /// snapshot is the authority's sanitized *target* state, identical for every observer of that
+    /// target, while these two describe one observer's own link and must never be visible through
+    /// another's. They are always present, so a caller can tell "nothing queued" apart from "this
+    /// build does not report queues".
+    static func pendingSendFields(
+        _ projection: AgentSessionLinkPendingSendProjection,
+        targetSessionID: UUID
+    ) -> [String: Value] {
+        [
+            "pending_send": projection.pending.map(pendingSendValue) ?? .null,
+            "last_pending_send_result": projection.lastResult.map {
+                pendingSendResultValue($0, targetSessionID: targetSessionID)
+            } ?? .null
+        ]
+    }
+
+    /// Fixed metadata for a queued message. Never the body: the queue owner wrote it and already
+    /// knows it, and a full copy would put an unbounded string in every poll.
+    static func pendingSendValue(_ pending: AgentSessionLinkPendingSend) -> Value {
+        .object([
+            "idempotency_key": .string(pending.idempotencyKey),
+            "queued_at": .string(AgentMCPToolHelpers.timestamp(pending.queuedAt)),
+            // The workflow as *resolved at admission*, so the caller sees what the message will
+            // actually run under rather than the reference it happened to name.
+            "workflow_id": AgentMCPToolHelpers.stringOrNull(pending.workflow?.id),
+            "workflow_name": AgentMCPToolHelpers.stringOrNull(pending.workflow?.displayName),
+            "message_preview": AgentMCPToolHelpers.stringOrNull(pending.messagePreview)
         ])
+    }
+
+    /// The one terminal outcome a link retains after its queued message settled.
+    ///
+    /// Deliberately the *same* shapes an immediate send returns, so a caller has one set of results
+    /// to understand rather than a parallel vocabulary for queued delivery.
+    static func pendingSendResultValue(
+        _ result: AgentSessionLinkPendingSendResult,
+        targetSessionID: UUID
+    ) -> Value {
+        let rendered: Value = switch result.outcome {
+        case let .delivered(receipt):
+            sendReceiptValue(receipt)
+        case let .failed(failure):
+            sendBlockedValue(failure, targetSessionID: targetSessionID)
+        case let .rejected(rejection):
+            sendRejectedValue(rejection.sendRejection, targetSessionID: targetSessionID)
+        }
+        guard case var .object(payload) = rendered else { return rendered }
+        payload["idempotency_key"] = .string(result.idempotencyKey)
+        payload["settled_at"] = .string(AgentMCPToolHelpers.timestamp(result.settledAt))
+        return .object(payload)
+    }
+
+    /// A message accepted into the link's single queue slot.
+    static func queuedValue(
+        targetSessionID: UUID,
+        replaced: Bool,
+        duplicate: Bool
+    ) -> Value {
+        .object([
+            "result": .string(AgentSessionLinkQueueResult.queued.rawValue),
+            "session_id": .string(targetSessionID.uuidString),
+            "delivered": .bool(false),
+            "replaced": .bool(replaced),
+            "duplicate": .bool(duplicate),
+            "detail": .string(queueResultDetail(.queued))
+        ])
+    }
+
+    /// Every other queue-state result. Nothing was delivered on any of these paths.
+    static func queueResultValue(
+        _ result: AgentSessionLinkQueueResult,
+        targetSessionID: UUID
+    ) -> Value {
+        .object([
+            "result": .string(result.rawValue),
+            "session_id": .string(targetSessionID.uuidString),
+            "delivered": .bool(false),
+            "detail": .string(queueResultDetail(result))
+        ])
+    }
+
+    private static func queueResultDetail(_ result: AgentSessionLinkQueueResult) -> String {
+        switch result {
+        case .queued:
+            "The message is queued and will be delivered once the target is ready to accept it. "
+                + "Poll this session for pending_send and last_pending_send_result; nothing is "
+                + "retried after RepoPrompt restarts or the link is stopped."
+        case .pendingSendExists:
+            "A different queued message already occupies this link's single slot. Cancel it with "
+                + "cancel_pending_send, or resend with replace_pending: true."
+        case .cancelled:
+            "The queued message was removed before delivery started. Nothing was delivered."
+        case .notPending:
+            "No message is queued for this session."
+        case .pendingSendMismatch:
+            "That idempotency_key does not identify the queued message, so nothing was cancelled. "
+                + "Poll this session to see the current pending_send."
+        case .tooLate:
+            "Delivery already passed the point where it can be stopped. Poll this session for "
+                + "last_pending_send_result to see how it settled."
+        }
     }
 
     static func transcriptItemValue(_ item: AgentSessionLinkTranscriptItem) -> Value {
@@ -961,6 +1290,7 @@ enum AgentSessionLinkResponseRenderer {
 
     static func waitValue(
         _ result: DomainAgentSessionLinkWaitResult,
+        pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:],
         isSingle: Bool
     ) -> Value {
         var payload: [String: Value] = [
@@ -977,9 +1307,15 @@ enum AgentSessionLinkResponseRenderer {
             if let state = result.targets.first {
                 payload["snapshot"] = snapshotValue(state)
                 payload["wait_cursor"] = .string(state.waitCursor)
+                payload.merge(pendingSendFields(
+                    pendingSends[state.sessionID] ?? .empty,
+                    targetSessionID: state.sessionID
+                )) { _, new in new }
             }
         } else {
-            payload["targets"] = .array(result.targets.map(targetEntryValue))
+            payload["targets"] = .array(result.targets.map { state in
+                targetEntryValue(state, pendingSend: pendingSends[state.sessionID] ?? .empty)
+            })
         }
         return .object(payload)
     }

@@ -29,6 +29,11 @@ final class AgentSessionLinkObservationToken {
 /// agent-facing assistant preview, which now costs a scan of the transcript items plus a pass of the
 /// oversight-scoped redaction regexes. Rendering a status pill must not pay for text an observer never
 /// sees, once per outbound row, on every status refresh of a streaming target.
+struct AgentSessionLinkTargetLocalInputState: Equatable {
+    let epoch: UInt64
+    let isLocalUser: Bool
+}
+
 struct AgentSessionLinkStatusProjection: Equatable {
     let status: DomainAgentSessionLinkStatus
     let pendingInteractionKind: DomainAgentSessionLinkPendingInteractionKind?
@@ -101,11 +106,31 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> Bool
 
+    func agentSessionLinkAutoWakeTargetSessionIDs(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> Set<UUID>
+
+    func agentSessionLinkTargetLocalInputState(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> AgentSessionLinkTargetLocalInputState
+
     /// Writes that setting to one exact observer incarnation, returning `false` when the endpoint no
     /// longer resolves to a live hydrated session.
     @discardableResult
     func agentSessionLinkSetAutoWakeOnUpdatesEnabled(
         _ enabled: Bool,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool
+
+    @discardableResult
+    func agentSessionLinkSetAutoWakeTargetSessionIDs(
+        _ targetSessionIDs: Set<UUID>,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool
+
+    @discardableResult
+    func agentSessionLinkSetWaitingOn(
+        _ waitingOn: DomainAgentSessionWaitingOn?,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool
 
@@ -266,6 +291,13 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkSetWaitingOn(
+        _: DomainAgentSessionWaitingOn?,
+        for _: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        false
+    }
+
     func agentSessionLinkComposeTabDescriptors() -> [AgentSessionLinkComposeTabDescriptor] {
         []
     }
@@ -293,9 +325,29 @@ extension AgentSessionLinkEndpointHost {
         false
     }
 
+    func agentSessionLinkAutoWakeTargetSessionIDs(
+        for _: AgentSessionLinkEndpointCandidate
+    ) -> Set<UUID> {
+        []
+    }
+
+    func agentSessionLinkTargetLocalInputState(
+        for _: AgentSessionLinkEndpointCandidate
+    ) -> AgentSessionLinkTargetLocalInputState {
+        AgentSessionLinkTargetLocalInputState(epoch: 0, isLocalUser: false)
+    }
+
     @discardableResult
     func agentSessionLinkSetAutoWakeOnUpdatesEnabled(
         _: Bool,
+        for _: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        false
+    }
+
+    @discardableResult
+    func agentSessionLinkSetAutoWakeTargetSessionIDs(
+        _: Set<UUID>,
         for _: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
         false
@@ -647,12 +699,26 @@ final class AgentSessionLinkRuntimeBridge {
     /// observation immediately produces a burst of identical rebuilds. Publishing those would advance
     /// the authority's `change_sequence` and wake waiters for a state that never changed.
     private var lastPublishedSnapshotBySession: [UUID: DomainAgentSessionObservationSnapshot] = [:]
+    /// At most one pre-authorized send per **current link generation**.
+    ///
+    /// Deliberately a plain main-actor dictionary rather than a queue subsystem: there is no
+    /// persistence, no history, no priority, no second message, and no timer. Every entry is keyed by
+    /// the exact generation it was admitted under, so a revoked or re-added link starts empty rather
+    /// than inheriting work the user granted under authority they have since removed.
+    private var pendingSendsByReference: [DomainAgentSessionLinkReference: AgentSessionLinkPendingSend] = [:]
+    /// The single terminal outcome each link retains for its observer's `poll`.
+    ///
+    /// Overwritten by the next queue mutation and dropped with the link. It exists so a queued
+    /// delivery that settled between two polls is still observable without a notification subsystem.
+    private var pendingSendResultsByReference:
+        [DomainAgentSessionLinkReference: AgentSessionLinkPendingSendResult] = [:]
     /// Injected so the bridge never imports the MCP connection actor in tests.
     private let toolAdvertisementInvalidator: @Sendable (UUID) async -> Void
     /// Reconciliation clock for status-edge timestamps. Injected so a test can assert that the
     /// stamped time is the status edge rather than render time.
     private let now: @Sendable () -> Date
     private var changeFeedTask: Task<Void, Never>?
+    private var inboundAdvertisementCountByTargetSession: [UUID: Int] = [:]
     private var refreshTask: Task<Void, Never>?
     private var pendingRefreshScope: ProjectionRefreshScope?
     /// Exact target incarnations whose effective location label changed and whose observers still
@@ -756,10 +822,16 @@ final class AgentSessionLinkRuntimeBridge {
             let events = await authority.changeEvents()
             for await event in events {
                 guard let self else { return }
-                // Events carry identity/revision only, so state is always refetched — but the event
-                // kind bounds *how much* has to be refetched.
-                await requestProjectionRefresh(scope(for: event))
-                await invalidateToolAdvertisement(for: event)
+                // Activation retracts catalog readiness before active inventory can publish; revocation
+                // publishes the reduced inventory before retracting the obsolete catalog observation.
+                switch event.kind {
+                case .activated:
+                    await invalidateToolAdvertisement(for: event)
+                    await requestProjectionRefresh(scope(for: event))
+                case .revoked, .targetStateChanged, .draining, .shutdown:
+                    await requestProjectionRefresh(scope(for: event))
+                    await invalidateToolAdvertisement(for: event)
+                }
             }
         }
     }
@@ -793,10 +865,31 @@ final class AgentSessionLinkRuntimeBridge {
     private func invalidateToolAdvertisement(for event: DomainAgentSessionLinkChangeEvent) async {
         switch event.kind {
         case .activated, .revoked:
-            guard event.observerLinkSetRevision != nil,
-                  let observerSessionID = event.observerSessionID
-            else { return }
-            await toolAdvertisementInvalidator(observerSessionID)
+            if event.observerLinkSetRevision != nil,
+               let observerSessionID = event.observerSessionID
+            {
+                await toolAdvertisementInvalidator(observerSessionID)
+            }
+            if let targetSessionID = event.targetSessionID {
+                switch event.kind {
+                case .activated:
+                    let previous = inboundAdvertisementCountByTargetSession[targetSessionID] ?? 0
+                    inboundAdvertisementCountByTargetSession[targetSessionID] = previous + 1
+                    if previous == 0 {
+                        await toolAdvertisementInvalidator(targetSessionID)
+                    }
+                case .revoked:
+                    let previous = inboundAdvertisementCountByTargetSession[targetSessionID] ?? 1
+                    let remaining = max(0, previous - 1)
+                    inboundAdvertisementCountByTargetSession[targetSessionID] = remaining
+                    if remaining == 0 {
+                        inboundAdvertisementCountByTargetSession.removeValue(forKey: targetSessionID)
+                        await toolAdvertisementInvalidator(targetSessionID)
+                    }
+                case .targetStateChanged, .draining, .shutdown:
+                    break
+                }
+            }
         case .targetStateChanged, .draining, .shutdown:
             return
         }
@@ -1088,6 +1181,11 @@ final class AgentSessionLinkRuntimeBridge {
         pendingMonitorObserverEndpoints.removeAll()
         monitorTriageByReference.removeAll()
         monitorSeenByReference.removeAll()
+        // Queued sends die with the process by design. They are pre-authorization for a delivery the
+        // user is not present for, and quitting ends the turn that authorized them; nothing about a
+        // queued message is expected back next launch.
+        pendingSendsByReference.removeAll()
+        pendingSendResultsByReference.removeAll()
         // Queued notices die with the process by design: they were only ever owed to a *future*
         // naturally started turn, and quitting means there is none.
         passiveNoticesByObserver.removeAll()
@@ -2308,11 +2406,10 @@ final class AgentSessionLinkRuntimeBridge {
         switch disposition {
         case let .activated(value):
             activation = value
-            // Released from the disposition, before the observation install and before any further
-            // suspension, so the fence is down again within the same MainActor run that learned the
-            // grant exists. The authority read this inventory at the instant it committed, so it is
-            // exactly what the projection refresh below will recompute — that pass republishes an
-            // equal value and dedupes.
+            // The manager-owned catalog projection must become unready before active inventory is
+            // published. Awaiting the existing invalidation path keeps the prompt hold across both
+            // authority activation and projection application.
+            await invalidateToolAdvertisement(forObserverSession: observerEndpoint.sessionID)
             host.agentSessionLinkReleasePromptInventoryHold(
                 hold,
                 for: observerEndpoint,
@@ -2416,7 +2513,14 @@ final class AgentSessionLinkRuntimeBridge {
         // overwriting it would discard that chain's next publication.
 
         await requestProjectionRefresh()
-        await invalidateToolAdvertisement(forObserverSession: observerEndpoint.sessionID)
+        if activation.installsTargetObservation {
+            let targetHoldsOutboundLink = await authority.hasActiveOutboundLink(
+                observerEndpoint: targetEndpoint
+            )
+            if !targetHoldsOutboundLink {
+                await toolAdvertisementInvalidator(targetEndpoint.sessionID)
+            }
+        }
         // Both calls above suspend. A deletion committed in either hop must not be followed by a
         // success report for a grant that the commit observer already invalidated.
         guard await tokenIsCurrent(token) else {
@@ -2523,6 +2627,21 @@ final class AgentSessionLinkRuntimeBridge {
         #if DEBUG
             logPairLane(pair: pair, outcome: "retired")
         #endif
+        if outcome == .stopped,
+           let host,
+           case let .success(observer) = AgentSessionLinkEndpointResolver.resolve(
+               sessionID: observerSessionID,
+               candidates: host.agentSessionLinkCandidates()
+           )
+        {
+            var selected = host.agentSessionLinkAutoWakeTargetSessionIDs(for: observer)
+            if selected.remove(targetSessionID) != nil {
+                _ = host.agentSessionLinkSetAutoWakeTargetSessionIDs(
+                    selected,
+                    for: observer.domainEndpoint
+                )
+            }
+        }
         return outcome
     }
 
@@ -2808,6 +2927,9 @@ final class AgentSessionLinkRuntimeBridge {
             // made under authority the user has since removed.
             monitorSeenByReference.removeValue(forKey: reference)
         }
+        // Generation-qualified for the same reason, and released before anything republishes: a
+        // queued message must never outlive the exact grant that admitted it.
+        releasePendingSends(after: notices)
         var touched = Set(notices.map(\.targetSessionID))
         touched.formUnion(notices.map(\.observerSessionID))
         // Runs before the projection work so a revoked link's saved row is already gone by the time
@@ -2824,6 +2946,11 @@ final class AgentSessionLinkRuntimeBridge {
         // gaining one.
         for observerSessionID in Set(notices.map(\.observerSessionID)) {
             await invalidateToolAdvertisement(forObserverSession: observerSessionID)
+        }
+        for targetEndpoint in Set(notices.compactMap(\.targetEndpoint)) {
+            let remainsLinked = await authority.hasActiveLink(endpoint: targetEndpoint)
+            guard !remainsLinked else { continue }
+            await toolAdvertisementInvalidator(targetEndpoint.sessionID)
         }
     }
 
@@ -2932,6 +3059,11 @@ final class AgentSessionLinkRuntimeBridge {
         // an unchanged target never advances `change_sequence` or wakes a parked waiter.
         guard lastPublishedSnapshotBySession[sessionID] != snapshot else { return }
         lastPublishedSnapshotBySession[sessionID] = snapshot
+        // The one readiness trigger a queued send has. It hangs off an *accepted* publication, so an
+        // unchanged target produces none at all and nothing ever polls for readiness.
+        if snapshot.idleForSend {
+            notePendingSendReadiness(forTargetSession: sessionID)
+        }
         let sequence = allocateSourcePublicationSequence(for: sessionID)
         let previous = chain.tail
         chain.tail = Task { [authority] in
@@ -3024,6 +3156,7 @@ final class AgentSessionLinkRuntimeBridge {
         }
         if scope.isFull {
             prunePassiveNotices(liveEndpoints: Set(candidates.map(\.domainEndpoint)))
+            await reconcilePendingSends()
         }
     }
 
@@ -3046,7 +3179,7 @@ final class AgentSessionLinkRuntimeBridge {
         // this session UUID owns neither these outbound grants nor these inbound observers nor these
         // notices, and must not render or be told about them.
         let inputs = await authority.projectionInputs(forEndpoint: candidate.domainEndpoint)
-        let monitor = makeMonitorProjection(
+        let monitor = await makeMonitorProjection(
             for: candidate,
             inputs: inputs,
             candidatesByEndpoint: candidatesByEndpoint,
@@ -3088,7 +3221,7 @@ final class AgentSessionLinkRuntimeBridge {
         inputs: DomainAgentSessionLinkEndpointProjectionInputs,
         candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate],
         collectsStatusSamples: Bool = false
-    ) -> MonitorProjection {
+    ) async -> MonitorProjection {
         let sessionID = candidate.sessionID
         let endpoint = candidate.domainEndpoint
 
@@ -3132,7 +3265,10 @@ final class AgentSessionLinkRuntimeBridge {
                 // grant carries none and knows nothing about send readiness, and neither substitution
                 // may reach a queued notice. Materializing the redacted preview is why this runs only
                 // on the authoritative pass and never on a location/Done/Seen repaint.
-                let observation = target.map { host?.agentSessionLinkObservationSnapshot(for: $0) } ?? nil
+                let observation = await authority.observationSnapshot(forTargetEndpoint: targetEndpoint)
+                let localInputState = target.flatMap {
+                    host?.agentSessionLinkTargetLocalInputState(for: $0)
+                }
                 statusSamples.append(AgentSessionLinkPassiveStatusNotices.Sample(
                     reference: reference,
                     targetEndpoint: targetEndpoint,
@@ -3142,6 +3278,10 @@ final class AgentSessionLinkRuntimeBridge {
                     displayName: item.displayName,
                     status: AgentSessionLinkPassiveStatusNotices.Status(presentation.status),
                     idleForSend: observation?.idleForSend ?? false,
+                    idleSince: observation?.idleSince,
+                    waitingOn: observation?.waitingOn,
+                    targetLocalInputEpoch: localInputState?.epoch ?? 0,
+                    targetTurnIsLocalUser: localInputState?.isLocalUser ?? false,
                     latestVisibleAssistantPreview: observation?.latestVisibleAssistantPreview
                 ))
             }
@@ -3212,6 +3352,8 @@ final class AgentSessionLinkRuntimeBridge {
             // state, so it renders identically on an authoritative pass and a monitor-only repaint.
             autoWakeOnUpdatesEnabled: host?
                 .agentSessionLinkAutoWakeOnUpdatesEnabled(for: candidate) ?? false,
+            autoWakeTargetSessionIDs: host?
+                .agentSessionLinkAutoWakeTargetSessionIDs(for: candidate) ?? [],
             autoWakeUnavailableReason: Self.autoWakeUnavailableReason(
                 for: candidate,
                 isFrozenForTermination: isFrozenForTermination
@@ -3509,14 +3651,12 @@ final class AgentSessionLinkRuntimeBridge {
             // Rows only: the samples this builds are deliberately dropped here. A location, Done,
             // Seen, or toggle repaint is not an authoritative status observation, and treating one as
             // such would let presentation work queue a notice.
-            host.agentSessionLinkPublishProjection(
-                makeMonitorProjection(
-                    for: candidate,
-                    inputs: inputs,
-                    candidatesByEndpoint: byEndpoint
-                ).props,
-                to: observer
+            let monitor = await makeMonitorProjection(
+                for: candidate,
+                inputs: inputs,
+                candidatesByEndpoint: byEndpoint
             )
+            host.agentSessionLinkPublishProjection(monitor.props, to: observer)
         }
     }
 
@@ -3786,6 +3926,75 @@ final class AgentSessionLinkRuntimeBridge {
         return .changed(enabled: enabled, activeLinkCount: activeLinkCount)
     }
 
+    func setAutoWakeTargetSelection(
+        targetSessionIDs: Set<UUID>,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> AgentMonitorPassiveNoticeOutcome {
+        let staleMessage = "That Agent session is no longer active."
+        guard !isFrozenForTermination, let host,
+              let candidate = host.agentSessionLinkCandidates()
+              .first(where: { $0.domainEndpoint == observerEndpoint })
+        else { return .failed(message: staleMessage) }
+        let activeLinkCount = await authority
+            .projectionInputs(forEndpoint: observerEndpoint).outbound.items.count
+        guard !isFrozenForTermination,
+              let host = self.host,
+              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
+        else { return .failed(message: staleMessage) }
+        let current = host.agentSessionLinkAutoWakeTargetSessionIDs(for: candidate)
+        guard current != targetSessionIDs else {
+            return .alreadyInRequestedState(enabled: true, activeLinkCount: activeLinkCount)
+        }
+        guard host.agentSessionLinkSetAutoWakeTargetSessionIDs(targetSessionIDs, for: observerEndpoint) else {
+            return .failed(message: staleMessage)
+        }
+        await requestProjectionRefresh(.sessions([observerEndpoint.sessionID]))
+        return .changed(enabled: true, activeLinkCount: activeLinkCount)
+    }
+
+    func setAutoWakeTargetSelection(
+        targetSessionIDs: Set<UUID>,
+        observerSessionID: UUID
+    ) async -> AgentMonitorPassiveNoticeOutcome {
+        guard let endpoint = host?.agentSessionLinkCandidates()
+            .first(where: { $0.sessionID == observerSessionID })?.domainEndpoint
+        else { return .failed(message: "That Agent session is no longer active.") }
+        return await setAutoWakeTargetSelection(
+            targetSessionIDs: targetSessionIDs,
+            observerEndpoint: endpoint
+        )
+    }
+
+    /// One observer's saved Auto-wake target selection, addressed by session UUID.
+    ///
+    /// An inbound row renders the *overseen* session's projection, whose selections belong to that
+    /// session and never to the observer above it. Unlink recovery therefore has to ask for the
+    /// observer's value by ID instead of reading the props it was invoked from.
+    func autoWakeTargetSelection(observerSessionID: UUID) -> Set<UUID> {
+        guard !isFrozenForTermination,
+              let host,
+              let observer = host.agentSessionLinkCandidates()
+              .first(where: { $0.sessionID == observerSessionID })
+        else { return [] }
+        return host.agentSessionLinkAutoWakeTargetSessionIDs(for: observer)
+    }
+
+    /// Re-selects one target for an observer after a successful Undo re-link.
+    ///
+    /// Additive against whatever the observer holds *now*, so a selection the user changed during
+    /// the recovery window survives the restore rather than being overwritten by a stale set.
+    @discardableResult
+    func restoreAutoWakeTargetSelection(
+        targetSessionID: UUID,
+        observerSessionID: UUID
+    ) async -> AgentMonitorPassiveNoticeOutcome {
+        await setAutoWakeTargetSelection(
+            targetSessionIDs: autoWakeTargetSelection(observerSessionID: observerSessionID)
+                .union([targetSessionID]),
+            observerSessionID: observerSessionID
+        )
+    }
+
     /// Applies one accepted provider receipt to the exact observer's queue.
     ///
     /// Synchronous because it runs at the provider's acceptance signal, on the same MainActor pass as
@@ -3837,6 +4046,23 @@ final class AgentSessionLinkRuntimeBridge {
             deliverable: deliverable,
             observedAt: observedAt
         )
+        let masterEnabled = current.map {
+            host?.agentSessionLinkAutoWakeOnUpdatesEnabled(for: $0) ?? false
+        } ?? false
+        let selectedTargetIDs = current.map {
+            host?.agentSessionLinkAutoWakeTargetSessionIDs(for: $0) ?? []
+        } ?? []
+        let autoWakeLanes = samples.map { sample in
+            AgentSessionLinkPassiveStatusNotices.AutoWakeLane(
+                reference: sample.reference,
+                targetEndpoint: sample.targetEndpoint,
+                targetSessionID: sample.targetSessionID,
+                targetLocalInputEpoch: sample.targetLocalInputEpoch,
+                targetTurnIsLocalUser: sample.targetTurnIsLocalUser,
+                isEffectivelySelected: masterEnabled || selectedTargetIDs.contains(sample.targetSessionID)
+            )
+        }
+        notices.setAutoWakeLanes(autoWakeLanes)
         let snapshot = notices.snapshot
         if samples.isEmpty {
             // The last direct link went away. Publish one terminal empty snapshot so the view model
@@ -4095,6 +4321,26 @@ final class AgentSessionLinkRuntimeBridge {
             .mapError(AuthorizationFailure.init)
     }
 
+    func setWaitingOn(
+        summary: String?,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> Bool {
+        guard let host,
+              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == endpoint }),
+              await authority.hasActiveLink(endpoint: endpoint)
+        else { return false }
+        let value: DomainAgentSessionWaitingOn?
+        if let summary {
+            guard let waitingOn = DomainAgentSessionWaitingOn(summary: summary, declaredAt: now()) else {
+                return false
+            }
+            value = waitingOn
+        } else {
+            value = nil
+        }
+        return host.agentSessionLinkSetWaitingOn(value, for: endpoint)
+    }
+
     /// Current sanitized target state plus a freshly minted successor wait cursor.
     func targetState(
         for lease: DomainAgentSessionLinkLease
@@ -4135,6 +4381,10 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> Bool {
         await authority.hasActiveOutboundLink(observerEndpoint: observerEndpoint)
+    }
+
+    func hasActiveLink(endpoint: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
+        await authority.hasActiveLink(endpoint: endpoint)
     }
 
     // MARK: - Sanitized read
@@ -4185,6 +4435,31 @@ final class AgentSessionLinkRuntimeBridge {
         case blocked(AgentSessionLinkSendFailure)
         /// The ledger refused before the transaction started.
         case rejected(SendRejection)
+        /// The caller named a workflow nothing currently answers to. A caller mistake rather than an
+        /// operational state, so the service raises it as an invalid parameter; the reservation it
+        /// was resolving for is abandoned, leaving the key free for a corrected retry.
+        case workflowUnavailable(reference: String)
+    }
+
+    /// How the one-shot workflow for one delivery is supplied.
+    private enum SendWorkflowInput {
+        /// An immediate send: the caller's reference, resolved only after the ledger has answered.
+        case unresolved(AgentWorkflowReference?)
+        /// A queued drain: resolved and frozen when the entry was admitted, never re-read. Re-reading
+        /// the store at delivery time would let a rename or delete change what the user authorized.
+        case resolved(AgentWorkflowDefinition?)
+    }
+
+    /// Main-actor hooks a queued drain installs around the authority commit fence.
+    ///
+    /// Immediate sends pass none: there is no pending entry to invalidate, so the fence is the
+    /// authority's alone.
+    private struct SendCommitFence {
+        /// Runs immediately before the authority hop. `false` abandons the delivery with no target
+        /// mutation; `true` closes the cancellation window for good.
+        let willCommit: @MainActor () -> Bool
+        /// Runs immediately after a successful commit, still on the main actor.
+        let didCommit: @MainActor () -> Void
     }
 
     /// Orchestrates one attributed send across the authority ledger and the target's MainActor.
@@ -4192,10 +4467,48 @@ final class AgentSessionLinkRuntimeBridge {
     /// The reservation is settled on exactly one path: a delivered outcome retains a stable receipt,
     /// and every refusal abandons the reservation so a later retry with the same key may proceed.
     /// A retry after a *delivered* send replays the stored receipt instead of delivering twice.
+    ///
+    /// A named workflow is resolved *after* the ledger answers, never before. An already-settled key
+    /// replays its stored receipt without a workflow lookup, so a retry stays idempotent even if the
+    /// workflow it originally named has since been renamed or deleted.
     func send(
         target: AuthorizedTarget,
         message: String,
-        idempotencyKey: String
+        idempotencyKey: String,
+        workflowReference: AgentWorkflowReference?
+    ) async -> SendOutcome {
+        await performSend(
+            target: target,
+            message: message,
+            idempotencyKey: idempotencyKey,
+            messageDigest: AgentSessionLinkMessageDigest.digest(
+                message: message,
+                workflowSelector: AgentWorkflowReference.canonicalSelector(for: workflowReference)
+            ),
+            workflow: .unresolved(workflowReference),
+            observerTurnOrigin: nil,
+            commitFence: nil
+        )
+    }
+
+    /// The single delivery path both an immediate `send` and a queued drain run through.
+    ///
+    /// - Parameters:
+    ///   - messageDigest: the caller's canonical request identity. Passed in rather than derived so a
+    ///     queued entry commits under the digest it was admitted with, not one recomputed from a
+    ///     workflow selector it no longer holds.
+    ///   - observerTurnOrigin: `nil` reads the observer's live origin, which is what an immediate
+    ///     send must do. A queued drain passes the origin captured when the user authorized the
+    ///     queued message, and must never recapture: whether the observer happens to be mid-automatic
+    ///     turn when the target frees up says nothing about that authorization.
+    private func performSend(
+        target: AuthorizedTarget,
+        message: String,
+        idempotencyKey: String,
+        messageDigest: String,
+        workflow workflowInput: SendWorkflowInput,
+        observerTurnOrigin: AgentSessionLinkTurnOrigin?,
+        commitFence: SendCommitFence?
     ) async -> SendOutcome {
         guard let host else { return .rejected(.denied) }
         // The observer's own live candidate supplies the attribution name and the turn origin that
@@ -4211,7 +4524,7 @@ final class AgentSessionLinkRuntimeBridge {
         let disposition = await authority.beginSend(
             lease: target.lease,
             idempotencyKey: idempotencyKey,
-            messageDigest: AgentSessionLinkMessageDigest.digest(message)
+            messageDigest: messageDigest
         )
         let reservation: DomainAgentSessionLinkSendReservation
         switch disposition {
@@ -4236,6 +4549,33 @@ final class AgentSessionLinkRuntimeBridge {
             return .rejected(error == .runtimeShuttingDown ? .shuttingDown : .denied)
         }
 
+        // Only a *fresh* reservation resolves a workflow, and only after the link was authorized:
+        // resolving earlier would let an unauthorized caller learn which workflows exist, and
+        // resolving on the duplicate path would fail a legitimate retry over a workflow the user
+        // edited away. Resolution is a synchronous read of the main-actor store, so it introduces no
+        // new suspension point between the reservation and the transaction's own fences.
+        var workflow: AgentWorkflowDefinition?
+        switch workflowInput {
+        case let .resolved(value):
+            workflow = value
+        case let .unresolved(workflowReference):
+            if let workflowReference {
+                guard let resolved = workflowReference.resolved() else {
+                    // Nothing is staged yet, so releasing the reservation is the whole rollback: no
+                    // row, no transcript mutation, and the same key may be retried with a valid
+                    // reference.
+                    await authority.abandonSend(reservation: reservation)
+                    // Releasing a reservation is a ledger settlement like any other. Skipping the
+                    // trigger here would strand every entry parked on this link's in-flight send or
+                    // on authority-wide saturation, because the slot this call just freed produced
+                    // no other event.
+                    notePendingSendLedgerSettled(on: target.lease.reference)
+                    return .workflowUnavailable(reference: workflowReference.reference)
+                }
+                workflow = resolved
+            }
+        }
+
         let request = AgentSessionLinkSendRequest(
             linkID: target.lease.linkID,
             linkGeneration: target.lease.linkGeneration,
@@ -4244,8 +4584,9 @@ final class AgentSessionLinkRuntimeBridge {
             // authorized is still the observer that exists.
             observerEndpoint: target.lease.observer,
             observerDisplayName: observer.resolvedDisplayName,
-            observerTurnOrigin: observer.turnOrigin,
-            message: message
+            observerTurnOrigin: observerTurnOrigin ?? observer.turnOrigin,
+            message: message,
+            workflow: workflow
         )
         // Re-read at every fence the transaction crosses. It is deliberately pure endpoint/window
         // liveness and never consults the authority: after the commit fence, manual revocation is
@@ -4263,12 +4604,23 @@ final class AgentSessionLinkRuntimeBridge {
             request: request,
             liveness: liveness,
             commitAuthorization: {
-                await AgentSessionLinkSendCommitOutcome(
+                // A queued drain's cancellation cutoff, taken synchronously on the bridge's main
+                // actor immediately before the authority hop. Refusing here is indistinguishable
+                // from losing the authority race: nothing is staged yet, so the delivery unwinds
+                // with no transcript mutation at all.
+                if let commitFence, !commitFence.willCommit() {
+                    return .linkRevoked
+                }
+                let outcome = await AgentSessionLinkSendCommitOutcome(
                     authority.commitSendAuthorization(
                         reservation: reservation,
                         linkGeneration: reservation.linkGeneration
                     )
                 )
+                if outcome == .committed {
+                    commitFence?.didCommit()
+                }
+                return outcome
             }
         )
 
@@ -4285,6 +4637,7 @@ final class AgentSessionLinkRuntimeBridge {
             // Publish immediately so both endpoints show the target as running without waiting for
             // the observation pipeline's next main-queue hop.
             publishTargetSnapshot(forTargetSession: target.lease.target.sessionID)
+            notePendingSendLedgerSettled(on: target.lease.reference)
             return .receipt(receipt)
         case let .blocked(failure):
             if failure.isDeliveryIndeterminate {
@@ -4295,7 +4648,574 @@ final class AgentSessionLinkRuntimeBridge {
             } else {
                 await authority.abandonSend(reservation: reservation)
             }
+            notePendingSendLedgerSettled(on: target.lease.reference)
             return .blocked(failure)
+        }
+    }
+
+    // MARK: - One pending send per link generation
+
+    /// What a queue admission or cancellation produced.
+    enum QueueOutcome: Equatable {
+        /// The entry is now pending. `replaced` reports that it displaced a different key;
+        /// `duplicate` reports an idempotent same-key, same-payload retry.
+        case queued(replaced: Bool, duplicate: Bool)
+        /// A queue-state result with no delivery attempt: `pending_send_exists`, `cancelled`,
+        /// `not_pending`, `pending_send_mismatch`, or `too_late`.
+        case result(AgentSessionLinkQueueResult)
+        /// The ordinary send path answered: the entry drained immediately, the ledger replayed a
+        /// settled outcome for its key, or admission itself was refused.
+        case send(SendOutcome)
+    }
+
+    /// Admits one pre-authorized send for delivery when the target next becomes sendable.
+    ///
+    /// Admission is the moment the *user's* authorization is captured, and it is captured once. The
+    /// observer's turn origin is checked here and never again: whether the observer happens to be
+    /// mid-automatic turn by the time the target frees up says nothing about whether its user asked
+    /// for this message. Everything else — the link, both endpoint incarnations, the target's
+    /// readiness — is proven again at every drain, because those facts genuinely can change.
+    ///
+    /// The order below is the contract. The slot is arbitrated before anything is resolved, so an
+    /// idempotent retry never re-resolves a workflow; the ledger is consulted before the workflow is
+    /// resolved, so an already-settled key replays even if the workflow it named is gone; and the
+    /// slot is arbitrated a second time after those awaits, because both of them suspend.
+    func queueSend(
+        target: AuthorizedTarget,
+        message: String,
+        idempotencyKey: String,
+        workflowReference: AgentWorkflowReference?,
+        replacePending: Bool
+    ) async -> QueueOutcome {
+        guard !isFrozenForTermination else { return .send(.rejected(.shuttingDown)) }
+        guard let host else { return .send(.rejected(.denied)) }
+        guard let observer = host.agentSessionLinkCandidates()
+            .first(where: { $0.domainEndpoint == target.lease.observer })
+        else {
+            await invalidate(endpoint: target.lease.observer, reason: .observerIdentityDrift)
+            return .send(.rejected(.denied))
+        }
+        // Queuing pre-authorizes a delivery the user is not present for, so it is reserved to a turn
+        // the user actually started. An auto-woken or cross-session turn may not stage one, exactly
+        // as it may not send one now.
+        guard !observer.turnOrigin.requiresNewLocalUserInstruction else {
+            return .send(.blocked(.crossSessionReplyRequiresUserInstruction))
+        }
+
+        let reference = target.lease.reference
+        let digest = AgentSessionLinkMessageDigest.digest(
+            message: message,
+            workflowSelector: AgentWorkflowReference.canonicalSelector(for: workflowReference)
+        )
+
+        // First arbitration: short-circuits everything that needs no lookup at all.
+        switch AgentSessionLinkPendingSend.slotDecision(
+            current: pendingSendsByReference[reference],
+            idempotencyKey: idempotencyKey,
+            requestDigest: digest,
+            replacePending: replacePending
+        ) {
+        case let .replay(revision):
+            return await drainAndReport(
+                reference: reference,
+                revision: revision,
+                replaced: false,
+                duplicate: true
+            )
+        case .conflict:
+            return .send(.rejected(.idempotencyConflict))
+        case .occupied:
+            return .result(.pendingSendExists)
+        case .tooLate:
+            return .result(.tooLate)
+        case .install:
+            break
+        }
+
+        // Consulted before the workflow is resolved: a key whose delivery already settled has to
+        // replay its stored outcome even when the workflow it originally named has since been
+        // renamed or deleted. This reserves nothing, so no in-flight slot is held while the message
+        // waits for the target.
+        switch await authority.probeSend(
+            lease: target.lease,
+            idempotencyKey: idempotencyKey,
+            messageDigest: digest
+        ) {
+        case .unused:
+            break
+        case let .duplicate(receipt):
+            return .send(.receipt(receipt))
+        case .inProgress:
+            return .send(.rejected(.sendAlreadyInProgress))
+        case .indeterminate:
+            return .send(.blocked(.persistenceIndeterminate))
+        case .conflict:
+            return .send(.rejected(.idempotencyConflict))
+        case let .rejected(error):
+            return .send(.rejected(error == .runtimeShuttingDown ? .shuttingDown : .denied))
+        }
+
+        // Resolved before the slot is touched. A reference nothing answers to therefore leaves any
+        // existing entry exactly as it was, which is the whole point of validating the replacement
+        // in full before installing it.
+        var workflow: AgentWorkflowDefinition?
+        if let workflowReference {
+            guard let resolved = workflowReference.resolved() else {
+                return .send(.workflowUnavailable(reference: workflowReference.reference))
+            }
+            workflow = resolved
+        }
+
+        // Second arbitration. The probe suspended, so the entry this call decided to displace may
+        // have drained, been cancelled, or been replaced meanwhile.
+        let replaced: Bool
+        switch AgentSessionLinkPendingSend.slotDecision(
+            current: pendingSendsByReference[reference],
+            idempotencyKey: idempotencyKey,
+            requestDigest: digest,
+            replacePending: replacePending
+        ) {
+        case let .replay(revision):
+            return await drainAndReport(
+                reference: reference,
+                revision: revision,
+                replaced: false,
+                duplicate: true
+            )
+        case .conflict:
+            return .send(.rejected(.idempotencyConflict))
+        case .occupied:
+            return .result(.pendingSendExists)
+        case .tooLate:
+            return .result(.tooLate)
+        case let .install(wasReplaced):
+            replaced = wasReplaced
+        }
+
+        // Atomic on the main actor: the old entry stops existing and the new one starts in the same
+        // synchronous step, so no drain can ever observe a slot that is momentarily empty or doubly
+        // occupied. A drain already suspended on the old revision compares out at its next fence.
+        let entry = AgentSessionLinkPendingSend(
+            revision: UUID(),
+            reference: reference,
+            observerEndpoint: target.lease.observer,
+            targetSessionID: target.lease.target.sessionID,
+            message: message,
+            idempotencyKey: idempotencyKey,
+            requestDigest: digest,
+            workflow: workflow,
+            authorizedTurnOrigin: .localUser,
+            queuedAt: now()
+        )
+        pendingSendsByReference[reference] = entry
+        pendingSendResultsByReference.removeValue(forKey: reference)
+        return await drainAndReport(
+            reference: reference,
+            revision: entry.revision,
+            replaced: replaced,
+            duplicate: false
+        )
+    }
+
+    /// Removes this link's pending entry, if the caller still identifies it and it has not crossed
+    /// its commit cutoff.
+    ///
+    /// Cancelling discards an instruction the user authorized, so it is reserved to the same kind of
+    /// locally started turn that could have created one.
+    func cancelPendingSend(
+        target: AuthorizedTarget,
+        idempotencyKey: String
+    ) async -> QueueOutcome {
+        guard let host else { return .send(.rejected(.denied)) }
+        guard let observer = host.agentSessionLinkCandidates()
+            .first(where: { $0.domainEndpoint == target.lease.observer })
+        else {
+            await invalidate(endpoint: target.lease.observer, reason: .observerIdentityDrift)
+            return .send(.rejected(.denied))
+        }
+        guard !observer.turnOrigin.requiresNewLocalUserInstruction else {
+            return .send(.blocked(.crossSessionReplyRequiresUserInstruction))
+        }
+        let reference = target.lease.reference
+        guard let entry = pendingSendsByReference[reference] else { return .result(.notPending) }
+        // Matched on both the current link reference and the key, so a stale cancel issued against an
+        // entry that has since been replaced removes nothing.
+        guard entry.idempotencyKey == idempotencyKey else { return .result(.pendingSendMismatch) }
+        guard entry.phase.isCancellable else { return .result(.tooLate) }
+        pendingSendsByReference.removeValue(forKey: reference)
+        // A cancellation is a queue mutation like any other, so the outcome the slot was retaining
+        // stops being current with it.
+        pendingSendResultsByReference.removeValue(forKey: reference)
+        return .result(.cancelled)
+    }
+
+    /// This link's observer-facing queue state.
+    func pendingSendProjection(
+        for lease: DomainAgentSessionLinkLease
+    ) -> AgentSessionLinkPendingSendProjection {
+        AgentSessionLinkPendingSendProjection(
+            pending: pendingSendsByReference[lease.reference],
+            lastResult: pendingSendResultsByReference[lease.reference]
+        )
+    }
+
+    /// Queue state for several leases at once, keyed by target session UUID.
+    ///
+    /// Exists for `wait`, which resumes off the main actor and needs one hop rather than one per
+    /// target. Keyed by target session because that is how the response addresses its rows; the
+    /// lookup itself is still generation-exact, so a lease whose link was revoked while the wait was
+    /// parked simply contributes nothing.
+    func pendingSendProjections(
+        for leases: [DomainAgentSessionLinkLease]
+    ) -> [UUID: AgentSessionLinkPendingSendProjection] {
+        var result: [UUID: AgentSessionLinkPendingSendProjection] = [:]
+        for lease in leases {
+            let projection = pendingSendProjection(for: lease)
+            guard !projection.isEmpty else { continue }
+            result[lease.target.sessionID] = projection
+        }
+        return result
+    }
+
+    // MARK: Drain
+
+    /// Runs one drain for a freshly installed or replayed entry and reports what it produced.
+    ///
+    /// A busy target leaves the entry pending and answers `queued`; an already-sendable one delivers
+    /// through the ordinary send path and answers with that receipt, which is what makes
+    /// `when_sendable` degrade to an immediate send rather than an extra round trip.
+    private func drainAndReport(
+        reference: DomainAgentSessionLinkReference,
+        revision: UUID,
+        replaced: Bool,
+        duplicate: Bool
+    ) async -> QueueOutcome {
+        await drainPendingSend(reference: reference)
+        if pendingSendsByReference[reference]?.revision == revision {
+            return .queued(replaced: replaced, duplicate: duplicate)
+        }
+        guard let result = pendingSendResultsByReference[reference], result.revision == revision else {
+            // Cleared with no retained outcome: the link ended underneath the entry, which is the
+            // same answer every other operation on a dead link gives.
+            return .send(.rejected(.denied))
+        }
+        return .send(sendOutcome(for: result.outcome))
+    }
+
+    /// Delivers one pending entry, if it is still the current one and the target now accepts it.
+    ///
+    /// Every drain reauthorizes from scratch. Queue-time authorization proved the *user* asked for
+    /// this message; it never proved the link, the endpoint incarnations, or the target's readiness
+    /// are still what they were, and all three are re-proven here and again inside the transaction
+    /// after every await it crosses.
+    private func drainPendingSend(reference: DomainAgentSessionLinkReference) async {
+        guard !isFrozenForTermination else {
+            pendingSendsByReference.removeValue(forKey: reference)
+            return
+        }
+        guard var entry = pendingSendsByReference[reference], entry.phase == .pending else { return }
+        let revision = entry.revision
+        // Opening the window also discards whatever it recorded earlier: this drain is about to
+        // observe the target and the ledger for itself, so only edges that land from here on are
+        // ones it can miss.
+        entry.beginDrainWindow()
+        pendingSendsByReference[reference] = entry
+
+        let authorization = await authorizeTarget(
+            operation: .monitorSend,
+            observerEndpoint: entry.observerEndpoint,
+            targetSessionID: entry.targetSessionID
+        )
+        // The authorization suspended; a replacement or cancellation may have landed in that window.
+        guard pendingSendsByReference[reference]?.revision == revision else { return }
+        guard case let .success(target) = authorization, target.lease.reference == reference else {
+            // Either the grant is gone, or a *new* generation now owns this pair. A queued message
+            // belongs to the exact generation that admitted it, so it is dropped rather than migrated
+            // onto authority the user granted separately.
+            clearPendingSend(
+                reference: reference,
+                revision: revision,
+                idempotencyKey: entry.idempotencyKey,
+                retaining: nil
+            )
+            return
+        }
+
+        let outcome = await performSend(
+            target: target,
+            message: entry.message,
+            idempotencyKey: entry.idempotencyKey,
+            messageDigest: entry.requestDigest,
+            workflow: .resolved(entry.workflow),
+            observerTurnOrigin: entry.authorizedTurnOrigin,
+            commitFence: SendCommitFence(
+                willCommit: { [weak self] in
+                    self?.beginPendingSendCommit(reference: reference, revision: revision) ?? false
+                },
+                didCommit: { [weak self] in
+                    self?.notePendingSendCommitted(reference: reference, revision: revision)
+                }
+            )
+        )
+        settlePendingSend(
+            reference: reference,
+            revision: revision,
+            idempotencyKey: entry.idempotencyKey,
+            outcome: outcome
+        )
+    }
+
+    /// The cancellation cutoff.
+    ///
+    /// Taken synchronously on the main actor immediately before the authority commit hop, and never
+    /// re-taken. Everything before it may still be invalidated by replace, cancel, or unlink; nothing
+    /// after it may be. That is what makes `too_late` a truthful answer rather than a race: the entry
+    /// is already past the point where refusing it would leave the transaction with nothing to do.
+    ///
+    /// - Returns: `false` when the entry was superseded, in which case the delivery unwinds with no
+    ///   transcript mutation at all.
+    private func beginPendingSendCommit(
+        reference: DomainAgentSessionLinkReference,
+        revision: UUID
+    ) -> Bool {
+        guard var entry = pendingSendsByReference[reference],
+              entry.revision == revision,
+              entry.phase == .draining
+        else { return false }
+        entry.phase = .committing
+        pendingSendsByReference[reference] = entry
+        return true
+    }
+
+    private func notePendingSendCommitted(
+        reference: DomainAgentSessionLinkReference,
+        revision: UUID
+    ) {
+        guard var entry = pendingSendsByReference[reference], entry.revision == revision else { return }
+        entry.phase = .committed
+        pendingSendsByReference[reference] = entry
+    }
+
+    /// Files one drain's outcome: park the entry for a later event, or end it and retain the single
+    /// terminal result the observer can poll.
+    private func settlePendingSend(
+        reference: DomainAgentSessionLinkReference,
+        revision: UUID,
+        idempotencyKey: String,
+        outcome: SendOutcome
+    ) {
+        // Past the cutoff the entry has to reach a terminal state. Re-parking it would resurrect a
+        // delivery that already answered `too_late` to a cancel, and deliver a message the user
+        // asked to stop.
+        let crossedCutoff = pendingSendsByReference[reference]
+            .map { $0.revision == revision && !$0.phase.isCancellable } ?? false
+
+        func park(_ reason: AgentSessionLinkPendingSend.ParkReason, failure: AgentSessionLinkSendFailure?) {
+            guard !crossedCutoff else {
+                clearPendingSend(
+                    reference: reference,
+                    revision: revision,
+                    idempotencyKey: idempotencyKey,
+                    retaining: failure.map { .failed($0) }
+                )
+                return
+            }
+            guard var entry = pendingSendsByReference[reference], entry.revision == revision else { return }
+            let releasedMidDrain = entry.park(reason: reason)
+            pendingSendsByReference[reference] = entry
+            guard releasedMidDrain else { return }
+            // The only edge this park waits for already passed, inside the drain that just ended.
+            // Re-driving it here is what makes the trigger lossless without a timer: the event is
+            // still the sole cause, it is simply consumed one step later than it arrived.
+            Task { [weak self] in await self?.drainPendingSend(reference: reference) }
+        }
+
+        func clear(_ retained: AgentSessionLinkPendingSendOutcome?) {
+            clearPendingSend(
+                reference: reference,
+                revision: revision,
+                idempotencyKey: idempotencyKey,
+                retaining: retained
+            )
+        }
+
+        switch outcome {
+        case let .receipt(receipt):
+            clear(.delivered(receipt))
+        case let .blocked(failure):
+            switch failure {
+            case .targetNotIdle, .targetLoading:
+                // The target became busy or is still hydrating. Nothing was mutated, so the entry
+                // waits for the next accepted readiness publication rather than retrying on a timer.
+                park(.targetReadiness, failure: failure)
+            case .persistenceFailed, .persistenceIndeterminate,
+                 .crossSessionReplyRequiresUserInstruction:
+                // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
+                // by explicitly queuing again — never by a background loop over failing storage.
+                clear(.failed(failure))
+            case .endpointInvalidated, .linkRevoked, .shuttingDown:
+                // The link, an endpoint, or the process is gone, so there is no surviving `poll` a
+                // retained result could ever be read through. This also covers the cutoff refusal:
+                // the entry was already replaced or cancelled, and the guard below drops the write.
+                clear(nil)
+            }
+        case let .rejected(rejection):
+            switch rejection {
+            case .sendAlreadyInProgress:
+                park(.sendInProgress, failure: nil)
+            case .deliveryLedgerFull:
+                park(.ledgerSaturated, failure: nil)
+            case .idempotencyConflict:
+                clear(.rejected(.idempotencyConflict))
+            case .deliveryLedgerExhausted:
+                // Permanent for this generation: retained outcomes are released only by revoking a
+                // link or restarting, so waiting cannot clear it and retrying only re-rejects.
+                clear(.rejected(.deliveryLedgerExhausted))
+            case .denied, .shuttingDown:
+                clear(nil)
+            }
+        case .workflowUnavailable:
+            // Unreachable: a queued drain hands the transaction an already-resolved workflow and
+            // never performs a lookup. Fail closed rather than leave the entry pending forever on an
+            // outcome this path cannot produce.
+            assertionFailure("A queued oversight send resolved a workflow reference at delivery time.")
+            clear(nil)
+        }
+    }
+
+    private func clearPendingSend(
+        reference: DomainAgentSessionLinkReference,
+        revision: UUID,
+        idempotencyKey: String,
+        retaining outcome: AgentSessionLinkPendingSendOutcome?
+    ) {
+        guard pendingSendsByReference[reference]?.revision == revision else { return }
+        pendingSendsByReference.removeValue(forKey: reference)
+        guard let outcome else { return }
+        pendingSendResultsByReference[reference] = AgentSessionLinkPendingSendResult(
+            revision: revision,
+            idempotencyKey: idempotencyKey,
+            outcome: outcome,
+            settledAt: now()
+        )
+    }
+
+    private func sendOutcome(for outcome: AgentSessionLinkPendingSendOutcome) -> SendOutcome {
+        switch outcome {
+        case let .delivered(receipt):
+            .receipt(receipt)
+        case let .failed(failure):
+            .blocked(failure)
+        case let .rejected(rejection):
+            .rejected(rejection.sendRejection)
+        }
+    }
+
+    // MARK: Drain triggers
+
+    /// Readiness trigger: an accepted publication reporting this target will now take a send.
+    ///
+    /// Event-driven by construction — it runs only from an accepted (deduplicated) target
+    /// publication, so an unchanged target produces no drains at all and nothing polls.
+    private func notePendingSendReadiness(forTargetSession sessionID: UUID) {
+        let references = pendingSendsByReference
+            .filter { $0.value.targetSessionID == sessionID }
+            .map(\.key)
+        for reference in references {
+            notePendingSendTrigger(
+                on: reference,
+                releasing: AgentSessionLinkPendingSend.parkReasonsReleasedByTargetReadiness
+            )
+        }
+    }
+
+    /// Settlement trigger.
+    ///
+    /// Same-link settlement releases an entry parked on `send_already_in_progress`; settlement on
+    /// *any* link may free an authority-wide in-flight slot, so entries parked by that saturation are
+    /// retried across links. Detached rather than awaited so one settlement cannot recurse into the
+    /// call stack of the send that produced it.
+    private func notePendingSendLedgerSettled(on reference: DomainAgentSessionLinkReference) {
+        for candidate in Array(pendingSendsByReference.keys) {
+            notePendingSendTrigger(
+                on: candidate,
+                releasing: AgentSessionLinkPendingSend.parkReasonsReleased(
+                    bySendSettlementOn: reference,
+                    forEntryOn: candidate
+                )
+            )
+        }
+    }
+
+    /// Delivers one drain trigger to one entry, losslessly.
+    ///
+    /// A parked entry is drained now. An entry whose drain is already in flight cannot be scheduled
+    /// — and is exactly the entry that can lose the edge, because the drain reads its inputs before
+    /// the event and decides how to park after it — so the trigger is recorded on it instead and
+    /// consumed by that drain's own park. Past the cancellation cutoff there is nothing to deliver:
+    /// the entry must reach a terminal state and can never park again.
+    private func notePendingSendTrigger(
+        on reference: DomainAgentSessionLinkReference,
+        releasing reasons: Set<AgentSessionLinkPendingSend.ParkReason>
+    ) {
+        guard var entry = pendingSendsByReference[reference] else { return }
+        switch entry.phase {
+        case .pending:
+            guard reasons.contains(entry.parkReason) else { return }
+            Task { [weak self] in await self?.drainPendingSend(reference: reference) }
+        case .draining:
+            entry.noteMissedDrainTriggers(reasons)
+            pendingSendsByReference[reference] = entry
+        case .committing, .committed:
+            break
+        }
+    }
+
+    // MARK: Lifecycle release
+
+    /// Drops every entry and retained outcome a set of revocations ended.
+    private func releasePendingSends(after notices: [DomainAgentSessionLinkRevocationNotice]) {
+        for notice in notices {
+            let reference = DomainAgentSessionLinkReference(
+                linkID: notice.linkID,
+                generation: notice.generation
+            )
+            pendingSendsByReference.removeValue(forKey: reference)
+            pendingSendResultsByReference.removeValue(forKey: reference)
+        }
+    }
+
+    /// Reconciles the map against authoritative membership.
+    ///
+    /// Revocation notices reach `reconcile(after:)` on every in-process path, but the change feed
+    /// that backs some of them is lossy by design, so a stranded entry has to be impossible rather
+    /// than merely unlikely. Each entry is re-checked against the authority directly rather than
+    /// against a membership set captured earlier in the pass: a set read before an admission would
+    /// drop the entry that admission had just installed.
+    private func reconcilePendingSends() async {
+        // Snapshotted before the authority reads below, and only these entries are eligible to be
+        // dropped. An entry admitted *during* those reads belongs to a link this pass never asked
+        // about, so judging it by the membership this pass collected would delete the message a
+        // caller was just told is queued.
+        let audited = pendingSendsByReference
+        guard !audited.isEmpty else { return }
+        var active: Set<DomainAgentSessionLinkReference> = []
+        var queried: Set<UUID> = []
+        for entry in audited.values {
+            guard queried.insert(entry.observerEndpoint.sessionID).inserted else { continue }
+            for item in await authority.links(forObserver: entry.observerEndpoint.sessionID).items {
+                active.insert(DomainAgentSessionLinkReference(
+                    linkID: item.linkID,
+                    generation: item.generation
+                ))
+            }
+        }
+        for (reference, entry) in audited where !active.contains(reference) {
+            // Revision-checked as well, so a replacement installed during the reads survives even
+            // though its predecessor was the entry this pass audited.
+            guard pendingSendsByReference[reference]?.revision == entry.revision else { continue }
+            pendingSendsByReference.removeValue(forKey: reference)
+            pendingSendResultsByReference.removeValue(forKey: reference)
         }
     }
 

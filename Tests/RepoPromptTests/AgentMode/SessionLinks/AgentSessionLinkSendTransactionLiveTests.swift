@@ -163,14 +163,18 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         targetWindowIsClosing: false
     )
 
-    private func makeRequest(message: String = "Please rerun the failing test.") -> AgentSessionLinkSendRequest {
+    private func makeRequest(
+        message: String = "Please rerun the failing test.",
+        workflow: AgentWorkflowDefinition? = nil
+    ) -> AgentSessionLinkSendRequest {
         AgentSessionLinkSendRequest(
             linkID: UUID(),
             linkGeneration: 1,
             observerEndpoint: Self.observerEndpoint,
             observerDisplayName: "Planning",
             observerTurnOrigin: .localUser,
-            message: message
+            message: message,
+            workflow: workflow
         )
     }
 
@@ -319,6 +323,55 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
             "The row is the raw message: no workflow wrapper, no interview block, no slash expansion"
         )
         XCTAssertNil(row.workflow, "A cross-session row must not be badged with the target's workflow")
+    }
+
+    /// A per-message workflow is applied to the provider payload and to nothing else.
+    ///
+    /// The target's composer selection is not saved-and-restored around the send — it is never read
+    /// or written at all, which is what makes preservation structural rather than a cleanup step a
+    /// failure path could skip.
+    func testPerMessageWorkflowWrapsTheEnvelopeWithoutBecomingComposerState() async throws {
+        let fixture = try makeFixture()
+        let targetOwnWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Target choice",
+            iconName: "checkmark",
+            template: "TARGET-TEMPLATE $ARGUMENTS"
+        )
+        fixture.session.selectedWorkflow = targetOwnWorkflow
+        fixture.viewModel.selectedWorkflow = targetOwnWorkflow
+
+        let override = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Sender choice",
+            iconName: "wand.and.stars",
+            template: "OVERRIDE-PREFIX\n$ARGUMENTS\nOVERRIDE-SUFFIX"
+        )
+        let request = makeRequest(message: "Please rerun the failing test.", workflow: override)
+
+        let outcome = await send(fixture, request: request)
+
+        guard case .delivered = outcome else {
+            return XCTFail("Expected a delivered outcome, got \(outcome)")
+        }
+        XCTAssertEqual(
+            fixture.session.selectedWorkflow,
+            targetOwnWorkflow,
+            "A one-shot workflow must not replace what the target's own user selected"
+        )
+        XCTAssertEqual(fixture.viewModel.selectedWorkflow, targetOwnWorkflow)
+
+        let row = try XCTUnwrap(fixture.session.items.first { $0.kind == .user })
+        XCTAssertEqual(row.text, request.message, "The row still stores the raw message")
+        XCTAssertFalse(
+            row.text.contains("OVERRIDE-PREFIX"),
+            "The workflow belongs to the provider payload, not to the stored transcript text"
+        )
+        XCTAssertEqual(
+            row.workflow,
+            override,
+            "The attributed row is badged with the workflow this turn actually ran under"
+        )
     }
 
     // MARK: - Races and refusals
@@ -618,7 +671,8 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
             observerEndpoint: Self.observerEndpoint,
             observerDisplayName: "Planning",
             observerTurnOrigin: .crossSessionMessage(sourceSessionID: UUID()),
-            message: "ping back"
+            message: "ping back",
+            workflow: nil
         )
 
         let outcome = await send(fixture, request: request)

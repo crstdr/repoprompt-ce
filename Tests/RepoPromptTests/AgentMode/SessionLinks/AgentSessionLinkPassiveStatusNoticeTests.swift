@@ -373,6 +373,45 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         )
     }
 
+    /// Auto-wake membership rides the reducer, so the snapshot a receipt produces carries it too.
+    ///
+    /// Every published snapshot is an input to the Auto-wake acceptance fence. A receipt that
+    /// republished a lane-less snapshot would read to the fence as "no lane is selected any more",
+    /// retracting a live attempt and resetting every consumed-epoch watermark.
+    func testAutoWakeLanesSurviveReceiptRepublicationAndAreReplacedWholesale() {
+        var reducer = overflowReducer()
+        let lanes = (0 ..< 2).map { index in
+            Reducer.AutoWakeLane(
+                reference: DomainAgentSessionLinkReference(
+                    linkID: UUID(uuidString: String(format: "10000000-0000-0000-0000-%012d", index))!,
+                    generation: 1
+                ),
+                targetEndpoint: endpoint(sessionID: sessionID(index), generation: 1),
+                targetSessionID: sessionID(index),
+                targetLocalInputEpoch: UInt64(index + 4),
+                targetTurnIsLocalUser: true,
+                isEffectivelySelected: index == 0
+            )
+        }
+        reducer.setAutoWakeLanes(lanes)
+        let claimed = reducer.snapshot
+        XCTAssertEqual(claimed.autoWakeLanes, lanes)
+        XCTAssertEqual(
+            Set(claimed.effectivelySelectedAutoWakeLanesByReference.keys),
+            [lanes[0].reference]
+        )
+
+        reducer.apply(Reducer.Receipt(
+            snapshot: claimed,
+            deliveredEntries: Array(claimed.entries.prefix(2)),
+            overflowProducedThrough: 1
+        ))
+        XCTAssertEqual(reducer.snapshot.autoWakeLanes, lanes)
+
+        reducer.setAutoWakeLanes([])
+        XCTAssertTrue(reducer.snapshot.autoWakeLanes.isEmpty)
+    }
+
     func testReceiptAcknowledgesOnlyDeliveredEntriesAndRenderedOverflow() {
         var reducer = overflowReducer()
         let claimed = reducer.snapshot

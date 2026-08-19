@@ -111,6 +111,7 @@ package enum DomainAgentSessionLinkPendingInteractionKind: String, CaseIterable,
 package enum DomainAgentSessionLinkTextBudget {
     package static let displayNameMaxBytes = 120
     package static let assistantPreviewMaxBytes = 280
+    package static let waitingOnSummaryMaxBytes = 280
     package static let idempotencyKeyMaxBytes = 200
     package static let messageDigestMaxBytes = 200
     package static let messageMaxBytes = 16_000
@@ -156,12 +157,28 @@ package enum DomainAgentSessionLinkTextBudget {
 ///
 /// It intentionally carries no interaction identifiers or bodies, no raw provider events, no run
 /// identifiers, no filesystem/worktree paths, and no diagnostics.
+package struct DomainAgentSessionWaitingOn: Hashable, Sendable {
+    package let summary: String
+    package let declaredAt: Date
+
+    package init?(summary: String, declaredAt: Date) {
+        guard let normalized = DomainAgentSessionLinkTextBudget.normalized(
+            summary,
+            maxBytes: DomainAgentSessionLinkTextBudget.waitingOnSummaryMaxBytes
+        ) else { return nil }
+        self.summary = normalized
+        self.declaredAt = declaredAt
+    }
+}
+
 package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
     package let sessionID: UUID
     package let displayName: String?
     package let providerDisplayName: String?
     package let status: DomainAgentSessionLinkStatus
     package let idleForSend: Bool
+    package let idleSince: Date?
+    package let waitingOn: DomainAgentSessionWaitingOn?
     package let pendingInteractionKind: DomainAgentSessionLinkPendingInteractionKind?
     package let latestVisibleAssistantPreview: String?
     package let visibleRowCount: Int
@@ -179,6 +196,8 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         providerDisplayName: String?,
         status: DomainAgentSessionLinkStatus,
         idleForSend: Bool,
+        idleSince: Date? = nil,
+        waitingOn: DomainAgentSessionWaitingOn? = nil,
         pendingInteractionKind: DomainAgentSessionLinkPendingInteractionKind?,
         latestVisibleAssistantPreview: String?,
         visibleRowCount: Int,
@@ -196,6 +215,8 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         self.status = status
         // A target that is not idle can never be admitted for send, regardless of what the bridge claims.
         self.idleForSend = idleForSend && status == .idle && pendingInteractionKind == nil
+        self.idleSince = status == .idle && pendingInteractionKind == nil ? idleSince : nil
+        self.waitingOn = waitingOn
         self.pendingInteractionKind = pendingInteractionKind
         self.latestVisibleAssistantPreview = DomainAgentSessionLinkTextBudget.normalized(
             latestVisibleAssistantPreview,
@@ -540,6 +561,7 @@ package enum DomainAgentSessionLinkRevocationDisposition: Equatable, Sendable {
 
 package enum DomainAgentSessionLinkTargetChangeDisposition: Equatable, Sendable {
     case accepted(changeSequence: UInt64)
+    case unchanged(changeSequence: UInt64)
     /// A late or out-of-order publication that must never regress the high-water mark.
     case stale(currentSourcePublicationSequence: UInt64)
     case unknownTarget
@@ -800,6 +822,30 @@ package enum DomainAgentSessionLinkSendReservationDisposition: Equatable, Sendab
     /// released when a link generation is revoked (`releaseSendLedger`) or the runtime restarts, so
     /// waiting does not clear it and retrying only re-rejects.
     case retainedOutcomeLimitReached
+    case rejected(DomainAgentSessionLinkError)
+}
+
+/// Non-mutating view of what the send ledger already holds for one exact
+/// `(link generation, idempotency key)` pair.
+///
+/// It exists for queued admission, which has to consult the ledger *before* it resolves a workflow:
+/// an already-settled duplicate must replay its stored outcome even when the workflow it originally
+/// named has since been renamed or deleted. `beginSend` cannot answer that question without also
+/// reserving, and a reservation held for a message that will not be delivered until the target next
+/// becomes sendable would occupy the in-flight ceiling for that entire time.
+///
+/// Nothing here is a promise about a *future* call: `unused` only means the ledger held no outcome
+/// at the instant it was read, and admission is still decided by `beginSend` at delivery time.
+package enum DomainAgentSessionLinkSendLedgerProbe: Equatable, Sendable {
+    case unused
+    /// Same key, same digest, already settled with a receipt.
+    case duplicate(DomainAgentSessionLinkSendReceipt)
+    /// Same key, same digest, still settling.
+    case inProgress
+    /// Same key, same digest, settled with an undetermined durable outcome.
+    case indeterminate
+    /// Same key, different digest.
+    case conflict
     case rejected(DomainAgentSessionLinkError)
 }
 

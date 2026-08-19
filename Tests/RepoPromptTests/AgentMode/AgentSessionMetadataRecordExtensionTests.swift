@@ -30,6 +30,7 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             from: XCTUnwrap(recordJSON.data(using: .utf8))
         )
         XCTAssertFalse(record.autoWakeOnOversightUpdates)
+        XCTAssertTrue(record.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty)
         // It is session configuration, not a transcript-derived field, so toggling it must not move
         // the completeness signal that decides whether a record needs on-demand enrichment.
         var toggled = record
@@ -38,6 +39,28 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         // The projection into the sidebar/restore entry carries it, so a cold seed cannot resurrect a
         // different value than the record holds.
         XCTAssertEqual(record.sidebarEntry(tabID: UUID())?.autoWakeOnOversightUpdates, false)
+
+        // The same guarantee on the session file itself: a version-8 payload carries the master
+        // setting but no granular key at all, and the missing key must decode as "no lane selected"
+        // rather than failing the whole session or inventing a selection the user never made.
+        let versionEightJSON = """
+        {
+            "id": "\(UUID().uuidString.lowercased())",
+            "serializationVersion": 8,
+            "name": "Version Eight Observer",
+            "savedAt": 0,
+            "items": [],
+            "autoEditEnabled": true,
+            "autoWakeOnOversightUpdates": true
+        }
+        """
+        let migrated = try JSONDecoder().decode(
+            AgentSession.self,
+            from: XCTUnwrap(versionEightJSON.data(using: .utf8))
+        )
+        XCTAssertEqual(migrated.serializationVersion, 8, "the stored version is preserved as written")
+        XCTAssertTrue(migrated.autoWakeOnOversightUpdates, "the version-8 master setting survives")
+        XCTAssertTrue(migrated.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty)
     }
 
     /// Round-trip, plus the version bumps that make an older loader refuse rather than misread.
@@ -45,18 +68,21 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         var session = AgentSession(id: UUID(), name: "Observer", savedAt: Date())
         XCTAssertFalse(session.autoWakeOnOversightUpdates, "new sessions default off")
         XCTAssertFalse(session.agentSessionLinkRequiresLocalUserInstruction)
+        let selectedTargetID = UUID()
         session.autoWakeOnOversightUpdates = true
+        session.agentSessionLinkAutoWakeTargetSessionIDs = [selectedTargetID]
         session.agentSessionLinkRequiresLocalUserInstruction = true
 
         let data = try JSONEncoder().encode(session)
         let decoded = try JSONDecoder().decode(AgentSession.self, from: data)
         XCTAssertTrue(decoded.autoWakeOnOversightUpdates)
+        XCTAssertEqual(decoded.agentSessionLinkAutoWakeTargetSessionIDs, [selectedTargetID])
         XCTAssertTrue(
             decoded.agentSessionLinkRequiresLocalUserInstruction,
             "the anti-chain fence must survive relaunch even though its process-local wake ID cannot"
         )
-        XCTAssertEqual(AgentSession.currentSerializationVersion, 8)
-        XCTAssertEqual(AgentSessionMetadataIndex.currentSchemaVersion, 6)
+        XCTAssertEqual(AgentSession.currentSerializationVersion, 9)
+        XCTAssertEqual(AgentSessionMetadataIndex.currentSchemaVersion, 7)
 
         let record = AgentSessionMetadataRecord.record(
             from: session,
@@ -65,7 +91,12 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             observedFileModificationDate: nil
         )
         XCTAssertTrue(record.autoWakeOnOversightUpdates)
+        XCTAssertEqual(record.agentSessionLinkAutoWakeTargetSessionIDs, [selectedTargetID])
         XCTAssertEqual(record.sidebarEntry(tabID: UUID())?.autoWakeOnOversightUpdates, true)
+        XCTAssertEqual(
+            record.sidebarEntry(tabID: UUID())?.agentSessionLinkAutoWakeTargetSessionIDs,
+            [selectedTargetID]
+        )
     }
 
     @MainActor

@@ -305,6 +305,27 @@ extension AgentModeViewModel {
         return session.autoWakeOnOversightUpdates
     }
 
+    func agentSessionLinkAutoWakeTargetSessionIDs(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> Set<UUID> {
+        guard let session = sessions[candidate.tabID],
+              session.activeAgentSessionID == candidate.sessionID
+        else { return [] }
+        return session.agentSessionLinkAutoWakeTargetSessionIDs
+    }
+
+    func agentSessionLinkTargetLocalInputState(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> AgentSessionLinkTargetLocalInputState {
+        guard let session = sessions[candidate.tabID],
+              session.activeAgentSessionID == candidate.sessionID
+        else { return AgentSessionLinkTargetLocalInputState(epoch: 0, isLocalUser: false) }
+        return AgentSessionLinkTargetLocalInputState(
+            epoch: session.agentSessionLinkLocalInputEpoch,
+            isLocalUser: session.agentSessionLinkTurnOrigin == .localUser
+        )
+    }
+
     /// Writes that setting to one exact observer incarnation.
     ///
     /// Endpoint-checked before the write, marked dirty so the existing scheduled persistence saves
@@ -334,11 +355,58 @@ extension AgentModeViewModel {
         // only failure suppression; it cannot bypass the durable non-local-origin fence.
         if enabled {
             agentSessionLinkClearAutoWakeSuppression(for: endpoint)
-        } else {
+        } else if session.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty {
             cancelAgentSessionLinkAutoWake(for: endpoint, reason: .settingDisabled)
         }
+        // Turning the master off may leave granular lanes effective, and turning it on selects every
+        // lane at once. Either way the resulting per-target selection is fenced synchronously here
+        // rather than waiting for the projection this signal schedules.
+        agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
         session.monitorObservationSignal.send(())
         return true
+    }
+
+    @discardableResult
+    func agentSessionLinkSetAutoWakeTargetSessionIDs(
+        _ targetSessionIDs: Set<UUID>,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = sessions[endpoint.tabID],
+              session.hasLoadedPersistedState
+        else { return false }
+        guard session.agentSessionLinkAutoWakeTargetSessionIDs != targetSessionIDs else { return true }
+        session.agentSessionLinkAutoWakeTargetSessionIDs = targetSessionIDs
+        session.isDirty = true
+        scheduleSave(for: endpoint.tabID)
+        if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
+            entry.agentSessionLinkAutoWakeTargetSessionIDs = targetSessionIDs
+            sessionIndexStore.applyLocalUpsert(entry)
+        }
+        // Baselines newly selected lanes at the epoch they hold now and retracts an attempt this
+        // change made ineligible, both before the republication can observe a target that moved in
+        // between.
+        agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
+        session.monitorObservationSignal.send(())
+        return true
+    }
+
+    @discardableResult
+    func agentSessionLinkSetWaitingOn(
+        _ waitingOn: DomainAgentSessionWaitingOn?,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = sessions[endpoint.tabID]
+        else { return false }
+        guard session.agentSessionLinkWaitingOn != waitingOn else { return true }
+        session.agentSessionLinkWaitingOn = waitingOn
+        session.monitorObservationSignal.send(())
+        return true
+    }
+
+    func agentSessionLinkClearWaitingOnAfterAcceptedTurn(_ session: TabSession) {
+        session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()
     }
 
     func agentSessionLinkStatusProjection(
@@ -379,6 +447,7 @@ extension AgentModeViewModel {
                 candidate: candidate,
                 status: projection.status
             ),
+            waitingOn: session.agentSessionLinkWaitingOn,
             pendingInteractionKind: projection.pendingInteractionKind,
             latestVisibleAssistantPreview: latestVisibleAssistantPreview(for: session),
             visibleRowCount: session.transcriptCanonicalVisibleRowCount,

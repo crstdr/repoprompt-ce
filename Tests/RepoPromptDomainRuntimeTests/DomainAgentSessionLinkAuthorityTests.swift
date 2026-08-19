@@ -10,7 +10,10 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private func makeAuthority(lifecycleGeneration: UInt64 = 1) -> DomainAgentSessionLinkAuthority {
+    private func makeAuthority(
+        lifecycleGeneration: UInt64 = 1,
+        now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1000) }
+    ) -> DomainAgentSessionLinkAuthority {
         DomainAgentSessionLinkAuthority(
             identity: DomainRuntimeIdentity(
                 runtimeID: UUID(),
@@ -19,7 +22,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
                 mode: .app,
                 createdAt: Date(timeIntervalSince1970: 0)
             ),
-            now: { Date(timeIntervalSince1970: 1000) }
+            now: now
         )
     }
 
@@ -804,6 +807,83 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(state?.changeSequence, sequence)
     }
 
+    func testIdleSinceIsAuthorityStampedStableAndRestartsAfterLeavingIdle() async throws {
+        let clock = LinkTestClock(Date(timeIntervalSince1970: 1000))
+        let authority = makeAuthority(now: { clock.now })
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        _ = try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: .monitorPoll,
+            observerEndpoint: observer,
+            targetSessionID: target.sessionID
+        ).get()
+
+        let initialState = await authority.targetState(for: lease)
+        let initial = try XCTUnwrap(initialState)
+        XCTAssertEqual(initial.snapshot.idleSince, clock.now)
+        let initialSequence = initial.changeSequence
+
+        clock.now = Date(timeIntervalSince1970: 2000)
+        let idleRefresh = makeSnapshot(sessionID: target.sessionID, displayName: "Renamed")
+        guard case .accepted = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: idleRefresh,
+            sourcePublicationSequence: 2
+        ) else { return XCTFail("Expected idle metadata refresh") }
+        let refreshedState = await authority.targetState(for: lease)
+        let refreshed = try XCTUnwrap(refreshedState)
+        XCTAssertEqual(refreshed.snapshot.idleSince, Date(timeIntervalSince1970: 1000))
+        XCTAssertEqual(refreshed.changeSequence, initialSequence + 1)
+
+        clock.now = Date(timeIntervalSince1970: 3000)
+        _ = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: makeSnapshot(sessionID: target.sessionID, status: .running),
+            sourcePublicationSequence: 3
+        )
+        let runningState = await authority.targetState(for: lease)
+        XCTAssertNil(runningState?.snapshot.idleSince)
+
+        clock.now = Date(timeIntervalSince1970: 4000)
+        _ = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: makeSnapshot(sessionID: target.sessionID),
+            sourcePublicationSequence: 4
+        )
+        let restartedIdleState = await authority.targetState(for: lease)
+        XCTAssertEqual(restartedIdleState?.snapshot.idleSince, Date(timeIntervalSince1970: 4000))
+    }
+
+    func testSemanticReplayAdvancesPublicationHighWaterWithoutAdvancingChangeSequence() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        _ = try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: .monitorPoll,
+            observerEndpoint: observer,
+            targetSessionID: target.sessionID
+        ).get()
+        let baselineState = await authority.targetState(for: lease)
+        let baseline = try XCTUnwrap(baselineState)
+
+        let replay = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: makeSnapshot(sessionID: target.sessionID),
+            sourcePublicationSequence: 2
+        )
+        XCTAssertEqual(replay, .unchanged(changeSequence: baseline.changeSequence))
+        let replayedState = await authority.targetState(for: lease)
+        XCTAssertEqual(replayedState?.changeSequence, baseline.changeSequence)
+        let stale = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: makeSnapshot(sessionID: target.sessionID, status: .running),
+            sourcePublicationSequence: 2
+        )
+        XCTAssertEqual(stale, .stale(currentSourcePublicationSequence: 2))
+    }
+
     func testPublicationFromAMismatchedEndpointIsRejected() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint()
@@ -1390,6 +1470,102 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         guard case .reserved = repeated else { return XCTFail("expected a fresh reservation") }
     }
 
+    /// Queued admission has to learn what the ledger already holds for a key *before* it resolves a
+    /// workflow, and without reserving: a reservation held for a message that will not be delivered
+    /// until the target next becomes sendable would occupy the in-flight ceiling for that whole time.
+    func testSendLedgerProbeReportsStoredOutcomesWithoutReservingASlot() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: .monitorSend,
+            observerEndpoint: observer,
+            targetSessionID: target.sessionID
+        ).get()
+
+        let unused = await authority.probeSend(lease: lease, idempotencyKey: "k1", messageDigest: "d1")
+        XCTAssertEqual(unused, .unused)
+        let idleSnapshot = await authority.snapshot()
+        XCTAssertEqual(
+            idleSnapshot.inFlightSendCount,
+            0,
+            "probing must not reserve; a queued message can wait for hours"
+        )
+
+        guard case let .reserved(reservation) = await authority.beginSend(
+            lease: lease,
+            idempotencyKey: "k1",
+            messageDigest: "d1"
+        ) else { return XCTFail("expected reservation") }
+        let inProgress = await authority.probeSend(
+            lease: lease,
+            idempotencyKey: "k1",
+            messageDigest: "d1"
+        )
+        XCTAssertEqual(inProgress, .inProgress)
+        let conflict = await authority.probeSend(
+            lease: lease,
+            idempotencyKey: "k1",
+            messageDigest: "d2"
+        )
+        XCTAssertEqual(conflict, .conflict)
+
+        _ = await authority.commitSendAuthorization(
+            reservation: reservation,
+            linkGeneration: reservation.linkGeneration
+        )
+        let receipt = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: target.sessionID,
+            targetItemID: "item-1",
+            acceptedAt: Date(timeIntervalSince1970: 42),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        )
+        await authority.completeSend(reservation: reservation, receipt: receipt)
+
+        guard case let .duplicate(stored) = await authority.probeSend(
+            lease: lease,
+            idempotencyKey: "k1",
+            messageDigest: "d1"
+        ) else { return XCTFail("expected the stored receipt") }
+        XCTAssertTrue(stored.duplicate)
+        XCTAssertEqual(stored.targetItemID, "item-1")
+        let settledSnapshot = await authority.snapshot()
+        XCTAssertEqual(
+            settledSnapshot.inFlightSendCount,
+            0,
+            "no probe on any path may leave a slot behind"
+        )
+    }
+
+    /// An indeterminate tombstone must never read as an undelivered retry, on the probe exactly as on
+    /// `beginSend`: the row may be on disk, so re-queuing the key could duplicate it.
+    func testSendLedgerProbeReportsAnIndeterminateTombstoneRatherThanADuplicate() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: .monitorSend,
+            observerEndpoint: observer,
+            targetSessionID: target.sessionID
+        ).get()
+        guard case let .reserved(reservation) = await authority.beginSend(
+            lease: lease,
+            idempotencyKey: "k1",
+            messageDigest: "d1"
+        ) else { return XCTFail("expected reservation") }
+        _ = await authority.commitSendAuthorization(
+            reservation: reservation,
+            linkGeneration: reservation.linkGeneration
+        )
+        await authority.settleIndeterminateSend(reservation: reservation)
+
+        let probe = await authority.probeSend(lease: lease, idempotencyKey: "k1", messageDigest: "d1")
+        XCTAssertEqual(probe, .indeterminate)
+    }
+
     func testManualRevocationRaceAroundTheSendCommitFence() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint()
@@ -1690,6 +1866,18 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         )
         XCTAssertEqual(snapshot.visibleRowCount, 0)
         XCTAssertFalse(snapshot.idleForSend, "a running target can never be admitted for send")
+
+        let waitingOn = try XCTUnwrap(DomainAgentSessionWaitingOn(
+            summary: "  dependency\n" + String(repeating: "é", count: 300),
+            declaredAt: Date(timeIntervalSince1970: 42)
+        ))
+        XCTAssertLessThanOrEqual(
+            waitingOn.summary.utf8.count,
+            DomainAgentSessionLinkTextBudget.waitingOnSummaryMaxBytes
+        )
+        XCTAssertFalse(waitingOn.summary.contains("\n"))
+        XCTAssertEqual(waitingOn.declaredAt, Date(timeIntervalSince1970: 42))
+        XCTAssertNil(DomainAgentSessionWaitingOn(summary: " \n ", declaredAt: Date()))
     }
 
     func testPendingInteractionForcesNonIdleSendAdmission() {
@@ -1706,6 +1894,20 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         )
         XCTAssertTrue(snapshot.hasPendingInteraction)
         XCTAssertFalse(snapshot.idleForSend)
+    }
+}
+
+private final class LinkTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ value: Date) {
+        self.value = value
+    }
+
+    var now: Date {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
     }
 }
 

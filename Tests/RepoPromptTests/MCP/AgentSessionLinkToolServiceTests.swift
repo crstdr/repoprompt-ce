@@ -24,9 +24,41 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         )
         XCTAssertEqual(
             AgentSessionLinkMCPToolService.sendKeys,
-            ["op", "session_id", "message", "idempotency_key"]
+            [
+                "op", "session_id", "message", "idempotency_key", "workflow_id", "workflow_name",
+                "delivery", "replace_pending"
+            ]
         )
+        // Cancelling names the exact queued message, and nothing else: it composes no turn, so it
+        // accepts no message, workflow, or delivery field.
+        XCTAssertEqual(
+            AgentSessionLinkMCPToolService.cancelPendingSendKeys,
+            ["op", "session_id", "idempotency_key"]
+        )
+        for keys in [
+            AgentSessionLinkMCPToolService.pollKeys,
+            AgentSessionLinkMCPToolService.waitKeys,
+            AgentSessionLinkMCPToolService.readKeys,
+            AgentSessionLinkMCPToolService.markDoneKeys,
+            AgentSessionLinkMCPToolService.setWaitingOnKeys,
+            AgentSessionLinkMCPToolService.cancelPendingSendKeys
+        ] {
+            XCTAssertTrue(keys.isDisjoint(with: ["delivery", "replace_pending"]))
+        }
+        // The per-message workflow is a `send` field only: no other operation composes a turn, so
+        // accepting it elsewhere would advertise an override that silently does nothing.
+        for keys in [
+            AgentSessionLinkMCPToolService.pollKeys,
+            AgentSessionLinkMCPToolService.waitKeys,
+            AgentSessionLinkMCPToolService.readKeys,
+            AgentSessionLinkMCPToolService.markDoneKeys,
+            AgentSessionLinkMCPToolService.setWaitingOnKeys
+        ] {
+            XCTAssertTrue(keys.isDisjoint(with: ["workflow_id", "workflow_name"]))
+        }
         XCTAssertEqual(AgentSessionLinkMCPToolService.markDoneKeys, ["op", "session_id"])
+        XCTAssertEqual(AgentSessionLinkMCPToolService.setWaitingOnKeys, ["op", "summary", "clear"])
+        XCTAssertFalse(AgentSessionLinkMCPToolService.setWaitingOnKeys.contains("session_id"))
         // `send` names exactly one target and never fans out; accepting `session_ids` would make one
         // invocation deliver several messages.
         XCTAssertFalse(AgentSessionLinkMCPToolService.sendKeys.contains("session_ids"))
@@ -189,7 +221,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(
             Set(object.keys),
             [
-                "session_id", "name", "provider", "status", "idle_for_send",
+                "session_id", "name", "provider", "status", "idle_for_send", "idle_since", "waiting_on",
                 "has_pending_interaction", "pending_interaction_kind",
                 "latest_visible_assistant_preview", "visible_row_count",
                 "last_activity_at", "change_sequence"
@@ -213,6 +245,38 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(object["has_pending_interaction"]?.boolValue, true)
         // A target with a pending interaction can never be advertised as send-ready.
         XCTAssertEqual(object["idle_for_send"]?.boolValue, false)
+    }
+
+    func testSnapshotSerializesAuthoritativeIdleAndAgentDeclaredWaitingMetadata() throws {
+        let sessionID = UUID()
+        let idleSince = Date(timeIntervalSince1970: 100)
+        let declaredAt = Date(timeIntervalSince1970: 200)
+        let state = DomainAgentSessionLinkTargetState(
+            sessionID: sessionID,
+            linkID: UUID(),
+            linkGeneration: 1,
+            snapshot: DomainAgentSessionObservationSnapshot(
+                sessionID: sessionID,
+                displayName: "Worker",
+                providerDisplayName: "Codex",
+                status: .idle,
+                idleForSend: false,
+                idleSince: idleSince,
+                waitingOn: DomainAgentSessionWaitingOn(summary: "CI artifact", declaredAt: declaredAt),
+                pendingInteractionKind: nil,
+                latestVisibleAssistantPreview: nil,
+                visibleRowCount: 0,
+                lastActivityAt: idleSince
+            ),
+            changeSequence: 4,
+            waitCursor: "w"
+        )
+        let object = try XCTUnwrap(AgentSessionLinkResponseRenderer.snapshotValue(state).objectValue)
+        XCTAssertEqual(object["idle_since"]?.stringValue, AgentMCPToolHelpers.timestamp(idleSince))
+        let waiting = try XCTUnwrap(object["waiting_on"]?.objectValue)
+        XCTAssertEqual(waiting["summary"]?.stringValue, "CI artifact")
+        XCTAssertEqual(waiting["declared_at"]?.stringValue, AgentMCPToolHelpers.timestamp(declaredAt))
+        XCTAssertFalse(object["idle_for_send"]?.boolValue ?? true)
     }
 
     func testMultiTargetWaitResponseKeepsRequestOrderAndSuccessorCursorsForEveryTarget() throws {
@@ -368,10 +432,43 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     }
 
     /// The missing-op and unsupported-op errors teach the same operation list the schema advertises.
+    func testSetWaitingOnIsSelfScopedAndRequiresExactlyOneMutation() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+
+        let setValue = try await fixture.service.execute(args: [
+            "op": .string("set_waiting_on"),
+            "summary": .string(" external review ")
+        ])
+        XCTAssertEqual(setValue.objectValue?["result"]?.stringValue, "set")
+        XCTAssertEqual(fixture.host.waitingOn?.summary, "external review")
+        XCTAssertNotNil(fixture.host.waitingOn?.declaredAt)
+
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("set_waiting_on"),
+                "summary": .string("both"),
+                "clear": .bool(true)
+            ])
+            XCTFail("Expected mutually exclusive mutation to fail")
+        } catch {}
+        do {
+            _ = try await fixture.service.execute(args: ["op": .string("set_waiting_on")])
+            XCTFail("Expected an empty mutation to fail")
+        } catch {}
+
+        let clearValue = try await fixture.service.execute(args: [
+            "op": .string("set_waiting_on"),
+            "clear": .bool(true)
+        ])
+        XCTAssertEqual(clearValue.objectValue?["result"]?.stringValue, "cleared")
+        XCTAssertNil(fixture.host.waitingOn)
+    }
+
     func testOperationHelpNamesEverySupportedOperation() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
-        for op in ["list", "poll", "wait", "read", "send", "mark_done"] {
+        for op in ["list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done", "set_waiting_on"] {
             XCTAssertTrue(
                 AgentSessionLinkMCPToolService.supportedOperationsSentence.contains(op),
                 "the supported-operation sentence must name \(op)"
@@ -555,6 +652,201 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseIdempotencyKey(.string(oversized)))
     }
 
+    // MARK: - queued delivery arguments
+
+    func testDeliveryDefaultsToImmediateAndRejectsAnythingElse() throws {
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseDelivery(nil), .immediate)
+        XCTAssertEqual(
+            try AgentSessionLinkMCPToolService.parseDelivery(.string(" When_Sendable ")),
+            .whenSendable
+        )
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseDelivery(.string("queued")))
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseDelivery(.string("later")))
+    }
+
+    /// `replace_pending` names a queue slot an immediate send never touches, so accepting it there
+    /// would confirm an intent the call cannot carry out.
+    func testReplacePendingIsRefusedForAnImmediateSend() throws {
+        XCTAssertFalse(try AgentSessionLinkMCPToolService.parseReplacePending(nil, delivery: .immediate))
+        XCTAssertFalse(
+            try AgentSessionLinkMCPToolService.parseReplacePending(.bool(false), delivery: .immediate),
+            "an explicit false is compatible with every delivery mode"
+        )
+        XCTAssertTrue(
+            try AgentSessionLinkMCPToolService.parseReplacePending(.bool(true), delivery: .whenSendable)
+        )
+        XCTAssertThrowsError(
+            try AgentSessionLinkMCPToolService.parseReplacePending(.bool(true), delivery: .immediate)
+        )
+        XCTAssertThrowsError(
+            try AgentSessionLinkMCPToolService.parseReplacePending(
+                .string("true"),
+                delivery: .whenSendable
+            ),
+            "a coerced string would let a malformed call silently displace a queued message"
+        )
+    }
+
+    func testCancelRequiresTheQueuedMessagesKey() throws {
+        XCTAssertEqual(
+            try AgentSessionLinkMCPToolService.parseCancelIdempotencyKey(.string(" abc ")),
+            "abc"
+        )
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseCancelIdempotencyKey(nil))
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseCancelIdempotencyKey(.string("")))
+        let oversized = String(
+            repeating: "k",
+            count: DomainAgentSessionLinkTextBudget.idempotencyKeyMaxBytes + 1
+        )
+        XCTAssertThrowsError(
+            try AgentSessionLinkMCPToolService.parseCancelIdempotencyKey(.string(oversized))
+        )
+    }
+
+    // MARK: - queue response shapes
+
+    /// The two Booleans are what tell a caller whether its call changed anything, so `queued` carries
+    /// them and every other queue result carries none.
+    func testQueueResultsRenderStableStringsAndNeverClaimDelivery() {
+        let sessionID = UUID()
+        guard case let .object(queued) = AgentSessionLinkResponseRenderer.queuedValue(
+            targetSessionID: sessionID,
+            replaced: true,
+            duplicate: false
+        ) else { return XCTFail("Expected an object payload") }
+        XCTAssertEqual(queued["result"], .string("queued"))
+        XCTAssertEqual(queued["session_id"], .string(sessionID.uuidString))
+        XCTAssertEqual(queued["delivered"], .bool(false))
+        XCTAssertEqual(queued["replaced"], .bool(true))
+        XCTAssertEqual(queued["duplicate"], .bool(false))
+
+        for result in [
+            AgentSessionLinkQueueResult.pendingSendExists,
+            .cancelled,
+            .notPending,
+            .pendingSendMismatch,
+            .tooLate
+        ] {
+            guard case let .object(payload) = AgentSessionLinkResponseRenderer.queueResultValue(
+                result,
+                targetSessionID: sessionID
+            ) else { return XCTFail("Expected an object payload") }
+            XCTAssertEqual(payload["result"], .string(result.rawValue))
+            XCTAssertEqual(payload["delivered"], .bool(false))
+            XCTAssertNotNil(payload["detail"])
+            XCTAssertNil(payload["replaced"])
+            XCTAssertNil(payload["duplicate"])
+        }
+        XCTAssertEqual(
+            [
+                AgentSessionLinkQueueResult.queued,
+                .pendingSendExists,
+                .cancelled,
+                .notPending,
+                .pendingSendMismatch,
+                .tooLate
+            ].map(\.rawValue),
+            ["queued", "pending_send_exists", "cancelled", "not_pending", "pending_send_mismatch", "too_late"]
+        )
+    }
+
+    /// The queue is observable through `poll` alone, so both fields are always present and the pending
+    /// entry reports fixed metadata rather than the body the queue owner already has.
+    func testPendingSendFieldsAreAlwaysPresentAndCarryOnlyBoundedMetadata() {
+        let sessionID = UUID()
+        XCTAssertEqual(
+            AgentSessionLinkResponseRenderer.pendingSendFields(.empty, targetSessionID: sessionID),
+            ["pending_send": .null, "last_pending_send_result": .null]
+        )
+
+        let pending = AgentSessionLinkPendingSend(
+            revision: UUID(),
+            reference: DomainAgentSessionLinkReference(linkID: UUID(), generation: 3),
+            observerEndpoint: DomainAgentSessionLinkEndpointIdentity(
+                windowID: 1,
+                workspaceID: UUID(),
+                tabID: UUID(),
+                sessionID: UUID(),
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: 1
+            ),
+            targetSessionID: sessionID,
+            message: "first line\nsecond\u{7} line",
+            idempotencyKey: "key-1",
+            requestDigest: "digest",
+            workflow: nil,
+            authorizedTurnOrigin: .localUser,
+            queuedAt: Date(timeIntervalSince1970: 1000)
+        )
+        guard case let .object(payload) = AgentSessionLinkResponseRenderer.pendingSendValue(pending)
+        else { return XCTFail("Expected an object payload") }
+        XCTAssertEqual(payload["idempotency_key"], .string("key-1"))
+        XCTAssertEqual(payload["workflow_id"], .null)
+        XCTAssertEqual(payload["workflow_name"], .null)
+        XCTAssertNotNil(payload["queued_at"])
+        XCTAssertEqual(
+            payload["message_preview"],
+            .string("first line second line"),
+            "the preview is normalized to one line and can never smuggle control scalars"
+        )
+    }
+
+    /// A queued delivery reports the *same* shapes an immediate one does, so a caller has one result
+    /// vocabulary rather than a parallel one for the queue.
+    func testRetainedQueueOutcomeReusesTheImmediateSendShapes() {
+        let sessionID = UUID()
+        let receipt = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: sessionID,
+            targetItemID: "item-1",
+            acceptedAt: Date(timeIntervalSince1970: 1000),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        )
+        guard case let .object(delivered) = AgentSessionLinkResponseRenderer.pendingSendResultValue(
+            AgentSessionLinkPendingSendResult(
+                revision: UUID(),
+                idempotencyKey: "key-1",
+                outcome: .delivered(receipt),
+                settledAt: Date(timeIntervalSince1970: 2000)
+            ),
+            targetSessionID: sessionID
+        ) else { return XCTFail("Expected an object payload") }
+        XCTAssertEqual(delivered["result"], .string("delivered"))
+        XCTAssertEqual(delivered["target_item_id"], .string("item-1"))
+        XCTAssertEqual(delivered["idempotency_key"], .string("key-1"))
+        XCTAssertNotNil(delivered["settled_at"])
+
+        guard case let .object(failed) = AgentSessionLinkResponseRenderer.pendingSendResultValue(
+            AgentSessionLinkPendingSendResult(
+                revision: UUID(),
+                idempotencyKey: "key-1",
+                outcome: .failed(.persistenceIndeterminate),
+                settledAt: Date(timeIntervalSince1970: 2000)
+            ),
+            targetSessionID: sessionID
+        ) else { return XCTFail("Expected an object payload") }
+        XCTAssertEqual(failed["result"], .string("persistence_indeterminate"))
+        XCTAssertEqual(failed["delivered"], .bool(false))
+        XCTAssertEqual(failed["retryable"], .bool(false))
+        XCTAssertEqual(failed["delivered_unknown"], .bool(true))
+
+        guard case let .object(rejected) = AgentSessionLinkResponseRenderer.pendingSendResultValue(
+            AgentSessionLinkPendingSendResult(
+                revision: UUID(),
+                idempotencyKey: "key-1",
+                outcome: .rejected(.deliveryLedgerExhausted),
+                settledAt: Date(timeIntervalSince1970: 2000)
+            ),
+            targetSessionID: sessionID
+        ) else { return XCTFail("Expected an object payload") }
+        XCTAssertEqual(rejected["result"], .string("delivery_ledger_exhausted"))
+        XCTAssertEqual(
+            rejected["retryable"],
+            .bool(false),
+            "exhaustion outlives the call, so a queued failure must not read as retryable either"
+        )
+    }
+
     // MARK: - send response shapes
 
     func testDeliveryReceiptRendersEveryStableField() {
@@ -647,6 +939,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     private final class ReadReleaseHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
+        var waitingOn: DomainAgentSessionWaitingOn?
         var lastTranscriptReaderSessionID: UUID?
         private(set) var transcriptPageCallCount = 0
         /// Runs *inside* the materialization, standing in for the real host's off-actor canonical
@@ -671,6 +964,15 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 visibleRowCount: 1,
                 lastActivityAt: Date(timeIntervalSince1970: 100)
             )
+        }
+
+        func agentSessionLinkSetWaitingOn(
+            _ waitingOn: DomainAgentSessionWaitingOn?,
+            for endpoint: DomainAgentSessionLinkEndpointIdentity
+        ) -> Bool {
+            guard candidates.contains(where: { $0.domainEndpoint == endpoint }) else { return false }
+            self.waitingOn = waitingOn
+            return true
         }
 
         func agentSessionLinkStatusProjection(

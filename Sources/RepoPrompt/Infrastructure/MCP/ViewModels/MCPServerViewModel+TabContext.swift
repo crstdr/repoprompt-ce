@@ -928,6 +928,24 @@ extension MCPServerViewModel {
             && tabContextByConnectionID[connectionID]?.tabID == expectedTabID
     }
 
+    /// Final synchronous fence for a catalog-qualified provider dispatch.
+    ///
+    /// The server actor already qualified the token's policy and connection lifecycle. This
+    /// MainActor check closes the remaining handover interval by requiring that the exact
+    /// connection observed by `tools/list` still owns the bidirectional route at composition time.
+    @MainActor
+    func hasCurrentRunCatalogRouteToken(
+        _ token: AgentSessionLinkRunCatalogRouteToken,
+        expectedTabID: UUID
+    ) -> Bool {
+        token.observerEndpoint.tabID == expectedTabID
+            && hasCurrentRunRouteMapping(
+                runID: token.runID,
+                connectionID: token.connectionID,
+                expectedTabID: expectedTabID
+            )
+    }
+
     /// Proactively removes all cached tab-context state for a closing tab while preserving window affinity.
     @MainActor
     func purgeClosedTabContext(tabID: UUID) {

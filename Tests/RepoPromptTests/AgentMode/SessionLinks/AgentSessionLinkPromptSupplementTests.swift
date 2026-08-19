@@ -244,6 +244,8 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         to: AgentSessionLinkPassiveStatusNotices.Status,
         observedAt: Date = Date(timeIntervalSince1970: 0),
         idleForSend: Bool = false,
+        idleSince: Date? = nil,
+        waitingOn: DomainAgentSessionWaitingOn? = nil,
         preview: String? = nil,
         changeSequence: UInt64 = 1
     ) -> AgentSessionLinkPassiveStatusNotices.PendingEntry {
@@ -264,6 +266,8 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             toStatus: to,
             observedAt: observedAt,
             idleForSend: idleForSend,
+            idleSince: idleSince,
+            waitingOn: waitingOn,
             latestVisibleAssistantPreview: preview,
             changeSequence: changeSequence
         )
@@ -311,6 +315,11 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
                             "8B91C0E0-0000-0000-0000-00000000E572",
                             from: .running,
                             to: .idle,
+                            idleSince: Date(timeIntervalSince1970: 50),
+                            waitingOn: DomainAgentSessionWaitingOn(
+                                summary: "CI <artifact>",
+                                declaredAt: Date(timeIntervalSince1970: 60)
+                            ),
                             changeSequence: 1
                         ),
                         passiveEntry(
@@ -338,6 +347,10 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
                 + "from=\"running\" to=\"idle\" observed_at=\""
         ))
         XCTAssertTrue(rendered.contains("idle_for_send=\"false\""))
+        XCTAssertTrue(rendered.contains("idle_since=\"1970-01-01T00:00:50Z\""))
+        XCTAssertTrue(rendered.contains(
+            "<waiting_on declared_at=\"1970-01-01T00:01:00Z\">CI &lt;artifact&gt;</waiting_on>"
+        ))
         // UTC ISO-8601, so two observers cannot disagree about when the same edge happened.
         XCTAssertTrue(rendered.contains("observed_at=\"1970-01-01T00:00:00Z\""))
         // The queue's internal `waiting` is rendered as the only status word the agent has ever been
@@ -2414,7 +2427,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         let workspaceManager: WorkspaceManagerViewModel
     }
 
-    private func makeFixture() throws -> Fixture {
+    private func makeFixture(catalogReady: Bool = true) throws -> Fixture {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
@@ -2435,16 +2448,61 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
+        session.installRunID(UUID())
         let sessionID = try XCTUnwrap(
             viewModel.test_ensureSessionBoundToTab(session),
             "expected a durable persistent binding"
         )
-        return Fixture(
+        #if DEBUG
+            let expectedCatalogConnectionID = UUID(
+                uuidString: "00000000-0000-0000-0000-00000000CA7A"
+            )!
+            viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { token, requestedTabID in
+                guard let currentRunID = session.runID else { return false }
+                return requestedTabID == tabID
+                    && token.observerEndpoint.tabID == tabID
+                    && token.connectionID == expectedCatalogConnectionID
+                    && token.runID == currentRunID
+            }
+        #endif
+        let fixture = Fixture(
             viewModel: viewModel,
             session: session,
             sessionID: sessionID,
             tabID: tabID,
             workspaceManager: workspaceManager
+        )
+        if catalogReady {
+            try publishCatalogProjection(fixture, revision: 1, hasAgentSessionLink: true)
+        }
+        return fixture
+    }
+
+    private func publishCatalogProjection(
+        _ fixture: Fixture,
+        revision: UInt64,
+        hasAgentSessionLink: Bool,
+        connectionID: UUID = UUID(uuidString: "00000000-0000-0000-0000-00000000CA7A")!
+    ) throws {
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        let runID = try XCTUnwrap(fixture.session.runID)
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+            AgentSessionLinkRunCatalogProjection(
+                runID: runID,
+                routeToken: AgentSessionLinkRunCatalogRouteToken(
+                    runID: runID,
+                    observerEndpoint: endpoint,
+                    connectionID: connectionID,
+                    routingAuthorityGeneration: 1,
+                    connectionLifecycleGeneration: 1
+                ),
+                projectionRevision: revision,
+                hasAgentSessionLink: hasAgentSessionLink
+            ),
+            to: endpoint
         )
     }
 
@@ -3219,6 +3277,145 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
     }
 
+    func testActiveInventoryWaitsForExactMonotonicCatalogReadiness() throws {
+        let fixture = try makeFixture(catalogReady: false)
+        fixture.session.selectedAgent = .codexExec
+        try publish(fixture, revision: 1, targetCount: 1)
+
+        let ordinaryDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(UUID())
+        let beforeReady = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+            "hello",
+            session: fixture.session,
+            dispatchID: ordinaryDispatchID
+        )
+        XCTAssertEqual(beforeReady.text, "hello")
+        XCTAssertNil(beforeReady.claim, "the inventory claim remains owed while the catalog is unready")
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkPromptClaimOutcome(
+                for: fixture.session,
+                dispatchID: .autoWake(wakeID: UUID(), localInputEpoch: 1)
+            ),
+            .requiredLaneBatchUnavailable,
+            "a lane-only dispatch must fail closed while the catalog is unready"
+        )
+
+        try publishCatalogProjection(fixture, revision: 4, hasAgentSessionLink: false)
+        try publishCatalogProjection(
+            fixture,
+            revision: 3,
+            hasAgentSessionLink: true,
+            connectionID: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-0000000057A1"))
+        )
+        try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: true)
+        XCTAssertNil(
+            fixture.viewModel.agentSessionLinkPromptClaim(
+                for: fixture.session,
+                dispatchID: ordinaryDispatchID
+            ),
+            "stale-route and out-of-order same-route readiness cannot lower the fence"
+        )
+
+        try publishCatalogProjection(fixture, revision: 5, hasAgentSessionLink: true)
+        let ready = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+            "hello",
+            session: fixture.session,
+            dispatchID: ordinaryDispatchID
+        )
+        XCTAssertEqual(ready.claim?.kind, .inventory)
+        XCTAssertTrue(ready.text.contains(AgentSessionLinkPrompts.envelopeTag))
+    }
+
+    func testLowerRevisionForANewCurrentRunReplacesHigherOldRunProjection() throws {
+        let fixture = try makeFixture(catalogReady: false)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        let oldRunID = try XCTUnwrap(fixture.session.runID)
+        let oldRoute = AgentSessionLinkRunCatalogRouteToken(
+            runID: oldRunID,
+            observerEndpoint: endpoint,
+            connectionID: UUID(),
+            routingAuthorityGeneration: 1,
+            connectionLifecycleGeneration: 1
+        )
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+            AgentSessionLinkRunCatalogProjection(
+                runID: oldRunID,
+                routeToken: oldRoute,
+                projectionRevision: 100,
+                hasAgentSessionLink: true
+            ),
+            to: endpoint
+        )
+
+        let newRunID = UUID()
+        fixture.session.installRunID(newRunID)
+        let newProjection = AgentSessionLinkRunCatalogProjection(
+            runID: newRunID,
+            routeToken: AgentSessionLinkRunCatalogRouteToken(
+                runID: newRunID,
+                observerEndpoint: endpoint,
+                connectionID: UUID(),
+                routingAuthorityGeneration: 2,
+                connectionLifecycleGeneration: 1
+            ),
+            projectionRevision: 1,
+            hasAgentSessionLink: true
+        )
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(newProjection, to: endpoint)
+
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+            newProjection
+        )
+    }
+
+    func testDelayedOldRunProjectionCannotOverwriteTheCurrentRun() throws {
+        let fixture = try makeFixture(catalogReady: false)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        let oldRunID = try XCTUnwrap(fixture.session.runID)
+        let newRunID = UUID()
+        fixture.session.installRunID(newRunID)
+        let current = AgentSessionLinkRunCatalogProjection(
+            runID: newRunID,
+            routeToken: AgentSessionLinkRunCatalogRouteToken(
+                runID: newRunID,
+                observerEndpoint: endpoint,
+                connectionID: UUID(),
+                routingAuthorityGeneration: 2,
+                connectionLifecycleGeneration: 1
+            ),
+            projectionRevision: 1,
+            hasAgentSessionLink: true
+        )
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(current, to: endpoint)
+
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+            AgentSessionLinkRunCatalogProjection(
+                runID: oldRunID,
+                routeToken: AgentSessionLinkRunCatalogRouteToken(
+                    runID: oldRunID,
+                    observerEndpoint: endpoint,
+                    connectionID: UUID(),
+                    routingAuthorityGeneration: 1,
+                    connectionLifecycleGeneration: 1
+                ),
+                projectionRevision: 200,
+                hasAgentSessionLink: true
+            ),
+            to: endpoint
+        )
+
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+            current
+        )
+    }
+
     func testCodexSessionsSeeTheQualifiedToolReference() throws {
         let fixture = try makeFixture()
         fixture.session.selectedAgent = .codexExec
@@ -3292,7 +3489,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         XCTAssertNil(decorated.claim)
     }
 
-    func testPruningForgetsAcknowledgementForADisappearedBinding() throws {
+    func testPruningUsesTheExactCurrentEndpointRatherThanSessionUUID() throws {
         let fixture = try makeFixture()
         try publish(fixture, revision: 1, targetCount: 1)
         let accepted = fixture.viewModel.agentSessionLinkDecoratedProviderText(
@@ -3301,11 +3498,26 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             dispatchID: .claudeNativeSend(UUID())
         )
         fixture.viewModel.acceptAgentSessionLinkPromptClaim(accepted.claim)
+        let retiredEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
 
-        fixture.viewModel.agentSessionLinkPrunePromptState(liveSessionIDs: [])
-        XCTAssertNil(fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session))
+        fixture.session.beginPersistentBindingTransition()
+        let currentEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        XCTAssertNotEqual(retiredEndpoint, currentEndpoint)
+        fixture.viewModel.agentSessionLinkPrunePromptState(liveSessionIDs: [fixture.sessionID])
+        XCTAssertNil(
+            fixture.viewModel.agentSessionLinkPromptInventoryBySessionID[fixture.sessionID],
+            "the retired endpoint must be pruned even while its session UUID remains live"
+        )
+        XCTAssertNil(fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[retiredEndpoint])
 
-        // A new incarnation republishes and must be taught oversight again.
+        // The replacement incarnation republishes and must be taught oversight again.
+        try publishCatalogProjection(fixture, revision: 1, hasAgentSessionLink: true)
         try publish(fixture, revision: 1, targetCount: 1)
         let reissued = fixture.viewModel.agentSessionLinkDecoratedProviderText(
             "hello again",

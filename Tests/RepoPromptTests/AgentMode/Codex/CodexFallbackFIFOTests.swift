@@ -312,6 +312,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
             queueRevision: lane.queueRevision,
             wakeFingerprint: lane.wakeEligibilityFingerprint,
             attemptedFingerprint: nil,
+            humanRearmEpochs: [:],
             physicalOutcome: .notAttempted,
             phase: .preparingDispatch,
             task: nil

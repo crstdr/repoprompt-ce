@@ -96,7 +96,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         inbound: [AgentMonitorPillProps.Inbound] = [],
         notices: [AgentMonitorPillProps.Notice] = [],
         canAddReason: String? = nil,
-        autoWakeOnUpdatesEnabled: Bool = false
+        autoWakeOnUpdatesEnabled: Bool = false,
+        autoWakeTargetSessionIDs: Set<UUID> = []
     ) -> AgentMonitorPillProps {
         AgentMonitorPillProps(
             sessionID: observerID,
@@ -104,7 +105,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             inbound: inbound,
             recentNotices: notices,
             canAddReason: canAddReason,
-            autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled
+            autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled,
+            autoWakeTargetSessionIDs: autoWakeTargetSessionIDs
         )
     }
 
@@ -211,13 +213,13 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         let outbound = outbound()
         XCTAssertEqual(
             outbound.detailLine,
-            "worktree/feature · Codex CLI · Idle · Activity unavailable"
+            "worktree/feature · Codex CLI · Activity unavailable"
         )
         XCTAssertEqual(outbound.locationProviderLine, "worktree/feature · Codex CLI")
         XCTAssertEqual(
-            outbound.statusActivityLine(now: moment(hour: 15), calendar: calendar, locale: locale),
-            "Idle · Activity unavailable",
-            "status and freshness must render independently of unbounded location/provider text"
+            outbound.metadataLine(now: moment(hour: 15), calendar: calendar, locale: locale),
+            "worktree/feature · Codex CLI · Activity unavailable",
+            "metadata stays on one line and visible status remains on the status dot"
         )
         // Inbound carries neither status nor location: nothing observes an observer's session, so
         // neither value has a path that would refresh it. See
@@ -231,7 +233,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
                 locationLabel: "worktree/feature",
                 status: .running
             ).detailLine,
-            "worktree/feature · Codex CLI · Running"
+            "worktree/feature · Codex CLI"
         )
     }
 
@@ -452,7 +454,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             inbound: [inbound()],
             notices: [notice],
             canAddReason: "Load this thread before adding sessions to oversee.",
-            autoWakeOnUpdatesEnabled: true
+            autoWakeOnUpdatesEnabled: true,
+            autoWakeTargetSessionIDs: [targetID]
         )
 
         let overlaid = AgentModeViewModel.monitorPillProps(
@@ -480,7 +483,9 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(withPersistence.inbound, published.inbound)
         XCTAssertEqual(withPersistence.recentNotices, published.recentNotices)
         XCTAssertTrue(withPersistence.autoWakeOnUpdatesEnabled)
+        XCTAssertEqual(withPersistence.autoWakeTargetSessionIDs, [targetID])
         XCTAssertTrue(published.withCanAddReason("changed").autoWakeOnUpdatesEnabled)
+        XCTAssertEqual(published.withCanAddReason("changed").autoWakeTargetSessionIDs, [targetID])
     }
 
     /// The switch is the only place the user learns what auto-wake does, so its copy has to carry the
@@ -737,9 +742,11 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     func testRowFreshnessLinesSplitRelativeFromAbsolute() {
         let now = moment(hour: 15, minute: 30)
         let row = outbound(status: .running, lastActivityAt: now.addingTimeInterval(-120))
+        XCTAssertEqual(row.locationProviderLine, "worktree/feature · Codex CLI")
+        XCTAssertEqual(row.activityLine(now: now, calendar: calendar, locale: locale), "2m ago")
         XCTAssertEqual(
-            row.statusActivityLine(now: now, calendar: calendar, locale: locale),
-            "Running · 2m ago"
+            row.metadataLine(now: now, calendar: calendar, locale: locale),
+            "worktree/feature · Codex CLI · 2m ago"
         )
         XCTAssertEqual(row.activityTooltip, AgentMonitorActivityFormatter.absolute(row.lastActivityAt))
         XCTAssertNotEqual(

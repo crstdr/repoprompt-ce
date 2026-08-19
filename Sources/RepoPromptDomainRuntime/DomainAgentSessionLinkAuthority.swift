@@ -319,7 +319,7 @@ package actor DomainAgentSessionLinkAuthority {
             let sequence = allocateChangeSequence(for: reservation.target.sessionID)
             targets[reservation.target.sessionID] = TargetRecord(
                 endpoint: reservation.target,
-                snapshot: initialSnapshot,
+                snapshot: canonicalSnapshot(initialSnapshot, previous: nil),
                 changeSequence: sequence,
                 // Seeded only from the chain that is actually installing.
                 sourcePublicationHighWater: sourcePublicationSequence,
@@ -540,6 +540,12 @@ package actor DomainAgentSessionLinkAuthority {
         links.values.contains { $0.grant.observer == observerEndpoint }
     }
 
+    package func hasActiveLink(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        links.values.contains { record in
+            record.grant.observer == endpoint || record.grant.target == endpoint
+        }
+    }
+
     // MARK: - Authorization
 
     /// Issues a short-lived lease for one operation on one target.
@@ -640,7 +646,12 @@ package actor DomainAgentSessionLinkAuthority {
             return .stale(currentSourcePublicationSequence: record.sourcePublicationHighWater)
         }
         record.sourcePublicationHighWater = sourcePublicationSequence
-        record.snapshot = snapshot
+        let canonical = canonicalSnapshot(snapshot, previous: record.snapshot)
+        guard canonical != record.snapshot else {
+            targets[endpoint.sessionID] = record
+            return .unchanged(changeSequence: record.changeSequence)
+        }
+        record.snapshot = canonical
         record.changeSequence = allocateChangeSequence(for: endpoint.sessionID)
         targets[endpoint.sessionID] = record
 
@@ -652,6 +663,40 @@ package actor DomainAgentSessionLinkAuthority {
         ))
         wakeWaiters(forTargetSession: endpoint.sessionID)
         return .accepted(changeSequence: record.changeSequence)
+    }
+
+    private func canonicalSnapshot(
+        _ incoming: DomainAgentSessionObservationSnapshot,
+        previous: DomainAgentSessionObservationSnapshot?
+    ) -> DomainAgentSessionObservationSnapshot {
+        let isIdle = incoming.status == .idle && !incoming.hasPendingInteraction
+        let idleSince: Date? = if isIdle {
+            previous?.status == .idle && previous?.hasPendingInteraction == false
+                ? previous?.idleSince ?? now()
+                : now()
+        } else {
+            nil
+        }
+        return DomainAgentSessionObservationSnapshot(
+            sessionID: incoming.sessionID,
+            displayName: incoming.displayName,
+            providerDisplayName: incoming.providerDisplayName,
+            status: incoming.status,
+            idleForSend: incoming.idleForSend,
+            idleSince: idleSince,
+            waitingOn: incoming.waitingOn,
+            pendingInteractionKind: incoming.pendingInteractionKind,
+            latestVisibleAssistantPreview: incoming.latestVisibleAssistantPreview,
+            visibleRowCount: incoming.visibleRowCount,
+            lastActivityAt: incoming.lastActivityAt
+        )
+    }
+
+    package func observationSnapshot(
+        forTargetEndpoint endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> DomainAgentSessionObservationSnapshot? {
+        guard let record = targets[endpoint.sessionID], record.endpoint == endpoint else { return nil }
+        return record.snapshot
     }
 
     /// Current authorized target state plus a freshly minted successor wait cursor.
@@ -1079,6 +1124,43 @@ package actor DomainAgentSessionLinkAuthority {
         sendLedger[key] = SendLedgerEntry(reservation: reservation, isCommitted: false, receipt: nil)
         sendLedgerOrder.append(key)
         return .reserved(reservation)
+    }
+
+    /// Non-mutating ledger lookup for one exact lease, key, and digest.
+    ///
+    /// Reserves nothing, so a queued send can learn that its key is already spent — or already
+    /// conflicting — without occupying an in-flight slot for the whole time its message sits waiting
+    /// for the target to become sendable. The disposition order deliberately mirrors `beginSend`, so
+    /// the two can never disagree about what a stored entry means.
+    package func probeSend(
+        lease: DomainAgentSessionLinkLease,
+        idempotencyKey: String,
+        messageDigest: String
+    ) -> DomainAgentSessionLinkSendLedgerProbe {
+        guard !isDraining, !isShutDown else { return .rejected(.runtimeShuttingDown) }
+        if let error = validate(lease: lease) { return .rejected(error) }
+        guard lease.capability == .sendWhenIdle else { return .rejected(.capabilityDenied) }
+        let trimmedKey = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty,
+              trimmedKey.utf8.count <= DomainAgentSessionLinkTextBudget.idempotencyKeyMaxBytes,
+              !messageDigest.isEmpty,
+              messageDigest.utf8.count <= DomainAgentSessionLinkTextBudget.messageDigestMaxBytes
+        else {
+            return .rejected(.invalidRequest)
+        }
+        guard let existing = sendLedger[SendLedgerKey(
+            linkID: lease.linkID,
+            linkGeneration: lease.linkGeneration,
+            idempotencyKey: trimmedKey
+        )] else {
+            return .unused
+        }
+        guard existing.reservation.messageDigest == messageDigest else { return .conflict }
+        // Checked before the receipt for the same reason `beginSend` does it: a tombstone must never
+        // be mistaken for an undelivered retry.
+        if existing.isIndeterminate { return .indeterminate }
+        if let receipt = existing.receipt { return .duplicate(receipt.markedDuplicate()) }
+        return .inProgress
     }
 
     /// The authorization linearization fence.

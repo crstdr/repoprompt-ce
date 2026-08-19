@@ -351,6 +351,7 @@ enum AgentSessionRestoreSupport {
             agentReasoningEffortRaw: session.agentReasoningEffort,
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: session.agentSessionLinkAutoWakeTargetSessionIDs,
             parentSessionID: session.parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: session.isMCPOriginated,

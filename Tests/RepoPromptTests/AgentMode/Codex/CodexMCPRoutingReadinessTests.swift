@@ -319,6 +319,61 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
 
     // MARK: - Routed resume proceeds
 
+    func testPresentationOnlyRunRouteDoesNotSatisfyAuthoritativeReconnectDecision() async throws {
+        #if DEBUG
+            try await withRoutingMCPFixture { window in
+                let runID = UUID()
+                let connectionID = UUID()
+                let tabID = UUID()
+                try await installRoutingSnapshot(for: tabID, in: window)
+                let session = window.agentModeViewModel.session(for: tabID)
+                session.selectedAgent = .codexExec
+                session.hasLoadedPersistedState = true
+                session.installRunID(runID)
+                _ = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(session))
+
+                let snapshot = ComposeTabState(id: tabID, name: "Presentation-only Codex route")
+                window.mcpServer.installTabContext(
+                    clientID: connectionID.uuidString,
+                    clientName: codexClientName,
+                    windowID: window.windowID,
+                    workspaceID: nil,
+                    snapshot: snapshot,
+                    runID: runID,
+                    signalRouting: false
+                )
+                defer {
+                    window.mcpServer.removeTabContext(
+                        forConnectionID: connectionID,
+                        clientName: codexClientName,
+                        windowID: window.windowID,
+                        runID: runID
+                    )
+                }
+
+                XCTAssertTrue(
+                    window.mcpServer.hasCurrentRunRouteMapping(
+                        runID: runID,
+                        connectionID: connectionID,
+                        expectedTabID: tabID
+                    ),
+                    "the presentation layer should reproduce the former false-positive route"
+                )
+                let hasAuthoritativeRoute = await window.agentModeViewModel
+                    .hasAuthoritativeRunRouteInCurrentMCPServer(
+                        runID: runID,
+                        tabID: tabID
+                    )
+                XCTAssertFalse(
+                    hasAuthoritativeRoute,
+                    "the reconnect decision must reject a route without actor-owned policy and connection lifecycle authority"
+                )
+            }
+        #else
+            throw XCTSkip("Authoritative route diagnostics are DEBUG-only.")
+        #endif
+    }
+
     func testRestoredResumeRequiresRealMatchingMCPAdmissionBeforeFirstTurn() async throws {
         #if DEBUG
             try await withRoutingMCPFixture { window in
