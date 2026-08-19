@@ -51,6 +51,22 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         return window.agentModeViewModel.agentSessionLinkAutoWakeOnUpdatesEnabled(for: candidate)
     }
 
+    func agentSessionLinkAutoWakeTargetSessionIDs(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> Set<UUID> {
+        guard let window = window(withID: candidate.windowID) else { return [] }
+        return window.agentModeViewModel.agentSessionLinkAutoWakeTargetSessionIDs(for: candidate)
+    }
+
+    func agentSessionLinkTargetLocalInputState(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> AgentSessionLinkTargetLocalInputState {
+        guard let window = window(withID: candidate.windowID) else {
+            return AgentSessionLinkTargetLocalInputState(epoch: 0, isLocalUser: false)
+        }
+        return window.agentModeViewModel.agentSessionLinkTargetLocalInputState(for: candidate)
+    }
+
     @discardableResult
     func agentSessionLinkSetAutoWakeOnUpdatesEnabled(
         _ enabled: Bool,
@@ -58,6 +74,24 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) -> Bool {
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
         return viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(enabled, for: endpoint)
+    }
+
+    @discardableResult
+    func agentSessionLinkSetAutoWakeTargetSessionIDs(
+        _ targetSessionIDs: Set<UUID>,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
+        return viewModel.agentSessionLinkSetAutoWakeTargetSessionIDs(targetSessionIDs, for: endpoint)
+    }
+
+    @discardableResult
+    func agentSessionLinkSetWaitingOn(
+        _ waitingOn: DomainAgentSessionWaitingOn?,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
+        return viewModel.agentSessionLinkSetWaitingOn(waitingOn, for: endpoint)
     }
 
     func agentSessionLinkInstallObservation(
@@ -91,6 +125,15 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) {
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
         viewModel.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
+    }
+
+    func agentSessionLinkPublishRunCatalogProjection(
+        _ projection: AgentSessionLinkRunCatalogProjection
+    ) {
+        guard let endpoint = projection.routeToken?.observerEndpoint,
+              let viewModel = agentSessionLinkOwningViewModel(for: endpoint)
+        else { return }
+        viewModel.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
     }
 
     /// Routes one passive status-notice queue to the exact incarnation it was reduced for.

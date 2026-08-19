@@ -2,7 +2,7 @@ import AppKit
 import RepoPromptDomainRuntime
 import SwiftUI
 
-/// Labeled **Oversee** pill, placed between Workflow and Interview.
+/// Compact oversight pill, placed between Workflow and Interview.
 ///
 /// It opens a management popover rather than acting as a one-shot toggle: oversight is
 /// session-scoped and survives until explicit or lifecycle revocation, so the user needs a surface
@@ -34,13 +34,10 @@ struct AgentMonitorPill: View {
                 // Status is carried by the glyph and the count text, never by colour alone.
                 Image(systemName: props.isActive ? "eye.fill" : "eye")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                Text("Oversee")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
-                if props.isActive {
-                    Text("\(props.outbound.count)")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                        .monospacedDigit()
-                }
+                Text("\(props.outbound.count)")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                    .monospacedDigit()
+                    .fixedSize()
                 if props.hasInbound {
                     // Distinct directional inbound indicator: another session is observing this one.
                     HStack(spacing: 1) {
@@ -55,6 +52,8 @@ struct AgentMonitorPill: View {
                 Image(systemName: "chevron.down")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
             }
+            .fixedSize(horizontal: true, vertical: false)
+            .lineLimit(1)
             .foregroundStyle(props.isActive ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
             .padding(.horizontal, horizontalPadding)
             .frame(height: height)
@@ -305,27 +304,28 @@ struct AgentMonitorPopoverView: View {
                         .fixedSize()
                 }
                 .hoverTooltip(row.identityTooltip, .top)
+                if row.hasUnreadActivity {
+                    unreadBadge(row, isBusy: isBusy)
+                }
                 Spacer(minLength: 6)
+                if !props.autoWakeOnUpdatesEnabled {
+                    laneAutoWakeToggle(row, isBusy: isBusy)
+                }
                 outboundActions(row, isBusy: isBusy)
             }
-            if !row.locationProviderLine.isEmpty {
+            HStack(spacing: 5) {
                 Text(row.locationProviderLine)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
-            }
-            HStack(spacing: 5) {
-                Text(row.statusActivityLine(now: now))
+                Spacer(minLength: 0)
+                Text(row.activityLine(now: now))
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .layoutPriority(1)
+                    .fixedSize()
                     .hoverTooltip(row.activityTooltip, .top)
-                if row.hasUnreadActivity {
-                    unreadBadge(row, isBusy: isBusy)
-                }
-                Spacer(minLength: 0)
             }
             if let message = actionFailureByLinkID[row.linkID] {
                 messageText(message)
@@ -428,7 +428,22 @@ struct AgentMonitorPopoverView: View {
     /// Observer-session controls, rendered whether or not anything is overseen.
     private var observerControlsSection: some View {
         VStack(alignment: .leading, spacing: 4) {
-            autoWakeToggle
+            HStack(spacing: 8) {
+                autoWakeToggle
+                if !props.autoWakeOnUpdatesEnabled, !props.outbound.isEmpty {
+                    Button(
+                        currentOutboundTargetsAreAllSelected
+                            ? AgentMonitorAutoWakeCopy.deselectAll
+                            : AgentMonitorAutoWakeCopy.selectAll
+                    ) {
+                        setAllCurrentAutoWakeTargets(selected: !currentOutboundTargetsAreAllSelected)
+                    }
+                    .buttonStyle(.plain)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                    .foregroundStyle(Color.accentColor)
+                    .disabled(isChangingAutoWake || props.autoWakeUnavailableReason != nil)
+                }
+            }
             if let reason = props.autoWakeUnavailableReason {
                 messageText(reason)
             } else if props.outbound.isEmpty {
@@ -443,6 +458,25 @@ struct AgentMonitorPopoverView: View {
     /// The binding reads `props`, never local state: the setting lives on the session and is
     /// republished after it settles. A checkbox that flipped optimistically would show the user a
     /// value the session had refused to take.
+    private var currentOutboundTargetsAreAllSelected: Bool {
+        props.outbound.allSatisfy { props.autoWakeTargetSessionIDs.contains($0.targetSessionID) }
+    }
+
+    private func laneAutoWakeToggle(
+        _ row: AgentMonitorPillProps.Outbound,
+        isBusy: Bool
+    ) -> some View {
+        Toggle(AgentMonitorAutoWakeCopy.laneLabel, isOn: Binding(
+            get: { props.autoWakeTargetSessionIDs.contains(row.targetSessionID) },
+            set: { setLaneAutoWake(row, enabled: $0) }
+        ))
+        .toggleStyle(.checkbox)
+        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+        .fixedSize()
+        .disabled(isBusy || isChangingAutoWake || props.autoWakeUnavailableReason != nil)
+        .accessibilityLabel("Auto-wake for \(row.displayName)")
+    }
+
     private var autoWakeToggle: some View {
         Toggle(AgentMonitorAutoWakeCopy.label, isOn: Binding(
             get: { props.autoWakeOnUpdatesEnabled },
@@ -517,7 +551,13 @@ struct AgentMonitorPopoverView: View {
                                 direction: .inbound,
                                 observerSessionID: row.observerSessionID,
                                 targetSessionID: targetSessionID,
-                                displayName: row.displayName
+                                displayName: row.displayName,
+                                // Captured before Stop runs, and read from the observer above this
+                                // row rather than from `props`: these are the overseen session's
+                                // own selections, which never include its observer's.
+                                restoreAutoWakeSelection: AgentSessionLinkRuntimeBridge.shared
+                                    .autoWakeTargetSelection(observerSessionID: row.observerSessionID)
+                                    .contains(targetSessionID)
                             )
                         }
                     ) {
@@ -669,6 +709,7 @@ struct AgentMonitorPopoverView: View {
         let observerSessionID: UUID
         let targetSessionID: UUID
         let displayName: String
+        let restoreAutoWakeSelection: Bool
 
         var message: String {
             AgentMonitorUnlinkUndo.message(direction: direction, displayName: displayName)
@@ -754,6 +795,12 @@ struct AgentMonitorPopoverView: View {
             guard undoSlot?.id == slot.id else { return }
             switch outcome {
             case .added, .alreadyLinked:
+                if slot.restoreAutoWakeSelection {
+                    _ = await AgentSessionLinkRuntimeBridge.shared.restoreAutoWakeTargetSelection(
+                        targetSessionID: slot.targetSessionID,
+                        observerSessionID: slot.observerSessionID
+                    )
+                }
                 undoSlot = nil
                 undoFailureMessage = nil
             case .failed, .rejected:
@@ -873,6 +920,45 @@ struct AgentMonitorPopoverView: View {
         }
     }
 
+    private func setLaneAutoWake(_ row: AgentMonitorPillProps.Outbound, enabled: Bool) {
+        var selected = props.autoWakeTargetSessionIDs
+        if enabled {
+            selected.insert(row.targetSessionID)
+        } else {
+            selected.remove(row.targetSessionID)
+        }
+        setAutoWakeTargets(selected)
+    }
+
+    private func setAllCurrentAutoWakeTargets(selected: Bool) {
+        var targetIDs = props.autoWakeTargetSessionIDs
+        let current = Set(props.outbound.map(\.targetSessionID))
+        if selected {
+            targetIDs.formUnion(current)
+        } else {
+            targetIDs.subtract(current)
+        }
+        setAutoWakeTargets(targetIDs)
+    }
+
+    private func setAutoWakeTargets(_ targetSessionIDs: Set<UUID>) {
+        guard !isChangingAutoWake else { return }
+        guard let observerEndpoint = props.endpoint else {
+            autoWakeFailureMessage = AgentMonitorAutoWakeCopy.unavailableMessage
+            return
+        }
+        isChangingAutoWake = true
+        autoWakeFailureMessage = nil
+        Task {
+            let outcome = await AgentSessionLinkRuntimeBridge.shared.setAutoWakeTargetSelection(
+                targetSessionIDs: targetSessionIDs,
+                observerEndpoint: observerEndpoint
+            )
+            isChangingAutoWake = false
+            autoWakeFailureMessage = outcome.failureMessage
+        }
+    }
+
     private func toggleTriage(_ row: AgentMonitorPillProps.Outbound) {
         guard !busyLinkIDs.contains(row.linkID) else { return }
         guard let observerEndpoint = props.endpoint else {
@@ -906,7 +992,8 @@ struct AgentMonitorPopoverView: View {
                     direction: .outbound,
                     observerSessionID: observerSessionID,
                     targetSessionID: row.targetSessionID,
-                    displayName: row.displayName
+                    displayName: row.displayName,
+                    restoreAutoWakeSelection: props.autoWakeTargetSessionIDs.contains(row.targetSessionID)
                 )
             }
         ) {

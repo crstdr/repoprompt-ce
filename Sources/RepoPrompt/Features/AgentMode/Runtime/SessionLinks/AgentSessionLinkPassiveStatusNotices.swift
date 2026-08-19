@@ -15,6 +15,22 @@ struct AgentSessionLinkPassiveStatusNotices {
         case unavailable
     }
 
+    struct AutoWakeLane: Hashable {
+        let reference: DomainAgentSessionLinkReference
+        let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+        let targetSessionID: UUID
+        let targetLocalInputEpoch: UInt64
+        let targetTurnIsLocalUser: Bool
+        /// The observer's Auto-wake selection for this lane **as of publication**.
+        ///
+        /// A projection, not the authority: selection is live session state the user can flip at any
+        /// time, and this snapshot is republished only on the next authoritative refresh. The
+        /// auto-wake coordinator therefore reads the session's own selection rather than this flag —
+        /// scheduling or accepting a wake on a value this stale is what let a deselected lane start a
+        /// turn and a freshly selected one lose its first human re-arm.
+        let isEffectivelySelected: Bool
+    }
+
     struct Sample: Hashable {
         let reference: DomainAgentSessionLinkReference
         let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -27,6 +43,10 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// letting an upstream projection assert otherwise would put a claim in the prompt that the
         /// send admission matrix would immediately refuse.
         let idleForSend: Bool
+        let idleSince: Date?
+        let waitingOn: DomainAgentSessionWaitingOn?
+        let targetLocalInputEpoch: UInt64
+        let targetTurnIsLocalUser: Bool
         let latestVisibleAssistantPreview: String?
 
         init(
@@ -36,6 +56,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             displayName: String?,
             status: Status,
             idleForSend: Bool = false,
+            idleSince: Date? = nil,
+            waitingOn: DomainAgentSessionWaitingOn? = nil,
+            targetLocalInputEpoch: UInt64 = 0,
+            targetTurnIsLocalUser: Bool = false,
             latestVisibleAssistantPreview: String? = nil
         ) {
             self.reference = reference
@@ -47,6 +71,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             )
             self.status = status
             self.idleForSend = status == .idle && idleForSend
+            self.idleSince = status == .idle ? idleSince : nil
+            self.waitingOn = waitingOn
+            self.targetLocalInputEpoch = targetLocalInputEpoch
+            self.targetTurnIsLocalUser = targetTurnIsLocalUser
             self.latestVisibleAssistantPreview = DomainAgentSessionLinkTextBudget.normalized(
                 latestVisibleAssistantPreview,
                 maxBytes: DomainAgentSessionLinkTextBudget.assistantPreviewMaxBytes
@@ -70,6 +98,10 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// A same-status metadata refresh updates this time without changing `edgeSequence`.
         let observedAt: Date
         let idleForSend: Bool
+        let idleSince: Date?
+        let waitingOn: DomainAgentSessionWaitingOn?
+        let targetLocalInputEpoch: UInt64
+        let targetTurnIsLocalUser: Bool
         let latestVisibleAssistantPreview: String?
         let changeSequence: UInt64
         /// Identity of the *status edge* that created or last advanced this entry.
@@ -100,6 +132,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             toStatus: Status,
             observedAt: Date = Date(),
             idleForSend: Bool = false,
+            idleSince: Date? = nil,
+            waitingOn: DomainAgentSessionWaitingOn? = nil,
+            targetLocalInputEpoch: UInt64 = 0,
+            targetTurnIsLocalUser: Bool = false,
             latestVisibleAssistantPreview: String? = nil,
             changeSequence: UInt64,
             edgeSequence: UInt64? = nil
@@ -113,6 +149,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             self.toStatus = toStatus
             self.observedAt = observedAt
             self.idleForSend = idleForSend
+            self.idleSince = idleSince
+            self.waitingOn = waitingOn
+            self.targetLocalInputEpoch = targetLocalInputEpoch
+            self.targetTurnIsLocalUser = targetTurnIsLocalUser
             self.latestVisibleAssistantPreview = latestVisibleAssistantPreview
             self.changeSequence = changeSequence
         }
@@ -131,6 +171,10 @@ struct AgentSessionLinkPassiveStatusNotices {
                 toStatus: toStatus,
                 observedAt: observedAt,
                 idleForSend: sample.idleForSend,
+                idleSince: sample.idleSince,
+                waitingOn: sample.waitingOn,
+                targetLocalInputEpoch: sample.targetLocalInputEpoch,
+                targetTurnIsLocalUser: sample.targetTurnIsLocalUser,
                 latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
                 changeSequence: changeSequence,
                 // Preserve only edge occurrence; refreshed readiness uses the new sample time above.
@@ -141,6 +185,10 @@ struct AgentSessionLinkPassiveStatusNotices {
         fileprivate func hasSameFinalMetadata(as sample: Sample) -> Bool {
             displayName == sample.displayName
                 && idleForSend == sample.idleForSend
+                && idleSince == sample.idleSince
+                && waitingOn == sample.waitingOn
+                && targetLocalInputEpoch == sample.targetLocalInputEpoch
+                && targetTurnIsLocalUser == sample.targetTurnIsLocalUser
                 && latestVisibleAssistantPreview == sample.latestVisibleAssistantPreview
         }
     }
@@ -193,6 +241,45 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// Monotonic for the life of the epoch, so acknowledging it is idempotent, order-independent,
         /// and safe to compare against overflow produced after the claim was reserved.
         let overflowProduced: UInt64
+        let autoWakeLanes: [AutoWakeLane]
+
+        init(
+            observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+            queueEpoch: UUID,
+            queueRevision: UInt64,
+            linkSetRevision: UInt64,
+            isEnabled: Bool,
+            isDeliverable: Bool,
+            entries: [PendingEntry],
+            unacknowledgedOverflowCount: UInt64,
+            overflowProduced: UInt64,
+            autoWakeLanes: [AutoWakeLane] = []
+        ) {
+            self.observerEndpoint = observerEndpoint
+            self.queueEpoch = queueEpoch
+            self.queueRevision = queueRevision
+            self.linkSetRevision = linkSetRevision
+            self.isEnabled = isEnabled
+            self.isDeliverable = isDeliverable
+            self.entries = entries
+            self.unacknowledgedOverflowCount = unacknowledgedOverflowCount
+            self.overflowProduced = overflowProduced
+            self.autoWakeLanes = autoWakeLanes
+        }
+
+        /// The lanes this snapshot was published believing were selected, keyed for lookup.
+        ///
+        /// Reporting only. Scheduling and acceptance must resolve selection against the live session
+        /// instead; see `isEffectivelySelected`.
+        ///
+        /// Built by reduction rather than `Dictionary(uniqueKeysWithValues:)` so a duplicated
+        /// reference degrades to a last-wins lookup instead of trapping on the main actor.
+        var effectivelySelectedAutoWakeLanesByReference: [DomainAgentSessionLinkReference: AutoWakeLane] {
+            autoWakeLanes.reduce(into: [:]) { lanes, lane in
+                guard lane.isEffectivelySelected else { return }
+                lanes[lane.reference] = lane
+            }
+        }
 
         /// Whether this snapshot has anything worth putting in front of the agent.
         ///
@@ -291,6 +378,14 @@ struct AgentSessionLinkPassiveStatusNotices {
     private(set) var lastAcceptedReceiptRevision: UInt64 = 0
     private(set) var overflowProduced: UInt64 = 0
     private(set) var overflowAcknowledged: UInt64 = 0
+    /// Current Auto-wake membership for this observer, held on the reducer rather than applied at
+    /// each publish.
+    ///
+    /// Every published snapshot is an input to the Auto-wake acceptance fence, including the one a
+    /// receipt produces. Decorating only the authoritative pass would let a receipt publish a
+    /// lane-less snapshot, which the fence would read as "no lane is selected any more" and use to
+    /// retract a live attempt and reset every consumed-epoch watermark.
+    private(set) var autoWakeLanes: [AutoWakeLane] = []
 
     private var nextChangeSequence: UInt64 = 0
     private var lastObservedStatus: [DomainAgentSessionLinkReference: Observation] = [:]
@@ -314,8 +409,14 @@ struct AgentSessionLinkPassiveStatusNotices {
             isDeliverable: isEnabled && isDeliverable,
             entries: orderedPendingEntries,
             unacknowledgedOverflowCount: overflowProduced - overflowAcknowledged,
-            overflowProduced: overflowProduced
+            overflowProduced: overflowProduced,
+            autoWakeLanes: autoWakeLanes
         )
+    }
+
+    /// Replaces the Auto-wake membership carried by every subsequent snapshot of this reducer.
+    mutating func setAutoWakeLanes(_ lanes: [AutoWakeLane]) {
+        autoWakeLanes = lanes
     }
 
     /// Starts collecting and silently baselines the current authoritative target states.
@@ -500,6 +601,10 @@ struct AgentSessionLinkPassiveStatusNotices {
                 toStatus: sample.status,
                 observedAt: observedAt,
                 idleForSend: sample.idleForSend,
+                idleSince: sample.idleSince,
+                waitingOn: sample.waitingOn,
+                targetLocalInputEpoch: sample.targetLocalInputEpoch,
+                targetTurnIsLocalUser: sample.targetTurnIsLocalUser,
                 latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
                 changeSequence: nextChangeSequence,
                 // A status edge, so this *is* a new occurrence: the wake fingerprint must not compare

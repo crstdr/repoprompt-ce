@@ -44,6 +44,8 @@ struct AgentSessionLinkAutoWakeAttempt {
     /// Frozen only at the physical boundary, so a later edge can never be suppressed as though it
     /// had been included in already-immutable provider text.
     var attemptedFingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
+    /// Fresh target-local epochs represented by this accepted wake, consumed atomically on acceptance.
+    var humanRearmEpochs: [DomainAgentSessionLinkReference: UInt64]
     var physicalOutcome: AgentSessionLinkPhysicalDispatchOutcome
     var phase: Phase
     var task: Task<Void, Never>?
@@ -88,6 +90,12 @@ extension AgentModeViewModel {
     ) {
         guard let session = agentSessionLinkAutoWakeSession(for: endpoint) else { return }
 
+        // Baselined ahead of the deliverability guard, because the publication that *activates* a lane
+        // carries no entries yet. Seeding the watermark from a lane's first update instead would
+        // consume the very epoch that update was caused by, so the first direct human turn in a
+        // freshly linked or freshly selected target could never re-arm the observer.
+        agentSessionLinkReconcileAutoWakeLaneBaselines(snapshot, session: session)
+
         // Content gone: a natural turn claimed it, or membership moved. Release the reservation
         // without a transcript row — nothing was ever delivered under this wake's name.
         guard snapshot.isDeliverable, snapshot.hasDeliverableContent else {
@@ -100,6 +108,17 @@ extension AgentModeViewModel {
         }
 
         let fingerprint = snapshot.wakeEligibilityFingerprint
+        let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
+        let representedSelectedEntries = snapshot.entries.filter { selectedLanes[$0.reference] != nil }
+        let freshHumanEpochs: [DomainAgentSessionLinkReference: UInt64] = representedSelectedEntries
+            .reduce(into: [:]) { epochs, entry in
+                guard let lane = selectedLanes[entry.reference],
+                      lane.targetTurnIsLocalUser,
+                      lane.targetLocalInputEpoch
+                      > (session.agentSessionLinkConsumedTargetLocalEpochs[entry.reference] ?? 0)
+                else { return }
+                epochs[entry.reference] = lane.targetLocalInputEpoch
+            }
 
         // One attempt absorbs newer revisions. A metadata-only revision deliberately does not clear a
         // failed attempt's suppression, so improving payload fidelity cannot re-trigger a provider
@@ -111,14 +130,19 @@ extension AgentModeViewModel {
             }
             attempt.queueRevision = max(attempt.queueRevision, snapshot.queueRevision)
             attempt.wakeFingerprint = fingerprint
+            for (reference, epoch) in freshHumanEpochs {
+                attempt.humanRearmEpochs[reference] = max(attempt.humanRearmEpochs[reference] ?? 0, epoch)
+            }
             session.pendingOversightAutoWake = attempt
             agentSessionLinkScheduleAutoWakeReevaluation(wakeID: attempt.wakeID, endpoint: endpoint)
             agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, "absorbed")
             return
         }
 
-        guard session.autoWakeOnOversightUpdates else { return }
-        guard !session.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction else {
+        guard !representedSelectedEntries.isEmpty
+            || agentSessionLinkOverflowAloneMayWake(snapshot, selectedLanes: selectedLanes)
+        else { return }
+        if session.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction, freshHumanEpochs.isEmpty {
             agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, "blocked.turnOrigin")
             return
         }
@@ -139,6 +163,7 @@ extension AgentModeViewModel {
             queueRevision: snapshot.queueRevision,
             wakeFingerprint: fingerprint,
             attemptedFingerprint: nil,
+            humanRearmEpochs: freshHumanEpochs,
             physicalOutcome: .notAttempted,
             phase: .scheduled,
             task: nil
@@ -219,9 +244,7 @@ extension AgentModeViewModel {
             else {
                 return
             }
-            guard session.autoWakeOnOversightUpdates,
-                  !session.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction
-            else {
+            guard agentSessionLinkAutoWakeAttemptIsStillEligible(attempt, session: session) else {
                 cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
                 return
             }
@@ -244,10 +267,32 @@ extension AgentModeViewModel {
                 wakeID: wakeID,
                 localInputEpoch: attempt.localInputEpoch
             )
+            if route == .waitingContinuation, session.selectedAgent == .codexExec {
+                let expectedWaitID = session.instructionWaitID
+                let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
+                let readiness = await ensureProviderInputCatalogReady(for: session)
+                guard readiness == .ready || readiness == .notRequired,
+                      let current = agentSessionLinkAutoWakeSession(for: endpoint),
+                      current === session,
+                      current.pendingOversightAutoWake?.wakeID == wakeID,
+                      current.instructionWaitID == expectedWaitID,
+                      current.codexController.map(ObjectIdentifier.init) == expectedControllerID,
+                      agentSessionLinkAutoWakeRoute(current) == .waitingContinuation
+                else {
+                    agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                    return
+                }
+            }
             // Reserve the exact rendered lane batch before provider preparation. Budget omission,
             // receipt competition, revocation, and membership drift therefore remain definite
             // no-call outcomes.
-            guard let reservedClaim = agentSessionLinkPromptClaim(for: session, dispatchID: dispatchID) else {
+            let monitoring = agentSessionLinkDecoratedProviderText(
+                "",
+                session: session,
+                dispatchID: dispatchID
+            )
+            guard !monitoring.mustAbortDispatch, let reservedClaim = monitoring.claim else {
+                agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
                 return
             }
@@ -299,9 +344,7 @@ extension AgentModeViewModel {
         guard var attempt = session.pendingOversightAutoWake,
               attempt.wakeID == wakeID,
               attempt.localInputEpoch == effectiveID.autoWakeLocalInputEpoch
-        else {
-            return false
-        }
+        else { return false }
         if attempt.phase == .cancelledBeforeDispatch {
             attempt.task?.cancel()
             session.pendingOversightAutoWake = nil
@@ -311,6 +354,15 @@ extension AgentModeViewModel {
             return false
         }
         if attempt.phase != .dispatching {
+            // The acceptance fence, evaluated exactly once and only on this side of the transport
+            // boundary. A re-entrant acquire for an attempt that is already `dispatching` must not
+            // consult it: the physical call may already have happened, so retracting the identity
+            // here would report "no call" for a turn the provider is running.
+            guard agentSessionLinkAutoWakeAttemptIsStillEligible(attempt, session: session) else {
+                attempt.task?.cancel()
+                session.pendingOversightAutoWake = nil
+                return false
+            }
             attempt.phase = .dispatching
             attempt.attemptedFingerprint = attempt.wakeFingerprint
             attempt.physicalOutcome = .ambiguous
@@ -461,9 +513,12 @@ extension AgentModeViewModel {
         else {
             return
         }
-        if var attempt = session.pendingOversightAutoWake, attempt.wakeID == wakeID {
-            attempt.physicalOutcome = .accepted
-            attempt.task?.cancel()
+        let acceptedAttempt = session.pendingOversightAutoWake.flatMap { attempt in
+            attempt.wakeID == wakeID ? attempt : nil
+        }
+        if var acceptedAttempt {
+            acceptedAttempt.physicalOutcome = .accepted
+            acceptedAttempt.task?.cancel()
             session.pendingOversightAutoWake = nil
         }
         // Receipt/provenance remains truthful even when the user won meanwhile, but only a callback
@@ -472,6 +527,13 @@ extension AgentModeViewModel {
             session.agentSessionLinkTurnOrigin = .laneUpdateAutoWake(wakeID: wakeID)
         }
         session.suppressedOversightWakeFingerprint = nil
+        for (reference, epoch) in acceptedAttempt?.humanRearmEpochs ?? [:] {
+            session.agentSessionLinkConsumedTargetLocalEpochs[reference] = max(
+                session.agentSessionLinkConsumedTargetLocalEpochs[reference] ?? 0,
+                epoch
+            )
+        }
+        agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
         session.appendItem(AgentChatItem.laneUpdateAutoWake(
             wakeID: wakeID,
             acceptedAt: acceptedAt,
@@ -577,10 +639,141 @@ extension AgentModeViewModel {
             && session.pendingWorktreeMergeReview == nil
     }
 
+    private func agentSessionLinkReconcileAutoWakeLaneBaselines(
+        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
+        session: TabSession
+    ) {
+        let currentReferences = Set(snapshot.autoWakeLanes.map(\.reference))
+        session.agentSessionLinkConsumedTargetLocalEpochs = session.agentSessionLinkConsumedTargetLocalEpochs
+            .filter { currentReferences.contains($0.key) }
+        session.agentSessionLinkAutoWakeEffectiveSelection = session.agentSessionLinkAutoWakeEffectiveSelection
+            .filter { currentReferences.contains($0.key) }
+        // Live selection, not the snapshot's projection of it. Reading the projection here would
+        // re-run the unselected -> selected transition on the first publication that catches up with
+        // a selection the fence already baselined, consuming the target's newest epoch as though it
+        // predated the selection.
+        let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
+        for lane in snapshot.autoWakeLanes {
+            let isSelected = selectedLanes[lane.reference] != nil
+            let wasEffective = session.agentSessionLinkAutoWakeEffectiveSelection[lane.reference]
+            if wasEffective == nil || (wasEffective == false && isSelected) {
+                session.agentSessionLinkConsumedTargetLocalEpochs[lane.reference] = lane.targetLocalInputEpoch
+            }
+            session.agentSessionLinkAutoWakeEffectiveSelection[lane.reference] = isSelected
+        }
+    }
+
+    /// The lanes this observer has selected for Auto-wake **right now**.
+    ///
+    /// The snapshot supplies the lanes; the selection comes from the session, never from the lane's
+    /// own `isEffectivelySelected`. That flag is a projection frozen when the lane was last
+    /// published, and a toggle the user just flipped reaches it only on the next authoritative
+    /// refresh. Scheduling, baselining, and the acceptance fence all run on the same main actor as
+    /// the selection write, so reading the setting directly is what linearizes them: a deselected
+    /// lane cannot cross the transport boundary on the strength of a stale republication, and a
+    /// freshly selected one is not left waiting for one.
+    private func agentSessionLinkLiveSelectedAutoWakeLanes(
+        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
+        session: TabSession
+    ) -> [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane] {
+        let masterEnabled = session.autoWakeOnOversightUpdates
+        let selectedTargetSessionIDs = session.agentSessionLinkAutoWakeTargetSessionIDs
+        return snapshot.autoWakeLanes.reduce(into: [:]) { lanes, lane in
+            guard masterEnabled || selectedTargetSessionIDs.contains(lane.targetSessionID) else { return }
+            lanes[lane.reference] = lane
+        }
+    }
+
+    /// Whether the queue's unattributed overflow may reserve a wake on its own.
+    ///
+    /// `unacknowledgedOverflowCount` is a whole-queue count: it records that status edges were
+    /// dropped, never which lane produced them. Treating "some lane is selected" as sufficient
+    /// therefore lets an unselected target's dropped edges start an autonomous turn about a session
+    /// the user deliberately excluded — the one thing per-target selection exists to prevent.
+    ///
+    /// The conservative rule, deliberately chosen over attributing overflow per link: overflow counts
+    /// only when *every* live lane is selected, so the dropped edges provably cannot have come from
+    /// an excluded one. Master-on satisfies it by construction, so the whole-observer case is
+    /// unchanged. The cost is a missed wake for pure overflow while any lane is unselected, and the
+    /// content stays owed to the next natural turn either way.
+    ///
+    /// One predicate for both scheduling and the acceptance fence: an attempt that could be reserved
+    /// under a rule the fence does not share would be scheduled and then silently refused, or worse,
+    /// accepted on a broader rule than the one that admitted it.
+    private func agentSessionLinkOverflowAloneMayWake(
+        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
+        selectedLanes: [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane]
+    ) -> Bool {
+        guard snapshot.unacknowledgedOverflowCount > 0, !snapshot.autoWakeLanes.isEmpty else {
+            return false
+        }
+        return snapshot.autoWakeLanes.allSatisfy { selectedLanes[$0.reference] != nil }
+    }
+
+    /// Linearizes one Auto-wake selection change with scheduling and the acceptance fence.
+    ///
+    /// Runs synchronously, in the same main-actor step as the setting write, and does the two things
+    /// the projection refresh it triggers cannot do correctly by the time it lands:
+    ///
+    /// - It baselines every newly selected lane at the epoch that lane last published, which is the
+    ///   target's work *as of the selection*. Left to the refresh, the first "selected" snapshot may
+    ///   already carry an input the target's own user made after the selection, and baselining that
+    ///   would spend the first valid human re-arm.
+    /// - It retracts an attempt the change just made ineligible, rather than leaving a deselected
+    ///   lane's wake alive until something else happens to re-evaluate it.
+    func agentSessionLinkFenceAutoWakeSelectionChange(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) {
+        guard let session = agentSessionLinkAutoWakeSession(for: endpoint) else { return }
+        if let snapshot = agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID],
+           snapshot.observerEndpoint == endpoint
+        {
+            let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
+            for lane in snapshot.autoWakeLanes {
+                let isSelected = selectedLanes[lane.reference] != nil
+                if isSelected, session.agentSessionLinkAutoWakeEffectiveSelection[lane.reference] != true {
+                    session.agentSessionLinkConsumedTargetLocalEpochs[lane.reference] = lane.targetLocalInputEpoch
+                }
+                session.agentSessionLinkAutoWakeEffectiveSelection[lane.reference] = isSelected
+            }
+        }
+        guard let attempt = session.pendingOversightAutoWake,
+              !agentSessionLinkAutoWakeAttemptIsStillEligible(attempt, session: session)
+        else { return }
+        cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+    }
+
+    private func agentSessionLinkAutoWakeAttemptIsStillEligible(
+        _ attempt: AgentSessionLinkAutoWakeAttempt,
+        session: TabSession
+    ) -> Bool {
+        guard let snapshot = agentSessionLinkPassiveNoticesBySessionID[attempt.observerEndpoint.sessionID],
+              snapshot.observerEndpoint == attempt.observerEndpoint,
+              snapshot.queueEpoch == attempt.queueEpoch
+        else { return false }
+        // Live selection: this is the last gate a wake crosses before the provider transport, so a
+        // lane the user deselected a moment ago must be gone from it whether or not the projection
+        // has caught up.
+        let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
+        if !attempt.humanRearmEpochs.isEmpty {
+            for (reference, epoch) in attempt.humanRearmEpochs {
+                guard let lane = selectedLanes[reference],
+                      lane.targetTurnIsLocalUser,
+                      lane.targetLocalInputEpoch == epoch,
+                      epoch > (session.agentSessionLinkConsumedTargetLocalEpochs[reference] ?? 0)
+                else { return false }
+            }
+            return true
+        }
+        guard !session.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction else { return false }
+        return snapshot.entries.contains { selectedLanes[$0.reference] != nil }
+            || agentSessionLinkOverflowAloneMayWake(snapshot, selectedLanes: selectedLanes)
+    }
+
     /// Whether an undispatchable observer is merely busy rather than gone.
     private func agentSessionLinkAutoWakeMayStillSettle(_ session: TabSession) -> Bool {
-        session.autoWakeOnOversightUpdates
-            && !session.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction
+        guard let attempt = session.pendingOversightAutoWake else { return false }
+        return agentSessionLinkAutoWakeAttemptIsStillEligible(attempt, session: session)
     }
 
     private func agentSessionLinkSetAutoWakePhase(

@@ -13,6 +13,7 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var agentReasoningEffortRaw: String?
     var autoEditEnabled: Bool
     var autoWakeOnOversightUpdates: Bool = false
+    var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = []
     var parentSessionID: UUID?
     var hasUnknownConversationContent: Bool
     var isMCPOriginated: Bool

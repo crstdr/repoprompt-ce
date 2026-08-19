@@ -273,7 +273,10 @@ enum AgentMonitorPassiveNoticeOutcome: Equatable {
 /// what this switch adds, and — load-bearing — the bound on what it can create. A user who reads
 /// "auto-wake" and imagines an autonomous background agent has been mis-sold the feature.
 enum AgentMonitorAutoWakeCopy {
-    static let label = "Auto-wake on updates"
+    static let label = "Auto-wake on all updates"
+    static let laneLabel = "Auto-wake"
+    static let selectAll = "Select all"
+    static let deselectAll = "Deselect all"
     static let tooltip = """
     Status updates for these sessions are always attached to this agent’s next turn. Turning this on \
     additionally lets RepoPrompt start one follow-up turn for them: a busy agent finishes its current \
@@ -281,7 +284,7 @@ enum AgentMonitorAutoWakeCopy {
     session rather than to individual links. Off by default, and saved with this session even when \
     it oversees nothing.
     """
-    static let accessibilityLabel = "Auto-wake on updates"
+    static let accessibilityLabel = "Auto-wake on all updates"
     static let accessibilityHint = """
     Lets RepoPrompt start one follow-up turn when overseen sessions change status; status updates \
     are attached to your own next turn either way
@@ -464,7 +467,7 @@ enum AgentMonitorDetailLineFormatter {
         status: AgentMonitorLinkStatus?,
         activity: String? = nil
     ) -> String {
-        [location, provider, status?.label, activity].compactMap(\.self).joined(separator: " · ")
+        [location, provider, activity].compactMap(\.self).joined(separator: " · ")
     }
 }
 
@@ -562,7 +565,7 @@ struct AgentMonitorPillProps: Equatable {
             AgentMonitorDetailLineFormatter.line(
                 location: locationLabel,
                 provider: providerDisplayName,
-                status: status,
+                status: nil,
                 activity: AgentMonitorActivityFormatter.absolute(lastActivityAt)
             )
         }
@@ -577,23 +580,31 @@ struct AgentMonitorPillProps: Equatable {
             )
         }
 
-        /// Protected, event-driven status and relative freshness line. It intentionally contains no
-        /// unbounded workspace, worktree, or provider text.
-        func statusActivityLine(
+        /// Compact freshness text rendered separately from truncatable execution context.
+        func activityLine(
+            now: Date = Date(),
+            calendar: Calendar = .current,
+            locale: Locale = .current
+        ) -> String {
+            AgentMonitorActivityFormatter.compact(
+                lastActivityAt,
+                now: now,
+                calendar: calendar,
+                locale: locale
+            )
+        }
+
+        /// Combined metadata retained for non-view consumers and focused formatting tests.
+        func metadataLine(
             now: Date = Date(),
             calendar: Calendar = .current,
             locale: Locale = .current
         ) -> String {
             AgentMonitorDetailLineFormatter.line(
-                location: nil,
-                provider: nil,
-                status: status,
-                activity: AgentMonitorActivityFormatter.compact(
-                    lastActivityAt,
-                    now: now,
-                    calendar: calendar,
-                    locale: locale
-                )
+                location: locationLabel,
+                provider: providerDisplayName,
+                status: nil,
+                activity: activityLine(now: now, calendar: calendar, locale: locale)
             )
         }
 
@@ -725,6 +736,8 @@ struct AgentMonitorPillProps: Equatable {
     /// It gates only whether pending actionable content may reserve one system-origin follow-up.
     /// Collection and natural-turn delivery are always on for a live, eligible direct link.
     var autoWakeOnUpdatesEnabled: Bool
+    /// Saved granular selections, including UUIDs whose links are currently hidden or absent.
+    var autoWakeTargetSessionIDs: Set<UUID>
     /// Why the setting cannot be changed right now, or `nil` when it can.
     ///
     /// Reserved for states where the exact session cannot take a write at all — missing, still
@@ -748,6 +761,7 @@ struct AgentMonitorPillProps: Equatable {
         recentNotices: [Notice],
         canAddReason: String?,
         autoWakeOnUpdatesEnabled: Bool = false,
+        autoWakeTargetSessionIDs: Set<UUID> = [],
         autoWakeUnavailableReason: String? = nil,
         persistence: AgentSessionOversightPersistencePresentation = AgentSessionOversightPersistencePresentation.noDurableLayer
     ) {
@@ -758,6 +772,7 @@ struct AgentMonitorPillProps: Equatable {
         self.recentNotices = recentNotices
         self.canAddReason = canAddReason
         self.autoWakeOnUpdatesEnabled = autoWakeOnUpdatesEnabled
+        self.autoWakeTargetSessionIDs = autoWakeTargetSessionIDs
         self.autoWakeUnavailableReason = autoWakeUnavailableReason
         self.persistence = persistence
     }
@@ -785,6 +800,7 @@ struct AgentMonitorPillProps: Equatable {
             recentNotices: recentNotices,
             canAddReason: reason,
             autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled,
+            autoWakeTargetSessionIDs: autoWakeTargetSessionIDs,
             autoWakeUnavailableReason: autoWakeUnavailableReason,
             persistence: persistence
         )
@@ -809,6 +825,7 @@ struct AgentMonitorPillProps: Equatable {
             recentNotices: recentNotices,
             canAddReason: reason,
             autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled,
+            autoWakeTargetSessionIDs: autoWakeTargetSessionIDs,
             autoWakeUnavailableReason: autoWakeUnavailableReason,
             persistence: presentation
         )

@@ -607,6 +607,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// same session UUID is refused the previous incarnation's inventory rather than inheriting it.
     var agentSessionLinkPromptInventoryBySessionID: [UUID: AgentSessionLinkPublishedPromptInventory] = [:]
 
+    /// Latest server-observed MCP catalog projection for each exact observer incarnation.
+    var agentSessionLinkRunCatalogProjectionByEndpoint:
+        [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] = [:]
+
+    #if DEBUG
+        /// Test-only live-authority seam for prompt readiness orchestration.
+        var test_agentSessionLinkHasActiveOutboundLink:
+            ((DomainAgentSessionLinkEndpointIdentity) async -> Bool)?
+        /// Test-only exact route-token seam for synthetic catalog publications.
+        var test_agentSessionLinkAuthoritativeRunCatalogRouteToken:
+            ((UUID, Int, UUID) async -> AgentSessionLinkRunCatalogRouteToken?)?
+        /// Test-only synchronous route fence for synthetic Codex catalog projections.
+        var test_agentSessionLinkCurrentRunCatalogRouteToken:
+            ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)?
+        /// Test-only suspension point after async catalog readiness and before Codex's final route fence.
+        var test_agentSessionLinkAfterProviderInputCatalogReadiness: (() async -> Void)?
+    #endif
+
     /// Endpoints whose prompt inventory is fenced while one or more membership writes that will change
     /// it are in flight.
     ///
@@ -4019,7 +4037,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let upperBound = explicitMaxSequenceIndexExclusive ?? nextAnchorUpperBound
         guard let target = session.items.last(where: { item in
             guard item.sequenceIndex > anchor.userSequenceIndex else { return false }
-            if let upperBound, item.sequenceIndex >= upperBound { return false }
+            if let upperBound, item.sequenceIndex >= upperBound {
+                return false
+            }
             return item.hasDisplayableAssistantBody
         }) else {
             return AgentTurnUserAnchorRollbackState.CompletedFooter(
@@ -4119,6 +4139,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.selectedReasoningEffortRaw = indexEntry.agentReasoningEffortRaw
         session.autoEditEnabled = indexEntry.autoEditEnabled
         session.autoWakeOnOversightUpdates = indexEntry.autoWakeOnOversightUpdates
+        session.agentSessionLinkAutoWakeTargetSessionIDs = indexEntry.agentSessionLinkAutoWakeTargetSessionIDs
     }
 
     func applyTranscriptViewportBindingState(
@@ -4953,6 +4974,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Kept as one seam so tests exercise the same restoration transition as the full payload path.
     func restoreAgentSessionLinkState(from agentSession: AgentSession, to session: TabSession) {
         session.autoWakeOnOversightUpdates = agentSession.autoWakeOnOversightUpdates
+        session.agentSessionLinkAutoWakeTargetSessionIDs = agentSession.agentSessionLinkAutoWakeTargetSessionIDs
         // Reconstructed before anything can publish a queue against this incarnation, so a session
         // that was auto-woken just before quitting cannot start a second autonomous turn on its first
         // post-restore status edge.
@@ -6076,8 +6098,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }()
         let resolvedSessionID = context.sessionID
         let resolvedSessionName: String? = {
-            if let name = workspaceManager?.composeTabName(with: session.tabID) { return name }
-            if let name = ownerValidatedSessionIndex[resolvedSessionID]?.name { return name }
+            if let name = workspaceManager?.composeTabName(with: session.tabID) {
+                return name
+            }
+            if let name = ownerValidatedSessionIndex[resolvedSessionID]?.name {
+                return name
+            }
             return "Agent Session"
         }()
         let providerRunID: UUID? = if canonicalTerminalState != nil {
@@ -6958,7 +6984,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             .map(Self.executionWorktreeSelection(from:))
         return Self.dedupedExecutionWorktreeSelections(selections)
             .sorted { lhs, rhs in
-                if lhs.isPrunable != rhs.isPrunable { return !lhs.isPrunable }
+                if lhs.isPrunable != rhs.isPrunable {
+                    return !lhs.isPrunable
+                }
                 let labelOrder = lhs.label.localizedCaseInsensitiveCompare(rhs.label)
                 return labelOrder == .orderedSame ? lhs.path < rhs.path : labelOrder == .orderedAscending
             }
@@ -7370,6 +7398,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 agentReasoningEffortRaw: existingEntry.agentReasoningEffortRaw,
                 autoEditEnabled: existingEntry.autoEditEnabled,
                 autoWakeOnOversightUpdates: existingEntry.autoWakeOnOversightUpdates,
+                agentSessionLinkAutoWakeTargetSessionIDs: existingEntry.agentSessionLinkAutoWakeTargetSessionIDs,
                 parentSessionID: parentSessionID,
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
@@ -7393,6 +7422,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: session.agentSessionLinkAutoWakeTargetSessionIDs,
             parentSessionID: parentSessionID,
             isMCPOriginated: session.isMCPOriginated
         )
@@ -9719,7 +9749,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             var recorded: [UUID] = []
             recorded.reserveCapacity(sessions.count)
             for session in sessions.values {
-                if let tabIDs, !tabIDs.contains(session.tabID) { continue }
+                if let tabIDs, !tabIDs.contains(session.tabID) {
+                    continue
+                }
                 recordAgentPerfSessionSnapshot(session, source: source)
                 recorded.append(session.tabID)
             }
@@ -11616,6 +11648,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         agentReasoningEffortRaw: String?,
         autoEditEnabled: Bool,
         autoWakeOnOversightUpdates: Bool = false,
+        agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
         parentSessionID: UUID? = nil,
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
@@ -11635,6 +11668,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentReasoningEffortRaw: agentReasoningEffortRaw,
             autoEditEnabled: autoEditEnabled,
             autoWakeOnOversightUpdates: autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: agentSessionLinkAutoWakeTargetSessionIDs,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
@@ -13231,6 +13265,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ),
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: session.agentSessionLinkAutoWakeTargetSessionIDs,
             // The durable half of "automatic turns never chain". Only the predicate travels: the wake
             // ID or source session behind a non-local origin dies with the process.
             agentSessionLinkRequiresLocalUserInstruction: session.agentSessionLinkTurnOrigin
@@ -13285,6 +13320,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 agentReasoningEffortRaw: agentSession.agentReasoningEffort,
                 autoEditEnabled: agentSession.autoEditEnabled,
                 autoWakeOnOversightUpdates: agentSession.autoWakeOnOversightUpdates,
+                agentSessionLinkAutoWakeTargetSessionIDs: agentSession.agentSessionLinkAutoWakeTargetSessionIDs,
                 parentSessionID: agentSession.parentSessionID,
                 isMCPOriginated: agentSession.isMCPOriginated,
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
@@ -13409,8 +13445,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await mcpServerEnabler()
     }
 
-    func hasLiveRunRouteInCurrentMCPServer(_ runID: UUID) -> Bool {
-        mcpServer?.hasLiveRunID(runID) == true
+    func hasAuthoritativeRunRouteInCurrentMCPServer(
+        runID: UUID,
+        tabID: UUID
+    ) async -> Bool {
+        await ServerNetworkManager.shared.authoritativeRunCatalogRouteToken(
+            runID: runID,
+            windowID: windowID,
+            tabID: tabID
+        ) != nil
+    }
+
+    func hasCurrentRunCatalogRouteTokenInCurrentMCPServer(
+        _ token: AgentSessionLinkRunCatalogRouteToken,
+        tabID: UUID
+    ) -> Bool {
+        guard token.observerEndpoint.windowID == windowID else { return false }
+        return mcpServer?.hasCurrentRunCatalogRouteToken(token, expectedTabID: tabID) == true
     }
 
     /// Submit a user message to the agent
@@ -14132,8 +14183,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // template is nil → wrapUserText is a no-op; actual expansion happens later
         // via expandSlashSkillInvocationIfNeeded in the augmentation path.
         let bubbleWorkflow: AgentWorkflowDefinition? = {
-            if let nativePreparedTurn { return nativePreparedTurn.bubbleWorkflow }
-            if activeWorkflow != nil { return activeWorkflow }
+            if let nativePreparedTurn {
+                return nativePreparedTurn.bubbleWorkflow
+            }
+            if activeWorkflow != nil {
+                return activeWorkflow
+            }
             guard let invocation = resolvedSlashSkillInvocations(in: trimmedText).first else { return nil }
             return invocation.definition.asBubbleWorkflowDefinition()
         }()
@@ -14276,6 +14331,235 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         scheduleSave(for: tabID)
     }
 
+    private func waitingInstructionReadinessErrorMessage(
+        _ readiness: ProviderInputCatalogReadiness
+    ) -> String {
+        switch readiness {
+        case .timedOut:
+            "RepoPrompt MCP catalog readiness timed out. Your instruction was restored."
+        case .unavailable:
+            "RepoPrompt MCP catalog readiness was unavailable. Your instruction was restored."
+        case .superseded:
+            "RepoPrompt MCP catalog readiness changed before dispatch. Your instruction was restored."
+        case .cancelled:
+            "The instruction was cancelled before provider dispatch and was restored."
+        case .notRequired, .ready:
+            "The instruction was not sent and was restored."
+        }
+    }
+
+    private func rollbackWaitingInstructionSubmission(
+        tabID: UUID,
+        session: TabSession,
+        userItemID: UUID,
+        turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState,
+        draftText: String,
+        images: [AgentImageAttachment],
+        taggedFiles: [AgentTaggedFileAttachment],
+        selectedWorkflow: AgentWorkflowDefinition?,
+        selectedWorkflowMutationGeneration: UInt64?,
+        stagedCodexComputerUseActivationID: UUID?,
+        message: String
+    ) {
+        guard sessions[tabID] === session else { return }
+        removeUnconfirmedOptimisticCodexUserItem(
+            session: session,
+            tabID: tabID,
+            itemID: userItemID,
+            reason: "waiting instruction was not accepted by the provider"
+        )
+        rollbackAgentTurnUserAnchor(turnRuntimeAnchorRollback, session: session)
+        clearPendingCodexComputerUseActivationIfMatched(
+            session: session,
+            activationID: stagedCodexComputerUseActivationID
+        )
+        restoreRejectedManualSubmissionComposerState(
+            tabID: tabID,
+            session: session,
+            draftText: draftText,
+            images: images,
+            taggedFiles: taggedFiles,
+            selectedWorkflow: selectedWorkflow,
+            selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
+            message: message
+        )
+    }
+
+    private func dispatchWaitingInstructionSubmission(
+        tabID: UUID,
+        session: TabSession,
+        text: String,
+        attachments: [AgentImageAttachment],
+        taggedFiles: [AgentTaggedFileAttachment],
+        userItemID: UUID,
+        turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState,
+        draftText: String,
+        selectedWorkflow: AgentWorkflowDefinition?,
+        selectedWorkflowMutationGeneration: UInt64?,
+        stagedCodexComputerUseActivationID: UUID?
+    ) {
+        let expectedWaitID = session.instructionWaitID
+        let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
+        let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(
+            waitID: expectedWaitID ?? session.tabID
+        )
+        let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
+        Task { @MainActor [weak self, weak session] in
+            guard let self, let session else {
+                session?.codexDispatchSerialGate.cancel(dispatchTicket)
+                return
+            }
+            guard await session.codexDispatchSerialGate.awaitTurn(dispatchTicket) else { return }
+            defer { session.codexDispatchSerialGate.finish(dispatchTicket) }
+
+            let stillOwnsContinuation = {
+                self.sessions[tabID] === session
+                    && session.instructionContinuation != nil
+                    && session.instructionWaitID == expectedWaitID
+                    && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
+            }
+            guard stillOwnsContinuation() else {
+                rollbackWaitingInstructionSubmission(
+                    tabID: tabID,
+                    session: session,
+                    userItemID: userItemID,
+                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                    draftText: draftText,
+                    images: attachments,
+                    taggedFiles: taggedFiles,
+                    selectedWorkflow: selectedWorkflow,
+                    selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
+                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    message: "The waiting request changed before dispatch. Your instruction was restored."
+                )
+                return
+            }
+
+            let augmentedText = await augmentUserMessageForProviderSend(
+                text,
+                attachments: attachments,
+                taggedFileAttachments: taggedFiles,
+                agent: session.selectedAgent,
+                session: session
+            )
+            guard stillOwnsContinuation() else {
+                rollbackWaitingInstructionSubmission(
+                    tabID: tabID,
+                    session: session,
+                    userItemID: userItemID,
+                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                    draftText: draftText,
+                    images: attachments,
+                    taggedFiles: taggedFiles,
+                    selectedWorkflow: selectedWorkflow,
+                    selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
+                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    message: "The waiting request changed before dispatch. Your instruction was restored."
+                )
+                return
+            }
+
+            let readiness = await ensureProviderInputCatalogReady(for: session)
+            guard readiness == .ready || readiness == .notRequired else {
+                agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                rollbackWaitingInstructionSubmission(
+                    tabID: tabID,
+                    session: session,
+                    userItemID: userItemID,
+                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                    draftText: draftText,
+                    images: attachments,
+                    taggedFiles: taggedFiles,
+                    selectedWorkflow: selectedWorkflow,
+                    selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
+                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    message: waitingInstructionReadinessErrorMessage(readiness)
+                )
+                return
+            }
+            guard readiness != .ready || agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) else {
+                agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                rollbackWaitingInstructionSubmission(
+                    tabID: tabID,
+                    session: session,
+                    userItemID: userItemID,
+                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                    draftText: draftText,
+                    images: attachments,
+                    taggedFiles: taggedFiles,
+                    selectedWorkflow: selectedWorkflow,
+                    selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
+                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    message: "RepoPrompt MCP catalog routing changed before provider dispatch. Your instruction was restored."
+                )
+                return
+            }
+            guard stillOwnsContinuation() else {
+                agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                rollbackWaitingInstructionSubmission(
+                    tabID: tabID,
+                    session: session,
+                    userItemID: userItemID,
+                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                    draftText: draftText,
+                    images: attachments,
+                    taggedFiles: taggedFiles,
+                    selectedWorkflow: selectedWorkflow,
+                    selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
+                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    message: "The waiting request changed before dispatch. Your instruction was restored."
+                )
+                return
+            }
+
+            let monitoring = agentSessionLinkDecoratedProviderText(
+                augmentedText,
+                session: session,
+                dispatchID: dispatchID
+            )
+            guard !monitoring.mustAbortDispatch else {
+                agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                rollbackWaitingInstructionSubmission(
+                    tabID: tabID,
+                    session: session,
+                    userItemID: userItemID,
+                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                    draftText: draftText,
+                    images: attachments,
+                    taggedFiles: taggedFiles,
+                    selectedWorkflow: selectedWorkflow,
+                    selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
+                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    message: "RepoPrompt MCP catalog input was unavailable. Your instruction was restored."
+                )
+                return
+            }
+            guard resumeWaitingInstructionContinuation(
+                session: session,
+                providerText: monitoring.text,
+                claim: monitoring.claim,
+                origin: .user
+            ) else {
+                agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                rollbackWaitingInstructionSubmission(
+                    tabID: tabID,
+                    session: session,
+                    userItemID: userItemID,
+                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                    draftText: draftText,
+                    images: attachments,
+                    taggedFiles: taggedFiles,
+                    selectedWorkflow: selectedWorkflow,
+                    selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
+                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    message: "The waiting request changed before dispatch. Your instruction was restored."
+                )
+                return
+            }
+            session.deferredActiveAgentRunTimerRollback = nil
+        }
+    }
+
     @discardableResult
     private func submitPreparedUserTurn(
         tabID: UUID,
@@ -14383,6 +14667,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // continuations, so the mutual-link loop guard reopens exactly when the user speaks again.
         session.agentSessionLinkLocalInputEpoch &+= 1
         session.agentSessionLinkTurnOrigin = .localUser
+        agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
         // Same point, and deliberately so: this is where the local user takes the submission gate.
         // A wake that has not yet reached its own dispatch boundary loses here and is released with
         // no provider call and no row — its queued content simply rides this turn instead. A wake
@@ -14435,6 +14720,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if shouldSignalMCPInstructionDeliveredAfterOptimisticSubmit(for: session) {
             signalMCPInstructionDeliveredFireAndForget(for: session)
+        }
+
+        if session.selectedAgent == .codexExec,
+           session.runState == .waitingForUser,
+           session.instructionContinuation != nil
+        {
+            dispatchWaitingInstructionSubmission(
+                tabID: tabID,
+                session: session,
+                text: wrappedText,
+                attachments: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                userItemID: userItem.id,
+                turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                draftText: restorationDraftText,
+                selectedWorkflow: restorationSelectedWorkflow,
+                selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID
+            )
+            return UserTurnSubmissionResult.submitted
         }
 
         if session.selectedAgent == .codexExec {
@@ -14593,40 +14898,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return UserTurnSubmissionResult.submitted
             }
             if session.instructionContinuation != nil {
-                let textForContinuation = wrappedText
-                let continuationAttachments = attachmentsToSend
-                let continuationTaggedFiles = taggedFilesToSend
                 _ = dequeuePendingNonCodexUserTokens(for: session) ?? userInputTokenEstimate
-                Task { @MainActor [weak self, weak session] in
-                    guard let self, let session else { return }
-                    let augmentedText = await augmentUserMessageForProviderSend(
-                        textForContinuation,
-                        attachments: continuationAttachments,
-                        taggedFileAttachments: continuationTaggedFiles,
-                        agent: session.selectedAgent,
-                        session: session
-                    )
-                    guard session.instructionContinuation != nil else { return }
-                    // The waiting-instruction continuation is the provider's next turn for a run that
-                    // is already in flight, so it needs the same supplement as an ordinary send. It is
-                    // composed here, after augmentation and immediately before the atomic one-shot
-                    // resume; a cancellation between the guard above and `resume(returning:)` leaves
-                    // the revision pending for the next dispatch.
-                    let waitDispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(
-                        waitID: session.instructionWaitID ?? session.tabID
-                    )
-                    let monitoring = agentSessionLinkDecoratedProviderText(
-                        augmentedText,
-                        session: session,
-                        dispatchID: waitDispatchID
-                    )
-                    resumeWaitingInstructionContinuation(
-                        session: session,
-                        providerText: monitoring.text,
-                        claim: monitoring.claim,
-                        origin: .user
-                    )
-                }
+                dispatchWaitingInstructionSubmission(
+                    tabID: tabID,
+                    session: session,
+                    text: wrappedText,
+                    attachments: attachmentsToSend,
+                    taggedFiles: taggedFilesToSend,
+                    userItemID: userItem.id,
+                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                    draftText: restorationDraftText,
+                    selectedWorkflow: restorationSelectedWorkflow,
+                    selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID
+                )
                 return UserTurnSubmissionResult.submitted
             }
         }
@@ -18040,7 +18325,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let latestAssistant = session.items.reversed().first(where: { $0.hasDisplayableAssistantBody })
                 let latestUser = session.items.reversed().first(where: { $0.kind == .user })
                 guard let assistant = latestAssistant else { return nil }
-                if let user = latestUser, user.timestamp >= assistant.timestamp { return nil }
+                if let user = latestUser, user.timestamp >= assistant.timestamp {
+                    return nil
+                }
                 return assistant.text
             }
             if lastTurn.isCompleted, status == .running {
@@ -19055,7 +19342,9 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
 
     var enforcesActiveWorkspaceIDForSessionIndexOwnership: Bool {
         #if DEBUG
-            if test_activeWorkspaceIDForSessionIndexOverride != nil { return true }
+            if test_activeWorkspaceIDForSessionIndexOverride != nil {
+                return true
+            }
         #endif
         return workspaceManager != nil
     }

@@ -125,9 +125,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
-    // 8 adds the additive, default-false `autoWakeOnOversightUpdates` observer-session setting and
-    // the additive, default-false `agentSessionLinkRequiresLocalUserInstruction` anti-chain fence.
-    static let currentSerializationVersion = 8
+    // 9 adds the granular observer-session Auto-wake target UUID set.
+    static let currentSerializationVersion = 9
     static let legacyUnversionedSerializationVersion = 0
 
     let id: UUID
@@ -182,6 +181,8 @@ struct AgentSession: Codable, Identifiable {
     /// gated on it — status collection and natural-turn delivery are always on for a live, eligible
     /// direct link.
     var autoWakeOnOversightUpdates: Bool
+    /// Granular target selections preserved even while the master setting is on.
+    var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>
 
     /// Whether the most recent input this session accepted was automatic rather than local-user.
     ///
@@ -254,6 +255,7 @@ struct AgentSession: Codable, Identifiable {
         providerCleanupHandle: ProviderConversationCleanupHandle? = nil,
         autoEditEnabled: Bool = true,
         autoWakeOnOversightUpdates: Bool = false,
+        agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
         agentSessionLinkRequiresLocalUserInstruction: Bool = false,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
@@ -293,6 +295,7 @@ struct AgentSession: Codable, Identifiable {
         self.providerCleanupHandle = providerCleanupHandle
         self.autoEditEnabled = autoEditEnabled
         self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
+        self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
         self.agentSessionLinkRequiresLocalUserInstruction = agentSessionLinkRequiresLocalUserInstruction
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
@@ -334,6 +337,7 @@ struct AgentSession: Codable, Identifiable {
         case providerCleanupHandle
         case autoEditEnabled
         case autoWakeOnOversightUpdates
+        case agentSessionLinkAutoWakeTargetSessionIDs
         case agentSessionLinkRequiresLocalUserInstruction
         case providerTokenUsageByTurn
         case codexConversationID
@@ -383,6 +387,10 @@ struct AgentSession: Codable, Identifiable {
             Bool.self,
             forKey: .autoWakeOnOversightUpdates
         ) ?? false
+        agentSessionLinkAutoWakeTargetSessionIDs = try container.decodeIfPresent(
+            Set<UUID>.self,
+            forKey: .agentSessionLinkAutoWakeTargetSessionIDs
+        ) ?? []
         // Additive and default-false: a session written before version 8 ended on whatever it ended
         // on, and the safe reconstruction of an unknown origin is the unfenced one — those sessions
         // predate automatic turns entirely, so none of them can have ended on one.

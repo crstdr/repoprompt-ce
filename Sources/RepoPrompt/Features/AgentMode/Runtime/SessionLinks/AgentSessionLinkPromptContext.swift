@@ -1108,6 +1108,46 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         ).claim
     }
 
+    /// Whether an already-accepted claim is still safe to reattach to the same physical dispatch.
+    ///
+    /// Managed-auth recovery is the only caller: it must replay byte-identical provider input when the
+    /// accepted membership is unchanged, but must not resurrect a fragment after the live prompt
+    /// context was withheld or moved. This is a predicate over existing authority only — it neither
+    /// reserves a claim nor advances acknowledgement state.
+    func canReuseAcceptedClaim(
+        _ claim: AgentSessionLinkOutboundPromptClaim,
+        dispatchID: AgentSessionLinkPromptDispatchID,
+        epoch: AgentSessionLinkPromptEpoch,
+        inventory: AgentSessionLinkPromptInventory
+    ) -> Bool {
+        let observerSessionID = inventory.observerSessionID
+        let hasLinks = !inventory.isEmpty
+        guard epoch.endpoint.sessionID == observerSessionID,
+              claim.observerSessionID == observerSessionID,
+              claim.dispatchID == dispatchID,
+              let state = states[observerSessionID],
+              state.epochIdentity == epoch,
+              state.epochToken == claim.epochToken,
+              state.lastAcceptedRevision == inventory.linkSetRevision,
+              state.lastAcceptedHadLinks == hasLinks
+        else {
+            return false
+        }
+        guard let membership = claim.membership else { return true }
+        let expectedKind: AgentSessionLinkPromptSupplementKind = if hasLinks {
+            .inventory
+        } else if epoch.allowsSupplement {
+            .revocation
+        } else {
+            .suspension
+        }
+        return membership == AgentSessionLinkOutboundPromptClaim.MembershipComponent(
+            linkSetRevision: inventory.linkSetRevision,
+            kind: expectedKind,
+            hasLinks: hasLinks
+        )
+    }
+
     /// The passive batch, if any, that may ride along with this exact dispatch.
     ///
     /// Every condition fails closed and none of them relaxes authorization. In order: the observer

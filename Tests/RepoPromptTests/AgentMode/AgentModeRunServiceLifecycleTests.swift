@@ -9,6 +9,7 @@ private let lifecycleAwaitTimeoutSeconds: TimeInterval = 5
 final class AgentModeRunServiceLifecycleTests: XCTestCase {
     private var temporaryURLs: [URL] = []
     private var lifecycleHosts: [AgentModeViewModel] = []
+    private var lifecycleWorkspaceManagers: [WorkspaceManagerViewModel] = []
     private var acpControllers: [ObjectIdentifier: ACPAgentSessionController] = [:]
 
     override func tearDown() async throws {
@@ -17,6 +18,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             try? FileManager.default.removeItem(at: url)
         }
         temporaryURLs.removeAll()
+        lifecycleWorkspaceManagers.removeAll()
         try await super.tearDown()
     }
 
@@ -112,6 +114,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let harness = makeHarness(recorder: recorder, codexController: codexController)
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .codexExec
+        installEndpointBoundSession(session, on: harness.host, name: "Rejected Codex send")
 
         let freshOutcome = await harness.service.startRun(
             tabID: session.tabID,
@@ -193,7 +196,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let harness = makeHarness(recorder: recorder, codexController: codexController)
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.selectedAgent = .codexExec
-            session.testInstallPersistentSessionBinding(sessionID: UUID())
+            installEndpointBoundSession(session, on: harness.host, name: "Codex provider dispatch")
 
             let outcome = await harness.service.startRun(
                 tabID: session.tabID,
@@ -1757,6 +1760,21 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    private func installEndpointBoundSession(
+        _ session: AgentModeViewModel.TabSession,
+        on host: AgentModeViewModel,
+        name: String
+    ) {
+        let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: host,
+            tabID: session.tabID,
+            name: name
+        )
+        lifecycleWorkspaceManagers.append(manager)
+        host.test_installLiveSession(session)
+        XCTAssertNotNil(host.test_ensureSessionBoundToTab(session))
+    }
+
     func makeHarness(
         recorder: LifecycleRecorder,
         workspacePathProvider: @escaping (AgentModeViewModel.TabSession) throws -> String? = { _ in FileManager.default.currentDirectoryPath },
@@ -1812,6 +1830,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             connectionPolicyInstaller: policyInstaller,
             mcpServerEnabler: serverEnabler
         )
+        #if DEBUG
+            // These lifecycle tests exercise provider ownership, not session oversight. Keep the
+            // synthetic host independent of any process-global link authority left by another test.
+            host.test_agentSessionLinkHasActiveOutboundLink = { _ in false }
+        #endif
         lifecycleHosts.append(host)
         let dependencies = AgentModeRunService.Dependencies(
             windowID: 1,

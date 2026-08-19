@@ -16,6 +16,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             await manager.debugResumePendingPolicyCommit()
             await manager.debugResumeConfirmOrFence()
             await manager.debugResumeConfirmOrFenceBeforeRevocation()
+            await manager.debugResumeRunCatalogPublicationBeforeMainActor()
         #endif
         try await super.tearDown()
     }
@@ -2443,7 +2444,669 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
         #endif
     }
 
+    @MainActor
+    func testRunCatalogObservationHandlesSameRouteMembershipRacesAndCleanup() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await manager.setEnabled(true)
+                let window = makeWindow()
+                await window.workspaceManager.awaitInitialized()
+                let registration = try await AppDomainRuntimeComposition.shared.register(
+                    window.mcpServer.windowMCPToolCatalogService
+                )
+                let runID = UUID()
+                let connectionID = UUID()
+                let tabID = UUID()
+                try await installRoutingSnapshot(for: tabID, in: window)
+                let session = window.agentModeViewModel.session(for: tabID)
+                session.selectedAgent = .openCode
+                session.hasLoadedPersistedState = true
+                session.installRunID(runID)
+                _ = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(session))
+                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+                    window.agentModeViewModel,
+                    tabID: tabID
+                )
+                addTeardownBlock { @MainActor in
+                    await self.manager.debugSetActiveSessionLinkEndpointsForTesting(nil)
+                    await self.cleanup(
+                        runID: runID,
+                        connectionID: connectionID,
+                        windowID: window.windowID,
+                        expectedPID: getpid()
+                    )
+                    await AppDomainRuntimeComposition.shared.unregister(registration.handle)
+                    WindowStatesManager.shared.unregisterWindowState(window)
+                }
+
+                await manager.debugSetActiveSessionLinkEndpointsForTesting([endpoint])
+                let routeBeforePolicy = await manager.authoritativeRunCatalogRouteToken(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: tabID
+                )
+                XCTAssertNil(
+                    routeBeforePolicy,
+                    "an active link restored before routing must not manufacture a route token"
+                )
+
+                await installAuthoritativePolicy(
+                    runID: runID,
+                    tabID: tabID,
+                    windowID: window.windowID
+                )
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                let testConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugInstallDirectAdmissionConnectionForTesting(
+                    connectionID: connectionID,
+                    connection: testConnection,
+                    pendingClientID: clientName
+                )
+                let applied = await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    sessionKey: "run-catalog-\(runID.uuidString)",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+                XCTAssertEqual(applied.outcome, "applied")
+                let authoritativeToken = await manager.authoritativeRunCatalogRouteToken(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: tabID
+                )
+                let exactToken = try XCTUnwrap(authoritativeToken)
+                let wrongToken = AgentSessionLinkRunCatalogRouteToken(
+                    runID: runID,
+                    observerEndpoint: endpoint,
+                    connectionID: UUID(),
+                    routingAuthorityGeneration: exactToken.routingAuthorityGeneration,
+                    connectionLifecycleGeneration: exactToken.connectionLifecycleGeneration
+                )
+                await manager.debugCompleteRunCatalogObservation(
+                    connectionID: connectionID,
+                    initialRouteToken: wrongToken,
+                    returnedSessionLinkPresence: true
+                )
+                let wrongRouteProjection = await manager.debugRunCatalogProjection(for: runID)
+                XCTAssertNil(wrongRouteProjection)
+
+                let names = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertTrue(names.contains(MCPWindowToolName.agentSessionLink))
+                let finalProjection = await manager.debugRunCatalogProjection(for: runID)
+                let ready = try XCTUnwrap(finalProjection)
+                XCTAssertTrue(ready.isReady)
+                XCTAssertEqual(ready.routeToken, exactToken)
+
+                let countBeforeRevocationRace = await testConnection.toolListChangedCount()
+                await manager.debugSetActiveSessionLinkEndpointsForTesting([])
+                await manager.debugCompleteRunCatalogObservation(
+                    connectionID: connectionID,
+                    initialRouteToken: exactToken,
+                    returnedSessionLinkPresence: true
+                )
+                let staleProjection = await manager.debugRunCatalogProjection(for: runID)
+                let staleMembershipProjection = try XCTUnwrap(staleProjection)
+                XCTAssertFalse(staleMembershipProjection.isReady)
+                XCTAssertEqual(staleMembershipProjection.routeToken, exactToken)
+                XCTAssertEqual(staleMembershipProjection.hasAgentSessionLink, true)
+                XCTAssertEqual(staleMembershipProjection.hasActiveOutboundLink, false)
+                let countAfterRevocationRace = await testConnection.toolListChangedCount()
+                XCTAssertEqual(countAfterRevocationRace, countBeforeRevocationRace + 1)
+
+                let namesAfterRevocation = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertFalse(namesAfterRevocation.contains(MCPWindowToolName.agentSessionLink))
+                let countAfterSettledList = await testConnection.toolListChangedCount()
+                XCTAssertEqual(countAfterSettledList, countBeforeRevocationRace + 1)
+
+                await manager.debugSetActiveSessionLinkEndpointsForTesting([endpoint])
+                _ = try await manager.debugListToolNames(for: connectionID)
+                let restoredProjection = await manager.debugRunCatalogProjection(for: runID)
+                XCTAssertTrue(try XCTUnwrap(restoredProjection).isReady)
+                let countBeforeDuplicateInvalidations = await testConnection.toolListChangedCount()
+                let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+                await manager.notifyToolListChangedForAgentSession(sessionID)
+                await manager.notifyToolListChangedForAgentSession(sessionID)
+                let projectionAfterDuplicates = await manager.debugRunCatalogProjection(for: runID)
+                XCTAssertTrue(try XCTUnwrap(projectionAfterDuplicates).isReady)
+                let countAfterDuplicateInvalidations = await testConnection.toolListChangedCount()
+                XCTAssertEqual(countAfterDuplicateInvalidations, countBeforeDuplicateInvalidations)
+
+                await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+                let hasCatalogStateAfterCleanup = await manager.debugHasRunCatalogState(for: runID)
+                XCTAssertFalse(hasCatalogStateAfterCleanup)
+            }
+        #else
+            throw XCTSkip("Run catalog observation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testRunCatalogObservationHandoverRejectsLatePredecessorCompletionAndRemoval() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await manager.setEnabled(true)
+                let window = makeWindow()
+                await window.workspaceManager.awaitInitialized()
+                let registration = try await AppDomainRuntimeComposition.shared.register(
+                    window.mcpServer.windowMCPToolCatalogService
+                )
+                let runID = UUID()
+                let tabID = UUID()
+                let predecessorConnectionID = UUID()
+                let successorConnectionID = UUID()
+                try await installRoutingSnapshot(for: tabID, in: window)
+                let session = window.agentModeViewModel.session(for: tabID)
+                session.selectedAgent = .openCode
+                session.hasLoadedPersistedState = true
+                session.installRunID(runID)
+                _ = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(session))
+                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+                    window.agentModeViewModel,
+                    tabID: tabID
+                )
+                addTeardownBlock { @MainActor in
+                    await self.manager.debugSetActiveSessionLinkEndpointsForTesting(nil)
+                    await self.manager.removeConnection(predecessorConnectionID)
+                    await self.cleanup(
+                        runID: runID,
+                        connectionID: successorConnectionID,
+                        windowID: window.windowID,
+                        expectedPID: getpid()
+                    )
+                    await AppDomainRuntimeComposition.shared.unregister(registration.handle)
+                    WindowStatesManager.shared.unregisterWindowState(window)
+                }
+
+                await manager.debugSetActiveSessionLinkEndpointsForTesting([endpoint])
+                await installAuthoritativePolicy(
+                    runID: runID,
+                    tabID: tabID,
+                    windowID: window.windowID
+                )
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                let predecessorConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugInstallDirectAdmissionConnectionForTesting(
+                    connectionID: predecessorConnectionID,
+                    connection: predecessorConnection,
+                    pendingClientID: clientName
+                )
+                let predecessorApplication = await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: predecessorConnectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    sessionKey: "run-catalog-predecessor-\(runID.uuidString)",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+                XCTAssertEqual(predecessorApplication.outcome, "applied")
+                let predecessorRouteToken = await manager.authoritativeRunCatalogRouteToken(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: tabID
+                )
+                let predecessorToken = try XCTUnwrap(predecessorRouteToken)
+                _ = try await manager.debugListToolNames(for: predecessorConnectionID)
+                let predecessorReady = await manager.debugRunCatalogProjection(for: runID)
+                XCTAssertEqual(predecessorReady?.routeToken, predecessorToken)
+
+                await installAuthoritativePolicy(
+                    runID: runID,
+                    tabID: tabID,
+                    windowID: window.windowID
+                )
+                let projectionWhileHandoverPending = await manager.debugRunCatalogProjection(for: runID)
+                XCTAssertEqual(
+                    projectionWhileHandoverPending?.routeToken,
+                    predecessorToken,
+                    "installing a pending handover must not retract the committed predecessor"
+                )
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                let successorConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugInstallDirectAdmissionConnectionForTesting(
+                    connectionID: successorConnectionID,
+                    connection: successorConnection,
+                    pendingClientID: clientName
+                )
+                let successorApplication = await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: successorConnectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    sessionKey: "run-catalog-successor-\(runID.uuidString)",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+                XCTAssertEqual(successorApplication.outcome, "applied")
+                XCTAssertFalse(
+                    window.mcpServer.hasCurrentRunCatalogRouteToken(
+                        predecessorToken,
+                        expectedTabID: tabID
+                    ),
+                    "the predecessor token must stop matching as soon as C2 owns the MainActor route"
+                )
+                let retractedProjection = await manager.debugRunCatalogProjection(for: runID)
+                XCTAssertNil(
+                    retractedProjection,
+                    "C2 is authoritative but has not published a tools/list observation yet"
+                )
+
+                let successorRouteToken = await manager.authoritativeRunCatalogRouteToken(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: tabID
+                )
+                let successorToken = try XCTUnwrap(successorRouteToken)
+                XCTAssertEqual(successorToken.connectionID, successorConnectionID)
+                _ = try await manager.debugListToolNames(for: successorConnectionID)
+                let successorReadyProjection = await manager.debugRunCatalogProjection(for: runID)
+                let successorReady = try XCTUnwrap(successorReadyProjection)
+                XCTAssertTrue(successorReady.isReady)
+                XCTAssertEqual(successorReady.routeToken, successorToken)
+
+                let successorNotificationCount = await successorConnection.toolListChangedCount()
+                await manager.debugCompleteRunCatalogObservation(
+                    connectionID: predecessorConnectionID,
+                    initialRouteToken: predecessorToken,
+                    returnedSessionLinkPresence: true
+                )
+                let projectionAfterLateCompletion = await manager.debugRunCatalogProjection(for: runID)
+                XCTAssertEqual(
+                    projectionAfterLateCompletion,
+                    successorReady,
+                    "late predecessor completion must not overwrite the successor observation"
+                )
+                let notificationCountAfterLateCompletion = await successorConnection.toolListChangedCount()
+                XCTAssertEqual(
+                    notificationCountAfterLateCompletion,
+                    successorNotificationCount + 1,
+                    "mismatch recovery must notify the authoritative successor"
+                )
+
+                await manager.removeConnection(predecessorConnectionID)
+                let projectionAfterPredecessorRemoval = await manager.debugRunCatalogProjection(for: runID)
+                XCTAssertEqual(
+                    projectionAfterPredecessorRemoval,
+                    successorReady,
+                    "predecessor removal must not terminate the successor observation"
+                )
+            }
+        #else
+            throw XCTSkip("Run catalog observation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testFullRestartClearsRunCatalogObservationWaitersAndProjectionBeforeSameRunReconnect() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await manager.setEnabled(true)
+                let fixture = try await makeRunCatalogFixture()
+                let predecessorConnectionID = UUID()
+                let successorConnectionID = UUID()
+                addTeardownBlock { @MainActor in
+                    await self.manager.debugSetActiveSessionLinkEndpointsForTesting(nil)
+                    await self.cleanup(
+                        runID: fixture.runID,
+                        connectionID: successorConnectionID,
+                        windowID: fixture.window.windowID,
+                        expectedPID: getpid()
+                    )
+                    await AppDomainRuntimeComposition.shared.unregister(fixture.registrationHandle)
+                    WindowStatesManager.shared.unregisterWindowState(fixture.window)
+                }
+
+                await manager.debugSetActiveSessionLinkEndpointsForTesting([fixture.endpoint])
+                let predecessorConnection = MCPPolicyAuthorityTestConnection()
+                let predecessorToken = try await installPendingCatalogConnection(
+                    fixture: fixture,
+                    connectionID: predecessorConnectionID,
+                    connection: predecessorConnection,
+                    sessionKey: "run-catalog-restart-predecessor"
+                )
+                _ = try await manager.debugListToolNames(for: predecessorConnectionID)
+                let predecessorProjection = await manager.debugRunCatalogProjection(for: fixture.runID)
+                XCTAssertEqual(predecessorProjection?.routeToken, predecessorToken)
+
+                let staleEndpoint = DomainAgentSessionLinkEndpointIdentity(
+                    windowID: fixture.endpoint.windowID,
+                    workspaceID: fixture.endpoint.workspaceID,
+                    tabID: fixture.endpoint.tabID,
+                    sessionID: fixture.endpoint.sessionID,
+                    persistentBindingGeneration: fixture.endpoint.persistentBindingGeneration,
+                    bindingTransitionGeneration: fixture.endpoint.bindingTransitionGeneration &+ 1
+                )
+                let waiter = Task {
+                    await self.manager.awaitRunCatalogReadiness(
+                        runID: fixture.runID,
+                        observerEndpoint: staleEndpoint,
+                        timeout: 30
+                    )
+                }
+                let waiterRegistered = await waitUntil {
+                    await self.manager.debugRunCatalogWaiterCount(for: fixture.runID) == 1
+                }
+                XCTAssertTrue(waiterRegistered)
+
+                await manager.stop()
+                let waiterOutcome = await waiter.value
+                let hasCatalogStateAfterStop = await manager.debugHasRunCatalogState(for: fixture.runID)
+                XCTAssertEqual(waiterOutcome, .superseded)
+                XCTAssertFalse(hasCatalogStateAfterStop)
+                let invalidatedProjection = fixture.window.agentModeViewModel
+                    .agentSessionLinkRunCatalogProjectionByEndpoint[fixture.endpoint]
+                XCTAssertEqual(invalidatedProjection?.runID, fixture.runID)
+                XCTAssertFalse(try XCTUnwrap(invalidatedProjection).isReady)
+
+                _ = await manager.start()
+                await manager.setEnabled(true)
+                let successorConnection = MCPPolicyAuthorityTestConnection()
+                let successorToken = try await installPendingCatalogConnection(
+                    fixture: fixture,
+                    connectionID: successorConnectionID,
+                    connection: successorConnection,
+                    sessionKey: "run-catalog-restart-successor"
+                )
+                XCTAssertNotEqual(successorToken.connectionLifecycleGeneration, predecessorToken.connectionLifecycleGeneration)
+                _ = try await manager.debugListToolNames(for: successorConnectionID)
+                let successorProjection = await manager.debugRunCatalogProjection(for: fixture.runID)
+                let successorReady = try XCTUnwrap(successorProjection)
+                XCTAssertTrue(successorReady.isReady)
+                XCTAssertEqual(successorReady.routeToken, successorToken)
+            }
+        #else
+            throw XCTSkip("Run catalog observation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testDirectRunMappingRetractsReadyPredecessorUntilSuccessorListsTools() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await manager.setEnabled(true)
+                let fixture = try await makeRunCatalogFixture()
+                let predecessorConnectionID = UUID()
+                let successorConnectionID = UUID()
+                addTeardownBlock { @MainActor in
+                    await self.manager.debugSetActiveSessionLinkEndpointsForTesting(nil)
+                    await self.manager.removeConnection(predecessorConnectionID)
+                    await self.cleanup(
+                        runID: fixture.runID,
+                        connectionID: successorConnectionID,
+                        windowID: fixture.window.windowID,
+                        expectedPID: getpid()
+                    )
+                    await AppDomainRuntimeComposition.shared.unregister(fixture.registrationHandle)
+                    WindowStatesManager.shared.unregisterWindowState(fixture.window)
+                }
+
+                await manager.debugSetActiveSessionLinkEndpointsForTesting([fixture.endpoint])
+                let predecessorConnection = MCPPolicyAuthorityTestConnection()
+                let predecessorToken = try await installPendingCatalogConnection(
+                    fixture: fixture,
+                    connectionID: predecessorConnectionID,
+                    connection: predecessorConnection,
+                    sessionKey: "run-catalog-direct-predecessor"
+                )
+                _ = try await manager.debugListToolNames(for: predecessorConnectionID)
+                let predecessorProjection = await manager.debugRunCatalogProjection(for: fixture.runID)
+                XCTAssertEqual(predecessorProjection?.routeToken, predecessorToken)
+
+                let successorConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugInstallDirectAdmissionConnectionForTesting(
+                    connectionID: successorConnectionID,
+                    connection: successorConnection,
+                    pendingClientID: clientName
+                )
+                let mapped = await manager.mapConnectionToRunID(
+                    successorConnectionID,
+                    runID: fixture.runID,
+                    windowID: fixture.window.windowID
+                )
+                XCTAssertTrue(mapped)
+                let mappedProjection = await manager.debugRunCatalogProjection(for: fixture.runID)
+                XCTAssertNil(
+                    mappedProjection,
+                    "predecessor teardown may remove the server observation after publishing its unready state"
+                )
+                let blockedProjection = try XCTUnwrap(
+                    fixture.window.agentModeViewModel
+                        .agentSessionLinkRunCatalogProjectionByEndpoint[fixture.endpoint]
+                )
+                XCTAssertFalse(blockedProjection.isReady)
+                XCTAssertEqual(
+                    blockedProjection.routeToken,
+                    predecessorToken,
+                    "the predecessor token is retained only to route its unready projection"
+                )
+                XCTAssertFalse(
+                    fixture.window.mcpServer.hasCurrentRunCatalogRouteToken(
+                        predecessorToken,
+                        expectedTabID: fixture.tabID
+                    )
+                )
+
+                let authoritativeSuccessorToken = await manager.authoritativeRunCatalogRouteToken(
+                    runID: fixture.runID,
+                    windowID: fixture.window.windowID,
+                    tabID: fixture.tabID
+                )
+                let successorToken = try XCTUnwrap(authoritativeSuccessorToken)
+                XCTAssertEqual(successorToken.connectionID, successorConnectionID)
+                _ = try await manager.debugListToolNames(for: successorConnectionID)
+                let successorProjection = await manager.debugRunCatalogProjection(for: fixture.runID)
+                let successorReady = try XCTUnwrap(successorProjection)
+                XCTAssertTrue(successorReady.isReady)
+                XCTAssertEqual(successorReady.routeToken, successorToken)
+            }
+        #else
+            throw XCTSkip("Run catalog observation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testStaleOwnedTerminationCannotRemoveSuccessorObservationOrSupersedeLaterWaiter() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await manager.setEnabled(true)
+                let fixture = try await makeRunCatalogFixture()
+                let predecessorConnectionID = UUID()
+                let successorConnectionID = UUID()
+                addTeardownBlock { @MainActor in
+                    await self.manager.debugResumeRunCatalogPublicationBeforeMainActor()
+                    await self.manager.debugSetActiveSessionLinkEndpointsForTesting(nil)
+                    await self.cleanup(
+                        runID: fixture.runID,
+                        connectionID: successorConnectionID,
+                        windowID: fixture.window.windowID,
+                        expectedPID: getpid()
+                    )
+                    await AppDomainRuntimeComposition.shared.unregister(fixture.registrationHandle)
+                    WindowStatesManager.shared.unregisterWindowState(fixture.window)
+                }
+
+                await manager.debugSetActiveSessionLinkEndpointsForTesting([fixture.endpoint])
+                let predecessorConnection = MCPPolicyAuthorityTestConnection()
+                _ = try await installPendingCatalogConnection(
+                    fixture: fixture,
+                    connectionID: predecessorConnectionID,
+                    connection: predecessorConnection,
+                    sessionKey: "run-catalog-termination-predecessor"
+                )
+                _ = try await manager.debugListToolNames(for: predecessorConnectionID)
+
+                await manager.debugSuspendNextRunCatalogPublicationBeforeMainActor()
+                let predecessorRemoval = Task {
+                    await self.manager.removeConnection(predecessorConnectionID)
+                }
+                let terminationSuspended = await waitUntil {
+                    await self.manager.debugIsRunCatalogPublicationBeforeMainActorSuspended()
+                }
+                XCTAssertTrue(terminationSuspended)
+
+                let successorConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugInstallDirectAdmissionConnectionForTesting(
+                    connectionID: successorConnectionID,
+                    connection: successorConnection,
+                    pendingClientID: clientName
+                )
+                let successorMapped = await manager.mapConnectionToRunID(
+                    successorConnectionID,
+                    runID: fixture.runID,
+                    windowID: fixture.window.windowID
+                )
+                XCTAssertTrue(successorMapped)
+                _ = try await manager.debugListToolNames(for: successorConnectionID)
+                let successorProjection = await manager.debugRunCatalogProjection(for: fixture.runID)
+                let successorReady = try XCTUnwrap(successorProjection)
+                XCTAssertTrue(successorReady.isReady)
+                XCTAssertEqual(successorReady.routeToken?.connectionID, successorConnectionID)
+
+                let laterEndpoint = DomainAgentSessionLinkEndpointIdentity(
+                    windowID: fixture.endpoint.windowID,
+                    workspaceID: fixture.endpoint.workspaceID,
+                    tabID: fixture.endpoint.tabID,
+                    sessionID: fixture.endpoint.sessionID,
+                    persistentBindingGeneration: fixture.endpoint.persistentBindingGeneration,
+                    bindingTransitionGeneration: fixture.endpoint.bindingTransitionGeneration &+ 1
+                )
+                let laterWaiter = Task {
+                    await self.manager.awaitRunCatalogReadiness(
+                        runID: fixture.runID,
+                        observerEndpoint: laterEndpoint,
+                        timeout: 30
+                    )
+                }
+                let laterWaiterRegistered = await waitUntil {
+                    await self.manager.debugRunCatalogWaiterCount(for: fixture.runID) == 1
+                }
+                XCTAssertTrue(laterWaiterRegistered)
+
+                await manager.debugResumeRunCatalogPublicationBeforeMainActor()
+                await predecessorRemoval.value
+                let projectionAfterStaleTermination = await manager.debugRunCatalogProjection(for: fixture.runID)
+                let waiterCountAfterStaleTermination = await manager.debugRunCatalogWaiterCount(for: fixture.runID)
+                XCTAssertEqual(projectionAfterStaleTermination, successorReady)
+                XCTAssertEqual(waiterCountAfterStaleTermination, 1)
+
+                laterWaiter.cancel()
+                let laterWaiterOutcome = await laterWaiter.value
+                XCTAssertEqual(laterWaiterOutcome, .cancelled)
+            }
+        #else
+            throw XCTSkip("Run catalog observation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
     #if DEBUG
+        private struct RunCatalogTestFixture {
+            let window: WindowState
+            let registrationHandle: MCPDomainToolRegistrationHandle
+            let runID: UUID
+            let tabID: UUID
+            let endpoint: DomainAgentSessionLinkEndpointIdentity
+        }
+
+        @MainActor
+        private func makeRunCatalogFixture() async throws -> RunCatalogTestFixture {
+            let window = makeWindow()
+            await window.workspaceManager.awaitInitialized()
+            let registration = try await AppDomainRuntimeComposition.shared.register(
+                window.mcpServer.windowMCPToolCatalogService
+            )
+            let runID = UUID()
+            let tabID = UUID()
+            try await installRoutingSnapshot(for: tabID, in: window)
+            let session = window.agentModeViewModel.session(for: tabID)
+            session.selectedAgent = .openCode
+            session.hasLoadedPersistedState = true
+            session.installRunID(runID)
+            _ = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(session))
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+                window.agentModeViewModel,
+                tabID: tabID
+            )
+            return RunCatalogTestFixture(
+                window: window,
+                registrationHandle: registration.handle,
+                runID: runID,
+                tabID: tabID,
+                endpoint: endpoint
+            )
+        }
+
+        private func installPendingCatalogConnection(
+            fixture: RunCatalogTestFixture,
+            connectionID: UUID,
+            connection: MCPPolicyAuthorityTestConnection,
+            sessionKey: String
+        ) async throws -> AgentSessionLinkRunCatalogRouteToken {
+            await installAuthoritativePolicy(
+                runID: fixture.runID,
+                tabID: fixture.tabID,
+                windowID: fixture.window.windowID
+            )
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: fixture.runID)
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: connectionID,
+                connection: connection,
+                pendingClientID: clientName
+            )
+            let application = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: connectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: true
+            )
+            XCTAssertEqual(application.outcome, "applied")
+            let routeToken = await manager.authoritativeRunCatalogRouteToken(
+                runID: fixture.runID,
+                windowID: fixture.window.windowID,
+                tabID: fixture.tabID
+            )
+            return try XCTUnwrap(routeToken)
+        }
+
+        @MainActor
+        private func installRoutingSnapshot(for tabID: UUID, in window: WindowState) async throws {
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Run catalog observation \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let switchResult = await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "runCatalogObservationInitial"
+            )
+            XCTAssertEqual(switchResult, .switched)
+            let workspaceIndex = try XCTUnwrap(
+                window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
+            )
+            window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
+                ComposeTabState(id: tabID, name: "Run catalog observation")
+            ]
+            window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tabID
+            let reloadResult = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
+                window.workspaceManager.workspaces[workspaceIndex],
+                reason: "runCatalogObservationTab"
+            )
+            XCTAssertEqual(reloadResult, .switched)
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+        }
+
         @MainActor
         private func makeWindow() -> WindowState {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
@@ -2605,7 +3268,9 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             var data = Data()
             while data.count < 32 {
                 guard let byte = try stdout.fileHandleForReading.read(upToCount: 1), !byte.isEmpty else { break }
-                if byte == Data([0x0A]) { break }
+                if byte == Data([0x0A]) {
+                    break
+                }
                 data.append(byte)
             }
             guard let text = String(data: data, encoding: .utf8),
@@ -2625,6 +3290,8 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
 }
 
 private actor MCPPolicyAuthorityTestConnection: MCPServerConnection {
+    private var toolListChangeNotifications = 0
+
     nonisolated var isFilesystemBacked: Bool {
         false
     }
@@ -2640,7 +3307,14 @@ private actor MCPPolicyAuthorityTestConnection: MCPServerConnection {
     func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
     func stop() async {}
     func abortForExecutionWatchdog() async {}
-    func notifyToolListChanged() async {}
+    func notifyToolListChanged() async {
+        toolListChangeNotifications += 1
+    }
+
+    func toolListChangedCount() -> Int {
+        toolListChangeNotifications
+    }
+
     func connectionState() -> ConnectionStateSnapshot {
         .ready
     }
