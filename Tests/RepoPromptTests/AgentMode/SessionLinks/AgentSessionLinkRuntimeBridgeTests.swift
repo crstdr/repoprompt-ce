@@ -253,6 +253,56 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             return sendOutcome
         }
 
+        /// Every snooze call the bridge actually admitted, so a test can prove a denial never reached
+        /// the owning session at all rather than being refused once it got there.
+        var snoozeProjectionCalls: [(
+            endpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetSessionID: UUID,
+            reference: DomainAgentSessionLinkReference
+        )] = []
+        var snoozeMutationCalls: [(
+            endpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetSessionID: UUID,
+            reference: DomainAgentSessionLinkReference,
+            command: AgentSessionLinkAutoWakeSnoozeCommand,
+            origin: AgentSessionLinkAutoWakeSnoozeOrigin
+        )] = []
+        var snoozeProjectionResult:
+            Result<AgentSessionLinkAutoWakeSnoozeProjection?, AgentSessionLinkAutoWakeSnoozeFailure> =
+            .success(nil)
+        var snoozeMutationResult:
+            Result<
+                AgentSessionLinkAutoWakeSnoozeMutationOutcome,
+                AgentSessionLinkAutoWakeSnoozeFailure
+            > = .success(AgentSessionLinkAutoWakeSnoozeMutationOutcome(
+                change: .snoozed,
+                projection: nil,
+                currentDispatchAlreadyStarted: false
+            ))
+
+        func agentSessionLinkAutoWakeSnoozeProjection(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetSessionID: UUID,
+            expectedReference: DomainAgentSessionLinkReference
+        ) -> Result<AgentSessionLinkAutoWakeSnoozeProjection?, AgentSessionLinkAutoWakeSnoozeFailure> {
+            snoozeProjectionCalls.append((endpoint, targetSessionID, expectedReference))
+            return snoozeProjectionResult
+        }
+
+        func agentSessionLinkMutateAutoWakeSnooze(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetSessionID: UUID,
+            expectedReference: DomainAgentSessionLinkReference,
+            command: AgentSessionLinkAutoWakeSnoozeCommand,
+            origin: AgentSessionLinkAutoWakeSnoozeOrigin
+        ) -> Result<
+            AgentSessionLinkAutoWakeSnoozeMutationOutcome,
+            AgentSessionLinkAutoWakeSnoozeFailure
+        > {
+            snoozeMutationCalls.append((endpoint, targetSessionID, expectedReference, command, origin))
+            return snoozeMutationResult
+        }
+
         func fireObservation(for sessionID: UUID) {
             liveObservations[sessionID]?()
         }
@@ -1786,6 +1836,144 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             retiredQueue,
             "the retired incarnation's last snapshot is the last thing it ever received"
         )
+    }
+
+    // MARK: - Auto-wake snooze routing
+
+    /// The bridge owns routing, not policy: it re-proves the exact observer incarnation and the exact
+    /// outbound link generation, then hands the decision to the live owning session.
+    func testAutoWakeSnoozeMutationRoutesOnlyForTheExactCurrentObserverLinkAndTarget() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let liveReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(liveReference)
+
+        let accepted = await fixture.bridge.mutateAutoWakeSnooze(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID,
+            expectedReference: reference,
+            command: .set(durationSeconds: 1200),
+            origin: .agent
+        )
+        guard case .success = accepted else {
+            return XCTFail("an exact current pairing must reach the owning observer session")
+        }
+        XCTAssertEqual(fixture.host.snoozeMutationCalls.count, 1)
+        let routed = try XCTUnwrap(fixture.host.snoozeMutationCalls.first)
+        XCTAssertEqual(routed.endpoint, fixture.observer.domainEndpoint)
+        XCTAssertEqual(routed.targetSessionID, fixture.target.sessionID)
+        XCTAssertEqual(routed.reference, reference)
+        XCTAssertEqual(routed.command, .set(durationSeconds: 1200))
+        XCTAssertEqual(routed.origin, .agent)
+
+        // A superseded generation is a different lane, and the target must be the one the reference
+        // actually names.
+        for stale in [
+            DomainAgentSessionLinkReference(
+                linkID: reference.linkID,
+                generation: reference.generation &+ 1
+            ),
+            DomainAgentSessionLinkReference(linkID: UUID(), generation: reference.generation)
+        ] {
+            let refused = await fixture.bridge.mutateAutoWakeSnooze(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetSessionID: fixture.target.sessionID,
+                expectedReference: stale,
+                command: .clear,
+                origin: .user
+            )
+            XCTAssertEqual(snoozeFailure(refused), .staleReference)
+        }
+        let wrongTarget = await fixture.bridge.mutateAutoWakeSnooze(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.observer.sessionID,
+            expectedReference: reference,
+            command: .clear,
+            origin: .user
+        )
+        XCTAssertEqual(snoozeFailure(wrongTarget), .staleReference)
+
+        // An in-place rebind keeps the session UUID while advancing the endpoint's generations.
+        let superseded = DomainAgentSessionLinkEndpointIdentity(
+            windowID: fixture.observer.windowID,
+            workspaceID: fixture.observer.workspaceID,
+            tabID: fixture.observer.tabID,
+            sessionID: fixture.observer.sessionID,
+            persistentBindingGeneration: fixture.observer.persistentBindingGeneration,
+            bindingTransitionGeneration: fixture.observer.bindingTransitionGeneration &+ 1
+        )
+        let rebound = await fixture.bridge.mutateAutoWakeSnooze(
+            observerEndpoint: superseded,
+            targetSessionID: fixture.target.sessionID,
+            expectedReference: reference,
+            command: .clear,
+            origin: .user
+        )
+        XCTAssertEqual(snoozeFailure(rebound), .observerUnavailable)
+
+        XCTAssertEqual(
+            fixture.host.snoozeMutationCalls.count,
+            1,
+            "every refusal is decided at the bridge; none of them reached a session"
+        )
+    }
+
+    /// The read is routed under the identical fence and stays observational.
+    func testAutoWakeSnoozeProjectionIsRoutedAndRefusedAfterRevocationOrFreeze() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let liveReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(liveReference)
+        let expected = AgentSessionLinkAutoWakeSnoozeProjection(
+            expiresAt: Date(timeIntervalSince1970: 2000),
+            remainingSeconds: 540,
+            origin: .user
+        )
+        fixture.host.snoozeProjectionResult = .success(expected)
+
+        let read = await fixture.bridge.autoWakeSnoozeProjection(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID,
+            expectedReference: reference
+        )
+        guard case let .success(projection) = read else {
+            return XCTFail("an exact current pairing must reach the owning observer session")
+        }
+        XCTAssertEqual(projection, expected)
+        XCTAssertEqual(fixture.host.snoozeProjectionCalls.count, 1)
+
+        // A revoked link has no current generation to speak for, in either direction.
+        await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        let afterRevocation = await fixture.bridge.autoWakeSnoozeProjection(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID,
+            expectedReference: reference
+        )
+        XCTAssertEqual(snoozeFailure(afterRevocation), .staleReference)
+        let mutationAfterRevocation = await fixture.bridge.mutateAutoWakeSnooze(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID,
+            expectedReference: reference,
+            command: .clear,
+            origin: .user
+        )
+        XCTAssertEqual(snoozeFailure(mutationAfterRevocation), .staleReference)
+
+        fixture.bridge.freezeForTermination()
+        let afterFreeze = await fixture.bridge.autoWakeSnoozeProjection(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID,
+            expectedReference: reference
+        )
+        XCTAssertEqual(snoozeFailure(afterFreeze), .shuttingDown)
+        XCTAssertEqual(fixture.host.snoozeProjectionCalls.count, 1)
+    }
+
+    private func snoozeFailure(
+        _ result: Result<some Any, AgentSessionLinkAutoWakeSnoozeFailure>
+    ) -> AgentSessionLinkAutoWakeSnoozeFailure? {
+        guard case let .failure(failure) = result else { return nil }
+        return failure
     }
 
     // MARK: - Unlink and fresh-link recovery

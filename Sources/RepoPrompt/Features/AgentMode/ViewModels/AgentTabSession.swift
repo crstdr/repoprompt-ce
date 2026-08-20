@@ -216,6 +216,46 @@ final class AgentTabSession: ObservableObject {
     var suppressedOversightWakeFingerprint:
         AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
 
+    /// Temporary per-lane Auto-wake suppression owned by *this exact* observer incarnation.
+    ///
+    /// Ephemeral in the strongest sense: absent from every Codable/save/restore model, never marking
+    /// the session dirty, never scheduling persistence, and bounded by the observer's current outbound
+    /// link references. Keyed by endpoint *and* generation-qualified reference so a rebind, an
+    /// unlink/relink, or a namesake replacement can never inherit a predecessor's policy.
+    ///
+    /// Content changes feed the existing observation signal, because the monitor renders the active
+    /// subrow from it. Task/token changes deliberately do not: they publish no user-visible state.
+    var agentSessionLinkAutoWakeSnoozes:
+        [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord] = [:]
+    {
+        didSet {
+            if oldValue != agentSessionLinkAutoWakeSnoozes {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    /// The single nearest-deadline task for this session, plus the never-reused token that fences it.
+    ///
+    /// One task rather than one per record: a replacement always cancels its predecessor, and the
+    /// token is what makes a cancelled-but-already-resumed callback fail closed instead of expiring a
+    /// record the newer arming is responsible for.
+    var agentSessionLinkAutoWakeSnoozeDeadlineTask: Task<Void, Never>?
+    var agentSessionLinkAutoWakeSnoozeTaskToken: UUID?
+    /// Injected monotonic seam. Production is `ContinuousClock`; tests advance it explicitly.
+    var agentSessionLinkAutoWakeSnoozeClock: AgentSessionLinkAutoWakeSnoozeClock = .continuous
+
+    /// Cancels the deadline task and drops every snooze record.
+    ///
+    /// Retirement, never transfer: an endpoint that is going away must not leave a task that could
+    /// resume against the incarnation replacing it.
+    func cancelAgentSessionLinkAutoWakeSnoozeState() {
+        agentSessionLinkAutoWakeSnoozeDeadlineTask?.cancel()
+        agentSessionLinkAutoWakeSnoozeDeadlineTask = nil
+        agentSessionLinkAutoWakeSnoozeTaskToken = nil
+        agentSessionLinkAutoWakeSnoozes.removeAll()
+    }
+
     func noteMonitorObservationInputsChanged() {
         monitorObservationSignal.send(())
     }
@@ -816,6 +856,7 @@ final class AgentTabSession: ObservableObject {
 
     deinit {
         applyEditsApprovalSubscriptionTask?.cancel()
+        agentSessionLinkAutoWakeSnoozeDeadlineTask?.cancel()
     }
 
     /// Cancels all ephemeral runtime tasks and clears transient state on this
@@ -850,6 +891,7 @@ final class AgentTabSession: ObservableObject {
         applyEditsApprovalSubscriptionTask?.cancel()
         applyEditsApprovalSubscriptionTask = nil
         applyEditsApprovalSubscriptionID = nil
+        cancelAgentSessionLinkAutoWakeSnoozeState()
     }
 
     @discardableResult

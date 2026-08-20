@@ -304,7 +304,10 @@ package enum MCPDomainToolCatalog {
             normalization: .trimmedLowercased
         )),
         .init(name: MCPWindowToolName.agentSessionLink, scope: .window, capability: .agentSessionLinkControl, admissionClass: .control, operationPolicy: .init(
-            operations: ["list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done", "set_waiting_on"],
+            operations: [
+                "list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done",
+                "set_waiting_on", "snooze_auto_wake"
+            ],
             normalization: .trimmedLowercased
         )),
         .init(name: MCPWindowToolName.shareThoughts, scope: .window, capability: .agentReasoningControl, admissionClass: .control),

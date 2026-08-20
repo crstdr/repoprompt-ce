@@ -1170,6 +1170,1028 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertEqual(fixture.session.items.count, itemsBefore)
     }
 
+    // MARK: - Auto-wake snooze
+
+    /// The canonical contract: a snoozed sole lane suppresses admission and nothing else, and its
+    /// deadline re-drives the *retained* snapshot rather than fabricating one.
+    func testSnoozedSoleLaneBlocksAdmissionUntilItsDeadlineRedrivesTheRetainedSnapshot() async throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        // Parked rather than dispatched: this test is about admission, not about the provider route.
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+
+        // Activation publication: the lane is live and selectable, and nothing is owed yet.
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0])
+        let snoozed = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        XCTAssertEqual(snoozed.change, .snoozed)
+        XCTAssertEqual(snoozed.projection?.remainingSeconds, 600)
+        XCTAssertEqual(snoozed.projection?.origin, .user)
+        XCTAssertFalse(snoozed.currentDispatchAlreadyStarted)
+
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, edgeSequenceOffset: 10)
+        XCTAssertNil(
+            fixture.session.pendingOversightAutoWake,
+            "the only selected lane is snoozed, so nothing may admit an automatic turn"
+        )
+        XCTAssertNotNil(
+            fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID],
+            "a snooze suppresses admission; it never discards, receipts, or baselines the queue"
+        )
+        XCTAssertNil(fixture.session.suppressedOversightWakeFingerprint)
+        XCTAssertTrue(fixture.session.agentSessionLinkConsumedTargetLocalEpochs.values.allSatisfy { $0 == 0 })
+        let retainedRevision = fixture.viewModel
+            .agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]?.queueRevision
+
+        clock.advance(seconds: 600)
+        try await AsyncTestWait.waitUntil("the deadline to re-drive the retained snapshot") {
+            await MainActor.run { fixture.session.pendingOversightAutoWake != nil }
+        }
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeSnoozes.isEmpty, "the due record is removed")
+        XCTAssertNil(fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken)
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]?.queueRevision,
+            retainedRevision,
+            "expiry reevaluates the accumulated snapshot; it never fabricates a status edge"
+        )
+    }
+
+    /// The product promise stated directly: updates that pile up across *several* lanes while they
+    /// are snoozed are all still there when the deadline re-drives, and the wake that follows carries
+    /// every one of them rather than only the change that happened to arrive last.
+    ///
+    /// "A summary of all that was missed" means the queue's ordinary coalesced summary — one
+    /// first-to-final interval per lane — which is the only thing the reducer has ever retained. It
+    /// is deliberately not a replay of every intermediate transition.
+    func testEveryLaneUpdateAccumulatedDuringASnoozeIsCarriedByTheWakeExpiryRedrives() async throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+
+        // Both lanes live and selected, nothing owed yet, then both silenced.
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0, 1]
+        )
+        for laneIndex in [0, 1] {
+            let outcome = try requireSnoozeSuccess(
+                mutateSnooze(
+                    fixture,
+                    endpoint: endpoint,
+                    laneIndex: laneIndex,
+                    command: .set(durationSeconds: 600)
+                )
+            )
+            XCTAssertEqual(outcome.change, .snoozed)
+        }
+
+        // Three successive rounds of activity while both lanes are silenced.
+        for (offset, revision) in [(10, UInt64(2)), (20, 3), (30, 4)] {
+            try publishLane(
+                fixture,
+                linkSetRevision: 1,
+                queueRevision: revision,
+                targetIndices: [0, 1],
+                laneIndices: [0, 1],
+                edgeSequenceOffset: UInt64(offset)
+            )
+            XCTAssertNil(
+                fixture.session.pendingOversightAutoWake,
+                "every selected lane is snoozed, so none of these rounds may start a turn"
+            )
+        }
+
+        clock.advance(seconds: 600)
+        try await AsyncTestWait.waitUntil("both deadlines to re-drive the accumulated snapshot") {
+            await MainActor.run { fixture.session.pendingOversightAutoWake != nil }
+        }
+
+        let attempt = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        XCTAssertEqual(
+            Set(attempt.wakeFingerprint.edges.map(\.reference)),
+            Set([0, 1].map { Self.laneReference($0, generation: 1) }),
+            "the wake expiry re-drove must account for every lane that changed while snoozed"
+        )
+        let snapshot = try XCTUnwrap(
+            fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]
+        )
+        XCTAssertEqual(
+            Set(snapshot.entries.map(\.reference)),
+            Set([0, 1].map { Self.laneReference($0, generation: 1) }),
+            "nothing a snooze did may have removed accumulated content from the canonical queue"
+        )
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeSnoozes.isEmpty)
+    }
+
+    /// Expiry is a reevaluation promise, not a delivery promise.
+    func testDeadlineCreatesNoAttemptWhenTheQueueNoLongerHasDeliverableContent() async throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0])
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, edgeSequenceOffset: 10)
+        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+
+        // A natural turn receipted it, or the interval net-reverted: the lane survives, the content
+        // does not.
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 3,
+            targetIndices: [],
+            laneIndices: [0]
+        )
+
+        clock.advance(seconds: 600)
+        try await AsyncTestWait.waitUntil("the deadline task to settle") {
+            await MainActor.run { fixture.session.agentSessionLinkAutoWakeSnoozes.isEmpty }
+        }
+        XCTAssertNil(
+            fixture.session.pendingOversightAutoWake,
+            "already receipted or net-reverted content is not a still-missed message"
+        )
+    }
+
+    /// The expiry race, stated directly: an elapsed record is inactive everywhere *before* the
+    /// deadline task has removed it, and a read never performs the removal itself.
+    func testElapsedSnoozeIsInactiveForProjectionSchedulingAndTheFinalFenceBeforeCleanup() throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0])
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+
+        // The clock passes the deadline, but the deadline task is never allowed to run.
+        clock.advanceWithoutFiring(seconds: 600)
+        XCTAssertEqual(
+            fixture.session.agentSessionLinkAutoWakeSnoozes.count,
+            1,
+            "precondition: the record is elapsed but still present"
+        )
+
+        let projection = try requireSnoozeSuccess(fixture.viewModel.agentSessionLinkAutoWakeSnoozeProjection(
+            endpoint: endpoint,
+            targetSessionID: Self.targetID(0),
+            expectedReference: Self.laneReference(0)
+        ))
+        XCTAssertNil(projection, "an elapsed record is not an active snooze")
+        XCTAssertEqual(
+            fixture.session.agentSessionLinkAutoWakeSnoozes.count,
+            1,
+            "a projection read removes nothing"
+        )
+        XCTAssertNotNil(
+            fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken,
+            "a projection read cancels and re-arms nothing"
+        )
+        XCTAssertNil(
+            fixture.session.pendingOversightAutoWake,
+            "a projection read never re-enters the wake pipeline"
+        )
+
+        // Scheduling agrees with the read: the elapsed record cannot block the next publication.
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, edgeSequenceOffset: 10)
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+
+        // And so does the final physical fence, which is the last gate before the transport.
+        reserved.task?.cancel()
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        fixture.session.pendingOversightAutoWake = preparing
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: .autoWake(
+                wakeID: reserved.wakeID,
+                localInputEpoch: reserved.localInputEpoch
+            )
+        ))
+    }
+
+    func testClearRemovesTheExactRecordAndRedrivesEvenWhenAlreadyClear() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0])
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, edgeSequenceOffset: 10)
+        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+
+        let cleared = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .clear)
+        )
+        XCTAssertEqual(cleared.change, .cleared)
+        XCTAssertNil(cleared.projection)
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeSnoozes.isEmpty)
+        XCTAssertNil(fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken, "no deadline remains")
+        let reserved = try XCTUnwrap(
+            fixture.session.pendingOversightAutoWake,
+            "clear performs the same immediate reevaluation the deadline would have"
+        )
+
+        // Already-clear still reevaluates: the promise is one normal-pipeline pass, not a state edge.
+        fixture.viewModel.cancelAgentSessionLinkAutoWake(for: endpoint, reason: .settingDisabled)
+        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+        let alreadyClear = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .clear)
+        )
+        XCTAssertEqual(alreadyClear.change, .alreadyClear)
+        XCTAssertNil(alreadyClear.projection)
+        let requeued = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        XCTAssertNotEqual(requeued.wakeID, reserved.wakeID)
+    }
+
+    /// The cap is a per-operation remaining horizon, never a lifetime cap, and the origin follows the
+    /// deadline rather than the caller.
+    func testEachOperationCapsTheHorizonWhileRepeatedOperationsExtendIndefinitely() throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0, 1],
+            selectedTargetIndices: [0, 1]
+        )
+
+        XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.defaultDurationSeconds, 600)
+        XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.minimumDurationSeconds, 60)
+        XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds, 3600)
+
+        let first = try requireSnoozeSuccess(mutateSnooze(
+            fixture,
+            endpoint: endpoint,
+            command: .set(durationSeconds: AgentSessionLinkAutoWakeSnooze.defaultDurationSeconds),
+            origin: .user
+        ))
+        XCTAssertEqual(first.change, .snoozed)
+        XCTAssertEqual(first.projection?.remainingSeconds, 600)
+
+        // A shorter operation cannot shorten a live snooze, and cannot take over its origin.
+        let shorter = try requireSnoozeSuccess(mutateSnooze(
+            fixture,
+            endpoint: endpoint,
+            command: .set(durationSeconds: 60),
+            origin: .agent
+        ))
+        XCTAssertEqual(shorter.change, .alreadySnoozed)
+        XCTAssertEqual(shorter.projection?.remainingSeconds, 600)
+        XCTAssertEqual(shorter.projection?.origin, .user)
+
+        clock.advanceWithoutFiring(seconds: 300)
+        let extended = try requireSnoozeSuccess(mutateSnooze(
+            fixture,
+            endpoint: endpoint,
+            command: .set(durationSeconds: 3600),
+            origin: .agent
+        ))
+        XCTAssertEqual(extended.change, .extended)
+        XCTAssertEqual(extended.projection?.remainingSeconds, 3600)
+        XCTAssertEqual(extended.projection?.origin, .agent, "moving the deadline takes over the origin")
+
+        clock.advanceWithoutFiring(seconds: 300)
+        let againExtended = try requireSnoozeSuccess(mutateSnooze(
+            fixture,
+            endpoint: endpoint,
+            command: .set(durationSeconds: 3600),
+            origin: .user
+        ))
+        XCTAssertEqual(againExtended.change, .extended)
+        XCTAssertEqual(
+            againExtended.projection?.remainingSeconds,
+            3600,
+            "no single operation ever leaves more than an hour on the clock"
+        )
+        XCTAssertEqual(againExtended.projection?.origin, .user)
+
+        // Out-of-range requests are clamped rather than silently creating an unbounded horizon.
+        let clampedLow = try requireSnoozeSuccess(mutateSnooze(
+            fixture,
+            endpoint: endpoint,
+            laneIndex: 1,
+            command: .set(durationSeconds: 5)
+        ))
+        XCTAssertEqual(clampedLow.projection?.remainingSeconds, 60)
+        clock.advanceWithoutFiring(seconds: 60)
+        let clampedHigh = try requireSnoozeSuccess(mutateSnooze(
+            fixture,
+            endpoint: endpoint,
+            laneIndex: 1,
+            command: .set(durationSeconds: 100_000)
+        ))
+        XCTAssertEqual(clampedHigh.projection?.remainingSeconds, 3600)
+    }
+
+    func testSnoozeMutationRefusesAStaleGenerationWrongTargetOrRetiredObserver() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0])
+
+        XCTAssertEqual(
+            snoozeFailure(mutateSnooze(
+                fixture,
+                endpoint: endpoint,
+                referenceGeneration: 2,
+                command: .set(durationSeconds: 600)
+            )),
+            .staleReference,
+            "a relinked generation is a different lane, not the same one"
+        )
+        XCTAssertEqual(
+            snoozeFailure(fixture.viewModel.agentSessionLinkMutateAutoWakeSnooze(
+                endpoint: endpoint,
+                targetSessionID: Self.targetID(1),
+                expectedReference: Self.laneReference(0),
+                command: .set(durationSeconds: 600),
+                origin: .agent
+            )),
+            .staleReference,
+            "the named target must be the target this reference actually names"
+        )
+        let superseded = DomainAgentSessionLinkEndpointIdentity(
+            windowID: endpoint.windowID,
+            workspaceID: endpoint.workspaceID,
+            tabID: endpoint.tabID,
+            sessionID: endpoint.sessionID,
+            persistentBindingGeneration: endpoint.persistentBindingGeneration,
+            bindingTransitionGeneration: endpoint.bindingTransitionGeneration &+ 1
+        )
+        XCTAssertEqual(
+            snoozeFailure(mutateSnooze(
+                fixture,
+                endpoint: superseded,
+                command: .set(durationSeconds: 600)
+            )),
+            .observerUnavailable,
+            "an in-place rebind keeps the session UUID; it must not keep the policy surface"
+        )
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeSnoozes.isEmpty, "no refusal mutated state")
+
+        // Set requires effective selection; clear stays available after deselection.
+        fixture.session.autoWakeOnOversightUpdates = false
+        fixture.session.agentSessionLinkAutoWakeTargetSessionIDs = [Self.targetID(0)]
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        fixture.session.agentSessionLinkAutoWakeTargetSessionIDs = []
+        XCTAssertEqual(
+            snoozeFailure(mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))),
+            .laneNotEffectivelySelected
+        )
+        XCTAssertEqual(
+            fixture.session.agentSessionLinkAutoWakeSnoozes.count,
+            1,
+            "a deselected lane keeps its live snooze rather than silently losing it"
+        )
+        XCTAssertEqual(
+            try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .clear)).change,
+            .cleared
+        )
+    }
+
+    func testUnlinkAndRelinkLeaveTheNewGenerationUnsnoozed() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0])
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+
+        // Unlink: the reference is no longer current, so the record is pruned by the next publication.
+        try publishLane(
+            fixture,
+            linkSetRevision: 2,
+            queueRevision: 2,
+            targetIndices: [],
+            laneIndices: [1],
+            selectedTargetIndices: [1]
+        )
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeSnoozes.isEmpty)
+        XCTAssertNil(fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken)
+
+        // Relink under a new generation: the replacement lane starts unsnoozed, and the retired
+        // generation is not readable through it.
+        try publishLane(
+            fixture,
+            linkSetRevision: 3,
+            queueRevision: 3,
+            targetIndices: [],
+            laneIndices: [0],
+            referenceGeneration: 2
+        )
+        XCTAssertNil(try requireSnoozeSuccess(fixture.viewModel.agentSessionLinkAutoWakeSnoozeProjection(
+            endpoint: endpoint,
+            targetSessionID: Self.targetID(0),
+            expectedReference: Self.laneReference(0, generation: 2)
+        )))
+        XCTAssertEqual(
+            snoozeFailure(mutateSnooze(
+                fixture,
+                endpoint: endpoint,
+                referenceGeneration: 1,
+                command: .set(durationSeconds: 600)
+            )),
+            .staleReference
+        )
+    }
+
+    func testRebindAndTeardownRetireSnoozeStateAndItsDeadlineToken() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0])
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+
+        // A record filed under a superseded incarnation of the same session UUID.
+        let superseded = DomainAgentSessionLinkEndpointIdentity(
+            windowID: endpoint.windowID,
+            workspaceID: endpoint.workspaceID,
+            tabID: endpoint.tabID,
+            sessionID: endpoint.sessionID,
+            persistentBindingGeneration: endpoint.persistentBindingGeneration,
+            bindingTransitionGeneration: endpoint.bindingTransitionGeneration &+ 1
+        )
+        let supersededKey = AgentSessionLinkAutoWakeSnoozeKey(
+            observerEndpoint: superseded,
+            reference: Self.laneReference(0)
+        )
+        fixture.session.agentSessionLinkAutoWakeSnoozes[supersededKey] =
+            AgentSessionLinkAutoWakeSnoozeRecord(
+                key: supersededKey,
+                deadline: ContinuousClock.now.advanced(by: .seconds(600)),
+                origin: .agent
+            )
+
+        fixture.viewModel.agentSessionLinkPruneAutoWakeSnoozeState()
+        XCTAssertNil(
+            fixture.session.agentSessionLinkAutoWakeSnoozes[supersededKey],
+            "a replacement incarnation never inherits its predecessor's suppression"
+        )
+        XCTAssertEqual(fixture.session.agentSessionLinkAutoWakeSnoozes.count, 1)
+        XCTAssertNotNil(fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken)
+
+        fixture.session.cancelEphemeralRuntimeState()
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeSnoozes.isEmpty)
+        XCTAssertNil(fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken)
+        XCTAssertNil(fixture.session.agentSessionLinkAutoWakeSnoozeDeadlineTask)
+    }
+
+    /// Snooze suppresses *admission*, not delivery: another lane's wake still ships the snoozed lane's
+    /// update, and the accepted row names it because it was rendered.
+    func testAnUnsnoozedLaneAdmitsAndDeliversTheSnoozedLanesUpdate() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0, 1],
+            selectedTargetIndices: [0, 1]
+        )
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 2,
+            targetIndices: [0, 1],
+            laneIndices: [0, 1],
+            edgeSequenceOffset: 10,
+            selectedTargetIndices: [0, 1]
+        )
+        let reserved = try XCTUnwrap(
+            fixture.session.pendingOversightAutoWake,
+            "an unsnoozed lane admits the unchanged canonical batch"
+        )
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: reserved.wakeID, localInputEpoch: reserved.localInputEpoch)
+        ))
+        let delivered = try Set(XCTUnwrap(claim.passive).receipt.deliveredStatuses.map(\.reference))
+        XCTAssertTrue(
+            delivered.contains(Self.laneReference(0)),
+            "the canonical batch is never filtered by snooze state"
+        )
+        XCTAssertTrue(delivered.contains(Self.laneReference(1)))
+
+        fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
+        let row = try XCTUnwrap(fixture.session.items.first { $0.id == reserved.wakeID })
+        XCTAssertEqual(
+            row.laneUpdateDisplayAttribution?.attributedLaneCount,
+            2,
+            "the accepted row names every delivered lane, hitchhikers included"
+        )
+        XCTAssertEqual(
+            fixture.session.agentSessionLinkAutoWakeSnoozes.count,
+            1,
+            "delivering a snoozed lane's update does not clear its snooze"
+        )
+    }
+
+    func testPureOverflowCannotAdmitWhileAnyLiveLaneIsSnoozed() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0, 1],
+            selectedTargetIndices: [0, 1]
+        )
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 2,
+            targetIndices: [],
+            laneIndices: [0, 1],
+            overflow: 2,
+            selectedTargetIndices: [0, 1]
+        )
+        XCTAssertNil(
+            fixture.session.pendingOversightAutoWake,
+            "unattributed overflow may have come from the lane the user just silenced"
+        )
+
+        _ = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .clear))
+        XCTAssertNotNil(
+            fixture.session.pendingOversightAutoWake,
+            "with every live lane selected and unsnoozed, overflow admits on its own again"
+        )
+    }
+
+    func testASnoozeDuringDispatchSucceedsWithoutRetractingThePhysicalCall() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        reserved.task?.cancel()
+        var dispatching = reserved
+        dispatching.phase = .dispatching
+        dispatching.attemptedFingerprint = reserved.wakeFingerprint
+        dispatching.physicalOutcome = .ambiguous
+        dispatching.task = nil
+        fixture.session.pendingOversightAutoWake = dispatching
+
+        let outcome = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        XCTAssertEqual(outcome.change, .snoozed)
+        XCTAssertTrue(outcome.currentDispatchAlreadyStarted)
+        XCTAssertEqual(
+            fixture.session.pendingOversightAutoWake?.phase,
+            .dispatching,
+            "a snooze applies to later admission and never retracts a call that may be in flight"
+        )
+
+        let cleared = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .clear))
+        XCTAssertEqual(cleared.change, .cleared)
+        XCTAssertTrue(cleared.currentDispatchAlreadyStarted)
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .dispatching)
+    }
+
+    func testASnoozeRetractsAPreparingWakeAndTheFinalFenceThenRefusesIt() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        reserved.task?.cancel()
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        fixture.session.pendingOversightAutoWake = preparing
+
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        XCTAssertEqual(
+            fixture.session.pendingOversightAutoWake?.phase,
+            .cancelledBeforeDispatch,
+            "preparation owns the only finalizer that can prove no transport call happened"
+        )
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: .autoWake(
+                wakeID: reserved.wakeID,
+                localInputEpoch: reserved.localInputEpoch
+            )
+        ))
+        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+        XCTAssertNil(
+            fixture.session.suppressedOversightWakeFingerprint,
+            "a refusal before the transport boundary suppresses nothing"
+        )
+    }
+
+    /// Clearing a snooze that retracted a *preparing* wake must not dismantle the provider fence.
+    ///
+    /// The tombstone is what keeps an in-flight provider path fenced: providers mint their own
+    /// dispatch IDs, and `agentSessionLinkEffectiveDispatchID` rewrites one to the wake's identity
+    /// only while an attempt exists in a dispatch phase. Retiring the tombstone to make room for a
+    /// successor therefore looks like tidying up and is actually an unfencing — the still-preparing
+    /// call would take the `autoWakeID == nil` early return and deliver the snoozed lane with no
+    /// provenance row and no anti-chain. The reevaluation a clear owes is replayed after the
+    /// tombstone's own finalizer settles instead.
+    func testClearingASnoozeWhileAWakePreparesKeepsTheProviderFenceIntact() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        reserved.task?.cancel()
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        fixture.session.pendingOversightAutoWake = preparing
+
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
+
+        _ = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .clear))
+        // Still tombstoned, still the same identity: the clear reevaluated, and reevaluating is not a
+        // licence to release a fence a provider call may still be behind.
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.wakeID, reserved.wakeID)
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
+
+        // The load-bearing consequence: a provider's *own* dispatch ID is still rewritten to the
+        // wake's, so the fence still sees it and still refuses.
+        let providerDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(UUID())
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkEffectiveDispatchID(
+                for: fixture.session,
+                dispatchID: providerDispatchID
+            ).autoWakeID,
+            reserved.wakeID
+        )
+        // Asserted before the acquire, which legitimately spends the tombstone: the teardown-safe
+        // restatement of the same rule has to see it too, or a teardown mid-dispatch becomes the one
+        // path that lets an empty wake turn through.
+        XCTAssertTrue(AgentModeViewModel.dispatchRequiresLaneBatch(
+            fixture.session,
+            providerDispatchID
+        ))
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: providerDispatchID
+        ))
+        XCTAssertNil(
+            fixture.session.pendingOversightAutoWake,
+            "reaching the transport boundary is what spends the tombstone"
+        )
+
+        // And this is why keeping the tombstone costs nothing: releasing it un-swallows the queue.
+        // With the snooze cleared, the next publication takes the empty-slot path and reserves a
+        // successor, so a snooze that retracted a preparing wake cannot park the accumulated content
+        // forever — which is the guarantee retiring the tombstone early was reaching for.
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, edgeSequenceOffset: 10)
+        let successor = try XCTUnwrap(
+            fixture.session.pendingOversightAutoWake,
+            "once the fence is spent, the ordinary path must be able to reserve again"
+        )
+        XCTAssertNotEqual(successor.wakeID, reserved.wakeID)
+    }
+
+    /// Losing the admission basis a *second* time must not release the fence.
+    ///
+    /// The sibling test above clears the snooze, which restores the basis and never reaches the
+    /// basis-lost path — so it passes either way. This one keeps the lane snoozed and publishes
+    /// again, which is the ordinary case: `cancel` is not idempotent across phases, and a second
+    /// cancel of an already-tombstoned attempt falls through to clearing the slot. That would delete
+    /// the dispatch-ID rewrite while a provider path is still preparing, and the snoozed lane would
+    /// then wake the model unfenced — no provenance row, no anti-chain.
+    func testLosingTheAdmissionBasisAgainWhileTombstonedKeepsTheFence() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        reserved.task?.cancel()
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        fixture.session.pendingOversightAutoWake = preparing
+
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
+
+        // The snoozed lane goes on being noisy. Every one of these re-drives the absorb branch and
+        // finds no admission basis, because the only selected lane is still snoozed.
+        for (offset, revision) in [(10, UInt64(2)), (20, 3)] {
+            try publishLane(
+                fixture,
+                linkSetRevision: 1,
+                queueRevision: revision,
+                edgeSequenceOffset: UInt64(offset)
+            )
+            XCTAssertEqual(
+                fixture.session.pendingOversightAutoWake?.wakeID,
+                reserved.wakeID,
+                "the tombstone must survive a repeated basis loss"
+            )
+            XCTAssertEqual(
+                fixture.session.pendingOversightAutoWake?.phase,
+                .cancelledBeforeDispatch
+            )
+        }
+        // An extension re-drives it too, and so does an idempotent repeat.
+        for command in [
+            AgentSessionLinkAutoWakeSnoozeCommand.set(durationSeconds: 1200),
+            .set(durationSeconds: 60)
+        ] {
+            _ = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: command))
+            XCTAssertEqual(fixture.session.pendingOversightAutoWake?.wakeID, reserved.wakeID)
+        }
+
+        // The consequence the fence exists for: a provider's own dispatch ID still resolves to the
+        // wake, so the still-preparing call is still refused.
+        let providerDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(UUID())
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkEffectiveDispatchID(
+                for: fixture.session,
+                dispatchID: providerDispatchID
+            ).autoWakeID,
+            reserved.wakeID
+        )
+        XCTAssertTrue(AgentModeViewModel.dispatchRequiresLaneBatch(
+            fixture.session,
+            providerDispatchID
+        ))
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: providerDispatchID
+        ))
+    }
+
+    /// Kept for the acquire-side settlement of an explicitly identified wake.
+    func testAcquiringATombstonedWakeByItsOwnIdentityRefusesAndReleasesIt() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        reserved.task?.cancel()
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        fixture.session.pendingOversightAutoWake = preparing
+
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
+
+        // The acquire path is the one place a tombstone is released synchronously: the provider
+        // reached its transport boundary, was refused, and the identity is spent.
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: .autoWake(
+                wakeID: reserved.wakeID,
+                localInputEpoch: reserved.localInputEpoch
+            )
+        ))
+        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+        XCTAssertNil(
+            fixture.session.suppressedOversightWakeFingerprint,
+            "a refusal before the transport boundary suppresses nothing"
+        )
+    }
+
+    /// Many records, one task: a re-arm replaces its predecessor, and the cancelled token can never
+    /// expire the replacement's records.
+    func testOneNearestDeadlineTaskSurvivesExtensionAndAStaleTokenCannotExpireItsReplacement() async throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0, 1],
+            selectedTargetIndices: [0, 1]
+        )
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, laneIndex: 1, command: .set(durationSeconds: 1200))
+        )
+        await settleSnoozeTasks()
+        XCTAssertEqual(clock.pendingSleepCount, 1, "two records still own exactly one deadline task")
+        let firstToken = try XCTUnwrap(fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken)
+
+        // Extending past the other record's deadline re-arms on the new nearest deadline.
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 3600))
+        )
+        await settleSnoozeTasks()
+        XCTAssertEqual(clock.pendingSleepCount, 1)
+        XCTAssertNotEqual(fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken, firstToken)
+
+        clock.advance(seconds: 600)
+        await settleSnoozeTasks()
+        XCTAssertEqual(
+            fixture.session.agentSessionLinkAutoWakeSnoozes.count,
+            2,
+            "the cancelled 600s arming cannot expire the records its replacement owns"
+        )
+
+        clock.advance(seconds: 600)
+        try await AsyncTestWait.waitUntil("the surviving deadline to expire only the due record") {
+            await MainActor.run { fixture.session.agentSessionLinkAutoWakeSnoozes.count == 1 }
+        }
+        XCTAssertNotNil(
+            fixture.session.agentSessionLinkAutoWakeSnoozes[AgentSessionLinkAutoWakeSnoozeKey(
+                observerEndpoint: endpoint,
+                reference: Self.laneReference(0)
+            )],
+            "the extended record survives its predecessor's deadline"
+        )
+        XCTAssertNotNil(
+            fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken,
+            "a remaining record keeps exactly one armed deadline"
+        )
+    }
+
+    // MARK: - Snooze helpers
+
+    @discardableResult
+    private func installSnoozeClock(_ fixture: Fixture) -> AgentSessionLinkAutoWakeSnoozeTestClock {
+        let clock = AgentSessionLinkAutoWakeSnoozeTestClock()
+        fixture.session.agentSessionLinkAutoWakeSnoozeClock = clock.clock
+        return clock
+    }
+
+    private func mutateSnooze(
+        _ fixture: Fixture,
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        laneIndex: Int = 0,
+        referenceGeneration: UInt64 = 1,
+        command: AgentSessionLinkAutoWakeSnoozeCommand,
+        origin: AgentSessionLinkAutoWakeSnoozeOrigin = .user
+    ) -> Result<AgentSessionLinkAutoWakeSnoozeMutationOutcome, AgentSessionLinkAutoWakeSnoozeFailure> {
+        fixture.viewModel.agentSessionLinkMutateAutoWakeSnooze(
+            endpoint: endpoint,
+            targetSessionID: Self.targetID(laneIndex),
+            expectedReference: Self.laneReference(laneIndex, generation: referenceGeneration),
+            command: command,
+            origin: origin
+        )
+    }
+
+    private func requireSnoozeSuccess<Value>(
+        _ result: Result<Value, AgentSessionLinkAutoWakeSnoozeFailure>
+    ) throws -> Value {
+        switch result {
+        case let .success(value):
+            return value
+        case let .failure(failure):
+            XCTFail("unexpected snooze failure: \(failure.rawValue)")
+            throw failure
+        }
+    }
+
+    private func snoozeFailure(
+        _ result: Result<some Any, AgentSessionLinkAutoWakeSnoozeFailure>
+    ) -> AgentSessionLinkAutoWakeSnoozeFailure? {
+        guard case let .failure(failure) = result else { return nil }
+        return failure
+    }
+
+    /// Lets cancelled deadline tasks finish unwinding before their bookkeeping is asserted.
+    private func settleSnoozeTasks() async {
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+    }
+
     // MARK: - Fixture
 
     private struct Fixture {
@@ -1282,7 +2304,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         targetLocalInputEpoch: UInt64 = 0,
         targetTurnIsLocalUser: Bool = false,
         overflow: UInt64 = 0,
-        selectedTargetIndices: Set<Int>? = nil
+        selectedTargetIndices: Set<Int>? = nil,
+        referenceGeneration: UInt64 = 1
     ) throws {
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
@@ -1311,7 +2334,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 targetLocalInputEpoch: targetLocalInputEpoch,
                 targetTurnIsLocalUser: targetTurnIsLocalUser,
                 overflow: overflow,
-                selectedTargetIndices: effectiveSelectedIndices
+                selectedTargetIndices: effectiveSelectedIndices,
+                referenceGeneration: referenceGeneration
             ),
             to: endpoint
         )
@@ -1354,10 +2378,13 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
-    static func laneReference(_ index: Int) -> DomainAgentSessionLinkReference {
+    static func laneReference(
+        _ index: Int,
+        generation: UInt64 = 1
+    ) -> DomainAgentSessionLinkReference {
         DomainAgentSessionLinkReference(
             linkID: UUID(uuidString: String(format: "0000000F-0000-0000-0000-%012d", index + 1))!,
-            generation: 1
+            generation: generation
         )
     }
 
@@ -1385,11 +2412,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         targetLocalInputEpoch: UInt64 = 0,
         targetTurnIsLocalUser: Bool = false,
         overflow: UInt64 = 0,
-        selectedTargetIndices: Set<Int>? = nil
+        selectedTargetIndices: Set<Int>? = nil,
+        referenceGeneration: UInt64 = 1
     ) -> AgentSessionLinkPassiveStatusNotices.Snapshot {
         let entries = targetIndices.map { index in
             AgentSessionLinkPassiveStatusNotices.PendingEntry(
-                reference: laneReference(index),
+                reference: laneReference(index, generation: referenceGeneration),
                 targetEndpoint: laneTargetEndpoint(index),
                 targetSessionID: targetID(index),
                 displayName: "Build API",
@@ -1413,7 +2441,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             overflowProduced: overflow,
             autoWakeLanes: (laneIndices ?? targetIndices).map { index in
                 AgentSessionLinkPassiveStatusNotices.AutoWakeLane(
-                    reference: laneReference(index),
+                    reference: laneReference(index, generation: referenceGeneration),
                     targetEndpoint: laneTargetEndpoint(index),
                     targetSessionID: targetID(index),
                     targetLocalInputEpoch: targetLocalInputEpoch,

@@ -520,6 +520,11 @@ extension AgentModeViewModel {
                 reason: .endpointInvalidated
             )
         }
+        // Snooze state retires on the same schedule and for the same reason: it is keyed by exact
+        // observer incarnation, so a rebind, unlink, replacement, or teardown must drop it and
+        // invalidate its deadline token rather than let a successor inherit suppression it never
+        // asked for. Accepted-provenance-before-receipt ordering is untouched by this.
+        agentSessionLinkPruneAutoWakeSnoozeState()
         agentSessionLinkPromptClaimStore.retainOnly(observerSessionIDs: liveSessionIDs)
     }
 

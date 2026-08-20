@@ -818,7 +818,7 @@ struct AgentMessageBubble: View {
                 )
             } else {
                 HStack(spacing: 6) {
-                    Text(item.text)
+                    Text(verbatim: laneUpdateDisplayText ?? item.text)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                         .foregroundColor(.secondary)
 
@@ -843,6 +843,16 @@ struct AgentMessageBubble: View {
     }
 
     // MARK: - Error Bubble
+
+    /// The richer sentence for an accepted lane-update row, or `nil` to show the row's own text.
+    ///
+    /// Deliberately keyed off the exact canonical marker plus independently validated metadata: a
+    /// legacy row, a malformed blob, and an overflow-only batch all fall through to the generic raw
+    /// text rather than to a partially formatted sentence. Rendered with `Text(verbatim:)` because
+    /// the lane labels inside it are target-derived and must never reach Markdown parsing.
+    private var laneUpdateDisplayText: String? {
+        AgentLaneUpdateDisplayAttribution.richDisplayText(for: item)
+    }
 
     private var legacyTranscriptSummaryLines: (primary: String, secondary: String)? {
         let rawParts = item.text

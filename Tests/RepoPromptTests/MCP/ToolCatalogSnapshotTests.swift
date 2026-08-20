@@ -54,7 +54,10 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         let operations = try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue)
         XCTAssertEqual(
             operations.compactMap(\.stringValue),
-            ["list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done", "set_waiting_on"]
+            [
+                "list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done",
+                "set_waiting_on", "snooze_auto_wake"
+            ]
         )
         XCTAssertNil(properties["enabled"])
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
@@ -135,6 +138,45 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertTrue(
             try XCTUnwrap(properties["idempotency_key"]?.objectValue?["description"]?.stringValue)
                 .contains("cancel_pending_send")
+        )
+    }
+
+    /// The observer-local Auto-wake snooze has the same vendored-blob problem the queue had: clients
+    /// bind the canonical definition, so the operation and its bounded `duration_seconds` have to
+    /// survive canonicalization or the advertised schema rejects the call this build accepts.
+    func testAgentSessionLinkAdvertisesTheBoundedAutoWakeSnooze() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentSessionLink })
+        let definition = try tool.domainBinding().definition
+        let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+
+        let duration = try XCTUnwrap(properties["duration_seconds"]?.objectValue)
+        XCTAssertTrue(
+            try XCTUnwrap(duration["description"]?.stringValue).hasPrefix("[snooze_auto_wake]"),
+            "duration_seconds must advertise the one operation that accepts it"
+        )
+        // The bounds are the contract: a caller that cannot see them from the bound schema learns the
+        // range only by being refused.
+        XCTAssertEqual(duration["minimum"]?.intValue, 60)
+        XCTAssertEqual(duration["maximum"]?.intValue, 3600)
+        // `clear` is now shared, and the exclusion this schema shape cannot express is documented.
+        XCTAssertTrue(
+            try XCTUnwrap(properties["clear"]?.objectValue?["description"]?.stringValue)
+                .hasPrefix("[set_waiting_on, snooze_auto_wake]")
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(schema["description"]?.stringValue).contains(
+                "**snooze_auto_wake**: session_id (required); optional duration_seconds (defaults to 600) or clear: true, never both"
+            )
+        )
+        // The three facts a caller most easily gets wrong: the horizon is per-operation, nothing
+        // shortens an active snooze, and expiry buys a re-evaluation rather than a turn.
+        XCTAssertTrue(definition.description.contains("at most a 60-minute horizon"))
+        XCTAssertTrue(definition.description.contains("nothing ever shortens an active snooze"))
+        XCTAssertTrue(
+            definition.description.contains("re-evaluate eligibility rather than forcing a turn")
         )
     }
 
@@ -1553,7 +1595,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=d367738ad179d8f6b39b98f73082d594f53c42d771c4f2e512790593c5b3f9f4",
         "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=2b5e211868964f961f2d369c2aa54da7035a92a83e900770ad433e4ceb00fd96|schema=0b4f819f3aa6624df0f54fdaba6f8717ac64667d07a0528240d26905ba480520",
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=80d302d4391d6136f8acfbe8fc0bafe394c5110c5e63aefcf8f4c59fcbdbf95f|schema=83f34927eacac4dc6352db72eae312ac3a5477b2f70c9031f09a2101dc8f2e97",
-        "20|agent_session_link|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=40da6cc22127e46313d81dbc77a327d91ba2037c0d0ae2ab9e60950caeba4f20|schema=0c6d9a10bc07a1dba426582ed4010024484e6f345381cb8faaa04ece9637931f",
+        "20|agent_session_link|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=1649616bba5a54fd85e45fa27496d565b9eb7d4702aa28bd66de4be5e15b7b73|schema=ce21343ef8157d1ac5d52011dcd6b7fd26784f9d62c9da3849fed67a9dda0837",
         "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
         "23|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",

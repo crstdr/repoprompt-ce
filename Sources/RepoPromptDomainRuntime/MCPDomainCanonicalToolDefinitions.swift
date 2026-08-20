@@ -1279,16 +1279,142 @@ package enum MCPDomainCanonicalToolDefinitions {
         static let idempotencyKeyWith = "[send, cancel_pending_send] Required. A new key per new message; reuse only to retry the same delivery. For cancel_pending_send, the key of the queued message. At most 200 UTF-8 bytes."
     }
 
+    /// Anchors and text for the observer-local Auto-wake snooze the vendored blob predates.
+    ///
+    /// Applied last, so every anchor it extends is already in the shape the earlier passes leave
+    /// behind. Mirrors `MCPAgentControlToolProvider` for the same reason every other pass does: that
+    /// inline text is only the fallback definition, and two descriptions of one contract must not
+    /// drift apart.
+    private enum AgentSessionLinkAutoWakeSnoozeOperation {
+        static let operation = "snooze_auto_wake"
+        static let durationProperty = "duration_seconds"
+
+        static let minimumDurationSeconds = 60
+        static let maximumDurationSeconds = 3600
+
+        static let operationsWithout = AgentSessionLinkQueuedSend.operationsWith
+        static let operationsWith = operationsWithout + " | " + operation
+
+        static let pollBulletWithout = AgentSessionLinkQueuedSend.pollBulletWith
+        static let pollBulletWith = pollBulletWithout
+            + " Each target also carries your own observer-local `auto_wake_snooze` for that lane, or `null` when it is not snoozed."
+
+        static let declarationBulletWithout = AgentSessionLinkWaitingDeclaration.declarationBullet
+        /// States the three things a caller gets wrong: what it suppresses, that the horizon is
+        /// per-operation rather than a lifetime cap, and that expiry promises re-evaluation only.
+        static let snoozeBullet = "- `snooze_auto_wake`: temporarily stop one currently selected overseen lane from starting an automatic follow-up turn of its own. Defaults to 600 seconds; `duration_seconds` accepts 60 through 3600 and is applied as max(current deadline, now + duration_seconds), so one call leaves at most a 60-minute horizon, repeated calls may extend indefinitely, and nothing ever shortens an active snooze. `clear: true` releases it. Collection and coalescing continue while snoozed, a turn your own user starts \u{2014} or another lane\u{2019}s wake \u{2014} may still deliver that lane, and clearing or expiry only asks RepoPrompt to re-evaluate eligibility rather than forcing a turn."
+        static let declarationBulletWith = declarationBulletWithout + "\n" + snoozeBullet
+
+        static let fieldSummaryWithout = AgentSessionLinkWaitingDeclaration.fieldSummaryWith
+        static let fieldSummaryWith = fieldSummaryWithout
+            + "\n**snooze_auto_wake**: session_id (required); optional duration_seconds (defaults to 600) or clear: true, never both"
+
+        static let durationDescription = "[snooze_auto_wake] Seconds this lane may not start an automatic wake of its own, 60 through 3600. Defaults to 600. Applied as max(current deadline, now + duration_seconds), so it never shortens an active snooze. Mutually exclusive with clear: true."
+
+        static let sessionIDWithout = AgentSessionLinkQueuedSend.sessionIDWith
+        static let sessionIDWith = "[poll, wait, read, send, cancel_pending_send, mark_done, snooze_auto_wake] Overseen session UUID. Mutually exclusive with session_ids."
+
+        static let clearWithout = AgentSessionLinkWaitingDeclaration.clearDescription
+        static let clearWith = "[set_waiting_on, snooze_auto_wake] Pass true to clear the current waiting_on declaration, or to release this lane\u{2019}s Auto-wake snooze. Mutually exclusive with summary and with duration_seconds."
+    }
+
     /// Brings the vendored `agent_session_link` definition up to the contract this build actually
     /// serves: the superseded operation is stripped, then the current self-scoped declaration,
-    /// per-message workflow override, and one-slot queued send are added. Every part is individually
-    /// idempotent, so this converges no matter how many times canonicalization runs, and the vendored
-    /// blob may lag in any of them independently.
+    /// per-message workflow override, one-slot queued send, and observer-local Auto-wake snooze are
+    /// added. Every part is individually idempotent, so this converges no matter how many times
+    /// canonicalization runs, and the vendored blob may lag in any of them independently.
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        addQueuedSend(
-            addSendWorkflowOverride(addWaitingOnDeclaration(stripLegacyPassiveUpdates(definition)))
+        addAutoWakeSnooze(
+            addQueuedSend(
+                addSendWorkflowOverride(addWaitingOnDeclaration(stripLegacyPassiveUpdates(definition)))
+            )
+        )
+    }
+
+    /// Adds the `snooze_auto_wake` operation and its bounded `duration_seconds` field.
+    ///
+    /// Clients bind the canonical definition rather than the provider's inline text, so without this
+    /// pass the operation would be uncallable through the advertised `op` enum and the strict
+    /// per-operation key check would reject `duration_seconds` on the one operation that accepts it.
+    ///
+    /// The mutual exclusion between `clear` and `duration_seconds` cannot be expressed in this schema
+    /// shape, so it is documented in both property descriptions and in the field summary, and
+    /// enforced by the tool service.
+    ///
+    /// Additive and idempotent, keyed on the advertised operation: a refreshed blob that already
+    /// carries the snooze is returned untouched. One that does not must still carry every anchor this
+    /// extends — a half-applied migration would advertise an operation whose duration bounds,
+    /// never-shortening horizon, or re-evaluation-only expiry went undocumented, which is exactly what
+    /// a caller gets wrong.
+    private static func addAutoWakeSnooze(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        typealias Snooze = AgentSessionLinkAutoWakeSnoozeOperation
+
+        guard case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"],
+              case var .object(operationProperty)? = properties["op"],
+              case let .array(operations)? = operationProperty["enum"],
+              case let .string(schemaDescription)? = schema["description"]
+        else {
+            preconditionFailure("agent_session_link canonical schema is not the expected object shape")
+        }
+
+        guard !operations.contains(.string(Snooze.operation)) else { return definition }
+
+        guard properties[Snooze.durationProperty] == nil,
+              definition.description.contains(Snooze.operationsWithout),
+              definition.description.contains(Snooze.pollBulletWithout),
+              definition.description.contains(Snooze.declarationBulletWithout),
+              schemaDescription.contains(Snooze.fieldSummaryWithout)
+        else {
+            preconditionFailure(
+                "agent_session_link canonical definition is missing an anchor the snooze migration extends"
+            )
+        }
+
+        operationProperty["enum"] = .array(operations + [.string(Snooze.operation)])
+        properties["op"] = .object(operationProperty)
+        properties[Snooze.durationProperty] = .object([
+            "description": .string(Snooze.durationDescription),
+            "type": .string("integer"),
+            "minimum": .int(Snooze.minimumDurationSeconds),
+            "maximum": .int(Snooze.maximumDurationSeconds)
+        ])
+        properties = retargeting(
+            properties,
+            property: "session_id",
+            from: Snooze.sessionIDWithout,
+            to: Snooze.sessionIDWith
+        )
+        properties = retargeting(
+            properties,
+            property: "clear",
+            from: Snooze.clearWithout,
+            to: Snooze.clearWith
+        )
+        schema["properties"] = .object(properties)
+        schema["description"] = .string(schemaDescription.replacingOccurrences(
+            of: Snooze.fieldSummaryWithout,
+            with: Snooze.fieldSummaryWith
+        ))
+
+        let description = definition.description
+            .replacingOccurrences(of: Snooze.operationsWithout, with: Snooze.operationsWith)
+            .replacingOccurrences(of: Snooze.pollBulletWithout, with: Snooze.pollBulletWith)
+            .replacingOccurrences(
+                of: Snooze.declarationBulletWithout,
+                with: Snooze.declarationBulletWith
+            )
+
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: description,
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
         )
     }
 

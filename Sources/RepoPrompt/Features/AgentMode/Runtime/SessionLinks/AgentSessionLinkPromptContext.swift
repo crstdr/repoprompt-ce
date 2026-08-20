@@ -535,6 +535,13 @@ struct AgentSessionLinkPromptRenderResult {
         /// The absolute producer-side overflow watermark the rendered envelope accounted for. Never
         /// the displayed omitted delta, which cannot be acknowledged without under-counting.
         let overflowProducedThrough: UInt64
+        /// Whether the rendered envelope actually disclosed dropped, unattributed changes.
+        ///
+        /// Separate from `overflowProducedThrough`, and not derivable from it: the watermark is an
+        /// absolute producer position that stays nonzero forever once any overflow has been
+        /// acknowledged, while this says whether *this* envelope showed a nonzero omitted count.
+        /// Only the renderer knows that, and only the local display sentence consumes it.
+        let includesUnattributedOverflow: Bool
     }
 
     let fragment: String
@@ -589,6 +596,14 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
         /// same physical-acceptance boundary as the queue receipt: a batch that failed, was
         /// abandoned, or was omitted by the byte budget acknowledges neither.
         let guidanceRevision: UInt64
+        /// Bounded local-display provenance for the transcript row an acceptance will append.
+        ///
+        /// Beside the receipt rather than inside it, and read-only: `Receipt` is queue authority and
+        /// must keep carrying nothing but what the reducer needs to settle. Captured here, at claim
+        /// construction, because this is the last point where the exact delivered batch is still
+        /// immutable — by acceptance time a rename, unlink, or rebind could rewrite what any live
+        /// lookup would say the turn had delivered.
+        let displayAttribution: AgentLaneUpdateDisplayAttribution?
     }
 
     let observerSessionID: UUID
@@ -1060,7 +1075,14 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                     ),
                     overflowProducedThrough: renderedPassive.overflowProducedThrough
                 ),
-                guidanceRevision: AgentSessionLinkPrompts.currentLaneGuidanceRevision
+                guidanceRevision: AgentSessionLinkPrompts.currentLaneGuidanceRevision,
+                // Derived from the rendered entries alone, so it names the lanes whose entries were
+                // delivered — snoozed and unselected hitchhikers included — rather than whichever
+                // lane admitted the wake.
+                displayAttribution: AgentLaneUpdateDisplayAttribution.make(
+                    renderedEntries: renderedPassive.entries,
+                    includesUnattributedOverflow: renderedPassive.includesUnattributedOverflow
+                )
             )
         }
 

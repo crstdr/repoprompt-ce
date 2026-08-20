@@ -94,6 +94,50 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         return viewModel.agentSessionLinkSetWaitingOn(waitingOn, for: endpoint)
     }
 
+    /// Routes one pure Auto-wake snooze read to the view model that *is* this exact incarnation.
+    ///
+    /// Addressed exactly like every other endpoint-scoped call here: a session UUID is not an address,
+    /// and an in-place rebind keeps that UUID while advancing the binding generations. A retired or
+    /// replaced endpoint therefore fails closed rather than reading a namesake's policy.
+    func agentSessionLinkAutoWakeSnoozeProjection(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        expectedReference: DomainAgentSessionLinkReference
+    ) -> Result<AgentSessionLinkAutoWakeSnoozeProjection?, AgentSessionLinkAutoWakeSnoozeFailure> {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else {
+            return .failure(.observerUnavailable)
+        }
+        return viewModel.agentSessionLinkAutoWakeSnoozeProjection(
+            endpoint: endpoint,
+            targetSessionID: targetSessionID,
+            expectedReference: expectedReference
+        )
+    }
+
+    /// Routes one Auto-wake snooze mutation to the view model that *is* this exact incarnation.
+    ///
+    /// The same-session-UUID replacement case is the one this exists to refuse: a stale monitor row or
+    /// a late MCP call naming a superseded incarnation must not install or clear policy on the live
+    /// one.
+    func agentSessionLinkMutateAutoWakeSnooze(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        expectedReference: DomainAgentSessionLinkReference,
+        command: AgentSessionLinkAutoWakeSnoozeCommand,
+        origin: AgentSessionLinkAutoWakeSnoozeOrigin
+    ) -> Result<AgentSessionLinkAutoWakeSnoozeMutationOutcome, AgentSessionLinkAutoWakeSnoozeFailure> {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else {
+            return .failure(.observerUnavailable)
+        }
+        return viewModel.agentSessionLinkMutateAutoWakeSnooze(
+            endpoint: endpoint,
+            targetSessionID: targetSessionID,
+            expectedReference: expectedReference,
+            command: command,
+            origin: origin
+        )
+    }
+
     func agentSessionLinkInstallObservation(
         for candidate: AgentSessionLinkEndpointCandidate,
         onChange: @escaping @MainActor () -> Void

@@ -32,7 +32,10 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let op = try XCTUnwrap(properties["op"]?.objectValue)
         XCTAssertEqual(
             op["enum"]?.arrayValue?.compactMap(\.stringValue),
-            ["list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done", "set_waiting_on"]
+            [
+                "list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done",
+                "set_waiting_on", "snooze_auto_wake"
+            ]
         )
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
         // `send` is the only target-mutating operation, so its two required inputs must be
@@ -180,6 +183,58 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         // Poll is where the queue is observable at all; without this the entry would be write-only.
         XCTAssertTrue(definition.description.contains("`pending_send`"))
         XCTAssertTrue(definition.description.contains("`last_pending_send_result`"))
+    }
+
+    /// The observer-local Auto-wake snooze, which the vendored blob predates.
+    ///
+    /// Two halves have to land together or the operation is worse than absent: the advertised `op`
+    /// value without `duration_seconds` would make every non-default call fail the strict key check,
+    /// and either without the prose would leave a caller unable to tell that the horizon is
+    /// per-operation, that nothing ever shortens an active snooze, and that expiry buys exactly one
+    /// re-evaluation rather than a turn.
+    func testAutoWakeSnoozeIsAdvertisedWithItsBoundsAndReevaluationOnlyContract() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+
+        let duration = try XCTUnwrap(properties["duration_seconds"]?.objectValue)
+        XCTAssertEqual(duration["type"]?.stringValue, "integer")
+        XCTAssertEqual(duration["minimum"]?.intValue, 60)
+        XCTAssertEqual(duration["maximum"]?.intValue, 3600)
+        // Still exactly `op`: the snooze adds no required field to any other operation, and its own
+        // `session_id` requirement is enforced by the service rather than by a schema that would then
+        // demand it from `list` and `set_waiting_on` too.
+        XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
+
+        // `clear` is now shared with `set_waiting_on`, and the mutual exclusion this schema shape
+        // cannot express has to be documented where a caller will read it.
+        let clear = try XCTUnwrap(properties["clear"]?.objectValue?["description"]?.stringValue)
+        XCTAssertTrue(clear.contains("[set_waiting_on, snooze_auto_wake]"))
+        XCTAssertTrue(clear.contains("Mutually exclusive with summary and with duration_seconds."))
+        XCTAssertTrue(
+            try XCTUnwrap(duration["description"]?.stringValue)
+                .contains("Mutually exclusive with clear: true.")
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(properties["session_id"]?.objectValue?["description"]?.stringValue)
+                .contains("snooze_auto_wake")
+        )
+
+        let fieldSummary = try XCTUnwrap(schema["description"]?.stringValue)
+        XCTAssertTrue(
+            fieldSummary.contains(
+                "**snooze_auto_wake**: session_id (required); optional duration_seconds (defaults to 600) or clear: true, never both"
+            )
+        )
+        XCTAssertTrue(definition.description.contains("- `snooze_auto_wake`:"))
+        XCTAssertTrue(definition.description.contains("max(current deadline, now + duration_seconds)"))
+        XCTAssertTrue(definition.description.contains("nothing ever shortens an active snooze"))
+        XCTAssertTrue(
+            definition.description.contains("re-evaluate eligibility rather than forcing a turn")
+        )
+        // Poll is the only place the state is observable; without it the operation would be
+        // write-only.
+        XCTAssertTrue(definition.description.contains("`auto_wake_snooze`"))
     }
 
     /// The numeric sequence is scoped to one target authority incarnation.
