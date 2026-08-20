@@ -107,6 +107,9 @@ struct AgentSessionLinkMCPToolService {
         case "set_waiting_on":
             try validateAllowedKeys(args, op: op, allowed: Self.setWaitingOnKeys)
             return try await executeSetWaitingOn(args: args)
+        case "snooze_auto_wake":
+            try validateAllowedKeys(args, op: op, allowed: Self.snoozeAutoWakeKeys)
+            return try await executeSnoozeAutoWake(args: args)
         default:
             throw MCPError.invalidParams(
                 "Unsupported agent_session_link op '\(op)'. \(Self.supportedOperationsSentence)"
@@ -117,7 +120,8 @@ struct AgentSessionLinkMCPToolService {
     /// Single-sourced so the missing-op and unsupported-op errors can never drift apart, or from the
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
-        "Use list, poll, wait, read, send, cancel_pending_send, mark_done, or set_waiting_on."
+        "Use list, poll, wait, read, send, cancel_pending_send, mark_done, set_waiting_on, "
+            + "or snooze_auto_wake."
 
     private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
         let endpoint = try await resolveObserverEndpointIdentity()
@@ -292,6 +296,7 @@ struct AgentSessionLinkMCPToolService {
 
         var states: [DomainAgentSessionLinkTargetState] = []
         var pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:]
+        var snoozes: [UUID: AgentSessionLinkAutoWakeSnoozeProjection] = [:]
         states.reserveCapacity(targets.count)
         for target in targets {
             guard let state = await bridge.targetState(for: target.lease) else {
@@ -301,6 +306,26 @@ struct AgentSessionLinkMCPToolService {
             // Read through this caller's own lease, so the queue state one observer staged is
             // structurally unreachable from another observer of the same target.
             pendingSends[state.sessionID] = bridge.pendingSendProjection(for: target.lease)
+            // Observational: the read removes no elapsed record, arms no deadline, and never
+            // re-enters the wake pipeline. All-or-nothing like every other multi-target field — a
+            // lane whose exact projection cannot be resolved denies the whole call rather than
+            // returning authorized rows beside a stale one.
+            switch await bridge.autoWakeSnoozeProjection(
+                observerEndpoint: observerEndpoint,
+                targetSessionID: target.lease.target.sessionID,
+                expectedReference: DomainAgentSessionLinkReference(
+                    linkID: target.lease.linkID,
+                    generation: target.lease.linkGeneration
+                )
+            ) {
+            case let .success(projection):
+                snoozes[state.sessionID] = projection
+            case let .failure(failure):
+                throw Self.error(
+                    for: failure,
+                    targetSessionID: request.isSingle ? target.lease.target.sessionID : nil
+                )
+            }
         }
 
         if request.isSingle, let state = states.first {
@@ -308,7 +333,9 @@ struct AgentSessionLinkMCPToolService {
                 "notice": .string(Self.untrustedContentNotice),
                 "session_id": .string(state.sessionID.uuidString),
                 "snapshot": AgentSessionLinkResponseRenderer.snapshotValue(state),
-                "wait_cursor": .string(state.waitCursor)
+                "wait_cursor": .string(state.waitCursor),
+                "auto_wake_snooze": AgentSessionLinkResponseRenderer
+                    .autoWakeSnoozeValue(snoozes[state.sessionID])
             ]
             payload.merge(AgentSessionLinkResponseRenderer.pendingSendFields(
                 pendingSends[state.sessionID] ?? .empty,
@@ -319,9 +346,10 @@ struct AgentSessionLinkMCPToolService {
         return .object([
             "notice": .string(Self.untrustedContentNotice),
             "targets": .array(states.map { state in
-                AgentSessionLinkResponseRenderer.targetEntryValue(
+                AgentSessionLinkResponseRenderer.pollTargetEntryValue(
                     state,
-                    pendingSend: pendingSends[state.sessionID] ?? .empty
+                    pendingSend: pendingSends[state.sessionID] ?? .empty,
+                    autoWakeSnooze: snoozes[state.sessionID]
                 )
             })
         ])
@@ -554,6 +582,102 @@ struct AgentSessionLinkMCPToolService {
             "result": .string(result),
             "session_id": .string(targetSessionID.uuidString)
         ])
+    }
+
+    // MARK: - snooze_auto_wake
+
+    /// Temporarily suppresses one exact outbound lane's ability to admit an automatic wake.
+    ///
+    /// Observer-local policy and nothing else: no receipt is applied, no queue entry is removed or
+    /// baselined, no durable selection or link authority moves, and the overseen session is neither
+    /// read nor told. That is why it authorizes against the same `.poll` grant the caller already
+    /// holds over the lane rather than introducing a capability of its own.
+    private func executeSnoozeAutoWake(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveObserverEndpointIdentity()
+        guard let rawSessionID = AgentMCPToolHelpers.normalizedString(args["session_id"]),
+              let targetSessionID = UUID(uuidString: rawSessionID)
+        else {
+            throw MCPError.invalidParams(
+                "agent_session_link snooze_auto_wake requires a canonical session_id."
+            )
+        }
+        let command = try Self.parseSnoozeCommand(args)
+        let target = try await authorize(
+            operation: .monitorSnoozeAutoWake,
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        )
+        // Derived from the authorized lease rather than from arguments: the caller names a session,
+        // and only the grant it was just proved against can say which link generation that is.
+        let reference = DomainAgentSessionLinkReference(
+            linkID: target.lease.linkID,
+            generation: target.lease.linkGeneration
+        )
+        let outcome: AgentSessionLinkAutoWakeSnoozeMutationOutcome
+        switch await bridge.mutateAutoWakeSnooze(
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID,
+            expectedReference: reference,
+            command: command,
+            origin: .agent
+        ) {
+        case let .success(value):
+            outcome = value
+        case let .failure(failure):
+            throw Self.error(for: failure, targetSessionID: targetSessionID)
+        }
+        return .object([
+            "result": .string(outcome.change.rawValue),
+            "session_id": .string(targetSessionID.uuidString),
+            "auto_wake_snooze": AgentSessionLinkResponseRenderer
+                .autoWakeSnoozeValue(outcome.projection),
+            // Truthful about the one thing this call cannot undo: past the provider boundary a set
+            // applies only to later admission, and a clear cannot retract the call already running.
+            "current_dispatch_already_started": .bool(outcome.currentDispatchAlreadyStarted)
+        ])
+    }
+
+    /// Strict set/extend/clear parsing: either `clear: true`, or a set whose `duration_seconds` is
+    /// optional and defaults to 600. The two forms are mutually exclusive, and naming neither is a
+    /// set at the default horizon rather than an error — "snooze this lane" is the common call, and
+    /// making it name a number would be ceremony.
+    static func parseSnoozeCommand(
+        _ args: [String: Value]
+    ) throws -> AgentSessionLinkAutoWakeSnoozeCommand {
+        let clear: Bool
+        switch args["clear"] {
+        case let .bool(value): clear = value
+        case nil: clear = false
+        default:
+            throw MCPError.invalidParams(
+                "agent_session_link snooze_auto_wake clear must be a Boolean."
+            )
+        }
+        guard !clear || args["duration_seconds"] == nil else {
+            throw MCPError.invalidParams(
+                "agent_session_link snooze_auto_wake accepts either clear: true or duration_seconds, not both."
+            )
+        }
+        guard !clear else { return .clear }
+        return try .set(durationSeconds: Self.parseSnoozeDurationSeconds(args["duration_seconds"]))
+    }
+
+    /// Integer-only, and bounded before anything is authorized.
+    ///
+    /// A string or floating-point numeral is refused rather than coerced: `"600"` and `600.5` are
+    /// both caller bugs, and silently rounding one of them would make the accepted horizon depend on
+    /// how a client happened to encode its request.
+    static func parseSnoozeDurationSeconds(_ value: Value?) throws -> Int {
+        guard let value else { return AgentSessionLinkAutoWakeSnooze.defaultDurationSeconds }
+        guard case let .int(seconds) = value,
+              seconds >= AgentSessionLinkAutoWakeSnooze.minimumDurationSeconds,
+              seconds <= AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds
+        else {
+            throw MCPError.invalidParams(
+                "agent_session_link snooze_auto_wake duration_seconds must be an integer from 60 through 3600."
+            )
+        }
+        return seconds
     }
 
     // MARK: - send
@@ -985,6 +1109,9 @@ struct AgentSessionLinkMCPToolService {
     static let cancelPendingSendKeys: Set<String> = ["op", "session_id", "idempotency_key"]
     static let markDoneKeys: Set<String> = ["op", "session_id"]
     static let setWaitingOnKeys: Set<String> = ["op", "summary", "clear"]
+    /// `clear` is shared with `set_waiting_on` and `duration_seconds` belongs to nothing else: the two
+    /// are mutually exclusive, which this schema shape cannot express and the service enforces.
+    static let snoozeAutoWakeKeys: Set<String> = ["op", "session_id", "duration_seconds", "clear"]
     // No identity field of any kind: the caller is resolved from server-owned run routing, so there
     // is nothing here for one session to address another with.
 
@@ -1013,6 +1140,29 @@ struct AgentSessionLinkMCPToolService {
         switch failure {
         case .denied:
             denialError(targetSessionID: targetSessionID)
+        case .shuttingDown:
+            MCPError.internalError("RepoPrompt is shutting down.")
+        }
+    }
+
+    /// Snooze routing failures, mapped so only the one a caller can act on is distinguishable.
+    ///
+    /// A lane that is no longer the current generation reuses the ordinary indistinguishable denial,
+    /// exactly as every other target-bearing operation does: "revoked between authorization and
+    /// mutation" and "never linked" must read the same.
+    static func error(
+        for failure: AgentSessionLinkAutoWakeSnoozeFailure,
+        targetSessionID: UUID?
+    ) -> MCPError {
+        switch failure {
+        case .observerUnavailable:
+            unavailableError
+        case .staleReference:
+            denialError(targetSessionID: targetSessionID)
+        case .laneNotEffectivelySelected:
+            MCPError.invalidParams(
+                "Auto-wake snooze requires this outbound lane to be currently selected."
+            )
         case .shuttingDown:
             MCPError.internalError("RepoPrompt is shutting down.")
         }
@@ -1086,6 +1236,40 @@ enum AgentSessionLinkResponseRenderer {
                 pendingSendResultValue($0, targetSessionID: targetSessionID)
             } ?? .null
         ]
+    }
+
+    /// One poll row: the shared target entry plus this observer's own lane policy.
+    ///
+    /// Kept separate from `targetEntryValue` because `wait` shares that entry and does **not** report
+    /// the snooze: a `wait` row rendering `auto_wake_snooze: null` would be a claim about a lane this
+    /// call never read, which is worse than omitting the field.
+    static func pollTargetEntryValue(
+        _ state: DomainAgentSessionLinkTargetState,
+        pendingSend projection: AgentSessionLinkPendingSendProjection = .empty,
+        autoWakeSnooze: AgentSessionLinkAutoWakeSnoozeProjection?
+    ) -> Value {
+        guard case var .object(payload) = targetEntryValue(state, pendingSend: projection) else {
+            return targetEntryValue(state, pendingSend: projection)
+        }
+        payload["auto_wake_snooze"] = autoWakeSnoozeValue(autoWakeSnooze)
+        return .object(payload)
+    }
+
+    /// One lane's observer-local Auto-wake suppression, or `null` when it is not snoozed.
+    ///
+    /// Rendered beside the snapshot rather than inside it, exactly like the pending-send fields and
+    /// for the same reason: the snapshot is the authority's sanitized *target* state, identical for
+    /// every observer, while this is one observer's own policy and must never be visible through
+    /// another's.
+    static func autoWakeSnoozeValue(
+        _ projection: AgentSessionLinkAutoWakeSnoozeProjection?
+    ) -> Value {
+        guard let projection else { return .null }
+        return .object([
+            "expires_at": .string(AgentMCPToolHelpers.timestamp(projection.expiresAt)),
+            "remaining_seconds": .int(projection.remainingSeconds),
+            "set_by": .string(projection.origin.rawValue)
+        ])
     }
 
     /// Fixed metadata for a queued message. Never the body: the queue owner wrote it and already

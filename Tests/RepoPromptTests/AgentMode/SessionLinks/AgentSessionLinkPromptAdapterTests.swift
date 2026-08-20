@@ -905,6 +905,13 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             sourceController: fixture.controller
         )
 
+        // Hold the thread non-idle *before* anything is queued. The pump starts the moment the entry
+        // lands and drains on the first idle snapshot it sees, so without this the drain races the
+        // membership change below — and a drain that wins composes against the revision the seed turn
+        // already acknowledged, which owes no supplement at all. That is a race in the test, not in
+        // the product, and anchoring the wait cannot fix it because the bare turn matches the anchor.
+        fixture.controller.threadRuntimeStatus = .active(activeFlags: ["turn"])
+
         // The provider rejects the steer with "no active turn", which is exactly how a turn lands in
         // the fallback queue. Membership changes while it sits there.
         fixture.controller.steerFailure = .noActiveTurn(
@@ -927,6 +934,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
         fixture.controller.steerFailure = nil
         await fixture.inventory.publishCodex(revision: 2, targetCount: 3)
+        // Only now may the head drain, so "drain time" provably means "after revision 2".
+        fixture.controller.threadRuntimeStatus = .idle
 
         // The pump drains the head once the thread reports idle.
         //
@@ -1806,6 +1815,13 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     /// When set, `steerUserTurn` throws it instead of accepting, which is how the runtime lands in
     /// the queued-fallback path.
     var steerFailure: CodexTurnSteerError?
+    /// Runtime status the queued-fallback pump reads. Idle unless a test deliberately holds it.
+    var threadRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus {
+        get { lock.withLock { runtimeStatus } }
+        set { lock.withLock { runtimeStatus = newValue } }
+    }
+
+    private var runtimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus = .idle
     private let continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
     private let stream: AsyncStream<CodexNativeSessionController.Event>
 
@@ -1901,7 +1917,12 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
         return CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
     }
 
-    /// Always reports an idle thread so the queued-fallback pump can claim its head.
+    /// Reports an idle thread by default, so the queued-fallback pump can claim its head.
+    ///
+    /// `threadRuntimeStatus` exists because "the pump may drain at any moment" is exactly what makes
+    /// a drain-time assertion racy: a test that changes state *after* queueing has no way to be sure
+    /// the drain has not already happened. Holding the thread non-idle is the seam that lets one test
+    /// order the two, and the default keeps every other suite drainable exactly as before.
     func readThreadSnapshot(
         includeTurns _: Bool,
         timeout _: TimeInterval?
@@ -1911,7 +1932,7 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
             rolloutPath: nil,
             model: nil,
             reasoningEffort: nil,
-            runtimeStatus: .idle,
+            runtimeStatus: threadRuntimeStatus,
             currentTurnID: nil,
             activeTurnIDs: [],
             latestTurnStatus: nil

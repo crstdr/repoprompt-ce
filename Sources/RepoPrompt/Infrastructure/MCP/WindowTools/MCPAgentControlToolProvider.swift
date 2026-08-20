@@ -41,16 +41,17 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             Access is per-target and granted only by the user. It is direct, non-transitive, non-reciprocal, and revocable at any time; knowing a session ID grants nothing. Only sessions returned by `list` can be named.
 
-            **Operations**: list | poll | wait | read | send | cancel_pending_send | mark_done | set_waiting_on
+            **Operations**: list | poll | wait | read | send | cancel_pending_send | mark_done | set_waiting_on | snooze_auto_wake
 
             - `list`: current authorized targets. Available only while at least one link remains.
-            - `poll`: sanitized status for one target (`session_id`) or several (`session_ids`), each with a `wait_cursor`. `change_sequence` is scoped to the current target authority incarnation; use returned cursors for continuation rather than storing the number across relaunch. Snapshots also carry nullable `idle_since` — when lifecycle status last became idle, which is not a claim the target is sendable — and any `waiting_on` the target declared. It also reports your own `pending_send` for that link and the single `last_pending_send_result` it retains.
+            - `poll`: sanitized status for one target (`session_id`) or several (`session_ids`), each with a `wait_cursor`. `change_sequence` is scoped to the current target authority incarnation; use returned cursors for continuation rather than storing the number across relaunch. Snapshots also carry nullable `idle_since` — when lifecycle status last became idle, which is not a claim the target is sendable — and any `waiting_on` the target declared. It also reports your own `pending_send` for that link and the single `last_pending_send_result` it retains. Each target also carries your own observer-local `auto_wake_snooze` for that lane, or `null` when it is not snoozed.
             - `wait`: bounded, event-driven wait for the first interesting change. Never busy-poll — pass the previous `wait_cursor` plus a `timeout_seconds`. At most one wait may be active per target; a second returns `wait_already_pending`. `until` is `change` (default), `idle`, or `sendable`.
             - `read`: paged, redacted, user-visible transcript. Reuse `next_cursor`; when a response sets `cursor_reset` the page restarted and may repeat rows. A `tail` read only pages toward newer rows, so `has_more: false` means nothing newer — use `from: "start"` for earlier history.
             - `send`: deliver one attributed message, only while the target is idle **and** ready to accept work. It is not a polling mechanism and never answers a question, approval, or permission prompt. Optionally attach `workflow_id` or `workflow_name` (mutually exclusive) to run that one message under a workflow; it applies to this message only and never changes the workflow the target has selected. Pass `delivery: "when_sendable"` to queue it instead of refusing: one message per link is held and delivered when the target next becomes ready, and `replace_pending: true` swaps it for one under a different key. Queueing, replacing, and cancelling all require a turn your own user started.
             - `cancel_pending_send`: remove the message you queued for one target. Requires that message's `idempotency_key`, so a stale cancel cannot discard a newer replacement; `too_late` means delivery already passed the point where it can be stopped and `last_pending_send_result` will report how it settled.
             - `mark_done`: mark the target Done only in this observer’s dashboard when completion is clear for the current user instruction. It does not stop, cancel, message, acknowledge, or unlink the target; fresh target activity reopens the row.
             - `set_waiting_on`: self-scoped agent declaration for a concrete external dependency. Set a non-empty `summary` or pass `clear: true`; RepoPrompt stamps the time, and the declaration clears on the next accepted turn, so re-declare it only if it still applies.
+            - `snooze_auto_wake`: temporarily stop one currently selected overseen lane from starting an automatic follow-up turn of its own. Defaults to 600 seconds; `duration_seconds` accepts 60 through 3600 and is applied as max(current deadline, now + duration_seconds), so one call leaves at most a 60-minute horizon, repeated calls may extend indefinitely, and nothing ever shortens an active snooze. `clear: true` releases it. Collection and coalescing continue while snoozed, a turn your own user starts — or another lane’s wake — may still deliver that lane, and clearing or expiry only asks RepoPrompt to re-evaluate eligibility rather than forcing a turn.
 
             **Sending**: `send` requires `idempotency_key`. Create a **new** key for each new message; reuse a key only to retry the *same* delivery after an ambiguous transport failure. Reusing a key with different text returns `idempotency_conflict` and delivers nothing. `status: "idle"` is not the send precondition: gate sends on the snapshot field `idle_for_send`, which is also false while the target commits its last turn, drains a queued instruction, or prepares where it runs. Wait for it with `until: "sendable"`; a target that is not ready returns `target_not_idle`, and waiting on `until: "idle"` instead can return immediately and loop. A turn started only by an incoming cross-session message or by RepoPrompt's automatic status-update follow-up cannot send onward until your own user gives a new instruction (`cross_session_reply_requires_user_instruction`). Delivery makes the target run, so at most one message lands per idle period.
 
@@ -71,10 +72,11 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                 **cancel_pending_send**: session_id (required), idempotency_key (required)
                 **mark_done**: session_id (required)
                 **set_waiting_on**: exactly one of summary / clear: true; no session_id
+                **snooze_auto_wake**: session_id (required); optional duration_seconds (defaults to 600) or clear: true, never both
                 """,
                 properties: [
-                    "op": .string(description: "Operation.", enum: ["list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done", "set_waiting_on"]),
-                    "session_id": .string(description: "[poll, wait, read, send, cancel_pending_send, mark_done] Overseen session UUID. Mutually exclusive with session_ids."),
+                    "op": .string(description: "Operation.", enum: ["list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done", "set_waiting_on", "snooze_auto_wake"]),
+                    "session_id": .string(description: "[poll, wait, read, send, cancel_pending_send, mark_done, snooze_auto_wake] Overseen session UUID. Mutually exclusive with session_ids."),
                     "session_ids": .array(
                         description: "[poll, wait] Overseen session UUIDs, in the order results should be returned. Duplicates are rejected and at most 32 targets are accepted per call. Mutually exclusive with session_id.",
                         items: .string()
@@ -102,7 +104,8 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                     "workflow_id": .string(description: "[send] Optional workflow for this one message. Mutually exclusive with workflow_name. Part of the delivery identity: reusing an idempotency_key with a different workflow is a conflict."),
                     "workflow_name": .string(description: "[send] Optional workflow name, matched case-insensitively. Mutually exclusive with workflow_id."),
                     "summary": .string(description: "[set_waiting_on] Concrete external dependency, normalized and capped at 280 UTF-8 bytes."),
-                    "clear": .boolean(description: "[set_waiting_on] Pass true to clear the current declaration. Mutually exclusive with summary.")
+                    "clear": .boolean(description: "[set_waiting_on, snooze_auto_wake] Pass true to clear the current waiting_on declaration, or to release this lane’s Auto-wake snooze. Mutually exclusive with summary and with duration_seconds."),
+                    "duration_seconds": .integer(description: "[snooze_auto_wake] Seconds this lane may not start an automatic wake of its own, 60 through 3600. Defaults to 600. Applied as max(current deadline, now + duration_seconds), so it never shortens an active snooze. Mutually exclusive with clear: true.", minimum: 60, maximum: 3600)
                 ],
                 required: ["op"]
             )

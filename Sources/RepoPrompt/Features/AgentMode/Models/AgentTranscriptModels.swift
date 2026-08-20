@@ -98,6 +98,13 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     /// Defensive: canonical user rows travel as request anchors, but this carrier reconstructs any
     /// `itemKind` field-by-field, so a user row routed through it must not lose its provenance.
     public var crossSessionAttribution: AgentCrossSessionAttribution?
+    /// Local-display lane labels for an accepted `.system` lane-update row.
+    ///
+    /// Carried for the same reason as `crossSessionAttribution`: this is the carrier every retained
+    /// activity is rebuilt from, so a field added to `AgentChatItem` alone would vanish the moment a
+    /// turn was reloaded. Every projection that leaves the machine selects `text` explicitly, so
+    /// carrying it here does not put it on the wire.
+    public var laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution?
 
     public init(
         id: UUID,
@@ -116,7 +123,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         reasoning: String? = nil,
         isSubstantiveAssistant: Bool = false,
         sealsAssistantBoundary: Bool = false,
-        crossSessionAttribution: AgentCrossSessionAttribution? = nil
+        crossSessionAttribution: AgentCrossSessionAttribution? = nil,
+        laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -135,6 +143,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.isSubstantiveAssistant = isSubstantiveAssistant
         self.sealsAssistantBoundary = sealsAssistantBoundary
         self.crossSessionAttribution = crossSessionAttribution
+        self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
     }
 
     public init(from item: AgentChatItem, toolExecution: AgentTranscriptToolExecution? = nil, role: AgentTranscriptActivityRole? = nil, sealsAssistantBoundary: Bool = false) {
@@ -155,6 +164,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         isSubstantiveAssistant = Self.defaultIsSubstantiveAssistant(for: item)
         self.sealsAssistantBoundary = sealsAssistantBoundary
         crossSessionAttribution = item.crossSessionAttribution
+        laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
     }
 
     public func toItem(text overrideText: String? = nil, isStreaming overrideStreaming: Bool? = nil) -> AgentChatItem {
@@ -176,7 +186,10 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             workflow: workflow,
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
-            crossSessionAttribution: crossSessionAttribution
+            crossSessionAttribution: crossSessionAttribution,
+            // Synthesized decoding cannot reject a malformed nested value without failing the whole
+            // activity, so the drop happens here instead.
+            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution?.validated
         )
     }
 

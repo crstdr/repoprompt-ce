@@ -511,7 +511,7 @@ extension AgentModeViewModel {
     ) {
         // The key is authoritative: stamping it onto the value too keeps the dismissal action the
         // view performs from ever addressing a different incarnation than the rows it is showing.
-        var props = props
+        var props = agentSessionLinkOverlayingAutoWakePolicy(props, endpoint: endpoint)
         props.endpoint = endpoint
         // One tab of one window holds at most one live incarnation
         // (`agentSessionLinkObserverEndpoint(tabID:)` resolves exactly one), so any *other* entry
@@ -528,6 +528,77 @@ extension AgentModeViewModel {
         }
         monitorPillPropsByEndpoint[endpoint] = props
         syncStatusPillsUIState()
+    }
+
+    /// Overlays this observer's own Auto-wake policy onto the authoritative link rows.
+    ///
+    /// Projection only, and deliberately applied here rather than inside the link projection itself:
+    /// snooze and effective selection live on the exact observer session, not in the link authority,
+    /// and the two change on different schedules. Nothing in this method mutates policy, removes an
+    /// elapsed record, arms a deadline, or re-enters the wake pipeline — the snooze read it uses is
+    /// the coordinator's pure projection, which answers "no snooze" for a record whose monotonic
+    /// deadline has passed whether or not bookkeeping has caught up.
+    private func agentSessionLinkOverlayingAutoWakePolicy(
+        _ props: AgentMonitorPillProps,
+        endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentMonitorPillProps {
+        guard !props.outbound.isEmpty,
+              let session = sessions[endpoint.tabID],
+              session.activeAgentSessionID == endpoint.sessionID
+        else {
+            return props
+        }
+        // The same rule the coordinator admits lanes by: the master setting covers every lane, and a
+        // granular selection covers its own. Read live from the session rather than from the props
+        // being published, so a selection written in this same pass cannot render a frame late.
+        let masterEnabled = session.autoWakeOnOversightUpdates
+        let selectedTargetSessionIDs = session.agentSessionLinkAutoWakeTargetSessionIDs
+        let outbound = props.outbound.map { row in
+            let reference = DomainAgentSessionLinkReference(
+                linkID: row.linkID,
+                generation: row.generation
+            )
+            let projection: AgentSessionLinkAutoWakeSnoozeProjection? = switch agentSessionLinkAutoWakeSnoozeProjection(
+                endpoint: endpoint,
+                targetSessionID: row.targetSessionID,
+                expectedReference: reference
+            ) {
+            case let .success(value):
+                value
+            case .failure:
+                // A row whose exact pairing no longer resolves renders as unsnoozed rather than
+                // inheriting a predecessor's suppression.
+                nil
+            }
+            return row.withAutoWakeState(
+                snooze: projection.map {
+                    AgentMonitorAutoWakeSnoozeState(
+                        // Quantized to a whole second because the projection derives it from wall time
+                        // at read: two publications a few milliseconds apart would otherwise produce
+                        // unequal props and repaint the dashboard for nothing.
+                        expiresAt: Date(
+                            timeIntervalSince1970: $0.expiresAt.timeIntervalSince1970.rounded()
+                        ),
+                        origin: $0.origin
+                    )
+                },
+                isEffectivelySelected: masterEnabled
+                    || selectedTargetSessionIDs.contains(row.targetSessionID)
+            )
+        }
+        guard outbound != props.outbound else { return props }
+        return AgentMonitorPillProps(
+            sessionID: props.sessionID,
+            endpoint: props.endpoint,
+            outbound: outbound,
+            inbound: props.inbound,
+            recentNotices: props.recentNotices,
+            canAddReason: props.canAddReason,
+            autoWakeOnUpdatesEnabled: props.autoWakeOnUpdatesEnabled,
+            autoWakeTargetSessionIDs: props.autoWakeTargetSessionIDs,
+            autoWakeUnavailableReason: props.autoWakeUnavailableReason,
+            persistence: props.persistence
+        )
     }
 
     /// Eagerly revokes links for tabs whose live binding just disappeared, and drops their stale

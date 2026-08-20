@@ -90,6 +90,16 @@ extension AgentModeViewModel {
     ) {
         guard let session = agentSessionLinkAutoWakeSession(for: endpoint) else { return }
 
+        // The explicit snooze cleanup boundary, ahead of every read of the map: due records are
+        // removed, references this snapshot no longer carries are pruned, and the one nearest-deadline
+        // task is re-armed. This publication *is* the reevaluation the cleanup owes, so nothing here
+        // re-enters the pipeline — a recursive submission would be a second evaluation of one edge.
+        agentSessionLinkReconcileAutoWakeSnoozes(
+            endpoint: endpoint,
+            session: session,
+            currentReferences: Set(snapshot.autoWakeLanes.map(\.reference))
+        )
+
         // Baselined ahead of the deliverability guard, because the publication that *activates* a lane
         // carries no entries yet. Seeding the watermark from a lane's first update instead would
         // consume the very epoch that update was caused by, so the first direct human turn in a
@@ -108,17 +118,22 @@ extension AgentModeViewModel {
         }
 
         let fingerprint = snapshot.wakeEligibilityFingerprint
-        let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
-        let representedSelectedEntries = snapshot.entries.filter { selectedLanes[$0.reference] != nil }
-        let freshHumanEpochs: [DomainAgentSessionLinkReference: UInt64] = representedSelectedEntries
-            .reduce(into: [:]) { epochs, entry in
-                guard let lane = selectedLanes[entry.reference],
-                      lane.targetTurnIsLocalUser,
-                      lane.targetLocalInputEpoch
-                      > (session.agentSessionLinkConsumedTargetLocalEpochs[entry.reference] ?? 0)
-                else { return }
-                epochs[entry.reference] = lane.targetLocalInputEpoch
-            }
+        let admission = agentSessionLinkAutoWakeAdmission(
+            snapshot,
+            session: session,
+            endpoint: endpoint
+        )
+
+        // A tombstoned attempt is deliberately *not* retired here, however dead it looks.
+        //
+        // It is the fence. Providers do not mint the wake's dispatch ID — they use their own, and
+        // `agentSessionLinkEffectiveDispatchID` rewrites it to the wake's only while an attempt exists
+        // in `.preparingDispatch`, `.cancelledBeforeDispatch`, or `.dispatching`. Clearing the
+        // tombstone while a provider path is still preparing would make that rewrite stop firing, so
+        // `agentSessionLinkAcquirePhysicalDispatch` would take its `autoWakeID == nil` early return
+        // and wave the call through unfenced — delivering a snoozed lane with no provenance row and
+        // no anti-chain. The reevaluation this publication owes is replayed once the tombstone's own
+        // finalizer settles instead; see `agentSessionLinkAwaitPhysicalDispatchSettlement`.
 
         // One attempt absorbs newer revisions. A metadata-only revision deliberately does not clear a
         // failed attempt's suppression, so improving payload fidelity cannot re-trigger a provider
@@ -130,19 +145,48 @@ extension AgentModeViewModel {
             }
             attempt.queueRevision = max(attempt.queueRevision, snapshot.queueRevision)
             attempt.wakeFingerprint = fingerprint
-            for (reference, epoch) in freshHumanEpochs {
+            // Every represented *selected* epoch, including a snoozed hitchhiker's: a snooze suppresses
+            // admission, not delivery, so a combined wake that ships that lane's update must still
+            // consume the target-local epoch it rode on. Otherwise the same human turn could re-arm
+            // the observer a second time after the snooze lifts.
+            for (reference, epoch) in admission.freshSelectedHumanEpochs {
                 attempt.humanRearmEpochs[reference] = max(attempt.humanRearmEpochs[reference] ?? 0, epoch)
             }
             session.pendingOversightAutoWake = attempt
+            // Immediate reevaluation rather than leaving it to the run loop: a snooze installed while
+            // this attempt was scheduled must retract it here if it was the attempt's only basis, and
+            // must leave it alone when another unsnoozed lane still admits. `cancel` owns the phase
+            // rules — `.preparingDispatch` becomes `.cancelledBeforeDispatch`, `.dispatching` is never
+            // touched.
+            guard admission.hasAdmissionBasis else {
+                // A tombstone is *already* cancelled, and cancelling it again is not idempotent:
+                // `cancel` only converts `.preparingDispatch` into a tombstone, so a second call
+                // falls through and clears the slot outright — which deletes the dispatch-ID rewrite
+                // that keeps a still-preparing provider path fenced. Losing the basis twice is the
+                // ordinary case here, not an exotic one: the snoozed lane publishing again, an
+                // extension, or even a repeated `already_snoozed` re-drives this path while the
+                // tombstone stands. Leave the release to the finalizer that can prove no transport
+                // call happened.
+                if attempt.phase != .cancelledBeforeDispatch {
+                    cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+                }
+                agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, "absorbed.basisLost")
+                return
+            }
             agentSessionLinkScheduleAutoWakeReevaluation(wakeID: attempt.wakeID, endpoint: endpoint)
             agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, "absorbed")
             return
         }
 
-        guard !representedSelectedEntries.isEmpty
-            || agentSessionLinkOverflowAloneMayWake(snapshot, selectedLanes: selectedLanes)
-        else { return }
-        if session.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction, freshHumanEpochs.isEmpty {
+        guard admission.hasAdmissionBasis else {
+            agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, "blocked.noAdmissionBasis")
+            return
+        }
+        // The anti-chain re-arm must come from a lane that may actually *admit*: a snoozed lane's
+        // fresh human epoch is carried for acceptance accounting, never used to unlock a turn.
+        if session.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction,
+           admission.freshAdmittingHumanEpochs.isEmpty
+        {
             agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, "blocked.turnOrigin")
             return
         }
@@ -163,7 +207,7 @@ extension AgentModeViewModel {
             queueRevision: snapshot.queueRevision,
             wakeFingerprint: fingerprint,
             attemptedFingerprint: nil,
-            humanRearmEpochs: freshHumanEpochs,
+            humanRearmEpochs: admission.freshSelectedHumanEpochs,
             physicalOutcome: .notAttempted,
             phase: .scheduled,
             task: nil
@@ -449,6 +493,17 @@ extension AgentModeViewModel {
 
             if attempt.phase == .cancelledBeforeDispatch {
                 cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+                // Replay one ordinary evaluation now that the fence is gone.
+                //
+                // A tombstone cannot be rescheduled, so every publication that arrived while it stood
+                // — including the one a snooze clear or a deadline expiry performs, which is the only
+                // reevaluation either of them promises — was absorbed and scheduled nothing. Without
+                // this the accumulated queue would stay owed with nothing arranged to deliver it.
+                // Unconditional because it is the same gated entry point as any other publication: if
+                // nothing is owed, or the ordinary gates refuse, it reserves nothing.
+                if let snapshot = agentSessionLinkCurrentPassiveSnapshot(for: endpoint) {
+                    agentSessionLinkNoteAutoWakeOpportunity(snapshot, endpoint: endpoint)
+                }
                 return
             }
             switch attempt.physicalOutcome {
@@ -534,10 +589,15 @@ extension AgentModeViewModel {
             )
         }
         agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
+        // Attribution comes from the claim — the immutable batch the provider actually accepted — and
+        // never from live links, live selection, or current snooze state. Snoozed and unselected
+        // hitchhikers therefore appear because they were *rendered*, and a rename or unlink after
+        // construction cannot change what the row says.
         session.appendItem(AgentChatItem.laneUpdateAutoWake(
             wakeID: wakeID,
             acceptedAt: acceptedAt,
-            sequenceIndex: session.nextSequenceIndex
+            sequenceIndex: session.nextSequenceIndex,
+            displayAttribution: claim.passive?.displayAttribution
         ))
         session.isDirty = true
         requestUIRefresh(tabID: endpoint.tabID)
@@ -573,6 +633,327 @@ extension AgentModeViewModel {
             claim: claim,
             origin: .laneUpdateAutoWake(wakeID: wakeID)
         )
+    }
+
+    // MARK: - Auto-wake snooze
+
+    /// Pure, observational read of one exact lane's snooze.
+    ///
+    /// It removes nothing, arms nothing, publishes nothing, and never re-enters the wake pipeline. An
+    /// elapsed record answers `success(nil)`: expiry is decided by the monotonic deadline, not by
+    /// whether bookkeeping has caught up.
+    func agentSessionLinkAutoWakeSnoozeProjection(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        expectedReference: DomainAgentSessionLinkReference
+    ) -> Result<AgentSessionLinkAutoWakeSnoozeProjection?, AgentSessionLinkAutoWakeSnoozeFailure> {
+        guard let session = agentSessionLinkAutoWakeSession(for: endpoint) else {
+            return .failure(.observerUnavailable)
+        }
+        let snapshot = agentSessionLinkCurrentPassiveSnapshot(for: endpoint)
+        if let snapshot,
+           let lane = snapshot.autoWakeLanes.first(where: { $0.reference == expectedReference }),
+           lane.targetSessionID != targetSessionID
+        {
+            return .failure(.staleReference)
+        }
+        let clock = session.agentSessionLinkAutoWakeSnoozeClock
+        let key = AgentSessionLinkAutoWakeSnoozeKey(
+            observerEndpoint: endpoint,
+            reference: expectedReference
+        )
+        return .success(AgentSessionLinkAutoWakeSnoozeProjection.make(
+            record: session.agentSessionLinkAutoWakeSnoozes[key],
+            now: clock.now(),
+            wallNow: clock.wallNow()
+        ))
+    }
+
+    /// Applies one set/extend/clear to the exact observer incarnation that owns the policy.
+    ///
+    /// The mutation is observer-local by construction. It never applies a receipt, removes or
+    /// baselines a passive entry, mutates durable Auto-wake selection, touches link authority or target
+    /// state, changes turn origin, moves the local-input epoch, consumes a target epoch, disturbs
+    /// failure suppression, or writes a transcript row.
+    ///
+    /// Every accepted command re-drives the current authoritative snapshot through the ordinary
+    /// pipeline exactly once. That is a reevaluation promise and nothing more: normal
+    /// authority/readiness/anti-chain/suppression gates stay in charge, and already receipted or
+    /// net-reverted content produces no turn at all.
+    func agentSessionLinkMutateAutoWakeSnooze(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        expectedReference: DomainAgentSessionLinkReference,
+        command: AgentSessionLinkAutoWakeSnoozeCommand,
+        origin: AgentSessionLinkAutoWakeSnoozeOrigin
+    ) -> Result<AgentSessionLinkAutoWakeSnoozeMutationOutcome, AgentSessionLinkAutoWakeSnoozeFailure> {
+        guard let session = agentSessionLinkAutoWakeSession(for: endpoint) else {
+            return .failure(.observerUnavailable)
+        }
+        let snapshot = agentSessionLinkCurrentPassiveSnapshot(for: endpoint)
+        let lane = snapshot?.autoWakeLanes.first { $0.reference == expectedReference }
+        if let lane, lane.targetSessionID != targetSessionID {
+            return .failure(.staleReference)
+        }
+        if case .set = command {
+            // Set/extend is only meaningful for a lane that could otherwise admit a turn, so it
+            // requires a current snapshot carrying the lane and a live effective selection. Clear
+            // deliberately requires neither: a lane deselected or master-disabled after being snoozed
+            // must still be releasable.
+            guard let snapshot, let lane else { return .failure(.staleReference) }
+            let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
+            guard selectedLanes[lane.reference] != nil else {
+                return .failure(.laneNotEffectivelySelected)
+            }
+        }
+
+        let clock = session.agentSessionLinkAutoWakeSnoozeClock
+        let now = clock.now()
+        var records = agentSessionLinkCleanedAutoWakeSnoozes(
+            session.agentSessionLinkAutoWakeSnoozes,
+            endpoint: endpoint,
+            currentReferences: snapshot.map { Set($0.autoWakeLanes.map(\.reference)) },
+            now: now
+        )
+        let key = AgentSessionLinkAutoWakeSnoozeKey(
+            observerEndpoint: endpoint,
+            reference: expectedReference
+        )
+        let existing = records[key]
+        let change: AgentSessionLinkAutoWakeSnoozeChange
+        switch command {
+        case let .set(durationSeconds):
+            // The cap is a per-operation *remaining horizon*, never a lifetime cap: the deadline only
+            // ever moves forward, so repeated operations may extend indefinitely while no single one
+            // of them leaves more than an hour on the clock.
+            let candidate = now.advanced(
+                by: .seconds(AgentSessionLinkAutoWakeSnooze.clampedDurationSeconds(durationSeconds))
+            )
+            if let existing {
+                if candidate > existing.deadline {
+                    // Only an operation that moves the deadline later takes over the origin.
+                    records[key] = AgentSessionLinkAutoWakeSnoozeRecord(
+                        key: key,
+                        deadline: candidate,
+                        origin: origin
+                    )
+                    change = .extended
+                } else {
+                    change = .alreadySnoozed
+                }
+            } else {
+                records[key] = AgentSessionLinkAutoWakeSnoozeRecord(
+                    key: key,
+                    deadline: candidate,
+                    origin: origin
+                )
+                change = .snoozed
+            }
+        case .clear:
+            if existing == nil {
+                change = .alreadyClear
+            } else {
+                records.removeValue(forKey: key)
+                change = .cleared
+            }
+        }
+
+        // Truthful about the one thing a mutation cannot undo. Past this boundary the provider call
+        // may already be running: a set applies only to later admission, and a clear cannot retract it.
+        let currentDispatchAlreadyStarted = session.pendingOversightAutoWake.map {
+            $0.observerEndpoint == endpoint && $0.phase == .dispatching
+        } ?? false
+
+        agentSessionLinkCommitAutoWakeSnoozes(records, endpoint: endpoint, session: session)
+        agentSessionLinkRearmAutoWakeSnoozeDeadlineTask(endpoint: endpoint, session: session)
+        let projection = AgentSessionLinkAutoWakeSnoozeProjection.make(
+            record: records[key],
+            now: now,
+            wallNow: clock.wallNow()
+        )
+        // Exactly one normal-pipeline reevaluation of the retained authoritative snapshot, for every
+        // accepted command including `.alreadySnoozed` and `.alreadyClear`. No snapshot is fabricated:
+        // with none published, the next authoritative publication performs the same evaluation.
+        if let snapshot {
+            agentSessionLinkNoteAutoWakeOpportunity(snapshot, endpoint: endpoint)
+        }
+        return .success(AgentSessionLinkAutoWakeSnoozeMutationOutcome(
+            change: change,
+            projection: projection,
+            currentDispatchAlreadyStarted: currentDispatchAlreadyStarted
+        ))
+    }
+
+    /// Drops snooze state whose exact observer incarnation is no longer live.
+    ///
+    /// Retirement, never transfer: an unlink, rebind, replacement, or teardown must leave the
+    /// successor unsnoozed, and it must invalidate the task token so a resumed deadline callback
+    /// cannot expire records the replacement never created.
+    func agentSessionLinkPruneAutoWakeSnoozeState() {
+        for (tabID, session) in sessions {
+            guard !session.agentSessionLinkAutoWakeSnoozes.isEmpty
+                || session.agentSessionLinkAutoWakeSnoozeTaskToken != nil
+            else { continue }
+            guard let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID) else {
+                session.cancelAgentSessionLinkAutoWakeSnoozeState()
+                continue
+            }
+            let retained = session.agentSessionLinkAutoWakeSnoozes
+                .filter { $0.key.observerEndpoint == endpoint }
+            agentSessionLinkCommitAutoWakeSnoozes(retained, endpoint: endpoint, session: session)
+            agentSessionLinkRearmAutoWakeSnoozeDeadlineTask(endpoint: endpoint, session: session)
+        }
+    }
+
+    /// The exact lane references currently suppressed for this observer, evaluated against the
+    /// monotonic clock rather than dictionary membership.
+    private func agentSessionLinkActiveAutoWakeSnoozedReferences(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        session: TabSession
+    ) -> Set<DomainAgentSessionLinkReference> {
+        guard !session.agentSessionLinkAutoWakeSnoozes.isEmpty else { return [] }
+        let now = session.agentSessionLinkAutoWakeSnoozeClock.now()
+        return Set(
+            session.agentSessionLinkAutoWakeSnoozes.values
+                .filter { $0.key.observerEndpoint == endpoint && $0.isActive(at: now) }
+                .map(\.key.reference)
+        )
+    }
+
+    /// The one mutating cleanup boundary: remove due and stale records, re-arm, repaint if changed.
+    ///
+    /// It never invokes the wake pipeline. Every caller owns its own single reevaluation, which is
+    /// what keeps "expiry causes exactly one evaluation" true even when cleanup runs twice.
+    private func agentSessionLinkReconcileAutoWakeSnoozes(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        session: TabSession,
+        currentReferences: Set<DomainAgentSessionLinkReference>?
+    ) {
+        guard !session.agentSessionLinkAutoWakeSnoozes.isEmpty
+            || session.agentSessionLinkAutoWakeSnoozeTaskToken != nil
+        else { return }
+        let cleaned = agentSessionLinkCleanedAutoWakeSnoozes(
+            session.agentSessionLinkAutoWakeSnoozes,
+            endpoint: endpoint,
+            currentReferences: currentReferences,
+            now: session.agentSessionLinkAutoWakeSnoozeClock.now()
+        )
+        agentSessionLinkCommitAutoWakeSnoozes(cleaned, endpoint: endpoint, session: session)
+        agentSessionLinkRearmAutoWakeSnoozeDeadlineTask(endpoint: endpoint, session: session)
+    }
+
+    private func agentSessionLinkCleanedAutoWakeSnoozes(
+        _ records: [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord],
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        currentReferences: Set<DomainAgentSessionLinkReference>?,
+        now: ContinuousClock.Instant
+    ) -> [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord] {
+        records.filter { key, record in
+            key.observerEndpoint == endpoint
+                && record.isActive(at: now)
+                && (currentReferences?.contains(key.reference) ?? true)
+        }
+    }
+
+    /// Publishes one map change through the existing monitor seams, or nothing at all.
+    ///
+    /// The single commit boundary for every snooze change — set, extend, clear, deadline expiry, and
+    /// membership pruning all land here — which is exactly why the authoritative repaint belongs
+    /// here and nowhere else. `requestUIRefresh` only re-renders the *cached* monitor props, and the
+    /// snooze a row displays is overlaid when those props are published, so expiry without the
+    /// projection refresh below would correctly release the lane while the row went on claiming it
+    /// was snoozed until some unrelated target event happened along.
+    @discardableResult
+    private func agentSessionLinkCommitAutoWakeSnoozes(
+        _ records: [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord],
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        session: TabSession
+    ) -> Bool {
+        guard session.agentSessionLinkAutoWakeSnoozes != records else { return false }
+        // The setter feeds `noteMonitorObservationInputsChanged`; the repaint is this side's job.
+        session.agentSessionLinkAutoWakeSnoozes = records
+        AgentSessionLinkRuntimeBridge.shared.requestObserverLocalPolicyRepaint(for: endpoint)
+        requestUIRefresh(tabID: endpoint.tabID)
+        return true
+    }
+
+    /// Maintains exactly one nearest-deadline task per observer session.
+    private func agentSessionLinkRearmAutoWakeSnoozeDeadlineTask(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        session: TabSession
+    ) {
+        let clock = session.agentSessionLinkAutoWakeSnoozeClock
+        let now = clock.now()
+        // Strictly-future deadlines only, which is what guarantees the handler makes progress: after
+        // its cleanup, every remaining record is still in the future.
+        let nextDeadline = session.agentSessionLinkAutoWakeSnoozes.values
+            .filter { $0.key.observerEndpoint == endpoint && $0.isActive(at: now) }
+            .map(\.deadline)
+            .min()
+        session.agentSessionLinkAutoWakeSnoozeDeadlineTask?.cancel()
+        session.agentSessionLinkAutoWakeSnoozeDeadlineTask = nil
+        session.agentSessionLinkAutoWakeSnoozeTaskToken = nil
+        guard let nextDeadline else { return }
+        let token = UUID()
+        session.agentSessionLinkAutoWakeSnoozeTaskToken = token
+        session.agentSessionLinkAutoWakeSnoozeDeadlineTask = Task { @MainActor [weak self] in
+            do {
+                try await clock.sleepUntil(nextDeadline)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.agentSessionLinkHandleAutoWakeSnoozeDeadline(
+                endpoint: endpoint,
+                token: token,
+                deadline: nextDeadline
+            )
+        }
+    }
+
+    /// Fails closed on every axis before mutating anything.
+    ///
+    /// The token proves both that this task is the current arming *and* that the same session object
+    /// still owns the state, because a replacement incarnation never inherits a token. A stale or
+    /// superseded callback performs no cleanup and no reevaluation.
+    private func agentSessionLinkHandleAutoWakeSnoozeDeadline(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        token: UUID,
+        deadline: ContinuousClock.Instant
+    ) {
+        guard let session = agentSessionLinkAutoWakeSession(for: endpoint),
+              session.agentSessionLinkAutoWakeSnoozeTaskToken == token
+        else { return }
+        guard session.agentSessionLinkAutoWakeSnoozeClock.now() >= deadline else {
+            // Resumed early. Nothing is due, so re-arm rather than expire anything.
+            agentSessionLinkRearmAutoWakeSnoozeDeadlineTask(endpoint: endpoint, session: session)
+            return
+        }
+        session.agentSessionLinkAutoWakeSnoozeDeadlineTask = nil
+        session.agentSessionLinkAutoWakeSnoozeTaskToken = nil
+        guard let snapshot = agentSessionLinkCurrentPassiveSnapshot(for: endpoint) else {
+            // No authoritative snapshot to reevaluate. Do the bookkeeping and stop: fabricating a
+            // snapshot or a status edge here would invent content the queue never held.
+            agentSessionLinkReconcileAutoWakeSnoozes(
+                endpoint: endpoint,
+                session: session,
+                currentReferences: nil
+            )
+            return
+        }
+        // One explicit reevaluation of the retained authoritative snapshot, through the ordinary
+        // publication entry point — which is also where the due records are removed and the next
+        // deadline is armed.
+        agentSessionLinkNoteAutoWakeOpportunity(snapshot, endpoint: endpoint)
+    }
+
+    private func agentSessionLinkCurrentPassiveSnapshot(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkPassiveStatusNotices.Snapshot? {
+        guard let snapshot = agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID],
+              snapshot.observerEndpoint == endpoint
+        else { return nil }
+        return snapshot
     }
 
     // MARK: Gates
@@ -702,12 +1083,100 @@ extension AgentModeViewModel {
     /// accepted on a broader rule than the one that admitted it.
     private func agentSessionLinkOverflowAloneMayWake(
         _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
-        selectedLanes: [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane]
+        selectedLanes: [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane],
+        snoozedReferences: Set<DomainAgentSessionLinkReference>
     ) -> Bool {
         guard snapshot.unacknowledgedOverflowCount > 0, !snapshot.autoWakeLanes.isEmpty else {
             return false
         }
-        return snapshot.autoWakeLanes.allSatisfy { selectedLanes[$0.reference] != nil }
+        // An active snooze on *any* live lane blocks pure overflow for exactly the reason an
+        // unselected lane does: the dropped edges are unattributed, so they may have come from the
+        // lane the user just silenced. The content stays owed to a natural turn either way.
+        return snapshot.autoWakeLanes.allSatisfy {
+            selectedLanes[$0.reference] != nil && !snoozedReferences.contains($0.reference)
+        }
+    }
+
+    // MARK: Admission
+
+    /// Everything one publication says about who may admit a wake, and about what an accepted wake
+    /// would have to account for.
+    ///
+    /// One value rather than five recomputations: reservation, absorption, selection fencing, snooze
+    /// mutation, deadline expiry, readiness settlement, and the physical-acquisition fence all read
+    /// this, so an attempt can never be admitted under a rule the fence does not share.
+    private struct AgentSessionLinkAutoWakeAdmission {
+        /// Live effective selection, snoozed lanes included.
+        let selectedLanes:
+            [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane]
+        /// Selected lanes minus the ones with an *active* snooze. Only these may start a turn.
+        let wakeAdmittingLanes:
+            [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane]
+        /// Fresh target-local human epochs represented by every selected entry, snoozed hitchhikers
+        /// included. This is acceptance accounting, not eligibility.
+        let freshSelectedHumanEpochs: [DomainAgentSessionLinkReference: UInt64]
+        /// The subset belonging to currently unsnoozed admitting entries. This is eligibility.
+        let freshAdmittingHumanEpochs: [DomainAgentSessionLinkReference: UInt64]
+        let hasConcreteAdmittingEntry: Bool
+        let overflowAloneMayWake: Bool
+
+        var hasAdmissionBasis: Bool {
+            hasConcreteAdmittingEntry || overflowAloneMayWake
+        }
+    }
+
+    /// Resolves the admission calculation against live session state and the monotonic clock.
+    ///
+    /// Elapsed records are treated as inactive here, before any cleanup runs, so a delayed deadline
+    /// task can never keep a lane suppressed past its own deadline.
+    private func agentSessionLinkAutoWakeAdmission(
+        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
+        session: TabSession,
+        endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkAutoWakeAdmission {
+        let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
+        let snoozedReferences = agentSessionLinkActiveAutoWakeSnoozedReferences(
+            endpoint: endpoint,
+            session: session
+        )
+        let wakeAdmittingLanes = selectedLanes.filter { !snoozedReferences.contains($0.key) }
+        let freshSelectedHumanEpochs = agentSessionLinkFreshHumanEpochs(
+            snapshot,
+            session: session,
+            lanes: selectedLanes
+        )
+        let freshAdmittingHumanEpochs = freshSelectedHumanEpochs
+            .filter { wakeAdmittingLanes[$0.key] != nil }
+        return AgentSessionLinkAutoWakeAdmission(
+            selectedLanes: selectedLanes,
+            wakeAdmittingLanes: wakeAdmittingLanes,
+            freshSelectedHumanEpochs: freshSelectedHumanEpochs,
+            freshAdmittingHumanEpochs: freshAdmittingHumanEpochs,
+            hasConcreteAdmittingEntry: snapshot.entries.contains {
+                wakeAdmittingLanes[$0.reference] != nil
+            },
+            overflowAloneMayWake: agentSessionLinkOverflowAloneMayWake(
+                snapshot,
+                selectedLanes: selectedLanes,
+                snoozedReferences: snoozedReferences
+            )
+        )
+    }
+
+    /// Fresh target-local human epochs represented by the entries of `lanes`.
+    private func agentSessionLinkFreshHumanEpochs(
+        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
+        session: TabSession,
+        lanes: [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane]
+    ) -> [DomainAgentSessionLinkReference: UInt64] {
+        snapshot.entries.reduce(into: [:]) { epochs, entry in
+            guard let lane = lanes[entry.reference],
+                  lane.targetTurnIsLocalUser,
+                  lane.targetLocalInputEpoch
+                  > (session.agentSessionLinkConsumedTargetLocalEpochs[entry.reference] ?? 0)
+            else { return }
+            epochs[entry.reference] = lane.targetLocalInputEpoch
+        }
     }
 
     /// Linearizes one Auto-wake selection change with scheduling and the acceptance fence.
@@ -743,31 +1212,38 @@ extension AgentModeViewModel {
         cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
     }
 
+    /// The shared final fence, evaluated identically at readiness settlement, selection changes, and
+    /// the physical-acquisition boundary.
+    ///
+    /// It reads live selection *and* live snoozes, because this is the last gate a wake crosses before
+    /// the provider transport: a lane the user deselected or snoozed a moment ago must be gone from it
+    /// whether or not the projection — or the deadline task — has caught up.
+    ///
+    /// `humanRearmEpochs` deliberately no longer acts as an eligibility shortcut. It keeps its
+    /// acceptance-accounting role (which epochs this wake consumes if it lands), while the question
+    /// "may this turn start at all?" is answered by the current admission calculation, so a snoozed
+    /// lane's retained epoch can never unlock a turn on its own.
     private func agentSessionLinkAutoWakeAttemptIsStillEligible(
         _ attempt: AgentSessionLinkAutoWakeAttempt,
         session: TabSession
     ) -> Bool {
-        guard let snapshot = agentSessionLinkPassiveNoticesBySessionID[attempt.observerEndpoint.sessionID],
+        guard sessions[attempt.observerEndpoint.tabID] === session,
+              agentSessionLinkObserverEndpoint(tabID: attempt.observerEndpoint.tabID)
+              == attempt.observerEndpoint,
+              let snapshot = agentSessionLinkPassiveNoticesBySessionID[attempt.observerEndpoint.sessionID],
               snapshot.observerEndpoint == attempt.observerEndpoint,
-              snapshot.queueEpoch == attempt.queueEpoch
+              snapshot.queueEpoch == attempt.queueEpoch,
+              snapshot.isDeliverable,
+              snapshot.hasDeliverableContent
         else { return false }
-        // Live selection: this is the last gate a wake crosses before the provider transport, so a
-        // lane the user deselected a moment ago must be gone from it whether or not the projection
-        // has caught up.
-        let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
-        if !attempt.humanRearmEpochs.isEmpty {
-            for (reference, epoch) in attempt.humanRearmEpochs {
-                guard let lane = selectedLanes[reference],
-                      lane.targetTurnIsLocalUser,
-                      lane.targetLocalInputEpoch == epoch,
-                      epoch > (session.agentSessionLinkConsumedTargetLocalEpochs[reference] ?? 0)
-                else { return false }
-            }
-            return true
-        }
-        guard !session.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction else { return false }
-        return snapshot.entries.contains { selectedLanes[$0.reference] != nil }
-            || agentSessionLinkOverflowAloneMayWake(snapshot, selectedLanes: selectedLanes)
+        let admission = agentSessionLinkAutoWakeAdmission(
+            snapshot,
+            session: session,
+            endpoint: attempt.observerEndpoint
+        )
+        guard admission.hasAdmissionBasis else { return false }
+        guard session.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction else { return true }
+        return !admission.freshAdmittingHumanEpochs.isEmpty
     }
 
     /// Whether an undispatchable observer is merely busy rather than gone.

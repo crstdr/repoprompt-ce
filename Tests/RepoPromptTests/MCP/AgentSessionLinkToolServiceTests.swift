@@ -58,6 +58,28 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
         XCTAssertEqual(AgentSessionLinkMCPToolService.markDoneKeys, ["op", "session_id"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.setWaitingOnKeys, ["op", "summary", "clear"])
+        XCTAssertEqual(
+            AgentSessionLinkMCPToolService.snoozeAutoWakeKeys,
+            ["op", "session_id", "duration_seconds", "clear"]
+        )
+        // The duration is a snooze field only: every other operation would silently ignore it, and
+        // accepting it there would advertise a bound that does nothing.
+        for keys in [
+            AgentSessionLinkMCPToolService.listKeys,
+            AgentSessionLinkMCPToolService.pollKeys,
+            AgentSessionLinkMCPToolService.waitKeys,
+            AgentSessionLinkMCPToolService.readKeys,
+            AgentSessionLinkMCPToolService.sendKeys,
+            AgentSessionLinkMCPToolService.markDoneKeys,
+            AgentSessionLinkMCPToolService.setWaitingOnKeys
+        ] {
+            XCTAssertFalse(keys.contains("duration_seconds"))
+        }
+        // Snooze names exactly one lane and composes nothing.
+        XCTAssertTrue(
+            AgentSessionLinkMCPToolService.snoozeAutoWakeKeys
+                .isDisjoint(with: ["session_ids", "summary", "message", "idempotency_key", "delivery"])
+        )
         XCTAssertFalse(AgentSessionLinkMCPToolService.setWaitingOnKeys.contains("session_id"))
         // `send` names exactly one target and never fans out; accepting `session_ids` would make one
         // invocation deliver several messages.
@@ -465,10 +487,311 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertNil(fixture.host.waitingOn)
     }
 
+    // MARK: - snooze_auto_wake
+
+    /// Arguments are refused before anything is authorized, and the two forms are exclusive.
+    func testSnoozeArgumentsAreStrictAboutTypeRangeAndMutualExclusion() throws {
+        // An omitted duration is the documented ten minutes, not "until cleared".
+        XCTAssertEqual(
+            try AgentSessionLinkMCPToolService.parseSnoozeCommand(["op": .string("snooze_auto_wake")]),
+            .set(durationSeconds: 600)
+        )
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(nil), 600)
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(60)), 60)
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(3600)), 3600)
+
+        // Out of range, and the two encodings that would otherwise be silently coerced: a string
+        // numeral and a fractional one.
+        for rejected: Value in [.int(59), .int(3601), .int(0), .string("600"), .double(600.5), .bool(true)] {
+            XCTAssertThrowsError(
+                try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(rejected)
+            ) { error in
+                XCTAssertTrue(
+                    "\(error)".contains("must be an integer from 60 through 3600"),
+                    "\(rejected)"
+                )
+            }
+        }
+
+        XCTAssertEqual(
+            try AgentSessionLinkMCPToolService.parseSnoozeCommand(["clear": .bool(true)]),
+            .clear
+        )
+        // `clear: false` is simply "not a clear", so it still snoozes for the default horizon.
+        XCTAssertEqual(
+            try AgentSessionLinkMCPToolService.parseSnoozeCommand([
+                "clear": .bool(false),
+                "duration_seconds": .int(900)
+            ]),
+            .set(durationSeconds: 900)
+        )
+        XCTAssertThrowsError(
+            try AgentSessionLinkMCPToolService.parseSnoozeCommand(["clear": .string("true")])
+        ) { error in
+            XCTAssertTrue("\(error)".contains("clear must be a Boolean"))
+        }
+        // Asking for both is a caller bug rather than a precedence question the service resolves.
+        XCTAssertThrowsError(
+            try AgentSessionLinkMCPToolService.parseSnoozeCommand([
+                "clear": .bool(true),
+                "duration_seconds": .int(600)
+            ])
+        ) { error in
+            XCTAssertTrue(
+                "\(error)".contains("either clear: true or duration_seconds, not both")
+            )
+        }
+    }
+
+    /// The mutation is routed with the generation-qualified reference the *lease* proved, attributed
+    /// to the agent, and every result variant is rendered on the wire.
+    func testSnoozeRoutesTheExactLeaseGenerationAsAgentOriginAndRendersEveryResult() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let liveReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(liveReference)
+        let expiresAt = Date(timeIntervalSince1970: 4000)
+        let projection = AgentSessionLinkAutoWakeSnoozeProjection(
+            expiresAt: expiresAt,
+            remainingSeconds: 1200,
+            origin: .agent
+        )
+        fixture.host.queuedSnoozeMutationResults = [
+            .success(.init(change: .snoozed, projection: projection, currentDispatchAlreadyStarted: false)),
+            .success(.init(change: .extended, projection: projection, currentDispatchAlreadyStarted: false)),
+            .success(.init(
+                change: .alreadySnoozed,
+                projection: projection,
+                currentDispatchAlreadyStarted: true
+            )),
+            .success(.init(change: .cleared, projection: nil, currentDispatchAlreadyStarted: false)),
+            .success(.init(change: .alreadyClear, projection: nil, currentDispatchAlreadyStarted: false))
+        ]
+
+        let expected: [(args: [String: Value], result: String, snoozed: Bool, tooLate: Bool)] = [
+            (["op": .string("snooze_auto_wake"), "session_id": .string(fixture.target.sessionID.uuidString)], "snoozed", true, false),
+            ([
+                "op": .string("snooze_auto_wake"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "duration_seconds": .int(1200)
+            ], "extended", true, false),
+            ([
+                "op": .string("snooze_auto_wake"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "duration_seconds": .int(60)
+            ], "already_snoozed", true, true),
+            ([
+                "op": .string("snooze_auto_wake"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "clear": .bool(true)
+            ], "cleared", false, false),
+            ([
+                "op": .string("snooze_auto_wake"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "clear": .bool(true)
+            ], "already_clear", false, false)
+        ]
+
+        for expectation in expected {
+            let value = try await fixture.service.execute(args: expectation.args)
+            let object = try XCTUnwrap(value.objectValue)
+            XCTAssertEqual(
+                Set(object.keys),
+                ["result", "session_id", "auto_wake_snooze", "current_dispatch_already_started"]
+            )
+            XCTAssertEqual(object["result"]?.stringValue, expectation.result)
+            XCTAssertEqual(
+                object["session_id"]?.stringValue,
+                fixture.target.sessionID.uuidString
+            )
+            XCTAssertEqual(
+                object["current_dispatch_already_started"]?.boolValue,
+                expectation.tooLate,
+                expectation.result
+            )
+            if expectation.snoozed {
+                let snooze = try XCTUnwrap(object["auto_wake_snooze"]?.objectValue, expectation.result)
+                XCTAssertEqual(Set(snooze.keys), ["expires_at", "remaining_seconds", "set_by"])
+                XCTAssertEqual(snooze["expires_at"]?.stringValue, AgentMCPToolHelpers.timestamp(expiresAt))
+                XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 1200)
+                XCTAssertEqual(snooze["set_by"]?.stringValue, "agent")
+            } else {
+                // A cleared lane reports the absence explicitly rather than dropping the field.
+                XCTAssertEqual(object["auto_wake_snooze"], .null, expectation.result)
+            }
+        }
+
+        XCTAssertEqual(fixture.host.snoozeMutationCalls.count, expected.count)
+        for call in fixture.host.snoozeMutationCalls {
+            XCTAssertEqual(call.endpoint, fixture.observer.domainEndpoint)
+            XCTAssertEqual(call.targetSessionID, fixture.target.sessionID)
+            // Derived from the authorized lease, never from arguments: the caller named a session,
+            // and only the grant can say which link generation that is.
+            XCTAssertEqual(call.reference, reference)
+            XCTAssertEqual(call.origin, .agent)
+        }
+        XCTAssertEqual(
+            fixture.host.snoozeMutationCalls.map(\.command),
+            [
+                .set(durationSeconds: 600),
+                .set(durationSeconds: 1200),
+                .set(durationSeconds: 60),
+                .clear,
+                .clear
+            ]
+        )
+    }
+
+    /// Refusals never reach the owning session, and the one a caller can act on says so plainly.
+    func testSnoozeRefusesMalformedUnauthorizedAndDeselectedLanes() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("snooze_auto_wake"),
+                "session_id": .string("not-a-uuid")
+            ])
+            XCTFail("snooze_auto_wake must reject a malformed session_id")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("canonical session_id"))
+        }
+
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("snooze_auto_wake"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "minutes": .int(10)
+            ])
+            XCTFail("snooze_auto_wake must reject any field beyond its four")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("does not support 'minutes'"))
+        }
+
+        // An unlinked UUID is refused exactly like a nonexistent one.
+        let unrelated = UUID()
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("snooze_auto_wake"),
+                "session_id": .string(unrelated.uuidString)
+            ])
+            XCTFail("snooze_auto_wake must not reach an unauthorized target")
+        } catch let error as MCPError {
+            XCTAssertEqual(
+                "\(error)",
+                "\(AgentSessionLinkMCPToolService.denialError(targetSessionID: unrelated))"
+            )
+        }
+        XCTAssertTrue(
+            fixture.host.snoozeMutationCalls.isEmpty,
+            "every refusal above is decided before the owning session is asked"
+        )
+
+        // A lane the user has not selected for Auto-wake has nothing to suppress, and the caller is
+        // told which condition it failed rather than getting the uniform denial.
+        fixture.host.snoozeMutationResult = .failure(.laneNotEffectivelySelected)
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("snooze_auto_wake"),
+                "session_id": .string(fixture.target.sessionID.uuidString)
+            ])
+            XCTFail("a deselected lane must not report a snooze it did not take")
+        } catch let error as MCPError {
+            XCTAssertTrue(
+                "\(error)".contains(
+                    "Auto-wake snooze requires this outbound lane to be currently selected."
+                )
+            )
+        }
+
+        // A link revoked between authorization and mutation reuses the indistinguishable denial.
+        fixture.host.snoozeMutationResult = .failure(.staleReference)
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("snooze_auto_wake"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "clear": .bool(true)
+            ])
+            XCTFail("a stale generation must not report success")
+        } catch let error as MCPError {
+            XCTAssertEqual(
+                "\(error)",
+                "\(AgentSessionLinkMCPToolService.denialError(targetSessionID: fixture.target.sessionID))"
+            )
+        }
+    }
+
+    /// `poll` is where the state is observable, and it is all-or-nothing.
+    func testPollCarriesTheObserverLocalSnoozeAndDeniesWhenItCannotBeResolved() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let liveReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(liveReference)
+        let expiresAt = Date(timeIntervalSince1970: 5000)
+        fixture.host.snoozeProjectionResult = .success(AgentSessionLinkAutoWakeSnoozeProjection(
+            expiresAt: expiresAt,
+            remainingSeconds: 540,
+            origin: .user
+        ))
+
+        let singleValue = try await fixture.service.execute(args: [
+            "op": .string("poll"),
+            "session_id": .string(fixture.target.sessionID.uuidString)
+        ])
+        let single = try XCTUnwrap(singleValue.objectValue)
+        let snooze = try XCTUnwrap(single["auto_wake_snooze"]?.objectValue)
+        XCTAssertEqual(snooze["expires_at"]?.stringValue, AgentMCPToolHelpers.timestamp(expiresAt))
+        XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 540)
+        XCTAssertEqual(snooze["set_by"]?.stringValue, "user")
+        // Observer-local policy, so it is rendered beside the sanitized target snapshot and never
+        // inside it: another observer of the same target must not see this.
+        XCTAssertNil(try XCTUnwrap(single["snapshot"]?.objectValue)["auto_wake_snooze"])
+        let routed = try XCTUnwrap(fixture.host.snoozeProjectionCalls.first)
+        XCTAssertEqual(routed.reference, reference)
+        XCTAssertEqual(routed.targetSessionID, fixture.target.sessionID)
+
+        let multiValue = try await fixture.service.execute(args: [
+            "op": .string("poll"),
+            "session_ids": .array([.string(fixture.target.sessionID.uuidString)])
+        ])
+        let multi = try XCTUnwrap(multiValue.objectValue)
+        let entry = try XCTUnwrap(multi["targets"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(entry["auto_wake_snooze"]?.objectValue?["set_by"]?.stringValue, "user")
+
+        // An unsnoozed lane says so explicitly, so "not snoozed" is distinguishable from "this build
+        // does not report snoozes".
+        fixture.host.snoozeProjectionResult = .success(nil)
+        let unsnoozedValue = try await fixture.service.execute(args: [
+            "op": .string("poll"),
+            "session_id": .string(fixture.target.sessionID.uuidString)
+        ])
+        let unsnoozed = try XCTUnwrap(unsnoozedValue.objectValue)
+        XCTAssertEqual(unsnoozed["auto_wake_snooze"], .null)
+
+        // A lane whose exact projection cannot be resolved denies the whole call rather than
+        // returning authorized rows beside a stale one.
+        fixture.host.snoozeProjectionResult = .failure(.staleReference)
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("poll"),
+                "session_ids": .array([.string(fixture.target.sessionID.uuidString)])
+            ])
+            XCTFail("an unresolvable lane projection must deny the whole poll")
+        } catch let error as MCPError {
+            XCTAssertEqual(
+                "\(error)",
+                "\(AgentSessionLinkMCPToolService.denialError(targetSessionID: nil))"
+            )
+        }
+    }
+
     func testOperationHelpNamesEverySupportedOperation() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
-        for op in ["list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done", "set_waiting_on"] {
+        for op in [
+            "list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done",
+            "set_waiting_on", "snooze_auto_wake"
+        ] {
             XCTAssertTrue(
                 AgentSessionLinkMCPToolService.supportedOperationsSentence.contains(op),
                 "the supported-operation sentence must name \(op)"
@@ -1038,6 +1361,65 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             lastTranscriptReaderSessionID = readerSessionID
             await duringTranscriptPage?()
             return transcriptPages[candidate.sessionID].map { .success($0) } ?? .failure(.targetLoading)
+        }
+
+        // MARK: Auto-wake snooze
+
+        /// Every snooze call that reached the owning session, with the exact reference and origin the
+        /// service derived. The policy itself belongs to the coordinator suite; this fixture proves
+        /// only what the tool surface routed and rendered.
+        var snoozeMutationCalls: [(
+            endpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetSessionID: UUID,
+            reference: DomainAgentSessionLinkReference,
+            command: AgentSessionLinkAutoWakeSnoozeCommand,
+            origin: AgentSessionLinkAutoWakeSnoozeOrigin
+        )] = []
+        var snoozeProjectionCalls: [(
+            endpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetSessionID: UUID,
+            reference: DomainAgentSessionLinkReference
+        )] = []
+        /// Consumed in order when present, so one test can walk every result variant.
+        var queuedSnoozeMutationResults: [Result<
+            AgentSessionLinkAutoWakeSnoozeMutationOutcome,
+            AgentSessionLinkAutoWakeSnoozeFailure
+        >] = []
+        var snoozeMutationResult: Result<
+            AgentSessionLinkAutoWakeSnoozeMutationOutcome,
+            AgentSessionLinkAutoWakeSnoozeFailure
+        > = .success(AgentSessionLinkAutoWakeSnoozeMutationOutcome(
+            change: .snoozed,
+            projection: nil,
+            currentDispatchAlreadyStarted: false
+        ))
+        var snoozeProjectionResult: Result<
+            AgentSessionLinkAutoWakeSnoozeProjection?,
+            AgentSessionLinkAutoWakeSnoozeFailure
+        > = .success(nil)
+
+        func agentSessionLinkAutoWakeSnoozeProjection(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetSessionID: UUID,
+            expectedReference: DomainAgentSessionLinkReference
+        ) -> Result<AgentSessionLinkAutoWakeSnoozeProjection?, AgentSessionLinkAutoWakeSnoozeFailure> {
+            snoozeProjectionCalls.append((endpoint, targetSessionID, expectedReference))
+            return snoozeProjectionResult
+        }
+
+        func agentSessionLinkMutateAutoWakeSnooze(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetSessionID: UUID,
+            expectedReference: DomainAgentSessionLinkReference,
+            command: AgentSessionLinkAutoWakeSnoozeCommand,
+            origin: AgentSessionLinkAutoWakeSnoozeOrigin
+        ) -> Result<
+            AgentSessionLinkAutoWakeSnoozeMutationOutcome,
+            AgentSessionLinkAutoWakeSnoozeFailure
+        > {
+            snoozeMutationCalls.append((endpoint, targetSessionID, expectedReference, command, origin))
+            guard !queuedSnoozeMutationResults.isEmpty else { return snoozeMutationResult }
+            return queuedSnoozeMutationResults.removeFirst()
         }
 
         func agentSessionLinkSendLiveness(

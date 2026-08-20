@@ -320,6 +320,216 @@ enum AgentMonitorRowActionCopy {
     """
 }
 
+/// One outbound lane's active Auto-wake snooze, exactly as the dashboard renders it.
+///
+/// Deliberately carries the wall-clock expiry rather than a countdown: admission is decided on a
+/// monotonic deadline the UI never sees, and a stored "seconds left" would be wrong the moment the
+/// popover stopped repainting. Everything visible is derived from this instant against an explicit
+/// `now`, so one popover-scoped minute tick renders every row from the same reference.
+struct AgentMonitorAutoWakeSnoozeState: Equatable {
+    let expiresAt: Date
+    let origin: AgentSessionLinkAutoWakeSnoozeOrigin
+
+    /// Rounded **up**, so a snooze with any time left never reads as `0 min left`.
+    func remainingMinutes(now: Date) -> Int {
+        let remaining = expiresAt.timeIntervalSince(now)
+        guard remaining > 0 else { return 0 }
+        return max(1, Int(ceil(remaining / 60)))
+    }
+
+    /// Local expiry, which can be reached before the authoritative removal repaints this row.
+    func hasExpired(now: Date) -> Bool {
+        expiresAt <= now
+    }
+}
+
+/// Copy for the subordinate Auto-wake snooze row, its Clear control, and the snooze/extend menu.
+///
+/// Lives on the model rather than inline in the view for the same reason the row action copy does:
+/// the wording, the minute rounding, and the extension filtering are all things a test can assert
+/// here and cannot assert about a SwiftUI `body`.
+///
+/// The filtering is presentation only. The server applies `max(current deadline, now + duration)`,
+/// so offering a choice that would not move the deadline is not unsafe — it is just a control that
+/// silently does nothing, which is what this hides.
+enum AgentMonitorAutoWakeSnoozeCopy {
+    static let menuLabel = "Snooze Auto-wake\u{2026}"
+    static let clearLabel = "Clear"
+
+    /// Shown between local expiry and the authoritative repaint that removes the row.
+    ///
+    /// Deliberately not "delivering", "sending", or "waking": expiry promises exactly one ordinary
+    /// re-evaluation, and the usual readiness, authority, anti-chain, and suppression gates decide
+    /// whether anything happens at all.
+    static let expired = "Auto-wake snooze expired \u{00B7} Re-evaluating eligibility\u{2026}"
+
+    /// The one informational — not failed — outcome a set or extension can report.
+    static let currentDispatchAlreadyStarted =
+        "Current Auto-wake already started. This snooze applies to later updates."
+
+    static let unavailableMessage = "That oversight link is no longer active."
+
+    /// Row-local wording for each typed routing failure.
+    ///
+    /// A stale generation reads as "no longer active" rather than naming the generation: the row the
+    /// user clicked really is gone, and the replacement is a different lane.
+    static func failureMessage(_ failure: AgentSessionLinkAutoWakeSnoozeFailure) -> String {
+        switch failure {
+        case .observerUnavailable, .staleReference:
+            unavailableMessage
+        case .laneNotEffectivelySelected:
+            "Auto-wake isn\u{2019}t on for this session, so there is nothing to snooze."
+        case .shuttingDown:
+            "RepoPrompt is shutting down, so the Auto-wake snooze wasn\u{2019}t changed."
+        }
+    }
+
+    /// Deliberately says “coalesced” rather than “collected”.
+    ///
+    /// What survives a snooze is the queue's ordinary first-to-final summary per lane, not a replay
+    /// of every intermediate change — and a lane that ends where it started leaves nothing at all.
+    /// “Collected” reads as an exhaustive history the reducer has never kept.
+    static let menuTooltip = """
+    Stops this session\u{2019}s updates from starting an automatic follow-up turn for a while. They stay \
+    coalesced into the pending summary, they still ride along with your next turn, and clearing or \
+    expiry only lets RepoPrompt re-evaluate \u{2014} it never forces a turn.
+    """
+
+    /// Who set the current deadline, phrased for the row rather than for the wire.
+    static func originPhrase(_ origin: AgentSessionLinkAutoWakeSnoozeOrigin) -> String {
+        switch origin {
+        case .user: "you"
+        case .agent: "this agent"
+        }
+    }
+
+    /// `Auto-wake snoozed by you \u{00B7} 9 min left`, or the expiring state once local time passes it.
+    static func subrow(_ state: AgentMonitorAutoWakeSnoozeState, now: Date) -> String {
+        guard !state.hasExpired(now: now) else { return expired }
+        return "Auto-wake snoozed by \(originPhrase(state.origin)) \u{00B7} "
+            + "\(state.remainingMinutes(now: now)) min left"
+    }
+
+    /// Spoken form: who set it, how much is left, and the absolute instant a listener cannot glance
+    /// back at the row to resolve.
+    static func accessibilityValue(
+        _ state: AgentMonitorAutoWakeSnoozeState,
+        now: Date,
+        calendar: Calendar = .current,
+        locale: Locale = .current
+    ) -> String {
+        guard !state.hasExpired(now: now) else { return expired }
+        let minutes = state.remainingMinutes(now: now)
+        let origin = state.origin == .user ? "Set by you." : "Set by this agent."
+        let expiry = expiryPhrase(state.expiresAt, now: now, calendar: calendar, locale: locale)
+        return "\(origin) \(minutes) \(minutes == 1 ? "minute" : "minutes") remaining. \(expiry)"
+    }
+
+    /// `Expires today at 4:20 PM.` — the day word is dropped only when the expiry is not today,
+    /// where the date itself is the unambiguous form.
+    static func expiryPhrase(
+        _ expiresAt: Date,
+        now: Date,
+        calendar: Calendar = .current,
+        locale: Locale = .current
+    ) -> String {
+        let time = expiresAt.formatted(
+            Date.FormatStyle(
+                date: .omitted,
+                time: .shortened,
+                locale: locale,
+                calendar: calendar,
+                timeZone: calendar.timeZone
+            )
+        )
+        guard calendar.isDate(expiresAt, inSameDayAs: now) else {
+            let day = expiresAt.formatted(
+                Date.FormatStyle(
+                    date: .abbreviated,
+                    time: .omitted,
+                    locale: locale,
+                    calendar: calendar,
+                    timeZone: calendar.timeZone
+                )
+            )
+            return "Expires \(day) at \(time)."
+        }
+        return "Expires today at \(time)."
+    }
+
+    static func minutes(forSeconds seconds: Int) -> Int {
+        max(1, seconds / 60)
+    }
+
+    static func setOptionLabel(seconds: Int) -> String {
+        "Snooze for \(minutes(forSeconds: seconds)) minutes"
+    }
+
+    /// `at least`, because the server keeps the later of the two deadlines: the horizon the user
+    /// picks is a floor, never a replacement.
+    static func extendOptionLabel(seconds: Int) -> String {
+        "Extend to at least \(minutes(forSeconds: seconds)) minutes from now"
+    }
+
+    /// The offers worth showing: everything when nothing is snoozed, and only the horizons that
+    /// would actually move an active deadline otherwise.
+    static func availableDurationSeconds(
+        activeExpiry: Date?,
+        now: Date
+    ) -> [Int] {
+        let offers = AgentSessionLinkAutoWakeSnooze.uiDurationSeconds
+        guard let activeExpiry, activeExpiry > now else { return offers }
+        return offers.filter { now.addingTimeInterval(TimeInterval($0)) > activeExpiry }
+    }
+
+    static func actionLabel(
+        displayName: String,
+        seconds: Int,
+        isExtension: Bool
+    ) -> String {
+        isExtension
+            ? "Extend Auto-wake snooze for \(displayName) to at least "
+            + "\(minutes(forSeconds: seconds)) minutes from now"
+            : "Snooze Auto-wake for \(displayName) for \(minutes(forSeconds: seconds)) minutes"
+    }
+
+    static func menuAccessibilityLabel(displayName: String) -> String {
+        "Snooze Auto-wake for \(displayName)"
+    }
+
+    static func clearActionLabel(displayName: String) -> String {
+        "Clear Auto-wake snooze for \(displayName)"
+    }
+}
+
+/// One row's persistent local feedback.
+///
+/// Widened from a bare string only far enough to tell an operation that **failed** apart from the
+/// approved informational notice that a set succeeded too late to affect the call already running.
+/// Both are row-local presentation: neither is authority, and neither survives the row.
+enum AgentMonitorRowFeedback: Equatable {
+    case failure(String)
+    case notice(String)
+
+    var message: String {
+        switch self {
+        case let .failure(message), let .notice(message): message
+        }
+    }
+
+    /// Whether this row-local message reports that something went wrong.
+    ///
+    /// The distinction has to be read somewhere or the two cases are the same type: it selects the
+    /// VoiceOver announcement priority, so a successful “too late to cancel” notice does not
+    /// interrupt like a failure does.
+    var isFailure: Bool {
+        switch self {
+        case .failure: true
+        case .notice: false
+        }
+    }
+}
+
 /// Freshness copy in the three deterministic forms the dashboard needs: compact calendar-aware
 /// visible text, expanded accessibility wording, and a full absolute timestamp for hover detail.
 ///
@@ -512,6 +722,18 @@ struct AgentMonitorPillProps: Equatable {
         /// acknowledged it?”, and their clearing rules differ.
         let hasUnreadActivity: Bool
         let targetRoute: AgentSessionDeepLinkRoute?
+        /// This lane's active Auto-wake snooze, or `nil` when it is not snoozed.
+        ///
+        /// State only: the row's controls act through the runtime bridge and render whatever the next
+        /// authoritative projection says, so nothing here is a closure, a busy flag, or a result the
+        /// view could set optimistically.
+        let autoWakeSnooze: AgentMonitorAutoWakeSnoozeState?
+        /// Whether this lane could currently admit an automatic wake at all — the observer's master
+        /// setting, or this target's own granular selection.
+        ///
+        /// It gates the set/extend offers and nothing else: a deselected lane that is still snoozed
+        /// must remain clearable, which is why Clear is not gated on it.
+        let isAutoWakeEffectivelySelected: Bool
 
         init(
             linkID: UUID,
@@ -524,7 +746,9 @@ struct AgentMonitorPillProps: Equatable {
             lastActivityAt: Date? = nil,
             triageState: AgentMonitorTriageState = .active,
             hasUnreadActivity: Bool = false,
-            targetRoute: AgentSessionDeepLinkRoute? = nil
+            targetRoute: AgentSessionDeepLinkRoute? = nil,
+            autoWakeSnooze: AgentMonitorAutoWakeSnoozeState? = nil,
+            isAutoWakeEffectivelySelected: Bool = false
         ) {
             self.linkID = linkID
             self.generation = generation
@@ -537,10 +761,50 @@ struct AgentMonitorPillProps: Equatable {
             self.triageState = triageState
             self.hasUnreadActivity = hasUnreadActivity
             self.targetRoute = targetRoute
+            self.autoWakeSnooze = autoWakeSnooze
+            self.isAutoWakeEffectivelySelected = isAutoWakeEffectivelySelected
+        }
+
+        /// The same row carrying observer-local Auto-wake policy.
+        ///
+        /// Applied where the authoritative link projection is received rather than built into it: the
+        /// policy lives on the exact observer session, not in the link authority, and the two are
+        /// deliberately refreshed on different schedules.
+        func withAutoWakeState(
+            snooze: AgentMonitorAutoWakeSnoozeState?,
+            isEffectivelySelected: Bool
+        ) -> Outbound {
+            guard snooze != autoWakeSnooze
+                || isEffectivelySelected != isAutoWakeEffectivelySelected
+            else {
+                return self
+            }
+            return Outbound(
+                linkID: linkID,
+                generation: generation,
+                targetSessionID: targetSessionID,
+                displayName: displayName,
+                providerDisplayName: providerDisplayName,
+                locationLabel: locationLabel,
+                status: status,
+                lastActivityAt: lastActivityAt,
+                triageState: triageState,
+                hasUnreadActivity: hasUnreadActivity,
+                targetRoute: targetRoute,
+                autoWakeSnooze: snooze,
+                isAutoWakeEffectivelySelected: isEffectivelySelected
+            )
         }
 
         var id: UUID {
             linkID
+        }
+
+        /// Generation-qualified row identity, used only to expire row-local view state: a relink
+        /// reuses the link ID under a new generation and must not inherit the retired row's busy
+        /// marker or feedback.
+        var rowKey: String {
+            "\(linkID.uuidString)-\(generation)"
         }
 
         var shortID: String {
@@ -645,6 +909,43 @@ struct AgentMonitorPillProps: Equatable {
         var unlinkActionLabel: String {
             "Unlink oversight of \(displayName)"
         }
+
+        var snoozeMenuAccessibilityLabel: String {
+            AgentMonitorAutoWakeSnoozeCopy.menuAccessibilityLabel(displayName: displayName)
+        }
+
+        var clearSnoozeActionLabel: String {
+            AgentMonitorAutoWakeSnoozeCopy.clearActionLabel(displayName: displayName)
+        }
+
+        /// An elapsed record is not an active snooze here either: the row's expiring state is a
+        /// presentation of the same monotonic deadline admission already treats as inactive.
+        func hasActiveAutoWakeSnooze(now: Date) -> Bool {
+            autoWakeSnooze.map { !$0.hasExpired(now: now) } ?? false
+        }
+
+        /// The horizons worth offering right now: everything when nothing is snoozed, and only the
+        /// ones that would actually move an active deadline otherwise.
+        func availableSnoozeDurationSeconds(now: Date) -> [Int] {
+            AgentMonitorAutoWakeSnoozeCopy.availableDurationSeconds(
+                activeExpiry: autoWakeSnooze?.expiresAt,
+                now: now
+            )
+        }
+
+        func snoozeOptionLabel(seconds: Int, now: Date) -> String {
+            hasActiveAutoWakeSnooze(now: now)
+                ? AgentMonitorAutoWakeSnoozeCopy.extendOptionLabel(seconds: seconds)
+                : AgentMonitorAutoWakeSnoozeCopy.setOptionLabel(seconds: seconds)
+        }
+
+        func snoozeActionLabel(seconds: Int, now: Date) -> String {
+            AgentMonitorAutoWakeSnoozeCopy.actionLabel(
+                displayName: displayName,
+                seconds: seconds,
+                isExtension: hasActiveAutoWakeSnooze(now: now)
+            )
+        }
     }
 
     struct Inbound: Equatable, Identifiable {
@@ -656,6 +957,13 @@ struct AgentMonitorPillProps: Equatable {
 
         var id: UUID {
             linkID
+        }
+
+        /// Generation-qualified row identity, for the same reason `Outbound` carries one: row-local
+        /// view state must expire with the exact row it was created for, and a relink reuses the
+        /// link ID under a new generation.
+        var rowKey: String {
+            "\(linkID.uuidString)-\(generation)"
         }
 
         var shortID: String {

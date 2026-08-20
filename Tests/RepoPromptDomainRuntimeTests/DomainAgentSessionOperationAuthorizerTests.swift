@@ -147,6 +147,9 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .monitorWait: .wait,
             .monitorRead: .read,
             .monitorSend: .sendWhenIdle,
+            // Observer-local admission policy, so it needs the read grant it already holds over the
+            // lane and nothing stronger.
+            .monitorSnoozeAutoWake: .poll,
         ]
         for operation in targetBearingMonitorOperations {
             guard let capability = expected[operation] else {
@@ -326,6 +329,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             [
                 "agent_session_link.list", "agent_session_link.poll", "agent_session_link.wait",
                 "agent_session_link.read", "agent_session_link.send", "agent_session_link.mark_done",
+                "agent_session_link.snooze_auto_wake",
             ]
         )
         for operation in sessionControlOperations where operation.requiredMonitorCapability != nil {
@@ -337,5 +341,15 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
         XCTAssertFalse(DomainAgentSessionTargetOperation.monitorMarkDone.mutatesTarget)
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorMarkDone.requiredMonitorCapability, .poll)
         XCTAssertTrue(DomainAgentSessionTargetOperation.manageCleanup.mutatesTarget)
+        // Snooze names a target because the policy is per-lane, but it never reaches that target: it
+        // must stay a non-observer-scoped, non-mutating `.poll` operation, or it would either be
+        // authorized against the wrong thing or claim an authority it does not use.
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorSnoozeAutoWake.isObserverScoped)
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorSnoozeAutoWake.mutatesTarget)
+        XCTAssertEqual(
+            DomainAgentSessionTargetOperation.monitorSnoozeAutoWake.requiredMonitorCapability,
+            .poll
+        )
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorSnoozeAutoWake.family, .monitor)
     }
 }

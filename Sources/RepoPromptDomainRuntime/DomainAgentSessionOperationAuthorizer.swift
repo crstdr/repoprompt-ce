@@ -24,6 +24,12 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     case monitorRead = "agent_session_link.read"
     case monitorSend = "agent_session_link.send"
     case monitorMarkDone = "agent_session_link.mark_done"
+    /// Observer-local Auto-wake admission policy for one exact outbound lane.
+    ///
+    /// It names a target because the policy is per-lane, but it never reaches that target: nothing
+    /// about the overseen session is read, written, resumed, or notified. The authority it needs is
+    /// therefore the plain read grant the observer already holds over that lane.
+    case monitorSnoozeAutoWake = "agent_session_link.snooze_auto_wake"
 
     package enum Family: String, Hashable, Sendable {
         /// Existing spawn-provenance control and read operations.
@@ -38,7 +44,8 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
              .manageList, .manageGetLog, .manageExtractHandoff,
              .manageResume, .manageStop, .manageCleanup:
             .sessionControl
-        case .monitorList, .monitorPoll, .monitorWait, .monitorRead, .monitorSend, .monitorMarkDone:
+        case .monitorList, .monitorPoll, .monitorWait, .monitorRead, .monitorSend, .monitorMarkDone,
+             .monitorSnoozeAutoWake:
             .monitor
         }
     }
@@ -50,6 +57,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
         case .monitorList:
             true
         case .monitorPoll, .monitorWait, .monitorRead, .monitorSend, .monitorMarkDone,
+             .monitorSnoozeAutoWake,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
              .manageList, .manageGetLog, .manageExtractHandoff,
              .manageResume, .manageStop, .manageCleanup:
@@ -63,7 +71,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     /// capability proof would either invent a target or authorize the wrong one.
     package var requiredMonitorCapability: DomainAgentSessionLinkCapability? {
         switch self {
-        case .monitorPoll, .monitorMarkDone:
+        case .monitorPoll, .monitorMarkDone, .monitorSnoozeAutoWake:
             .poll
         case .monitorWait:
             .wait
@@ -85,7 +93,8 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
         case .runCancel, .runSteer, .runRespond, .manageResume, .manageStop, .manageCleanup, .monitorSend:
             true
         case .runPoll, .runWait, .manageList, .manageGetLog, .manageExtractHandoff,
-             .monitorList, .monitorPoll, .monitorWait, .monitorRead, .monitorMarkDone:
+             .monitorList, .monitorPoll, .monitorWait, .monitorRead, .monitorMarkDone,
+             .monitorSnoozeAutoWake:
             false
         }
     }

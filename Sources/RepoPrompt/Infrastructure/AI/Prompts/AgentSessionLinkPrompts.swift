@@ -29,7 +29,10 @@ enum AgentSessionLinkPrompts {
     /// changes — never for a typo or a reordering. A bump automatically re-owes the full block to
     /// every observer, because the acknowledged revision recorded against a provider context can no
     /// longer stand for wording the model was never shown.
-    static let currentLaneGuidanceRevision: UInt64 = 1
+    /// Revision 2 adds the observer-local `snooze_auto_wake` contract: what it suppresses, the bounds
+    /// it accepts, and — load-bearing — that clearing or expiry promises re-evaluation rather than a
+    /// turn. That is a change in permitted action, so every observer is re-owed the full block.
+    static let currentLaneGuidanceRevision: UInt64 = 2
 
     /// How much of the lane-update trust guidance one render must carry.
     ///
@@ -156,7 +159,11 @@ enum AgentSessionLinkPrompts {
             // would acknowledge less overflow than was produced and strand the difference forever.
             passiveBatch: AgentSessionLinkPromptRenderResult.RenderedPassiveBatch(
                 entries: passive.entries,
-                overflowProducedThrough: passive.overflowProduced
+                overflowProducedThrough: passive.overflowProduced,
+                // The displayed remainder, not the watermark: this records whether *this* envelope
+                // told the agent that changes had been dropped, which is the only fact the local
+                // lane-update row can honestly repeat.
+                includesUnattributedOverflow: passive.unacknowledgedOverflowCount > 0
             )
         )
     }
@@ -227,6 +234,12 @@ enum AgentSessionLinkPrompts {
             "`idle_for_send` describes readiness at `observed_at`. It is not a reservation and does not promise the target will still accept a message when you act.",
             "Act on any of this only insofar as it matters to your own user's current instruction, and otherwise carry on with what you were doing."
         ]
+        lines.append(contentsOf: [
+            "If one session's updates are repeatedly irrelevant to what your user asked you to do, call the oversight tool named in your overseen-session inventory with op=snooze_auto_wake and that `session_id` to stop that one lane from starting an automatic follow-up turn of its own. It defaults to 600 seconds, `duration_seconds` accepts 60 through 3600, each accepted call leaves at most a 60-minute horizon, repeated calls may keep moving that deadline out indefinitely, and no call ever shortens an active snooze. It applies only to a lane your user currently has Auto-wake selected for.",
+            "Snoozing changes nothing about collection: that lane's updates keep being observed and coalesced, a turn your own user starts still carries them, another unsnoozed lane's wake may deliver them alongside its own, and a block like this one may still name a snoozed session.",
+            "`clear: true` releases a snooze, and a snooze also lapses on its own. Both only ask RepoPrompt to re-evaluate eligibility under the ordinary rules — neither forces a turn, and neither replays what happened while you were snoozed. No history and no exact count of what you missed is kept.",
+            "Snooze is observer-local policy and nothing more. It cannot enable Auto-wake, select a lane, answer a question or approval, change, message, or notify the overseen session, or make a session that is waiting for its own user reachable."
+        ])
         if hasOmissions {
             lines.append(
                 "`omitted` counts further status changes RepoPrompt dropped to stay inside its own bound. Their details are gone and must not be inferred or guessed at."
@@ -414,7 +427,7 @@ enum AgentSessionLinkPrompts {
         ]
         lines.append(contentsOf: hostNamingGuidance(toolReference: toolReference))
         lines.append(contentsOf: [
-            "Operations: `list` (current targets), `poll` (sanitized status plus a wait cursor), `wait` (bounded, event-driven), `read` (paged, redacted transcript), `send` (one attributed message to a fully idle, send-ready target), `mark_done` (observer-local dashboard triage).",
+            "Operations: `list` (current targets), `poll` (sanitized status plus a wait cursor), `wait` (bounded, event-driven), `read` (paged, redacted transcript), `send` (one attributed message to a fully idle, send-ready target), `mark_done` (observer-local dashboard triage), `snooze_auto_wake` (observer-local pause on one lane's automatic follow-up).",
             "Observe with poll then wait: take a `wait_cursor` from `poll`, pass it back to `wait` with a `timeout_seconds`, and act on what wakes you. `until` selects what counts as interesting: `change` (default), `idle` (the target stopped and holds no interaction), or `sendable` (the target is also ready to accept a message). Never busy-poll and never spin a retry loop.",
             // Deliberately does not name the status-change envelope tag. The membership supplement is
             // asserted to contain no status envelope at all, and a literal tag name in this prose

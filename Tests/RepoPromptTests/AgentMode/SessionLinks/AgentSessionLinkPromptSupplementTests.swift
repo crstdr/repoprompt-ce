@@ -448,6 +448,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         ).lowerBound
         XCTAssertLessThan(membershipIndex, statusIndex)
         XCTAssertEqual(rendered.passiveBatch?.entries.count, 1)
+        XCTAssertEqual(rendered.passiveBatch?.includesUnattributedOverflow, false)
     }
 
     /// A queue that dropped changes and kept no entry still has something true to say, and saying it
@@ -481,6 +482,109 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         // The receipt acknowledges what was produced, not the remainder the envelope displays.
         XCTAssertEqual(rendered.passiveBatch?.entries.count, 0)
         XCTAssertEqual(rendered.passiveBatch?.overflowProducedThrough, 5)
+        // The local-display fact is the remainder, not the watermark: this envelope did disclose an
+        // omission, so the accepted row may say so.
+        XCTAssertEqual(rendered.passiveBatch?.includesUnattributedOverflow, true)
+    }
+
+    /// The disclosed-omission fact tracks what the envelope showed, not the absolute watermark. Once
+    /// every dropped change has been acknowledged the envelope shows `omitted="0"`, and a row that
+    /// still claimed changes were dropped would be repeating an omission the agent was already told
+    /// about on an earlier turn.
+    func testAFullyAcknowledgedWatermarkDisclosesNoOmission() {
+        let rendered = AgentSessionLinkPrompts.rendered(
+            AgentSessionLinkPromptRenderRequest(
+                membershipKind: nil,
+                inventory: inventory(items: []),
+                passiveNotices: passiveSnapshot(
+                    entries: [passiveEntry(
+                        "8B91C0E0-0000-0000-0000-00000000E572",
+                        from: .running,
+                        to: .idle
+                    )],
+                    overflow: 0,
+                    overflowProduced: 5
+                ),
+                toolReference: "agent_session_link"
+            )
+        )
+
+        XCTAssertTrue(rendered.fragment.contains("omitted=\"0\""))
+        XCTAssertEqual(rendered.passiveBatch?.overflowProducedThrough, 5)
+        XCTAssertEqual(rendered.passiveBatch?.includesUnattributedOverflow, false)
+    }
+
+    /// The lane block teaches the snooze contract, and teaches it as a re-evaluation promise.
+    ///
+    /// Every clause here is one a model can act on wrongly: a lifetime cap it does not have, a
+    /// shortening it cannot perform, a delivery guarantee expiry does not make, or a replay of missed
+    /// activity that does not exist.
+    func testLaneGuidanceTeachesTheSnoozeBoundsAndReevaluationOnlyContract() {
+        let rendered = AgentSessionLinkPrompts.rendered(
+            AgentSessionLinkPromptRenderRequest(
+                membershipKind: nil,
+                inventory: inventory(items: []),
+                passiveNotices: passiveSnapshot(entries: [passiveEntry(
+                    "8B91C0E0-0000-0000-0000-00000000E572",
+                    from: .running,
+                    to: .idle
+                )]),
+                toolReference: "agent_session_link",
+                laneGuidanceMode: .full
+            )
+        ).fragment
+
+        XCTAssertTrue(rendered.contains("op=snooze_auto_wake"))
+        XCTAssertTrue(rendered.contains("defaults to 600 seconds"))
+        XCTAssertTrue(rendered.contains("60 through 3600"))
+        XCTAssertTrue(rendered.contains("at most a 60-minute horizon"))
+        XCTAssertTrue(rendered.contains("no call ever shortens an active snooze"))
+        XCTAssertTrue(rendered.contains("currently has Auto-wake selected for"))
+        // Collection is unaffected, and the lane can still be delivered by other means.
+        XCTAssertTrue(rendered.contains("keep being observed and coalesced"))
+        XCTAssertTrue(rendered.contains("another unsnoozed lane"))
+        // The promise, stated as re-evaluation rather than delivery.
+        XCTAssertTrue(rendered.contains("re-evaluate eligibility under the ordinary rules"))
+        XCTAssertTrue(rendered.contains("neither forces a turn"))
+        XCTAssertTrue(rendered.contains("No history and no exact count of what you missed is kept"))
+        // The negative list: a snooze is not a way to reach the target or to widen this session's
+        // own authority.
+        XCTAssertTrue(rendered.contains("It cannot enable Auto-wake"))
+        XCTAssertTrue(rendered.contains("waiting for its own user"))
+        // A wording change this load-bearing has to re-owe the block, so the revision must be past
+        // the original one.
+        XCTAssertGreaterThanOrEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 2)
+    }
+
+    /// The reminder form stays one line: the full contract is owed once per provider context, not on
+    /// every delivery.
+    func testReminderLaneGuidanceDoesNotRepeatTheSnoozeContract() {
+        let rendered = AgentSessionLinkPrompts.rendered(
+            AgentSessionLinkPromptRenderRequest(
+                membershipKind: nil,
+                inventory: inventory(items: []),
+                passiveNotices: passiveSnapshot(entries: [passiveEntry(
+                    "8B91C0E0-0000-0000-0000-00000000E572",
+                    from: .running,
+                    to: .idle
+                )]),
+                toolReference: "agent_session_link",
+                laneGuidanceMode: .reminder
+            )
+        ).fragment
+
+        XCTAssertFalse(rendered.contains("snooze_auto_wake"))
+        XCTAssertTrue(rendered.contains("Lane update: informational context"))
+    }
+
+    /// Membership guidance names the operation so the agent knows it exists at all.
+    func testMembershipGuidanceNamesTheSnoozeOperation() {
+        let rendered = AgentSessionLinkPrompts.render(
+            kind: .inventory,
+            inventory: inventory(items: [item("8B91C0E0-0000-0000-0000-00000000E572")]),
+            toolReference: "agent_session_link"
+        )
+        XCTAssertTrue(rendered.contains("`snooze_auto_wake` (observer-local pause"))
     }
 
     /// Membership guidance states always-on awareness as a fact and teaches no switch for it.

@@ -99,11 +99,21 @@ struct AgentMonitorPopoverView: View {
     @State private var isWorking = false
     /// One busy gate per generation-qualified row. Navigation, triage, acknowledgement, and durable
     /// Unlink must not race from the same stale projection.
-    @State private var busyLinkIDs: Set<UUID> = []
-    /// Persistent per-row feedback for routing, triage, acknowledgement, and durable Unlink failures.
-    @State private var actionFailureByLinkID: [UUID: String] = [:]
+    ///
+    /// Keyed by `rowKey` rather than by link ID, and that is the whole point: a relink reuses the
+    /// link ID under a new generation, so an action that completes late must write the *retired*
+    /// row's key — which nothing renders any more — instead of clearing the replacement's busy
+    /// marker or stamping it with a failure that belongs to the row the user already lost.
+    @State private var busyRowKeys: Set<String> = []
+    /// Persistent per-row feedback for routing, triage, acknowledgement, durable Unlink, and
+    /// Auto-wake snooze outcomes. Same generation-qualified keying, for the same reason.
+    ///
+    /// Widened from a bare string only far enough to tell a failure apart from the one informational
+    /// notice a *successful* snooze can carry; the dictionary remains the single row-local message
+    /// surface, and none of it is authority.
+    @State private var rowFeedbackByRowKey: [String: AgentMonitorRowFeedback] = [:]
     @State private var isRetryingSave = false
-    /// Observer-level, deliberately not part of `busyLinkIDs`: the passive preference covers every
+    /// Observer-level, deliberately not part of `busyRowKeys`: the passive preference covers every
     /// outbound link at once, so gating it on a row would disable an unrelated row's actions.
     @State private var isChangingAutoWake = false
     @State private var autoWakeFailureMessage: String?
@@ -143,6 +153,12 @@ struct AgentMonitorPopoverView: View {
 
     private var sortedOutbound: [AgentMonitorPillProps.Outbound] {
         AgentMonitorDashboardSortPolicy.sorted(props.outbound, mode: sortMode)
+    }
+
+    /// Generation-qualified identity of every visible row, watched so retired rows can drop their
+    /// local presentation state.
+    private var visibleRowKeys: [String] {
+        props.outbound.map(\.rowKey) + props.inbound.map(\.rowKey)
     }
 
     /// Fixed, collision-free identity tokens computed across the whole visible set, so two rows
@@ -191,6 +207,11 @@ struct AgentMonitorPopoverView: View {
         }
         .frame(width: popoverWidth, height: popoverHeight)
         .accessibilityElement(children: .contain)
+        // A relink reuses the link ID under a new generation, so row-local busy and feedback state
+        // has to expire with the exact row it was created for rather than following the identifier.
+        .onChange(of: visibleRowKeys) { _, _ in
+            pruneRetiredRowState()
+        }
         .onDisappear {
             // Presentation only. The revocation itself already committed and stays committed.
             undoExpiryTask?.cancel()
@@ -285,7 +306,7 @@ struct AgentMonitorPopoverView: View {
     }
 
     private func outboundRow(_ row: AgentMonitorPillProps.Outbound, now: Date) -> some View {
-        let isBusy = busyLinkIDs.contains(row.linkID)
+        let isBusy = busyRowKeys.contains(row.rowKey)
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 AgentMonitorStatusIndicator(status: row.status, fontPreset: fontPreset)
@@ -327,17 +348,91 @@ struct AgentMonitorPopoverView: View {
                     .fixedSize()
                     .hoverTooltip(row.activityTooltip, .top)
             }
-            if let message = actionFailureByLinkID[row.linkID] {
-                messageText(message)
+            snoozeRow(row, now: now, isBusy: isBusy)
+            if let feedback = rowFeedbackByRowKey[row.rowKey] {
+                messageText(feedback.message)
             }
         }
         .accessibilityElement(children: .contain)
         .accessibilityValue(row.accessibilityDescription)
     }
 
+    /// The subordinate Auto-wake line: current snooze state with its Clear, plus the one compact
+    /// snooze/extend menu.
+    ///
+    /// Rendered only when there is something to say — an active snooze, or a lane that could be
+    /// snoozed — so an unselected, unsnoozed row keeps the two-line shape it has today.
+    @ViewBuilder
+    private func snoozeRow(
+        _ row: AgentMonitorPillProps.Outbound,
+        now: Date,
+        isBusy: Bool
+    ) -> some View {
+        let durations = row.availableSnoozeDurationSeconds(now: now)
+        let offersMenu = row.isAutoWakeEffectivelySelected && !durations.isEmpty
+        if row.autoWakeSnooze != nil || offersMenu {
+            HStack(spacing: 6) {
+                if let snooze = row.autoWakeSnooze {
+                    Text(AgentMonitorAutoWakeSnoozeCopy.subrow(snooze, now: now))
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .accessibilityLabel("Auto-wake snooze")
+                        // Spoken from the same instant the text is drawn from, and deliberately not a
+                        // live region: a minute tick is not news, and announcing every countdown step
+                        // would make the row unusable with VoiceOver.
+                        .accessibilityValue(
+                            AgentMonitorAutoWakeSnoozeCopy.accessibilityValue(snooze, now: now)
+                        )
+                    Button(AgentMonitorAutoWakeSnoozeCopy.clearLabel) {
+                        mutateAutoWakeSnooze(row, command: .clear)
+                    }
+                    .buttonStyle(.plain)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                    .foregroundStyle(Color.accentColor)
+                    .disabled(isBusy)
+                    .accessibilityLabel(row.clearSnoozeActionLabel)
+                }
+                Spacer(minLength: 0)
+                if offersMenu {
+                    snoozeMenu(row, now: now, durations: durations, isBusy: isBusy)
+                }
+            }
+        }
+    }
+
+    /// One compact menu for both the first snooze and every extension.
+    ///
+    /// While a snooze is active it offers only horizons that would actually move the deadline. That
+    /// filtering is presentation: the authority is always the server-side
+    /// `max(current deadline, now + duration)`, which never shortens an active snooze.
+    private func snoozeMenu(
+        _ row: AgentMonitorPillProps.Outbound,
+        now: Date,
+        durations: [Int],
+        isBusy: Bool
+    ) -> some View {
+        Menu {
+            ForEach(durations, id: \.self) { seconds in
+                Button(row.snoozeOptionLabel(seconds: seconds, now: now)) {
+                    mutateAutoWakeSnooze(row, command: .set(durationSeconds: seconds))
+                }
+                .accessibilityLabel(row.snoozeActionLabel(seconds: seconds, now: now))
+            }
+        } label: {
+            Label(AgentMonitorAutoWakeSnoozeCopy.menuLabel, systemImage: "moon.zzz")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(isBusy)
+        .hoverTooltip(AgentMonitorAutoWakeSnoozeCopy.menuTooltip, .top)
+        .accessibilityLabel(row.snoozeMenuAccessibilityLabel)
+    }
+
     /// The row's common actions, promoted out of an overflow menu.
     ///
-    /// They share `busyLinkIDs`, so View, New, Done, and Unlink can never act concurrently against
+    /// They share `busyRowKeys`, so View, New, Done, and Unlink can never act concurrently against
     /// one stale row.
     private func outboundActions(_ row: AgentMonitorPillProps.Outbound, isBusy: Bool) -> some View {
         HStack(spacing: 8) {
@@ -542,7 +637,7 @@ struct AgentMonitorPopoverView: View {
                     // built the other way around.
                     unlinkButton(
                         label: row.unlinkActionLabel,
-                        linkID: row.linkID,
+                        rowKey: row.rowKey,
                         // Inbound recovery re-establishes the direct grant on behalf of the other
                         // session through the same user-level authority that just removed it. It
                         // grants nothing beyond the relationship the user themselves ended.
@@ -573,8 +668,8 @@ struct AgentMonitorPopoverView: View {
                 .hoverTooltip(row.fullID, .top)
                 .accessibilityElement(children: .contain)
                 .accessibilityValue(row.accessibilityDescription)
-                if let message = actionFailureByLinkID[row.linkID] {
-                    messageText(message)
+                if let feedback = rowFeedbackByRowKey[row.rowKey] {
+                    messageText(feedback.message)
                 }
             }
         }
@@ -616,12 +711,12 @@ struct AgentMonitorPopoverView: View {
 
     private func unlinkButton(
         label: String,
-        linkID: UUID,
+        rowKey: String,
         undo: UndoSlot?,
         action: @escaping () async -> AgentMonitorStopOutcome
     ) -> some View {
         Button("Unlink") {
-            performUnlink(linkID: linkID, undo: undo, action: action)
+            performUnlink(rowKey: rowKey, undo: undo, action: action)
         }
         .buttonStyle(.plain)
         .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
@@ -629,7 +724,7 @@ struct AgentMonitorPopoverView: View {
         .padding(.horizontal, 6)
         .padding(.vertical, 2)
         .contentShape(Rectangle())
-        .disabled(busyLinkIDs.contains(linkID))
+        .disabled(busyRowKeys.contains(rowKey))
         .accessibilityLabel(label)
     }
 
@@ -842,45 +937,157 @@ struct AgentMonitorPopoverView: View {
         }
     }
 
-    private func viewAgent(_ row: AgentMonitorPillProps.Outbound) {
-        guard !busyLinkIDs.contains(row.linkID) else { return }
-        guard let route = row.targetRoute else {
-            actionFailureByLinkID[row.linkID] = "That Agent session’s location is unavailable."
+    /// Marks one exact row busy and clears whatever it was last saying.
+    ///
+    /// Callers capture the returned key and use it for the completion, so an action that outlives its
+    /// row settles against the identity it started on and never the replacement's.
+    @discardableResult
+    private func beginRowAction(_ rowKey: String) -> String {
+        busyRowKeys.insert(rowKey)
+        setRowFeedback(rowKey, nil)
+        return rowKey
+    }
+
+    /// Replaces one row's persistent feedback, announcing it exactly once when it is new.
+    ///
+    /// The announcement lives here rather than in `body` on purpose: a timeline tick, a scroll, or
+    /// any other recomputation must not repeat it, and replacing or clearing the value is what resets
+    /// the announcement identity.
+    private func setRowFeedback(_ rowKey: String, _ feedback: AgentMonitorRowFeedback?) {
+        guard rowFeedbackByRowKey[rowKey] != feedback else { return }
+        guard let feedback else {
+            rowFeedbackByRowKey.removeValue(forKey: rowKey)
             return
         }
-        busyLinkIDs.insert(row.linkID)
-        actionFailureByLinkID.removeValue(forKey: row.linkID)
+        rowFeedbackByRowKey[rowKey] = feedback
+        announce(feedback)
+    }
+
+    /// Speaks one row-local outcome once.
+    ///
+    /// A failure interrupts, because the action the user just took did not happen. An informational
+    /// notice does not: “the current wake already started” reports a *successful* snooze and has no
+    /// business preempting whatever VoiceOver is saying.
+    private func announce(_ feedback: AgentMonitorRowFeedback) {
+        let element: Any = if let window = NSApplication.shared.keyWindow {
+            window
+        } else {
+            NSApplication.shared
+        }
+        let priority: NSAccessibilityPriorityLevel = feedback.isFailure ? .high : .medium
+        NSAccessibility.post(
+            element: element,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: feedback.message,
+                .priority: priority.rawValue
+            ]
+        )
+    }
+
+    /// Drops busy markers and feedback for rows whose exact generation is gone.
+    ///
+    /// This is also what collects the state a late completion wrote against a retired key, so the
+    /// two dictionaries stay bounded by what is actually on screen.
+    private func pruneRetiredRowState() {
+        let live = Set(visibleRowKeys)
+        busyRowKeys.formIntersection(live)
+        rowFeedbackByRowKey = rowFeedbackByRowKey.filter { live.contains($0.key) }
+    }
+
+    private func viewAgent(_ row: AgentMonitorPillProps.Outbound) {
+        guard !busyRowKeys.contains(row.rowKey) else { return }
+        guard let route = row.targetRoute else {
+            setRowFeedback(row.rowKey, .failure("That Agent session\u{2019}s location is unavailable."))
+            return
+        }
+        let rowKey = beginRowAction(row.rowKey)
         Task {
             let result = await AppDeepLinkRouter.shared.route(agentSession: route)
-            busyLinkIDs.remove(row.linkID)
+            busyRowKeys.remove(rowKey)
             switch result {
             case .routed:
-                actionFailureByLinkID.removeValue(forKey: row.linkID)
+                setRowFeedback(rowKey, nil)
             case let .workspaceSwitchBlocked(message):
-                let message = message?.trimmingCharacters(in: .whitespacesAndNewlines)
-                actionFailureByLinkID[row.linkID] = if let message, !message.isEmpty {
-                    message
+                let trimmed = message?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let reason: String = if let trimmed, !trimmed.isEmpty {
+                    trimmed
                 } else {
-                    "RepoPrompt couldn’t switch to that Agent session’s workspace."
+                    "RepoPrompt couldn\u{2019}t switch to that Agent session\u{2019}s workspace."
                 }
+                setRowFeedback(rowKey, .failure(reason))
             case .blockedByActiveDifferentSession:
-                actionFailureByLinkID[row.linkID] =
+                setRowFeedback(rowKey, .failure(
                     "That tab is actively running another Agent session. Try again after it finishes."
+                ))
             case .workspaceUnavailable, .tabUnavailable, .sessionUnavailable, .sessionMismatch:
-                actionFailureByLinkID[row.linkID] = "That Agent session is no longer available."
+                setRowFeedback(rowKey, .failure("That Agent session is no longer available."))
+            }
+        }
+    }
+
+    /// Requests one exact lane's Auto-wake snooze change and renders whatever the runtime settles on.
+    ///
+    /// Addressed with the row's own generation-qualified reference, so a stale row cannot authorize a
+    /// mutation against the lane that replaced it. Nothing is applied optimistically: the authoritative
+    /// repaint supplies the new state, and the only thing this records locally is the outcome the row
+    /// has to explain.
+    private func mutateAutoWakeSnooze(
+        _ row: AgentMonitorPillProps.Outbound,
+        command: AgentSessionLinkAutoWakeSnoozeCommand
+    ) {
+        guard !busyRowKeys.contains(row.rowKey) else { return }
+        guard let observerEndpoint = props.endpoint else {
+            setRowFeedback(
+                row.rowKey,
+                .failure(AgentMonitorAutoWakeSnoozeCopy.unavailableMessage)
+            )
+            return
+        }
+        let rowKey = beginRowAction(row.rowKey)
+        let reference = DomainAgentSessionLinkReference(
+            linkID: row.linkID,
+            generation: row.generation
+        )
+        Task {
+            let result = await AgentSessionLinkRuntimeBridge.shared.mutateAutoWakeSnooze(
+                observerEndpoint: observerEndpoint,
+                targetSessionID: row.targetSessionID,
+                expectedReference: reference,
+                command: command,
+                origin: .user
+            )
+            busyRowKeys.remove(rowKey)
+            switch result {
+            case let .success(outcome):
+                // Reported only for a set or extension. A clear that arrives too late removed the
+                // snooze it was asked to remove, so telling the user the current call could not be
+                // retracted would describe a failure that did not happen.
+                let appliesToLaterUpdatesOnly = outcome.currentDispatchAlreadyStarted
+                    && command != .clear
+                setRowFeedback(
+                    rowKey,
+                    appliesToLaterUpdatesOnly
+                        ? .notice(AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted)
+                        : nil
+                )
+            case let .failure(failure):
+                setRowFeedback(
+                    rowKey,
+                    .failure(AgentMonitorAutoWakeSnoozeCopy.failureMessage(failure))
+                )
             }
         }
     }
 
     /// Acknowledges new activity without touching Done, status, or authority.
     private func markSeen(_ row: AgentMonitorPillProps.Outbound) {
-        guard !busyLinkIDs.contains(row.linkID) else { return }
+        guard !busyRowKeys.contains(row.rowKey) else { return }
         guard let observerEndpoint = props.endpoint else {
-            actionFailureByLinkID[row.linkID] = "That oversight link is no longer active."
+            setRowFeedback(row.rowKey, .failure("That oversight link is no longer active."))
             return
         }
-        busyLinkIDs.insert(row.linkID)
-        actionFailureByLinkID.removeValue(forKey: row.linkID)
+        let rowKey = beginRowAction(row.rowKey)
         let reference = DomainAgentSessionLinkReference(
             linkID: row.linkID,
             generation: row.generation
@@ -891,8 +1098,8 @@ struct AgentMonitorPopoverView: View {
                 targetSessionID: row.targetSessionID,
                 expectedReference: reference
             )
-            busyLinkIDs.remove(row.linkID)
-            actionFailureByLinkID[row.linkID] = outcome.failureMessage
+            busyRowKeys.remove(rowKey)
+            setRowFeedback(rowKey, outcome.failureMessage.map(AgentMonitorRowFeedback.failure))
         }
     }
 
@@ -960,13 +1167,12 @@ struct AgentMonitorPopoverView: View {
     }
 
     private func toggleTriage(_ row: AgentMonitorPillProps.Outbound) {
-        guard !busyLinkIDs.contains(row.linkID) else { return }
+        guard !busyRowKeys.contains(row.rowKey) else { return }
         guard let observerEndpoint = props.endpoint else {
-            actionFailureByLinkID[row.linkID] = "That oversight link is no longer active."
+            setRowFeedback(row.rowKey, .failure("That oversight link is no longer active."))
             return
         }
-        busyLinkIDs.insert(row.linkID)
-        actionFailureByLinkID.removeValue(forKey: row.linkID)
+        let rowKey = beginRowAction(row.rowKey)
         let requestedState: AgentMonitorTriageState = row.triageState == .done ? .active : .done
         let reference = DomainAgentSessionLinkReference(
             linkID: row.linkID,
@@ -979,14 +1185,14 @@ struct AgentMonitorPopoverView: View {
                 expectedReference: reference,
                 state: requestedState
             )
-            busyLinkIDs.remove(row.linkID)
-            actionFailureByLinkID[row.linkID] = outcome.failureMessage
+            busyRowKeys.remove(rowKey)
+            setRowFeedback(rowKey, outcome.failureMessage.map(AgentMonitorRowFeedback.failure))
         }
     }
 
     private func unlinkOutbound(_ row: AgentMonitorPillProps.Outbound) {
         performUnlink(
-            linkID: row.linkID,
+            rowKey: row.rowKey,
             undo: props.sessionID.map { observerSessionID in
                 UndoSlot(
                     direction: .outbound,
@@ -1016,18 +1222,17 @@ struct AgentMonitorPopoverView: View {
     /// other path removed it, and offering to recreate a link this click did not end would be a
     /// different decision than the one the user made.
     private func performUnlink(
-        linkID: UUID,
+        rowKey: String,
         undo: UndoSlot?,
         action: @escaping () async -> AgentMonitorStopOutcome
     ) {
-        guard !busyLinkIDs.contains(linkID) else { return }
-        busyLinkIDs.insert(linkID)
-        actionFailureByLinkID.removeValue(forKey: linkID)
+        guard !busyRowKeys.contains(rowKey) else { return }
+        beginRowAction(rowKey)
         Task {
             let outcome = await action()
-            busyLinkIDs.remove(linkID)
+            busyRowKeys.remove(rowKey)
             // A failed durable removal is still live and still saved, so it must remain visible.
-            actionFailureByLinkID[linkID] = outcome.failureMessage
+            setRowFeedback(rowKey, outcome.failureMessage.map(AgentMonitorRowFeedback.failure))
             if outcome == .stopped, let undo {
                 presentUndo(undo)
             }

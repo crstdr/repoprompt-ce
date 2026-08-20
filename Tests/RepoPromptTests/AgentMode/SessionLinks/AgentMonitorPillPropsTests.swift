@@ -15,7 +15,9 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         lastActivityAt: Date? = nil,
         triageState: AgentMonitorTriageState = .active,
         hasUnreadActivity: Bool = false,
-        targetRoute: AgentSessionDeepLinkRoute? = nil
+        targetRoute: AgentSessionDeepLinkRoute? = nil,
+        autoWakeSnooze: AgentMonitorAutoWakeSnoozeState? = nil,
+        isAutoWakeEffectivelySelected: Bool = false
     ) -> AgentMonitorPillProps.Outbound {
         AgentMonitorPillProps.Outbound(
             linkID: UUID(),
@@ -28,7 +30,9 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             lastActivityAt: lastActivityAt,
             triageState: triageState,
             hasUnreadActivity: hasUnreadActivity,
-            targetRoute: targetRoute
+            targetRoute: targetRoute,
+            autoWakeSnooze: autoWakeSnooze,
+            isAutoWakeEffectivelySelected: isAutoWakeEffectivelySelected
         )
     }
 
@@ -891,5 +895,269 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         let first = AgentMonitorPillProps.Notice(linkID: linkID, generation: 1, message: "a")
         let second = AgentMonitorPillProps.Notice(linkID: linkID, generation: 2, message: "b")
         XCTAssertNotEqual(first.id, second.id)
+    }
+
+    // MARK: - Auto-wake snooze
+
+    private func snooze(
+        minutesFromNow: Double,
+        origin: AgentSessionLinkAutoWakeSnoozeOrigin = .user,
+        now: Date
+    ) -> AgentMonitorAutoWakeSnoozeState {
+        AgentMonitorAutoWakeSnoozeState(
+            expiresAt: now.addingTimeInterval(minutesFromNow * 60),
+            origin: origin
+        )
+    }
+
+    /// Rows carry snooze *state* and nothing else: no closures, no busy flag, no result to render
+    /// optimistically. A default row is unsnoozed and unselected, which is the fail-closed pair.
+    func testOutboundRowsCarryOnlySnoozeStateAndDefaultToNeitherSnoozedNorSelected() {
+        let row = outbound()
+        XCTAssertNil(row.autoWakeSnooze)
+        XCTAssertFalse(row.isAutoWakeEffectivelySelected)
+
+        let now = moment(hour: 16, minute: 11)
+        let updated = row.withAutoWakeState(
+            snooze: snooze(minutesFromNow: 9, origin: .agent, now: now),
+            isEffectivelySelected: true
+        )
+        // Every other field survives the overlay, so a policy repaint cannot drop identity, status,
+        // triage, unread, or routing.
+        XCTAssertEqual(updated.linkID, row.linkID)
+        XCTAssertEqual(updated.generation, row.generation)
+        XCTAssertEqual(updated.targetSessionID, row.targetSessionID)
+        XCTAssertEqual(updated.displayName, row.displayName)
+        XCTAssertEqual(updated.providerDisplayName, row.providerDisplayName)
+        XCTAssertEqual(updated.locationLabel, row.locationLabel)
+        XCTAssertEqual(updated.status, row.status)
+        XCTAssertEqual(updated.lastActivityAt, row.lastActivityAt)
+        XCTAssertEqual(updated.triageState, row.triageState)
+        XCTAssertEqual(updated.hasUnreadActivity, row.hasUnreadActivity)
+        XCTAssertEqual(updated.targetRoute, row.targetRoute)
+        XCTAssertEqual(updated.autoWakeSnooze?.origin, .agent)
+        XCTAssertTrue(updated.isAutoWakeEffectivelySelected)
+        // An unchanged overlay is identity, so repeated publications of the same policy compare equal
+        // and repaint nothing.
+        XCTAssertEqual(
+            updated.withAutoWakeState(
+                snooze: updated.autoWakeSnooze,
+                isEffectivelySelected: true
+            ),
+            updated
+        )
+    }
+
+    /// The subrow names who is responsible for the current deadline and rounds the remainder up, so
+    /// a live snooze never reads as `0 min left`.
+    func testSubrowNamesTheSetterAndRoundsRemainingMinutesUp() {
+        let now = moment(hour: 16, minute: 11)
+        XCTAssertEqual(
+            AgentMonitorAutoWakeSnoozeCopy.subrow(
+                snooze(minutesFromNow: 9, origin: .user, now: now),
+                now: now
+            ),
+            "Auto-wake snoozed by you · 9 min left"
+        )
+        XCTAssertEqual(
+            AgentMonitorAutoWakeSnoozeCopy.subrow(
+                snooze(minutesFromNow: 8.2, origin: .agent, now: now),
+                now: now
+            ),
+            "Auto-wake snoozed by this agent · 9 min left"
+        )
+        // Seconds left is still left.
+        XCTAssertEqual(
+            AgentMonitorAutoWakeSnoozeCopy.subrow(
+                snooze(minutesFromNow: 0.1, origin: .user, now: now),
+                now: now
+            ),
+            "Auto-wake snoozed by you · 1 min left"
+        )
+    }
+
+    /// Local expiry is a presentation state, and it promises exactly what expiry promises.
+    func testExpiredSnoozeSaysEligibilityIsBeingReevaluatedAndNothingStronger() {
+        let now = moment(hour: 16, minute: 11)
+        let elapsed = snooze(minutesFromNow: -1, now: now)
+        XCTAssertTrue(elapsed.hasExpired(now: now))
+        XCTAssertEqual(AgentMonitorAutoWakeSnoozeCopy.subrow(elapsed, now: now), "Auto-wake snooze expired · Re-evaluating eligibility…")
+        XCTAssertEqual(
+            AgentMonitorAutoWakeSnoozeCopy.accessibilityValue(
+                elapsed,
+                now: now,
+                calendar: calendar,
+                locale: locale
+            ),
+            AgentMonitorAutoWakeSnoozeCopy.expired
+        )
+        for overclaim in ["delivering", "sending", "waking", "starting"] {
+            XCTAssertFalse(
+                AgentMonitorAutoWakeSnoozeCopy.expired.lowercased().contains(overclaim),
+                "expiry buys one re-evaluation, never a turn: \(overclaim)"
+            )
+        }
+        // An elapsed record is not an active snooze for the row either, so the menu goes back to
+        // offering every horizon.
+        let row = outbound(autoWakeSnooze: elapsed, isAutoWakeEffectivelySelected: true)
+        XCTAssertFalse(row.hasActiveAutoWakeSnooze(now: now))
+        XCTAssertEqual(
+            row.availableSnoozeDurationSeconds(now: now),
+            AgentSessionLinkAutoWakeSnooze.uiDurationSeconds
+        )
+    }
+
+    /// The spoken form carries the three things the visible row cannot: who set it, how much is
+    /// left, and the absolute instant a listener cannot glance back at the row to resolve.
+    func testSnoozeAccessibilityValueCarriesOriginRoundedTimeAndAbsoluteExpiry() {
+        let now = moment(hour: 16, minute: 11)
+        let state = snooze(minutesFromNow: 9, origin: .agent, now: now)
+        let spoken = AgentMonitorAutoWakeSnoozeCopy.accessibilityValue(
+            state,
+            now: now,
+            calendar: calendar,
+            locale: locale
+        )
+        XCTAssertTrue(spoken.hasPrefix("Set by this agent. 9 minutes remaining."))
+        XCTAssertTrue(spoken.contains("Expires today at \(expectedShortTime(state.expiresAt))."))
+
+        let mine = AgentMonitorAutoWakeSnoozeCopy.accessibilityValue(
+            snooze(minutesFromNow: 1, origin: .user, now: now),
+            now: now,
+            calendar: calendar,
+            locale: locale
+        )
+        XCTAssertTrue(mine.hasPrefix("Set by you. 1 minute remaining."))
+
+        // A snooze that lands tomorrow names the day instead of claiming "today".
+        let tomorrow = AgentMonitorAutoWakeSnoozeCopy.expiryPhrase(
+            now.addingTimeInterval(60 * 60 * 20),
+            now: now,
+            calendar: calendar,
+            locale: locale
+        )
+        XCTAssertFalse(tomorrow.contains("today"))
+    }
+
+    /// Action labels name the target, because four visually identical controls per row are
+    /// indistinguishable in the rotor without it.
+    func testSnoozeActionLabelsNameTheTargetAndDistinguishSettingFromExtending() {
+        let now = moment(hour: 16, minute: 11)
+        let fresh = outbound(isAutoWakeEffectivelySelected: true)
+        XCTAssertEqual(fresh.snoozeMenuAccessibilityLabel, "Snooze Auto-wake for Build API")
+        XCTAssertEqual(fresh.clearSnoozeActionLabel, "Clear Auto-wake snooze for Build API")
+        XCTAssertEqual(
+            fresh.snoozeActionLabel(seconds: 600, now: now),
+            "Snooze Auto-wake for Build API for 10 minutes"
+        )
+        XCTAssertEqual(fresh.snoozeOptionLabel(seconds: 1200, now: now), "Snooze for 20 minutes")
+
+        let active = outbound(
+            autoWakeSnooze: snooze(minutesFromNow: 9, now: now),
+            isAutoWakeEffectivelySelected: true
+        )
+        // `at least`, because the server keeps the later of the two deadlines rather than replacing
+        // the current one.
+        XCTAssertEqual(
+            active.snoozeOptionLabel(seconds: 1200, now: now),
+            "Extend to at least 20 minutes from now"
+        )
+        XCTAssertEqual(
+            active.snoozeActionLabel(seconds: 1200, now: now),
+            "Extend Auto-wake snooze for Build API to at least 20 minutes from now"
+        )
+    }
+
+    /// The menu offers only horizons that would actually move the deadline; a deselected lane keeps
+    /// Clear but loses set/extend.
+    func testSnoozeMenuOffersOnlyDeadlineMovingChoicesAndSurvivesDeselectionOnlyForClear() {
+        let now = moment(hour: 16, minute: 11)
+        XCTAssertEqual(
+            outbound(isAutoWakeEffectivelySelected: true).availableSnoozeDurationSeconds(now: now),
+            [600, 1200, 2400, 3600]
+        )
+        // 25 minutes left: ten and twenty would not move it, forty and sixty would.
+        XCTAssertEqual(
+            outbound(
+                autoWakeSnooze: snooze(minutesFromNow: 25, now: now),
+                isAutoWakeEffectivelySelected: true
+            ).availableSnoozeDurationSeconds(now: now),
+            [2400, 3600]
+        )
+        // At the cap nothing can move it further, so the menu offers nothing at all.
+        XCTAssertTrue(
+            outbound(
+                autoWakeSnooze: snooze(minutesFromNow: 60, now: now),
+                isAutoWakeEffectivelySelected: true
+            ).availableSnoozeDurationSeconds(now: now).isEmpty
+        )
+        // Deselection leaves the state — and therefore Clear — intact; the view gates only the
+        // set/extend offers on selection.
+        let deselected = outbound(
+            autoWakeSnooze: snooze(minutesFromNow: 9, now: now),
+            isAutoWakeEffectivelySelected: false
+        )
+        XCTAssertNotNil(deselected.autoWakeSnooze)
+        XCTAssertFalse(deselected.isAutoWakeEffectivelySelected)
+    }
+
+    /// The one informational outcome a *successful* set can carry, and the failures that are not it.
+    func testRowFeedbackSeparatesTheTooLateNoticeFromRealFailures() {
+        XCTAssertEqual(
+            AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted,
+            "Current Auto-wake already started. This snooze applies to later updates."
+        )
+        let notice = AgentMonitorRowFeedback.notice(
+            AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted
+        )
+        let failure = AgentMonitorRowFeedback.failure(
+            AgentMonitorAutoWakeSnoozeCopy.unavailableMessage
+        )
+        XCTAssertNotEqual(notice, failure)
+        XCTAssertEqual(notice.message, AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted)
+
+        // A retired generation reads as a gone row rather than naming the generation, and the one
+        // condition the user can fix says what to fix.
+        XCTAssertEqual(
+            AgentMonitorAutoWakeSnoozeCopy.failureMessage(.staleReference),
+            AgentMonitorAutoWakeSnoozeCopy.unavailableMessage
+        )
+        XCTAssertEqual(
+            AgentMonitorAutoWakeSnoozeCopy.failureMessage(.observerUnavailable),
+            AgentMonitorAutoWakeSnoozeCopy.unavailableMessage
+        )
+        XCTAssertTrue(
+            AgentMonitorAutoWakeSnoozeCopy.failureMessage(.laneNotEffectivelySelected)
+                .contains("nothing to snooze")
+        )
+        XCTAssertTrue(
+            AgentMonitorAutoWakeSnoozeCopy.failureMessage(.shuttingDown).contains("shutting down")
+        )
+    }
+
+    /// Row-local view state is expired by generation, so a relink cannot inherit the retired row's
+    /// busy marker or feedback.
+    func testRowKeyIsGenerationQualified() {
+        let linkID = UUID()
+        let first = AgentMonitorPillProps.Outbound(
+            linkID: linkID,
+            generation: 1,
+            targetSessionID: targetID,
+            displayName: "Build API",
+            providerDisplayName: nil,
+            locationLabel: nil,
+            status: .idle
+        )
+        let relinked = AgentMonitorPillProps.Outbound(
+            linkID: linkID,
+            generation: 2,
+            targetSessionID: targetID,
+            displayName: "Build API",
+            providerDisplayName: nil,
+            locationLabel: nil,
+            status: .idle
+        )
+        XCTAssertNotEqual(first.rowKey, relinked.rowKey)
+        XCTAssertEqual(first.id, relinked.id, "the identifier itself is deliberately unchanged")
     }
 }

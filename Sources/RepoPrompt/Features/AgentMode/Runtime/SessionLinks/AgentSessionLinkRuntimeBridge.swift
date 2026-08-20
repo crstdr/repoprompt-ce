@@ -134,6 +134,30 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool
 
+    /// Pure Auto-wake snooze read for one exact observer incarnation and link generation.
+    ///
+    /// Observational only: a conforming host must not remove records, arm or cancel tasks, publish
+    /// monitor changes, or re-enter the wake pipeline from it. An elapsed record reports
+    /// `success(nil)` rather than being cleaned up by the read.
+    func agentSessionLinkAutoWakeSnoozeProjection(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        expectedReference: DomainAgentSessionLinkReference
+    ) -> Result<AgentSessionLinkAutoWakeSnoozeProjection?, AgentSessionLinkAutoWakeSnoozeFailure>
+
+    /// Applies one Auto-wake snooze set/extend/clear to the exact live observer incarnation.
+    ///
+    /// Observer-local policy only. It must not apply a receipt, mutate durable selection, touch link
+    /// authority or target state, or start a turn; the coordinator owns the single reevaluation each
+    /// accepted command performs.
+    func agentSessionLinkMutateAutoWakeSnooze(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        expectedReference: DomainAgentSessionLinkReference,
+        command: AgentSessionLinkAutoWakeSnoozeCommand,
+        origin: AgentSessionLinkAutoWakeSnoozeOrigin
+    ) -> Result<AgentSessionLinkAutoWakeSnoozeMutationOutcome, AgentSessionLinkAutoWakeSnoozeFailure>
+
     /// Installs the target-state observation for one endpoint, returning `nil` when the endpoint is
     /// no longer live. `onChange` fires on MainActor for every observation input, including the
     /// non-`@Published` readiness inputs that publish through an explicit revision counter.
@@ -351,6 +375,28 @@ extension AgentSessionLinkEndpointHost {
         for _: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
         false
+    }
+
+    /// Fail-closed defaults for snooze routing.
+    ///
+    /// A host that models no live view model cannot own observer-local policy, so it reports the
+    /// endpoint as unavailable in both directions rather than inventing an empty projection.
+    func agentSessionLinkAutoWakeSnoozeProjection(
+        for _: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID _: UUID,
+        expectedReference _: DomainAgentSessionLinkReference
+    ) -> Result<AgentSessionLinkAutoWakeSnoozeProjection?, AgentSessionLinkAutoWakeSnoozeFailure> {
+        .failure(.observerUnavailable)
+    }
+
+    func agentSessionLinkMutateAutoWakeSnooze(
+        for _: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID _: UUID,
+        expectedReference _: DomainAgentSessionLinkReference,
+        command _: AgentSessionLinkAutoWakeSnoozeCommand,
+        origin _: AgentSessionLinkAutoWakeSnoozeOrigin
+    ) -> Result<AgentSessionLinkAutoWakeSnoozeMutationOutcome, AgentSessionLinkAutoWakeSnoozeFailure> {
+        .failure(.observerUnavailable)
     }
 }
 
@@ -3993,6 +4039,114 @@ final class AgentSessionLinkRuntimeBridge {
                 .union([targetSessionID]),
             observerSessionID: observerSessionID
         )
+    }
+
+    // MARK: Auto-wake snooze routing
+
+    /// Routes one pure Auto-wake snooze read to the live owning observer session.
+    ///
+    /// The bridge stores no snooze state, schedules no deadline, and decides no admission policy. It
+    /// is the trusted *routing* boundary and nothing more: it re-resolves the current directional
+    /// outbound link and re-proves the exact observer endpoint, target session, link ID, and
+    /// generation before the coordinator is allowed to answer.
+    func autoWakeSnoozeProjection(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        expectedReference: DomainAgentSessionLinkReference
+    ) async -> Result<AgentSessionLinkAutoWakeSnoozeProjection?, AgentSessionLinkAutoWakeSnoozeFailure> {
+        switch await resolveAutoWakeSnoozeHost(
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID,
+            expectedReference: expectedReference
+        ) {
+        case let .failure(failure):
+            .failure(failure)
+        case let .success(host):
+            host.agentSessionLinkAutoWakeSnoozeProjection(
+                for: observerEndpoint,
+                targetSessionID: targetSessionID,
+                expectedReference: expectedReference
+            )
+        }
+    }
+
+    /// Routes one exact-reference Auto-wake snooze mutation to the live owning observer session.
+    ///
+    /// Same validation as the read, for the same reason: an unlink/relink reuses the target session
+    /// UUID under a new generation, and an in-place observer rebind keeps the session UUID while
+    /// advancing the endpoint's generations. Only a byte-for-byte current pairing may mutate.
+    func mutateAutoWakeSnooze(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        expectedReference: DomainAgentSessionLinkReference,
+        command: AgentSessionLinkAutoWakeSnoozeCommand,
+        origin: AgentSessionLinkAutoWakeSnoozeOrigin
+    ) async -> Result<AgentSessionLinkAutoWakeSnoozeMutationOutcome, AgentSessionLinkAutoWakeSnoozeFailure> {
+        let host: AgentSessionLinkEndpointHost
+        switch await resolveAutoWakeSnoozeHost(
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID,
+            expectedReference: expectedReference
+        ) {
+        case let .failure(failure):
+            return .failure(failure)
+        case let .success(resolved):
+            host = resolved
+        }
+        // The repaint is deliberately *not* requested here. Set, extend, clear, expiry, and pruning
+        // all change the same map, and only one of them arrives through this method; owning the
+        // refresh here would have left the other three silently stale. The coordinator requests it
+        // from its single map-change commit instead.
+        return host.agentSessionLinkMutateAutoWakeSnooze(
+            for: observerEndpoint,
+            targetSessionID: targetSessionID,
+            expectedReference: expectedReference,
+            command: command,
+            origin: origin
+        )
+    }
+
+    /// Republishes one exact observer's own monitor rows after its local Auto-wake policy changed.
+    ///
+    /// Nothing installs an observation on an *observer's* session — observations are installed per
+    /// overseen target — so no target event will ever carry this change, and `requestUIRefresh` alone
+    /// only re-renders the cached props. Presentation only: it republishes rows and moves no
+    /// authority, reads no target, and never re-enters the wake pipeline.
+    func requestObserverLocalPolicyRepaint(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) {
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: [endpoint])
+    }
+
+    /// The shared fence both snooze entry points cross.
+    ///
+    /// Re-proved *after* the authority hop as well as before it, because a tab that closed or rebound
+    /// while this was suspended must not have policy read or written for the incarnation that
+    /// replaced it.
+    private func resolveAutoWakeSnoozeHost(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        expectedReference: DomainAgentSessionLinkReference
+    ) async -> Result<AgentSessionLinkEndpointHost, AgentSessionLinkAutoWakeSnoozeFailure> {
+        guard !isFrozenForTermination else { return .failure(.shuttingDown) }
+        guard let host,
+              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
+        else { return .failure(.observerUnavailable) }
+        guard await revalidateObserver(endpoint: observerEndpoint) else {
+            return .failure(.observerUnavailable)
+        }
+        let outbound = await authority.projectionInputs(forEndpoint: observerEndpoint).outbound
+        guard outbound.items.contains(where: {
+            $0.linkID == expectedReference.linkID
+                && $0.generation == expectedReference.generation
+                && $0.targetSessionID == targetSessionID
+        }) else {
+            return .failure(.staleReference)
+        }
+        guard !isFrozenForTermination, let host = self.host,
+              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
+        else { return .failure(.observerUnavailable) }
+        return .success(host)
     }
 
     /// Applies one accepted provider receipt to the exact observer's queue.
