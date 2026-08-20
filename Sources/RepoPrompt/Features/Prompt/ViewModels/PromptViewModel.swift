@@ -1353,7 +1353,8 @@ class PromptViewModel: ObservableObject {
     /// and is safe to auto-upgrade to the current canonical version.
     private var previousCanonicalBuiltIns: [UUID: [StoredPrompt]] {
         [
-            architectPrompt.id: [previousArchitectPromptV1, previousArchitectPromptV2, previousArchitectPromptV3, previousArchitectPromptV4]
+            architectPrompt.id: [previousArchitectPromptV1, previousArchitectPromptV2, previousArchitectPromptV3, previousArchitectPromptV4],
+            reviewPrompt.id: [previousReviewPromptV1, previousReviewPromptV2]
         ]
     }
 
@@ -1385,13 +1386,6 @@ class PromptViewModel: ObservableObject {
                 "Use illustrative snippets, interface shapes, sample signatures, state/data shapes, or pseudocode",
                 "The name, kind (for example: class, interface, enum, record, service, module, controller)",
                 "Trade-offs and alternatives"
-            ]
-        ],
-        // Review prompt v1 — these phrases only appear in the original unedited version
-        UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!: [
-            [
-                "Acknowledge what's done particularly well",
-                "Are the commit boundaries logical?"
             ]
         ]
     ]
@@ -1912,6 +1906,96 @@ class PromptViewModel: ObservableObject {
         """
     )
 
+    /// RCA-observed legacy Review canonical. Keep byte-exact for one-way migration only.
+    /// 1,547 characters, 41 lines, 21 tabs; SHA-256 942fb763e8dd9c6c3227656f25137cd27f9dc97d367aa880cf96d734ce9bbaa5.
+    private let previousReviewPromptV1 = StoredPrompt(
+        id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
+        title: "[Review]",
+        content: """
+        You are reviewing code changes with git diffs included in the prompt. Focus on ensuring the changes are sound, clean, intentional, and void of regressions.
+
+        **Primary Review Goals:**
+
+        1. **Verify Change Correctness**:
+        \t- Confirm the changes achieve their intended purpose
+        \t- Check for unintended side effects or regressions
+        \t- Validate edge cases are handled properly
+        \t- Ensure error paths are covered
+
+        2. **Code Quality & Cleanliness**:
+        \t- Is the code readable and self-documenting?
+        \t- Are the changes minimal and focused?
+        \t- Do they follow existing patterns in the codebase?
+        \t- Are there any code smells or anti-patterns?
+
+        3. **Intentionality Check**:
+        \t- Does every change have a clear purpose?
+        \t- Are there any accidental modifications?
+        \t- Is there dead code being introduced?
+        \t- Are the commit boundaries logical?
+
+        4. **Potential Issues to Flag**:
+        \t- Performance degradations
+        \t- Security vulnerabilities
+        \t- Race conditions or concurrency issues
+        \t- Resource leaks (memory, file handles, etc.)
+        \t- Breaking changes to internal APIs
+
+        5. **Constructive Suggestions**:
+        \t- Alternative approaches that might be cleaner
+        \t- Opportunities to reduce complexity
+        \t- Missing test coverage for critical paths
+        \t- Documentation gaps for complex logic
+
+        **Review Format:**
+        - Start with a summary of what the changes accomplish
+        - List any critical issues that must be addressed
+        - Note minor improvements that would enhance quality
+
+        Remember: The git diff shows what changed, and the file contents show the full context. Use both to understand the complete picture.
+        """
+    )
+
+    /// Immediately previous code-owned Review canonical. Keep byte-exact for one-way migration only.
+    /// 1,710 characters, 31 lines, 10 tabs; SHA-256 80d17ed6e6863c9eae7dff113394d5ff39577e2a4a07e25a229c9bb27b417921.
+    private let previousReviewPromptV2 = StoredPrompt(
+        id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
+        title: "[Review]",
+        content: """
+        You are reviewing code changes with git diffs included in the prompt. The git diff shows what changed; the file contents show full context. Use both.
+
+        **Review Criteria:**
+
+        1. **Correctness & Safety**:
+        \t- Do the changes achieve their intended purpose without regressions?
+        \t- Are edge cases and error paths handled?
+        \t- Any security vulnerabilities, race conditions, or resource leaks?
+        \t- Any breaking changes to APIs or contracts?
+
+        2. **Design & Complexity**:
+        \t- Do changes increase coupling or reduce separation of concerns?
+        \t- Is new complexity justified, or can the same result be achieved more simply?
+        \t- Are there DRY violations — duplicated logic that should be extracted?
+        \t- Do abstractions sit at the right level (not too early, not too late)?
+
+        3. **Intentionality**:
+        \t- Does every change have a clear purpose? Flag accidental modifications or dead code.
+        \t- Are the changes minimal and focused, or is scope creeping in?
+
+        **Severity Levels — be disciplined about classification:**
+        - **P0 (Must fix)**: Bugs, data loss, security holes, crashes — things that break correctness.
+        - **P1 (Should fix)**: Design issues that will compound — poor separation of concerns, growing complexity, DRY violations, missing error handling for reachable paths.
+        - **P2 (Consider)**: Style, naming, minor refactoring opportunities, test coverage gaps.
+
+        Most findings should be P1 or P2. Reserve P0 for genuinely broken behavior.
+
+        **Output Format:**
+        1. One-paragraph summary of what the changes accomplish.
+        2. Findings grouped by severity (P0 → P1 → P2), each with: file reference, what's wrong, and a concrete suggestion. Omit empty severity groups.
+        3. If no issues found at a severity level, skip it — don't pad the review.
+        """
+    )
+
     private let reviewPrompt = StoredPrompt(
         id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
         title: "[Review]",
@@ -1921,20 +2005,20 @@ class PromptViewModel: ObservableObject {
         **Review Criteria:**
 
         1. **Correctness & Safety**:
-        	- Do the changes achieve their intended purpose without regressions?
-        	- Are edge cases and error paths handled?
-        	- Any security vulnerabilities, race conditions, or resource leaks?
-        	- Any breaking changes to APIs or contracts?
+            - Do the changes achieve their intended purpose without regressions?
+            - Are edge cases and error paths handled?
+            - Any security vulnerabilities, race conditions, or resource leaks?
+            - Any breaking changes to APIs or contracts?
 
         2. **Design & Complexity**:
-        	- Do changes increase coupling or reduce separation of concerns?
-        	- Is new complexity justified, or can the same result be achieved more simply?
-        	- Are there DRY violations — duplicated logic that should be extracted?
-        	- Do abstractions sit at the right level (not too early, not too late)?
+            - Do changes increase coupling or reduce separation of concerns?
+            - Is new complexity justified, or can the same result be achieved more simply?
+            - Are there DRY violations — duplicated logic that should be extracted?
+            - Do abstractions sit at the right level (not too early, not too late)?
 
         3. **Intentionality**:
-        	- Does every change have a clear purpose? Flag accidental modifications or dead code.
-        	- Are the changes minimal and focused, or is scope creeping in?
+            - Does every change have a clear purpose? Flag accidental modifications or dead code.
+            - Are the changes minimal and focused, or is scope creeping in?
 
         **Severity Levels — be disciplined about classification:**
         - **P0 (Must fix)**: Bugs, data loss, security holes, crashes — things that break correctness.
@@ -2015,13 +2099,15 @@ class PromptViewModel: ObservableObject {
     // MARK: - Initialization
 
     private let settingsManager: SettingsManaging
+    private let promptStorage: PromptStorage
 
     init(
         fileManager: WorkspaceFilesViewModel,
         aiQueriesService: AIQueriesService? = nil,
         apiSettingsViewModel: APISettingsViewModel,
         windowID: Int,
-        settingsManager: SettingsManaging
+        settingsManager: SettingsManaging,
+        promptStorage: PromptStorage = .shared
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2029,6 +2115,7 @@ class PromptViewModel: ObservableObject {
         self.apiSettingsViewModel = apiSettingsViewModel
         self.windowID = windowID
         self.settingsManager = settingsManager
+        self.promptStorage = promptStorage
         codeMapsGloballyDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
 
         // Removed usage of workspaceManager to load an initial prompt
@@ -4339,16 +4426,16 @@ class PromptViewModel: ObservableObject {
     }
 
     func saveStoredPrompts() {
-        PromptStorage.shared.savePrompts(storedPrompts)
+        promptStorage.savePrompts(storedPrompts)
     }
 
     func exportPrompts(to url: URL) throws {
-        try PromptStorage.shared.exportPrompts(to: url, prompts: storedPrompts)
+        try promptStorage.exportPrompts(to: url, prompts: storedPrompts)
     }
 
     func importPrompts(from url: URL) throws -> Int {
-        let external = try PromptStorage.shared.loadExternalPrompts(from: url)
-        let (merged, addedCount) = PromptStorage.shared.mergeExternalPrompts(
+        let external = try promptStorage.loadExternalPrompts(from: url)
+        let (merged, addedCount) = promptStorage.mergeExternalPrompts(
             current: storedPrompts,
             external: external
         )
@@ -4360,11 +4447,20 @@ class PromptViewModel: ObservableObject {
         return addedCount
     }
 
+    /// Returns true only when two strings have the same UTF-8 bytes.
+    /// Swift String equality is canonically equivalent and is therefore too loose for migration gates.
+    static func hasIdenticalUTF8Bytes(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.utf8.elementsEqual(rhs.utf8)
+    }
+
     /// Checks if a persisted built-in prompt matches a known previous canonical version.
     /// Exact matches are preferred so we do not overwrite user-customized prompts.
     private func isKnownPreviousCanonical(_ prompt: StoredPrompt) -> Bool {
         if let previousVariants = previousCanonicalBuiltIns[prompt.id],
-           previousVariants.contains(where: { $0.title == prompt.title && $0.content == prompt.content })
+           previousVariants.contains(where: { previous in
+               Self.hasIdenticalUTF8Bytes(previous.title, prompt.title) &&
+                   Self.hasIdenticalUTF8Bytes(previous.content, prompt.content)
+           })
         {
             return true
         }
@@ -4432,7 +4528,7 @@ class PromptViewModel: ObservableObject {
     }
 
     func loadStoredPrompts() {
-        let loadResult = PromptStorage.shared.loadPrompts()
+        let loadResult = promptStorage.loadPrompts()
 
         // Handle the load result
         let loadedPrompts: [StoredPrompt]
