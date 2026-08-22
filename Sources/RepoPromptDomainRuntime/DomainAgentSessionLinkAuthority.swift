@@ -212,7 +212,8 @@ package actor DomainAgentSessionLinkAuthority {
     package func reserveLink(
         observer: DomainAgentSessionLinkEndpointIdentity,
         target: DomainAgentSessionLinkEndpointIdentity,
-        capabilities: Set<DomainAgentSessionLinkCapability> = DomainAgentSessionLinkCapability.version1
+        capabilities: Set<DomainAgentSessionLinkCapability> = DomainAgentSessionLinkCapability.version1,
+        requiresExistingOutboundLink: Bool = false
     ) -> DomainAgentSessionLinkReservationDisposition {
         guard !isDraining, !isShutDown else { return .rejected(.shuttingDown) }
         guard observer.sessionID != target.sessionID, observer != target else {
@@ -223,6 +224,9 @@ package actor DomainAgentSessionLinkAuthority {
 
         if let existing = activeLink(observer: observer, target: target) {
             return .existing(existing.grant)
+        }
+        guard !requiresExistingOutboundLink || hasActiveOutboundLink(observerEndpoint: observer) else {
+            return .rejected(.observerHasNoActiveOutboundLink)
         }
         if pendingReservations.values.contains(where: { $0.observer == observer && $0.target == target }) {
             return .rejected(.reservationAlreadyPending)
@@ -254,6 +258,7 @@ package actor DomainAgentSessionLinkAuthority {
             observer: observer,
             target: target,
             capabilities: capabilities,
+            requiresExistingOutboundLink: requiresExistingOutboundLink,
             provisionallyInstallsTargetObservation: targets[target.sessionID] == nil
                 && !hasPendingInboundReservation,
             reservedAtAuthorityRevision: advanceAuthorityRevision()
@@ -290,6 +295,12 @@ package actor DomainAgentSessionLinkAuthority {
         if activeLink(observer: reservation.observer, target: reservation.target) != nil {
             pendingReservations.removeValue(forKey: reservation.linkID)
             return .rejected(.endpointDrift)
+        }
+        if reservation.requiresExistingOutboundLink,
+           !hasActiveOutboundLink(observerEndpoint: reservation.observer)
+        {
+            pendingReservations.removeValue(forKey: reservation.linkID)
+            return .rejected(.observerHasNoActiveOutboundLink)
         }
 
         pendingReservations.removeValue(forKey: reservation.linkID)
@@ -364,6 +375,22 @@ package actor DomainAgentSessionLinkAuthority {
         target: DomainAgentSessionLinkEndpointIdentity
     ) -> LinkRecord? {
         links.values.first { $0.grant.observer == observer && $0.grant.target == target }
+    }
+
+    /// Returns the active grant recorded for one exact link generation.
+    ///
+    /// This is a read-only authority lookup for callers that already hold a generation-qualified
+    /// reference. It neither resolves live endpoints nor mints a lease, and a stale generation can
+    /// never observe the grant that replaced it.
+    package func activeGrant(
+        for reference: DomainAgentSessionLinkReference
+    ) -> DomainAgentSessionLinkGrant? {
+        guard let record = links[reference.linkID],
+              record.grant.generation == reference.generation
+        else {
+            return nil
+        }
+        return record.grant
     }
 
     // MARK: - Inventory
@@ -513,6 +540,7 @@ package actor DomainAgentSessionLinkAuthority {
             inbound: inbound,
             outboundTargetEndpoints: outboundTargetEndpoints,
             inboundObserverEndpoints: inboundObserverEndpoints,
+            activeOutboundObserverEndpoints: Set(links.values.map { $0.grant.observer }),
             notices: recentRevocationNotices[endpoint] ?? []
         )
     }

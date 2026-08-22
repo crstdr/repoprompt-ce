@@ -187,12 +187,14 @@ final class AgentSessionLinkRunnerHarness {
                 claimAgentSessionLinkPrompt: { _, dispatchID in
                     MainActor.assumeIsolated {
                         guard let harnessBox else {
-                            return dispatchID.autoWakeID == nil
-                                ? .nothingOwed
-                                : .requiredLaneBatchUnavailable
+                            // Family-first, exactly like the production fence: a reserved-family
+                            // value that does not parse must never degrade to "nothing owed".
+                            return dispatchID.isAutoWakeFamily
+                                ? .requiredLaneBatchUnavailable
+                                : .nothingOwed
                         }
                         let effectiveDispatchID = harnessBox.forcedAutoWakeID.map {
-                            AgentSessionLinkPromptDispatchID.autoWake(wakeID: $0, localInputEpoch: 0)
+                            AgentSessionLinkPromptDispatchID.autoWake(wakeID: $0)
                         } ?? dispatchID
                         return harnessBox.claimStore.claimOutcome(
                             dispatchID: effectiveDispatchID,

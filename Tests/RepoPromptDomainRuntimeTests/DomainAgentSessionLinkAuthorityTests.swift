@@ -141,6 +141,42 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(inventory.items.count, 1)
     }
 
+    func testActiveGrantLookupIsGenerationQualifiedReadOnlyAndEndsAtRevocation() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        let grant = try await activateLink(authority, observer: observer, target: target)
+        let reference = DomainAgentSessionLinkReference(
+            linkID: grant.id,
+            generation: grant.generation
+        )
+        let revisionBeforeLookup = await authority.snapshot().authorityRevision
+
+        let active = await authority.activeGrant(for: reference)
+        let staleGeneration = await authority.activeGrant(for: DomainAgentSessionLinkReference(
+            linkID: grant.id,
+            generation: grant.generation &+ 1
+        ))
+        let unknownLink = await authority.activeGrant(for: DomainAgentSessionLinkReference(
+            linkID: UUID(),
+            generation: grant.generation
+        ))
+        let revisionAfterLookup = await authority.snapshot().authorityRevision
+
+        XCTAssertEqual(active, grant)
+        XCTAssertNil(staleGeneration)
+        XCTAssertNil(unknownLink)
+        XCTAssertEqual(revisionAfterLookup, revisionBeforeLookup)
+
+        _ = await authority.revoke(
+            linkID: grant.id,
+            generation: grant.generation,
+            reason: .userRequested
+        )
+        let afterRevocation = await authority.activeGrant(for: reference)
+        XCTAssertNil(afterRevocation)
+    }
+
     func testSelfMonitorAndUnresolvedBindingsAreRejected() async throws {
         let authority = makeAuthority()
         let sessionID = UUID()
@@ -156,6 +192,50 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let unboundTarget = makeEndpoint(windowID: 2, persistentBindingGeneration: nil)
         let targetRejection = await authority.reserveLink(observer: makeEndpoint(), target: unboundTarget)
         XCTAssertEqual(targetRejection, .rejected(.targetBindingUnresolved))
+    }
+
+    func testExistingOutboundRequirementIsRecheckedAtomicallyAtActivation() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let existingTarget = makeEndpoint(windowID: 2)
+        let newTarget = makeEndpoint(windowID: 3)
+
+        let noAuthority = await authority.reserveLink(
+            observer: observer,
+            target: newTarget,
+            requiresExistingOutboundLink: true
+        )
+        XCTAssertEqual(noAuthority, .rejected(.observerHasNoActiveOutboundLink))
+
+        let existingGrant = try await activateLink(
+            authority,
+            observer: observer,
+            target: existingTarget
+        )
+        let conditional = await authority.reserveLink(
+            observer: observer,
+            target: newTarget,
+            requiresExistingOutboundLink: true
+        )
+        guard case let .reserved(pending, _) = conditional else {
+            return XCTFail("expected conditional reservation, got \(conditional)")
+        }
+
+        _ = await authority.revoke(
+            linkID: existingGrant.id,
+            generation: existingGrant.generation,
+            reason: .userRequested
+        )
+        let activation = await authority.activateLink(
+            reservation: pending,
+            initialSnapshot: makeSnapshot(sessionID: newTarget.sessionID),
+            sourcePublicationSequence: 1
+        )
+
+        XCTAssertEqual(activation, .rejected(.observerHasNoActiveOutboundLink))
+        let snapshot = await authority.snapshot()
+        XCTAssertEqual(snapshot.activeLinkCount, 0)
+        XCTAssertEqual(snapshot.pendingReservationCount, 0)
     }
 
     func testMultipleObserversMayMonitorOneTargetWithoutArtificialCap() async throws {

@@ -67,20 +67,14 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
     func testAutoWakeRoundTripsAndCarriesTheBumpedVersions() throws {
         var session = AgentSession(id: UUID(), name: "Observer", savedAt: Date())
         XCTAssertFalse(session.autoWakeOnOversightUpdates, "new sessions default off")
-        XCTAssertFalse(session.agentSessionLinkRequiresLocalUserInstruction)
         let selectedTargetID = UUID()
         session.autoWakeOnOversightUpdates = true
         session.agentSessionLinkAutoWakeTargetSessionIDs = [selectedTargetID]
-        session.agentSessionLinkRequiresLocalUserInstruction = true
 
         let data = try JSONEncoder().encode(session)
         let decoded = try JSONDecoder().decode(AgentSession.self, from: data)
         XCTAssertTrue(decoded.autoWakeOnOversightUpdates)
         XCTAssertEqual(decoded.agentSessionLinkAutoWakeTargetSessionIDs, [selectedTargetID])
-        XCTAssertTrue(
-            decoded.agentSessionLinkRequiresLocalUserInstruction,
-            "the anti-chain fence must survive relaunch even though its process-local wake ID cannot"
-        )
         XCTAssertEqual(AgentSession.currentSerializationVersion, 9)
         XCTAssertEqual(AgentSessionMetadataIndex.currentSchemaVersion, 7)
 
@@ -99,11 +93,93 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         )
     }
 
+    /// The retired durable predicate is decode-compatible in both directions and is never re-emitted.
+    ///
+    /// An older file still carries `agentSessionLinkRequiresLocalUserInstruction`. Keyed decoding
+    /// ignores the unknown key, every surviving field still loads, and the next save simply omits it.
+    /// `serializationVersion` deliberately does not move: nothing about the surviving schema changed,
+    /// and an older binary reading a new file reconstructs the same default it always did for a
+    /// missing key.
+    func testRetiredLocalInstructionPredicateDecodesAndIsNotReEmitted() throws {
+        let sessionID = UUID()
+        let selectedTargetID = UUID()
+        let legacyJSON = """
+        {
+            "id": "\(sessionID.uuidString.lowercased())",
+            "serializationVersion": 9,
+            "name": "Saved Observer",
+            "savedAt": 0,
+            "items": [],
+            "autoEditEnabled": true,
+            "autoWakeOnOversightUpdates": true,
+            "agentSessionLinkAutoWakeTargetSessionIDs": ["\(selectedTargetID.uuidString.lowercased())"],
+            "agentSessionLinkRequiresLocalUserInstruction": true
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(
+            AgentSession.self,
+            from: XCTUnwrap(legacyJSON.data(using: .utf8))
+        )
+        XCTAssertEqual(decoded.id, sessionID)
+        XCTAssertEqual(decoded.name, "Saved Observer")
+        XCTAssertTrue(decoded.autoWakeOnOversightUpdates)
+        XCTAssertEqual(decoded.agentSessionLinkAutoWakeTargetSessionIDs, [selectedTargetID])
+        XCTAssertEqual(AgentSession.currentSerializationVersion, 9, "the schema version must not move")
+
+        let reEncoded = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(decoded)
+        ) as? [String: Any]
+        XCTAssertNil(
+            reEncoded?["agentSessionLinkRequiresLocalUserInstruction"],
+            "the retired key must not be written back"
+        )
+    }
+
+    /// The header-only cold load is an independent decoder path and must retire the field with the
+    /// full one — otherwise a lightweight restore keeps reconstructing a predicate nothing consumes.
+    func testHeaderOnlyColdLoadIgnoresTheRetiredPredicateAndKeepsSurvivingMetadata() async throws {
+        let sessionID = UUID()
+        let selectedTargetID = UUID()
+        let legacyJSON = """
+        {
+            "id": "\(sessionID.uuidString.lowercased())",
+            "serializationVersion": 9,
+            "name": "Cold Observer",
+            "savedAt": 0,
+            "itemCount": 4,
+            "autoEditEnabled": true,
+            "autoWakeOnOversightUpdates": true,
+            "agentSessionLinkAutoWakeTargetSessionIDs": ["\(selectedTargetID.uuidString.lowercased())"],
+            "agentSessionLinkRequiresLocalUserInstruction": true,
+            "agentKind": "codexExec"
+        }
+        """
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentSessionColdLoad-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fileURL = folder.appendingPathComponent("AgentSession-cold.json")
+        try XCTUnwrap(legacyJSON.data(using: .utf8)).write(to: fileURL)
+
+        let stub = try await AgentSessionDataService.shared.loadAgentSessionStub(from: fileURL)
+
+        XCTAssertEqual(stub.id, sessionID)
+        XCTAssertEqual(stub.name, "Cold Observer")
+        XCTAssertEqual(stub.itemCount, 4)
+        XCTAssertEqual(stub.agentKind, "codexExec")
+        XCTAssertTrue(stub.autoWakeOnOversightUpdates)
+        XCTAssertEqual(stub.agentSessionLinkAutoWakeTargetSessionIDs, [selectedTargetID])
+    }
+
+    /// Restoration applies the durable Auto-wake settings and nothing else: there is no longer any
+    /// saved predicate that could arm a fence a relaunch would then have to clear.
     @MainActor
-    func testSavedAutomaticFenceHydratesAsRestoredAutomaticAndBlocksAnotherWake() throws {
+    func testRestorationAppliesDurableAutoWakeSettingsOnly() throws {
         var saved = AgentSession(id: UUID(), name: "Observer", savedAt: Date())
         saved.autoWakeOnOversightUpdates = true
-        saved.agentSessionLinkRequiresLocalUserInstruction = true
+        let selectedTargetID = UUID()
+        saved.agentSessionLinkAutoWakeTargetSessionIDs = [selectedTargetID]
         let decoded = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(saved))
 
         let viewModel = AgentModeViewModel(
@@ -119,8 +195,8 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         viewModel.restoreAgentSessionLinkState(from: decoded, to: live)
 
         XCTAssertTrue(live.autoWakeOnOversightUpdates)
-        XCTAssertEqual(live.agentSessionLinkTurnOrigin, .restoredAutomatic)
-        XCTAssertTrue(live.agentSessionLinkTurnOrigin.requiresNewLocalUserInstruction)
+        XCTAssertEqual(live.agentSessionLinkAutoWakeTargetSessionIDs, [selectedTargetID])
+        XCTAssertNil(live.pendingOversightAutoWake, "restoration reserves no wake")
     }
 
     // MARK: - Codable Backward Compatibility

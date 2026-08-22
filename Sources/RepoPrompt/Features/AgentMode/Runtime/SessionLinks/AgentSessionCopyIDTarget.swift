@@ -81,7 +81,7 @@ enum AgentSessionCopyIDPolicy {
     /// Offer the action only for live, exactly-bound, top-level sessions. Child sessions,
     /// sessionless/provisional rows, and endpoints that are closing or rebinding never get it.
     static func isOfferable(_ candidate: AgentSessionLinkEndpointCandidate) -> Bool {
-        AgentSessionLinkEndpointEligibility.isEligibleTarget(candidate.eligibilityInput)
+        AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate) == nil
     }
 
     /// Revalidates immediately before the clipboard write.

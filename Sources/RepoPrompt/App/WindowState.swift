@@ -32,6 +32,12 @@ enum WindowKind: String, Codable {
 }
 
 enum WindowTitleFormatter {
+    /// Text-presentation eye marker used for the exact current overseer role.
+    ///
+    /// Variation Selector-15 is intentional: the native title must use the monochrome text glyph,
+    /// not an emoji-presentation eye that can change titlebar metrics.
+    static let overseerPrefix = "\u{1F441}\u{FE0E} "
+
     /// Default window title when no user workspace is active.
     /// Mirrors the app's display name so window and tab titles match the running distribution.
     static let defaultTitle: String = {
@@ -58,6 +64,10 @@ enum WindowTitleFormatter {
         }
 
         return "\(trimmedSessionTitle) — \(workspaceTitle)"
+    }
+
+    static func applyingOverseerPrefix(to baseTitle: String, isOverseer: Bool) -> String {
+        isOverseer ? overseerPrefix + baseTitle : baseTitle
     }
 }
 
@@ -225,15 +235,28 @@ class WindowState: ObservableObject {
     /// app display name whenever it refreshes the window chrome.
     @Published private(set) var displayedWindowTitle: String = WindowTitleFormatter.defaultTitle
 
-    // Cache to survive transient activeWorkspace == nil. This may include Agent session context.
-    private var lastKnownResolvedTitle: String = WindowTitleFormatter.defaultTitle
+    // Undecorated cache used only to survive transient activeWorkspace == nil. Exact role decoration
+    // is reapplied from current projection truth on every resolution, so a retired role cannot remain
+    // stuck in the cached title.
+    private var lastKnownResolvedBaseTitle: String = WindowTitleFormatter.defaultTitle
     private var lastAppliedWindowTitle: String?
 
     private func resolvedWindowTitle() -> String {
+        let baseTitle = resolvedBaseWindowTitle()
+        let isOverseer = promptManager.activeComposeTabID.map {
+            agentModeViewModel.agentSessionLinkIsOverseer(tabID: $0)
+        } ?? false
+        return WindowTitleFormatter.applyingOverseerPrefix(
+            to: baseTitle,
+            isOverseer: isOverseer
+        )
+    }
+
+    private func resolvedBaseWindowTitle() -> String {
         guard let ws = workspaceManager.activeWorkspace else {
             // If we expect a workspace but it is temporarily unresolved, do not stomp to default.
             if workspaceManager.activeWorkspaceID != nil {
-                return lastKnownResolvedTitle
+                return lastKnownResolvedBaseTitle
             }
 
             return WindowTitleFormatter.defaultTitle
@@ -245,7 +268,7 @@ class WindowState: ObservableObject {
             agentSessionTitle: resolvedAgentSessionTitleForWindowTitle(activeWorkspace: ws),
             duplicateWorkspaceTitle: ws.isSystemWorkspace ? WindowTitleFormatter.defaultTitle : ws.name
         )
-        lastKnownResolvedTitle = resolvedTitle
+        lastKnownResolvedBaseTitle = resolvedTitle
         return resolvedTitle
     }
 
@@ -279,6 +302,7 @@ class WindowState: ObservableObject {
         case appBecameActive
         case activeComposeTabChanged
         case agentSessionNameChanged
+        case agentSessionOverseerProjectionChanged
         case explicit
         case unspecified
     }
@@ -487,6 +511,16 @@ class WindowState: ObservableObject {
                 requestWindowTitleUpdate(reason: .agentSessionNameChanged)
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(
+            for: .agentSessionLinkOverseerProjectionDidChange,
+            object: agentModeViewModel
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] _ in
+            self?.requestWindowTitleUpdate(reason: .agentSessionOverseerProjectionChanged)
+        }
+        .store(in: &cancellables)
 
         NotificationCenter.default.publisher(for: .agentSessionBindingDidChange)
             .receive(on: RunLoop.main)

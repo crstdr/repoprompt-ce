@@ -150,36 +150,34 @@ struct AgentSessionLinkPromptDispatchID: Hashable, CustomStringConvertible {
     /// continuation, and both are the *same* logical dispatch that must never be delivered twice. It
     /// is substituted for the provider's own dispatch ID at the single claim seam, so every provider
     /// family produces a claim carrying this identity without knowing what a lane update is.
-    static func autoWake(wakeID: UUID, localInputEpoch: UInt64) -> Self {
-        .init(autoWakeFamily, "\(wakeID.uuidString):\(localInputEpoch)")
+    static func autoWake(wakeID: UUID) -> Self {
+        .init(autoWakeFamily, wakeID.uuidString)
     }
 
-    /// The wake this dispatch names, or `nil` for any ordinary dispatch.
+    /// Whether this value claims the reserved Auto-wake family, **regardless of whether it parses**.
+    ///
+    /// Derived from the raw prefix and stores nothing. Every consumer that would otherwise treat an
+    /// unparseable ID as an ordinary provider dispatch has to consult this first: a constructor and
+    /// parser that ever disagree would otherwise turn a lane update into an unfenced ordinary call,
+    /// which is exactly the fail-open the physical-dispatch fence exists to prevent.
+    var isAutoWakeFamily: Bool {
+        rawValue.hasPrefix("\(Self.autoWakeFamily):")
+    }
+
+    /// The wake this dispatch names, or `nil` for any ordinary dispatch **and** for a malformed value
+    /// in the reserved Auto-wake family. Pair it with `isAutoWakeFamily` to tell those two apart.
     ///
     /// This is what lets acceptance be decided from the *claim* rather than from whatever the session
     /// happens to hold at the moment the provider signals: a claim minted for wake A can never be
     /// mistaken for wake B, even if the attempt was replaced in between.
+    ///
+    /// The suffix is exactly one canonical UUID. The historical `<UUID>:<epoch>` form is deliberately
+    /// **not** accepted: it names a fence that no longer exists, and silently tolerating it would let
+    /// a stale identity satisfy a current physical-dispatch check.
     var autoWakeID: UUID? {
-        autoWakeComponents?.wakeID
-    }
-
-    /// The local-input epoch captured by this wake. Acceptance from an older epoch may record
-    /// provenance, but can never reclaim turn ownership after a newer local instruction.
-    var autoWakeLocalInputEpoch: UInt64? {
-        autoWakeComponents?.localInputEpoch
-    }
-
-    private var autoWakeComponents: (wakeID: UUID, localInputEpoch: UInt64)? {
         let prefix = "\(Self.autoWakeFamily):"
         guard rawValue.hasPrefix(prefix) else { return nil }
-        let components = rawValue.dropFirst(prefix.count).split(separator: ":", maxSplits: 1)
-        guard components.count == 2,
-              let wakeID = UUID(uuidString: String(components[0])),
-              let localInputEpoch = UInt64(components[1])
-        else {
-            return nil
-        }
-        return (wakeID, localInputEpoch)
+        return UUID(uuidString: String(rawValue.dropFirst(prefix.count)))
     }
 }
 
@@ -954,10 +952,15 @@ final class AgentSessionLinkOutboundPromptClaimStore {
     ///   or `.requiredLaneBatchUnavailable` when an auto-wake dispatch could not be given its lane
     ///   batch, which callers must never turn into a physical provider call.
     ///
-    /// An auto-wake dispatch — identified by `dispatchID.autoWakeID`, not by a caller-supplied flag —
-    /// *requires* the lane batch, because that content is the entire justification for the turn. The
-    /// requirement is therefore a property of the dispatch identity itself and travels with the claim
-    /// through every retry and every provider family.
+    /// An auto-wake dispatch — identified by its reserved dispatch-ID family, not by a caller-supplied
+    /// flag — *requires* the lane batch, because that content is the entire justification for the
+    /// turn. The requirement is therefore a property of the dispatch identity itself and travels with
+    /// the claim through every retry and every provider family.
+    ///
+    /// Classification is by family rather than by "carries a parsed wake ID" so a malformed
+    /// reserved-family value fails closed. Testing for a parsed ID would let such a value present
+    /// itself as an ordinary dispatch and be granted a claim with no lane batch at all — which is the
+    /// empty system-only turn this fence exists to prevent.
     ///
     /// The two refusals are separate cases rather than one `nil` precisely because they demand
     /// opposite behaviour from the caller: one means "send the text you already had", the other means
@@ -970,7 +973,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkPromptClaimOutcome {
-        let requiresLaneBatch = dispatchID.autoWakeID != nil
+        let requiresLaneBatch = dispatchID.isAutoWakeFamily
         // Every refusal below means "send undecorated" for an ordinary dispatch and "do not dispatch"
         // for a wake, so the mapping is decided once here instead of being restated — and possibly
         // forgotten — at each exit.

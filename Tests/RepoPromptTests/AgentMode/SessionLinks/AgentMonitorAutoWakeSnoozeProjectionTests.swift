@@ -71,10 +71,14 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
     private func props(_ fixture: Fixture) -> AgentMonitorPillProps {
         AgentMonitorPillProps(
             sessionID: fixture.endpoint.sessionID,
+            sidebarOversightMenu: nil,
             outbound: [AgentMonitorPillProps.Outbound(
                 linkID: fixture.reference.linkID,
                 generation: fixture.reference.generation,
                 targetSessionID: fixture.targetSessionID,
+                targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(
+                    sessionID: fixture.targetSessionID
+                ),
                 displayName: "Build API",
                 providerDisplayName: "Codex CLI",
                 locationLabel: "worktree/feature",
@@ -249,7 +253,7 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
             "Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentMonitorPill.swift"
         )
         // The view owns the action, builds the exact generation-qualified reference itself, and calls
-        // the bridge directly — the same pattern Done, Seen, and Unlink already use.
+        // the bridge directly — the same pattern Seen and Unlink already use.
         XCTAssertTrue(view.contains("AgentSessionLinkRuntimeBridge.shared.mutateAutoWakeSnooze("))
         XCTAssertTrue(view.contains("origin: .user"))
         XCTAssertTrue(view.contains("linkID: row.linkID,\n            generation: row.generation"))

@@ -184,13 +184,6 @@ struct AgentSessionLinkEndpointCandidate: Equatable {
     /// Workspace/worktree label for **UI only**. It is never placed in an agent-facing snapshot,
     /// inventory, or prompt.
     let locationLabel: String?
-    /// Logical origin of this session's current turn.
-    ///
-    /// Only meaningful when this candidate is the *observer* of a send: it is the input to the
-    /// mutual-link loop guard. It travels on the candidate so the guard is evaluated against the
-    /// observer's live state captured in the same MainActor pass as its identity, rather than being
-    /// re-read after the hop to the target.
-    var turnOrigin: AgentSessionLinkTurnOrigin = .localUser
 
     /// Binding-qualified hydration proof, already resolved against this candidate's *current*
     /// binding state by its owning window.
@@ -303,15 +296,9 @@ enum AgentSessionLinkEndpointResolver {
         guard !matches.isEmpty else { return .failure(.notFound) }
         guard matches.count == 1 else { return .failure(.ambiguous) }
         let match = matches[0]
-
-        // Ordered so the most specific, most actionable reason wins.
-        if !match.isTopLevel { return .failure(.childSession) }
-        if match.isClosing { return .failure(.closing) }
-        // Transient: a running deletion refuses a *new* link without implying the endpoint is gone.
-        if match.isDeletionInProgress { return .failure(.closing) }
-        if match.bindingTransitionInProgress { return .failure(.rebinding) }
-        if !match.hasLoadedPersistedState { return .failure(.loading) }
-        guard match.persistentBindingGeneration != nil else { return .failure(.bindingUnresolved) }
+        if let failure = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: match) {
+            return .failure(failure)
+        }
         return .success(match)
     }
 }
@@ -370,15 +357,31 @@ enum AgentSessionLinkEndpointEligibility {
     /// A target only has to be a live, exactly-bound, top-level session. It does **not** need
     /// outbound tool eligibility, because being observed grants it nothing.
     ///
-    /// Copy Session ID uses exactly this predicate, so a row can never offer an ID that the resolver
-    /// would immediately reject.
+    /// Ordered so the most specific, most actionable reason wins. The UUID resolver owns not-found
+    /// and ambiguity, then delegates its unique candidate here; exact sidebar projection and Add
+    /// revalidation call the same candidate-local helper without ever choosing between incarnations.
+    static func targetResolveFailure(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> AgentSessionLinkResolveFailure? {
+        targetResolveFailure(for: candidate.eligibilityInput)
+    }
+
+    /// Boolean compatibility for consumers that only need offerability. It is intentionally a thin
+    /// view of the same ordered failure helper rather than a second target predicate.
     static func isEligibleTarget(_ input: Input) -> Bool {
-        input.hasDurableBinding
-            && input.hasLoadedPersistedState
-            && !input.isChildSession
-            && !input.bindingTransitionInProgress
-            && !input.isClosing
-            && !input.isDeletionInProgress
+        targetResolveFailure(for: input) == nil
+    }
+
+    private static func targetResolveFailure(for input: Input) -> AgentSessionLinkResolveFailure? {
+        // Keep this precedence synchronized with the user-facing resolver contract.
+        if input.isChildSession { return .childSession }
+        if input.isClosing { return .closing }
+        // Transient: a running deletion refuses a new link without implying permanent endpoint loss.
+        if input.isDeletionInProgress { return .closing }
+        if input.bindingTransitionInProgress { return .rebinding }
+        if !input.hasLoadedPersistedState { return .loading }
+        if !input.hasDurableBinding { return .bindingUnresolved }
+        return nil
     }
 
     /// Whether a live observer may still exercise an existing grant.

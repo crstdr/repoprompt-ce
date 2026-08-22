@@ -938,11 +938,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             wakeID: wakeID,
             observerEndpoint: endpoint,
             queueEpoch: lane.queueEpoch,
-            localInputEpoch: session.agentSessionLinkLocalInputEpoch,
             queueRevision: lane.queueRevision,
             wakeFingerprint: lane.wakeEligibilityFingerprint,
             attemptedFingerprint: nil,
-            humanRearmEpochs: [:],
             physicalOutcome: .notAttempted,
             phase: .preparingDispatch,
             task: nil
@@ -964,7 +962,6 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertEqual(controller.startCount, 0)
         XCTAssertEqual(session.items.count, itemCount, "quiet pre-call refusal writes no provider error or provenance row")
         XCTAssertNil(session.suppressedOversightWakeFingerprint)
-        XCTAssertEqual(session.agentSessionLinkTurnOrigin, .localUser)
         XCTAssertNotNil(
             viewModel.agentSessionLinkPassiveNoticesBySessionID[sessionID],
             "the refused lane batch remains owed"
@@ -982,8 +979,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
         let readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
             session: session,
             endpointMatchesGrant: true,
-            isClosing: false,
-            observerTurnOrigin: session.agentSessionLinkTurnOrigin
+            isClosing: false
         )
         XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness), .ready)
     }

@@ -158,6 +158,39 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         )
     }
 
+    /// A sample carries only what the observer is actually shown or gated on.
+    ///
+    /// Target-side input provenance used to ride along here purely to feed a human-rearm fence, and a
+    /// change to it produced an otherwise invisible metadata refresh: a new `changeSequence`, a fresh
+    /// `observed_at`, and an acknowledged receipt invalidated, all with identical rendered content.
+    /// With that fence gone the sample is rendering/readiness only, so two observations that look the
+    /// same to the observer *are* the same and nothing republishes.
+    func testSamplesWithIdenticalRenderedContentProduceNoMetadataRefresh() {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        reducer.reconcile(
+            samples: [sample(0, status: .idle, idleForSend: true, preview: "Done.")],
+            linkSetRevision: 1,
+            deliverable: true,
+            observedAt: Date(timeIntervalSince1970: 1000)
+        )
+        let first = tryUnwrap(reducer.snapshot.entries.first)
+
+        // Byte-identical rendered content, observed later. Nothing about the target's own input
+        // history is representable any more, so there is nothing left to refresh on.
+        reducer.reconcile(
+            samples: [sample(0, status: .idle, idleForSend: true, preview: "Done.")],
+            linkSetRevision: 1,
+            deliverable: true,
+            observedAt: Date(timeIntervalSince1970: 9000)
+        )
+        let second = tryUnwrap(reducer.snapshot.entries.first)
+
+        XCTAssertEqual(second.changeSequence, first.changeSequence)
+        XCTAssertEqual(second.edgeSequence, first.edgeSequence)
+        XCTAssertEqual(second.observedAt, first.observedAt)
+    }
+
     /// Readiness is a point-in-time fact about an idle target, never an upstream assertion.
     func testReadinessIsForcedFalseUnlessTheFinalStatusIsIdle() {
         var reducer = makeReducer()
@@ -377,7 +410,7 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
     ///
     /// Every published snapshot is an input to the Auto-wake acceptance fence. A receipt that
     /// republished a lane-less snapshot would read to the fence as "no lane is selected any more",
-    /// retracting a live attempt and resetting every consumed-epoch watermark.
+    /// retracting a live attempt.
     func testAutoWakeLanesSurviveReceiptRepublicationAndAreReplacedWholesale() {
         var reducer = overflowReducer()
         let lanes = (0 ..< 2).map { index in
@@ -388,8 +421,6 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
                 ),
                 targetEndpoint: endpoint(sessionID: sessionID(index), generation: 1),
                 targetSessionID: sessionID(index),
-                targetLocalInputEpoch: UInt64(index + 4),
-                targetTurnIsLocalUser: true,
                 isEffectivelySelected: index == 0
             )
         }

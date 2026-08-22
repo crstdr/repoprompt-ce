@@ -653,8 +653,10 @@ extension AgentModeViewModel {
         let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
         guard let context = agentSessionLinkPromptContext(for: session) else {
             // No prompt context at all still refuses a wake: the batch it exists to deliver cannot be
-            // rendered, so the turn has nothing to say.
-            return effectiveID.autoWakeID == nil ? .nothingOwed : .requiredLaneBatchUnavailable
+            // rendered, so the turn has nothing to say. Classified by reserved family, exactly as the
+            // claim store does, so a malformed Auto-wake identity cannot report the benign
+            // "nothing owed" outcome and be dispatched as an ordinary turn.
+            return effectiveID.isAutoWakeFamily ? .requiredLaneBatchUnavailable : .nothingOwed
         }
         return agentSessionLinkPromptClaimStore.claimOutcome(
             dispatchID: effectiveID,
@@ -688,11 +690,16 @@ extension AgentModeViewModel {
     ///
     /// Only a wake that has passed the ownership boundary substitutes: before that it has not started
     /// a run, so any claim being taken belongs to some other dispatch and must keep its own identity.
+    ///
+    /// "Ordinary" is tested as *not in the reserved Auto-wake family*, not as "carries no wake ID".
+    /// A malformed reserved-family value is left exactly as it is: rewriting it would hand the
+    /// current wake's identity to a dispatch that never legitimately held one, and the physical fence
+    /// refuses it on its own.
     func agentSessionLinkEffectiveDispatchID(
         for session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkPromptDispatchID {
-        guard dispatchID.autoWakeID == nil,
+        guard !dispatchID.isAutoWakeFamily,
               let attempt = session.pendingOversightAutoWake,
               attempt.phase == .preparingDispatch
               || attempt.phase == .cancelledBeforeDispatch
@@ -700,7 +707,7 @@ extension AgentModeViewModel {
         else {
             return dispatchID
         }
-        return .autoWake(wakeID: attempt.wakeID, localInputEpoch: attempt.localInputEpoch)
+        return .autoWake(wakeID: attempt.wakeID)
     }
 
     /// Whether this dispatch would carry a wake's identity, decided without a live view model.
@@ -708,11 +715,14 @@ extension AgentModeViewModel {
     /// The same substitution rule as `agentSessionLinkEffectiveDispatchID`, restated only for the
     /// hook closures that must still answer after the view model is gone. Failing closed there is the
     /// point: a teardown mid-dispatch must not be the one path that lets an empty wake turn through.
+    ///
+    /// The reserved family is what classifies, exactly as it does at the physical fence: a malformed
+    /// Auto-wake identity is never ordinary, so it can never take the no-batch-required path.
     static func dispatchRequiresLaneBatch(
         _ session: TabSession,
         _ dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {
-        guard dispatchID.autoWakeID == nil else { return true }
+        guard !dispatchID.isAutoWakeFamily else { return true }
         guard let phase = session.pendingOversightAutoWake?.phase else { return false }
         return phase == .preparingDispatch
             || phase == .cancelledBeforeDispatch
@@ -768,9 +778,9 @@ extension AgentModeViewModel {
     /// decides whether it still applies. Gating it on the store's token instead would re-deliver a
     /// batch the model already holds whenever a provider or eligibility flip raced the acceptance.
     ///
-    /// Ordering is load-bearing for an accepted auto-wake: the lane-update turn origin and its
-    /// visible provenance row are recorded *before* the receipt is applied, so the queue republication
-    /// the receipt triggers cannot schedule a second autonomous turn in the same origin epoch.
+    /// Ordering is load-bearing for an accepted auto-wake: the wake's visible provenance row is
+    /// recorded *before* the receipt is applied, so the queue republication the receipt triggers
+    /// already sees the settled attempt rather than a still-pending one.
     func acceptAgentSessionLinkPromptClaim(_ claim: AgentSessionLinkOutboundPromptClaim?) {
         guard let claim else { return }
         agentSessionLinkPromptClaimStore.accept(claim)

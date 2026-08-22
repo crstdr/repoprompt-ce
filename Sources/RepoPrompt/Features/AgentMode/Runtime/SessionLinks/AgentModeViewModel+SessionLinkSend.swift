@@ -16,7 +16,6 @@ extension AgentModeViewModel {
         session: TabSession,
         endpointMatchesGrant: Bool,
         isClosing: Bool,
-        observerTurnOrigin: AgentSessionLinkTurnOrigin,
         ignoresComposerSubmissionInFlight: Bool = false
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
         AgentSessionLinkDeliveryReadiness.Snapshot(
@@ -43,8 +42,7 @@ extension AgentModeViewModel {
             hasPendingPermissionsRequest: session.pendingPermissionsRequest != nil,
             hasPendingMCPElicitationRequest: session.pendingMCPElicitationRequest != nil,
             hasPendingApplyEditsReview: session.pendingApplyEditsReview != nil,
-            hasPendingWorktreeMergeReview: session.pendingWorktreeMergeReview != nil,
-            observerTurnOrigin: observerTurnOrigin
+            hasPendingWorktreeMergeReview: session.pendingWorktreeMergeReview != nil
         )
     }
 
@@ -92,8 +90,7 @@ extension AgentModeViewModel {
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: admissionLiveness.targetEndpointIsLive,
-                isClosing: admissionLiveness.targetWindowIsClosing,
-                observerTurnOrigin: request.observerTurnOrigin
+                isClosing: admissionLiveness.targetWindowIsClosing
             )
         )
         if case let .blocked(reason) = admission {
@@ -150,7 +147,6 @@ extension AgentModeViewModel {
                 session: liveSession,
                 endpointMatchesGrant: postCommitLiveness.targetEndpointIsLive,
                 isClosing: postCommitLiveness.targetWindowIsClosing,
-                observerTurnOrigin: request.observerTurnOrigin,
                 ignoresComposerSubmissionInFlight: true
             )
         )
@@ -167,7 +163,6 @@ extension AgentModeViewModel {
 
         // 6. Durable acceptance. The row carries the observer's raw text plus attribution; the
         //    envelope is built for the provider only, so the transcript is not a rendering of XML.
-        let previousTurnOrigin = liveSession.agentSessionLinkTurnOrigin
         let userItem = AgentChatItem.user(
             request.message,
             sequenceIndex: liveSession.nextSequenceIndex,
@@ -180,9 +175,6 @@ extension AgentModeViewModel {
         )
         let anchorRollback = recordAgentTurnUserAnchor(for: liveSession, userItem: userItem)
         liveSession.appendItem(userItem)
-        liveSession.agentSessionLinkTurnOrigin = .crossSessionMessage(
-            sourceSessionID: request.observerSessionID
-        )
         updateBindingsFromSession(liveSession)
         requestUIRefresh(tabID: candidate.tabID, urgent: true)
 
@@ -191,8 +183,7 @@ extension AgentModeViewModel {
                 itemID: userItem.id,
                 tabID: candidate.tabID,
                 session: liveSession,
-                anchorRollback: anchorRollback,
-                previousTurnOrigin: previousTurnOrigin
+                anchorRollback: anchorRollback
             )
             // A failed flush may already have written the row, so "nothing was delivered" is only
             // true once the compensating removal is itself durable. Confirm it synchronously here
@@ -248,7 +239,6 @@ extension AgentModeViewModel {
                 session: liveSession,
                 endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,
                 isClosing: dispatchLiveness.targetWindowIsClosing,
-                observerTurnOrigin: request.observerTurnOrigin,
                 ignoresComposerSubmissionInFlight: true
             )
         )
@@ -327,7 +317,7 @@ extension AgentModeViewModel {
     }
 
     /// Removes a staged attributed row whose durable persistence failed and restores the turn-runtime
-    /// bookkeeping and turn origin it changed.
+    /// bookkeeping it changed.
     ///
     /// A save is scheduled afterwards so the on-disk copy converges even if the failed flush had
     /// already written the row. The caller must additionally *confirm* that removal durably before it
@@ -336,14 +326,12 @@ extension AgentModeViewModel {
         itemID: UUID,
         tabID: UUID,
         session: TabSession,
-        anchorRollback: AgentTurnUserAnchorRollbackState,
-        previousTurnOrigin: AgentSessionLinkTurnOrigin
+        anchorRollback: AgentTurnUserAnchorRollbackState
     ) {
         if let index = session.items.firstIndex(where: { $0.id == itemID }) {
             _ = session.removeItem(at: index)
         }
         rollbackAgentTurnUserAnchor(anchorRollback, session: session)
-        session.agentSessionLinkTurnOrigin = previousTurnOrigin
         updateBindingsFromSession(session)
         requestUIRefresh(tabID: tabID, urgent: true)
         scheduleSave(for: tabID)

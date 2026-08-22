@@ -11,11 +11,13 @@ import RepoPromptDomainRuntime
 /// migrate it. There is at most one per link generation, and no scheduler, timer, or queue manager
 /// owns it — every drain is triggered by an event that already exists.
 ///
-/// The values captured here are frozen on purpose. `workflow` is resolved once, at admission, so a
-/// later rename or delete cannot change what a queued message runs under, and the queue-time proof
-/// that admission came from a local-user-started observer turn is never recaptured at delivery: the
-/// user authorized *this* instruction, and the observer's turn origin by the time the target frees
-/// up says nothing about that authorization.
+/// An entry is not proof that some particular local user turn authorized this message. It is a
+/// grant-authorized request accepted into the one-slot convenience queue under the trusted prompt
+/// contract: the user's exact direct grant is the delegation, and the observer is responsible for
+/// only queueing in service of an explicit current or standing instruction from its own user.
+///
+/// The values captured here are frozen on purpose. `workflow` in particular is resolved once, at
+/// admission, so a later rename or delete cannot change what a queued message runs under.
 struct AgentSessionLinkPendingSend: Equatable {
     /// How far the entry has travelled toward the authority commit fence.
     ///
@@ -69,13 +71,6 @@ struct AgentSessionLinkPendingSend: Equatable {
     let requestDigest: String
     /// Resolved once, at admission, and never re-read.
     let workflow: AgentWorkflowDefinition?
-    /// The observer turn origin that authorized this entry, captured at admission.
-    ///
-    /// Admission only ever stores `.localUser` — a queued send is the user's authorization, and
-    /// nothing else may create one. It is carried as the origin rather than as a Boolean because the
-    /// delivery hands it straight to the readiness evaluator, which is what makes "never recaptured"
-    /// structural: there is no live read for a later automatic turn to leak into.
-    let authorizedTurnOrigin: AgentSessionLinkTurnOrigin
     let queuedAt: Date
     var phase: Phase
     var parkReason: ParkReason
@@ -101,7 +96,6 @@ struct AgentSessionLinkPendingSend: Equatable {
         idempotencyKey: String,
         requestDigest: String,
         workflow: AgentWorkflowDefinition?,
-        authorizedTurnOrigin: AgentSessionLinkTurnOrigin,
         queuedAt: Date,
         phase: Phase = .pending,
         parkReason: ParkReason = .targetReadiness,
@@ -115,7 +109,6 @@ struct AgentSessionLinkPendingSend: Equatable {
         self.idempotencyKey = idempotencyKey
         self.requestDigest = requestDigest
         self.workflow = workflow
-        self.authorizedTurnOrigin = authorizedTurnOrigin
         self.queuedAt = queuedAt
         self.phase = phase
         self.parkReason = parkReason

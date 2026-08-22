@@ -19,15 +19,13 @@ struct AgentSessionLinkPassiveStatusNotices {
         let reference: DomainAgentSessionLinkReference
         let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
         let targetSessionID: UUID
-        let targetLocalInputEpoch: UInt64
-        let targetTurnIsLocalUser: Bool
         /// The observer's Auto-wake selection for this lane **as of publication**.
         ///
         /// A projection, not the authority: selection is live session state the user can flip at any
         /// time, and this snapshot is republished only on the next authoritative refresh. The
         /// auto-wake coordinator therefore reads the session's own selection rather than this flag —
         /// scheduling or accepting a wake on a value this stale is what let a deselected lane start a
-        /// turn and a freshly selected one lose its first human re-arm.
+        /// turn.
         let isEffectivelySelected: Bool
     }
 
@@ -45,8 +43,6 @@ struct AgentSessionLinkPassiveStatusNotices {
         let idleForSend: Bool
         let idleSince: Date?
         let waitingOn: DomainAgentSessionWaitingOn?
-        let targetLocalInputEpoch: UInt64
-        let targetTurnIsLocalUser: Bool
         let latestVisibleAssistantPreview: String?
 
         init(
@@ -58,8 +54,6 @@ struct AgentSessionLinkPassiveStatusNotices {
             idleForSend: Bool = false,
             idleSince: Date? = nil,
             waitingOn: DomainAgentSessionWaitingOn? = nil,
-            targetLocalInputEpoch: UInt64 = 0,
-            targetTurnIsLocalUser: Bool = false,
             latestVisibleAssistantPreview: String? = nil
         ) {
             self.reference = reference
@@ -73,8 +67,6 @@ struct AgentSessionLinkPassiveStatusNotices {
             self.idleForSend = status == .idle && idleForSend
             self.idleSince = status == .idle ? idleSince : nil
             self.waitingOn = waitingOn
-            self.targetLocalInputEpoch = targetLocalInputEpoch
-            self.targetTurnIsLocalUser = targetTurnIsLocalUser
             self.latestVisibleAssistantPreview = DomainAgentSessionLinkTextBudget.normalized(
                 latestVisibleAssistantPreview,
                 maxBytes: DomainAgentSessionLinkTextBudget.assistantPreviewMaxBytes
@@ -100,8 +92,6 @@ struct AgentSessionLinkPassiveStatusNotices {
         let idleForSend: Bool
         let idleSince: Date?
         let waitingOn: DomainAgentSessionWaitingOn?
-        let targetLocalInputEpoch: UInt64
-        let targetTurnIsLocalUser: Bool
         let latestVisibleAssistantPreview: String?
         let changeSequence: UInt64
         /// Identity of the *status edge* that created or last advanced this entry.
@@ -134,8 +124,6 @@ struct AgentSessionLinkPassiveStatusNotices {
             idleForSend: Bool = false,
             idleSince: Date? = nil,
             waitingOn: DomainAgentSessionWaitingOn? = nil,
-            targetLocalInputEpoch: UInt64 = 0,
-            targetTurnIsLocalUser: Bool = false,
             latestVisibleAssistantPreview: String? = nil,
             changeSequence: UInt64,
             edgeSequence: UInt64? = nil
@@ -151,8 +139,6 @@ struct AgentSessionLinkPassiveStatusNotices {
             self.idleForSend = idleForSend
             self.idleSince = idleSince
             self.waitingOn = waitingOn
-            self.targetLocalInputEpoch = targetLocalInputEpoch
-            self.targetTurnIsLocalUser = targetTurnIsLocalUser
             self.latestVisibleAssistantPreview = latestVisibleAssistantPreview
             self.changeSequence = changeSequence
         }
@@ -173,8 +159,6 @@ struct AgentSessionLinkPassiveStatusNotices {
                 idleForSend: sample.idleForSend,
                 idleSince: sample.idleSince,
                 waitingOn: sample.waitingOn,
-                targetLocalInputEpoch: sample.targetLocalInputEpoch,
-                targetTurnIsLocalUser: sample.targetTurnIsLocalUser,
                 latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
                 changeSequence: changeSequence,
                 // Preserve only edge occurrence; refreshed readiness uses the new sample time above.
@@ -187,8 +171,6 @@ struct AgentSessionLinkPassiveStatusNotices {
                 && idleForSend == sample.idleForSend
                 && idleSince == sample.idleSince
                 && waitingOn == sample.waitingOn
-                && targetLocalInputEpoch == sample.targetLocalInputEpoch
-                && targetTurnIsLocalUser == sample.targetTurnIsLocalUser
                 && latestVisibleAssistantPreview == sample.latestVisibleAssistantPreview
         }
     }
@@ -603,8 +585,6 @@ struct AgentSessionLinkPassiveStatusNotices {
                 idleForSend: sample.idleForSend,
                 idleSince: sample.idleSince,
                 waitingOn: sample.waitingOn,
-                targetLocalInputEpoch: sample.targetLocalInputEpoch,
-                targetTurnIsLocalUser: sample.targetTurnIsLocalUser,
                 latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
                 changeSequence: nextChangeSequence,
                 // A status edge, so this *is* a new occurrence: the wake fingerprint must not compare

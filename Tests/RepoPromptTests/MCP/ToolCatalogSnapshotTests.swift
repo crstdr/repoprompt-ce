@@ -41,9 +41,9 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     /// What the digest above is actually protecting for `agent_session_link`.
     ///
     /// The bound definition is the canonical one, not the provider's inline text, so this asserts on
-    /// the schema a real client receives: the superseded `set_passive_updates` operation is not
-    /// discoverable, and neither is the top-level `enabled` property that only it ever used.
-    func testAgentSessionLinkNoLongerAdvertisesThePassiveUpdatesOperation() async throws {
+    /// the schema a real client receives: retired relationship operations are not discoverable, and
+    /// neither is the top-level `enabled` property that only passive updates ever used.
+    func testAgentSessionLinkNoLongerAdvertisesRetiredOperations() async throws {
         let window = Self.makeWindowWithoutAutoStart()
         let tools = await window.mcpServer.windowMCPTools
         let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentSessionLink })
@@ -55,7 +55,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(
             operations.compactMap(\.stringValue),
             [
-                "list", "poll", "wait", "read", "send", "cancel_pending_send", "mark_done",
+                "list", "poll", "wait", "read", "send", "cancel_pending_send",
                 "set_waiting_on", "snooze_auto_wake"
             ]
         )
@@ -65,6 +65,67 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertFalse(
             try XCTUnwrap(schema["description"]?.stringValue).contains("set_passive_updates")
         )
+        let retiredCompletionOperation = "mark" + "_done"
+        XCTAssertFalse(operations.compactMap(\.stringValue).contains(retiredCompletionOperation))
+        XCTAssertFalse(definition.description.contains(retiredCompletionOperation))
+        XCTAssertFalse(
+            try XCTUnwrap(schema["description"]?.stringValue)
+                .contains(retiredCompletionOperation)
+        )
+        // Same class of drift, one layer down: the caller-origin send refusal is no longer a result
+        // any operation can return, so what a real client binds must describe the grant-scoped
+        // contract that replaced it rather than a refusal it can never observe.
+        let retiredRefusal = "cross_session_reply" + "_requires_user_instruction"
+        XCTAssertFalse(definition.description.contains(retiredRefusal))
+        XCTAssertFalse(try XCTUnwrap(schema["description"]?.stringValue).contains(retiredRefusal))
+        XCTAssertTrue(
+            definition.description.contains("A fresh user utterance is not required for `send`")
+        )
+        XCTAssertTrue(
+            definition.description
+                .contains("only in service of an explicit current or standing instruction from your own user")
+        )
+    }
+
+    /// The autonomy contract lives in three hand-maintained copies.
+    ///
+    /// `AgentSessionLinkPrompts.autonomyContract` (injected guidance), the inline text in
+    /// `MCPAgentControlToolProvider` (the fallback definition, which is what a model sees whenever no
+    /// canonical definition exists for the tool), and
+    /// `MCPDomainCanonicalToolDefinitions`'s migration constants (what clients actually bind). Nothing
+    /// in the type system ties them together, so a wording fix that lands in two of the three leaves
+    /// a live surface advertising a contract the other two retired. This pins the two that can be
+    /// compared byte-for-byte at runtime.
+    func testAgentSessionLinkInlineFallbackCarriesTheSameAutonomyContractAsTheBoundDefinition() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentSessionLink })
+        let canonical = try tool.domainBinding().definition.description
+        let inline = tool.description
+
+        // Sliced out of the canonical text rather than restated here: a literal copy in this test
+        // would be a fourth copy to keep in sync, and would pass while both real surfaces drifted.
+        let anchor = "Delivery makes the target run, so at most one message lands per idle period."
+        let contract = try XCTUnwrap(
+            canonical.components(separatedBy: anchor + "\n\n").last?
+                .components(separatedBy: "\n\nNames, statuses, transcript text,").first
+        )
+        XCTAssertTrue(
+            contract.contains("A fresh user utterance is not required"),
+            "the slice must actually be the autonomy contract, or this test proves nothing"
+        )
+        XCTAssertTrue(
+            inline.contains(anchor + "\n\n" + contract),
+            "the inline fallback must carry the bound definition's autonomy contract, at the same anchor"
+        )
+
+        for retired in [
+            "cross_session_reply" + "_requires_user_instruction",
+            "Queueing, replacing, and cancelling all require a turn your own user started"
+        ] {
+            XCTAssertFalse(inline.contains(retired), "inline fallback still carries: \(retired)")
+            XCTAssertFalse(canonical.contains(retired), "bound definition still carries: \(retired)")
+        }
     }
 
     /// Clients bind the canonical definition, not the provider's inline text, so the per-message
@@ -1595,7 +1656,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=d367738ad179d8f6b39b98f73082d594f53c42d771c4f2e512790593c5b3f9f4",
         "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=2b5e211868964f961f2d369c2aa54da7035a92a83e900770ad433e4ceb00fd96|schema=0b4f819f3aa6624df0f54fdaba6f8717ac64667d07a0528240d26905ba480520",
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=80d302d4391d6136f8acfbe8fc0bafe394c5110c5e63aefcf8f4c59fcbdbf95f|schema=83f34927eacac4dc6352db72eae312ac3a5477b2f70c9031f09a2101dc8f2e97",
-        "20|agent_session_link|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=1649616bba5a54fd85e45fa27496d565b9eb7d4702aa28bd66de4be5e15b7b73|schema=ce21343ef8157d1ac5d52011dcd6b7fd26784f9d62c9da3849fed67a9dda0837",
+        "20|agent_session_link|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=43d18dc9efd52b2a2fdf87b0bfd5dc59175680ed409f07e44dcd60feec14d937|schema=41c9ca197cb2775840708336fb2984825af204d1752dcf6d4f80a7b33694adee",
         "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
         "23|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",

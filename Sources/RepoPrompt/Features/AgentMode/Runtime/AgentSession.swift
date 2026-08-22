@@ -184,18 +184,6 @@ struct AgentSession: Codable, Identifiable {
     /// Granular target selections preserved even while the master setting is on.
     var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>
 
-    /// Whether the most recent input this session accepted was automatic rather than local-user.
-    ///
-    /// The durable half of the "automatic turns never chain" invariant. The live fence is
-    /// `AgentSessionLinkTurnOrigin`, whose non-local cases carry process-scoped identities (a wake
-    /// ID, a source session UUID) that are meaningless after a relaunch — so what persists is the
-    /// predicate, not the identity.
-    ///
-    /// Without it the fence silently reset to `.localUser` on restore, and an observer that was
-    /// auto-woken just before quitting could start a *second* autonomous turn on its first
-    /// post-restore status edge, with no local instruction in between.
-    var agentSessionLinkRequiresLocalUserInstruction: Bool
-
     /// Persisted per-turn token usage for non-Codex providers.
     /// Used to rebuild context usage after reopen/resume when tool payloads are pruned.
     var providerTokenUsageByTurn: [AgentTokenUsagePersist]
@@ -256,7 +244,6 @@ struct AgentSession: Codable, Identifiable {
         autoEditEnabled: Bool = true,
         autoWakeOnOversightUpdates: Bool = false,
         agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
-        agentSessionLinkRequiresLocalUserInstruction: Bool = false,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
@@ -296,7 +283,6 @@ struct AgentSession: Codable, Identifiable {
         self.autoEditEnabled = autoEditEnabled
         self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
         self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
-        self.agentSessionLinkRequiresLocalUserInstruction = agentSessionLinkRequiresLocalUserInstruction
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
@@ -338,7 +324,6 @@ struct AgentSession: Codable, Identifiable {
         case autoEditEnabled
         case autoWakeOnOversightUpdates
         case agentSessionLinkAutoWakeTargetSessionIDs
-        case agentSessionLinkRequiresLocalUserInstruction
         case providerTokenUsageByTurn
         case codexConversationID
         case codexRolloutPath
@@ -391,13 +376,6 @@ struct AgentSession: Codable, Identifiable {
             Set<UUID>.self,
             forKey: .agentSessionLinkAutoWakeTargetSessionIDs
         ) ?? []
-        // Additive and default-false: a session written before version 8 ended on whatever it ended
-        // on, and the safe reconstruction of an unknown origin is the unfenced one — those sessions
-        // predate automatic turns entirely, so none of them can have ended on one.
-        agentSessionLinkRequiresLocalUserInstruction = try container.decodeIfPresent(
-            Bool.self,
-            forKey: .agentSessionLinkRequiresLocalUserInstruction
-        ) ?? false
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)

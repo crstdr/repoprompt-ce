@@ -1,60 +1,5 @@
 import Foundation
 
-// MARK: - Turn origin
-
-/// Explicit logical origin of a session's current (or most recent) turn.
-///
-/// This is recorded at every acceptance point rather than inferred from the transcript. Inferring it
-/// from "the last user row" would be wrong in both directions: a queued local instruction is accepted
-/// long before its row becomes the last one, and an attributed cross-session row stays the last user
-/// row for the whole run even after the local user has steered.
-enum AgentSessionLinkTurnOrigin: Equatable {
-    /// A local user instruction was the most recent accepted input for this session.
-    case localUser
-    /// The most recent accepted input arrived across an oversight link, and no local user instruction
-    /// has been accepted since.
-    case crossSessionMessage(sourceSessionID: UUID)
-    /// The most recent accepted input was RepoPrompt's own lane-update follow-up, and no local user
-    /// instruction has been accepted since.
-    case laneUpdateAutoWake(wakeID: UUID)
-    /// The session was restored from disk having last accepted an automatic input, and no local user
-    /// instruction has been accepted since.
-    ///
-    /// The wake ID and source session UUID of the pre-relaunch turn are ephemeral process identities
-    /// that mean nothing after a restart, so the fence is reconstructed as the *predicate* it exists
-    /// to enforce rather than as a fabricated identity. Without this case the fence silently reset to
-    /// `.localUser` on every relaunch, and a saved-on observer could start a second autonomous turn
-    /// with no intervening local instruction — exactly the chain the guard exists to forbid.
-    case restoredAutomatic
-
-    /// Whether this origin bars the session from *originating* further linked work.
-    ///
-    /// True for every non-local origin, and that is the whole cycle bound: an oversight loop can
-    /// produce at most one automatic turn per locally initiated origin epoch, because neither an
-    /// incoming cross-session message nor an auto-wake can send onward or wake again. `poll`, `wait`,
-    /// and `read` keep their ordinary authority — only origination is fenced.
-    var requiresNewLocalUserInstruction: Bool {
-        switch self {
-        case .localUser: false
-        case .crossSessionMessage, .laneUpdateAutoWake, .restoredAutomatic: true
-        }
-    }
-
-    /// The durable projection of this origin: one Boolean, which is all a later launch can act on.
-    ///
-    /// Restoring it as `.restoredAutomatic` reconstructs the fence exactly; restoring `false` as
-    /// `.localUser` preserves the documented behaviour that a saved-on observer may wake on its first
-    /// new post-baseline transition.
-    var persistedRequiresLocalUserInstruction: Bool {
-        requiresNewLocalUserInstruction
-    }
-
-    /// Rebuilds the fence for a session hydrated from disk.
-    static func restored(requiresLocalUserInstruction: Bool) -> AgentSessionLinkTurnOrigin {
-        requiresLocalUserInstruction ? .restoredAutomatic : .localUser
-    }
-}
-
 // MARK: - Readiness
 
 /// Pure admission decision for an attributed cross-session send.
@@ -65,7 +10,11 @@ enum AgentSessionLinkTurnOrigin: Equatable {
 /// state. The target's MainActor assembles the snapshot immediately before claiming submission, and
 /// the same snapshot is re-evaluated after the authorization commit hop.
 enum AgentSessionLinkDeliveryReadiness {
-    /// Every verified blocker, plus the caller's logical turn origin.
+    /// Every verified blocker, all of them facts about the **target**.
+    ///
+    /// Nothing about the caller appears here. The user's exact direct oversight grant is the
+    /// delegation for this surface, so admission depends on whether the target can safely accept a
+    /// message — never on what started the caller's own turn.
     ///
     /// Field-for-field this mirrors live `TabSession` state; nothing is derived here so a future
     /// blocker cannot be silently dropped by an intermediate projection.
@@ -106,9 +55,6 @@ enum AgentSessionLinkDeliveryReadiness {
         var hasPendingApplyEditsReview: Bool
         var hasPendingWorktreeMergeReview: Bool
 
-        /// Caller
-        var observerTurnOrigin: AgentSessionLinkTurnOrigin
-
         init(
             hasLoadedPersistedState: Bool,
             bindingTransitionInProgress: Bool,
@@ -131,8 +77,7 @@ enum AgentSessionLinkDeliveryReadiness {
             hasPendingPermissionsRequest: Bool,
             hasPendingMCPElicitationRequest: Bool,
             hasPendingApplyEditsReview: Bool,
-            hasPendingWorktreeMergeReview: Bool,
-            observerTurnOrigin: AgentSessionLinkTurnOrigin
+            hasPendingWorktreeMergeReview: Bool
         ) {
             self.hasLoadedPersistedState = hasLoadedPersistedState
             self.bindingTransitionInProgress = bindingTransitionInProgress
@@ -156,10 +101,9 @@ enum AgentSessionLinkDeliveryReadiness {
             self.hasPendingMCPElicitationRequest = hasPendingMCPElicitationRequest
             self.hasPendingApplyEditsReview = hasPendingApplyEditsReview
             self.hasPendingWorktreeMergeReview = hasPendingWorktreeMergeReview
-            self.observerTurnOrigin = observerTurnOrigin
         }
 
-        /// A fully idle, hydrated, exactly-bound target with a local-origin caller.
+        /// A fully idle, hydrated, exactly-bound target.
         ///
         /// Only used to build test cases and as documentation of the ready shape; production always
         /// assembles from live state.
@@ -185,8 +129,7 @@ enum AgentSessionLinkDeliveryReadiness {
             hasPendingPermissionsRequest: false,
             hasPendingMCPElicitationRequest: false,
             hasPendingApplyEditsReview: false,
-            hasPendingWorktreeMergeReview: false,
-            observerTurnOrigin: .localUser
+            hasPendingWorktreeMergeReview: false
         )
     }
 
@@ -198,12 +141,6 @@ enum AgentSessionLinkDeliveryReadiness {
         case targetLoading = "target_loading"
         /// The target is running, waiting, has a pending interaction, or has queued work.
         case targetNotIdle = "target_not_idle"
-        /// The caller's turn was started by something other than its own user — an incoming
-        /// cross-session message, or RepoPrompt's own lane-update follow-up.
-        ///
-        /// The case name and its wire-stable raw value are deliberately unchanged: the observer's
-        /// prompt guidance names this string, and broadening what can produce it is not a new refusal.
-        case crossSessionReplyRequiresUserInstruction = "cross_session_reply_requires_user_instruction"
 
         var message: String {
             switch self {
@@ -215,10 +152,6 @@ enum AgentSessionLinkDeliveryReadiness {
                 "The overseen session is not ready to accept a message. Wait for it with "
                     + "until: \"sendable\" and send when a snapshot reports idle_for_send: true; "
                     + "until: \"idle\" is satisfied by targets this call still refuses."
-            case .crossSessionReplyRequiresUserInstruction:
-                "This turn was not started by your own user — it came from an incoming cross-session "
-                    + "message or an automatic status update. Wait for a new instruction from your own "
-                    + "user before sending onward."
             }
         }
     }
@@ -240,8 +173,8 @@ enum AgentSessionLinkDeliveryReadiness {
     /// Evaluates the full matrix in fixed precedence order.
     ///
     /// Order matters for the caller's next action, not just for the message: an invalidated endpoint
-    /// must never be reported as retryable, and the loop guard is checked last so a caller that is
-    /// *also* blocked by a busy target learns the retryable reason rather than the permanent one.
+    /// is permanent for this grant and must never be reported as the retryable "still loading" or
+    /// "busy" case that a caller would poll on.
     static func evaluate(snapshot: Snapshot) -> Decision {
         if !snapshot.endpointMatchesGrant || snapshot.isClosing {
             return .blocked(.endpointInvalidated)
@@ -251,9 +184,6 @@ enum AgentSessionLinkDeliveryReadiness {
         }
         if isTargetBusy(snapshot) {
             return .blocked(.targetNotIdle)
-        }
-        if snapshot.observerTurnOrigin.requiresNewLocalUserInstruction {
-            return .blocked(.crossSessionReplyRequiresUserInstruction)
         }
         return .ready
     }

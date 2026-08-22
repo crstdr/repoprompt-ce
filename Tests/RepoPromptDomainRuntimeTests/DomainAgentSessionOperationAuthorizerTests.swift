@@ -143,7 +143,6 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
     func testMonitorOperationsRequireTheExactGrantCapability() {
         let expected: [DomainAgentSessionTargetOperation: DomainAgentSessionLinkCapability] = [
             .monitorPoll: .poll,
-            .monitorMarkDone: .poll,
             .monitorWait: .wait,
             .monitorRead: .read,
             .monitorSend: .sendWhenIdle,
@@ -328,7 +327,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             Set(monitorOperations.map(\.rawValue)),
             [
                 "agent_session_link.list", "agent_session_link.poll", "agent_session_link.wait",
-                "agent_session_link.read", "agent_session_link.send", "agent_session_link.mark_done",
+                "agent_session_link.read", "agent_session_link.send",
                 "agent_session_link.snooze_auto_wake",
             ]
         )
@@ -337,9 +336,9 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
         }
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorSend.mutatesTarget)
         XCTAssertFalse(DomainAgentSessionTargetOperation.monitorRead.mutatesTarget)
-        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorMarkDone.isObserverScoped)
-        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorMarkDone.mutatesTarget)
-        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorMarkDone.requiredMonitorCapability, .poll)
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorPoll.isObserverScoped)
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorPoll.mutatesTarget)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorPoll.requiredMonitorCapability, .poll)
         XCTAssertTrue(DomainAgentSessionTargetOperation.manageCleanup.mutatesTarget)
         // Snooze names a target because the policy is per-lane, but it never reaches that target: it
         // must stay a non-observer-scoped, non-mutating `.poll` operation, or it would either be

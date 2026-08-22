@@ -5399,12 +5399,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // dispatch ID. An accepted Auto-wake is already settled: it may replay only its exact
             // accepted fragment, never raw text or a newly minted lane claim. Ordinary turns keep
             // the current-claim, exact-accepted-claim, then raw-text ordering.
+            //
+            // Classified by reserved dispatch-ID family rather than by a parsed wake ID, so a
+            // malformed Auto-wake identity takes the restrictive branch and is refused instead of
+            // falling through to the ordinary replay that may mint a fresh claim or send raw text.
             let originalMonitoringDispatchID = replayTurn.monitoringDispatchID
                 ?? replayTurn.monitoringClaim?.dispatchID
             let monitoring: AgentSessionLinkDecoratedProviderText?
             let replayText: String
             if let originalMonitoringDispatchID,
-               originalMonitoringDispatchID.autoWakeID != nil
+               originalMonitoringDispatchID.isAutoWakeFamily
             {
                 guard let acknowledged = replayTurn.monitoringClaim,
                       viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
