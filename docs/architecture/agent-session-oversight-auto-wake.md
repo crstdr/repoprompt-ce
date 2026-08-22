@@ -262,6 +262,15 @@ Because the reducer keeps one coalesced interval per lane and no event history, 
 description of what survives a snooze is "the current coalesced summary" — never a count of missed
 events. Copy and model guidance are written to that standard on purpose.
 
+### The Auto-wake line is subordinate to its lane
+
+In the dashboard's Overseeing list, the Snooze Auto-wake line is drawn inside the lane it governs,
+bound tighter to the metadata it qualifies than that lane's own lines are bound to each other, and
+complete lane blocks are held apart by the widest gap. A faint rule may fall only *between* two
+complete blocks (`AgentMonitorLaneGrouping.drawsSeparator`) — never inside one, which would present
+a lane's snooze control as an entry with no lane, and never after the last, where the section's own
+`Divider()` already ends the list and a second rule reads as an empty lane.
+
 ## The `.cancelledBeforeDispatch` tombstone is a fence, not bookkeeping
 
 When a snooze — or any eligibility loss — retracts a wake that is already in `.preparingDispatch`,
