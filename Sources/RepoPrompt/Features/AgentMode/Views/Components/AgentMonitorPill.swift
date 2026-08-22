@@ -136,6 +136,16 @@ struct AgentMonitorPopoverView: View {
         /// visual QA.
         static let baseWidth: CGFloat = 500
         static let baseHeight: CGFloat = 430
+
+        /// The Overseeing list's spacing ladder, tightest binding first.
+        ///
+        /// A lane is one block: identity, the metadata line, and the subordinate Auto-wake line. The
+        /// subordinate line binds tighter to the metadata it qualifies than the lane's own lines bind
+        /// to each other, and complete blocks are held apart by the widest gap — so the grouping is
+        /// legible from spacing alone, before the rule between blocks is noticed at all.
+        static let laneSubordinateSpacing: CGFloat = 1
+        static let laneLineSpacing: CGFloat = 2
+        static let laneBlockSpacing: CGFloat = 8
     }
 
     private var popoverWidth: CGFloat {
@@ -282,18 +292,41 @@ struct AgentMonitorPopoverView: View {
             // One popover-scoped minute tick drives every row's relative timestamp from the same
             // instant. It exists only while the popover is open and performs no authority work.
             TimelineView(.periodic(from: freshnessTickAnchor, by: 60)) { timeline in
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(sortedOutbound) { row in
-                        outboundRow(row, now: timeline.date)
-                    }
+                outboundList(now: timeline.date)
+            }
+        }
+    }
+
+    /// The lane blocks, with a rule wherever one complete block ends and the next begins.
+    ///
+    /// The rule is a sibling of the blocks rather than a trailing decoration carried by each one, so
+    /// the stack's own spacing falls on both sides of it and every block is bounded the same way
+    /// above and below.
+    private func outboundList(now: Date) -> some View {
+        let rows = sortedOutbound
+        return VStack(alignment: .leading, spacing: Layout.laneBlockSpacing) {
+            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                outboundRow(row, now: now)
+                if AgentMonitorLaneGrouping.drawsSeparator(afterLaneAt: index, of: rows.count) {
+                    laneBlockSeparator
                 }
             }
         }
     }
 
+    /// Deliberately lighter than the `Divider()` this popover draws between sections: Overseeing is
+    /// one section, and a full-weight rule inside it would read as several.
+    private var laneBlockSeparator: some View {
+        Rectangle()
+            .fill(Color(nsColor: .separatorColor).opacity(0.5))
+            .frame(height: 1)
+            .frame(maxWidth: .infinity)
+            .accessibilityHidden(true)
+    }
+
     private func outboundRow(_ row: AgentMonitorPillProps.Outbound, now: Date) -> some View {
         let isBusy = busyRowKeys.contains(row.rowKey)
-        return VStack(alignment: .leading, spacing: 2) {
+        return VStack(alignment: .leading, spacing: Layout.laneLineSpacing) {
             HStack(spacing: 6) {
                 AgentMonitorStatusIndicator(status: row.status, fontPreset: fontPreset)
                     .hoverTooltip(row.status.tooltip, .top)
@@ -310,13 +343,18 @@ struct AgentMonitorPopoverView: View {
                 }
                 outboundActions(row, isBusy: isBusy)
             }
-            Text(row.taskMetadataLine(now: now))
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .hoverTooltip("\(row.identityTooltip)\n\(row.activityTooltip)", .top)
-            snoozeRow(row, now: now, isBusy: isBusy)
+            // The Auto-wake line qualifies this lane's metadata rather than standing beside it, so
+            // the two are one unit held tighter than the lane's own line spacing. When the row has
+            // nothing to say about Auto-wake, `snoozeRow` renders nothing and adds no gap.
+            VStack(alignment: .leading, spacing: Layout.laneSubordinateSpacing) {
+                Text(row.taskMetadataLine(now: now))
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .hoverTooltip("\(row.identityTooltip)\n\(row.activityTooltip)", .top)
+                snoozeRow(row, now: now, isBusy: isBusy)
+            }
             if let feedback = rowFeedbackByRowKey[row.rowKey] {
                 messageText(feedback.message)
             }
@@ -1167,6 +1205,21 @@ struct AgentMonitorPopoverView: View {
                 validationMessage = nil
             }
         }
+    }
+}
+
+// MARK: - Lane grouping
+
+/// Where the Overseeing list is allowed to draw a rule.
+///
+/// The rule carries one claim: a complete lane block ended and the next begins. A lane block is the
+/// identity line, its metadata, and the subordinate Auto-wake line, so a rule may never fall inside
+/// one — a rule above a lane's own snooze control would present that control as an entry with no
+/// lane. It also never follows the last lane, because the popover already draws a `Divider()` where
+/// the section ends and a second rule immediately above it reads as an empty lane.
+enum AgentMonitorLaneGrouping {
+    static func drawsSeparator(afterLaneAt index: Int, of count: Int) -> Bool {
+        index >= 0 && index < count - 1
     }
 }
 
