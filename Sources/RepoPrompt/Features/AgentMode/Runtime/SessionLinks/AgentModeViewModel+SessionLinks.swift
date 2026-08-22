@@ -216,7 +216,6 @@ extension AgentModeViewModel {
                 worktreeLabel: primaryExecutionWorktreeIndicator(forTabID: tabID)?.label,
                 workspaceName: workspaceManager?.workspace(withID: identity.workspaceID)?.name
             ),
-            turnOrigin: session.agentSessionLinkTurnOrigin,
             // Qualified here, in the endpoint's own window, against the binding state read in this
             // same MainActor pass. A proof left over from a superseded binding degrades to pending
             // rather than travelling on the candidate as authoritative.
@@ -244,7 +243,7 @@ extension AgentModeViewModel {
 
     /// Repaints the observers of one tab when its effective location label actually changed.
     ///
-    /// Presentation only: it fires the monitor-only sink and nothing else. A changed *endpoint*
+    /// Presentation only: it fires the projection-only sink and nothing else. A changed *endpoint*
     /// is deliberately not treated as a location delta — an in-place rebind is a lifecycle event the
     /// authoritative paths already own, and repainting a superseded incarnation's observers here
     /// would only race them.
@@ -314,18 +313,6 @@ extension AgentModeViewModel {
         return session.agentSessionLinkAutoWakeTargetSessionIDs
     }
 
-    func agentSessionLinkTargetLocalInputState(
-        for candidate: AgentSessionLinkEndpointCandidate
-    ) -> AgentSessionLinkTargetLocalInputState {
-        guard let session = sessions[candidate.tabID],
-              session.activeAgentSessionID == candidate.sessionID
-        else { return AgentSessionLinkTargetLocalInputState(epoch: 0, isLocalUser: false) }
-        return AgentSessionLinkTargetLocalInputState(
-            epoch: session.agentSessionLinkLocalInputEpoch,
-            isLocalUser: session.agentSessionLinkTurnOrigin == .localUser
-        )
-    }
-
     /// Writes that setting to one exact observer incarnation.
     ///
     /// Endpoint-checked before the write, marked dirty so the existing scheduled persistence saves
@@ -352,7 +339,8 @@ extension AgentModeViewModel {
         }
         // Disabling cancels not-yet-accepted wake work but never clears the lane queue: the content
         // stays owed to a natural future turn. Re-enabling is an explicit recovery action and clears
-        // only failure suppression; it cannot bypass the durable non-local-origin fence.
+        // only failure suppression; it invents no admission basis, so a lane with no genuinely new
+        // edge stays silent.
         if enabled {
             agentSessionLinkClearAutoWakeSuppression(for: endpoint)
         } else if session.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty {
@@ -522,12 +510,127 @@ extension AgentModeViewModel {
         let superseded = monitorPillPropsByEndpoint.keys.filter { cached in
             cached.tabID == endpoint.tabID && cached != endpoint
         }
-        guard !superseded.isEmpty || monitorPillPropsByEndpoint[endpoint] != props else { return }
-        for stale in superseded {
-            monitorPillPropsByEndpoint.removeValue(forKey: stale)
+        agentSessionLinkMutateProjectionStorage { stored in
+            for stale in superseded {
+                stored.removeValue(forKey: stale)
+            }
+            stored[endpoint] = props
         }
-        monitorPillPropsByEndpoint[endpoint] = props
+    }
+
+    /// Applies one logical exact-projection storage transaction and publishes one presentation
+    /// invalidation only after every write and removal is visible.
+    ///
+    /// This is the sole mutation boundary for `monitorPillPropsByEndpoint`. The status-pill snapshot
+    /// is synchronized before the notification so every consumer can immediately re-read the same
+    /// completed state. Equal replacements are true no-ops and publish nothing.
+    private func agentSessionLinkMutateProjectionStorage(
+        _ mutation: (inout [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps]) -> Void
+    ) {
+        var updated = monitorPillPropsByEndpoint
+        mutation(&updated)
+        guard updated != monitorPillPropsByEndpoint else { return }
+        monitorPillPropsByEndpoint = updated
         syncStatusPillsUIState()
+        NotificationCenter.default.post(
+            name: .agentSessionLinkOverseerProjectionDidChange,
+            object: self
+        )
+    }
+
+    /// Whether the tab's exact current incarnation is presently overseeing at least one target.
+    ///
+    /// A session UUID match is insufficient: an in-place rebind advances the endpoint generations,
+    /// and a projection addressed to the retired incarnation must fail closed.
+    func agentSessionLinkIsOverseer(tabID: UUID, expectedSessionID: UUID) -> Bool {
+        guard sessions[tabID]?.activeAgentSessionID == expectedSessionID,
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID),
+              let props = monitorPillPropsByEndpoint[endpoint],
+              props.endpoint == endpoint
+        else {
+            return false
+        }
+        return props.isOverseer
+    }
+
+    /// Convenience for callers that already hold a live tab identity.
+    func agentSessionLinkIsOverseer(tabID: UUID) -> Bool {
+        guard let sessionID = sessions[tabID]?.activeAgentSessionID else { return false }
+        return agentSessionLinkIsOverseer(tabID: tabID, expectedSessionID: sessionID)
+    }
+
+    /// Current target-centric oversight choices for one exact active sidebar row.
+    ///
+    /// The tab and session checks reject stale sidebar snapshots, while the two endpoint checks keep
+    /// an in-place rebind from inheriting either the enclosing projection or its target menu.
+    func agentSidebarOversightMenuProps(
+        tabID: UUID,
+        expectedSessionID: UUID
+    ) -> AgentSidebarOversightMenuProps? {
+        guard let endpoint = agentSidebarOversightTargetEndpoint(
+            tabID: tabID,
+            expectedSessionID: expectedSessionID
+        ),
+            let props = monitorPillPropsByEndpoint[endpoint],
+            props.endpoint == endpoint,
+            let menu = props.sidebarOversightMenu,
+            menu.targetEndpoint == endpoint,
+            menu.targetSessionID == expectedSessionID
+        else {
+            return nil
+        }
+        return menu
+    }
+
+    /// Exact current endpoint behind one active sidebar row, independent of whether its target menu
+    /// is presently projectable. System menus can outlive a rebind, so action feedback uses this
+    /// identity to distinguish same-endpoint eligibility churn from a replacement incarnation.
+    func agentSidebarOversightTargetEndpoint(
+        tabID: UUID,
+        expectedSessionID: UUID
+    ) -> DomainAgentSessionLinkEndpointIdentity? {
+        guard sessions[tabID]?.activeAgentSessionID == expectedSessionID else { return nil }
+        return agentSessionLinkObserverEndpoint(tabID: tabID)
+    }
+
+    /// Adds one exact current overseer to one exact target through the shared establishment core.
+    func addAgentSidebarOversight(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> AgentSidebarOversightActionOutcome {
+        switch await AgentSessionLinkRuntimeBridge.shared.addSidebarMonitorLink(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint
+        ) {
+        case .added:
+            .changed
+        case .alreadyLinked:
+            .alreadyInRequestedState
+        case let .failed(failure):
+            .failed(message: failure.uiMessage)
+        case let .rejected(message):
+            .failed(message: message)
+        }
+    }
+
+    /// Removes only the captured generation-qualified observer-target relationship.
+    func stopAgentSidebarOversight(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        expectedReference: DomainAgentSessionLinkReference
+    ) async -> AgentSidebarOversightActionOutcome {
+        switch await AgentSessionLinkRuntimeBridge.shared.stopMonitorLink(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint,
+            expectedReference: expectedReference
+        ) {
+        case .stopped:
+            .changed
+        case .alreadyStopped:
+            .alreadyInRequestedState
+        case let .failed(message):
+            .failed(message: message)
+        }
     }
 
     /// Overlays this observer's own Auto-wake policy onto the authoritative link rows.
@@ -590,6 +693,7 @@ extension AgentModeViewModel {
         return AgentMonitorPillProps(
             sessionID: props.sessionID,
             endpoint: props.endpoint,
+            sidebarOversightMenu: props.sidebarOversightMenu,
             outbound: outbound,
             inbound: props.inbound,
             recentNotices: props.recentNotices,
@@ -649,11 +753,11 @@ extension AgentModeViewModel {
             liveSessionIDs: Set(sessions.values.compactMap(\.activeAgentSessionID))
         )
         let stale = monitorPillPropsByEndpoint.keys.filter { !liveEndpoints.contains($0) }
-        guard !stale.isEmpty else { return }
-        for endpoint in stale {
-            monitorPillPropsByEndpoint.removeValue(forKey: endpoint)
+        agentSessionLinkMutateProjectionStorage { stored in
+            for endpoint in stale {
+                stored.removeValue(forKey: endpoint)
+            }
         }
-        syncStatusPillsUIState()
     }
 
     /// Live Add-eligibility inputs for one tab, read synchronously from current session state.
@@ -756,6 +860,7 @@ extension AgentModeViewModel {
         guard let published else {
             return AgentMonitorPillProps(
                 sessionID: sessionID,
+                sidebarOversightMenu: nil,
                 outbound: [],
                 inbound: [],
                 recentNotices: [],

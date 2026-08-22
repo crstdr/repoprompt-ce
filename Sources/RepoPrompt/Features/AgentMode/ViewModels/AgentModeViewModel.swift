@@ -4933,17 +4933,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    /// Applies the durable observer setting and conservative anti-chain predicate during hydration.
+    /// Applies the durable observer Auto-wake settings during hydration.
     /// Kept as one seam so tests exercise the same restoration transition as the full payload path.
     func restoreAgentSessionLinkState(from agentSession: AgentSession, to session: TabSession) {
         session.autoWakeOnOversightUpdates = agentSession.autoWakeOnOversightUpdates
         session.agentSessionLinkAutoWakeTargetSessionIDs = agentSession.agentSessionLinkAutoWakeTargetSessionIDs
-        // Reconstructed before anything can publish a queue against this incarnation, so a session
-        // that was auto-woken just before quitting cannot start a second autonomous turn on its first
-        // post-restore status edge.
-        session.agentSessionLinkTurnOrigin = .restored(
-            requiresLocalUserInstruction: agentSession.agentSessionLinkRequiresLocalUserInstruction
-        )
     }
 
     @discardableResult
@@ -12953,10 +12947,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
             agentSessionLinkAutoWakeTargetSessionIDs: session.agentSessionLinkAutoWakeTargetSessionIDs,
-            // The durable half of "automatic turns never chain". Only the predicate travels: the wake
-            // ID or source session behind a non-local origin dies with the process.
-            agentSessionLinkRequiresLocalUserInstruction: session.agentSessionLinkTurnOrigin
-                .persistedRequiresLocalUserInstruction,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
             parentSessionID: session.parentSessionID,
             pendingHandoffPayload: session.pendingHandoff.payload,
@@ -14349,13 +14339,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
-        // A locally accepted instruction always clears an earlier cross-session origin. This is the
-        // single acceptance point for every local user turn, including waiting-instruction
-        // continuations, so the mutual-link loop guard reopens exactly when the user speaks again.
-        session.agentSessionLinkLocalInputEpoch &+= 1
-        session.agentSessionLinkTurnOrigin = .localUser
         agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
-        // Same point, and deliberately so: this is where the local user takes the submission gate.
+        // This is the single acceptance point for every local user turn, including waiting-instruction
+        // continuations, and deliberately so: it is where the local user takes the submission gate.
         // A wake that has not yet reached its own dispatch boundary loses here and is released with
         // no provider call and no row — its queued content simply rides this turn instead. A wake
         // that already owns the gate is left alone: its physical call may be in flight, so the user's
@@ -15899,10 +15885,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let laneUpdateWakeID = directStartOptions.laneUpdateWakeID {
             guard agentSessionLinkPromptClaim(
                 for: session,
-                dispatchID: .autoWake(
-                    wakeID: laneUpdateWakeID,
-                    localInputEpoch: session.agentSessionLinkLocalInputEpoch
-                )
+                dispatchID: .autoWake(wakeID: laneUpdateWakeID)
             ) != nil else {
                 startOutcome?.recordStartFailure(message: nil)
                 return nil
@@ -17325,9 +17308,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ///   budget exactly as an ordinary send is.
     /// - `.laneUpdateAutoWake`: RepoPrompt authored the envelope. Nothing here attributes authorship
     ///   to the user — no `.user` row, no `lastUserMessageAt` movement, no user token charge, and no
-    ///   staged handoff consumption — and the anti-chain origin is deliberately *not* reset to
-    ///   `.localUser`; `acceptAgentSessionLinkPromptClaim` moves it to the lane-update origin instead,
-    ///   which is what stops one automatic turn from arming the next.
+    ///   staged handoff consumption. `acceptAgentSessionLinkPromptClaim` records the wake's own
+    ///   provenance row instead.
     ///
     /// Successful `resume(returning:)` is the physical acceptance boundary for this route, exactly as
     /// it already was for an ordinary instruction. No acceptance point moves earlier.

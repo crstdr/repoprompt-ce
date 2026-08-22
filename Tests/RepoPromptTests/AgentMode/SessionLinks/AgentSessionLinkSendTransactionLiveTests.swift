@@ -172,7 +172,6 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
             linkGeneration: 1,
             observerEndpoint: Self.observerEndpoint,
             observerDisplayName: "Planning",
-            observerTurnOrigin: .localUser,
             message: message,
             workflow: workflow
         )
@@ -224,11 +223,36 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
             fixture.events.saveHappenedBeforeProviderStart(),
             "Provider start must never precede durable persistence"
         )
+    }
 
-        XCTAssertEqual(
-            fixture.session.agentSessionLinkTurnOrigin,
-            .crossSessionMessage(sourceSessionID: request.observerSessionID)
+    /// Delivery needs no proof about the caller's own turn, and the row it commits is still
+    /// structurally attributed to the exact granted observer.
+    ///
+    /// The user's direct grant is the delegation, so the same request that would once have been
+    /// refused as "not started by your own user" now commits — while attribution, which is what stops
+    /// an observer from speaking as the target's user, is unchanged.
+    func testDeliveryNeedsNoLocalTurnProofAndStaysStructurallyAttributed() async throws {
+        let fixture = try makeFixture()
+        let request = AgentSessionLinkSendRequest(
+            linkID: UUID(),
+            linkGeneration: 1,
+            observerEndpoint: Self.observerEndpoint,
+            observerDisplayName: "Planning",
+            message: "ping back",
+            workflow: nil
         )
+
+        let outcome = await send(fixture, request: request)
+
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("Expected a durable delivery, got \(outcome)")
+        }
+        XCTAssertEqual(delivery.deliveryState, .runStarted)
+        let row = try XCTUnwrap(fixture.session.items.first { $0.kind == .user })
+        XCTAssertEqual(row.text, "ping back")
+        XCTAssertEqual(row.crossSessionAttribution?.sourceSessionID, request.observerSessionID)
+        XCTAssertEqual(row.crossSessionAttribution?.linkID, request.linkID)
+        XCTAssertTrue(fixture.events.savedItemsContainAttributedRow(id: row.id))
     }
 
     /// Regression for the non-Codex reporting gap: `AgentModeRunService.startRun` returns `nil` for
@@ -401,7 +425,6 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertTrue(fixture.session.items.isEmpty, "A lost claim must mutate nothing")
         XCTAssertFalse(fixture.events.contains(.save))
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
-        XCTAssertEqual(fixture.session.agentSessionLinkTurnOrigin, .localUser)
     }
 
     func testPersistenceFailureRollsBackTheStagedRowAndStartsNoRun() async throws {
@@ -415,11 +438,6 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertTrue(
             fixture.session.items.isEmpty,
             "A failed durable commit must roll the staged row back out of the transcript"
-        )
-        XCTAssertEqual(
-            fixture.session.agentSessionLinkTurnOrigin,
-            .localUser,
-            "Rollback must restore the turn origin so the loop guard is not left armed"
         )
         XCTAssertFalse(
             fixture.events.contains(.providerControllerCreated),
@@ -452,7 +470,6 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
             fixture.session.items.isEmpty,
             "The in-memory rollback still runs even when it cannot be durably confirmed"
         )
-        XCTAssertEqual(fixture.session.agentSessionLinkTurnOrigin, .localUser)
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
     }
@@ -661,25 +678,6 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertFalse(fixture.events.contains(.save))
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
-    }
-
-    func testCrossSessionOriginatedTurnCannotSendOnwardUntilALocalInstruction() async throws {
-        let fixture = try makeFixture()
-        let request = AgentSessionLinkSendRequest(
-            linkID: UUID(),
-            linkGeneration: 1,
-            observerEndpoint: Self.observerEndpoint,
-            observerDisplayName: "Planning",
-            observerTurnOrigin: .crossSessionMessage(sourceSessionID: UUID()),
-            message: "ping back",
-            workflow: nil
-        )
-
-        let outcome = await send(fixture, request: request)
-
-        XCTAssertEqual(outcome, .blocked(.crossSessionReplyRequiresUserInstruction))
-        XCTAssertTrue(fixture.session.items.isEmpty)
-        XCTAssertFalse(fixture.events.contains(.save))
     }
 }
 

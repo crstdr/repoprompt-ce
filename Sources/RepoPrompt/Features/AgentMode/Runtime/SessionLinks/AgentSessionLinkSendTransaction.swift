@@ -7,9 +7,9 @@ import RepoPromptDomainRuntime
 /// Everything the target's MainActor needs to run one cross-session send, as a value.
 ///
 /// The target never receives the observer's `AgentModeViewModel`, window, or lease: it receives the
-/// already-authorized facts. `observerTurnOrigin` in particular is captured from the *observer's*
-/// live session before the hop, because the loop guard is a property of the caller's turn and cannot
-/// be recovered from anything the target can see.
+/// already-authorized facts. Those facts are identity and attribution only — the user's exact direct
+/// grant is the delegation, so nothing about what started the observer's own turn travels with the
+/// request or gates its delivery.
 struct AgentSessionLinkSendRequest: Equatable {
     let linkID: UUID
     let linkGeneration: UInt64
@@ -23,7 +23,6 @@ struct AgentSessionLinkSendRequest: Equatable {
     /// Sender name captured at delivery time. Persisted with the row so the badge stays truthful
     /// after the sending session is renamed or closed.
     let observerDisplayName: String?
-    let observerTurnOrigin: AgentSessionLinkTurnOrigin
     /// Raw, unescaped message exactly as the observer wrote it. Escaping happens only at the
     /// provider-envelope boundary; the transcript row keeps the original text.
     let message: String
@@ -110,7 +109,6 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     case endpointInvalidated = "endpoint_invalidated"
     case targetLoading = "target_loading"
     case targetNotIdle = "target_not_idle"
-    case crossSessionReplyRequiresUserInstruction = "cross_session_reply_requires_user_instruction"
     case linkRevoked = "link_revoked"
     case persistenceFailed = "persistence_failed"
     /// The durable write failed *and* its compensating removal could not be durably confirmed, so the
@@ -123,7 +121,6 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .endpointInvalidated: self = .endpointInvalidated
         case .targetLoading: self = .targetLoading
         case .targetNotIdle: self = .targetNotIdle
-        case .crossSessionReplyRequiresUserInstruction: self = .crossSessionReplyRequiresUserInstruction
         }
     }
 
@@ -137,8 +134,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         switch self {
         case .targetLoading, .targetNotIdle, .persistenceFailed:
             true
-        case .endpointInvalidated, .linkRevoked, .crossSessionReplyRequiresUserInstruction,
-             .persistenceIndeterminate, .shuttingDown:
+        case .endpointInvalidated, .linkRevoked, .persistenceIndeterminate, .shuttingDown:
             false
         }
     }
@@ -156,9 +152,6 @@ enum AgentSessionLinkSendFailure: String, Equatable {
             "The overseen session is still loading. Poll it and try again."
         case .targetNotIdle:
             AgentSessionLinkDeliveryReadiness.BlockReason.targetNotIdle.message
-        case .crossSessionReplyRequiresUserInstruction:
-            AgentSessionLinkDeliveryReadiness.BlockReason
-                .crossSessionReplyRequiresUserInstruction.message
         case .linkRevoked:
             "Oversight of this session ended before the message was authorized. Nothing was delivered."
         case .persistenceFailed:

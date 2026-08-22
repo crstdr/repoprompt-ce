@@ -3,7 +3,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import XCTest
 
-/// Monitor-only execution-location refresh.
+/// Presentation-only projection refresh exercised through execution-location invalidation.
 ///
 /// Location is UI-only and lives on observer-side outbound rows alone, so the authoritative
 /// projection path cannot carry it: a worktree, branch, or workspace-name edit produces no authority
@@ -75,8 +75,8 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
             publishedInventoriesByEndpoint[endpoint] = inventory
         }
 
-        /// Counted for the same reason the inventory is: the monitor-only repaint must publish rows
-        /// and nothing an agent could be told.
+        /// Counted for the same reason the inventory is: the presentation-only repaint must publish
+        /// rows and nothing an agent could be told.
         func agentSessionLinkPublishPassiveStatusNotices(
             _: AgentSessionLinkPassiveStatusNotices.Snapshot,
             to _: DomainAgentSessionLinkEndpointIdentity
@@ -497,7 +497,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
             relabeled(fixture.target, locationLabel: "Quarry (main)")
         ]
         fixture.bridge.requestMonitorLocationRefresh(forExactTargetEndpoints: [targetEndpoint])
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
 
         XCTAssertEqual(
             fixture.host.publishedPropsByEndpoint[observerEndpoint]?.outbound.first?.locationLabel,
@@ -533,7 +533,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
             relabeled(fixture.target, locationLabel: "release-42")
         ]
         fixture.bridge.requestMonitorLocationRefresh(forExactTargetEndpoints: [targetEndpoint])
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
 
         let rawStateAfter = await fixture.authority.targetState(for: lease)
         let stateAfter = try XCTUnwrap(rawStateAfter)
@@ -563,7 +563,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
             relabeled(fixture.target, locationLabel: "dropped")
         ]
         fixture.bridge.requestMonitorLocationRefresh(forExactTargetEndpoints: [targetEndpoint])
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
         XCTAssertEqual(
             fixture.host.publishedPropsByEndpoint[fixture.observer.domainEndpoint]?
                 .outbound.first?.locationLabel,

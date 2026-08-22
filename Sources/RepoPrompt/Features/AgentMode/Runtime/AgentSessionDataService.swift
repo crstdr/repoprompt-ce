@@ -189,9 +189,6 @@ actor AgentSessionDataService {
         /// carries no key at all, and a non-optional would fail the whole header decode.
         let autoWakeOnOversightUpdates: Bool?
         let agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>?
-        /// Optional for the same reason, and read on the same restore path: the durable half of the
-        /// anti-chain fence has to survive the header-only cold load, not just a full hydration.
-        let agentSessionLinkRequiresLocalUserInstruction: Bool?
         let codexConversationID: String?
         let codexRolloutPath: String?
         let codexModel: String?
@@ -1127,8 +1124,6 @@ actor AgentSessionDataService {
                 autoEditEnabled: header.autoEditEnabled,
                 autoWakeOnOversightUpdates: header.autoWakeOnOversightUpdates ?? false,
                 agentSessionLinkAutoWakeTargetSessionIDs: header.agentSessionLinkAutoWakeTargetSessionIDs ?? [],
-                agentSessionLinkRequiresLocalUserInstruction: header
-                    .agentSessionLinkRequiresLocalUserInstruction ?? false,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
                 codexModel: header.codexModel,

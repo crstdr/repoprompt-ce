@@ -12,8 +12,9 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     private func outbound(
         status: AgentMonitorLinkStatus = .idle,
         displayName: String = "Build API",
+        providerDisplayName: String? = "Codex CLI",
+        locationLabel: String? = "worktree/feature",
         lastActivityAt: Date? = nil,
-        triageState: AgentMonitorTriageState = .active,
         hasUnreadActivity: Bool = false,
         targetRoute: AgentSessionDeepLinkRoute? = nil,
         autoWakeSnooze: AgentMonitorAutoWakeSnoozeState? = nil,
@@ -23,12 +24,12 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             linkID: UUID(),
             generation: 1,
             targetSessionID: targetID,
+            targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: targetID),
             displayName: displayName,
-            providerDisplayName: "Codex CLI",
-            locationLabel: "worktree/feature",
+            providerDisplayName: providerDisplayName,
+            locationLabel: locationLabel,
             status: status,
             lastActivityAt: lastActivityAt,
-            triageState: triageState,
             hasUnreadActivity: hasUnreadActivity,
             targetRoute: targetRoute,
             autoWakeSnooze: autoWakeSnooze,
@@ -90,12 +91,14 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             linkID: UUID(),
             generation: 1,
             observerSessionID: observerID,
+            observerEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID),
             displayName: displayName,
             providerDisplayName: "Claude Code"
         )
     }
 
     private func makeProps(
+        sidebarOversightMenu: AgentSidebarOversightMenuProps? = nil,
         outbound: [AgentMonitorPillProps.Outbound] = [],
         inbound: [AgentMonitorPillProps.Inbound] = [],
         notices: [AgentMonitorPillProps.Notice] = [],
@@ -105,6 +108,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     ) -> AgentMonitorPillProps {
         AgentMonitorPillProps(
             sessionID: observerID,
+            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: notices,
@@ -116,60 +120,23 @@ final class AgentMonitorPillPropsTests: XCTestCase {
 
     // MARK: - Identifiers
 
-    func testShortIDKeepsBothEndsSoRowsStayDistinguishable() {
+    func testShortIDKeepsBothEndsForFallbackSurfaces() {
         XCTAssertEqual(AgentMonitorSessionIDFormatter.short(targetID), "8B91…E572")
         XCTAssertEqual(AgentMonitorSessionIDFormatter.short(observerID), "04CF…1A00")
     }
 
-    /// Two overseen sessions can carry the same display name, so the token is the row's only
-    /// at-a-glance identity breaker. It must never render two visible rows identically, and it must
-    /// not widen rows that are already unambiguous.
-    func testShortTokensWidenOnlyForCollidingRowsAndFallBackToTheFullUUID() {
-        let first = UUID(uuidString: "8B910000-0000-0000-0000-00000000E572")
-        let second = UUID(uuidString: "8B911111-0000-0000-0000-00000000E572")
-        let distinct = UUID(uuidString: "04CF0000-0000-0000-0000-000000771A00")
-        guard let first, let second, let distinct else { return XCTFail("malformed fixture UUID") }
-
-        let tokens = AgentMonitorSessionIDFormatter.distinctShortTokens(for: [first, second, distinct])
-        XCTAssertEqual(tokens.count, 3)
-        XCTAssertEqual(Set(tokens.values).count, 3, "two visible rows would render the same token")
-        XCTAssertEqual(
-            tokens[distinct],
-            "04CF…1A00",
-            "an unambiguous row must not pay for another row's collision"
-        )
-        // One extra character at each end is enough to separate this pair, and no more is spent.
-        XCTAssertEqual(tokens[first], "8B910…0E572")
-        XCTAssertEqual(tokens[second], "8B911…0E572")
-        for token in tokens.values {
-            XCTAssertTrue(token.contains("…"), "both ends must survive: \(token)")
-        }
-
-        // Same input, same output: the token is a function of the visible set, never of ordering.
-        XCTAssertEqual(
-            AgentMonitorSessionIDFormatter.distinctShortTokens(for: [distinct, second, first]),
-            tokens
-        )
-
-        // Nothing widens forever. A pair that stays ambiguous at every bounded length falls back to
-        // the canonical UUID rather than rendering an ambiguous row.
-        let repeated = AgentMonitorSessionIDFormatter.distinctShortTokens(for: [first, first])
-        XCTAssertEqual(repeated, [first: "8B91…E572"])
-        XCTAssertEqual(AgentMonitorSessionIDFormatter.distinctShortTokens(for: []), [:])
-    }
-
     func testRowsCarryDirectionAndExposeTheFullUUID() {
         let out = outbound()
-        // The outbound row renders name and identity token as separate views, so the model carries
-        // the hover identity rather than one pre-joined label the layout would have to truncate.
+        // The visible outbound suffix is gone, so hover and accessibility retain canonical identity.
         XCTAssertEqual(out.identityTooltip, "Build API\n\(targetID.uuidString)")
-        XCTAssertEqual(out.shortID, "8B91…E572")
         XCTAssertEqual(out.fullID, targetID.uuidString)
         XCTAssertEqual(out.id, out.linkID)
+        XCTAssertEqual(out.targetEndpoint.sessionID, targetID)
 
         let inb = inbound()
         XCTAssertEqual(inb.rowLabel, "← Planning (04CF…1A00)")
         XCTAssertEqual(inb.fullID, observerID.uuidString)
+        XCTAssertEqual(inb.observerEndpoint.sessionID, observerID)
     }
 
     func testAccessibilityDescriptionsCarryTheFullUUIDAndStatusWord() {
@@ -192,18 +159,21 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             "Overseeing Build API in worktree/feature, session \(targetID.uuidString), "
                 + "Idle, Last activity unavailable"
         )
-        // A row whose target incarnation could not be resolved carries no location; the sentence must
-        // stay grammatical rather than speaking an empty slot.
+        // A row whose target incarnation could not be resolved renders an explicit visual fallback,
+        // while its accessible identity remains grammatical and carries the full canonical UUID.
+        let unavailable = AgentMonitorPillProps.Outbound(
+            linkID: UUID(),
+            generation: 1,
+            targetSessionID: targetID,
+            targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: targetID),
+            displayName: "Build API",
+            providerDisplayName: nil,
+            locationLabel: nil,
+            status: .unavailable
+        )
+        XCTAssertEqual(unavailable.locationDisplayLabel, "Location unavailable")
         XCTAssertEqual(
-            AgentMonitorPillProps.Outbound(
-                linkID: UUID(),
-                generation: 1,
-                targetSessionID: targetID,
-                displayName: "Build API",
-                providerDisplayName: nil,
-                locationLabel: nil,
-                status: .unavailable
-            ).accessibilityDescription,
+            unavailable.accessibilityDescription,
             "Overseeing Build API, session \(targetID.uuidString), "
                 + "Unavailable, Last activity unavailable"
         )
@@ -211,19 +181,18 @@ final class AgentMonitorPillPropsTests: XCTestCase {
 
     // MARK: - Detail line
 
-    /// Location leads: across many sessions spanning two providers the provider name distinguishes
-    /// almost nothing, while the worktree/workspace distinguishes strongly.
-    func testDetailLineLeadsWithLocationWhereAvailable() {
+    /// Location leads on the primary row; task, provider, and freshness share the secondary line.
+    func testOutboundLocationAndTaskMetadataFormatting() {
         let outbound = outbound()
         XCTAssertEqual(
             outbound.detailLine,
             "worktree/feature · Codex CLI · Activity unavailable"
         )
-        XCTAssertEqual(outbound.locationProviderLine, "worktree/feature · Codex CLI")
+        XCTAssertEqual(outbound.locationDisplayLabel, "worktree/feature")
         XCTAssertEqual(
-            outbound.metadataLine(now: moment(hour: 15), calendar: calendar, locale: locale),
-            "worktree/feature · Codex CLI · Activity unavailable",
-            "metadata stays on one line and visible status remains on the status dot"
+            outbound.taskMetadataLine(now: moment(hour: 15), calendar: calendar, locale: locale),
+            "Build API · Codex CLI · Activity unavailable",
+            "visible status remains on the status indicator rather than in task metadata"
         )
         // Inbound carries neither status nor location: nothing observes an observer's session, so
         // neither value has a path that would refresh it. See
@@ -241,7 +210,38 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         )
     }
 
-    func testOutboundKeepsActivityRouteAndDoneSeparateFromLiveStatus() {
+    func testOutboundFormattingTrimsLocationAndOmitsBlankProvider() {
+        let row = outbound(
+            displayName: "8B91…E572",
+            providerDisplayName: "  \n",
+            locationLabel: "  feature/api  "
+        )
+        XCTAssertEqual(row.locationDisplayLabel, "feature/api")
+        XCTAssertEqual(
+            row.taskMetadataLine(now: moment(hour: 15), calendar: calendar, locale: locale),
+            "8B91…E572 · Activity unavailable"
+        )
+
+        let missingLocation = outbound(providerDisplayName: nil, locationLabel: " \t ")
+        XCTAssertEqual(missingLocation.locationDisplayLabel, "Location unavailable")
+        XCTAssertEqual(
+            missingLocation.taskMetadataLine(now: moment(hour: 15), calendar: calendar, locale: locale),
+            "Build API · Activity unavailable"
+        )
+
+        let missingTask = outbound(
+            displayName: "  \n",
+            providerDisplayName: nil,
+            locationLabel: "feature/api"
+        )
+        XCTAssertEqual(
+            missingTask.taskMetadataLine(now: moment(hour: 15), calendar: calendar, locale: locale),
+            "Activity unavailable",
+            "blank task and provider segments must not leave a leading separator"
+        )
+    }
+
+    func testOutboundKeepsActivityRouteAndUnreadSeparateFromLiveStatus() {
         let activity = Date(timeIntervalSince1970: 123)
         let route = AgentSessionDeepLinkRoute(
             windowID: 7,
@@ -252,16 +252,16 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         let row = outbound(
             status: .running,
             lastActivityAt: activity,
-            triageState: .done,
+            hasUnreadActivity: true,
             targetRoute: route
         )
 
         XCTAssertEqual(row.status, .running)
         XCTAssertEqual(row.lastActivityAt, activity)
-        XCTAssertEqual(row.triageState, .done)
+        XCTAssertTrue(row.hasUnreadActivity)
         XCTAssertEqual(row.targetRoute, route)
         XCTAssertTrue(row.activityAccessibilityLabel.hasPrefix("Last activity "))
-        XCTAssertTrue(row.accessibilityDescription.hasSuffix(", Done"))
+        XCTAssertTrue(row.accessibilityDescription.hasSuffix(", New activity"))
     }
 
     /// A blank location slot is ambiguous between "the main checkout" and "we have no idea", which
@@ -346,6 +346,24 @@ final class AgentMonitorPillPropsTests: XCTestCase {
 
     // MARK: - Pill state
 
+    func testDashboardCountsOmitZeroAndPreserveEachDirection() {
+        let empty = makeProps()
+        XCTAssertNil(empty.dashboardOutboundCount)
+        XCTAssertNil(empty.dashboardInboundCount)
+
+        let outboundOnly = makeProps(outbound: [outbound(), outbound()])
+        XCTAssertEqual(outboundOnly.dashboardOutboundCount, 2)
+        XCTAssertNil(outboundOnly.dashboardInboundCount)
+
+        let inboundOnly = makeProps(inbound: [inbound()])
+        XCTAssertNil(inboundOnly.dashboardOutboundCount)
+        XCTAssertEqual(inboundOnly.dashboardInboundCount, 1)
+
+        let both = makeProps(outbound: [outbound()], inbound: [inbound(), inbound()])
+        XCTAssertEqual(both.dashboardOutboundCount, 1)
+        XCTAssertEqual(both.dashboardInboundCount, 2)
+    }
+
     func testAccessibilityValueDescribesBothDirections() {
         XCTAssertEqual(makeProps().accessibilityValue, "Not overseeing any sessions.")
         XCTAssertEqual(
@@ -362,13 +380,13 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         )
     }
 
-    func testActiveAndInboundFlagsAreIndependent() {
-        XCTAssertFalse(makeProps().isActive)
+    func testOverseerAndInboundFlagsAreIndependent() {
+        XCTAssertFalse(makeProps().isOverseer)
         XCTAssertFalse(makeProps().hasInbound)
-        XCTAssertTrue(makeProps(outbound: [outbound()]).isActive)
+        XCTAssertTrue(makeProps(outbound: [outbound()]).isOverseer)
         XCTAssertFalse(makeProps(outbound: [outbound()]).hasInbound)
         // Being observed must not make the pill look like it is observing someone.
-        XCTAssertFalse(makeProps(inbound: [inbound()]).isActive)
+        XCTAssertFalse(makeProps(inbound: [inbound()]).isOverseer)
         XCTAssertTrue(makeProps(inbound: [inbound()]).hasInbound)
     }
 
@@ -449,12 +467,18 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     }
 
     func testOverlayPreservesAuthoritativeLinkAndNoticeProjection() {
-        // Only eligibility is recomputed; link membership, triage, unread, and notices stay
-        // authority-owned. A copy helper that dropped unread would silently clear a signal the user
-        // has not acknowledged.
+        // Only eligibility is recomputed; link membership, unread, and notices stay authority-owned.
+        // A copy helper that dropped unread would silently clear a signal the user has not acknowledged.
         let notice = AgentMonitorPillProps.Notice(linkID: UUID(), generation: 3, message: "ended")
+        let menu = AgentSidebarOversightMenuProps(
+            targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID),
+            targetSessionID: observerID,
+            targetDisplayName: "Planning",
+            observerOptions: []
+        )
         let published = makeProps(
-            outbound: [outbound(status: .running, triageState: .done, hasUnreadActivity: true)],
+            sidebarOversightMenu: menu,
+            outbound: [outbound(status: .running, hasUnreadActivity: true)],
             inbound: [inbound()],
             notices: [notice],
             canAddReason: "Load this thread before adding sessions to oversee.",
@@ -472,6 +496,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertTrue(overlaid.outbound.allSatisfy(\.hasUnreadActivity))
         XCTAssertEqual(overlaid.inbound, published.inbound)
         XCTAssertEqual(overlaid.recentNotices, published.recentNotices)
+        XCTAssertEqual(overlaid.sidebarOversightMenu, menu)
         XCTAssertNil(overlaid.canAddReason)
         XCTAssertTrue(
             overlaid.autoWakeOnUpdatesEnabled,
@@ -486,15 +511,23 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(withPersistence.outbound, published.outbound)
         XCTAssertEqual(withPersistence.inbound, published.inbound)
         XCTAssertEqual(withPersistence.recentNotices, published.recentNotices)
+        XCTAssertEqual(withPersistence.sidebarOversightMenu, menu)
         XCTAssertTrue(withPersistence.autoWakeOnUpdatesEnabled)
         XCTAssertEqual(withPersistence.autoWakeTargetSessionIDs, [targetID])
         XCTAssertTrue(published.withCanAddReason("changed").autoWakeOnUpdatesEnabled)
         XCTAssertEqual(published.withCanAddReason("changed").autoWakeTargetSessionIDs, [targetID])
+        XCTAssertEqual(published.withCanAddReason("changed").sidebarOversightMenu, menu)
     }
 
     /// The switch is the only place the user learns what auto-wake does, so its copy has to carry the
-    /// whole contract — and in particular the three halves that are easy to assume wrongly: updates
-    /// arrive either way, a busy agent is never interrupted, and automatic turns do not chain.
+    /// whole contract — and in particular the halves that are easy to assume wrongly: updates arrive
+    /// either way, a busy agent is never interrupted, and follow-up turns *can* continue.
+    ///
+    /// That last one used to read "automatic turns never chain", which was a transport guarantee that
+    /// no longer exists. A follow-up turn may act on the user's standing instruction and produce
+    /// activity that is itself an update, and two sessions the user explicitly pointed at each other
+    /// can keep waking one another. A bounded-sounding promise beside unbounded behaviour is worse
+    /// than no promise, so the copy states the outcome and names the controls that stop it.
     func testAutoWakeCopyStatesTheAlwaysOnAndBoundedFollowUpContract() {
         let tooltip = AgentMonitorAutoWakeCopy.tooltip
         XCTAssertTrue(
@@ -503,7 +536,20 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         )
         XCTAssertTrue(tooltip.contains("one follow-up turn"))
         XCTAssertTrue(tooltip.contains("already-accepted work first"))
-        XCTAssertTrue(tooltip.contains("never chain"))
+        XCTAssertFalse(
+            tooltip.contains("never chain"),
+            "the anti-chain guarantee was deleted from the transport; the copy must not still promise it"
+        )
+        XCTAssertTrue(
+            tooltip.contains("follow-ups can continue"),
+            "a chain is now a real outcome of turning this on, so the control has to say so"
+        )
+        XCTAssertTrue(
+            tooltip.contains("oversee each other can keep waking"),
+            "reciprocal grants are the case a user is most likely to create by accident"
+        )
+        // No new setting was added, so the copy has to point at the controls that already exist.
+        XCTAssertTrue(tooltip.contains("Snooze a lane, deselect it, or unlink"))
         XCTAssertTrue(
             tooltip.contains("this session"),
             "the scope is the observer session, not a link and not a global preference"
@@ -746,11 +792,11 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     func testRowFreshnessLinesSplitRelativeFromAbsolute() {
         let now = moment(hour: 15, minute: 30)
         let row = outbound(status: .running, lastActivityAt: now.addingTimeInterval(-120))
-        XCTAssertEqual(row.locationProviderLine, "worktree/feature · Codex CLI")
+        XCTAssertEqual(row.locationDisplayLabel, "worktree/feature")
         XCTAssertEqual(row.activityLine(now: now, calendar: calendar, locale: locale), "2m ago")
         XCTAssertEqual(
-            row.metadataLine(now: now, calendar: calendar, locale: locale),
-            "worktree/feature · Codex CLI · 2m ago"
+            row.taskMetadataLine(now: now, calendar: calendar, locale: locale),
+            "Build API · Codex CLI · 2m ago"
         )
         XCTAssertEqual(row.activityTooltip, AgentMonitorActivityFormatter.absolute(row.lastActivityAt))
         XCTAssertNotEqual(
@@ -762,30 +808,24 @@ final class AgentMonitorPillPropsTests: XCTestCase {
 
     // MARK: - Unread
 
-    /// Unread is a separate record from Done, so a row can be triaged complete and still be flagged
-    /// when strictly newer activity arrives.
-    func testUnreadIsIndependentOfDoneAndIsSpokenInTheRowValue() {
+    func testUnreadIsSpokenInTheRowValue() {
         XCTAssertFalse(outbound().hasUnreadActivity, "rows default to read, never to a false alarm")
 
         let unread = outbound(status: .running, hasUnreadActivity: true)
         XCTAssertTrue(unread.accessibilityDescription.hasSuffix(", New activity"))
         XCTAssertFalse(outbound().accessibilityDescription.contains("New activity"))
-
-        let reopened = outbound(triageState: .done, hasUnreadActivity: true)
-        XCTAssertTrue(reopened.accessibilityDescription.hasSuffix(", New activity, Done"))
     }
 
-    /// Four visually identical controls per row are indistinguishable in the VoiceOver rotor, so
+    /// Three visually identical controls per row are indistinguishable in the VoiceOver rotor, so
     /// each one names the session it acts on.
     func testInlineActionLabelsNameTheirRow() {
         let row = outbound()
         XCTAssertEqual(row.viewActionLabel, "View Build API")
-        XCTAssertEqual(row.doneActionLabel, "Done for Build API")
         XCTAssertEqual(row.markSeenActionLabel, "Mark Build API activity as seen")
         XCTAssertEqual(row.unlinkActionLabel, "Unlink oversight of Build API")
         XCTAssertEqual(
-            Set([row.viewActionLabel, row.doneActionLabel, row.markSeenActionLabel, row.unlinkActionLabel]).count,
-            4
+            Set([row.viewActionLabel, row.markSeenActionLabel, row.unlinkActionLabel]).count,
+            3
         )
     }
 
@@ -807,6 +847,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             AgentMonitorUnlinkUndo.undoAccessibilityLabel(direction: .inbound, displayName: "Build API")
         )
         XCTAssertTrue(AgentMonitorUnlinkUndo.undoTooltip.contains("new oversight link"))
+        XCTAssertTrue(AgentMonitorUnlinkUndo.undoTooltip.contains("Unread"))
         XCTAssertEqual(AgentMonitorUnlinkUndo.window, .seconds(8))
     }
 
@@ -923,16 +964,16 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             isEffectivelySelected: true
         )
         // Every other field survives the overlay, so a policy repaint cannot drop identity, status,
-        // triage, unread, or routing.
+        // unread, or routing.
         XCTAssertEqual(updated.linkID, row.linkID)
         XCTAssertEqual(updated.generation, row.generation)
         XCTAssertEqual(updated.targetSessionID, row.targetSessionID)
+        XCTAssertEqual(updated.targetEndpoint, row.targetEndpoint)
         XCTAssertEqual(updated.displayName, row.displayName)
         XCTAssertEqual(updated.providerDisplayName, row.providerDisplayName)
         XCTAssertEqual(updated.locationLabel, row.locationLabel)
         XCTAssertEqual(updated.status, row.status)
         XCTAssertEqual(updated.lastActivityAt, row.lastActivityAt)
-        XCTAssertEqual(updated.triageState, row.triageState)
         XCTAssertEqual(updated.hasUnreadActivity, row.hasUnreadActivity)
         XCTAssertEqual(updated.targetRoute, row.targetRoute)
         XCTAssertEqual(updated.autoWakeSnooze?.origin, .agent)
@@ -1143,6 +1184,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             linkID: linkID,
             generation: 1,
             targetSessionID: targetID,
+            targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: targetID),
             displayName: "Build API",
             providerDisplayName: nil,
             locationLabel: nil,
@@ -1152,6 +1194,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             linkID: linkID,
             generation: 2,
             targetSessionID: targetID,
+            targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: targetID),
             displayName: "Build API",
             providerDisplayName: nil,
             locationLabel: nil,

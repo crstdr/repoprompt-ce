@@ -23,8 +23,8 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(Set(actionFixtures.keys).union(actionlessFixtures.keys), Set(allTools))
         XCTAssertTrue(Set(actionFixtures.keys).isDisjoint(with: actionlessFixtures.keys))
         XCTAssertTrue(actionFixtures.values.allSatisfy { !$0.isEmpty })
-        XCTAssertEqual(actionFixtures.values.reduce(0) { $0 + $1.count }, 95)
-        XCTAssertEqual(try integer(catalog, key: "canonical_discriminated_action_count"), 95)
+        XCTAssertEqual(actionFixtures.values.reduce(0) { $0 + $1.count }, 94)
+        XCTAssertEqual(try integer(catalog, key: "canonical_discriminated_action_count"), 94)
         XCTAssertEqual(actionlessFixtures.count, try integer(catalog, key: "actionless_tool_count"))
 
         let actionEvidence = try dictionary(catalog, key: "action_execution_evidence")

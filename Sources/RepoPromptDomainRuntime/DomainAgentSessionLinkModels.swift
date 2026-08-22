@@ -389,7 +389,8 @@ package struct DomainAgentSessionLinkRevocationNotice: Hashable, Sendable {
 /// membership change and render rows, agent-facing inventory, and notices from different snapshots.
 /// The peer maps exist because an inventory item carries only session UUIDs: a session UUID can be
 /// live in more than one window at once, so a host that resolved the other side of a link by UUID
-/// would render — and attribute — the wrong incarnation.
+/// would render — and attribute — the wrong incarnation. Available target-menu choices also need
+/// the authority's exact current outbound observers from that same membership snapshot.
 package struct DomainAgentSessionLinkEndpointProjectionInputs: Equatable, Sendable {
     /// Grants where this exact incarnation is the observer.
     package let outbound: DomainAgentSessionLinkInventory
@@ -399,6 +400,8 @@ package struct DomainAgentSessionLinkEndpointProjectionInputs: Equatable, Sendab
     package let outboundTargetEndpoints: [UUID: DomainAgentSessionLinkEndpointIdentity]
     /// Exact observer incarnation of every `inbound` grant, keyed by link ID.
     package let inboundObserverEndpoints: [UUID: DomainAgentSessionLinkEndpointIdentity]
+    /// Exact endpoint incarnations that currently hold at least one outbound grant.
+    package let activeOutboundObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
     /// Revocation notices recorded for this exact incarnation. A different incarnation of the same
     /// session UUID never sees them.
     package let notices: [DomainAgentSessionLinkRevocationNotice]
@@ -408,12 +411,14 @@ package struct DomainAgentSessionLinkEndpointProjectionInputs: Equatable, Sendab
         inbound: DomainAgentSessionLinkInventory,
         outboundTargetEndpoints: [UUID: DomainAgentSessionLinkEndpointIdentity],
         inboundObserverEndpoints: [UUID: DomainAgentSessionLinkEndpointIdentity],
+        activeOutboundObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>,
         notices: [DomainAgentSessionLinkRevocationNotice]
     ) {
         self.outbound = outbound
         self.inbound = inbound
         self.outboundTargetEndpoints = outboundTargetEndpoints
         self.inboundObserverEndpoints = inboundObserverEndpoints
+        self.activeOutboundObserverEndpoints = activeOutboundObserverEndpoints
         self.notices = notices
     }
 }
@@ -445,6 +450,13 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
     package let observer: DomainAgentSessionLinkEndpointIdentity
     package let target: DomainAgentSessionLinkEndpointIdentity
     package let capabilities: Set<DomainAgentSessionLinkCapability>
+    /// Whether activation must preserve an already-active outbound relationship for this observer.
+    ///
+    /// Sidebar target-management uses this to prevent a stale available-choice projection from
+    /// creating an observer's first link after that exact endpoint stopped being an overseer. The
+    /// authority rechecks the predicate at activation, in the same actor turn that would insert the
+    /// new grant, so revoking the previous final link cannot race this precondition.
+    package let requiresExistingOutboundLink: Bool
     /// Advisory hint that this reservation is currently expected to install target observation.
     ///
     /// This is **not** authoritative. A reservation elected here can still be abandoned or
@@ -463,6 +475,7 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
         observer: DomainAgentSessionLinkEndpointIdentity,
         target: DomainAgentSessionLinkEndpointIdentity,
         capabilities: Set<DomainAgentSessionLinkCapability>,
+        requiresExistingOutboundLink: Bool,
         provisionallyInstallsTargetObservation: Bool,
         reservedAtAuthorityRevision: UInt64
     ) {
@@ -471,6 +484,7 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
         self.observer = observer
         self.target = target
         self.capabilities = capabilities
+        self.requiresExistingOutboundLink = requiresExistingOutboundLink
         self.provisionallyInstallsTargetObservation = provisionallyInstallsTargetObservation
         self.reservedAtAuthorityRevision = reservedAtAuthorityRevision
     }
@@ -527,6 +541,7 @@ package enum DomainAgentSessionLinkReservationRejection: String, Equatable, Send
     case observerBindingUnresolved = "observer_binding_unresolved"
     case targetBindingUnresolved = "target_binding_unresolved"
     case reservationAlreadyPending = "reservation_already_pending"
+    case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
 }
 
 package enum DomainAgentSessionLinkActivationDisposition: Equatable, Sendable {
@@ -549,6 +564,7 @@ package enum DomainAgentSessionLinkActivationRejection: String, Equatable, Senda
     case unknownReservation = "unknown_reservation"
     case endpointDrift = "endpoint_drift"
     case snapshotSessionMismatch = "snapshot_session_mismatch"
+    case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
 }
 
 package enum DomainAgentSessionLinkRevocationDisposition: Equatable, Sendable {

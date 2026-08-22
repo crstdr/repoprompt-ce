@@ -356,15 +356,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         sessionID: UUID = UUID(),
         workspaceID: UUID = UUID(),
         tabID: UUID = UUID(),
-        persistentBindingGeneration: UUID = UUID(),
+        persistentBindingGeneration: UUID? = UUID(),
         bindingTransitionGeneration: UInt64 = 1,
         hasLoadedPersistedState: Bool = true,
         bindingTransitionInProgress: Bool = false,
         isTopLevel: Bool = true,
+        isClosing: Bool = false,
         isMCPControlled: Bool = false,
         isMCPOriginated: Bool = false,
         roleAllowsOutboundMonitoring: Bool = true,
-        displayName: String = "Session"
+        displayName: String = "Session",
+        providerDisplayName: String? = "Codex CLI",
+        locationLabel: String? = "worktree/main",
+        isDeletionInProgress: Bool = false
     ) -> AgentSessionLinkEndpointCandidate {
         AgentSessionLinkEndpointCandidate(
             windowID: windowID,
@@ -376,13 +380,14 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             isTopLevel: isTopLevel,
             hasLoadedPersistedState: hasLoadedPersistedState,
             bindingTransitionInProgress: bindingTransitionInProgress,
-            isClosing: false,
+            isClosing: isClosing,
             isMCPControlled: isMCPControlled,
             isMCPOriginated: isMCPOriginated,
             roleAllowsOutboundMonitoring: roleAllowsOutboundMonitoring,
             displayName: displayName,
-            providerDisplayName: "Codex CLI",
-            locationLabel: "worktree/main"
+            providerDisplayName: providerDisplayName,
+            locationLabel: locationLabel,
+            isDeletionInProgress: isDeletionInProgress
         )
     }
 
@@ -493,7 +498,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         fixture.host.fireObservation(for: target.sessionID)
         await fixture.bridge.test_settleProjections()
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
     }
 
     // MARK: - Add and synchronous seed
@@ -620,6 +625,134 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(second, .alreadyLinked(linkID: firstLinkID, targetSessionID: fixture.target.sessionID))
         let observed5 = await fixture.authority.snapshot().activeLinkCount
         XCTAssertEqual(observed5, 1)
+    }
+
+    func testExactAddSelectsPresentedIncarnationsAmidDuplicateUUIDsAndIsIdempotent() async throws {
+        let fixture = makeFixture()
+        let duplicateObserver = makeCandidate(
+            windowID: 3,
+            sessionID: fixture.observer.sessionID,
+            displayName: "Planning duplicate"
+        )
+        let duplicateTarget = makeCandidate(
+            windowID: 4,
+            sessionID: fixture.target.sessionID,
+            displayName: "Build API duplicate"
+        )
+        fixture.host.candidates = [
+            duplicateObserver,
+            duplicateTarget,
+            fixture.observer,
+            fixture.target
+        ]
+
+        let first = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        )
+        guard case let .added(linkID, _) = first else {
+            return XCTFail("exact add failed: \(first)")
+        }
+        let exactInputs = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.observer.domainEndpoint
+        )
+        let item = try XCTUnwrap(exactInputs.outbound.items.first)
+        XCTAssertEqual(item.linkID, linkID)
+        XCTAssertEqual(
+            exactInputs.outboundTargetEndpoints[linkID],
+            fixture.target.domainEndpoint
+        )
+        let duplicateObserverInputs = await fixture.authority.projectionInputs(
+            forEndpoint: duplicateObserver.domainEndpoint
+        )
+        let duplicateTargetInputs = await fixture.authority.projectionInputs(
+            forEndpoint: duplicateTarget.domainEndpoint
+        )
+        XCTAssertTrue(duplicateObserverInputs.outbound.items.isEmpty)
+        XCTAssertTrue(duplicateTargetInputs.inbound.items.isEmpty)
+
+        let repeated = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        )
+        XCTAssertEqual(
+            repeated,
+            .alreadyLinked(
+                linkID: linkID,
+                targetSessionID: fixture.target.sessionID
+            )
+        )
+        let afterRepeated = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.observer.domainEndpoint
+        )
+        XCTAssertEqual(afterRepeated.outbound.items.first?.generation, item.generation)
+        let activeCount = await fixture.authority.snapshot().activeLinkCount
+        XCTAssertEqual(activeCount, 1)
+    }
+
+    func testExactAddRevalidatesObserverEligibilityBeforeMutatingAuthority() async {
+        let fixture = makeFixture()
+        let deniedObserver = makeCandidate(
+            windowID: fixture.observer.windowID,
+            sessionID: fixture.observer.sessionID,
+            workspaceID: fixture.observer.workspaceID,
+            tabID: fixture.observer.tabID,
+            persistentBindingGeneration: fixture.observer.persistentBindingGeneration,
+            bindingTransitionGeneration: fixture.observer.bindingTransitionGeneration,
+            roleAllowsOutboundMonitoring: false,
+            displayName: fixture.observer.displayName ?? "Planning"
+        )
+        XCTAssertEqual(deniedObserver.domainEndpoint, fixture.observer.domainEndpoint)
+        fixture.host.candidates = [deniedObserver, fixture.target]
+
+        let outcome = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        )
+
+        XCTAssertEqual(
+            outcome,
+            .rejected(message: AgentSessionLinkEndpointEligibility.roleDeniedReason)
+        )
+        let activeCount = await fixture.authority.snapshot().activeLinkCount
+        XCTAssertEqual(activeCount, 0)
+    }
+
+    func testExactAddRevokesWhenObserverEligibilityDriftsDuringTailAwait() async {
+        let authority = makeAuthority()
+        let host = FakeEndpointHost()
+        let observer = makeCandidate(windowID: 1, displayName: "Planning")
+        let target = makeCandidate(windowID: 2, displayName: "Build API")
+        let deniedObserver = makeCandidate(
+            windowID: observer.windowID,
+            sessionID: observer.sessionID,
+            workspaceID: observer.workspaceID,
+            tabID: observer.tabID,
+            persistentBindingGeneration: observer.persistentBindingGeneration,
+            bindingTransitionGeneration: observer.bindingTransitionGeneration,
+            roleAllowsOutboundMonitoring: false,
+            displayName: observer.displayName ?? "Planning"
+        )
+        host.candidates = [observer, target]
+        let bridge = AgentSessionLinkRuntimeBridge(
+            authority: authority,
+            host: host,
+            toolAdvertisementInvalidator: { sessionID in
+                guard sessionID == target.sessionID else { return }
+                await MainActor.run {
+                    host.candidates = [deniedObserver, target]
+                }
+            }
+        )
+
+        let outcome = await bridge.addMonitorLink(
+            observerEndpoint: observer.domainEndpoint,
+            targetEndpoint: target.domainEndpoint
+        )
+
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        let activeCount = await authority.snapshot().activeLinkCount
+        XCTAssertEqual(activeCount, 0, "tail drift must revoke the grant before Add reports failure")
     }
 
     func testForkInheritanceMintsFreshDirectLinksWithoutTransitiveTargetsAndIsIdempotent() async throws {
@@ -1073,7 +1206,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         XCTAssertEqual(outbound.locationLabel, "worktree/main")
         XCTAssertEqual(outbound.lastActivityAt, Date(timeIntervalSince1970: 100))
-        XCTAssertEqual(outbound.triageState, .active)
         XCTAssertEqual(
             outbound.targetRoute,
             AgentSessionDeepLinkRoute(
@@ -1094,210 +1226,338 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
     }
 
-    // MARK: - Dashboard triage
-
-    func testDoneAndActiveTriageAreGenerationQualifiedAndDoNotAdvanceAuthority() async {
+    func testTargetMenuProjectsMultipleLinkedObserversAndExactPeerEndpoints() async throws {
         let fixture = makeFixture()
+        let secondObserver = makeCandidate(windowID: 3, displayName: "Docs")
+        let availableObserver = makeCandidate(windowID: 4, displayName: "Review")
+        fixture.host.candidates = [
+            fixture.observer,
+            fixture.target,
+            secondObserver,
+            availableObserver
+        ]
         guard case .added = await addLink(fixture),
-              let reference = await linkReference(fixture)
-        else { return XCTFail("missing active link") }
+              case .added = await fixture.bridge.addMonitorLink(
+                  observerSessionID: secondObserver.sessionID,
+                  rawTargetSessionID: fixture.target.sessionID.uuidString
+              ), case .added = await fixture.bridge.addMonitorLink(
+                  observerEndpoint: availableObserver.domainEndpoint,
+                  targetEndpoint: fixture.observer.domainEndpoint
+              )
+        else {
+            return XCTFail("setup links failed")
+        }
+        await fixture.bridge.test_settleProjections()
+
+        let targetProps = try XCTUnwrap(
+            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]
+        )
+        let menu = try XCTUnwrap(targetProps.sidebarOversightMenu)
+        XCTAssertEqual(menu.targetEndpoint, fixture.target.domainEndpoint)
+        XCTAssertEqual(
+            Set(menu.linkedObservers.map(\.observerEndpoint)),
+            [fixture.observer.domainEndpoint, secondObserver.domainEndpoint]
+        )
+        XCTAssertEqual(menu.availableObservers.map(\.observerEndpoint), [availableObserver.domainEndpoint])
+        XCTAssertTrue(menu.linkedObservers.allSatisfy { option in
+            guard case .linked(_, observerCurrentlyEligible: true) = option.relationship else {
+                return false
+            }
+            return true
+        })
+        XCTAssertEqual(Set(targetProps.inbound.map(\.observerEndpoint)), [
+            fixture.observer.domainEndpoint,
+            secondObserver.domainEndpoint
+        ])
+        XCTAssertEqual(
+            fixture.host.publishedPropsByEndpoint[fixture.observer.domainEndpoint]?
+                .outbound.first?.targetEndpoint,
+            fixture.target.domainEndpoint
+        )
+    }
+
+    func testTargetMenuOffersOnlyExistingOverseersButRetainsUnavailableLinkedObserver() async throws {
+        let fixture = makeFixture()
+        let existingOverseer = makeCandidate(windowID: 3, displayName: "Existing overseer")
+        let ordinaryLane = makeCandidate(windowID: 4, displayName: "Ordinary lane")
+        fixture.host.candidates = [
+            fixture.observer,
+            fixture.target,
+            existingOverseer,
+            ordinaryLane
+        ]
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        ), case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: existingOverseer.domainEndpoint,
+            targetEndpoint: fixture.observer.domainEndpoint
+        ) else {
+            return XCTFail("setup links failed")
+        }
+        await fixture.bridge.test_settleProjections()
+        XCTAssertTrue(try XCTUnwrap(
+            fixture.host.publishedPropsByEndpoint[existingOverseer.domainEndpoint]
+        ).isOverseer)
+        XCTAssertFalse(try XCTUnwrap(
+            fixture.host.publishedPropsByEndpoint[ordinaryLane.domainEndpoint]
+        ).isOverseer)
+
+        // Keep the authority relationship but remove its live candidate. This is the unlink path that
+        // must survive an observer closing or otherwise becoming unavailable.
+        fixture.host.candidates = [fixture.target, existingOverseer, ordinaryLane]
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+
+        let menu = try XCTUnwrap(
+            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
+        )
+        XCTAssertEqual(menu.linkedObservers.map(\.observerEndpoint), [fixture.observer.domainEndpoint])
+        guard case .linked(_, observerCurrentlyEligible: false) = menu.linkedObservers.first?.relationship else {
+            return XCTFail("the unavailable linked observer must remain visible for unlink")
+        }
+        XCTAssertEqual(
+            menu.availableObservers.map(\.displayName),
+            ["Existing overseer"],
+            "ordinary live Agent lanes must not appear as Add choices"
+        )
+    }
+
+    func testSidebarAddFailsClosedWhenPresentedOverseerLosesItsFinalLinkBeforeActivation() async throws {
+        let fixture = makeFixture()
+        let newTarget = makeCandidate(windowID: 3, displayName: "New target")
+        fixture.host.candidates = [fixture.observer, fixture.target, newTarget]
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        ) else {
+            return XCTFail("setup link failed")
+        }
+        await fixture.bridge.test_settleProjections()
+        let presentedMenu = try XCTUnwrap(
+            fixture.host.publishedPropsByEndpoint[newTarget.domainEndpoint]?.sidebarOversightMenu
+        )
+        XCTAssertEqual(
+            presentedMenu.availableObservers.map(\.observerEndpoint),
+            [fixture.observer.domainEndpoint]
+        )
+        let currentReference = await linkReference(fixture)
+        let existingReference = try XCTUnwrap(currentReference)
+        let pair = AgentSessionOversightIntent(
+            observerSessionID: fixture.observer.sessionID,
+            targetSessionID: newTarget.sessionID
+        )
+        var revokedDuringAdd = false
+        fixture.bridge.test_afterReservationBeforeActivation = { pendingPair in
+            guard pendingPair == pair, !revokedDuringAdd else { return }
+            revokedDuringAdd = true
+            let disposition = await fixture.authority.revoke(
+                linkID: existingReference.linkID,
+                generation: existingReference.generation,
+                reason: .userRequested
+            )
+            guard case .revoked = disposition else {
+                return XCTFail("expected the former overseer's final link to revoke")
+            }
+        }
+
+        let outcome = await fixture.bridge.addSidebarMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: newTarget.domainEndpoint
+        )
+
+        XCTAssertTrue(revokedDuringAdd)
+        XCTAssertEqual(
+            outcome,
+            .rejected(message: AgentSessionLinkRuntimeBridge.existingOverseerRequiredMessage)
+        )
+        let snapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(snapshot.activeLinkCount, 0)
+        XCTAssertEqual(snapshot.pendingReservationCount, 0)
+        let remainsOverseer = await fixture.authority.hasActiveOutboundLink(
+            observerEndpoint: fixture.observer.domainEndpoint
+        )
+        XCTAssertFalse(remainsOverseer)
+    }
+
+    func testExactStopUnlinksOnlyTheSelectedObserverFromAMultiObserverTarget() async throws {
+        let fixture = makeFixture()
+        let secondObserver = makeCandidate(windowID: 3, displayName: "Docs")
+        fixture.host.candidates = [fixture.observer, secondObserver, fixture.target]
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        ), case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: secondObserver.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        ) else {
+            return XCTFail("setup links failed")
+        }
+        let firstInputs = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.observer.domainEndpoint
+        )
+        let firstItem = try XCTUnwrap(firstInputs.outbound.items.first)
+        let firstReference = DomainAgentSessionLinkReference(
+            linkID: firstItem.linkID,
+            generation: firstItem.generation
+        )
+
+        let outcome = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: firstReference
+        )
+
+        XCTAssertEqual(outcome, .stopped)
+        let stoppedInputs = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.observer.domainEndpoint
+        )
+        let survivingInputs = await fixture.authority.projectionInputs(
+            forEndpoint: secondObserver.domainEndpoint
+        )
+        let targetInputs = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.target.domainEndpoint
+        )
+        XCTAssertTrue(stoppedInputs.outbound.items.isEmpty)
+        XCTAssertEqual(survivingInputs.outbound.items.map(\.targetSessionID), [fixture.target.sessionID])
+        XCTAssertEqual(targetInputs.inbound.items.map(\.observerSessionID), [secondObserver.sessionID])
+        XCTAssertEqual(fixture.host.installCountsBySession[fixture.target.sessionID], 1)
+    }
+
+    func testExactStopRejectsMismatchedGrantEndpointsWithoutMutation() async throws {
+        let fixture = makeFixture()
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        ) else {
+            return XCTFail("setup add failed")
+        }
+        let inputs = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.observer.domainEndpoint
+        )
+        let item = try XCTUnwrap(inputs.outbound.items.first)
+        let reference = DomainAgentSessionLinkReference(
+            linkID: item.linkID,
+            generation: item.generation
+        )
+        let wrongObserver = makeCandidate(
+            windowID: 9,
+            sessionID: fixture.observer.sessionID,
+            displayName: "Wrong observer incarnation"
+        )
+        let wrongTarget = makeCandidate(
+            windowID: 10,
+            sessionID: fixture.target.sessionID,
+            displayName: "Wrong target incarnation"
+        )
         let authorityBefore = await fixture.authority.snapshot()
-        let promptInventoryBefore = fixture.host.publishedPromptInventories
-        let targetSnapshotCallsBefore = fixture.host.observationSnapshotCalls
 
-        let markedDone = await fixture.bridge.setMonitorTriageState(
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: reference,
-            state: .done
+        let observerMismatch = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: wrongObserver.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
         )
-        XCTAssertEqual(markedDone, .changed)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .done
+        let targetMismatch = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: wrongTarget.domainEndpoint,
+            expectedReference: reference
         )
 
-        let repeatedDone = await fixture.bridge.setMonitorTriageState(
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: reference,
-            state: .done
-        )
-        XCTAssertEqual(repeatedDone, .alreadyInRequestedState)
+        let staleMessage = "That oversight relationship is no longer active."
+        XCTAssertEqual(observerMismatch, .failed(message: staleMessage))
+        XCTAssertEqual(targetMismatch, .failed(message: staleMessage))
+        let authorityAfter = await fixture.authority.snapshot()
+        let activeGrant = await fixture.authority.activeGrant(for: reference)
+        XCTAssertEqual(authorityAfter, authorityBefore)
+        XCTAssertEqual(activeGrant?.observer, fixture.observer.domainEndpoint)
+        XCTAssertEqual(activeGrant?.target, fixture.target.domainEndpoint)
+    }
 
-        let markedActive = await fixture.bridge.setMonitorTriageState(
+    func testDeadObserverCanBeUnlinkedFromTheTargetsAuthorityRecordedGrant() async throws {
+        let fixture = makeFixture()
+        guard case .added = await fixture.bridge.addMonitorLink(
             observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: reference,
-            state: .active
+            targetEndpoint: fixture.target.domainEndpoint
+        ) else {
+            return XCTFail("setup add failed")
+        }
+        let inputs = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.observer.domainEndpoint
         )
-        XCTAssertEqual(markedActive, .changed)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .active
+        let item = try XCTUnwrap(inputs.outbound.items.first)
+        let reference = DomainAgentSessionLinkReference(
+            linkID: item.linkID,
+            generation: item.generation
         )
+        // Do not run a stale-endpoint sweep. The menu captured this exact authority relationship
+        // while the observer was live; Stop must not require that candidate to remain available.
+        fixture.host.candidates = [fixture.target]
+
+        let outcome = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+
+        XCTAssertEqual(outcome, .stopped)
+        let activeGrant = await fixture.authority.activeGrant(for: reference)
+        let targetInputs = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.target.domainEndpoint
+        )
+        XCTAssertNil(activeGrant)
+        XCTAssertTrue(targetInputs.inbound.items.isEmpty)
+    }
+
+    func testCandidateReadinessRepaintsMenusWithoutPromptInventoryPassiveSamplesOrAuthorityChanges() async throws {
+        let fixture = makeFixture()
+        let otherTarget = makeCandidate(
+            windowID: 3,
+            roleAllowsOutboundMonitoring: false,
+            displayName: "Other target"
+        )
+        fixture.host.candidates.append(otherTarget)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: otherTarget.domainEndpoint
+        ) else {
+            return XCTFail("setup link failed")
+        }
+        await fixture.bridge.test_settleProjections()
+        let before = try XCTUnwrap(
+            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
+        )
+        XCTAssertEqual(before.availableObservers.map(\.observerEndpoint), [fixture.observer.domainEndpoint])
+        let inventoryBefore = fixture.host.publishedInventoriesByEndpoint
+        let passivePublicationsBefore = fixture.host.passiveNoticePublicationCount
+        let authorityBefore = await fixture.authority.snapshot()
+
+        let loadingObserver = makeCandidate(
+            windowID: fixture.observer.windowID,
+            sessionID: fixture.observer.sessionID,
+            workspaceID: fixture.observer.workspaceID,
+            tabID: fixture.observer.tabID,
+            persistentBindingGeneration: fixture.observer.persistentBindingGeneration,
+            bindingTransitionGeneration: fixture.observer.bindingTransitionGeneration,
+            hasLoadedPersistedState: false,
+            displayName: fixture.observer.displayName ?? "Planning"
+        )
+        fixture.host.candidates = [loadingObserver, fixture.target, otherTarget]
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+
+        let repainted = try XCTUnwrap(
+            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
+        )
+        XCTAssertTrue(repainted.availableObservers.isEmpty)
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint, inventoryBefore)
+        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, passivePublicationsBefore)
         let authorityAfter = await fixture.authority.snapshot()
         XCTAssertEqual(authorityAfter, authorityBefore)
-        XCTAssertEqual(fixture.host.publishedPromptInventories, promptInventoryBefore)
-        XCTAssertEqual(fixture.host.observationSnapshotCalls, targetSnapshotCallsBefore)
     }
 
-    func testOnlyStrictlyNewerExactActivityReopensDone() async {
-        let fixture = makeFixture()
-        guard case .added = await addLink(fixture),
-              let reference = await linkReference(fixture)
-        else { return XCTFail("missing active link") }
-        let markedDone = await fixture.bridge.setMonitorTriageState(
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: reference,
-            state: .done
-        )
-        XCTAssertEqual(markedDone, .changed)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+    // MARK: - Activity high-water
 
-        func publish(status: DomainAgentSessionLinkStatus, activity: TimeInterval) async {
-            fixture.host.snapshotOverrides[fixture.target.sessionID] = DomainAgentSessionObservationSnapshot(
-                sessionID: fixture.target.sessionID,
-                displayName: "Build API",
-                providerDisplayName: "Codex CLI",
-                status: status,
-                idleForSend: status == .idle,
-                pendingInteractionKind: nil,
-                latestVisibleAssistantPreview: nil,
-                visibleRowCount: 1,
-                lastActivityAt: Date(timeIntervalSince1970: activity)
-            )
-            fixture.host.fireObservation(for: fixture.target.sessionID)
-            await fixture.bridge.test_settleMonitorLocationRefresh()
-        }
-
-        await publish(status: .running, activity: 100)
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .done
-        )
-        await publish(status: .idle, activity: 50)
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .done
-        )
-        await publish(status: .running, activity: 101)
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .active
-        )
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.lastActivityAt,
-            Date(timeIntervalSince1970: 101)
-        )
-    }
-
-    func testDoneCommitsPostValidationActivityAndDeniesAReboundTarget() async {
-        let fixture = makeFixture()
-        guard case .added = await addLink(fixture),
-              let reference = await linkReference(fixture)
-        else { return XCTFail("missing active link") }
-
-        let settledDuringValidation = Date(timeIntervalSince1970: 200)
-        fixture.bridge.test_duringFinalTriageLeaseValidation = {
-            fixture.host.snapshotOverrides[fixture.target.sessionID] = DomainAgentSessionObservationSnapshot(
-                sessionID: fixture.target.sessionID,
-                displayName: "Build API",
-                providerDisplayName: "Codex CLI",
-                status: .running,
-                idleForSend: false,
-                pendingInteractionKind: nil,
-                latestVisibleAssistantPreview: nil,
-                visibleRowCount: 1,
-                lastActivityAt: settledDuringValidation
-            )
-            await Task.yield()
-        }
-
-        let markedDone = await fixture.bridge.setMonitorTriageState(
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: reference,
-            state: .done
-        )
-        fixture.bridge.test_duringFinalTriageLeaseValidation = nil
-        XCTAssertEqual(markedDone, .changed)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.lastActivityAt,
-            settledDuringValidation
-        )
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .done
-        )
-
-        // Delivery of the already-settled observation after Done commits must not reopen it.
-        fixture.host.fireObservation(for: fixture.target.sessionID)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .done
-        )
-
-        fixture.host.snapshotOverrides[fixture.target.sessionID] = DomainAgentSessionObservationSnapshot(
-            sessionID: fixture.target.sessionID,
-            displayName: "Build API",
-            providerDisplayName: "Codex CLI",
-            status: .running,
-            idleForSend: false,
-            pendingInteractionKind: nil,
-            latestVisibleAssistantPreview: nil,
-            visibleRowCount: 1,
-            lastActivityAt: Date(timeIntervalSince1970: 201)
-        )
-        fixture.host.fireObservation(for: fixture.target.sessionID)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .active,
-            "only strictly later activity reopens the post-validation Done record"
-        )
-
-        let reboundTarget = makeCandidate(
-            windowID: fixture.target.windowID,
-            sessionID: fixture.target.sessionID,
-            workspaceID: fixture.target.workspaceID,
-            tabID: fixture.target.tabID,
-            bindingTransitionGeneration: fixture.target.bindingTransitionGeneration + 1,
-            displayName: "Build API (rebound)"
-        )
-        fixture.bridge.test_duringFinalTriageLeaseValidation = {
-            fixture.host.candidates = [fixture.observer, reboundTarget]
-            await Task.yield()
-        }
-        let deniedAfterRebind = await fixture.bridge.setMonitorTriageState(
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: reference,
-            state: .done
-        )
-        fixture.bridge.test_duringFinalTriageLeaseValidation = nil
-        guard case .failed = deniedAfterRebind else {
-            return XCTFail("a target rebound during final validation must deny Done")
-        }
-
-        // Restore the exact target. A fresh Done must still change state, proving the denied attempt
-        // did not commit triage against the replacement incarnation.
-        fixture.host.candidates = [fixture.observer, fixture.target]
-        let markedDoneAfterRestore = await fixture.bridge.setMonitorTriageState(
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: reference,
-            state: .done
-        )
-        XCTAssertEqual(markedDoneAfterRestore, .changed)
-    }
-
-    func testActivityHighWaterObservedByOneTriageActionReopensEveryExactTargetObserver() async {
+    func testActivityHighWaterObservedByOneSeenActionIsRetainedForEveryExactTargetObserver() async {
         let fixture = makeFixture()
         let secondObserver = makeCandidate(windowID: 3, displayName: "Docs")
         fixture.host.candidates = [fixture.observer, fixture.target, secondObserver]
@@ -1311,19 +1571,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
               let secondReference = await linkReference(fixture, observer: secondObserver.sessionID)
         else { return XCTFail("missing active links") }
 
-        for (observer, reference) in [
-            (fixture.observer, firstReference),
-            (secondObserver, secondReference)
-        ] {
-            let outcome = await fixture.bridge.setMonitorTriageState(
-                observerEndpoint: observer.domainEndpoint,
-                targetSessionID: fixture.target.sessionID,
-                expectedReference: reference,
-                state: .done
-            )
-            XCTAssertEqual(outcome, .changed)
-        }
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        XCTAssertNotEqual(firstReference, secondReference)
 
         fixture.host.snapshotOverrides[fixture.target.sessionID] = DomainAgentSessionObservationSnapshot(
             sessionID: fixture.target.sessionID,
@@ -1336,13 +1584,17 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             visibleRowCount: 1,
             lastActivityAt: Date(timeIntervalSince1970: 200)
         )
-        let firstActive = await fixture.bridge.setMonitorTriageState(
+        let markedSeen = await fixture.bridge.markMonitorActivitySeen(
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID,
-            expectedReference: firstReference,
-            state: .active
+            expectedReference: firstReference
         )
-        XCTAssertEqual(firstActive, .alreadyInRequestedState)
+        XCTAssertEqual(markedSeen, .marked)
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        XCTAssertEqual(
+            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.hasUnreadActivity,
+            false
+        )
 
         // A later regressed sample cannot hide the high-water from the other observer.
         fixture.host.snapshotOverrides[fixture.target.sessionID] = DomainAgentSessionObservationSnapshot(
@@ -1357,62 +1609,99 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             lastActivityAt: Date(timeIntervalSince1970: 50)
         )
         fixture.host.fireObservation(for: fixture.target.sessionID)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
 
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .active
-        )
-        XCTAssertEqual(
-            fixture.host.publishedProps[secondObserver.sessionID]?.outbound.first?.triageState,
-            .active
-        )
         XCTAssertEqual(
             fixture.host.publishedProps[secondObserver.sessionID]?.outbound.first?.lastActivityAt,
             Date(timeIntervalSince1970: 200)
         )
-    }
-
-    func testRevocationAndReaddCannotCarryDoneToTheNewReference() async {
-        let fixture = makeFixture()
-        guard case .added = await addLink(fixture),
-              let oldReference = await linkReference(fixture)
-        else { return XCTFail("missing active link") }
-        let markedDone = await fixture.bridge.setMonitorTriageState(
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: oldReference,
-            state: .done
-        )
-        XCTAssertEqual(markedDone, .changed)
-
-        await fixture.bridge.revokeLink(
-            linkID: oldReference.linkID,
-            generation: oldReference.generation
-        )
-        guard case .added = await addLink(fixture),
-              let newReference = await linkReference(fixture)
-        else { return XCTFail("re-add failed") }
-        XCTAssertNotEqual(newReference, oldReference)
         XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .active
-        )
-        guard case .failed = await fixture.bridge.setMonitorTriageState(
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: oldReference,
-            state: .done
-        ) else {
-            return XCTFail("stale triage action unexpectedly changed the replacement link")
-        }
-        XCTAssertEqual(
-            fixture.host.publishedProps[fixture.observer.sessionID]?.outbound.first?.triageState,
-            .active
+            fixture.host.publishedProps[secondObserver.sessionID]?.outbound.first?.hasUnreadActivity,
+            true,
+            "the other exact observer must still compare its own baseline with the target high-water"
         )
     }
 
     // MARK: - Unread since seen
+
+    func testSeenUsesPollAuthorization() async {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture),
+              let reference = await linkReference(fixture)
+        else { return XCTFail("missing active link") }
+        await publishTargetActivity(fixture, status: .running, activity: 200)
+
+        var observedOperations: [DomainAgentSessionTargetOperation] = []
+        fixture.bridge.test_observeSeenAuthorizationOperation = { operation in
+            observedOperations.append(operation)
+        }
+
+        let markedSeen = await fixture.bridge.markMonitorActivitySeen(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID,
+            expectedReference: reference
+        )
+        fixture.bridge.test_observeSeenAuthorizationOperation = nil
+
+        XCTAssertEqual(markedSeen, .marked)
+        XCTAssertEqual(observedOperations, [.monitorPoll])
+    }
+
+    func testSeenCommitsPostValidationActivityAndDeniesAReboundTarget() async {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture),
+              let reference = await linkReference(fixture)
+        else { return XCTFail("missing active link") }
+
+        let settledDuringValidation = Date(timeIntervalSince1970: 200)
+        fixture.bridge.test_duringFinalSeenLeaseValidation = {
+            fixture.host.snapshotOverrides[fixture.target.sessionID] = DomainAgentSessionObservationSnapshot(
+                sessionID: fixture.target.sessionID,
+                displayName: "Build API",
+                providerDisplayName: "Codex CLI",
+                status: .running,
+                idleForSend: false,
+                pendingInteractionKind: nil,
+                latestVisibleAssistantPreview: nil,
+                visibleRowCount: 1,
+                lastActivityAt: settledDuringValidation
+            )
+            await Task.yield()
+        }
+
+        let markedSeen = await fixture.bridge.markMonitorActivitySeen(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID,
+            expectedReference: reference
+        )
+        fixture.bridge.test_duringFinalSeenLeaseValidation = nil
+        XCTAssertEqual(markedSeen, .marked)
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        XCTAssertEqual(outboundRow(fixture)?.lastActivityAt, settledDuringValidation)
+        XCTAssertEqual(outboundRow(fixture)?.hasUnreadActivity, false)
+
+        let reboundTarget = makeCandidate(
+            windowID: fixture.target.windowID,
+            sessionID: fixture.target.sessionID,
+            workspaceID: fixture.target.workspaceID,
+            tabID: fixture.target.tabID,
+            bindingTransitionGeneration: fixture.target.bindingTransitionGeneration + 1,
+            displayName: "Build API (rebound)"
+        )
+        fixture.bridge.test_duringFinalSeenLeaseValidation = {
+            fixture.host.candidates = [fixture.observer, reboundTarget]
+            await Task.yield()
+        }
+        let deniedAfterRebind = await fixture.bridge.markMonitorActivitySeen(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID,
+            expectedReference: reference
+        )
+        fixture.bridge.test_duringFinalSeenLeaseValidation = nil
+        guard case .failed = deniedAfterRebind else {
+            return XCTFail("a target rebound during final validation must deny Seen")
+        }
+    }
 
     func testUnreadBaselinesReadThenTracksStrictlyNewerActivityUntilAcknowledged() async {
         let fixture = makeFixture()
@@ -1439,7 +1728,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             expectedReference: reference
         )
         XCTAssertEqual(marked, .marked)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
         XCTAssertEqual(outboundRow(fixture)?.hasUnreadActivity, false)
 
         let repeated = await fixture.bridge.markMonitorActivitySeen(
@@ -1454,54 +1743,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(outboundRow(fixture)?.hasUnreadActivity, false)
         await publishTargetActivity(fixture, status: .running, activity: 300)
         XCTAssertEqual(outboundRow(fixture)?.hasUnreadActivity, true)
-    }
-
-    func testDoneAcknowledgesUnreadAndLaterActivityReopensBothTogether() async {
-        let fixture = makeFixture()
-        guard case .added = await addLink(fixture),
-              let reference = await linkReference(fixture)
-        else { return XCTFail("missing active link") }
-
-        func triage(_ state: AgentMonitorTriageState) async -> AgentMonitorTriageOutcome {
-            let outcome = await fixture.bridge.setMonitorTriageState(
-                observerEndpoint: fixture.observer.domainEndpoint,
-                targetSessionID: fixture.target.sessionID,
-                expectedReference: reference,
-                state: state
-            )
-            await fixture.bridge.test_settleMonitorLocationRefresh()
-            return outcome
-        }
-
-        await publishTargetActivity(fixture, status: .running, activity: 200)
-        XCTAssertEqual(outboundRow(fixture)?.hasUnreadActivity, true)
-
-        // Triaging a lane complete necessarily means its current state was looked at, so Done
-        // advances the seen watermark to the same validated activity it captures.
-        let markedDone = await triage(.done)
-        XCTAssertEqual(markedDone, .changed)
-        XCTAssertEqual(outboundRow(fixture)?.triageState, .done)
-        XCTAssertEqual(outboundRow(fixture)?.hasUnreadActivity, false)
-
-        await publishTargetActivity(fixture, status: .running, activity: 300)
-        XCTAssertEqual(outboundRow(fixture)?.triageState, .active, "later activity reopens Done")
-        XCTAssertEqual(
-            outboundRow(fixture)?.hasUnreadActivity,
-            true,
-            "one activity sample must not reopen Done while leaving the row silently read"
-        )
-
-        let markedDoneAgain = await triage(.done)
-        XCTAssertEqual(markedDoneAgain, .changed)
-        XCTAssertEqual(outboundRow(fixture)?.hasUnreadActivity, false)
-        let reopened = await triage(.active)
-        XCTAssertEqual(reopened, .changed)
-        XCTAssertEqual(outboundRow(fixture)?.triageState, .active)
-        XCTAssertEqual(
-            outboundRow(fixture)?.hasUnreadActivity,
-            false,
-            "reopening a lane says nothing about review, so it must not re-flag acknowledged activity"
-        )
     }
 
     func testMarkSeenIsScopedToTheExactObserverAndReference() async {
@@ -1528,7 +1769,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             expectedReference: firstReference
         )
         XCTAssertEqual(marked, .marked)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
         XCTAssertEqual(outboundRow(fixture)?.hasUnreadActivity, false)
         XCTAssertEqual(
             outboundRow(fixture, observer: secondObserver.sessionID)?.hasUnreadActivity,
@@ -1544,7 +1785,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         ) else {
             return XCTFail("a foreign reference unexpectedly acknowledged this observer's row")
         }
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
         XCTAssertEqual(outboundRow(fixture, observer: secondObserver.sessionID)?.hasUnreadActivity, true)
     }
 
@@ -1566,7 +1807,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     /// Collection is an always-on property of a live, eligible direct link, so there is nothing to
     /// switch on: settling the authoritative pass is the whole setup.
     private func settlePassive(_ fixture: Fixture) async {
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
     }
 
     func testFirstDirectLinkBaselinesSilentlyAndOnlyTheAuthoritativePassSamplesTransitions() async throws {
@@ -1618,7 +1859,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         fixture.bridge.requestMonitorLocationRefresh(
             forExactTargetEndpoints: [fixture.target.domainEndpoint]
         )
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
         XCTAssertEqual(outboundRow(fixture)?.status, .awaitingUser, "the repaint did render the change")
         XCTAssertEqual(fixture.host.passiveNoticePublicationCount, publications)
         XCTAssertEqual(passiveSnapshot(fixture)?.queueRevision, settledRevision)
@@ -1691,7 +1932,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             generation: firstReference.generation
         )
         XCTAssertEqual(stoppedFirst, .stopped)
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
         XCTAssertEqual(passiveSnapshot(fixture)?.isEnabled, false)
         XCTAssertEqual(passiveSnapshot(fixture)?.entries.isEmpty, true)
         XCTAssertEqual(
@@ -1704,7 +1945,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         // retired queue's history.
         let retiredEpoch = passiveSnapshot(fixture)?.queueEpoch
         guard case .added = await addLink(fixture) else { return XCTFail("re-add failed") }
-        await fixture.bridge.test_settleMonitorLocationRefresh()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
         XCTAssertEqual(passiveSnapshot(fixture)?.isEnabled, true)
         XCTAssertNotEqual(passiveSnapshot(fixture)?.queueEpoch, retiredEpoch)
         XCTAssertEqual(passiveTransitions(passiveSnapshot(fixture)), [])
@@ -2021,7 +2262,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     /// The dashboard's Undo is not a restoration API: it runs the ordinary Add with the captured
     /// session pair, so the recovered relationship is a new link that inherits nothing.
-    func testUnlinkThenUndoStyleReAddCreatesAFreshLinkCarryingNoTriageOrSeenState() async {
+    func testUnlinkThenUndoStyleReAddCreatesAFreshLinkCarryingNoSeenState() async {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture),
               let oldReference = await linkReference(fixture)
@@ -2029,13 +2270,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         await publishTargetActivity(fixture, status: .running, activity: 200)
         XCTAssertEqual(outboundRow(fixture)?.hasUnreadActivity, true)
-        let markedDone = await fixture.bridge.setMonitorTriageState(
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID,
-            expectedReference: oldReference,
-            state: .done
-        )
-        XCTAssertEqual(markedDone, .changed)
 
         func stop() async -> AgentMonitorStopOutcome {
             await fixture.bridge.stopMonitorLink(
@@ -2067,7 +2301,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertNotEqual(newReference, oldReference)
 
         let recovered = outboundRow(fixture)
-        XCTAssertEqual(recovered?.triageState, .active)
         XCTAssertEqual(
             recovered?.hasUnreadActivity,
             false,
@@ -2075,7 +2308,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         XCTAssertEqual(recovered?.lastActivityAt, Date(timeIntervalSince1970: 200))
 
-        // Presentation actions addressed to the retired reference cannot reach the replacement.
+        // Seen addressed to the retired reference cannot reach the replacement.
         guard case .failed = await fixture.bridge.markMonitorActivitySeen(
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID,
@@ -2191,7 +2424,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(observerProps.outbound.first?.displayName, "Build API")
         XCTAssertEqual(observerProps.outbound.first?.status, .idle)
         XCTAssertTrue(observerProps.inbound.isEmpty)
-        XCTAssertTrue(observerProps.isActive)
+        XCTAssertTrue(observerProps.isOverseer)
         XCTAssertNil(observerProps.canAddReason)
 
         let targetProps = try XCTUnwrap(fixture.host.publishedProps[fixture.target.sessionID])
@@ -2817,14 +3050,15 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         ))
     }
 
-    func testSendPassesObserverIdentityNameAndTurnOriginToTheTargetTransaction() async throws {
+    /// The observer's live candidate supplies identity and the badge name — and nothing else.
+    ///
+    /// The user's exact direct grant is the delegation, so a send carries no proof about what started
+    /// the caller's own turn. What must still hold is that every delivery is structurally attributed
+    /// to the exact granted incarnation, which is what stops an observer from speaking anonymously.
+    func testSendPassesObserverIdentityAndNameToTheTargetTransactionWithNoCallerTurnProof() async throws {
         let fixture = makeFixture()
         _ = await addLink(fixture)
-        // The observer's live candidate is the authority for both the badge name and the loop guard.
-        var observerWithCrossOrigin = fixture.observer
-        observerWithCrossOrigin.turnOrigin = .crossSessionMessage(sourceSessionID: UUID())
-        fixture.host.candidates = [observerWithCrossOrigin, fixture.target]
-        fixture.host.sendOutcome = .blocked(.crossSessionReplyRequiresUserInstruction)
+        stageReadyTarget(fixture)
 
         let resolvedTarget = await authorizedSendTarget(fixture)
         let target = try XCTUnwrap(resolvedTarget)
@@ -2834,11 +3068,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             idempotencyKey: "key-1"
         )
 
-        XCTAssertEqual(outcome, .blocked(.crossSessionReplyRequiresUserInstruction))
+        guard case .receipt = outcome else {
+            return XCTFail("A grant-authorized send into an idle target must deliver: \(outcome)")
+        }
         let request = try XCTUnwrap(fixture.host.sendRequests.first?.request)
         XCTAssertEqual(request.observerSessionID, fixture.observer.sessionID)
         XCTAssertEqual(request.observerDisplayName, "Planning")
-        XCTAssertEqual(request.observerTurnOrigin, observerWithCrossOrigin.turnOrigin)
         XCTAssertEqual(request.message, "ship it")
         XCTAssertEqual(request.attribution.sourceSessionID, fixture.observer.sessionID)
         XCTAssertEqual(request.attribution.linkID, target.lease.linkID)
@@ -3295,50 +3530,40 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.host.sendRequests.last?.request.message, "review the diff")
     }
 
-    /// Queuing pre-authorizes a delivery the user is not present for, so it is reserved to a turn the
-    /// user actually started — exactly like sending now.
-    func testQueueAdmissionRefusesATurnTheObserversOwnUserDidNotStart() async {
+    /// Queue admission is decided by the grant and the slot, not by what started the caller's turn.
+    ///
+    /// The exact granted observer incarnation is still required — a drifted one may not install an
+    /// entry — but there is no caller-origin predicate left for admission to consult.
+    func testQueueAdmissionIsGrantAuthorizedWithoutAnyCallerTurnProof() async {
         let fixture = makeFixture()
         _ = await addLink(fixture)
-        var automatic = fixture.observer
-        automatic.turnOrigin = .laneUpdateAutoWake(wakeID: UUID())
-        fixture.host.candidates = [automatic, fixture.target]
+        stageBusyTarget(fixture)
 
         let outcome = await queueSend(fixture)
 
-        XCTAssertEqual(outcome, .send(.blocked(.crossSessionReplyRequiresUserInstruction)))
-        XCTAssertTrue(fixture.host.sendRequests.isEmpty, "Nothing may reach the target transaction")
+        XCTAssertEqual(outcome, .queued(replaced: false, duplicate: false))
         let projection = await pendingSend(fixture)
-        XCTAssertNil(projection?.pending)
+        XCTAssertNotNil(projection?.pending)
     }
 
-    /// The authorization captured at admission is the user's, and it is never recaptured.
+    /// A queued entry freezes identity, payload, and workflow — and captures no observer-turn state.
     ///
-    /// Reading the observer's *current* origin at delivery would refuse a message the user asked for
-    /// merely because the observer happened to be mid-automatic turn when the target freed up — and,
-    /// worse, would make the delivered/refused outcome depend on unrelated timing.
-    func testQueuedDeliveryUsesQueueTimeAuthorizationNotTheObserversLaterOrigin() async {
+    /// The drain therefore has nothing about the caller to recapture or compare, and a message the
+    /// user asked for cannot be refused merely because of when the target happened to free up.
+    func testQueuedDeliveryCapturesNoObserverTurnStateAndDrainsOnReadiness() async {
         let fixture = makeFixture()
         _ = await addLink(fixture)
         stageBusyTarget(fixture)
         let queued = await queueSend(fixture)
         XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
 
-        // The observer's turn moves on to an automatic one while the message waits.
-        var automatic = fixture.observer
-        automatic.turnOrigin = .laneUpdateAutoWake(wakeID: UUID())
-        fixture.host.candidates = [automatic, fixture.target]
         stageReadyTarget(fixture)
-
         await publishTargetActivity(fixture, status: .idle, activity: 2000)
-        await settleDrains { fixture.host.sendRequests.count > 1 }
+        await settleDrains { !fixture.host.sendRequests.isEmpty }
 
-        XCTAssertEqual(fixture.host.sendRequests.count, 2)
-        XCTAssertEqual(
-            fixture.host.sendRequests.last?.request.observerTurnOrigin,
-            .localUser,
-            "The drain must deliver under the origin that authorized the queue entry"
-        )
+        let delivered = try? XCTUnwrap(fixture.host.sendRequests.last?.request)
+        XCTAssertEqual(delivered?.observerEndpoint, fixture.observer.domainEndpoint)
+        XCTAssertEqual(delivered?.message, "ship it")
         let drained = await pendingSend(fixture)
         XCTAssertNil(drained?.pending)
     }
@@ -3488,8 +3713,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(fixture.host.sendRequests.count <= 1, "Cancelling delivers nothing")
     }
 
-    /// Cancelling discards an instruction the user authorized, so an automatic turn may not do it.
-    func testCancelRefusesATurnTheObserversOwnUserDidNotStart() async throws {
+    /// Cancelling is a queue mutation under the same grant, so it needs the exact granted incarnation
+    /// and the exact key — and nothing about the caller's own turn.
+    ///
+    /// A drifted or duplicate observer incarnation is still refused; that fence is what stops another
+    /// live copy of the same session UUID from discarding a queue it never held the lease for.
+    func testCancelIsGrantAuthorizedButStillRequiresTheExactObserverIncarnation() async throws {
         let fixture = makeFixture()
         _ = await addLink(fixture)
         stageBusyTarget(fixture)
@@ -3497,17 +3726,32 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         let resolvedCancelTarget = await authorizedSendTarget(fixture)
         let target = try XCTUnwrap(resolvedCancelTarget)
-        var automatic = fixture.observer
-        automatic.turnOrigin = .crossSessionMessage(sourceSessionID: UUID())
-        fixture.host.candidates = [automatic, fixture.target]
 
-        let refused = await fixture.bridge.cancelPendingSend(target: target, idempotencyKey: "key-1")
-        XCTAssertEqual(refused, .send(.blocked(.crossSessionReplyRequiresUserInstruction)))
-        let survived = await pendingSend(fixture)
-        XCTAssertNotNil(
-            survived?.pending,
-            "The queued instruction must survive an unauthorized cancel"
+        // Cancelling under the grant succeeds with no condition on the caller's own turn, and it is
+        // still purely a queue mutation: the cancel itself reaches no target transaction. (Admission
+        // already made one refused drain attempt against the busy target; the cancel adds none.)
+        let attemptsBeforeCancel = fixture.host.sendRequests.count
+        let cancelled = await fixture.bridge.cancelPendingSend(target: target, idempotencyKey: "key-1")
+        XCTAssertEqual(cancelled, .result(.cancelled))
+        let afterCancel = await pendingSend(fixture)
+        XCTAssertNil(afterCancel?.pending)
+        XCTAssertEqual(
+            fixture.host.sendRequests.count,
+            attemptsBeforeCancel,
+            "A cancel must deliver nothing"
         )
+
+        // A drifted observer incarnation is still refused: the exact granted identity remains the
+        // fence, and it invalidates the grant rather than mutating a queue it never held.
+        _ = await queueSend(fixture, key: "key-2")
+        let resolvedAgainTarget = await authorizedSendTarget(fixture)
+        let resolvedAgain = try XCTUnwrap(resolvedAgainTarget)
+        fixture.host.candidates = [fixture.target]
+        let refused = await fixture.bridge.cancelPendingSend(
+            target: resolvedAgain,
+            idempotencyKey: "key-2"
+        )
+        XCTAssertEqual(refused, .send(.rejected(.denied)))
     }
 
     /// Before the cutoff, a cancel wins outright: the delivery unwinds with no transcript mutation at
@@ -3875,7 +4119,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             idempotencyKey: key,
             requestDigest: digest,
             workflow: nil,
-            authorizedTurnOrigin: .localUser,
             queuedAt: Date(timeIntervalSince1970: 1000),
             phase: phase
         )

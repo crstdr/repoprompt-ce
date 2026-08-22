@@ -58,15 +58,6 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         return window.agentModeViewModel.agentSessionLinkAutoWakeTargetSessionIDs(for: candidate)
     }
 
-    func agentSessionLinkTargetLocalInputState(
-        for candidate: AgentSessionLinkEndpointCandidate
-    ) -> AgentSessionLinkTargetLocalInputState {
-        guard let window = window(withID: candidate.windowID) else {
-            return AgentSessionLinkTargetLocalInputState(epoch: 0, isLocalUser: false)
-        }
-        return window.agentModeViewModel.agentSessionLinkTargetLocalInputState(for: candidate)
-    }
-
     @discardableResult
     func agentSessionLinkSetAutoWakeOnUpdatesEnabled(
         _ enabled: Bool,

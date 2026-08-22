@@ -3,50 +3,16 @@ import RepoPromptDomainRuntime
 
 // MARK: - Identifier formatting
 
-/// Short display form for an overseen session ID.
+/// Short display form for an Agent session ID.
 ///
-/// The full canonical UUID always remains available in tooltip/accessibility text; the short form is
-/// only a visual disambiguator for rows such as `← Planning (04CF…1A00)`.
+/// The full canonical UUID remains available through the row's tooltip, accessibility value, and
+/// Copy Session ID actions. The compact form is retained for fallback task names, previews, inbound
+/// labels, notices, and attribution.
 enum AgentMonitorSessionIDFormatter {
-    /// Characters kept at each end before collision widening.
     private static let baseTokenLength = 4
-    /// Widening stops here: a token this long is no more scannable than the full UUID, so the
-    /// remaining collisions fall back to the UUID itself rather than growing without bound.
-    private static let maxTokenLength = 16
 
     static func short(_ sessionID: UUID) -> String {
         token(sessionID, endLength: baseTokenLength)
-    }
-
-    /// Collision-free short tokens for one visible row set.
-    ///
-    /// Two overseen sessions may carry the same display name, so this token is the only at-a-glance
-    /// identity breaker the row has room for. It widens deterministically — the same visible set
-    /// always produces the same tokens — and falls back to the full UUID rather than ever rendering
-    /// two rows identically. Both ends are always preserved, so the value is never truncated by
-    /// layout either.
-    static func distinctShortTokens(for sessionIDs: [UUID]) -> [UUID: String] {
-        var tokens: [UUID: String] = [:]
-        var colliding = Array(Set(sessionIDs))
-        var endLength = baseTokenLength
-        // Length is a pure function of the *set*, not of iteration order: an ID resolved at one
-        // length can never collide with one resolved at another, because the rendered widths differ.
-        while !colliding.isEmpty, endLength <= maxTokenLength {
-            var next: [UUID] = []
-            for (_, ids) in Dictionary(grouping: colliding, by: { token($0, endLength: endLength) }) {
-                if ids.count == 1, let only = ids.first {
-                    tokens[only] = token(only, endLength: endLength)
-                } else {
-                    next.append(contentsOf: ids)
-                }
-            }
-            colliding = next
-            endLength += 1
-        }
-        for sessionID in colliding {
-            tokens[sessionID] = sessionID.uuidString
-        }
-        return tokens
     }
 
     private static func token(_ sessionID: UUID, endLength: Int) -> String {
@@ -93,6 +59,14 @@ enum AgentMonitorLinkStatus: String, Equatable {
         case .running: "Running"
         case .awaitingUser: "Waiting for input"
         case .unavailable: "Unavailable"
+        }
+    }
+
+    /// Canonical dashboard partition. Status subtypes do not rank within either partition.
+    var isActiveForDashboardOrdering: Bool {
+        switch self {
+        case .running, .awaitingUser: true
+        case .idle, .unavailable: false
         }
     }
 
@@ -195,30 +169,9 @@ struct AgentMonitorStatusIndicatorDescriptor: Equatable {
     }
 }
 
-// MARK: - Triage and activity
-
-/// Process-memory dashboard triage. It never changes or replaces the live target status.
-enum AgentMonitorTriageState: String, Equatable {
-    case active
-    case done
-}
-
-/// Result of changing one generation-qualified dashboard triage record.
-enum AgentMonitorTriageOutcome: Equatable {
-    case changed
-    case alreadyInRequestedState
-    case failed(message: String)
-
-    var failureMessage: String? {
-        guard case let .failed(message) = self else { return nil }
-        return message
-    }
-}
+// MARK: - Activity acknowledgement
 
 /// Result of acknowledging one generation-qualified row's newest activity.
-///
-/// Kept separate from `AgentMonitorTriageOutcome` because acknowledgement has no inverse the user
-/// can request: there is no “mark unread”, so there is no requested-state axis to report against.
 enum AgentMonitorSeenOutcome: Equatable {
     case marked
     case alreadySeen
@@ -277,10 +230,20 @@ enum AgentMonitorAutoWakeCopy {
     static let laneLabel = "Auto-wake"
     static let selectAll = "Select all"
     static let deselectAll = "Deselect all"
+    /// Says what the switch does *and* what it can lead to.
+    ///
+    /// It used to promise that “automatic turns never chain”. That was a transport guarantee, and it
+    /// no longer exists: a follow-up turn may act on the user’s standing instruction and produce
+    /// activity that is itself an update, so a chain — including two sessions the user pointed at each
+    /// other — is a real outcome of turning this on. Leaving the old sentence in place would be the
+    /// worst version of this control: a bounded-sounding promise next to unbounded behaviour. The
+    /// three existing controls that actually stop it are named instead of a new setting.
     static let tooltip = """
     Status updates for these sessions are always attached to this agent’s next turn. Turning this on \
-    additionally lets RepoPrompt start one follow-up turn for them: a busy agent finishes its current \
-    and already-accepted work first, automatic turns never chain, and the setting applies to this \
+    additionally lets RepoPrompt start one follow-up turn per update: a busy agent finishes its \
+    current and already-accepted work first, and that turn’s own activity can be an update in its \
+    own right — so follow-ups can continue, and two sessions that oversee each other can keep waking \
+    one another. Snooze a lane, deselect it, or unlink to stop that. The setting applies to this \
     session rather than to individual links. Off by default, and saved with this session even when \
     it oversees nothing.
     """
@@ -309,11 +272,6 @@ enum AgentMonitorRowActionCopy {
     """
     static let viewTooltip = "Open this Agent session"
     static let viewDisabledTooltip = "This Agent session’s location is unavailable."
-    static let doneTooltip = """
-    Your own triage marker. It reopens automatically when this session has newer activity, and it \
-    never changes what the session is doing.
-    """
-    static let doneHint = "Reopens automatically when this session has newer activity"
     static let unlinkTooltip = """
     Removes oversight immediately. Undo is offered briefly and creates a new link rather than \
     restoring the old one.
@@ -359,7 +317,7 @@ enum AgentMonitorAutoWakeSnoozeCopy {
     /// Shown between local expiry and the authoritative repaint that removes the row.
     ///
     /// Deliberately not "delivering", "sending", or "waking": expiry promises exactly one ordinary
-    /// re-evaluation, and the usual readiness, authority, anti-chain, and suppression gates decide
+    /// re-evaluation, and the usual readiness, authority, selection, and suppression gates decide
     /// whether anything happens at all.
     static let expired = "Auto-wake snooze expired \u{00B7} Re-evaluating eligibility\u{2026}"
 
@@ -663,13 +621,11 @@ enum AgentMonitorLocationLabelFormatter {
     }
 }
 
-/// Builds the secondary line under an oversight row, e.g. `feature-219 · Codex CLI · Idle`.
+/// Builds supporting preview, inbound, and non-layout detail lines.
 ///
-/// Location leads deliberately: across many sessions spanning two providers the provider name
-/// distinguishes almost nothing, while the worktree/workspace distinguishes strongly.
-///
-/// Lives on the model rather than inline in the view so the ordering and separator stay under test
-/// and cannot drift between the three surfaces that render it.
+/// The outbound dashboard now promotes location to its primary line and uses
+/// `taskMetadataLine(now:calendar:locale:)` for its secondary line; these remaining consumers still
+/// share separator and omission behavior here.
 enum AgentMonitorDetailLineFormatter {
     static func line(
         location: String?,
@@ -708,18 +664,15 @@ struct AgentMonitorPillProps: Equatable {
         let linkID: UUID
         let generation: UInt64
         let targetSessionID: UUID
+        /// Exact target incarnation recorded by the authority for this generation-qualified row.
+        let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
         let displayName: String
         let providerDisplayName: String?
         let locationLabel: String?
         let status: AgentMonitorLinkStatus
         let lastActivityAt: Date?
-        let triageState: AgentMonitorTriageState
         /// True when this exact link has activity strictly newer than the watermark the user
         /// acknowledged.
-        ///
-        /// Deliberately a separate record from `triageState`, not a derived view of it: Done answers
-        /// “have I triaged this lane as complete?” while unread answers “has it changed since I
-        /// acknowledged it?”, and their clearing rules differ.
         let hasUnreadActivity: Bool
         let targetRoute: AgentSessionDeepLinkRoute?
         /// This lane's active Auto-wake snooze, or `nil` when it is not snoozed.
@@ -739,12 +692,12 @@ struct AgentMonitorPillProps: Equatable {
             linkID: UUID,
             generation: UInt64,
             targetSessionID: UUID,
+            targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
             displayName: String,
             providerDisplayName: String?,
             locationLabel: String?,
             status: AgentMonitorLinkStatus,
             lastActivityAt: Date? = nil,
-            triageState: AgentMonitorTriageState = .active,
             hasUnreadActivity: Bool = false,
             targetRoute: AgentSessionDeepLinkRoute? = nil,
             autoWakeSnooze: AgentMonitorAutoWakeSnoozeState? = nil,
@@ -753,12 +706,12 @@ struct AgentMonitorPillProps: Equatable {
             self.linkID = linkID
             self.generation = generation
             self.targetSessionID = targetSessionID
+            self.targetEndpoint = targetEndpoint
             self.displayName = displayName
             self.providerDisplayName = providerDisplayName
             self.locationLabel = locationLabel
             self.status = status
             self.lastActivityAt = lastActivityAt
-            self.triageState = triageState
             self.hasUnreadActivity = hasUnreadActivity
             self.targetRoute = targetRoute
             self.autoWakeSnooze = autoWakeSnooze
@@ -783,12 +736,12 @@ struct AgentMonitorPillProps: Equatable {
                 linkID: linkID,
                 generation: generation,
                 targetSessionID: targetSessionID,
+                targetEndpoint: targetEndpoint,
                 displayName: displayName,
                 providerDisplayName: providerDisplayName,
                 locationLabel: locationLabel,
                 status: status,
                 lastActivityAt: lastActivityAt,
-                triageState: triageState,
                 hasUnreadActivity: hasUnreadActivity,
                 targetRoute: targetRoute,
                 autoWakeSnooze: snooze,
@@ -807,16 +760,11 @@ struct AgentMonitorPillProps: Equatable {
             "\(linkID.uuidString)-\(generation)"
         }
 
-        var shortID: String {
-            AgentMonitorSessionIDFormatter.short(targetSessionID)
-        }
-
         var fullID: String {
             targetSessionID.uuidString
         }
 
-        /// Identity hover detail: the truncatable display name plus the canonical UUID the fixed
-        /// short token stands in for.
+        /// Identity hover detail for the truncatable task metadata line.
         var identityTooltip: String {
             "\(displayName)\n\(fullID)"
         }
@@ -834,17 +782,18 @@ struct AgentMonitorPillProps: Equatable {
             )
         }
 
-        /// Truncatable execution context. The row renders this separately so long workspace or
-        /// provider text can never displace live status or absolute freshness.
-        var locationProviderLine: String {
-            AgentMonitorDetailLineFormatter.line(
-                location: locationLabel,
-                provider: providerDisplayName,
-                status: nil
-            )
+        /// Primary visible location. Missing raw locations remain missing for sorting, while the row
+        /// renders an explicit fallback instead of an ambiguous empty slot.
+        var locationDisplayLabel: String {
+            guard let trimmed = locationLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty
+            else {
+                return "Location unavailable"
+            }
+            return trimmed
         }
 
-        /// Compact freshness text rendered separately from truncatable execution context.
+        /// Compact freshness text rendered as the final task-metadata segment.
         func activityLine(
             now: Date = Date(),
             calendar: Calendar = .current,
@@ -858,18 +807,24 @@ struct AgentMonitorPillProps: Equatable {
             )
         }
 
-        /// Combined metadata retained for non-view consumers and focused formatting tests.
-        func metadataLine(
+        /// Secondary task metadata: task name, optional provider, then compact freshness.
+        func taskMetadataLine(
             now: Date = Date(),
             calendar: Calendar = .current,
             locale: Locale = .current
         ) -> String {
-            AgentMonitorDetailLineFormatter.line(
-                location: locationLabel,
-                provider: providerDisplayName,
-                status: nil,
-                activity: activityLine(now: now, calendar: calendar, locale: locale)
-            )
+            var segments: [String] = []
+            let task = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !task.isEmpty {
+                segments.append(task)
+            }
+            if let provider = providerDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !provider.isEmpty
+            {
+                segments.append(provider)
+            }
+            segments.append(activityLine(now: now, calendar: calendar, locale: locale))
+            return segments.joined(separator: " · ")
         }
 
         /// Absolute instant behind the compact relative text, revealed on hover.
@@ -884,22 +839,17 @@ struct AgentMonitorPillProps: Equatable {
         var accessibilityDescription: String {
             let location = AgentMonitorAccessibilityLocationPhrase.clause(locationLabel)
             let unread = hasUnreadActivity ? ", New activity" : ""
-            let triage = triageState == .done ? ", Done" : ""
             return "Overseeing \(displayName)\(location), session \(fullID), "
-                + "\(status.accessibilityLabel), \(activityAccessibilityLabel)\(unread)\(triage)"
+                + "\(status.accessibilityLabel), \(activityAccessibilityLabel)\(unread)"
         }
 
         /// VoiceOver labels for this row's inline controls.
         ///
         /// They live on the model rather than inline in the view so the wording stays under test and
-        /// cannot drift from `accessibilityDescription`; four visually identical controls repeated
+        /// cannot drift from `accessibilityDescription`; repeated compact controls
         /// per row are indistinguishable in the rotor without the session name.
         var viewActionLabel: String {
             "View \(displayName)"
-        }
-
-        var doneActionLabel: String {
-            "Done for \(displayName)"
         }
 
         var markSeenActionLabel: String {
@@ -952,6 +902,8 @@ struct AgentMonitorPillProps: Equatable {
         let linkID: UUID
         let generation: UInt64
         let observerSessionID: UUID
+        /// Exact observer incarnation recorded by the authority for this generation-qualified row.
+        let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
         let displayName: String
         let providerDisplayName: String?
 
@@ -1029,6 +981,11 @@ struct AgentMonitorPillProps: Equatable {
     /// Notices are recorded per incarnation, so dismissing them needs the identity rather than the
     /// session UUID: a duplicate live incarnation of the same UUID must not clear another's notices.
     var endpoint: DomainAgentSessionLinkEndpointIdentity?
+    /// Target-centric relationship choices for this exact endpoint.
+    ///
+    /// `nil` means the endpoint is not currently an eligible target (or this is a synthesized local
+    /// placeholder). A non-nil empty value keeps management discoverable when no observer qualifies.
+    let sidebarOversightMenu: AgentSidebarOversightMenuProps?
     let outbound: [Outbound]
     let inbound: [Inbound]
     let recentNotices: [Notice]
@@ -1064,6 +1021,7 @@ struct AgentMonitorPillProps: Equatable {
     init(
         sessionID: UUID?,
         endpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
+        sidebarOversightMenu: AgentSidebarOversightMenuProps?,
         outbound: [Outbound],
         inbound: [Inbound],
         recentNotices: [Notice],
@@ -1075,6 +1033,7 @@ struct AgentMonitorPillProps: Equatable {
     ) {
         self.sessionID = sessionID
         self.endpoint = endpoint
+        self.sidebarOversightMenu = sidebarOversightMenu
         self.outbound = outbound
         self.inbound = inbound
         self.recentNotices = recentNotices
@@ -1087,6 +1046,7 @@ struct AgentMonitorPillProps: Equatable {
 
     static let empty = AgentMonitorPillProps(
         sessionID: nil,
+        sidebarOversightMenu: nil,
         outbound: [],
         inbound: [],
         recentNotices: [],
@@ -1103,6 +1063,7 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
+            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1128,6 +1089,7 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
+            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1139,12 +1101,26 @@ struct AgentMonitorPillProps: Equatable {
         )
     }
 
-    var isActive: Bool {
+    /// Exact current observer role: outbound membership only.
+    ///
+    /// Inbound links, durable intents, and eligibility to create a future link do not make this
+    /// projection an overseer.
+    var isOverseer: Bool {
         !outbound.isEmpty
     }
 
     var hasInbound: Bool {
         !inbound.isEmpty
+    }
+
+    /// Directional counts shown in the compact dashboard pill. A missing value means the pill
+    /// omits that numeric badge rather than rendering a visually ambiguous zero.
+    var dashboardOutboundCount: Int? {
+        outbound.isEmpty ? nil : outbound.count
+    }
+
+    var dashboardInboundCount: Int? {
+        inbound.isEmpty ? nil : inbound.count
     }
 
     var canAdd: Bool {
@@ -1458,8 +1434,8 @@ enum AgentMonitorUnlinkUndo {
     }
 
     static let undoTooltip = """
-    Creates a new oversight link between the same two sessions. Done, unread, and delivery state \
-    from the removed link do not come back.
+    Creates a new oversight link between the same two sessions. Unread, cursor, delivery, and \
+    Auto-wake lane state from the removed link do not come back.
     """
 }
 

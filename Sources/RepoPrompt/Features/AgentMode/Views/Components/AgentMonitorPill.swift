@@ -27,23 +27,26 @@ struct AgentMonitorPill: View {
         let cornerRadius = AgentPillMetrics.cornerRadius()
         let height = AgentPillMetrics.height()
         let horizontalPadding = AgentPillMetrics.horizontalPadding()
+        let capsule = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         Button {
             showPopover.toggle()
         } label: {
             HStack(spacing: 4) {
                 // Status is carried by the glyph and the count text, never by colour alone.
-                Image(systemName: props.isActive ? "eye.fill" : "eye")
+                Image(systemName: props.isOverseer ? "eye.fill" : "eye")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                Text("\(props.outbound.count)")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                    .monospacedDigit()
-                    .fixedSize()
-                if props.hasInbound {
+                if let outboundCount = props.dashboardOutboundCount {
+                    Text("\(outboundCount)")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                        .monospacedDigit()
+                        .fixedSize()
+                }
+                if let inboundCount = props.dashboardInboundCount {
                     // Distinct directional inbound indicator: another session is observing this one.
                     HStack(spacing: 1) {
                         Image(systemName: "arrow.down.left")
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .bold))
-                        Text("\(props.inbound.count)")
+                        Text("\(inboundCount)")
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
                             .monospacedDigit()
                     }
@@ -54,22 +57,24 @@ struct AgentMonitorPill: View {
             }
             .fixedSize(horizontal: true, vertical: false)
             .lineLimit(1)
-            .foregroundStyle(props.isActive ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
+            .foregroundStyle(props.isOverseer ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
             .padding(.horizontal, horizontalPadding)
             .frame(height: height)
+            .background(.ultraThinMaterial)
+            .clipShape(capsule)
+            .overlay(
+                capsule
+                    .stroke(
+                        props.isOverseer || props.hasInbound
+                            ? Color.accentColor.opacity(0.4)
+                            : Color.secondary.opacity(0.15),
+                        lineWidth: props.isOverseer || props.hasInbound ? 1 : 0.5
+                    )
+                    .allowsHitTesting(false)
+            )
+            .contentShape(capsule)
         }
         .buttonStyle(.plain)
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .stroke(
-                    props.isActive || props.hasInbound
-                        ? Color.accentColor.opacity(0.4)
-                        : Color.secondary.opacity(0.15),
-                    lineWidth: props.isActive || props.hasInbound ? 1 : 0.5
-                )
-        )
         .hoverTooltip("Oversee other Agent sessions in any window", .top)
         .accessibilityLabel("Oversee")
         .accessibilityValue(props.accessibilityValue)
@@ -90,23 +95,21 @@ struct AgentMonitorPopoverView: View {
         fontScale.preset
     }
 
-    @AppStorage(AgentMonitorDashboardSortMode.preferenceKey)
-    private var sortModeRawValue = AgentMonitorDashboardSortMode.smart.rawValue
     @State private var identifierText = ""
     @State private var preview: AgentMonitorResolvedPreview?
     /// Persistent validation text. Errors are never conveyed by transient colour alone.
     @State private var validationMessage: String?
     @State private var isWorking = false
-    /// One busy gate per generation-qualified row. Navigation, triage, acknowledgement, and durable
-    /// Unlink must not race from the same stale projection.
+    /// One busy gate per generation-qualified row. Navigation, acknowledgement, durable Unlink, and
+    /// Auto-wake changes must not race from the same stale projection.
     ///
     /// Keyed by `rowKey` rather than by link ID, and that is the whole point: a relink reuses the
     /// link ID under a new generation, so an action that completes late must write the *retired*
     /// row's key — which nothing renders any more — instead of clearing the replacement's busy
     /// marker or stamping it with a failure that belongs to the row the user already lost.
     @State private var busyRowKeys: Set<String> = []
-    /// Persistent per-row feedback for routing, triage, acknowledgement, durable Unlink, and
-    /// Auto-wake snooze outcomes. Same generation-qualified keying, for the same reason.
+    /// Persistent per-row feedback for routing, acknowledgement, durable Unlink, and Auto-wake
+    /// snooze outcomes. Same generation-qualified keying, for the same reason.
     ///
     /// Widened from a bare string only far enough to tell a failure apart from the one informational
     /// notice a *successful* snooze can carry; the dictionary remains the single row-local message
@@ -147,12 +150,8 @@ struct AgentMonitorPopoverView: View {
         Set(props.outbound.map(\.targetSessionID))
     }
 
-    private var sortMode: AgentMonitorDashboardSortMode {
-        AgentMonitorDashboardSortMode.resolved(preferenceRawValue: sortModeRawValue)
-    }
-
     private var sortedOutbound: [AgentMonitorPillProps.Outbound] {
-        AgentMonitorDashboardSortPolicy.sorted(props.outbound, mode: sortMode)
+        AgentMonitorDashboardSortPolicy.sorted(props.outbound)
     }
 
     /// Generation-qualified identity of every visible row, watched so retired rows can drop their
@@ -161,29 +160,22 @@ struct AgentMonitorPopoverView: View {
         props.outbound.map(\.rowKey) + props.inbound.map(\.rowKey)
     }
 
-    /// Fixed, collision-free identity tokens computed across the whole visible set, so two rows
-    /// carrying the same display name are still told apart without a permanent full-UUID line.
-    private var shortTokensByTargetID: [UUID: String] {
-        AgentMonitorSessionIDFormatter.distinctShortTokens(for: props.outbound.map(\.targetSessionID))
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
+                    if !props.outbound.isEmpty {
+                        outboundSection
+                        Divider()
+                    }
                     addSection
-                    // Unconditional, and above both lists on purpose: the setting is saved with this
-                    // observer session rather than with any link, so it has to stay reachable from the
-                    // state where the user is most likely to want it — before anything is overseen.
+                    // Unconditional and available with zero links: the setting is saved with this
+                    // observer session rather than with any individual oversight relationship.
                     Divider()
                     observerControlsSection
                     if hasPersistenceContent {
                         Divider()
                         persistenceSection
-                    }
-                    if !props.outbound.isEmpty {
-                        Divider()
-                        outboundSection
                     }
                     if !props.inbound.isEmpty {
                         Divider()
@@ -286,13 +278,7 @@ struct AgentMonitorPopoverView: View {
 
     private var outboundSection: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                sectionHeader("Overseeing")
-                Spacer(minLength: 0)
-                // Sorting stays here: it is a property of the list, and there is no list to sort
-                // until there are rows.
-                sortMenu
-            }
+            sectionHeader("Overseeing")
             // One popover-scoped minute tick drives every row's relative timestamp from the same
             // instant. It exists only while the popover is open and performs no authority work.
             TimelineView(.periodic(from: freshnessTickAnchor, by: 60)) { timeline in
@@ -311,20 +297,10 @@ struct AgentMonitorPopoverView: View {
             HStack(spacing: 6) {
                 AgentMonitorStatusIndicator(status: row.status, fontPreset: fontPreset)
                     .hoverTooltip(row.status.tooltip, .top)
-                HStack(spacing: 5) {
-                    Text(row.displayName)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    // Fixed width and never truncated: it is the only at-a-glance identity breaker
-                    // between two rows that share a display name.
-                    Text(shortTokensByTargetID[row.targetSessionID] ?? row.shortID)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                        .foregroundStyle(.secondary)
-                        .monospaced()
-                        .fixedSize()
-                }
-                .hoverTooltip(row.identityTooltip, .top)
+                Text(row.locationDisplayLabel)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 if row.hasUnreadActivity {
                     unreadBadge(row, isBusy: isBusy)
                 }
@@ -334,20 +310,12 @@ struct AgentMonitorPopoverView: View {
                 }
                 outboundActions(row, isBusy: isBusy)
             }
-            HStack(spacing: 5) {
-                Text(row.locationProviderLine)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer(minLength: 0)
-                Text(row.activityLine(now: now))
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .hoverTooltip(row.activityTooltip, .top)
-            }
+            Text(row.taskMetadataLine(now: now))
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .hoverTooltip("\(row.identityTooltip)\n\(row.activityTooltip)", .top)
             snoozeRow(row, now: now, isBusy: isBusy)
             if let feedback = rowFeedbackByRowKey[row.rowKey] {
                 messageText(feedback.message)
@@ -432,8 +400,8 @@ struct AgentMonitorPopoverView: View {
 
     /// The row's common actions, promoted out of an overflow menu.
     ///
-    /// They share `busyRowKeys`, so View, New, Done, and Unlink can never act concurrently against
-    /// one stale row.
+    /// They share `busyRowKeys`, so View, New, and Unlink can never act concurrently against one
+    /// stale row.
     private func outboundActions(_ row: AgentMonitorPillProps.Outbound, isBusy: Bool) -> some View {
         HStack(spacing: 8) {
             inlineActionButton(
@@ -447,20 +415,6 @@ struct AgentMonitorPopoverView: View {
             ) {
                 viewAgent(row)
             }
-
-            // Native checkbox rather than a badge plus a menu item: Done is a state the user sets,
-            // and it must read as one. The binding is authoritative — the check follows the
-            // republished projection rather than flipping optimistically.
-            Toggle("Done", isOn: Binding(
-                get: { row.triageState == .done },
-                set: { _ in toggleTriage(row) }
-            ))
-            .toggleStyle(.checkbox)
-            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-            .disabled(isBusy)
-            .hoverTooltip(AgentMonitorRowActionCopy.doneTooltip, .top)
-            .accessibilityLabel(row.doneActionLabel)
-            .accessibilityHint(AgentMonitorRowActionCopy.doneHint)
 
             inlineActionButton(
                 title: "Unlink",
@@ -477,8 +431,8 @@ struct AgentMonitorPopoverView: View {
 
     /// Explicit acknowledgement of new activity.
     ///
-    /// Deliberately the *only* way unread clears besides Done: opening, hovering, or scrolling this
-    /// dashboard proves nothing was reviewed, and View Agent proves only that the target opened.
+    /// Deliberately the only way unread clears: opening, hovering, or scrolling this dashboard proves
+    /// nothing was reviewed, and View Agent proves only that the target opened.
     private func unreadBadge(_ row: AgentMonitorPillProps.Outbound, isBusy: Bool) -> some View {
         Button {
             markSeen(row)
@@ -591,29 +545,6 @@ struct AgentMonitorPopoverView: View {
         )
     }
 
-    private var sortMenu: some View {
-        Menu {
-            ForEach(AgentMonitorDashboardSortMode.allCases) { mode in
-                Button {
-                    sortModeRawValue = mode.rawValue
-                } label: {
-                    if mode == sortMode {
-                        Label(mode.label, systemImage: "checkmark")
-                    } else {
-                        Text(mode.label)
-                    }
-                }
-            }
-        } label: {
-            Label(sortMode.label, systemImage: "arrow.up.arrow.down")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .accessibilityLabel("Sort overseen sessions")
-        .accessibilityValue(sortMode.label)
-    }
-
     private var inboundSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             sectionHeader("Overseen by")
@@ -656,12 +587,14 @@ struct AgentMonitorPopoverView: View {
                             )
                         }
                     ) {
-                        guard let targetSessionID = props.sessionID else { return .alreadyStopped }
+                        guard let targetEndpoint = props.endpoint else { return .alreadyStopped }
                         return await AgentSessionLinkRuntimeBridge.shared.stopMonitorLink(
-                            observerSessionID: row.observerSessionID,
-                            targetSessionID: targetSessionID,
-                            linkID: row.linkID,
-                            generation: row.generation
+                            observerEndpoint: row.observerEndpoint,
+                            targetEndpoint: targetEndpoint,
+                            expectedReference: DomainAgentSessionLinkReference(
+                                linkID: row.linkID,
+                                generation: row.generation
+                            )
                         )
                     }
                 }
@@ -872,9 +805,9 @@ struct AgentMonitorPopoverView: View {
 
     /// Recovers by creating a new link through the ordinary Add entry point.
     ///
-    /// Nothing about the retired grant is restored: it has a new reference and generation, and Done,
-    /// unread, cursors, and delivery state all start fresh. `.alreadyLinked` counts as recovered
-    /// because the user's goal — the relationship exists again — is satisfied.
+    /// Nothing about the retired grant is restored: it has a new reference and generation, and
+    /// unread, cursors, delivery, and Auto-wake lane state all start fresh. `.alreadyLinked` counts
+    /// as recovered because the user's goal — the relationship exists again — is satisfied.
     private func performUndo(_ slot: UndoSlot) {
         guard !isUndoing else { return }
         isUndoing = true
@@ -1080,7 +1013,7 @@ struct AgentMonitorPopoverView: View {
         }
     }
 
-    /// Acknowledges new activity without touching Done, status, or authority.
+    /// Acknowledges new activity without touching status or authority.
     private func markSeen(_ row: AgentMonitorPillProps.Outbound) {
         guard !busyRowKeys.contains(row.rowKey) else { return }
         guard let observerEndpoint = props.endpoint else {
@@ -1166,30 +1099,6 @@ struct AgentMonitorPopoverView: View {
         }
     }
 
-    private func toggleTriage(_ row: AgentMonitorPillProps.Outbound) {
-        guard !busyRowKeys.contains(row.rowKey) else { return }
-        guard let observerEndpoint = props.endpoint else {
-            setRowFeedback(row.rowKey, .failure("That oversight link is no longer active."))
-            return
-        }
-        let rowKey = beginRowAction(row.rowKey)
-        let requestedState: AgentMonitorTriageState = row.triageState == .done ? .active : .done
-        let reference = DomainAgentSessionLinkReference(
-            linkID: row.linkID,
-            generation: row.generation
-        )
-        Task {
-            let outcome = await AgentSessionLinkRuntimeBridge.shared.setMonitorTriageState(
-                observerEndpoint: observerEndpoint,
-                targetSessionID: row.targetSessionID,
-                expectedReference: reference,
-                state: requestedState
-            )
-            busyRowKeys.remove(rowKey)
-            setRowFeedback(rowKey, outcome.failureMessage.map(AgentMonitorRowFeedback.failure))
-        }
-    }
-
     private func unlinkOutbound(_ row: AgentMonitorPillProps.Outbound) {
         performUnlink(
             rowKey: row.rowKey,
@@ -1203,14 +1112,14 @@ struct AgentMonitorPopoverView: View {
                 )
             }
         ) {
-            // The durable pair is derived from the row's owner and peer rather than duplicated on the
-            // row, because this projection is already addressed to the exact observer incarnation.
-            guard let observerSessionID = props.sessionID else { return .alreadyStopped }
+            guard let observerEndpoint = props.endpoint else { return .alreadyStopped }
             return await AgentSessionLinkRuntimeBridge.shared.stopMonitorLink(
-                observerSessionID: observerSessionID,
-                targetSessionID: row.targetSessionID,
-                linkID: row.linkID,
-                generation: row.generation
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: row.targetEndpoint,
+                expectedReference: DomainAgentSessionLinkReference(
+                    linkID: row.linkID,
+                    generation: row.generation
+                )
             )
         }
     }

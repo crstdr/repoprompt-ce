@@ -181,14 +181,6 @@ final class AgentTabSession: ObservableObject {
         .eraseToAnyPublisher()
     }
 
-    /// Monotonic ownership fence advanced at the single local-instruction acceptance point.
-    /// Auto-wake dispatch IDs carry the value they observed so late provider callbacks cannot
-    /// overwrite a newer local-user origin.
-    var agentSessionLinkLocalInputEpoch: UInt64 = 0
-    /// Per-link target-local epochs consumed or baselined for human-caused Auto-wake rearm.
-    var agentSessionLinkConsumedTargetLocalEpochs: [DomainAgentSessionLinkReference: UInt64] = [:]
-    var agentSessionLinkAutoWakeEffectiveSelection: [DomainAgentSessionLinkReference: Bool] = [:]
-
     /// The one automatic lane-update follow-up this exact incarnation has reserved, if any.
     ///
     /// Ephemeral by construction: it lives beside the run lifecycle it competes with, is never
@@ -780,6 +772,7 @@ final class AgentTabSession: ObservableObject {
         didSet {
             if oldValue != bindingTransitionInProgress {
                 noteMonitorObservationInputsChanged()
+                AgentSessionLinkCandidateReadinessSignal.didChange()
             }
         }
     }
@@ -791,12 +784,11 @@ final class AgentTabSession: ObservableObject {
         didSet {
             if oldValue != hasLoadedPersistedState {
                 noteMonitorObservationInputsChanged()
+                AgentSessionLinkCandidateReadinessSignal.didChange()
             }
         }
     }
 
-    /// Logical origin of this session's most recent accepted input.
-    var agentSessionLinkTurnOrigin: AgentSessionLinkTurnOrigin = .localUser
     /// Ephemeral, agent-declared dependency metadata shared with current inbound observers.
     var agentSessionLinkWaitingOn: DomainAgentSessionWaitingOn?
 

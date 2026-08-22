@@ -384,8 +384,6 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 reference: reference,
                 targetEndpoint: targetEndpoint,
                 targetSessionID: targetSessionID,
-                targetLocalInputEpoch: 0,
-                targetTurnIsLocalUser: false,
                 isEffectivelySelected: true
             )]
         )
@@ -396,11 +394,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             wakeID: wakeID,
             observerEndpoint: endpoint,
             queueEpoch: queueEpoch,
-            localInputEpoch: fixture.session.agentSessionLinkLocalInputEpoch,
             queueRevision: 1,
             wakeFingerprint: snapshot.wakeEligibilityFingerprint,
             attemptedFingerprint: nil,
-            humanRearmEpochs: [:],
             physicalOutcome: .notAttempted,
             phase: .preparingDispatch,
             task: nil
@@ -967,6 +963,119 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
 
+    // MARK: Auto-wake dispatch identity
+
+    /// The Auto-wake dispatch identity is exactly one canonical UUID after the reserved prefix.
+    func testAutoWakeDispatchIDRendersAndRoundTripsAWakeIDOnly() {
+        let wakeID = UUID()
+        let dispatchID = AgentSessionLinkPromptDispatchID.autoWake(wakeID: wakeID)
+
+        XCTAssertEqual(dispatchID.rawValue, "lane.autowake:\(wakeID.uuidString)")
+        XCTAssertTrue(dispatchID.isAutoWakeFamily)
+        XCTAssertEqual(dispatchID.autoWakeID, wakeID)
+    }
+
+    /// Ordinary provider dispatch IDs stay ordinary: they are outside the reserved family, so they
+    /// take the pass-through path at the physical fence and require no lane batch.
+    func testOrdinaryProviderDispatchIDsAreNotAutoWakeFamily() {
+        for dispatchID in [
+            AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID()),
+            .headlessRun(runID: UUID()),
+            .acpPromptTurn(runAttemptID: UUID()),
+            .acpActiveSteering(runAttemptID: UUID()),
+            .waitingContinuation(waitID: UUID())
+        ] {
+            XCTAssertFalse(dispatchID.isAutoWakeFamily, dispatchID.rawValue)
+            XCTAssertNil(dispatchID.autoWakeID, dispatchID.rawValue)
+        }
+    }
+
+    /// A reserved-family value that does not parse is **malformed, not ordinary**.
+    ///
+    /// This is the fail-closed rule the whole atomic ID change depends on. If a constructor and the
+    /// parser ever disagreed — the historical `lane.autowake:<UUID>:<epoch>` form is the concrete
+    /// example — a `nil` identity that also read as "not a wake" would let the physical fence take
+    /// its ordinary-dispatch early return and wave an unfenced, unclaimed lane update straight to a
+    /// provider. Classifying by prefix first makes that impossible: the value is refused instead.
+    func testMalformedReservedFamilyDispatchIDsAreRefusedRatherThanTreatedAsOrdinary() throws {
+        let malformed = [
+            "lane.autowake:\(UUID().uuidString):7",
+            "lane.autowake:\(UUID().uuidString):0",
+            "lane.autowake:not-a-uuid",
+            "lane.autowake:"
+        ]
+        let fixture = try makeFixture()
+
+        for raw in malformed {
+            let dispatchID = AgentSessionLinkPromptDispatchID(rawValue: raw)
+            XCTAssertTrue(dispatchID.isAutoWakeFamily, raw)
+            XCTAssertNil(dispatchID.autoWakeID, "\(raw) must not parse as a current wake identity")
+            XCTAssertFalse(
+                fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+                    for: fixture.session,
+                    dispatchID: dispatchID
+                ),
+                "\(raw) must never acquire the physical dispatch boundary"
+            )
+            XCTAssertTrue(
+                AgentModeViewModel.dispatchRequiresLaneBatch(fixture.session, dispatchID),
+                "\(raw) must never bypass the lane-batch requirement"
+            )
+            // The claim store is the authoritative lane-batch fence, and it must classify the same
+            // way. Reporting `.nothingOwed` here would tell every provider family "send undecorated"
+            // for what is really a lane update — an empty, unjustified turn with no batch at all.
+            XCTAssertEqual(
+                fixture.viewModel.agentSessionLinkPromptClaimOutcome(
+                    for: fixture.session,
+                    dispatchID: dispatchID
+                ),
+                .requiredLaneBatchUnavailable,
+                "\(raw) must refuse rather than report nothing owed"
+            )
+        }
+    }
+
+    /// The rewrite seam substitutes the in-flight wake's identity for an *ordinary* provider ID, and
+    /// preserves the exact wake ID across preparation, tombstone, and dispatching.
+    func testEffectiveDispatchIDPreservesTheExactWakeIDAcrossEveryOwnedPhase() throws {
+        let fixture = try makeFixture()
+        let wakeID = try prepareAutoWake(fixture)
+        let providerID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
+
+        for phase in [
+            AgentSessionLinkAutoWakeAttempt.Phase.preparingDispatch,
+            .cancelledBeforeDispatch,
+            .dispatching
+        ] {
+            var attempt = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+            attempt.phase = phase
+            fixture.session.pendingOversightAutoWake = attempt
+
+            let effective = fixture.viewModel.agentSessionLinkEffectiveDispatchID(
+                for: fixture.session,
+                dispatchID: providerID
+            )
+            XCTAssertEqual(effective.autoWakeID, wakeID, "\(phase)")
+            XCTAssertEqual(effective.rawValue, "lane.autowake:\(wakeID.uuidString)", "\(phase)")
+        }
+    }
+
+    /// A malformed reserved-family value is left alone by the rewrite: handing it the current wake's
+    /// identity would launder a dispatch that never legitimately held one.
+    func testEffectiveDispatchIDDoesNotRewriteMalformedReservedFamilyValues() throws {
+        let fixture = try makeFixture()
+        _ = try prepareAutoWake(fixture)
+        let raw = "lane.autowake:\(UUID().uuidString):7"
+
+        let effective = fixture.viewModel.agentSessionLinkEffectiveDispatchID(
+            for: fixture.session,
+            dispatchID: AgentSessionLinkPromptDispatchID(rawValue: raw)
+        )
+
+        XCTAssertEqual(effective.rawValue, raw)
+        XCTAssertNil(effective.autoWakeID)
+    }
+
     // MARK: Managed-auth recovery replay
 
     func testAuthRecoveryReplayOfSettledAutoWakeUsesExactAcceptedEnvelope() async throws {
@@ -1213,6 +1322,94 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
         try MonitorSupplementAssertions.assertCarriesNoSupplement(
             XCTUnwrap(fixture.controller.startedTurns.last)
+        )
+    }
+
+    /// Regression: managed-auth replay classifies by reserved dispatch-ID *family*, never by a parsed
+    /// wake.
+    ///
+    /// `lane.autowake:<UUID>:<epoch>` is the historical spelling: reserved family, no parseable wake.
+    /// If this branch asked `autoWakeID != nil` instead of `isAutoWakeFamily`, that value would read
+    /// as an ordinary dispatch and fall into the ordinary replay — the one branch that may mint a
+    /// fresh lane claim or ship raw stored text. A settled wake is already spent; the only thing it
+    /// may ever replay is the exact fragment that was accepted, and an identity that cannot be matched
+    /// to that fragment must refuse instead of composing a new turn.
+    ///
+    /// Membership churns mid-recovery on purpose: the ordinary branch would then have something to
+    /// say, so reaching the provider at all is the failure this pins down.
+    func testAuthRecoveryReplayRefusesAMalformedReservedFamilyMonitoringIdentity() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let wakeID = try prepareAutoWake(fixture)
+        fixture.session.beginRunAttempt(source: "test.codex.auth.autowake.malformed")
+        _ = await fixture.coordinator.sendCodexNativeMessage(
+            session: fixture.session,
+            text: "",
+            attachments: []
+        )
+        let accepted = try XCTUnwrap(fixture.controller.startedTurns.last)
+        XCTAssertEqual(fixture.controller.startedTurns.count, 1)
+        XCTAssertNil(fixture.session.pendingOversightAutoWake, "the accepted wake must be settled")
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkPromptClaimStore
+                .test_lastAcceptedRevision(observerSessionID: fixture.sessionID),
+            1
+        )
+
+        // Only the stored replay identity is corrupted. The accepted claim itself stays valid, so the
+        // refusal can only come from the identity no longer matching it.
+        let malformed = AgentSessionLinkPromptDispatchID(
+            rawValue: "lane.autowake:\(wakeID.uuidString):3"
+        )
+        XCTAssertTrue(malformed.isAutoWakeFamily)
+        XCTAssertNil(malformed.autoWakeID, "the fixture must be malformed, not a current wake identity")
+        var replayTurn = try XCTUnwrap(fixture.session.codexPendingAuthRetryTurn)
+        replayTurn.monitoringDispatchID = malformed
+        fixture.session.codexPendingAuthRetryTurn = replayTurn
+
+        await fixture.inventory.publishCodex(revision: 2, targetCount: 3)
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .errorNotification(.init(
+                message: "external auth is active",
+                willRetry: false,
+                threadID: nil,
+                turnID: nil,
+                itemID: nil
+            )),
+            session: fixture.session,
+            sourceController: fixture.controller
+        )
+
+        let didRefresh = await fixture.authRecovery.didRefresh
+        XCTAssertTrue(didRefresh, "recovery must reach the replay fence rather than stopping before it")
+        XCTAssertEqual(
+            fixture.controller.startedTurns,
+            [accepted],
+            "a malformed reserved-family identity must make no second provider call and ship no raw text"
+        )
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkPromptClaimStore
+                .test_pendingClaimCount(observerSessionID: fixture.sessionID),
+            0,
+            "the refused replay must not mint a fresh lane claim"
+        )
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkPromptClaimStore
+                .test_lastAcceptedRevision(observerSessionID: fixture.sessionID),
+            1,
+            "the refused replay must not acknowledge the membership it never delivered"
+        )
+        XCTAssertNil(
+            fixture.session.pendingOversightAutoWake,
+            "a refusal must not resurrect wake state either"
+        )
+        // Recovery reports refusal rather than success, so the status a dispatched replay would have
+        // installed is never reached. The run's terminal handling belongs to the caller and is
+        // deliberately not asserted here.
+        XCTAssertNotEqual(
+            fixture.session.runningStatusText,
+            "Waiting for response\u{2026}",
+            "a refused replay must not report the success status a dispatched one sets"
         )
     }
 }

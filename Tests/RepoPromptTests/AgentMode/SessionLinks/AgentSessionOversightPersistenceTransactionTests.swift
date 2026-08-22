@@ -20,6 +20,9 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         /// a durable insert has to be able to compensate itself out of.
         var candidatesByCall: ((Int) -> [AgentSessionLinkEndpointCandidate])?
         private(set) var candidateCallCount = 0
+        /// Lets a test land endpoint or eligibility drift in the final post-activation tail, when
+        /// the bridge invalidates the target's tool advertisement after projection publication.
+        var onToolAdvertisementInvalidation: ((UUID) -> Void)?
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
             candidateCallCount += 1
@@ -187,6 +190,30 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         )
     }
 
+    private func replacingOutboundMonitoringRole(
+        of candidate: AgentSessionLinkEndpointCandidate,
+        allowed: Bool
+    ) -> AgentSessionLinkEndpointCandidate {
+        AgentSessionLinkEndpointCandidate(
+            windowID: candidate.windowID,
+            workspaceID: candidate.workspaceID,
+            tabID: candidate.tabID,
+            sessionID: candidate.sessionID,
+            persistentBindingGeneration: candidate.persistentBindingGeneration,
+            bindingTransitionGeneration: candidate.bindingTransitionGeneration,
+            isTopLevel: candidate.isTopLevel,
+            hasLoadedPersistedState: candidate.hasLoadedPersistedState,
+            bindingTransitionInProgress: candidate.bindingTransitionInProgress,
+            isClosing: candidate.isClosing,
+            isMCPControlled: candidate.isMCPControlled,
+            isMCPOriginated: candidate.isMCPOriginated,
+            roleAllowsOutboundMonitoring: allowed,
+            displayName: candidate.displayName,
+            providerDisplayName: candidate.providerDisplayName,
+            locationLabel: candidate.locationLabel
+        )
+    }
+
     private func makeFixture(mode: AgentSessionOversightPersistenceMode = .enabled) -> Fixture {
         let authority = DomainAgentSessionLinkAuthority(
             identity: DomainRuntimeIdentity(
@@ -212,7 +239,11 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         let bridge = AgentSessionLinkRuntimeBridge(
             authority: authority,
             host: host,
-            toolAdvertisementInvalidator: { _ in }
+            toolAdvertisementInvalidator: { [weak host] sessionID in
+                await MainActor.run {
+                    host?.onToolAdvertisementInvalidation?(sessionID)
+                }
+            }
         )
         bridge.installIntentStore(store)
         return Fixture(
@@ -239,10 +270,12 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         generation: UInt64
     ) async -> AgentMonitorStopOutcome {
         await fixture.bridge.stopMonitorLink(
-            observerSessionID: fixture.observer.sessionID,
-            targetSessionID: fixture.target.sessionID,
-            linkID: linkID,
-            generation: generation
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: DomainAgentSessionLinkReference(
+                linkID: linkID,
+                generation: generation
+            )
         )
     }
 
@@ -305,6 +338,107 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         XCTAssertEqual(inventory.items.count, 1, "A Stop that could not commit must not report the link gone.")
     }
 
+    func testExactStopEndpointMismatchLeavesTheDurableTokenAndGrantIntact() async throws {
+        let fixture = makeFixture()
+        guard case .added = await add(fixture) else { return XCTFail("Expected the link to be added") }
+        let live = await liveReference(fixture)
+        let reference = try XCTUnwrap(live)
+        let storedTokenBefore = await fixture.store.token(for: fixture.pair)
+        let tokenBefore = try XCTUnwrap(storedTokenBefore)
+        let wrongObserver = makeCandidate(
+            windowID: 9,
+            displayName: "Wrong observer incarnation",
+            sessionID: fixture.observer.sessionID
+        )
+
+        let outcome = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: wrongObserver.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+
+        XCTAssertEqual(
+            outcome,
+            .failed(message: "That oversight relationship is no longer active.")
+        )
+        let tokenAfter = await fixture.store.token(for: fixture.pair)
+        let activeGrant = await fixture.authority.activeGrant(for: reference)
+        XCTAssertEqual(tokenAfter, tokenBefore)
+        XCTAssertEqual(activeGrant?.observer, fixture.observer.domainEndpoint)
+        XCTAssertEqual(activeGrant?.target, fixture.target.domainEndpoint)
+    }
+
+    func testDeadObserverExactStopRemovesDurableIntentBeforeRevokingGrant() async throws {
+        let fixture = makeFixture()
+        guard case .added = await add(fixture) else { return XCTFail("Expected the link to be added") }
+        let live = await liveReference(fixture)
+        let reference = try XCTUnwrap(live)
+        fixture.host.candidates = [fixture.target]
+
+        let outcome = await stop(
+            fixture,
+            linkID: reference.linkID,
+            generation: reference.generation
+        )
+
+        XCTAssertEqual(outcome, .stopped)
+        let token = await fixture.store.token(for: fixture.pair)
+        let activeGrant = await fixture.authority.activeGrant(for: reference)
+        XCTAssertNil(token)
+        XCTAssertNil(activeGrant)
+    }
+
+    func testAuthorityActiveExactStopRevokesItsGrantWhenTheDurableRowIsAlreadyAbsent() async throws {
+        let fixture = makeFixture()
+        guard case .added = await add(fixture) else { return XCTFail("Expected the link to be added") }
+        let live = await liveReference(fixture)
+        let reference = try XCTUnwrap(live)
+        let storedToken = await fixture.store.token(for: fixture.pair)
+        let token = try XCTUnwrap(storedToken)
+        let externalRemoval = await fixture.store.remove(fixture.pair, ifCurrent: token)
+        XCTAssertEqual(externalRemoval.outcome, .applied)
+
+        let outcome = await stop(
+            fixture,
+            linkID: reference.linkID,
+            generation: reference.generation
+        )
+
+        XCTAssertEqual(outcome, .stopped)
+        let tokenAfter = await fixture.store.token(for: fixture.pair)
+        let activeGrant = await fixture.authority.activeGrant(for: reference)
+        XCTAssertNil(tokenAfter)
+        XCTAssertNil(activeGrant, "An authority-active reference must not survive an absent durable row.")
+    }
+
+    func testAuthorityActiveExactStopRevokesOnlyItsGrantWhenANewerTokenIsDurable() async throws {
+        let fixture = makeFixture()
+        guard case .added = await add(fixture) else { return XCTFail("Expected the link to be added") }
+        let live = await liveReference(fixture)
+        let reference = try XCTUnwrap(live)
+        let storedTokenA = await fixture.store.token(for: fixture.pair)
+        let tokenA = try XCTUnwrap(storedTokenA)
+        let externalRemoval = await fixture.store.remove(fixture.pair, ifCurrent: tokenA)
+        XCTAssertEqual(externalRemoval.outcome, .applied)
+        let replacementInsertion = await fixture.store.insert(fixture.pair)
+        XCTAssertEqual(replacementInsertion.outcome, .applied)
+        let storedTokenB = await fixture.store.token(for: fixture.pair)
+        let tokenB = try XCTUnwrap(storedTokenB)
+        XCTAssertNotEqual(tokenA, tokenB)
+
+        let outcome = await stop(
+            fixture,
+            linkID: reference.linkID,
+            generation: reference.generation
+        )
+
+        XCTAssertEqual(outcome, .stopped)
+        let tokenAfter = await fixture.store.token(for: fixture.pair)
+        let activeGrant = await fixture.authority.activeGrant(for: reference)
+        XCTAssertEqual(tokenAfter, tokenB, "The stale reference must not delete the newer durable token.")
+        XCTAssertNil(activeGrant, "The authority-validated expected reference must still be revoked.")
+    }
+
     /// Add commits its insert before reserving, so a failure after that point owes a compensation:
     /// otherwise a link the user was told did not start would silently come back next launch.
     func testEstablishmentFailureAfterTheDurableInsertCompensatesItsOwnToken() async {
@@ -322,6 +456,48 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         XCTAssertNil(token, "A failed establishment must compensate the intent it durably inserted.")
         let inventory = await fixture.authority.links(forObserver: fixture.observer.sessionID)
         XCTAssertTrue(inventory.items.isEmpty, "The rolled-back reservation must leave no grant behind.")
+    }
+
+    func testSidebarAddCompensatesItsTokenWhenObserverLosesFinalLinkBeforeActivation() async throws {
+        let fixture = makeFixture()
+        guard case .added = await add(fixture) else { return XCTFail("setup link failed") }
+        let currentReference = await liveReference(fixture)
+        let existingReference = try XCTUnwrap(currentReference)
+        let newTarget = makeCandidate(windowID: 3, displayName: "New target")
+        fixture.host.candidates = [fixture.observer, fixture.target, newTarget]
+        let newPair = AgentSessionOversightIntent(
+            observerSessionID: fixture.observer.sessionID,
+            targetSessionID: newTarget.sessionID
+        )
+        var stopOutcome: AgentMonitorStopOutcome?
+        fixture.bridge.test_afterReservationBeforeActivation = { pendingPair in
+            guard pendingPair == newPair, stopOutcome == nil else { return }
+            let insertedToken = await fixture.store.token(for: newPair)
+            XCTAssertNotNil(insertedToken, "sidebar Add must persist before reserving")
+            stopOutcome = await fixture.bridge.stopMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: fixture.target.domainEndpoint,
+                expectedReference: existingReference
+            )
+        }
+
+        let outcome = await fixture.bridge.addSidebarMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: newTarget.domainEndpoint
+        )
+
+        XCTAssertEqual(stopOutcome, .stopped)
+        XCTAssertEqual(
+            outcome,
+            .rejected(message: AgentSessionLinkRuntimeBridge.existingOverseerRequiredMessage)
+        )
+        let oldToken = await fixture.store.token(for: fixture.pair)
+        let newToken = await fixture.store.token(for: newPair)
+        XCTAssertNil(oldToken)
+        XCTAssertNil(newToken, "failed sidebar Add must compensate its newly inserted durable token")
+        let authoritySnapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(authoritySnapshot.activeLinkCount, 0)
+        XCTAssertEqual(authoritySnapshot.pendingReservationCount, 0)
     }
 
     func testIdempotentExpectedEndpointAddFailureDoesNotCompensateExistingIntent() async throws {
@@ -355,6 +531,313 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
             "A failed idempotent reassertion must not compensate a durable row it did not insert."
         )
         XCTAssertEqual(referenceAfter, referenceBefore, "The pre-existing authority grant remains live.")
+    }
+
+    func testConcurrentExactIncarnationsCannotShareOneDurablePairToken() async throws {
+        let fixture = makeFixture()
+        let duplicateObserver = makeCandidate(
+            windowID: 3,
+            displayName: "Planning duplicate",
+            sessionID: fixture.observer.sessionID
+        )
+        fixture.host.candidates = [fixture.observer, duplicateObserver, fixture.target]
+
+        let reservationFence = TestReleaseFence(name: "winning exact Add reservation")
+        let pairWaitFence = TestReleaseFence(name: "sibling exact Add pair wait")
+        defer {
+            pairWaitFence.release()
+            reservationFence.release()
+        }
+        var shouldFenceWinningReservation = true
+        fixture.bridge.test_afterReservationBeforeActivation = { pair in
+            guard pair == fixture.pair, shouldFenceWinningReservation else { return }
+            shouldFenceWinningReservation = false
+            await reservationFence.enterAndWait()
+        }
+        fixture.bridge.test_beforePairEstablishmentWait = { pair in
+            guard pair == fixture.pair else { return }
+            await pairWaitFence.enterAndWait()
+        }
+
+        let winningAdd = Task { @MainActor in
+            await fixture.bridge.addMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: fixture.target.domainEndpoint
+            )
+        }
+        await reservationFence.waitUntilEntered()
+        let authorityWhileWinnerIsParked = await fixture.authority.snapshot()
+        XCTAssertEqual(authorityWhileWinnerIsParked.activeLinkCount, 0)
+        XCTAssertEqual(authorityWhileWinnerIsParked.pendingReservationCount, 1)
+        let storedTokenBeforeSibling = await fixture.store.token(for: fixture.pair)
+        let tokenBeforeSibling = try XCTUnwrap(storedTokenBeforeSibling)
+        let assertionBeforeSibling = await fixture.store.assertionGeneration(for: fixture.pair)
+
+        let siblingAdd = Task { @MainActor in
+            await fixture.bridge.addMonitorLink(
+                observerEndpoint: duplicateObserver.domainEndpoint,
+                targetEndpoint: fixture.target.domainEndpoint
+            )
+        }
+        await pairWaitFence.waitUntilEntered()
+        let tokenWhileSiblingWaits = await fixture.store.token(for: fixture.pair)
+        let assertionWhileSiblingWaits = await fixture.store.assertionGeneration(for: fixture.pair)
+        let authorityWhileSiblingWaits = await fixture.authority.snapshot()
+        XCTAssertEqual(tokenWhileSiblingWaits, tokenBeforeSibling)
+        XCTAssertEqual(
+            assertionWhileSiblingWaits,
+            assertionBeforeSibling,
+            "A waiting sibling incarnation must not reassert the shared durable token."
+        )
+        XCTAssertEqual(authorityWhileSiblingWaits.activeLinkCount, 0)
+        XCTAssertEqual(
+            authorityWhileSiblingWaits.pendingReservationCount,
+            1,
+            "The sibling incarnation must not reserve alongside the winning semantic pair owner."
+        )
+
+        pairWaitFence.release()
+        reservationFence.release()
+
+        let winningOutcome = await winningAdd.value
+        let siblingOutcome = await siblingAdd.value
+        guard case let .added(linkID, _) = winningOutcome else {
+            return XCTFail("Expected the first exact incarnation to win: \(winningOutcome)")
+        }
+        XCTAssertEqual(siblingOutcome, .failed(.rebinding))
+        let tokenAfterSibling = await fixture.store.token(for: fixture.pair)
+        let assertionAfterSibling = await fixture.store.assertionGeneration(for: fixture.pair)
+        XCTAssertEqual(tokenAfterSibling, tokenBeforeSibling)
+        XCTAssertEqual(assertionAfterSibling, assertionBeforeSibling)
+
+        let winningInputs = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.observer.domainEndpoint
+        )
+        let winningItem = try XCTUnwrap(winningInputs.outbound.items.first)
+        XCTAssertEqual(winningItem.linkID, linkID)
+        let siblingInputs = await fixture.authority.projectionInputs(
+            forEndpoint: duplicateObserver.domainEndpoint
+        )
+        XCTAssertTrue(siblingInputs.outbound.items.isEmpty)
+
+        let stopOutcome = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: DomainAgentSessionLinkReference(
+                linkID: winningItem.linkID,
+                generation: winningItem.generation
+            )
+        )
+
+        XCTAssertEqual(stopOutcome, .stopped)
+        let tokenAfterStop = await fixture.store.token(for: fixture.pair)
+        XCTAssertNil(tokenAfterStop)
+        let authoritySnapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(authoritySnapshot.activeLinkCount, 0)
+        XCTAssertEqual(authoritySnapshot.pendingReservationCount, 0)
+    }
+
+    func testUnconstrainedAndExactAddsShareSemanticPairEstablishmentOwnership() async throws {
+        let fixture = makeFixture()
+        let duplicateObserver = makeCandidate(
+            windowID: 3,
+            displayName: "Planning duplicate",
+            sessionID: fixture.observer.sessionID
+        )
+        let reservationFence = TestReleaseFence(name: "unconstrained Add reservation")
+        let pairWaitFence = TestReleaseFence(name: "exact Add pair wait")
+        defer {
+            pairWaitFence.release()
+            reservationFence.release()
+        }
+        var shouldFenceReservation = true
+        fixture.bridge.test_afterReservationBeforeActivation = { pair in
+            guard pair == fixture.pair, shouldFenceReservation else { return }
+            shouldFenceReservation = false
+            await reservationFence.enterAndWait()
+        }
+        fixture.bridge.test_beforePairEstablishmentWait = { pair in
+            guard pair == fixture.pair else { return }
+            await pairWaitFence.enterAndWait()
+        }
+
+        let unconstrainedAdd = Task { @MainActor in
+            await add(fixture)
+        }
+        await reservationFence.waitUntilEntered()
+        let authorityWhileWinnerIsParked = await fixture.authority.snapshot()
+        XCTAssertEqual(authorityWhileWinnerIsParked.activeLinkCount, 0)
+        XCTAssertEqual(authorityWhileWinnerIsParked.pendingReservationCount, 1)
+        let storedTokenBeforeSibling = await fixture.store.token(for: fixture.pair)
+        let tokenBeforeSibling = try XCTUnwrap(storedTokenBeforeSibling)
+        let assertionBeforeSibling = await fixture.store.assertionGeneration(for: fixture.pair)
+        fixture.host.candidates = [fixture.observer, duplicateObserver, fixture.target]
+
+        let exactSiblingAdd = Task { @MainActor in
+            await fixture.bridge.addMonitorLink(
+                observerEndpoint: duplicateObserver.domainEndpoint,
+                targetEndpoint: fixture.target.domainEndpoint
+            )
+        }
+        await pairWaitFence.waitUntilEntered()
+        let tokenWhileSiblingWaits = await fixture.store.token(for: fixture.pair)
+        let assertionWhileSiblingWaits = await fixture.store.assertionGeneration(for: fixture.pair)
+        let authorityWhileSiblingWaits = await fixture.authority.snapshot()
+        XCTAssertEqual(tokenWhileSiblingWaits, tokenBeforeSibling)
+        XCTAssertEqual(
+            assertionWhileSiblingWaits,
+            assertionBeforeSibling,
+            "An exact Add must not reassert a token owned by an in-flight unconstrained Add."
+        )
+        XCTAssertEqual(authorityWhileSiblingWaits.activeLinkCount, 0)
+        XCTAssertEqual(authorityWhileSiblingWaits.pendingReservationCount, 1)
+
+        pairWaitFence.release()
+        reservationFence.release()
+
+        let unconstrainedOutcome = await unconstrainedAdd.value
+        let siblingOutcome = await exactSiblingAdd.value
+        guard case .added = unconstrainedOutcome else {
+            return XCTFail("Expected the unconstrained incarnation to win: \(unconstrainedOutcome)")
+        }
+        XCTAssertEqual(siblingOutcome, .failed(.rebinding))
+        let tokenAfterSibling = await fixture.store.token(for: fixture.pair)
+        let assertionAfterSibling = await fixture.store.assertionGeneration(for: fixture.pair)
+        XCTAssertEqual(tokenAfterSibling, tokenBeforeSibling)
+        XCTAssertEqual(assertionAfterSibling, assertionBeforeSibling)
+
+        let winningInputs = await fixture.authority.projectionInputs(
+            forEndpoint: fixture.observer.domainEndpoint
+        )
+        let winningItem = try XCTUnwrap(winningInputs.outbound.items.first)
+        let siblingInputs = await fixture.authority.projectionInputs(
+            forEndpoint: duplicateObserver.domainEndpoint
+        )
+        XCTAssertTrue(siblingInputs.outbound.items.isEmpty)
+
+        let stopOutcome = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: DomainAgentSessionLinkReference(
+                linkID: winningItem.linkID,
+                generation: winningItem.generation
+            )
+        )
+
+        XCTAssertEqual(stopOutcome, .stopped)
+        let tokenAfterStop = await fixture.store.token(for: fixture.pair)
+        XCTAssertNil(tokenAfterStop)
+        let authoritySnapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(authoritySnapshot.activeLinkCount, 0)
+        XCTAssertEqual(authoritySnapshot.pendingReservationCount, 0)
+    }
+
+    func testPostActivationEndpointDriftPreservesPreloadedDurableIntent() async throws {
+        let fixture = makeFixture()
+        _ = await fixture.store.loadForLaunch()
+        let preload = await fixture.store.insert(fixture.pair)
+        XCTAssertEqual(preload.outcome, .applied)
+        let storedTokenBefore = await fixture.store.token(for: fixture.pair)
+        let tokenBefore = try XCTUnwrap(storedTokenBefore)
+        let assertionBefore = await fixture.store.assertionGeneration(for: fixture.pair)
+        let replacementTarget = makeCandidate(
+            windowID: 9,
+            displayName: "Replacement target",
+            sessionID: fixture.target.sessionID
+        )
+        var shouldDrift = true
+        fixture.bridge.test_afterActivationBeforeDeletionFence = { pair in
+            guard pair == fixture.pair, shouldDrift else { return }
+            shouldDrift = false
+            fixture.host.candidates = [fixture.observer, replacementTarget]
+        }
+
+        let outcome = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        )
+
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        let tokenAfter = await fixture.store.token(for: fixture.pair)
+        let assertionAfter = await fixture.store.assertionGeneration(for: fixture.pair)
+        XCTAssertEqual(
+            tokenAfter,
+            tokenBefore,
+            "Exact endpoint rollback must not settle durable intent this Add only reasserted."
+        )
+        XCTAssertGreaterThan(
+            assertionAfter,
+            assertionBefore,
+            "The unchanged insert remains a reassertion even though authority activation rolls back."
+        )
+        let authoritySnapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(authoritySnapshot.activeLinkCount, 0)
+        XCTAssertEqual(authoritySnapshot.pendingReservationCount, 0)
+    }
+
+    func testPostActivationEndpointDriftCompensatesDurableIntentCreatedByAdd() async {
+        let fixture = makeFixture()
+        let replacementTarget = makeCandidate(
+            windowID: 9,
+            displayName: "Replacement target",
+            sessionID: fixture.target.sessionID
+        )
+        var shouldDrift = true
+        fixture.bridge.test_afterActivationBeforeDeletionFence = { pair in
+            guard pair == fixture.pair, shouldDrift else { return }
+            shouldDrift = false
+            fixture.host.candidates = [fixture.observer, replacementTarget]
+        }
+
+        let outcome = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        )
+
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        let tokenAfter = await fixture.store.token(for: fixture.pair)
+        XCTAssertNil(
+            tokenAfter,
+            "Outer Add compensation must remove the durable intent this attempt created."
+        )
+        let authoritySnapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(authoritySnapshot.activeLinkCount, 0)
+        XCTAssertEqual(authoritySnapshot.pendingReservationCount, 0)
+    }
+
+    func testPostActivationEligibilityDriftPreservesPreloadedDurableIntent() async throws {
+        let fixture = makeFixture()
+        _ = await fixture.store.loadForLaunch()
+        let preload = await fixture.store.insert(fixture.pair)
+        XCTAssertEqual(preload.outcome, .applied)
+        let storedTokenBefore = await fixture.store.token(for: fixture.pair)
+        let tokenBefore = try XCTUnwrap(storedTokenBefore)
+        let assertionBefore = await fixture.store.assertionGeneration(for: fixture.pair)
+        let deniedObserver = replacingOutboundMonitoringRole(of: fixture.observer, allowed: false)
+        XCTAssertEqual(deniedObserver.domainEndpoint, fixture.observer.domainEndpoint)
+        fixture.host.onToolAdvertisementInvalidation = { [weak host = fixture.host] sessionID in
+            guard sessionID == fixture.target.sessionID, let host else { return }
+            host.onToolAdvertisementInvalidation = nil
+            host.candidates = [deniedObserver, fixture.target]
+        }
+
+        let outcome = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        )
+
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        let tokenAfter = await fixture.store.token(for: fixture.pair)
+        let assertionAfter = await fixture.store.assertionGeneration(for: fixture.pair)
+        XCTAssertEqual(
+            tokenAfter,
+            tokenBefore,
+            "Final-tail eligibility rollback must preserve a pre-existing durable intent."
+        )
+        XCTAssertGreaterThan(assertionAfter, assertionBefore)
+        let authoritySnapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(authoritySnapshot.activeLinkCount, 0)
+        XCTAssertEqual(authoritySnapshot.pendingReservationCount, 0)
     }
 
     func testExpectedEndpointMismatchLeavesExistingGrantAndDurableAssertionUntouched() async throws {

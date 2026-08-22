@@ -23,9 +23,11 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
         isClosing: Bool = false,
         isMCPControlled: Bool = false,
         isMCPOriginated: Bool = false,
+        roleAllowsOutboundMonitoring: Bool = true,
         displayName: String? = "Build API",
         providerDisplayName: String? = "Codex CLI",
-        locationLabel: String? = "worktree/feature"
+        locationLabel: String? = "worktree/feature",
+        isDeletionInProgress: Bool = false
     ) -> AgentSessionLinkEndpointCandidate {
         AgentSessionLinkEndpointCandidate(
             windowID: windowID,
@@ -40,10 +42,11 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
             isClosing: isClosing,
             isMCPControlled: isMCPControlled,
             isMCPOriginated: isMCPOriginated,
-            roleAllowsOutboundMonitoring: true,
+            roleAllowsOutboundMonitoring: roleAllowsOutboundMonitoring,
             displayName: displayName,
             providerDisplayName: providerDisplayName,
-            locationLabel: locationLabel
+            locationLabel: locationLabel,
+            isDeletionInProgress: isDeletionInProgress
         )
     }
 
@@ -120,6 +123,96 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
                 .resolve(sessionID: candidate.sessionID, candidates: [candidate])
                 .failure,
             .childSession
+        )
+    }
+
+    func testTargetFailureHelperAndResolverShareOrderedPrecedence() throws {
+        let cases: [(String, AgentSessionLinkEndpointCandidate, AgentSessionLinkResolveFailure?)] = [
+            (
+                "child",
+                makeCandidate(
+                    persistentBindingGeneration: nil,
+                    isTopLevel: false,
+                    hasLoadedPersistedState: false,
+                    bindingTransitionInProgress: true,
+                    isClosing: true,
+                    isDeletionInProgress: true
+                ),
+                .childSession
+            ),
+            (
+                "closing",
+                makeCandidate(
+                    persistentBindingGeneration: nil,
+                    hasLoadedPersistedState: false,
+                    bindingTransitionInProgress: true,
+                    isClosing: true,
+                    isDeletionInProgress: true
+                ),
+                .closing
+            ),
+            (
+                "deletion",
+                makeCandidate(
+                    persistentBindingGeneration: nil,
+                    hasLoadedPersistedState: false,
+                    bindingTransitionInProgress: true,
+                    isDeletionInProgress: true
+                ),
+                .closing
+            ),
+            (
+                "rebinding",
+                makeCandidate(
+                    persistentBindingGeneration: nil,
+                    hasLoadedPersistedState: false,
+                    bindingTransitionInProgress: true
+                ),
+                .rebinding
+            ),
+            (
+                "loading",
+                makeCandidate(persistentBindingGeneration: nil, hasLoadedPersistedState: false),
+                .loading
+            ),
+            ("binding", makeCandidate(persistentBindingGeneration: nil), .bindingUnresolved),
+            ("eligible", makeCandidate(), nil)
+        ]
+
+        for (name, candidate, expected) in cases {
+            XCTAssertEqual(
+                AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate),
+                expected,
+                name
+            )
+            let resolution = AgentSessionLinkEndpointResolver.resolve(
+                sessionID: candidate.sessionID,
+                candidates: [candidate]
+            )
+            if let expected {
+                XCTAssertEqual(resolution.failure, expected, name)
+            } else {
+                XCTAssertEqual(try resolution.get(), candidate, name)
+            }
+        }
+    }
+
+    func testResolverOwnsAmbiguityBeforeCandidateLocalTargetEligibility() {
+        let sessionID = UUID()
+        let eligible = makeCandidate(windowID: 1, sessionID: sessionID)
+        let child = makeCandidate(windowID: 2, sessionID: sessionID, isTopLevel: false)
+
+        XCTAssertNil(AgentSessionLinkEndpointEligibility.targetResolveFailure(for: eligible))
+        XCTAssertEqual(
+            AgentSessionLinkEndpointEligibility.targetResolveFailure(for: child),
+            .childSession
+        )
+        XCTAssertEqual(
+            AgentSessionLinkEndpointResolver.resolve(
+                sessionID: sessionID,
+                candidates: [eligible, child]
+            ).failure,
+            .ambiguous
         )
     }
 

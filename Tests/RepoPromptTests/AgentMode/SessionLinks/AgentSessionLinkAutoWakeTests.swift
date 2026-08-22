@@ -62,12 +62,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     func testAutoWakeDispatchIDRoundTripsItsWakeAndNothingElseClaimsToBeOne() {
         let wakeID = UUID()
         XCTAssertEqual(
-            AgentSessionLinkPromptDispatchID.autoWake(wakeID: wakeID, localInputEpoch: 0).autoWakeID,
+            AgentSessionLinkPromptDispatchID.autoWake(wakeID: wakeID).autoWakeID,
             wakeID
         )
         XCTAssertNotEqual(
-            AgentSessionLinkPromptDispatchID.autoWake(wakeID: wakeID, localInputEpoch: 0),
-            AgentSessionLinkPromptDispatchID.autoWake(wakeID: UUID(), localInputEpoch: 0)
+            AgentSessionLinkPromptDispatchID.autoWake(wakeID: wakeID),
+            AgentSessionLinkPromptDispatchID.autoWake(wakeID: UUID())
         )
         for ordinary: AgentSessionLinkPromptDispatchID in [
             .claudeNativeSend(wakeID),
@@ -84,6 +84,13 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             )
         }
         XCTAssertNil(AgentSessionLinkPromptDispatchID(rawValue: "lane.autowake:nope").autoWakeID)
+
+        // The historical two-component form named a fence that no longer exists. It must read as
+        // *malformed reserved family*, never as an ordinary dispatch: the physical seam classifies by
+        // family first precisely so a stale identity cannot slip through the ordinary pass-through.
+        let legacy = AgentSessionLinkPromptDispatchID(rawValue: "lane.autowake:\(wakeID.uuidString):3")
+        XCTAssertNil(legacy.autoWakeID)
+        XCTAssertTrue(legacy.isAutoWakeFamily)
     }
 
     /// A wake's claim is refused outright unless the lane batch it exists to deliver is present.
@@ -110,7 +117,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let wakeStore = AgentSessionLinkOutboundPromptClaimStore()
         XCTAssertNil(
             wakeStore.claim(
-                dispatchID: .autoWake(wakeID: UUID(), localInputEpoch: 0),
+                dispatchID: .autoWake(wakeID: UUID()),
                 epoch: epoch,
                 inventory: inventory,
                 passiveNotices: nil,
@@ -137,7 +144,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(first.laneGuidanceMode, .full)
-        XCTAssertTrue(first.fragment.contains("untrusted data from another session"))
+        // Two things only the full block carries: the supersession notice that retires the old
+        // caller-origin fence, and the autonomy contract that replaced it.
+        XCTAssertTrue(first.fragment.contains("Guidance revision 3 supersedes"))
+        XCTAssertTrue(first.fragment.contains("A fresh user utterance is not required"))
         XCTAssertTrue(first.fragment.contains("idle_for_send` describes readiness at `observed_at`"))
 
         // Rendering is not acceptance: an abandoned batch leaves the wording still owed.
@@ -183,7 +193,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertEqual(rebuilt.laneGuidanceMode, .full)
     }
 
-    // MARK: - Readiness and loop prevention
+    // MARK: - Readiness
 
     /// A reserved wake makes the observer busy for every other observer's `send`.
     ///
@@ -197,28 +207,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             AgentSessionLinkDeliveryReadiness.evaluate(snapshot: snapshot).blockReason,
             .targetNotIdle
         )
-    }
-
-    /// An auto-woken turn cannot originate further linked work until its own user speaks.
-    ///
-    /// The wire-stable reason is deliberately unchanged: broadening what can produce it is not a new
-    /// refusal, and the observer's prompt guidance names that exact string.
-    func testAutoWakeOriginBlocksOnwardSendUnderTheExistingWireReason() {
-        var snapshot = AgentSessionLinkDeliveryReadiness.Snapshot.ready
-        snapshot.observerTurnOrigin = .laneUpdateAutoWake(wakeID: UUID())
-        let decision = AgentSessionLinkDeliveryReadiness.evaluate(snapshot: snapshot)
-        XCTAssertEqual(decision.blockReason, .crossSessionReplyRequiresUserInstruction)
-        XCTAssertEqual(
-            decision.blockReason?.rawValue,
-            "cross_session_reply_requires_user_instruction"
-        )
-        XCTAssertTrue(AgentSessionLinkTurnOrigin.localUser.requiresNewLocalUserInstruction == false)
-        for blocked: AgentSessionLinkTurnOrigin in [
-            .crossSessionMessage(sourceSessionID: UUID()),
-            .laneUpdateAutoWake(wakeID: UUID())
-        ] {
-            XCTAssertTrue(blocked.requiresNewLocalUserInstruction)
-        }
     }
 
     // MARK: - Provenance
@@ -332,11 +320,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             wakeID: reserved.wakeID,
             observerEndpoint: reserved.observerEndpoint,
             queueEpoch: reserved.queueEpoch,
-            localInputEpoch: reserved.localInputEpoch,
             queueRevision: reserved.queueRevision,
             wakeFingerprint: reserved.wakeFingerprint,
             attemptedFingerprint: reserved.wakeFingerprint,
-            humanRearmEpochs: reserved.humanRearmEpochs,
             physicalOutcome: .ambiguous,
             phase: .dispatching,
             task: nil
@@ -347,10 +333,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertEqual(fixture.session.pendingOversightAutoWake?.wakeID, reserved.wakeID)
         fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(
             for: fixture.session,
-            dispatchID: .autoWake(
-                wakeID: reserved.wakeID,
-                localInputEpoch: reserved.localInputEpoch
-            )
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         )
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
         XCTAssertEqual(
@@ -359,134 +342,139 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
-    /// A non-local origin can never arm a wake, so oversight cycles cannot chain.
-    func testANonLocalOriginNeverArmsAWake() throws {
+    /// The pipeline the product ruling exists to allow: wake, accept, new edge, wake again — with no
+    /// local user turn anywhere in between.
+    ///
+    /// Each accepted wake used to leave the observer on a non-local origin that only a fresh human
+    /// utterance could clear, so a delegated multi-stage pipeline stalled at the *second* Auto-wake
+    /// even though the user had already granted and selected the lane. Admission is now decided by
+    /// selection, snooze, and whether a genuinely new edge exists.
+    func testRepeatedAutonomousWakesAdmitWithoutAnyInterveningLocalUserTurn() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
         fixture.session.autoWakeOnOversightUpdates = true
-        fixture.session.agentSessionLinkTurnOrigin = .laneUpdateAutoWake(wakeID: UUID())
 
-        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
-        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+        var queueRevision: UInt64 = 0
+        var edgeOffset: UInt64 = 0
+        var acceptedWakeIDs: [UUID] = []
+        for wakeNumber in 1 ... 3 {
+            queueRevision += 1
+            edgeOffset += 10
+            try publishLane(
+                fixture,
+                linkSetRevision: 1,
+                queueRevision: queueRevision,
+                edgeSequenceOffset: edgeOffset
+            )
+            let attempt = try XCTUnwrap(
+                fixture.session.pendingOversightAutoWake,
+                "wake \(wakeNumber) must be admitted by its own new edge"
+            )
 
-        // Only accepted local-user input re-arms it.
-        fixture.session.agentSessionLinkTurnOrigin = .localUser
-        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2)
-        XCTAssertNotNil(fixture.session.pendingOversightAutoWake)
+            // Accepted exactly as a provider would, through the claim that carries its identity.
+            let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+                for: fixture.session,
+                dispatchID: .autoWake(wakeID: attempt.wakeID)
+            ))
+            fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
+            acceptedWakeIDs.append(attempt.wakeID)
+            XCTAssertNil(
+                fixture.session.pendingOversightAutoWake,
+                "wake \(wakeNumber) must settle on acceptance"
+            )
+        }
+
+        XCTAssertEqual(Set(acceptedWakeIDs).count, 3, "each wake has its own identity")
+        for wakeID in acceptedWakeIDs {
+            XCTAssertEqual(
+                fixture.session.items.count(where: { $0.id == wakeID }),
+                1,
+                "each accepted wake leaves exactly one visible provenance row"
+            )
+        }
     }
 
-    func testFreshSelectedTargetLocalEpochBypassesObserverFenceWithoutRetroactiveWake() throws {
-        let fixture = try makeFixture()
-        try publishInventory(fixture, revision: 1)
-        fixture.session.agentSessionLinkTurnOrigin = .laneUpdateAutoWake(wakeID: UUID())
+    /// Two independently granted, independently selected directions each keep waking on their own
+    /// new edges — and a user control is what stops one of them.
+    ///
+    /// This is the accepted product consequence of the deletion, pinned rather than papered over.
+    /// Neither grant implies the other; the user created both. The transport deliberately encodes no
+    /// reciprocal detector, cycle counter, or cooldown, so the only things that stop the churn are
+    /// the visible controls: per-lane snooze, Auto-wake deselection, and unlink. This test proves
+    /// both halves — that reciprocal wakes really do continue, and that deselection really does end
+    /// the direction it is applied to without touching the other.
+    func testReciprocalExplicitGrantsKeepWakingUntilAUserControlStopsOneDirection() throws {
+        let observerA = try makeFixture()
+        let observerB = try makeFixture()
+        for fixture in [observerA, observerB] {
+            try publishInventory(fixture, revision: 1)
+            fixture.session.autoWakeOnOversightUpdates = true
+        }
+
+        // Round 1: each direction's own new edge admits its own wake.
+        try publishLane(observerA, linkSetRevision: 1, queueRevision: 1, edgeSequenceOffset: 10)
+        try publishLane(observerB, linkSetRevision: 1, queueRevision: 1, edgeSequenceOffset: 10)
+        let wakeA1 = try XCTUnwrap(observerA.session.pendingOversightAutoWake).wakeID
+        let wakeB1 = try XCTUnwrap(observerB.session.pendingOversightAutoWake).wakeID
+        try acceptWake(observerA, wakeID: wakeA1)
+        try acceptWake(observerB, wakeID: wakeB1)
+
+        // Round 2: each accepted wake is itself a lifecycle change the *other* side observes, and
+        // that genuinely new edge admits again. No local user turn happened anywhere.
+        try publishLane(observerA, linkSetRevision: 1, queueRevision: 2, edgeSequenceOffset: 20)
+        try publishLane(observerB, linkSetRevision: 1, queueRevision: 2, edgeSequenceOffset: 20)
+        let wakeA2 = try XCTUnwrap(
+            observerA.session.pendingOversightAutoWake,
+            "reciprocal churn is an accepted consequence, not something the transport damps"
+        ).wakeID
+        XCTAssertNotEqual(wakeA2, wakeA1)
+        XCTAssertNotNil(observerB.session.pendingOversightAutoWake)
+        try acceptWake(observerA, wakeID: wakeA2)
+        let wakeB2 = try XCTUnwrap(observerB.session.pendingOversightAutoWake).wakeID
+        try acceptWake(observerB, wakeID: wakeB2)
+
+        // The user applies a control to one direction only.
+        let endpointA = try AgentSessionLinkEndpointTestSupport.endpoint(
+            observerA.viewModel,
+            tabID: observerA.tabID
+        )
+        XCTAssertTrue(observerA.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+            false,
+            for: endpointA
+        ))
+        observerA.session.agentSessionLinkAutoWakeTargetSessionIDs = []
 
         try publishLane(
-            fixture,
-            linkSetRevision: 1,
-            queueRevision: 1,
-            targetLocalInputEpoch: 5,
-            targetTurnIsLocalUser: true,
-            selectedTargetIndices: [0]
-        )
-        XCTAssertNil(fixture.session.pendingOversightAutoWake, "activation baselines existing target work")
-
-        try publishLane(
-            fixture,
-            linkSetRevision: 1,
-            queueRevision: 2,
-            edgeSequenceOffset: 10,
-            targetLocalInputEpoch: 6,
-            targetTurnIsLocalUser: true,
-            selectedTargetIndices: [0]
-        )
-        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.humanRearmEpochs.count, 1)
-    }
-
-    func testCrossSessionTargetEpochCannotRearmAndFailedAttemptDoesNotConsumeLocalEpoch() throws {
-        let fixture = try makeFixture()
-        try publishInventory(fixture, revision: 1)
-        fixture.session.agentSessionLinkTurnOrigin = .laneUpdateAutoWake(wakeID: UUID())
-        try publishLane(
-            fixture,
-            linkSetRevision: 1,
-            queueRevision: 1,
-            targetLocalInputEpoch: 4,
-            targetTurnIsLocalUser: false,
-            selectedTargetIndices: [0]
-        )
-        XCTAssertNil(fixture.session.pendingOversightAutoWake)
-
-        try publishLane(
-            fixture,
-            linkSetRevision: 1,
-            queueRevision: 2,
-            edgeSequenceOffset: 10,
-            targetLocalInputEpoch: 5,
-            targetTurnIsLocalUser: true,
-            selectedTargetIndices: [0]
-        )
-        let first = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
-        fixture.viewModel.cancelAgentSessionLinkAutoWake(
-            for: first.observerEndpoint,
-            reason: .requiredClaimUnavailable
-        )
-        XCTAssertTrue(fixture.session.agentSessionLinkConsumedTargetLocalEpochs.values.allSatisfy { $0 < 5 })
-
-        try publishLane(
-            fixture,
+            observerA,
             linkSetRevision: 1,
             queueRevision: 3,
-            edgeSequenceOffset: 20,
-            targetLocalInputEpoch: 5,
-            targetTurnIsLocalUser: true,
-            selectedTargetIndices: [0]
+            edgeSequenceOffset: 30,
+            selectedTargetIndices: []
         )
-        XCTAssertNotNil(fixture.session.pendingOversightAutoWake)
+        try publishLane(observerB, linkSetRevision: 1, queueRevision: 3, edgeSequenceOffset: 30)
+
+        XCTAssertNil(
+            observerA.session.pendingOversightAutoWake,
+            "deselecting Auto-wake must stop later admission for that direction"
+        )
+        XCTAssertNotNil(
+            observerB.session.pendingOversightAutoWake,
+            "a control on one direction must not silence the other"
+        )
     }
 
-    /// The publication that *activates* a lane carries no entries, so it is the only chance to
-    /// baseline that lane's target epoch without spending it.
-    ///
-    /// Regression: baselining from the lane's first *update* instead consumed the very epoch that
-    /// update was caused by, so the first direct human turn in a freshly linked or freshly selected
-    /// target could never re-arm a fenced observer.
-    func testActivationPublicationBaselinesLaneEpochSoTheFirstHumanTurnStillRearms() throws {
-        let fixture = try makeFixture()
-        try publishInventory(fixture, revision: 1)
-        fixture.session.agentSessionLinkTurnOrigin = .laneUpdateAutoWake(wakeID: UUID())
-
-        // Activation: the lane is live and its target has already taken local input, but no status
-        // edge has been queued for it yet.
-        try publishLane(
-            fixture,
-            linkSetRevision: 1,
-            queueRevision: 1,
-            targetIndices: [],
-            laneIndices: [0],
-            targetLocalInputEpoch: 5,
-            targetTurnIsLocalUser: true,
-            selectedTargetIndices: [0]
-        )
+    /// Accepts one wake through the real claim path, exactly as a provider's acceptance signal does.
+    private func acceptWake(_ fixture: Fixture, wakeID: UUID) throws {
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: wakeID)
+        ))
+        fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
+        XCTAssertNil(fixture.session.pendingOversightAutoWake, "an accepted wake settles")
         XCTAssertEqual(
-            fixture.session.agentSessionLinkConsumedTargetLocalEpochs[Self.laneReference(0)],
-            5,
-            "work that predates the lane must be baselined by the entry-less activation publication"
-        )
-        XCTAssertNil(fixture.session.pendingOversightAutoWake)
-
-        try publishLane(
-            fixture,
-            linkSetRevision: 1,
-            queueRevision: 2,
-            edgeSequenceOffset: 10,
-            targetLocalInputEpoch: 6,
-            targetTurnIsLocalUser: true,
-            selectedTargetIndices: [0]
-        )
-        XCTAssertEqual(
-            fixture.session.pendingOversightAutoWake?.humanRearmEpochs[Self.laneReference(0)],
-            6,
-            "the first direct human turn after activation is fresh and may re-arm the observer"
+            fixture.session.items.count(where: { $0.id == wakeID }),
+            1,
+            "each accepted wake leaves exactly one visible provenance row"
         )
     }
 
@@ -580,10 +568,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session,
-            dispatchID: .autoWake(
-                wakeID: reserved.wakeID,
-                localInputEpoch: reserved.localInputEpoch
-            )
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         ))
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
 
@@ -631,10 +616,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session,
-            dispatchID: .autoWake(
-                wakeID: reserved.wakeID,
-                localInputEpoch: reserved.localInputEpoch
-            )
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         ))
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
         XCTAssertNil(
@@ -664,25 +646,22 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
-    /// Selecting a lane baselines the target work that predates the selection — and nothing else.
+    /// Selecting a lane makes its *next* update wake-eligible and changes nothing retroactively.
     ///
-    /// Regression: the baseline was taken from the first snapshot published *after* the selection, so
-    /// a target-local instruction that arrived in between was consumed as pre-selection work and the
-    /// first direct human turn under the new selection could never re-arm a fenced observer.
-    func testSelectingALaneBaselinesAtTheSelectionRatherThanAtTheNextPublication() throws {
+    /// Selection is read live rather than from the lane's frozen projection, so a freshly selected
+    /// lane does not have to wait for an authoritative republication to become eligible — and an
+    /// already-published edge that predates the selection does not manufacture a turn either.
+    func testSelectingALaneMakesItsNextUpdateEligibleWithoutRetroactiveWake() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
-        fixture.session.agentSessionLinkTurnOrigin = .laneUpdateAutoWake(wakeID: UUID())
 
-        // The lane is live and unselected, and its target has already taken local input.
+        // The lane is live and unselected, with no queued edge yet.
         try publishLane(
             fixture,
             linkSetRevision: 1,
             queueRevision: 1,
             targetIndices: [],
             laneIndices: [0],
-            targetLocalInputEpoch: 5,
-            targetTurnIsLocalUser: true,
             selectedTargetIndices: []
         )
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
@@ -695,33 +674,25 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             [Self.targetID(0)],
             for: endpoint
         ))
-        XCTAssertEqual(
-            fixture.session.agentSessionLinkConsumedTargetLocalEpochs[Self.laneReference(0)],
-            5,
-            "the selection itself baselines the target work that predates it"
+        XCTAssertNil(
+            fixture.session.pendingOversightAutoWake,
+            "selecting a lane must not retroactively wake on state that already existed"
         )
 
-        // The target's own user sends the first instruction after the selection, and the projection
-        // catches up with the selection and that instruction in the same publication.
+        // The lane's next genuine edge is eligible under the new selection.
         try publishLane(
             fixture,
             linkSetRevision: 1,
             queueRevision: 2,
             edgeSequenceOffset: 10,
-            targetLocalInputEpoch: 6,
-            targetTurnIsLocalUser: true,
             selectedTargetIndices: [0]
         )
-        XCTAssertEqual(
-            fixture.session.pendingOversightAutoWake?.humanRearmEpochs[Self.laneReference(0)],
-            6,
-            "the first human turn after a selection must still re-arm the fenced observer"
-        )
+        XCTAssertNotNil(fixture.session.pendingOversightAutoWake)
     }
 
     /// Drives the real waiting-instruction continuation from suspension through lane acceptance.
-    /// The returned origin, user-activity timestamp, transcript authorship, and anti-chain fence are
-    /// the observable contract that distinguishes this from an ordinary user answer.
+    /// The returned origin, user-activity timestamp, and transcript authorship are the observable
+    /// contract that distinguishes this from an ordinary user answer.
     func testWaitingContinuationPreservesSystemOriginWithoutUserAttribution() async throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
@@ -751,7 +722,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         XCTAssertEqual(fixture.session.lastUserMessageAt, priorUserActivity)
         XCTAssertEqual(fixture.session.items.count(where: { $0.kind == .user }), userRowsBefore)
-        XCTAssertEqual(fixture.session.agentSessionLinkTurnOrigin, .laneUpdateAutoWake(wakeID: wakeID))
         XCTAssertEqual(fixture.session.items.count(where: { $0.id == wakeID && $0.kind == .system }), 1)
         XCTAssertNil(fixture.session.instructionContinuation)
         XCTAssertEqual(fixture.session.runState, .running)
@@ -833,8 +803,16 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 fixture.session.items.contains { $0.id == attempt.wakeID },
                 "no provider-accepted auto-wake row may be written"
             )
+            // Tear the wait down the way the production path does. Resuming the continuation without
+            // also cancelling the timeout task leaves a 10-second timer armed against a continuation
+            // that has already been consumed, and it fires long after this test ends — crashing
+            // whichever unrelated test happens to be running with a checked-continuation misuse.
+            fixture.session.instructionTimeoutTask?.cancel()
+            fixture.session.instructionTimeoutTask = nil
             fixture.session.instructionContinuation?.resume(throwing: CancellationError())
             fixture.session.instructionContinuation = nil
+            fixture.session.instructionWaitID = nil
+            fixture.session.waitingPrompt = nil
             _ = try? await waiting.value
             withExtendedLifetime(controller) {}
         #else
@@ -881,7 +859,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
-    func testExplicitOffOnCycleClearsFailureSuppressionWithoutRearmingANonLocalOrigin() throws {
+    /// Off/on is failure recovery: it clears suppression without inventing an admission basis.
+    func testExplicitOffOnCycleClearsFailureSuppressionWithoutInventingAdmission() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
@@ -893,25 +872,30 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             queueRevision: 1
         ).wakeEligibilityFingerprint
         fixture.session.autoWakeOnOversightUpdates = true
-        fixture.session.agentSessionLinkTurnOrigin = .laneUpdateAutoWake(wakeID: UUID())
+        fixture.session.agentSessionLinkAutoWakeTargetSessionIDs = []
         fixture.session.suppressedOversightWakeFingerprint = fingerprint
 
         XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(false, for: endpoint))
-        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(true, for: endpoint))
 
-        XCTAssertNil(fixture.session.suppressedOversightWakeFingerprint)
-        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        // Master off with no per-lane selection: nothing is selected, so nothing may admit.
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, selectedTargetIndices: [])
         XCTAssertNil(
             fixture.session.pendingOversightAutoWake,
-            "off/on is failure recovery, not a bypass around the anti-chain fence"
+            "an unselected lane may not admit a wake"
+        )
+
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(true, for: endpoint))
+        XCTAssertNil(
+            fixture.session.suppressedOversightWakeFingerprint,
+            "an explicit off/on cycle clears a failed attempt's suppression"
         )
     }
 
-    /// Accepting a wake's claim records the origin, writes exactly one row, and is idempotent.
+    /// Accepting a wake's claim settles the attempt, writes exactly one row, and is idempotent.
     ///
     /// Acceptance is keyed on the claim's own dispatch identity, so this is the same path every
     /// provider family reaches through its existing physical-acceptance signal.
-    func testAcceptedWakeRecordsOriginAndExactlyOneSystemRowIdempotently() throws {
+    func testAcceptedWakeSettlesTheAttemptAndWritesExactlyOneSystemRowIdempotently() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
         fixture.session.autoWakeOnOversightUpdates = true
@@ -920,7 +904,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
             for: fixture.session,
-            dispatchID: .autoWake(wakeID: wakeID, localInputEpoch: 0)
+            dispatchID: .autoWake(wakeID: wakeID)
         ))
         XCTAssertNotNil(claim.passive, "a wake claim always carries the batch it exists for")
 
@@ -928,10 +912,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let nextSequenceIndex = fixture.session.nextSequenceIndex
         fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
 
-        XCTAssertEqual(
-            fixture.session.agentSessionLinkTurnOrigin,
-            .laneUpdateAutoWake(wakeID: wakeID)
-        )
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
         let appended = fixture.session.items.suffix(from: itemsBefore)
         XCTAssertEqual(appended.count, 1)
@@ -948,45 +928,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertEqual(fixture.session.items.count(where: { $0.id == wakeID }), 1)
     }
 
-    func testAcceptedCoalescedWakeConsumesEveryRepresentedHumanEpochAtomically() throws {
-        let fixture = try makeFixture()
-        try publishInventory(fixture, revision: 1)
-        fixture.session.agentSessionLinkTurnOrigin = .laneUpdateAutoWake(wakeID: UUID())
-        try publishLane(
-            fixture,
-            linkSetRevision: 1,
-            queueRevision: 1,
-            targetIndices: [0, 1],
-            targetLocalInputEpoch: 5,
-            targetTurnIsLocalUser: true,
-            selectedTargetIndices: [0, 1]
-        )
-        XCTAssertNil(fixture.session.pendingOversightAutoWake)
-        try publishLane(
-            fixture,
-            linkSetRevision: 1,
-            queueRevision: 2,
-            targetIndices: [0, 1],
-            edgeSequenceOffset: 10,
-            targetLocalInputEpoch: 6,
-            targetTurnIsLocalUser: true,
-            selectedTargetIndices: [0, 1]
-        )
-        let attempt = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
-        XCTAssertEqual(attempt.humanRearmEpochs.count, 2)
-        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
-            for: fixture.session,
-            dispatchID: .autoWake(wakeID: attempt.wakeID, localInputEpoch: attempt.localInputEpoch)
-        ))
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
-        XCTAssertEqual(
-            Set(fixture.session.agentSessionLinkConsumedTargetLocalEpochs.values),
-            [6]
-        )
-        XCTAssertEqual(fixture.session.agentSessionLinkConsumedTargetLocalEpochs.count, 2)
-    }
-
-    func testLateAndDuplicateAcceptanceCannotOverwriteNewerLocalUserOrigin() throws {
+    /// A late or duplicate acceptance stays truthful without reclaiming anything.
+    ///
+    /// The user submitted after this wake crossed its physical boundary, so the wake genuinely did
+    /// run and its provenance row is recorded — exactly once, keyed by wake ID. There is no origin
+    /// state left for a late callback to overwrite, and replaying the same claim adds nothing.
+    func testLateAndDuplicateAcceptanceRecordProvenanceExactlyOnce() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
         fixture.session.autoWakeOnOversightUpdates = true
@@ -998,33 +945,37 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             wakeID: reserved.wakeID,
             observerEndpoint: reserved.observerEndpoint,
             queueEpoch: reserved.queueEpoch,
-            localInputEpoch: reserved.localInputEpoch,
             queueRevision: reserved.queueRevision,
             wakeFingerprint: reserved.wakeFingerprint,
             attemptedFingerprint: reserved.wakeFingerprint,
-            humanRearmEpochs: reserved.humanRearmEpochs,
             physicalOutcome: .ambiguous,
             phase: .dispatching,
             task: nil
         )
         let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
             for: fixture.session,
-            dispatchID: .autoWake(
-                wakeID: reserved.wakeID,
-                localInputEpoch: reserved.localInputEpoch
-            )
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         ))
 
-        fixture.session.agentSessionLinkLocalInputEpoch &+= 1
-        fixture.session.agentSessionLinkTurnOrigin = .localUser
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
-        XCTAssertEqual(fixture.session.agentSessionLinkTurnOrigin, .localUser)
-        XCTAssertEqual(fixture.session.items.count(where: { $0.id == reserved.wakeID }), 1)
+        // The local user wins the submission gate after the wake was already dispatching.
+        fixture.viewModel.cancelAgentSessionLinkAutoWake(
+            for: reserved.observerEndpoint,
+            reason: .localUserWon
+        )
 
-        fixture.session.agentSessionLinkTurnOrigin = .localUser
         fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
-        XCTAssertEqual(fixture.session.agentSessionLinkTurnOrigin, .localUser)
-        XCTAssertEqual(fixture.session.items.count(where: { $0.id == reserved.wakeID }), 1)
+        XCTAssertEqual(
+            fixture.session.items.count(where: { $0.id == reserved.wakeID }),
+            1,
+            "a late acceptance still records the turn that really happened, exactly once"
+        )
+
+        fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
+        XCTAssertEqual(
+            fixture.session.items.count(where: { $0.id == reserved.wakeID }),
+            1,
+            "replaying the same claim adds nothing"
+        )
     }
 
     func testAmbiguousFailureSuppressesOnlyThePhysicallyAttemptedFingerprint() throws {
@@ -1053,17 +1004,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(
             for: fixture.session,
-            dispatchID: .autoWake(
-                wakeID: reserved.wakeID,
-                localInputEpoch: reserved.localInputEpoch
-            )
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         )
         XCTAssertEqual(fixture.session.suppressedOversightWakeFingerprint, reserved.wakeFingerprint)
         XCTAssertNotEqual(fixture.session.suppressedOversightWakeFingerprint, newerFingerprint)
-        XCTAssertEqual(
-            fixture.session.agentSessionLinkTurnOrigin,
-            .laneUpdateAutoWake(wakeID: reserved.wakeID)
-        )
         XCTAssertNotNil(
             fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID],
             "ambiguous delivery must leave the lane receipt unacknowledged"
@@ -1087,14 +1031,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
         XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session,
-            dispatchID: .autoWake(
-                wakeID: reserved.wakeID,
-                localInputEpoch: reserved.localInputEpoch
-            )
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         ))
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
         XCTAssertNil(fixture.session.suppressedOversightWakeFingerprint)
-        XCTAssertEqual(fixture.session.agentSessionLinkTurnOrigin, .localUser)
     }
 
     func testPreparingCancellationKeepsFinalizerAndSettlesWithoutConsumingLane() throws {
@@ -1133,7 +1073,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
         XCTAssertEqual(fixture.session.items.count, itemCount, "a pre-call cancellation writes no provider error or provenance row")
         XCTAssertNil(fixture.session.suppressedOversightWakeFingerprint)
-        XCTAssertEqual(fixture.session.agentSessionLinkTurnOrigin, .localUser)
         XCTAssertNotNil(
             fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID],
             "the unaccepted lane batch remains owed"
@@ -1143,8 +1082,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
             session: fixture.session,
             endpointMatchesGrant: true,
-            isClosing: false,
-            observerTurnOrigin: fixture.session.agentSessionLinkTurnOrigin
+            isClosing: false
         )
         XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness), .ready)
     }
@@ -1166,8 +1104,11 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let itemsBefore = fixture.session.items.count
         fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
 
-        XCTAssertEqual(fixture.session.agentSessionLinkTurnOrigin, .localUser)
-        XCTAssertEqual(fixture.session.items.count, itemsBefore)
+        XCTAssertEqual(
+            fixture.session.items.count,
+            itemsBefore,
+            "an ordinary dispatch must not write a wake provenance row"
+        )
     }
 
     // MARK: - Auto-wake snooze
@@ -1206,7 +1147,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             "a snooze suppresses admission; it never discards, receipts, or baselines the queue"
         )
         XCTAssertNil(fixture.session.suppressedOversightWakeFingerprint)
-        XCTAssertTrue(fixture.session.agentSessionLinkConsumedTargetLocalEpochs.values.allSatisfy { $0 == 0 })
         let retainedRevision = fixture.viewModel
             .agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]?.queueRevision
 
@@ -1394,10 +1334,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         fixture.session.pendingOversightAutoWake = preparing
         XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session,
-            dispatchID: .autoWake(
-                wakeID: reserved.wakeID,
-                localInputEpoch: reserved.localInputEpoch
-            )
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         ))
     }
 
@@ -1741,7 +1678,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
             for: fixture.session,
-            dispatchID: .autoWake(wakeID: reserved.wakeID, localInputEpoch: reserved.localInputEpoch)
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         ))
         let delivered = try Set(XCTUnwrap(claim.passive).receipt.deliveredStatuses.map(\.reference))
         XCTAssertTrue(
@@ -1871,10 +1808,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session,
-            dispatchID: .autoWake(
-                wakeID: reserved.wakeID,
-                localInputEpoch: reserved.localInputEpoch
-            )
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         ))
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
         XCTAssertNil(
@@ -1889,9 +1823,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     /// dispatch IDs, and `agentSessionLinkEffectiveDispatchID` rewrites one to the wake's identity
     /// only while an attempt exists in a dispatch phase. Retiring the tombstone to make room for a
     /// successor therefore looks like tidying up and is actually an unfencing — the still-preparing
-    /// call would take the `autoWakeID == nil` early return and deliver the snoozed lane with no
-    /// provenance row and no anti-chain. The reevaluation a clear owes is replayed after the
-    /// tombstone's own finalizer settles instead.
+    /// call would take the ordinary-dispatch early return and deliver the snoozed lane with no claim
+    /// and no provenance row. The reevaluation a clear owes is replayed after the tombstone's own
+    /// finalizer settles instead.
     func testClearingASnoozeWhileAWakePreparesKeepsTheProviderFenceIntact() throws {
         let fixture = try makeFixture()
         installSnoozeClock(fixture)
@@ -1966,7 +1900,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     /// again, which is the ordinary case: `cancel` is not idempotent across phases, and a second
     /// cancel of an already-tombstoned attempt falls through to clearing the slot. That would delete
     /// the dispatch-ID rewrite while a provider path is still preparing, and the snoozed lane would
-    /// then wake the model unfenced — no provenance row, no anti-chain.
+    /// then wake the model unfenced — no claim, no provenance row.
     func testLosingTheAdmissionBasisAgainWhileTombstonedKeepsTheFence() throws {
         let fixture = try makeFixture()
         installSnoozeClock(fixture)
@@ -2066,10 +2000,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         // reached its transport boundary, was refused, and the identity is spent.
         XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session,
-            dispatchID: .autoWake(
-                wakeID: reserved.wakeID,
-                localInputEpoch: reserved.localInputEpoch
-            )
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         ))
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
         XCTAssertNil(
@@ -2301,8 +2232,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         targetIndices: [Int] = [0],
         laneIndices: [Int]? = nil,
         edgeSequenceOffset: UInt64 = 0,
-        targetLocalInputEpoch: UInt64 = 0,
-        targetTurnIsLocalUser: Bool = false,
         overflow: UInt64 = 0,
         selectedTargetIndices: Set<Int>? = nil,
         referenceGeneration: UInt64 = 1
@@ -2331,8 +2260,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 targetIndices: targetIndices,
                 laneIndices: laneIndices,
                 edgeSequenceOffset: edgeSequenceOffset,
-                targetLocalInputEpoch: targetLocalInputEpoch,
-                targetTurnIsLocalUser: targetTurnIsLocalUser,
                 overflow: overflow,
                 selectedTargetIndices: effectiveSelectedIndices,
                 referenceGeneration: referenceGeneration
@@ -2409,8 +2336,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         targetIndices: [Int] = [0],
         laneIndices: [Int]? = nil,
         edgeSequenceOffset: UInt64 = 0,
-        targetLocalInputEpoch: UInt64 = 0,
-        targetTurnIsLocalUser: Bool = false,
         overflow: UInt64 = 0,
         selectedTargetIndices: Set<Int>? = nil,
         referenceGeneration: UInt64 = 1
@@ -2444,8 +2369,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                     reference: laneReference(index, generation: referenceGeneration),
                     targetEndpoint: laneTargetEndpoint(index),
                     targetSessionID: targetID(index),
-                    targetLocalInputEpoch: targetLocalInputEpoch,
-                    targetTurnIsLocalUser: targetTurnIsLocalUser,
                     isEffectivelySelected: selectedTargetIndices?.contains(index) ?? true
                 )
             }

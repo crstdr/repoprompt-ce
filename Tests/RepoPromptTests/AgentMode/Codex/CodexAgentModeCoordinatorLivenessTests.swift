@@ -2299,11 +2299,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             wakeID: UUID(),
             observerEndpoint: endpoint,
             queueEpoch: UUID(),
-            localInputEpoch: 0,
             queueRevision: 1,
             wakeFingerprint: .init(queueEpoch: UUID(), edges: [], overflowProduced: 0),
             attemptedFingerprint: .init(queueEpoch: UUID(), edges: [], overflowProduced: 0),
-            humanRearmEpochs: [:],
             physicalOutcome: .ambiguous,
             phase: .dispatching,
             task: nil

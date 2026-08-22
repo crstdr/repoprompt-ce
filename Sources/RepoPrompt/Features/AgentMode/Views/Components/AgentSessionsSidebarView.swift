@@ -1,3 +1,5 @@
+import Combine
+import RepoPromptDomainRuntime
 import SwiftUI
 
 // MARK: - Sessions Sidebar
@@ -336,6 +338,7 @@ struct AgentModeSessionsListView: View {
     @State private var archivedSessionsExpanded = false
     @State private var showingClearArchivedConfirmation = false
     @State private var showingBulkDeleteConfirmation = false
+    @State private var sessionLinkProjectionRevision: UInt64 = 0
     @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
     private var showComposeTabsWithoutAgentSessions = false
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -399,6 +402,10 @@ struct AgentModeSessionsListView: View {
         #if DEBUG
             let _ = Self.recordBodyMetric()
         #endif
+        // The sidebar projection intentionally does not cache exact oversight role. Reading this
+        // revision makes a post-storage link projection invalidation re-evaluate the exact role below
+        // without rebuilding row identity or resetting row-local state.
+        let _ = sessionLinkProjectionRevision
         let sidebarSnapshot = sidebarUI.snapshot
         let activeWorkspaceID = agentModeVM.workspaceManager?.activeWorkspaceID
         let workspaceSnapshot = promptManager.sidebarWorkspaceSnapshot.flatMap { snapshot in
@@ -480,10 +487,36 @@ struct AgentModeSessionsListView: View {
                                 let copySessionIDAction = copySessionIDTarget.map { target in
                                     { agentModeVM.copyAgentSessionID(target: target) }
                                 }
+                                let isOverseer = session.sessionID.map { sessionID in
+                                    agentModeVM.agentSessionLinkIsOverseer(
+                                        tabID: session.tabID,
+                                        expectedSessionID: sessionID
+                                    )
+                                } ?? false
+                                let sidebarOversightMenuResolver: (@MainActor () -> AgentSidebarOversightMenuProps?)? =
+                                    session.sessionID.map { expectedSessionID in
+                                        { @MainActor in
+                                            agentModeVM.agentSidebarOversightMenuProps(
+                                                tabID: session.tabID,
+                                                expectedSessionID: expectedSessionID
+                                            )
+                                        }
+                                    }
+                                let sidebarOversightTargetEndpointResolver:
+                                    (@MainActor () -> DomainAgentSessionLinkEndpointIdentity?)? =
+                                    session.sessionID.map { expectedSessionID in
+                                        { @MainActor in
+                                            agentModeVM.agentSidebarOversightTargetEndpoint(
+                                                tabID: session.tabID,
+                                                expectedSessionID: expectedSessionID
+                                            )
+                                        }
+                                    }
 
                                 AgentSessionRow(
                                     title: session.title,
                                     isActive: session.tabID == currentTabID,
+                                    isOverseer: isOverseer,
                                     isPinned: session.isPinned,
                                     isMCPControlled: session.isMCPControlled,
                                     runState: runState,
@@ -536,7 +569,23 @@ struct AgentModeSessionsListView: View {
                                         agentModeVM.renameSession(tabID: session.tabID, to: newName)
                                     },
                                     onDismissAttention: dismissAttentionAction,
-                                    onCopySessionID: copySessionIDAction
+                                    onCopySessionID: copySessionIDAction,
+                                    resolveSidebarOversightMenu: sidebarOversightMenuResolver,
+                                    resolveSidebarOversightTargetEndpoint:
+                                    sidebarOversightTargetEndpointResolver,
+                                    onAddSidebarOversight: { observerEndpoint, targetEndpoint in
+                                        await agentModeVM.addAgentSidebarOversight(
+                                            observerEndpoint: observerEndpoint,
+                                            targetEndpoint: targetEndpoint
+                                        )
+                                    },
+                                    onStopSidebarOversight: { observerEndpoint, targetEndpoint, reference in
+                                        await agentModeVM.stopAgentSidebarOversight(
+                                            observerEndpoint: observerEndpoint,
+                                            targetEndpoint: targetEndpoint,
+                                            expectedReference: reference
+                                        )
+                                    }
                                 )
                             }
                         }
@@ -655,6 +704,15 @@ struct AgentModeSessionsListView: View {
             }
         }
         .id(snapshot.workspaceID)
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .agentSessionLinkOverseerProjectionDidChange,
+                object: agentModeVM
+            )
+            .receive(on: DispatchQueue.main)
+        ) { _ in
+            sessionLinkProjectionRevision &+= 1
+        }
         .task(id: activeWorkspaceID) {
             showingClearArchivedConfirmation = false
             showingBulkDeleteConfirmation = false

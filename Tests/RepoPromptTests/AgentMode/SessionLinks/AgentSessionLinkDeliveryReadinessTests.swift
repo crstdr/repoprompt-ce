@@ -15,8 +15,20 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
 
     // MARK: - Ready shape
 
-    func testFullyIdleHydratedExactlyBoundLocalOriginTargetIsReady() {
+    func testFullyIdleHydratedExactlyBoundTargetIsReady() {
         XCTAssertEqual(Readiness.evaluate(snapshot: .ready), .ready)
+    }
+
+    /// The snapshot is target-only by construction. The user's exact direct grant is the delegation,
+    /// so admission may never depend on anything about the caller: a `.ready` target is ready no
+    /// matter what started the observer's turn, and there is no caller-derived field left to set.
+    func testAdmissionIsDecidedEntirelyByTargetFacts() {
+        XCTAssertTrue(Readiness.evaluate(snapshot: .ready).isReady)
+        XCTAssertEqual(
+            Set(Readiness.BlockReason.allCases),
+            [.endpointInvalidated, .targetLoading, .targetNotIdle],
+            "Only target lifecycle, hydration, and busy state may refuse a send."
+        )
     }
 
     // MARK: - Busy matrix
@@ -104,36 +116,6 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertEqual(Readiness.evaluate(snapshot: rebinding), .blocked(.targetLoading))
     }
 
-    // MARK: - Mutual-link loop guard
-
-    func testTurnStartedByAnIncomingCrossSessionMessageCannotSendOnward() {
-        var snapshot = Snapshot.ready
-        snapshot.observerTurnOrigin = .crossSessionMessage(sourceSessionID: UUID())
-        XCTAssertEqual(
-            Readiness.evaluate(snapshot: snapshot),
-            .blocked(.crossSessionReplyRequiresUserInstruction)
-        )
-    }
-
-    /// The loop guard is checked last so a caller that is *also* blocked by a busy target learns the
-    /// retryable reason. Reporting the permanent reason first would tell it to give up on a send
-    /// that a new local instruction plus an idle target would allow.
-    func testBusyTargetOutranksTheLoopGuard() {
-        var snapshot = Snapshot.ready
-        snapshot.observerTurnOrigin = .crossSessionMessage(sourceSessionID: UUID())
-        snapshot.runStateIsActive = true
-        XCTAssertEqual(Readiness.evaluate(snapshot: snapshot), .blocked(.targetNotIdle))
-    }
-
-    func testLocalOriginReopensSendingAfterACrossSessionTurn() {
-        var snapshot = Snapshot.ready
-        snapshot.observerTurnOrigin = .crossSessionMessage(sourceSessionID: UUID())
-        XCTAssertFalse(Readiness.evaluate(snapshot: snapshot).isReady)
-
-        snapshot.observerTurnOrigin = .localUser
-        XCTAssertTrue(Readiness.evaluate(snapshot: snapshot).isReady)
-    }
-
     // MARK: - Failure vocabulary
 
     /// Terminal prior runs are idle. A completed/cancelled/failed run in a live session must stay
@@ -156,8 +138,13 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertTrue(AgentSessionLinkSendFailure.persistenceFailed.isRetryable)
         XCTAssertFalse(AgentSessionLinkSendFailure.linkRevoked.isRetryable)
         XCTAssertFalse(AgentSessionLinkSendFailure.endpointInvalidated.isRetryable)
-        XCTAssertFalse(
-            AgentSessionLinkSendFailure.crossSessionReplyRequiresUserInstruction.isRetryable
-        )
+    }
+
+    /// The retired transport refusal must not survive anywhere on the wire. A caller that still
+    /// branches on the old string has to see it disappear rather than keep matching a dead case.
+    func testRetiredCallerOriginRefusalIsAbsentFromTheWireVocabulary() {
+        let retired = "cross_session_reply_requires_user_instruction"
+        XCTAssertFalse(Readiness.BlockReason.allCases.map(\.rawValue).contains(retired))
+        XCTAssertNil(AgentSessionLinkSendFailure(rawValue: retired))
     }
 }
