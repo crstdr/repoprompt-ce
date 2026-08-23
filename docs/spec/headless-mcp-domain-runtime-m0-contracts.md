@@ -9,7 +9,7 @@ Machine-readable authority: `Scripts/Fixtures/headless_mcp_domain_runtime_m0_con
 
 This is Milestone 0 of the eight-PR headless runtime plan. It records current authorities, closes bounded evidence questions, and establishes drift guards. It deliberately does **not** add a runtime target, move providers, define a production `DomainRunLaunchToken`, change persistence, or launch a child process.
 
-The normalized catalog fixture contains all 28 public tools. Sixteen tools expose 91 schema-discriminated actions; the other 12 tools are actionless and instead freeze their top-level required properties. M0 does **not** claim that every action was invoked or that a universal success/error envelope exists.
+The normalized catalog fixture contains all 28 public tools. Sixteen tools expose 94 schema-discriminated actions; the other 12 tools are actionless and instead freeze their top-level required properties. M0 does **not** claim that every action was invoked or that a universal success/error envelope exists.
 
 Missing-discriminator behavior is frozen per action-bearing tool from implementation source:
 

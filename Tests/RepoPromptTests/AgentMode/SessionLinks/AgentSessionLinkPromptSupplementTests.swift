@@ -870,7 +870,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
                 "\(kind.rawValue) resolves RepoPrompt tools by their server-qualified name"
             )
         }
-        for kind in [AgentProviderKind.openCode, .cursor] {
+        for kind in [AgentProviderKind.openCode, .cursor, .grokBuild] {
             XCTAssertEqual(
                 AgentSessionLinkPrompts.toolReference(agentKind: kind),
                 "agent_session_link",

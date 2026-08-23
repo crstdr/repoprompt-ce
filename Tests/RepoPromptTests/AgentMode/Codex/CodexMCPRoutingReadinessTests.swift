@@ -408,6 +408,7 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
                     recorder: recorder,
                     routingTimeoutMs: 60000,
                     capturedRunID: runIDBox,
+                    liveSession: session,
                     windowID: windowID
                 )
 
@@ -607,6 +608,7 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
         recorder: TerminalPublicationRecorder,
         routingTimeoutMs: Int? = nil,
         capturedRunID: RunIDBox? = nil,
+        liveSession: AgentModeViewModel.TabSession? = nil,
         windowID: Int
     ) -> CodexAgentModeCoordinator {
         // Install the real per-run policy so the expected-PID policy arms. Routed tests must
@@ -652,6 +654,12 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
             },
             testCodexLeaseRoutingTimeoutMs: routingTimeoutMs ?? self.routingTimeoutMs
         )
+        if let liveSession {
+            // Production sends always address the host's exact live session. Keep routed-success
+            // fixtures on that same ownership seam so exact catalog fencing does not correctly
+            // reject a foreign session before the real MCP admission under test can settle.
+            host.test_installLiveSession(liveSession)
+        }
         retainedHosts.append(host)
         let coordinator = host.test_codexCoordinator
         let hooks = makeHooks(recorder: recorder)

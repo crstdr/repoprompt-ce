@@ -331,7 +331,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in controller },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true },
-            testCodexAuthRecovery: authRecovery
+            testCodexManagedAuthRecovery: authRecovery
         )
         retained.append(viewModel)
         // The supplement is scoped to an exact incarnation, so the tab needs a real workspace
@@ -1543,6 +1543,16 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         continuation?.resume(throwing: CancellationError())
     }
 
+    private func claudeRunIntent(
+        for session: AgentModeViewModel.TabSession,
+        source: String
+    ) throws -> ClaudeAgentModeCoordinator.NativeSessionIntent {
+        let runID = try XCTUnwrap(session.runID)
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: source)
+        return .runAttempt(ownership: ownership, runID: runID)
+    }
+
     // MARK: Claude native
 
     func testClaudeNativeSendCarriesExactlyOneSupplementThenGoesQuiet() async throws {
@@ -1550,11 +1560,16 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 2)
         fixture.session.claudeController = controller
+        let intent = try claudeRunIntent(
+            for: fixture.session,
+            source: "test.claude.native.supplement"
+        )
 
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "claude turn",
-            attachments: []
+            attachments: [],
+            intent: intent
         )
 
         let sent = await controller.sentMessages
@@ -1569,7 +1584,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "second turn",
-            attachments: []
+            attachments: [],
+            intent: intent
         )
         let after = await controller.sentMessages
         try MonitorSupplementAssertions.assertCarriesNoSupplement(XCTUnwrap(after.last))
@@ -1580,17 +1596,23 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 1)
         fixture.session.claudeController = controller
+        let intent = try claudeRunIntent(
+            for: fixture.session,
+            source: "test.claude.native.revocation"
+        )
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "linked",
-            attachments: []
+            attachments: [],
+            intent: intent
         )
 
         fixture.inventory.publish(revision: 2, targetCount: 0)
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "after revoke",
-            attachments: []
+            attachments: [],
+            intent: intent
         )
 
         let sent = await controller.sentMessages

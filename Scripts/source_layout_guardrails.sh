@@ -481,7 +481,7 @@ PY
     fi
   done
   if ! grep -q 'MCPDomainCanonicalToolDefinitions.definition(named:' "$domain_runtime_source_dir/MCPDomainReadToolDefinitions.swift"; then
-    fail "M3 shared read definitions must delegate to the canonical 27-tool schema authority"
+    fail "M3 shared read definitions must delegate to the canonical 28-tool schema authority"
   fi
   print_matches \
     "RepoPromptDomainRuntime contains app/UI/provider implementation" \

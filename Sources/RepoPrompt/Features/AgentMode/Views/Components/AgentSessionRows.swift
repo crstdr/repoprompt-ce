@@ -50,25 +50,25 @@ struct AgentSessionRow: View {
     /// Non-nil only for live, exactly-bound, top-level sessions. The closure revalidates the captured
     /// generation-bearing target immediately before writing and returns `false` when it went stale,
     /// so a stale row performs zero clipboard writes and shows no false success.
-    var onCopySessionID: (() -> Bool)? = nil
+    var onCopySessionID: (() -> Bool)?
     /// Re-resolves the exact current target projection whenever SwiftUI materializes either menu.
     /// A frozen props value would make an available observer actionable after it closed or rebound.
-    var resolveSidebarOversightMenu: (@MainActor () -> AgentSidebarOversightMenuProps?)? = nil
+    var resolveSidebarOversightMenu: (@MainActor () -> AgentSidebarOversightMenuProps?)?
     /// Resolves the row's current exact target even when lifecycle eligibility makes its menu nil.
     /// This fences feedback from a system menu that stayed open across an in-place rebind.
     var resolveSidebarOversightTargetEndpoint:
-        (@MainActor () -> DomainAgentSessionLinkEndpointIdentity?)? = nil
+        (@MainActor () -> DomainAgentSessionLinkEndpointIdentity?)?
     /// Exact Add and Stop callbacks. They never focus either endpoint's window and never mutate row
     /// presentation optimistically; the next projection publication supplies relationship state.
     var onAddSidebarOversight: (@MainActor (
         DomainAgentSessionLinkEndpointIdentity,
         DomainAgentSessionLinkEndpointIdentity
-    ) async -> AgentSidebarOversightActionOutcome)? = nil
+    ) async -> AgentSidebarOversightActionOutcome)?
     var onStopSidebarOversight: (@MainActor (
         DomainAgentSessionLinkEndpointIdentity,
         DomainAgentSessionLinkEndpointIdentity,
         DomainAgentSessionLinkReference
-    ) async -> AgentSidebarOversightActionOutcome)? = nil
+    ) async -> AgentSidebarOversightActionOutcome)?
     let sessionIDCopyAction: AgentSidebarSessionIDCopyAction
 
     @State private var isHovered = false

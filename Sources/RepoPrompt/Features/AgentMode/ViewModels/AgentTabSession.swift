@@ -336,6 +336,7 @@ final class AgentTabSession: ObservableObject {
             }
         }
     }
+
     let codexSteerAckTracker = CodexSteerAckTracker()
 
     /// Claude-only steering queue — carries draft text for restoration on cancel/failure
@@ -365,6 +366,7 @@ final class AgentTabSession: ObservableObject {
             }
         }
     }
+
     /// Claude turn IDs whose terminal events should be treated as superseded by accepted steering.
     var claudeSupersedingProtectedTurnIDs: Set<UUID> = []
     /// Task that drains `pendingClaudeSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
@@ -399,6 +401,7 @@ final class AgentTabSession: ObservableObject {
             }
         }
     }
+
     /// Task that drains `pendingACPSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
     var acpSteeringFlushTask: Task<Void, Never>?
 

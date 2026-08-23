@@ -148,7 +148,7 @@ The two consumers intentionally use different main-thread schedulers:
 | Management eye | Sidebar trailing hover action and context menu | Manage which observers oversee this exact target | Neutral outlined `eye`; interactive menu |
 
 The dashboard pill renders no number at absolute zero and renders each directional count only when
-that direction is nonzero. An outbound relationship uses the filled purple eye and outbound count;
+that direction is nonzero. An outbound relationship uses the filled accent-colored eye and outbound count;
 an inbound relationship uses the orange directional indicator and inbound count; a bidirectional
 state shows both. The complete rounded capsule is the button hit target, while its material and
 stroke remain decorative.

@@ -366,8 +366,8 @@ struct AgentSession: Codable, Identifiable {
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
         providerCleanupHandle = try container.decodeIfPresent(ProviderConversationCleanupHandle.self, forKey: .providerCleanupHandle)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
-        // Additive and `decodeIfPresent`: every session written before version 8 decodes as off,
-        // which is the same default a new session takes.
+        // Additive and `decodeIfPresent`: every session written before version 8 decodes as off.
+        // Fresh live sessions now start on, but restore deliberately preserves this legacy value.
         autoWakeOnOversightUpdates = try container.decodeIfPresent(
             Bool.self,
             forKey: .autoWakeOnOversightUpdates

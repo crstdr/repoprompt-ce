@@ -93,7 +93,10 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
     /// Round-trip, plus the version bumps that make an older loader refuse rather than misread.
     func testAutoWakeRoundTripsAndCarriesTheBumpedVersions() throws {
         var session = AgentSession(id: UUID(), name: "Observer", savedAt: Date())
-        XCTAssertFalse(session.autoWakeOnOversightUpdates, "new sessions default off")
+        XCTAssertFalse(
+            session.autoWakeOnOversightUpdates,
+            "persisted value objects retain an off fallback; the live AgentTabSession owns the new-session default"
+        )
         let selectedTargetID = UUID()
         session.autoWakeOnOversightUpdates = true
         session.agentSessionLinkAutoWakeTargetSessionIDs = [selectedTargetID]

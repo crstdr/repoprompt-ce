@@ -444,16 +444,34 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
             return
         }
         runCatalogRevision += 1
+        let routeToken = AgentSessionLinkRunCatalogRouteToken(
+            runID: runID,
+            observerEndpoint: endpoint,
+            connectionID: UUID(),
+            routingAuthorityGeneration: 1,
+            connectionLifecycleGeneration: 1
+        )
+        #if DEBUG
+            if node.session.selectedAgent.usesClaudeNativeRuntime {
+                node.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = {
+                    requestedRunID,
+                    requestedWindowID,
+                    requestedTabID in
+                    guard requestedRunID == routeToken.runID,
+                          requestedWindowID == routeToken.observerEndpoint.windowID,
+                          requestedTabID == routeToken.observerEndpoint.tabID
+                    else { return nil }
+                    return routeToken
+                }
+                node.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, requestedTabID in
+                    candidate == routeToken && requestedTabID == routeToken.observerEndpoint.tabID
+                }
+            }
+        #endif
         node.viewModel.agentSessionLinkPublishRunCatalogProjection(
             AgentSessionLinkRunCatalogProjection(
                 runID: runID,
-                routeToken: AgentSessionLinkRunCatalogRouteToken(
-                    runID: runID,
-                    observerEndpoint: endpoint,
-                    connectionID: UUID(),
-                    routingAuthorityGeneration: 1,
-                    connectionLifecycleGeneration: 1
-                ),
+                routeToken: routeToken,
                 projectionRevision: runCatalogRevision,
                 hasAgentSessionLink: true
             ),

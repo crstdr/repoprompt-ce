@@ -51,6 +51,9 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
+        // This suite exercises the projection transition from master-off to granular/master-on;
+        // keep that baseline explicit now that fresh live sessions default Auto-wake on.
+        session.autoWakeOnOversightUpdates = false
         _ = try XCTUnwrap(
             viewModel.test_ensureSessionBoundToTab(session),
             "expected a durable persistent binding"

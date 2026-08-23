@@ -215,6 +215,7 @@ enum AgentSessionLinkPromptProviderContext: String, Hashable, CaseIterable {
     case customClaudeCompatible
     case openCode
     case cursor
+    case grokBuild
 
     init(agentKind: AgentProviderKind?) {
         guard let agentKind else {
@@ -229,6 +230,7 @@ enum AgentSessionLinkPromptProviderContext: String, Hashable, CaseIterable {
         case .customClaudeCompatible: self = .customClaudeCompatible
         case .openCode: self = .openCode
         case .cursor: self = .cursor
+        case .grokBuild: self = .grokBuild
         }
     }
 }

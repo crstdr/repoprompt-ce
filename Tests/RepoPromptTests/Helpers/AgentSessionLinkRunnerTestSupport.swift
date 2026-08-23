@@ -246,7 +246,7 @@ final class AgentSessionLinkRunnerHarness {
         HeadlessAgentModeRunner(
             headlessProviderFactory: headlessProviderFactory,
             hooks: hooks,
-            terminalCommitBarrier: AgentRunTerminalCommitBarrier(hooks: hooks)
+            terminalCommitBarrier: AgentRunTerminalCommitBarrier()
         )
     }
 

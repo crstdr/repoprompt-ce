@@ -3273,7 +3273,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 dispatchID: promptDispatchID
             )
             await failCodexFallbackDispatch(session: session, entry: head, message: nil)
-            return
+            return false
         }
         let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
             for: session,
@@ -3285,7 +3285,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 dispatchID: promptDispatchID
             )
             await failCodexFallbackDispatch(session: session, entry: head, message: nil)
-            return
+            return false
         }
         do {
             updateCodexStallWatchdogState(for: session)

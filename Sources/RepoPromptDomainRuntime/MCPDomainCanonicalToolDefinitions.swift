@@ -1133,12 +1133,15 @@ package enum MCPDomainCanonicalToolDefinitions {
             let oldWaitDescription = "Returns `interaction_id` when input is pending."
             let currentWaitDescription = oldWaitDescription
                 + " A steering interruption may include `wait.steering_message` as caller context; it does not acknowledge provider delivery or instruct the caller to resend."
-            return MCPDomainToolDefinition(
-                name: definition.name,
-                description: definition.description.replacingOccurrences(
+            let description = definition.description.contains(currentWaitDescription)
+                ? definition.description
+                : definition.description.replacingOccurrences(
                     of: oldWaitDescription,
                     with: currentWaitDescription
-                ),
+                )
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: description,
                 inputSchema: definition.inputSchema,
                 annotations: definition.annotations,
                 isEnabledByDefault: definition.isEnabledByDefault

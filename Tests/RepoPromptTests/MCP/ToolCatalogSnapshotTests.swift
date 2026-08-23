@@ -241,6 +241,20 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         )
     }
 
+    func testAgentRunSteeringInterruptionGuidanceAppearsOnceAfterCanonicalization() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentRun })
+        let definition = try tool.domainBinding().definition
+        let guidance = "A steering interruption may include `wait.steering_message` as caller context; it does not acknowledge provider delivery or instruct the caller to resend."
+
+        XCTAssertEqual(
+            definition.description.components(separatedBy: guidance).count - 1,
+            1,
+            "Compatibility canonicalization must not duplicate guidance already present in a newer vendored definition."
+        )
+    }
+
     func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
         let generated = try MCPDomainCanonicalToolDefinitions.reviewSnapshotData()
         let repoRoot = try RepoRoot.url()
@@ -1640,7 +1654,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "1|file_actions|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=81230c22d826458cae079855b133d59da34c4a66ae4a68252727e564931335b8|schema=4fd6a59a00940e13efc05b74c81372928d3ad3de0e028c8b34586e2168d16103",
         "2|get_code_structure|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=22f87c78aabfda053a0a62d731743d8ba06db649f6f2497820aea0e2a97fa769|schema=3e87702a79eee436137bef3cf5fec4ee42ab5d252bd69d4eaa7a82ca62ad736a",
         "3|get_file_tree|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=9bf648121646b463554d58373f61c2dcede04640482994e0cf1533d21ae77093|schema=91972027e030989cf242fed03377bdc5056c6317cc77d351d3fa5348dd1767a0",
-        "4|read_file|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=58efaf989ce4fc8da48e081227832ae899d2104567f24ce6afbf3aca46141b18|schema=d023edb446167481751886bebeac7dc8896e2b3f57c12b18591761f846618bb1",
+        "4|read_file|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=7e7949aed9a99c362eedc048ec8f41ffc62536269578d3c762a25fdc70fbb321|schema=d023edb446167481751886bebeac7dc8896e2b3f57c12b18591761f846618bb1",
         "5|file_search|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=f2c9e16ca780c4e94f795b6c9489658856052e6d159aa467a64c906ee48a3fe4|schema=08904f5e241c06414ff476b80b81338a5798961a69d93227d7ed098694546b99",
         "6|workspace_context|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=fb968e72d430d354b03a0dfdb5251d95bbdea2a38cddcd58fe402f6bcb4f1035|schema=d41b9e8db1ccb1ce385d2d20619485a211bda4a8474270ef0c08fc77647e8376",
         "7|prompt|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=e1377f12a6495829c0ade3e37b9325f7a07dc2065288b16bb810d01a4df9e55d|schema=8c8ea22a39bbb9e10c364ad483527faf109a52e1eb9c45c0c939f569ecf144d1",
