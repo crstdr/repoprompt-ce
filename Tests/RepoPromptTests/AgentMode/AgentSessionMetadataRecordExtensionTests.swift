@@ -5,6 +5,33 @@ import XCTest
 final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
     // MARK: - Auto-wake setting
 
+    /// The product default applies only while creating a fresh live session. Hydration must still
+    /// replace it with the user's durable choice rather than opting an existing observer back in.
+    @MainActor
+    func testFreshLiveSessionDefaultsAutoWakeOnButSavedOffStillWins() {
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let live = viewModel.session(for: UUID())
+        XCTAssertTrue(live.autoWakeOnOversightUpdates, "fresh sessions default on")
+
+        let saved = AgentSession(
+            id: UUID(),
+            name: "Observer",
+            savedAt: Date(),
+            autoWakeOnOversightUpdates: false
+        )
+        viewModel.restoreAgentSessionLinkState(from: saved, to: live)
+
+        XCTAssertFalse(live.autoWakeOnOversightUpdates, "the durable saved choice wins")
+    }
+
     /// Every payload written before the setting existed decodes as off.
     ///
     /// The default matters more than usual here: the setting is the only thing standing between an

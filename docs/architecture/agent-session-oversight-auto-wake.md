@@ -86,6 +86,10 @@ The controls are the user's, and they are the ones that already exist:
 | Auto-wake deselection | That lane stops admitting at all |
 | Unlink / revocation | The grant is gone, and any queued send with it |
 
+New live sessions start with the observer-level Auto-wake preference enabled. That is only a
+creation default: hydration replaces it with the durable session value, and payloads written before
+the setting existed continue to decode as off rather than silently opting restored sessions in.
+
 Each prevents *subsequent* admission and may retract a pre-dispatch attempt. None of them claims to
 cancel a physical provider call already in flight.
 

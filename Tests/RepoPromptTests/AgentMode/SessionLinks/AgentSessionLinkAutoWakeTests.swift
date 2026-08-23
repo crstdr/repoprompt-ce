@@ -483,6 +483,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     func testMasterOffLeavesAnUnselectedLaneSilentUntilThatLaneIsSelected() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = false
         XCTAssertFalse(fixture.session.autoWakeOnOversightUpdates)
 
         try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, selectedTargetIndices: [])
@@ -512,6 +513,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     func testOverflowFromAnUnselectedLaneCannotWakeMerelyBecauseAnotherLaneIsSelected() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = false
         XCTAssertFalse(fixture.session.autoWakeOnOversightUpdates)
 
         // No entries at all, so the unattributed overflow is the only thing that could trigger a
@@ -695,6 +697,24 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     /// contract that distinguishes this from an ordinary user answer.
     func testWaitingContinuationPreservesSystemOriginWithoutUserAttribution() async throws {
         let fixture = try makeFixture()
+        // This assertion also covers Claude's non-Codex token accounting; the generic fixture uses
+        // OpenCode only to keep unrelated exact-catalog readiness out of admission tests.
+        fixture.session.selectedAgent = .claudeCode
+        #if DEBUG
+            let projection = try publishCatalogProjection(
+                fixture,
+                revision: 2,
+                hasAgentSessionLink: true
+            )
+            let routeToken = try XCTUnwrap(projection.routeToken)
+            fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in
+                routeToken
+            }
+            fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in
+                candidate == routeToken && tabID == fixture.tabID
+            }
+        #endif
         try publishInventory(fixture, revision: 1)
         fixture.session.autoWakeOnOversightUpdates = true
         let priorUserActivity = Date(timeIntervalSince1970: 123)
@@ -2152,7 +2172,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             name: "Oversee auto-wake seam"
         )
         let session = viewModel.session(for: tabID)
-        session.selectedAgent = .claudeCode
+        // This suite owns provider-neutral admission and settlement. Exact Claude/Codex catalog
+        // readiness has dedicated adapter coverage and would add an unrelated async gate here.
+        session.selectedAgent = .openCode
+        // Most tests establish their own explicit policy. Keep the shared fixture off so changing
+        // the product's fresh-session default cannot silently change their preconditions.
+        session.autoWakeOnOversightUpdates = false
         session.hasLoadedPersistedState = true
         session.installRunID(UUID())
         let sessionID = try XCTUnwrap(

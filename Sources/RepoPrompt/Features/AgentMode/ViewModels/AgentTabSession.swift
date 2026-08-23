@@ -662,8 +662,9 @@ final class AgentTabSession: ObservableObject {
     var selectedModelRaw: String = AgentModel.defaultModel.rawValue
     var selectedReasoningEffortRaw: String?
     var autoEditEnabled: Bool = true
-    /// Persisted with the session. Default off, and inert while this session oversees nothing.
-    var autoWakeOnOversightUpdates: Bool = false
+    /// Persisted with the session. New sessions default on and remain inert while overseeing
+    /// nothing; restoration replaces this creation default with the durable saved value.
+    var autoWakeOnOversightUpdates: Bool = true
     /// Granular target UUIDs; preserved while the master setting is enabled.
     var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = []
     var selectedModel: AgentModel {
