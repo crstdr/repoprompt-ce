@@ -137,13 +137,9 @@ struct AgentMonitorPopoverView: View {
         static let baseWidth: CGFloat = 500
         static let baseHeight: CGFloat = 430
 
-        /// The Overseeing list's spacing ladder, tightest binding first.
-        ///
-        /// A lane is one block: identity, the metadata line, and the subordinate Auto-wake line. The
-        /// subordinate line binds tighter to the metadata it qualifies than the lane's own lines bind
-        /// to each other, and complete blocks are held apart by the widest gap — so the grouping is
-        /// legible from spacing alone, before the rule between blocks is noticed at all.
-        static let laneSubordinateSpacing: CGFloat = 1
+        /// A lane is one compact two-line block: identity and primary actions above, then task
+        /// metadata and its subordinate Auto-wake control sharing the secondary line. Complete lane
+        /// blocks use the widest gap so the grouping is legible before the separator is noticed.
         static let laneLineSpacing: CGFloat = 2
         static let laneBlockSpacing: CGFloat = 8
     }
@@ -343,17 +339,18 @@ struct AgentMonitorPopoverView: View {
                 }
                 outboundActions(row, isBusy: isBusy)
             }
-            // The Auto-wake line qualifies this lane's metadata rather than standing beside it, so
-            // the two are one unit held tighter than the lane's own line spacing. When the row has
-            // nothing to say about Auto-wake, `snoozeRow` renders nothing and adds no gap.
-            VStack(alignment: .leading, spacing: Layout.laneSubordinateSpacing) {
+            // Task metadata and Auto-wake are one secondary line: this keeps the control visibly
+            // attached to its lane and balances it beneath the primary actions.
+            HStack(spacing: 6) {
                 Text(row.taskMetadataLine(now: now))
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .hoverTooltip("\(row.identityTooltip)\n\(row.activityTooltip)", .top)
+                Spacer(minLength: 6)
                 snoozeRow(row, now: now, isBusy: isBusy)
+                    .layoutPriority(1)
             }
             if let feedback = rowFeedbackByRowKey[row.rowKey] {
                 messageText(feedback.message)
@@ -363,8 +360,8 @@ struct AgentMonitorPopoverView: View {
         .accessibilityValue(row.accessibilityDescription)
     }
 
-    /// The subordinate Auto-wake line: current snooze state with its Clear, plus the one compact
-    /// snooze/extend menu.
+    /// The subordinate Auto-wake controls: current snooze state with its Clear, plus the compact
+    /// snooze/extend menu rendered on the lane's secondary line.
     ///
     /// Rendered only when there is something to say — an active snooze, or a lane that could be
     /// snoozed — so an unselected, unsnoozed row keeps the two-line shape it has today.
@@ -399,7 +396,6 @@ struct AgentMonitorPopoverView: View {
                     .disabled(isBusy)
                     .accessibilityLabel(row.clearSnoozeActionLabel)
                 }
-                Spacer(minLength: 0)
                 if offersMenu {
                     snoozeMenu(row, now: now, durations: durations, isBusy: isBusy)
                 }
@@ -430,6 +426,7 @@ struct AgentMonitorPopoverView: View {
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
         }
         .menuStyle(.borderlessButton)
+        .controlSize(.mini)
         .fixedSize()
         .disabled(isBusy)
         .hoverTooltip(AgentMonitorAutoWakeSnoozeCopy.menuTooltip, .top)
@@ -1213,9 +1210,9 @@ struct AgentMonitorPopoverView: View {
 /// Where the Overseeing list is allowed to draw a rule.
 ///
 /// The rule carries one claim: a complete lane block ended and the next begins. A lane block is the
-/// identity line, its metadata, and the subordinate Auto-wake line, so a rule may never fall inside
-/// one — a rule above a lane's own snooze control would present that control as an entry with no
-/// lane. It also never follows the last lane, because the popover already draws a `Divider()` where
+/// identity line plus the shared metadata and Auto-wake line, so a rule may never fall inside one —
+/// a rule above a lane's own snooze control would present that control as an entry with no lane. It
+/// also never follows the last lane, because the popover already draws a `Divider()` where
 /// the section ends and a second rule immediately above it reads as an empty lane.
 enum AgentMonitorLaneGrouping {
     static func drawsSeparator(afterLaneAt index: Int, of count: Int) -> Bool {

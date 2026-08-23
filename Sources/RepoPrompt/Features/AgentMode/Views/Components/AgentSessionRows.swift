@@ -649,6 +649,7 @@ struct AgentSessionRow: View {
                 // permanent purple filled observer-role badge, and this neutral outlined target menu.
                 if allowsDirectMutations,
                    let sidebarOversightMenu,
+                   !sidebarOversightMenu.isEmpty,
                    onAddSidebarOversight != nil,
                    onStopSidebarOversight != nil
                 {
@@ -732,6 +733,7 @@ struct AgentSessionRow: View {
         .contextMenu {
             if allowsDirectMutations,
                let sidebarOversightMenu,
+               !sidebarOversightMenu.isEmpty,
                onAddSidebarOversight != nil,
                onStopSidebarOversight != nil
             {

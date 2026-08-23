@@ -152,9 +152,10 @@ stroke remain decorative.
 The role eye uses fixed system purple rather than the user's accent color. It is a bare filled glyph;
 stable placement, its tooltip, and the row's directional accessibility wording ensure the role is not
 conveyed by hue alone. It remains visible without hover and in selection mode. The management eye is
-hidden with other mutation controls in selection mode. A row may legitimately show both sidebar eyes
-at once; their fill, color, placement, interaction, tooltip, and directional accessibility wording
-must remain distinct.
+hidden with other mutation controls in selection mode, and is omitted when the target has neither an
+eligible observer to add nor an existing relationship to unlink. A row may legitimately show both
+sidebar eyes at once; their fill, color, placement, interaction, tooltip, and directional
+accessibility wording must remain distinct.
 
 ## Target-centric sidebar management stays exact
 
@@ -262,14 +263,15 @@ Because the reducer keeps one coalesced interval per lane and no event history, 
 description of what survives a snooze is "the current coalesced summary" — never a count of missed
 events. Copy and model guidance are written to that standard on purpose.
 
-### The Auto-wake line is subordinate to its lane
+### The Auto-wake control is subordinate to its lane
 
-In the dashboard's Overseeing list, the Snooze Auto-wake line is drawn inside the lane it governs,
-bound tighter to the metadata it qualifies than that lane's own lines are bound to each other, and
-complete lane blocks are held apart by the widest gap. A faint rule may fall only *between* two
-complete blocks (`AgentMonitorLaneGrouping.drawsSeparator`) — never inside one, which would present
-a lane's snooze control as an entry with no lane, and never after the last, where the section's own
-`Divider()` already ends the list and a second rule reads as an empty lane.
+In the dashboard's Overseeing list, each lane is a compact two-line block. The primary lane identity
+and actions share the first line; task metadata and the smaller Snooze Auto-wake control share the
+secondary line. This keeps the control visibly attached to the metadata it qualifies and balances it
+beneath the primary actions. A faint rule may fall only *between* two complete blocks
+(`AgentMonitorLaneGrouping.drawsSeparator`) — never inside one, which would present a lane's snooze
+control as an entry with no lane, and never after the last, where the section's own `Divider()`
+already ends the list and a second rule reads as an empty lane.
 
 ## The `.cancelledBeforeDispatch` tombstone is a fence, not bookkeeping
 

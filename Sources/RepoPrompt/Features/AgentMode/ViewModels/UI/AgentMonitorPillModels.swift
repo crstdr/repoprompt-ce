@@ -301,7 +301,7 @@ struct AgentMonitorAutoWakeSnoozeState: Equatable {
     }
 }
 
-/// Copy for the subordinate Auto-wake snooze row, its Clear control, and the snooze/extend menu.
+/// Copy for the subordinate Auto-wake status, its Clear control, and the snooze/extend menu.
 ///
 /// Lives on the model rather than inline in the view for the same reason the row action copy does:
 /// the wording, the minute rounding, and the extension filtering are all things a test can assert
@@ -984,7 +984,8 @@ struct AgentMonitorPillProps: Equatable {
     /// Target-centric relationship choices for this exact endpoint.
     ///
     /// `nil` means the endpoint is not currently an eligible target (or this is a synthesized local
-    /// placeholder). A non-nil empty value keeps management discoverable when no observer qualifies.
+    /// placeholder). A non-nil empty value means there is neither an eligible observer to add nor an
+    /// existing relationship to unlink, so the sidebar renders no management surface.
     let sidebarOversightMenu: AgentSidebarOversightMenuProps?
     let outbound: [Outbound]
     let inbound: [Inbound]
