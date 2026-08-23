@@ -73,6 +73,12 @@ final class ClaudeAgentModeCoordinator {
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Void
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
+        let ensureAgentSessionLinkProviderInputCatalogReady: @MainActor (
+            _ session: AgentTabSession
+        ) async -> AgentModeViewModel.ProviderInputCatalogReadiness
+        let hasCurrentAgentSessionLinkProviderInputCatalogRoute: @MainActor (
+            _ session: AgentTabSession
+        ) -> Bool
         let decorateAgentSessionLinkPrompt: @MainActor (
             _ text: String,
             _ session: AgentTabSession,
@@ -92,6 +98,51 @@ final class ClaudeAgentModeCoordinator {
         ) -> Void
         let acceptAgentSessionLinkPromptClaim: @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
 
+        init(
+            isSessionCurrent: @escaping @MainActor (_ session: AgentTabSession) -> Bool,
+            requestUIRefresh: @escaping @MainActor (_ session: AgentTabSession, _ urgent: Bool) -> Void,
+            scheduleSave: @escaping @MainActor (_ session: AgentTabSession) -> Void,
+            stageClaudeResumeRecoveryHandoff: @escaping @MainActor (_ session: AgentTabSession) async -> Void,
+            prependPendingHandoff: @escaping @MainActor (_ text: String, _ session: AgentTabSession) -> String,
+            ensureAgentSessionLinkProviderInputCatalogReady: @escaping @MainActor (
+                _ session: AgentTabSession
+            ) async -> AgentModeViewModel.ProviderInputCatalogReadiness = { _ in .notRequired },
+            hasCurrentAgentSessionLinkProviderInputCatalogRoute: @escaping @MainActor (
+                _ session: AgentTabSession
+            ) -> Bool = { _ in true },
+            decorateAgentSessionLinkPrompt: @escaping @MainActor (
+                _ text: String,
+                _ session: AgentTabSession,
+                _ dispatchID: AgentSessionLinkPromptDispatchID
+            ) -> AgentSessionLinkDecoratedProviderText,
+            acquireAgentSessionLinkPhysicalDispatch: @escaping @MainActor (
+                _ session: AgentTabSession,
+                _ dispatchID: AgentSessionLinkPromptDispatchID
+            ) -> Bool,
+            recordAgentSessionLinkPhysicalDispatchNotAttempted: @escaping @MainActor (
+                _ session: AgentTabSession,
+                _ dispatchID: AgentSessionLinkPromptDispatchID
+            ) -> Void,
+            recordAgentSessionLinkPhysicalDispatchFailure: @escaping @MainActor (
+                _ session: AgentTabSession,
+                _ dispatchID: AgentSessionLinkPromptDispatchID
+            ) -> Void,
+            acceptAgentSessionLinkPromptClaim: @escaping @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
+        ) {
+            self.isSessionCurrent = isSessionCurrent
+            self.requestUIRefresh = requestUIRefresh
+            self.scheduleSave = scheduleSave
+            self.stageClaudeResumeRecoveryHandoff = stageClaudeResumeRecoveryHandoff
+            self.prependPendingHandoff = prependPendingHandoff
+            self.ensureAgentSessionLinkProviderInputCatalogReady = ensureAgentSessionLinkProviderInputCatalogReady
+            self.hasCurrentAgentSessionLinkProviderInputCatalogRoute = hasCurrentAgentSessionLinkProviderInputCatalogRoute
+            self.decorateAgentSessionLinkPrompt = decorateAgentSessionLinkPrompt
+            self.acquireAgentSessionLinkPhysicalDispatch = acquireAgentSessionLinkPhysicalDispatch
+            self.recordAgentSessionLinkPhysicalDispatchNotAttempted = recordAgentSessionLinkPhysicalDispatchNotAttempted
+            self.recordAgentSessionLinkPhysicalDispatchFailure = recordAgentSessionLinkPhysicalDispatchFailure
+            self.acceptAgentSessionLinkPromptClaim = acceptAgentSessionLinkPromptClaim
+        }
+
         static var noOp: Self {
             Self(
                 isSessionCurrent: { _ in true },
@@ -99,6 +150,8 @@ final class ClaudeAgentModeCoordinator {
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
                 prependPendingHandoff: { text, _ in text },
+                ensureAgentSessionLinkProviderInputCatalogReady: { _ in .notRequired },
+                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in true },
                 decorateAgentSessionLinkPrompt: { text, _, _ in
                     .init(text: text, claim: nil, mustAbortDispatch: false)
                 },
@@ -941,6 +994,8 @@ final class ClaudeAgentModeCoordinator {
         // controller is a transport retry of the *same* user turn, so every attempt must carry a
         // byte-equivalent oversight supplement rather than re-deciding per attempt.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
+        let routeVerificationFailureMessage =
+            "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run."
 
         for _ in 0 ..< 3 {
             switch await ensureClaudeNativeSession(session: session, intent: intent) {
@@ -1039,6 +1094,31 @@ final class ClaudeAgentModeCoordinator {
                 return .superseded
             }
 
+            let catalogReadiness = await hostCapabilities.ensureAgentSessionLinkProviderInputCatalogReady(session)
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                return .superseded
+            }
+            let requiresFinalRouteFence: Bool
+            switch catalogReadiness {
+            case .notRequired:
+                requiresFinalRouteFence = false
+            case .ready:
+                requiresFinalRouteFence = true
+            case .cancelled, .superseded:
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                return .superseded
+            case .unavailable, .timedOut:
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                return recordSendFailure(
+                    routeVerificationFailureMessage,
+                    session: session,
+                    intent: intent
+                )
+            }
+
             // This is the final launch-settings validation before dispatch. There is
             // intentionally no suspension between this check and sendUserMessage, so a
             // Safe Managed tightening cannot enqueue a turn on the stale controller.
@@ -1052,6 +1132,17 @@ final class ClaudeAgentModeCoordinator {
                 await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
                 handler = toolHandler(for: session)
                 continue
+            }
+
+            guard !requiresFinalRouteFence
+                || hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
+            else {
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                return recordSendFailure(
+                    routeVerificationFailureMessage,
+                    session: session,
+                    intent: intent
+                )
             }
 
             do {

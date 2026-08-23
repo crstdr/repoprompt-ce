@@ -165,21 +165,44 @@ final class MonitorInventoryPublisher {
                 """
             )
         }
+        #if DEBUG
+            if viewModel.sessions[tabID]?.selectedAgent.usesClaudeNativeRuntime == true {
+                viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in targetCount > 0 }
+            }
+        #endif
         if targetCount > 0, let session = viewModel.sessions[tabID] {
             if session.runID == nil {
                 session.installRunID(UUID())
             }
             if let runID = session.runID {
+                let routeToken = AgentSessionLinkRunCatalogRouteToken(
+                    runID: runID,
+                    observerEndpoint: endpoint,
+                    connectionID: UUID(),
+                    routingAuthorityGeneration: 1,
+                    connectionLifecycleGeneration: 1
+                )
+                #if DEBUG
+                    if session.selectedAgent.usesClaudeNativeRuntime {
+                        viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = {
+                            requestedRunID,
+                            requestedWindowID,
+                            requestedTabID in
+                            guard requestedRunID == routeToken.runID,
+                                  requestedWindowID == routeToken.observerEndpoint.windowID,
+                                  requestedTabID == routeToken.observerEndpoint.tabID
+                            else { return nil }
+                            return routeToken
+                        }
+                        viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, requestedTabID in
+                            candidate == routeToken && requestedTabID == routeToken.observerEndpoint.tabID
+                        }
+                    }
+                #endif
                 viewModel.agentSessionLinkPublishRunCatalogProjection(
                     AgentSessionLinkRunCatalogProjection(
                         runID: runID,
-                        routeToken: AgentSessionLinkRunCatalogRouteToken(
-                            runID: runID,
-                            observerEndpoint: endpoint,
-                            connectionID: UUID(),
-                            routingAuthorityGeneration: 1,
-                            connectionLifecycleGeneration: 1
-                        ),
+                        routeToken: routeToken,
                         projectionRevision: revision,
                         hasAgentSessionLink: true
                     ),
@@ -1574,6 +1597,113 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let closing = try XCTUnwrap(sent.last)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(closing, userContent: "after revoke")
         XCTAssertTrue(closing.contains("status=\"ended\""))
+    }
+
+    func testClaudeNativeCatalogReadinessUsesExactReadyRoute() async throws {
+        #if DEBUG
+            let fixture = try makeFixture(agent: .claudeCode)
+            fixture.session.installRunID(UUID())
+            let runID = try XCTUnwrap(fixture.session.runID)
+            let endpoint = try XCTUnwrap(
+                fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)
+            )
+            let routeToken = AgentSessionLinkRunCatalogRouteToken(
+                runID: runID,
+                observerEndpoint: endpoint,
+                connectionID: UUID(),
+                routingAuthorityGeneration: 1,
+                connectionLifecycleGeneration: 1
+            )
+            fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { candidate in
+                candidate == endpoint
+            }
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = {
+                requestedRunID,
+                requestedWindowID,
+                requestedTabID in
+                guard requestedRunID == runID,
+                      requestedWindowID == endpoint.windowID,
+                      requestedTabID == endpoint.tabID
+                else { return nil }
+                return routeToken
+            }
+            fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, requestedTabID in
+                candidate == routeToken && requestedTabID == endpoint.tabID
+            }
+            fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+                AgentSessionLinkRunCatalogProjection(
+                    runID: runID,
+                    routeToken: routeToken,
+                    projectionRevision: 1,
+                    hasAgentSessionLink: true
+                ),
+                to: endpoint
+            )
+
+            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
+            XCTAssertEqual(readiness, .ready)
+            XCTAssertTrue(
+                fixture.viewModel.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: fixture.session)
+            )
+        #else
+            throw XCTSkip("Catalog route seams require DEBUG helpers.")
+        #endif
+    }
+
+    func testClaudeNativeCatalogReadinessIsNotRequiredWithoutActiveOutboundLink() async throws {
+        #if DEBUG
+            let fixture = try makeFixture(agent: .claudeCode)
+            fixture.session.installRunID(UUID())
+            _ = try XCTUnwrap(
+                fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)
+            )
+            fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in false }
+
+            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
+            XCTAssertEqual(readiness, .notRequired)
+        #else
+            throw XCTSkip("Catalog route seams require DEBUG helpers.")
+        #endif
+    }
+
+    func testClaudeNativeFinalCatalogFenceRejectsStaleRouteToken() async throws {
+        #if DEBUG
+            let fixture = try makeFixture(agent: .claudeCode)
+            fixture.session.installRunID(UUID())
+            let runID = try XCTUnwrap(fixture.session.runID)
+            let endpoint = try XCTUnwrap(
+                fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)
+            )
+            let routeToken = AgentSessionLinkRunCatalogRouteToken(
+                runID: runID,
+                observerEndpoint: endpoint,
+                connectionID: UUID(),
+                routingAuthorityGeneration: 1,
+                connectionLifecycleGeneration: 1
+            )
+            fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in
+                routeToken
+            }
+            fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { _, _ in false }
+            fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+                AgentSessionLinkRunCatalogProjection(
+                    runID: runID,
+                    routeToken: routeToken,
+                    projectionRevision: 1,
+                    hasAgentSessionLink: true
+                ),
+                to: endpoint
+            )
+
+            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
+            XCTAssertEqual(readiness, .ready)
+            XCTAssertFalse(
+                fixture.viewModel.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: fixture.session)
+            )
+        #else
+            throw XCTSkip("Catalog route seams require DEBUG helpers.")
+        #endif
     }
 
     // MARK: Waiting-instruction continuations

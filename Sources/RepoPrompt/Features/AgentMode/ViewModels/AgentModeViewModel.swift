@@ -1778,6 +1778,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prependPendingHandoff: { [weak self] text, session in
                 self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
             },
+            ensureAgentSessionLinkProviderInputCatalogReady: { [weak self] session in
+                guard let self else { return .unavailable }
+                return await ensureProviderInputCatalogReady(for: session)
+            },
+            hasCurrentAgentSessionLinkProviderInputCatalogRoute: { [weak self] session in
+                guard let self else { return false }
+                return agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session)
+            },
             decorateAgentSessionLinkPrompt: { [weak self] text, session, dispatchID in
                 guard let self else {
                     return .init(

@@ -630,6 +630,267 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertFalse(session.items.contains(where: { $0.kind == .error }))
     }
 
+    func testClaudeCatalogReadinessTimeoutMakesNoProviderCallAndTerminalizesRun() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder, label: "catalog-timeout")
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        let providerBindingService = installClaudeCatalogGateCapabilities(
+            on: harness.host.claudeCoordinator,
+            session: session,
+            readiness: .timedOut,
+            routeIsCurrent: false,
+            recorder: recorder
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "catalog timeout",
+            initialMessageForRun: "catalog timeout",
+            attachments: []
+        )
+        let agentTask = try XCTUnwrap(session.agentTask)
+        await agentTask.value
+        withExtendedLifetime(providerBindingService) {}
+
+        let diagnostic =
+            "Claude Code could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run."
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .failed)
+        XCTAssertFalse(recorder.contains("catalog-timeout:send"))
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:catalog-route" }), 0)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:decorate" }), 0)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:dispatch-not-attempted" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+        XCTAssertEqual(
+            session.items.count(where: { $0.kind == .error && $0.text == diagnostic }),
+            1
+        )
+    }
+
+    func testClaudeOrdinarySendWithoutOversightOrResolvedEndpointRemainsNotRequired() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "catalog-no-endpoint",
+            turnStatusOnSend: .completed
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.installRunID(UUID())
+        let sessionID = UUID()
+        XCTAssertNotNil(
+            harness.host.test_installPersistentSessionBinding(
+                sessionID: sessionID,
+                on: session,
+                updateWorkspaceMetadata: false
+            )
+        )
+        harness.host.test_installLiveSession(session)
+
+        XCTAssertEqual(session.activeAgentSessionID, sessionID)
+        XCTAssertNil(harness.host.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let readiness = await harness.host.ensureProviderInputCatalogReady(for: session)
+        XCTAssertEqual(readiness, .notRequired)
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "ordinary send",
+            initialMessageForRun: "ordinary send",
+            attachments: []
+        )
+        let agentTask = try XCTUnwrap(session.agentTask)
+        await agentTask.value
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "catalog-no-endpoint:send" }), 1)
+        XCTAssertFalse(session.items.contains(where: { $0.kind == .error }))
+    }
+
+    func testClaudeReadyCatalogWithStaleFinalRouteMakesNoProviderCall() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder, label: "catalog-stale")
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runState = .running
+        let runID = UUID()
+        session.installRunID(runID)
+        let ownership = session.beginRunAttempt(source: "test.catalogStale")
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1,
+            workspacePathProvider: { _ in "/workspace" },
+            claudeControllerFactory: { _, _, _, _ in controller }
+        )
+        let providerBindingService = installClaudeCatalogGateCapabilities(
+            on: coordinator,
+            session: session,
+            readiness: .ready,
+            routeIsCurrent: false,
+            recorder: recorder
+        )
+
+        let outcome = await coordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "stale route",
+            attachments: [],
+            intent: .runAttempt(ownership: ownership, runID: runID)
+        )
+        withExtendedLifetime(providerBindingService) {}
+
+        let diagnostic =
+            "Claude Code could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run."
+        XCTAssertEqual(outcome, .failed(message: diagnostic))
+        XCTAssertFalse(recorder.contains("catalog-stale:send"))
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:catalog-route" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:decorate" }), 0)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:dispatch-not-attempted" }), 1)
+        XCTAssertEqual(
+            session.items.count(where: { $0.kind == .error && $0.text == diagnostic }),
+            1
+        )
+    }
+
+    func testClaudeReadyCatalogWithCurrentFinalRouteSendsOnce() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder, label: "catalog-ready")
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runState = .running
+        let runID = UUID()
+        session.installRunID(runID)
+        let ownership = session.beginRunAttempt(source: "test.catalogReady")
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1,
+            workspacePathProvider: { _ in "/workspace" },
+            claudeControllerFactory: { _, _, _, _ in controller }
+        )
+        let providerBindingService = installClaudeCatalogGateCapabilities(
+            on: coordinator,
+            session: session,
+            readiness: .ready,
+            routeIsCurrent: true,
+            recorder: recorder
+        )
+
+        let outcome = await coordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "ready route",
+            attachments: [],
+            intent: .runAttempt(ownership: ownership, runID: runID)
+        )
+        withExtendedLifetime(providerBindingService) {}
+
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "catalog-ready:send" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:catalog-route" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:decorate" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:dispatch-not-attempted" }), 0)
+        XCTAssertFalse(session.items.contains(where: { $0.kind == .error }))
+    }
+
+    func testClaudeCatalogNotRequiredSendsOnceWithoutFinalRouteCheck() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder, label: "catalog-not-required")
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runState = .running
+        let runID = UUID()
+        session.installRunID(runID)
+        let ownership = session.beginRunAttempt(source: "test.catalogNotRequired")
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1,
+            workspacePathProvider: { _ in "/workspace" },
+            claudeControllerFactory: { _, _, _, _ in controller }
+        )
+        let providerBindingService = installClaudeCatalogGateCapabilities(
+            on: coordinator,
+            session: session,
+            readiness: .notRequired,
+            routeIsCurrent: false,
+            recorder: recorder
+        )
+
+        let outcome = await coordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "no link",
+            attachments: [],
+            intent: .runAttempt(ownership: ownership, runID: runID)
+        )
+        withExtendedLifetime(providerBindingService) {}
+
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "catalog-not-required:send" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:catalog-route" }), 0)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:decorate" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:dispatch-not-attempted" }), 0)
+        XCTAssertFalse(session.items.contains(where: { $0.kind == .error }))
+    }
+
+    func testClaudeControllerReplacementDuringCatalogReadinessSupersedesWithoutProviderCall() async {
+        let recorder = LifecycleRecorder()
+        let readinessGate = LifecycleAsyncGate()
+        let oldController = LifecycleFakeNativeController(recorder: recorder, label: "catalog-await-old")
+        let replacementController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "catalog-await-replacement"
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runState = .running
+        let runID = UUID()
+        session.installRunID(runID)
+        let ownership = session.beginRunAttempt(source: "test.catalogAwaitReplacement")
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1,
+            workspacePathProvider: { _ in "/workspace" },
+            claudeControllerFactory: { _, _, _, _ in oldController }
+        )
+        let providerBindingService = installClaudeCatalogGateCapabilities(
+            on: coordinator,
+            session: session,
+            readiness: .ready,
+            routeIsCurrent: true,
+            recorder: recorder,
+            readinessGate: readinessGate
+        )
+
+        let sendTask = Task { @MainActor in
+            await coordinator.sendClaudeNativeMessage(
+                session: session,
+                text: "replace during readiness",
+                attachments: [],
+                intent: .runAttempt(ownership: ownership, runID: runID)
+            )
+        }
+        await readinessGate.waitUntilArrived()
+        XCTAssertEqual(
+            session.claudeController.map { ObjectIdentifier($0 as AnyObject) },
+            ObjectIdentifier(oldController)
+        )
+        session.claudeController = replacementController
+        await readinessGate.release()
+        let outcome = await sendTask.value
+        withExtendedLifetime(providerBindingService) {}
+
+        XCTAssertEqual(outcome, .superseded)
+        XCTAssertEqual(
+            session.claudeController.map { ObjectIdentifier($0 as AnyObject) },
+            ObjectIdentifier(replacementController)
+        )
+        XCTAssertEqual(recorder.events.count(where: { $0 == "catalog-await-old:start" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:catalog-readiness" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:catalog-route" }), 0)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:decorate" }), 0)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "host:dispatch-not-attempted" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "catalog-await-old:send" }), 0)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "catalog-await-replacement:send" }), 0)
+        XCTAssertFalse(session.items.contains(where: { $0.kind == .error }))
+    }
+
     func testClaudeSendFailureReportsEvidenceWithoutTerminalizingSession() async {
         let recorder = LifecycleRecorder()
         let controller = LifecycleFakeNativeController(
@@ -1108,6 +1369,51 @@ extension AgentModeRunServiceLifecycleTests {
             defaults: preferences.defaults,
             securePermissions: preferences.securePermissions
         )
+    }
+
+    private func installClaudeCatalogGateCapabilities(
+        on coordinator: ClaudeAgentModeCoordinator,
+        session: AgentModeViewModel.TabSession,
+        readiness: AgentModeViewModel.ProviderInputCatalogReadiness,
+        routeIsCurrent: Bool,
+        recorder: LifecycleRecorder,
+        readinessGate: LifecycleAsyncGate? = nil
+    ) -> AgentModeProviderBindingService {
+        let providerBindingService = AgentModeProviderBindingService()
+        coordinator.installHostCapabilities(
+            .init(
+                isSessionCurrent: { $0 === session },
+                requestUIRefresh: { _, _ in },
+                scheduleSave: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in },
+                prependPendingHandoff: { text, _ in text },
+                ensureAgentSessionLinkProviderInputCatalogReady: { _ in
+                    recorder.record("host:catalog-readiness")
+                    if let readinessGate {
+                        await readinessGate.arriveAndWait()
+                    }
+                    return readiness
+                },
+                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in
+                    recorder.record("host:catalog-route")
+                    return routeIsCurrent
+                },
+                decorateAgentSessionLinkPrompt: { text, _, _ in
+                    recorder.record("host:decorate")
+                    return .init(text: text, claim: nil, mustAbortDispatch: false)
+                },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in
+                    recorder.record("host:dispatch-not-attempted")
+                },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in
+                    recorder.record("host:dispatch-failed")
+                },
+                acceptAgentSessionLinkPromptClaim: { _ in }
+            ),
+            providerBindingService: providerBindingService
+        )
+        return providerBindingService
     }
 
     private func setClaudeControllerLaunchSettings(

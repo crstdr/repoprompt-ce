@@ -74,17 +74,26 @@ extension AgentModeViewModel {
         case cancelled
     }
 
-    /// Codex retains provider context across turns, so active oversight input waits for the exact
+    private func requiresExactSessionLinkProviderInputCatalog(
+        _ agent: AgentProviderKind
+    ) -> Bool {
+        agent == .codexExec || agent.usesClaudeNativeRuntime
+    }
+
+    /// Providers that retain or initialize an MCP catalog before dispatch wait for the exact
     /// server-observed catalog instead of treating client configuration as acknowledgement.
     func ensureProviderInputCatalogReady(
         for session: TabSession,
         timeout: TimeInterval = 2.0
     ) async -> ProviderInputCatalogReadiness {
-        guard session.selectedAgent == .codexExec else { return .notRequired }
+        guard requiresExactSessionLinkProviderInputCatalog(session.selectedAgent) else { return .notRequired }
         guard sessions[session.tabID] === session,
-              let runID = session.runID,
-              let sessionID = session.activeAgentSessionID,
-              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              let runID = session.runID
+        else { return .unavailable }
+        // Outbound oversight links are keyed by exact endpoint incarnation. Without one, this run
+        // has no oversight route whose provider catalog must be qualified before an ordinary send.
+        guard let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID) else { return .notRequired }
+        guard let sessionID = session.activeAgentSessionID,
               endpoint.sessionID == sessionID
         else {
             return .unavailable
@@ -197,11 +206,11 @@ extension AgentModeViewModel {
         )
     }
 
-    /// Synchronous final fence for Codex, whose retained MCP catalog can outlive a connection.
+    /// Synchronous final fence for providers whose MCP catalog can outlive or race a connection.
     /// The async readiness query proves policy/lifecycle authority; this last check proves that the
     /// exact connection it qualified still owns the MainActor route at composition time.
     func agentSessionLinkHasCurrentProviderInputCatalogRoute(for session: TabSession) -> Bool {
-        guard session.selectedAgent == .codexExec else { return true }
+        guard requiresExactSessionLinkProviderInputCatalog(session.selectedAgent) else { return true }
         guard sessions[session.tabID] === session,
               let runID = session.runID,
               let sessionID = session.activeAgentSessionID,
