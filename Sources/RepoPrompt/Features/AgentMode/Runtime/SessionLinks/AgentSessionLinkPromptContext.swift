@@ -950,6 +950,9 @@ final class AgentSessionLinkOutboundPromptClaimStore {
     ///   - passiveNotices: the observer's latest published passive queue, if any. Fenced here rather
     ///     than at the call site so every condition that may join a status batch to a dispatch is one
     ///     truth table.
+    ///   - locationLabelsByReference: a transient local-display snapshot from the exact observer
+    ///     endpoint. It may decorate accepted attribution but never participates in rendering, claim
+    ///     identity, provider content, or the passive receipt.
     /// - Returns: `.nothingOwed` when neither component is owed — callers send undecorated text —
     ///   or `.requiredLaneBatchUnavailable` when an auto-wake dispatch could not be given its lane
     ///   batch, which callers must never turn into a physical provider call.
@@ -973,6 +976,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         epoch: AgentSessionLinkPromptEpoch,
         inventory: AgentSessionLinkPromptInventory,
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
+        locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:],
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkPromptClaimOutcome {
         let requiresLaneBatch = dispatchID.isAutoWakeFamily
@@ -1081,12 +1085,13 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                     overflowProducedThrough: renderedPassive.overflowProducedThrough
                 ),
                 guidanceRevision: AgentSessionLinkPrompts.currentLaneGuidanceRevision,
-                // Derived from the rendered entries alone, so it names the lanes whose entries were
-                // delivered — snoozed and unselected hitchhikers included — rather than whichever
-                // lane admitted the wake.
+                // Reference, order, and task come from the rendered entries, so this names the lanes
+                // actually delivered — snoozed and unselected hitchhikers included. The optional
+                // location prefix is the exact-reference UI snapshot captured for this claim only.
                 displayAttribution: AgentLaneUpdateDisplayAttribution.make(
                     renderedEntries: renderedPassive.entries,
-                    includesUnattributedOverflow: renderedPassive.includesUnattributedOverflow
+                    includesUnattributedOverflow: renderedPassive.includesUnattributedOverflow,
+                    locationLabelsByReference: locationLabelsByReference
                 )
             )
         }
@@ -1124,6 +1129,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         epoch: AgentSessionLinkPromptEpoch,
         inventory: AgentSessionLinkPromptInventory,
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
+        locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:],
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkOutboundPromptClaim? {
         claimOutcome(
@@ -1131,6 +1137,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             epoch: epoch,
             inventory: inventory,
             passiveNotices: passiveNotices,
+            locationLabelsByReference: locationLabelsByReference,
             render: render
         ).claim
     }

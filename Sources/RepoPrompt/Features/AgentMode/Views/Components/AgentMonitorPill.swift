@@ -326,10 +326,25 @@ struct AgentMonitorPopoverView: View {
             HStack(spacing: 6) {
                 AgentMonitorStatusIndicator(status: row.status, fontPreset: fontPreset)
                     .hoverTooltip(row.status.tooltip, .top)
-                Text(row.locationDisplayLabel)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                Button {
+                    viewAgent(row)
+                } label: {
+                    Text(row.locationDisplayLabel)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accentColor)
+                .contentShape(Rectangle())
+                .disabled(isBusy || row.targetRoute == nil)
+                .hoverTooltip(
+                    row.targetRoute == nil
+                        ? AgentMonitorRowActionCopy.viewDisabledTooltip
+                        : AgentMonitorRowActionCopy.viewTooltip,
+                    .top
+                )
+                .accessibilityLabel(row.viewActionLabel)
                 if row.hasUnreadActivity {
                     unreadBadge(row, isBusy: isBusy)
                 }
@@ -337,7 +352,7 @@ struct AgentMonitorPopoverView: View {
                 if !props.autoWakeOnUpdatesEnabled {
                     laneAutoWakeToggle(row, isBusy: isBusy)
                 }
-                outboundActions(row, isBusy: isBusy)
+                unlinkActionButton(row, isBusy: isBusy)
             }
             // Task metadata and Auto-wake are one secondary line: this keeps the control visibly
             // attached to its lane and balances it beneath the primary actions.
@@ -433,33 +448,17 @@ struct AgentMonitorPopoverView: View {
         .accessibilityLabel(row.snoozeMenuAccessibilityLabel)
     }
 
-    /// The row's common actions, promoted out of an overflow menu.
-    ///
-    /// They share `busyRowKeys`, so View, New, and Unlink can never act concurrently against one
-    /// stale row.
-    private func outboundActions(_ row: AgentMonitorPillProps.Outbound, isBusy: Bool) -> some View {
-        HStack(spacing: 8) {
-            inlineActionButton(
-                title: "View",
-                systemImage: "arrow.up.right.square",
-                accessibilityLabel: row.viewActionLabel,
-                tooltip: row.targetRoute == nil
-                    ? AgentMonitorRowActionCopy.viewDisabledTooltip
-                    : AgentMonitorRowActionCopy.viewTooltip,
-                isDisabled: isBusy || row.targetRoute == nil
-            ) {
-                viewAgent(row)
-            }
-
-            inlineActionButton(
-                title: "Unlink",
-                systemImage: "link.badge.minus",
-                accessibilityLabel: row.unlinkActionLabel,
-                tooltip: AgentMonitorRowActionCopy.unlinkTooltip,
-                isDisabled: isBusy
-            ) {
-                unlinkOutbound(row)
-            }
+    /// Unlink remains independent from the location-only View affordance and the New control.
+    /// All three share `busyRowKeys`, so they cannot act concurrently against one stale row.
+    private func unlinkActionButton(_ row: AgentMonitorPillProps.Outbound, isBusy: Bool) -> some View {
+        inlineActionButton(
+            title: "Unlink",
+            systemImage: "link.badge.minus",
+            accessibilityLabel: row.unlinkActionLabel,
+            tooltip: AgentMonitorRowActionCopy.unlinkTooltip,
+            isDisabled: isBusy
+        ) {
+            unlinkOutbound(row)
         }
         .fixedSize()
     }
@@ -589,9 +588,20 @@ struct AgentMonitorPopoverView: View {
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                         .foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(row.rowLabel)
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                            .lineLimit(1)
+                        Button {
+                            viewObserver(row)
+                        } label: {
+                            Text(row.rowLabel)
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
+                        .contentShape(Rectangle())
+                        .disabled(busyRowKeys.contains(row.rowKey))
+                        .hoverTooltip(AgentMonitorRowActionCopy.viewTooltip, .top)
+                        .accessibilityLabel(row.viewActionLabel)
+
                         Text(row.detailLine)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                             .foregroundStyle(.secondary)
@@ -964,12 +974,23 @@ struct AgentMonitorPopoverView: View {
     }
 
     private func viewAgent(_ row: AgentMonitorPillProps.Outbound) {
-        guard !busyRowKeys.contains(row.rowKey) else { return }
-        guard let route = row.targetRoute else {
-            setRowFeedback(row.rowKey, .failure("That Agent session\u{2019}s location is unavailable."))
+        routeToAgent(rowKey: row.rowKey, route: row.targetRoute)
+    }
+
+    private func viewObserver(_ row: AgentMonitorPillProps.Inbound) {
+        routeToAgent(rowKey: row.rowKey, route: row.observerRoute)
+    }
+
+    /// Routes one exact generation-qualified row and keeps navigation mutually exclusive with every
+    /// other action on that row. Outbound and inbound navigation therefore share identical failure
+    /// feedback without making either complete row a hit target.
+    private func routeToAgent(rowKey: String, route: AgentSessionDeepLinkRoute?) {
+        guard !busyRowKeys.contains(rowKey) else { return }
+        guard let route else {
+            setRowFeedback(rowKey, .failure(AgentMonitorRowActionCopy.viewFailureMessage))
             return
         }
-        let rowKey = beginRowAction(row.rowKey)
+        let rowKey = beginRowAction(rowKey)
         Task {
             let result = await AppDeepLinkRouter.shared.route(agentSession: route)
             busyRowKeys.remove(rowKey)

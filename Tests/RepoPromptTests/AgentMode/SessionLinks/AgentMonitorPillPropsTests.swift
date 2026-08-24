@@ -137,6 +137,16 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(inb.rowLabel, "← Planning (04CF…1A00)")
         XCTAssertEqual(inb.fullID, observerID.uuidString)
         XCTAssertEqual(inb.observerEndpoint.sessionID, observerID)
+        XCTAssertEqual(
+            inb.observerRoute,
+            AgentSessionDeepLinkRoute(
+                windowID: inb.observerEndpoint.windowID,
+                workspaceID: inb.observerEndpoint.workspaceID,
+                tabID: inb.observerEndpoint.tabID,
+                sessionID: inb.observerEndpoint.sessionID
+            )
+        )
+        XCTAssertEqual(inb.viewActionLabel, "View Planning, session 04CF…1A00")
     }
 
     func testAccessibilityDescriptionsCarryTheFullUUIDAndStatusWord() {
@@ -159,8 +169,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             "Overseeing Build API in worktree/feature, session \(targetID.uuidString), "
                 + "Idle, Last activity unavailable"
         )
-        // A row whose target incarnation could not be resolved renders an explicit visual fallback,
-        // while its accessible identity remains grammatical and carries the full canonical UUID.
+        // A row whose presentation location could not be resolved renders an action-oriented
+        // fallback, while its row identity remains grammatical and carries the full canonical UUID.
         let unavailable = AgentMonitorPillProps.Outbound(
             linkID: UUID(),
             generation: 1,
@@ -171,7 +181,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             locationLabel: nil,
             status: .unavailable
         )
-        XCTAssertEqual(unavailable.locationDisplayLabel, "Location unavailable")
+        XCTAssertEqual(unavailable.locationDisplayLabel, "Open session")
         XCTAssertEqual(
             unavailable.accessibilityDescription,
             "Overseeing Build API, session \(targetID.uuidString), "
@@ -223,7 +233,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         )
 
         let missingLocation = outbound(providerDisplayName: nil, locationLabel: " \t ")
-        XCTAssertEqual(missingLocation.locationDisplayLabel, "Location unavailable")
+        XCTAssertEqual(missingLocation.locationDisplayLabel, "Open session")
         XCTAssertEqual(
             missingLocation.taskMetadataLine(now: moment(hour: 15), calendar: calendar, locale: locale),
             "Build API · Activity unavailable"
@@ -816,16 +826,34 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertFalse(outbound().accessibilityDescription.contains("New activity"))
     }
 
-    /// Three visually identical controls per row are indistinguishable in the VoiceOver rotor, so
-    /// each one names the session it acts on.
+    /// The location View affordance and the independent New and Unlink controls each name the session
+    /// they act on for VoiceOver.
     func testInlineActionLabelsNameTheirRow() {
         let row = outbound()
-        XCTAssertEqual(row.viewActionLabel, "View Build API")
+        XCTAssertEqual(row.viewActionLabel, "View Build API in worktree/feature")
         XCTAssertEqual(row.markSeenActionLabel, "Mark Build API activity as seen")
         XCTAssertEqual(row.unlinkActionLabel, "Unlink oversight of Build API")
         XCTAssertEqual(
             Set([row.viewActionLabel, row.markSeenActionLabel, row.unlinkActionLabel]).count,
             3
+        )
+        let route = AgentSessionDeepLinkRoute(
+            windowID: 7,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            sessionID: targetID
+        )
+        let missingLocation = outbound(locationLabel: nil, targetRoute: route)
+        XCTAssertEqual(missingLocation.targetRoute, route)
+        XCTAssertEqual(missingLocation.locationDisplayLabel, "Open session")
+        XCTAssertEqual(missingLocation.viewActionLabel, "Open session: View Build API")
+        XCTAssertEqual(
+            AgentMonitorRowActionCopy.viewDisabledTooltip,
+            "This Agent session can’t be opened right now."
+        )
+        XCTAssertEqual(
+            AgentMonitorRowActionCopy.viewFailureMessage,
+            "That Agent session can’t be opened right now."
         )
     }
 

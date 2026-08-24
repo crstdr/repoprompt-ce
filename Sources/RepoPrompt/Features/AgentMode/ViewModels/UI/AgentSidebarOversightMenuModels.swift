@@ -61,6 +61,20 @@ enum AgentSidebarOversightActionOutcome: Equatable {
     }
 }
 
+/// Copy for removing one target-scoped oversight relationship from the sidebar menu.
+enum AgentSidebarOversightMenuCopy {
+    static func stopTitle(observerMenuLabel: String) -> String {
+        "Stop oversight by “\(observerMenuLabel)”"
+    }
+
+    static func stopAccessibilityLabel(
+        observerMenuLabel: String,
+        targetDisplayName: String
+    ) -> String {
+        "Stop oversight of \(targetDisplayName) by “\(observerMenuLabel)”"
+    }
+}
+
 /// Exact row-local busy identity. Unrelated relationships may mutate concurrently.
 enum AgentSidebarOversightActionKey: Hashable {
     case add(
@@ -86,7 +100,17 @@ enum AgentSidebarOversightMenuProjection {
         let observerSessionID: UUID
         let displayName: String
         let providerDisplayName: String?
+        let locationLabel: String?
         let relationship: AgentSidebarOversightMenuProps.Relationship
+
+        var baseMenuLabel: String {
+            guard let location = locationLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !location.isEmpty
+            else {
+                return displayName
+            }
+            return "\(location): \(displayName)"
+        }
 
         var fullIdentityDescription: String {
             let binding = observerEndpoint.persistentBindingGeneration?.uuidString ?? "unresolved"
@@ -141,6 +165,7 @@ enum AgentSidebarOversightMenuProjection {
                 displayName: observer?.resolvedDisplayName
                     ?? AgentMonitorSessionIDFormatter.short(observerEndpoint.sessionID),
                 providerDisplayName: normalizedProvider(observer?.providerDisplayName),
+                locationLabel: observer?.locationLabel,
                 relationship: .linked(
                     reference: DomainAgentSessionLinkReference(
                         linkID: item.linkID,
@@ -171,6 +196,7 @@ enum AgentSidebarOversightMenuProjection {
                 observerSessionID: observer.sessionID,
                 displayName: observer.resolvedDisplayName,
                 providerDisplayName: normalizedProvider(observer.providerDisplayName),
+                locationLabel: observer.locationLabel,
                 relationship: .available
             ))
         }
@@ -183,7 +209,7 @@ enum AgentSidebarOversightMenuProjection {
                 observerSessionID: seed.observerSessionID,
                 displayName: seed.displayName,
                 providerDisplayName: seed.providerDisplayName,
-                menuLabel: labels[seed.observerEndpoint] ?? seed.displayName,
+                menuLabel: labels[seed.observerEndpoint] ?? seed.baseMenuLabel,
                 fullIdentityDescription: seed.fullIdentityDescription,
                 relationship: seed.relationship
             )
@@ -244,22 +270,22 @@ enum AgentSidebarOversightMenuProjection {
         for seeds: [Seed]
     ) -> [DomainAgentSessionLinkEndpointIdentity: String] {
         var labels = Dictionary(
-            uniqueKeysWithValues: seeds.map { ($0.observerEndpoint, $0.displayName) }
+            uniqueKeysWithValues: seeds.map { ($0.observerEndpoint, $0.baseMenuLabel) }
         )
         widenCollisions(in: &labels, seeds: seeds) { seed in
-            "\(seed.displayName) (\(shortUUID(seed.observerSessionID)))"
+            "\(seed.baseMenuLabel) (\(shortUUID(seed.observerSessionID)))"
         }
         widenCollisions(in: &labels, seeds: seeds) { seed in
-            "\(seed.displayName) (\(shortUUID(seed.observerSessionID)), "
+            "\(seed.baseMenuLabel) (\(shortUUID(seed.observerSessionID)), "
                 + "window \(seed.observerEndpoint.windowID))"
         }
         widenCollisions(in: &labels, seeds: seeds) { seed in
-            "\(seed.displayName) (\(shortUUID(seed.observerSessionID)), "
+            "\(seed.baseMenuLabel) (\(shortUUID(seed.observerSessionID)), "
                 + "window \(seed.observerEndpoint.windowID), "
                 + "tab \(shortUUID(seed.observerEndpoint.tabID)))"
         }
         widenCollisions(in: &labels, seeds: seeds) { seed in
-            "\(seed.displayName) (\(seed.fullIdentityDescription))"
+            "\(seed.baseMenuLabel) (\(seed.fullIdentityDescription))"
         }
         return labels
     }

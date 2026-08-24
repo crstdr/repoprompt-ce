@@ -6,10 +6,12 @@ import RepoPromptDomainRuntime
 /// Bounded, **local-display-only** provenance for one accepted automatic lane-update turn.
 ///
 /// It answers one question for the person reading their own transcript: which overseen lanes did
-/// RepoPrompt actually deliver an update for when it woke this session? It is derived exclusively
-/// from the immutable `RenderedPassiveBatch.entries` of the accepted claim, so it describes the
-/// lanes whose entries were *delivered* — including snoozed and unselected hitchhikers that rode
-/// along on someone else's wake — rather than the lane that happened to cause admission.
+/// RepoPrompt actually deliver an update for when it woke this session? Lane identity, order, and
+/// task labels come exclusively from the immutable `RenderedPassiveBatch.entries` of the accepted
+/// claim. An optional UI location prefix is joined by exact generation-qualified reference from a
+/// synchronous claim-time snapshot. The result therefore describes the lanes whose entries were
+/// *delivered* — including snoozed and unselected hitchhikers that rode along on someone else's wake
+/// — rather than the lane that happened to cause admission.
 ///
 /// It is deliberately **not** authority data and deliberately **not** part of the provider contract:
 ///
@@ -19,9 +21,10 @@ import RepoPromptDomainRuntime
 /// - No UUID, link reference, endpoint identity, target preview, path, provider, status payload, or
 ///   admission-cause information is retained. Only at most two already-capped display labels, a
 ///   distinct lane count, and one overflow Boolean.
-/// - Target display names are untrusted target-derived data. They arrive already normalized and
-///   byte-capped by `DomainAgentSessionLinkTextBudget`, are re-sanitized here against format and
-///   bidi controls, and are rendered verbatim rather than through Markdown.
+/// - Task and UI location labels are untrusted target-derived data. They are sanitized here against
+///   format and bidi controls. A location is prefixed only when the complete compound label fits the
+///   `DomainAgentSessionLinkTextBudget`; otherwise the identifying task survives unchanged. Labels
+///   are rendered verbatim rather than through Markdown.
 ///
 /// Decoding is a **lossy validation boundary**: a malformed payload decodes to an invalid
 /// representation rather than throwing, because a bad nested blob must never fail the enclosing
@@ -100,15 +103,17 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
     /// Builds display attribution from the exact entries one render put in front of the model.
     ///
     /// `renderedEntries` must be `AgentSessionLinkPromptRenderResult.RenderedPassiveBatch.entries`
-    /// and nothing else. Live links, current selection, current snooze state, the latest snapshot,
-    /// and any post-acceptance target lookup are all mutable and would let a rename, unlink, or
-    /// rebind rewrite what a delivered turn claimed to have delivered.
+    /// and nothing else. `locationLabelsByReference` may contain only the exact observer endpoint's
+    /// UI projection synchronously captured while this claim is reserved. Live links, current
+    /// selection, current snooze state, and any post-claim target lookup are all mutable and would
+    /// let a rename, unlink, or rebind rewrite what a delivered turn claimed to have delivered.
     ///
     /// Returns `nil` when the invariants do not hold, which leaves the generic raw row standing
     /// rather than clamping the batch into misleading metadata.
     static func make(
         renderedEntries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
-        includesUnattributedOverflow: Bool
+        includesUnattributedOverflow: Bool,
+        locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:]
     ) -> AgentLaneUpdateDisplayAttribution? {
         // Defensive dedupe by exact generation-qualified reference, first occurrence wins. The
         // reducer keys its pending table by reference and cannot produce a duplicate, so this is a
@@ -130,7 +135,11 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
             guard labels.count < maximumLabelCount else { break }
             // An unnamed lane, or one whose whole name was invisible scalars, is counted but not
             // named. It reappears in the sentence as "other overseen lane", never as an invention.
-            guard let label = sanitizedLabel(entry.displayName) else { continue }
+            guard let taskLabel = sanitizedLabel(entry.displayName) else { continue }
+            let label = displayLabel(
+                taskLabel: taskLabel,
+                locationLabel: locationLabelsByReference[entry.reference]
+            )
             guard !labels.contains(label) else { continue }
             labels.append(label)
         }
@@ -143,6 +152,20 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
     }
 
     // MARK: Label sanitization
+
+    /// Prefixes a surviving task with its exact claim-time UI location only when the complete pair
+    /// fits the existing label byte budget. A missing, invalid, or oversized location degrades to the
+    /// task-only label so the identifying half is never truncated or erased by presentation context.
+    private static func displayLabel(taskLabel: String, locationLabel: String?) -> String {
+        guard let locationLabel = sanitizedLabel(locationLabel) else { return taskLabel }
+        let combined = "\(locationLabel): \(taskLabel)"
+        guard combined.utf8.count <= DomainAgentSessionLinkTextBudget.displayNameMaxBytes,
+              let sanitizedCombined = sanitizedLabel(combined)
+        else {
+            return taskLabel
+        }
+        return sanitizedCombined
+    }
 
     /// The narrow defense added on top of the existing display-name normalization.
     ///

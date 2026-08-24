@@ -667,11 +667,33 @@ extension AgentModeViewModel {
             // "nothing owed" outcome and be dispatched as an ordinary turn.
             return effectiveID.isAutoWakeFamily ? .requiredLaneBatchUnavailable : .nothingOwed
         }
+        // Snapshot only this exact observer incarnation's current UI projection. The generation-
+        // qualified join remains transient local-display input: it does not enter prompt context,
+        // rendering, receipts, or any lookup after this claim is constructed.
+        var locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:]
+        if let props = monitorPillPropsByEndpoint[context.epoch.endpoint],
+           props.endpoint == context.epoch.endpoint
+        {
+            for row in props.outbound {
+                guard let locationLabel = row.locationLabel,
+                      AgentLaneUpdateDisplayAttribution.sanitizedLabel(locationLabel) != nil
+                else {
+                    continue
+                }
+                let reference = DomainAgentSessionLinkReference(
+                    linkID: row.linkID,
+                    generation: row.generation
+                )
+                guard locationLabelsByReference[reference] == nil else { continue }
+                locationLabelsByReference[reference] = locationLabel
+            }
+        }
         return agentSessionLinkPromptClaimStore.claimOutcome(
             dispatchID: effectiveID,
             epoch: context.epoch,
             inventory: context.inventory,
             passiveNotices: context.passiveNotices,
+            locationLabelsByReference: locationLabelsByReference,
             render: AgentSessionLinkPrompts.rendered
         )
     }

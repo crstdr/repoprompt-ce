@@ -53,19 +53,26 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
 
     private func attribution(
         names: [String?],
-        overflow: Bool = false
+        overflow: Bool = false,
+        locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:]
     ) -> AgentLaneUpdateDisplayAttribution? {
         AgentLaneUpdateDisplayAttribution.make(
             renderedEntries: names.enumerated().map { entry($0.offset, name: $0.element) },
-            includesUnattributedOverflow: overflow
+            includesUnattributedOverflow: overflow,
+            locationLabelsByReference: locationLabelsByReference
         )
     }
 
     private func sentence(
         names: [String?],
-        overflow: Bool = false
+        overflow: Bool = false,
+        locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:]
     ) throws -> String {
-        let built = try XCTUnwrap(attribution(names: names, overflow: overflow))
+        let built = try XCTUnwrap(attribution(
+            names: names,
+            overflow: overflow,
+            locationLabelsByReference: locationLabelsByReference
+        ))
         return try XCTUnwrap(AgentLaneUpdateDisplayAttribution.richDisplayText(
             rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
             attribution: built
@@ -116,6 +123,60 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
             try sentence(names: ["Build API", "Docs"]),
             "\(opening) updates for overseen lanes \u{201C}Build API\u{201D} and \u{201C}Docs\u{201D}."
         )
+    }
+
+    func testExactReferenceLocationsPrefixTaskLabelsAtClaimBoundary() throws {
+        let locations = [
+            reference(0): "kidfriendly-nova",
+            reference(1): "RepoPrompt (main)"
+        ]
+        let built = try XCTUnwrap(attribution(
+            names: ["Build API", "Docs"],
+            locationLabelsByReference: locations
+        ))
+
+        XCTAssertEqual(built.labels, [
+            "kidfriendly-nova: Build API",
+            "RepoPrompt (main): Docs"
+        ])
+        XCTAssertEqual(built.attributedLaneCount, 2)
+        XCTAssertEqual(
+            try sentence(
+                names: ["Build API", "Docs"],
+                locationLabelsByReference: locations
+            ),
+            "\(opening) updates for overseen lanes \u{201C}kidfriendly-nova: Build API\u{201D} "
+                + "and \u{201C}RepoPrompt (main): Docs\u{201D}."
+        )
+    }
+
+    func testMissingInvalidAndMismatchedLocationsFallBackToTaskOnly() throws {
+        let exact = reference(0)
+        let mismatchedGeneration = DomainAgentSessionLinkReference(
+            linkID: exact.linkID,
+            generation: exact.generation + 1
+        )
+        let locationMaps: [[DomainAgentSessionLinkReference: String]] = [
+            [:],
+            [exact: "   \n  "],
+            [exact: "\u{200B}\u{202E}\u{FEFF}"],
+            [mismatchedGeneration: "replacement-worktree"]
+        ]
+
+        for locations in locationMaps {
+            let built = try XCTUnwrap(attribution(
+                names: ["Build API"],
+                locationLabelsByReference: locations
+            ))
+            XCTAssertEqual(built.labels, ["Build API"])
+        }
+
+        let unnamed = try XCTUnwrap(attribution(
+            names: [nil],
+            locationLabelsByReference: [exact: "kidfriendly-nova"]
+        ))
+        XCTAssertTrue(unnamed.labels.isEmpty, "a location must not invent a missing task label")
+        XCTAssertEqual(unnamed.attributedLaneCount, 1)
     }
 
     func testTwoNamedLanesWithOneOtherLaneUseTheSerialForm() throws {
@@ -270,6 +331,46 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
             rendered.components(separatedBy: "\u{201D}").count - 1,
             1,
             "exactly one closing delimiter, and it belongs to the grammar"
+        )
+    }
+
+    func testHostileLocationAndTaskAreSanitizedAsOneLabel() throws {
+        let location = "kid\u{200B}friendly\u{202E}-nova\u{201D}"
+        let task = "Build\u{2069} API\u{201C}"
+        let built = try XCTUnwrap(attribution(
+            names: [task],
+            locationLabelsByReference: [reference(0): location]
+        ))
+
+        XCTAssertEqual(built.labels, ["kidfriendly-nova\": Build API\""])
+        for scalar in ["\u{200B}", "\u{202E}", "\u{2069}", "\u{201C}", "\u{201D}"] {
+            XCTAssertFalse(try XCTUnwrap(built.labels.first).contains(scalar))
+        }
+    }
+
+    func testLocationPrefixIsAllOrNothingWithinExistingSingleLabelByteCap() throws {
+        let task = String(repeating: "T", count: 100)
+        let fittingLocation = String(repeating: "L", count: 18)
+        let oversizedLocation = fittingLocation + "L"
+
+        let fitting = try XCTUnwrap(attribution(
+            names: [task],
+            locationLabelsByReference: [reference(0): fittingLocation]
+        ))
+        let oversized = try XCTUnwrap(attribution(
+            names: [task],
+            locationLabelsByReference: [reference(0): oversizedLocation]
+        ))
+
+        XCTAssertEqual(
+            try XCTUnwrap(fitting.labels.first).utf8.count,
+            DomainAgentSessionLinkTextBudget.displayNameMaxBytes
+        )
+        XCTAssertEqual(fitting.labels, ["\(fittingLocation): \(task)"])
+        XCTAssertEqual(
+            oversized.labels,
+            [task],
+            "presentation context must be omitted rather than truncate the identifying task"
         )
     }
 
@@ -428,7 +529,13 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
     /// The same carriers cross-session attribution had to be threaded through: a field on
     /// `AgentChatItem` alone disappears the moment a turn is persisted or rebuilt.
     func testAttributionSurvivesEveryReconstructionCarrier() throws {
-        let built = try XCTUnwrap(attribution(names: ["Build API", "Docs", nil]))
+        let built = try XCTUnwrap(attribution(
+            names: ["Build API", "Docs", nil],
+            locationLabelsByReference: [
+                reference(0): "kidfriendly-nova",
+                reference(1): "RepoPrompt (main)"
+            ]
+        ))
         let row = AgentChatItem.laneUpdateAutoWake(
             wakeID: UUID(),
             acceptedAt: Date(timeIntervalSince1970: 100),
@@ -485,7 +592,14 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
     /// The whole point of keeping the raw text generic: what the model is replayed, and what any
     /// other session or export can read, says nothing about which lanes changed.
     func testProviderReplaySerializesOnlyTheGenericRawRow() throws {
-        let built = try XCTUnwrap(attribution(names: ["Build API", "Docs"], overflow: true))
+        let built = try XCTUnwrap(attribution(
+            names: ["Build API", "Docs"],
+            overflow: true,
+            locationLabelsByReference: [
+                reference(0): "kidfriendly-nova",
+                reference(1): "RepoPrompt (main)"
+            ]
+        ))
         let items = [
             AgentChatItem.user("go", sequenceIndex: 0),
             AgentChatItem.laneUpdateAutoWake(
@@ -504,6 +618,8 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
         for forbidden in [
             "Build API",
             "Docs",
+            "kidfriendly-nova",
+            "RepoPrompt (main)",
             "overseen lane",
             "overseen lanes",
             AgentLaneUpdateDisplayAttribution.unattributedOverflowSentence
@@ -519,10 +635,34 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
         )
     }
 
+    func testCrossSessionProjectionEmitsOnlyTheCanonicalRawRow() throws {
+        let built = try XCTUnwrap(attribution(
+            names: ["Build API"],
+            locationLabelsByReference: [reference(0): "kidfriendly-nova"]
+        ))
+        let row = AgentChatItem.laneUpdateAutoWake(
+            wakeID: UUID(),
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            displayAttribution: built
+        )
+
+        let projected = try XCTUnwrap(AgentSessionLinkTranscriptSanitizer.sanitize(
+            row: row,
+            homeDirectory: "/Users/local"
+        ))
+        XCTAssertEqual(projected.role, .system)
+        XCTAssertEqual(projected.text, AgentLaneUpdateDisplayAttribution.canonicalSystemText)
+        XCTAssertFalse(projected.text?.contains("kidfriendly-nova") == true)
+        XCTAssertFalse(projected.text?.contains("Build API") == true)
+    }
+
     /// The encoded session file may carry the labels, because that file is the local transcript.
     /// Nothing derived from `text` may.
     func testEncodedRowCarriesLabelsOnlyInTheLocalDisplayFieldAndNeverInText() throws {
-        let built = try XCTUnwrap(attribution(names: ["Build API"]))
+        let built = try XCTUnwrap(attribution(
+            names: ["Build API"],
+            locationLabelsByReference: [reference(0): "kidfriendly-nova"]
+        ))
         let row = AgentChatItem.laneUpdateAutoWake(
             wakeID: UUID(),
             acceptedAt: Date(timeIntervalSince1970: 100),
@@ -537,10 +677,19 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
             AgentLaneUpdateDisplayAttribution.canonicalSystemText
         )
         let metadata = try XCTUnwrap(object["laneUpdateDisplayAttribution"] as? [String: Any])
-        XCTAssertEqual(metadata["labels"] as? [String], ["Build API"])
+        XCTAssertEqual(metadata["labels"] as? [String], ["kidfriendly-nova: Build API"])
         XCTAssertEqual(metadata["attributedLaneCount"] as? Int, 1)
         // No identity of any kind travels with the labels.
-        for forbidden in ["reference", "linkID", "sessionID", "endpoint", "targetSessionID"] {
+        for forbidden in [
+            "reference",
+            "linkID",
+            "sessionID",
+            "endpoint",
+            "targetSessionID",
+            "location",
+            "locationLabel",
+            "locationLabelsByReference"
+        ] {
             XCTAssertNil(metadata[forbidden], "attribution must not persist \(forbidden)")
         }
     }

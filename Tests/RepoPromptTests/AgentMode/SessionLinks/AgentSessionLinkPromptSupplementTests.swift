@@ -2757,12 +2757,25 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         UUID(uuidString: String(format: "0000000%d-0000-0000-0000-0000000055AA", index))!
     }
 
+    private static func viewModelReference(
+        _ index: Int,
+        generation: UInt64 = 1
+    ) -> DomainAgentSessionLinkReference {
+        DomainAgentSessionLinkReference(
+            linkID: UUID(
+                uuidString: String(format: "0000000%d-0000-0000-0000-0000000055BB", index)
+            )!,
+            generation: generation
+        )
+    }
+
     /// Publishes a passive queue to the tab's exact live incarnation, exactly as the bridge does.
     private func publishPassive(
         _ fixture: Fixture,
         linkSetRevision: UInt64,
         queueRevision: UInt64 = 1,
-        targetIndices: [Int] = [0]
+        targetIndices: [Int] = [0],
+        referenceGeneration: UInt64 = 1
     ) throws {
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
@@ -2778,7 +2791,10 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
                 isDeliverable: true,
                 entries: targetIndices.map { index in
                     AgentSessionLinkPassiveStatusNotices.PendingEntry(
-                        reference: DomainAgentSessionLinkReference(linkID: UUID(), generation: 1),
+                        reference: Self.viewModelReference(
+                            index,
+                            generation: referenceGeneration
+                        ),
                         targetEndpoint: DomainAgentSessionLinkEndpointIdentity(
                             windowID: 2,
                             workspaceID: UUID(),
@@ -2874,28 +2890,164 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         XCTAssertNil(decorated.claim?.passive)
     }
 
+    func testAcceptedAutoWakeKeepsTheExactReferenceLocationCapturedAtClaimTime() throws {
+        let fixture = try makeFixture()
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publish(fixture, revision: 1, targetCount: 1)
+        try publishPassive(fixture, linkSetRevision: 1, referenceGeneration: 7)
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            monitorProps(
+                sessionID: fixture.sessionID,
+                targetSessionID: Self.viewModelTargetID(0),
+                endpoint: endpoint,
+                locationLabel: "kidfriendly-nova",
+                reference: Self.viewModelReference(0, generation: 7)
+            ),
+            to: endpoint
+        )
+
+        let wakeID = UUID()
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: wakeID)
+        ))
+        XCTAssertEqual(
+            claim.passive?.displayAttribution?.labels,
+            ["kidfriendly-nova: Build API"]
+        )
+        XCTAssertFalse(
+            claim.fragment.contains("kidfriendly-nova"),
+            "UI location must not enter the provider fragment"
+        )
+
+        // A presentation-only repaint after reservation cannot rewrite immutable claim provenance.
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            monitorProps(
+                sessionID: fixture.sessionID,
+                targetSessionID: Self.viewModelTargetID(0),
+                endpoint: endpoint,
+                locationLabel: "repainted-location",
+                reference: Self.viewModelReference(0, generation: 7)
+            ),
+            to: endpoint
+        )
+        fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
+
+        let row = try XCTUnwrap(fixture.session.items.first { $0.id == wakeID })
+        XCTAssertEqual(row.text, AgentLaneUpdateDisplayAttribution.canonicalSystemText)
+        XCTAssertEqual(
+            row.laneUpdateDisplayAttribution?.labels,
+            ["kidfriendly-nova: Build API"]
+        )
+        XCTAssertFalse(try XCTUnwrap(row.laneUpdateDisplayAttribution?.labels.first).contains(
+            "repainted-location"
+        ))
+    }
+
+    func testClaimNeverBorrowsALocationFromAnotherObserverEndpoint() throws {
+        let fixture = try makeFixture()
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        let decoyEndpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: endpoint.windowID,
+            workspaceID: endpoint.workspaceID,
+            tabID: UUID(),
+            sessionID: endpoint.sessionID,
+            persistentBindingGeneration: endpoint.persistentBindingGeneration,
+            bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+        )
+        let reference = Self.viewModelReference(0, generation: 7)
+        try publish(fixture, revision: 1, targetCount: 1)
+        try publishPassive(fixture, linkSetRevision: 1, referenceGeneration: 7)
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            monitorProps(
+                sessionID: fixture.sessionID,
+                targetSessionID: Self.viewModelTargetID(0),
+                endpoint: decoyEndpoint,
+                locationLabel: "wrong-endpoint-location",
+                reference: reference
+            ),
+            to: decoyEndpoint
+        )
+
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: UUID())
+        ))
+
+        XCTAssertEqual(claim.passive?.displayAttribution?.labels, ["Build API"])
+        XCTAssertFalse(claim.fragment.contains("wrong-endpoint-location"))
+    }
+
+    func testClaimRejectsProjectionWhoseStoredEndpointStampDoesNotMatchItsKey() throws {
+        let fixture = try makeFixture()
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        let mismatchedEndpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: endpoint.windowID,
+            workspaceID: endpoint.workspaceID,
+            tabID: UUID(),
+            sessionID: endpoint.sessionID,
+            persistentBindingGeneration: endpoint.persistentBindingGeneration,
+            bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+        )
+        let reference = Self.viewModelReference(0, generation: 7)
+        try publish(fixture, revision: 1, targetCount: 1)
+        try publishPassive(fixture, linkSetRevision: 1, referenceGeneration: 7)
+        fixture.viewModel.monitorPillPropsByEndpoint[endpoint] = monitorProps(
+            sessionID: fixture.sessionID,
+            targetSessionID: Self.viewModelTargetID(0),
+            endpoint: mismatchedEndpoint,
+            locationLabel: "wrong-stamped-location",
+            reference: reference
+        )
+        XCTAssertEqual(
+            fixture.viewModel.monitorPillPropsByEndpoint[endpoint]?.endpoint,
+            mismatchedEndpoint,
+            "fixture must corrupt the value stamp while retaining the correct dictionary key"
+        )
+
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: UUID())
+        ))
+
+        XCTAssertEqual(claim.passive?.displayAttribution?.labels, ["Build API"])
+        XCTAssertFalse(claim.fragment.contains("wrong-stamped-location"))
+    }
+
     // MARK: - Oversee projection cache
 
     private func monitorProps(
         sessionID: UUID,
         targetSessionID: UUID = UUID(),
-        endpoint: DomainAgentSessionLinkEndpointIdentity
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        locationLabel: String? = "worktree/main",
+        reference: DomainAgentSessionLinkReference? = nil
     ) -> AgentMonitorPillProps {
-        AgentMonitorPillProps(
+        let reference = reference ?? Self.viewModelReference(0)
+        return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
             sidebarOversightMenu: nil,
             outbound: [
                 AgentMonitorPillProps.Outbound(
-                    linkID: UUID(),
-                    generation: 1,
+                    linkID: reference.linkID,
+                    generation: reference.generation,
                     targetSessionID: targetSessionID,
                     targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(
                         sessionID: targetSessionID
                     ),
                     displayName: "Build API",
                     providerDisplayName: "Codex CLI",
-                    locationLabel: "worktree/main",
+                    locationLabel: locationLabel,
                     status: .idle
                 )
             ],

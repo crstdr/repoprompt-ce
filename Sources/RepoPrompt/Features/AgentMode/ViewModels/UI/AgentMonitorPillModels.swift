@@ -271,7 +271,8 @@ enum AgentMonitorRowActionCopy {
     dashboard or viewing the agent does not.
     """
     static let viewTooltip = "Open this Agent session"
-    static let viewDisabledTooltip = "This Agent session’s location is unavailable."
+    static let viewDisabledTooltip = "This Agent session can’t be opened right now."
+    static let viewFailureMessage = "That Agent session can’t be opened right now."
     static let unlinkTooltip = """
     Removes oversight immediately. Undo is offered briefly and creates a new link rather than \
     restoring the old one.
@@ -783,12 +784,12 @@ struct AgentMonitorPillProps: Equatable {
         }
 
         /// Primary visible location. Missing raw locations remain missing for sorting, while the row
-        /// renders an explicit fallback instead of an ambiguous empty slot.
+        /// renders an action-oriented fallback because this label is also the View affordance.
         var locationDisplayLabel: String {
             guard let trimmed = locationLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !trimmed.isEmpty
             else {
-                return "Location unavailable"
+                return "Open session"
             }
             return trimmed
         }
@@ -849,7 +850,12 @@ struct AgentMonitorPillProps: Equatable {
         /// cannot drift from `accessibilityDescription`; repeated compact controls
         /// per row are indistinguishable in the rotor without the session name.
         var viewActionLabel: String {
-            "View \(displayName)"
+            guard let location = locationLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !location.isEmpty
+            else {
+                return "Open session: View \(displayName)"
+            }
+            return "View \(displayName) in \(location)"
         }
 
         var markSeenActionLabel: String {
@@ -928,6 +934,25 @@ struct AgentMonitorPillProps: Equatable {
 
         var rowLabel: String {
             "← \(displayName) (\(shortID))"
+        }
+
+        /// Exact route to the observer incarnation recorded on this relationship.
+        ///
+        /// It is derived rather than refreshed from the live candidate list: a disappeared observer
+        /// must remain unlinkable, and attempting this route lets the shared router report that the
+        /// exact window, workspace, tab, or session is no longer available.
+        var observerRoute: AgentSessionDeepLinkRoute {
+            AgentSessionDeepLinkRoute(
+                windowID: observerEndpoint.windowID,
+                workspaceID: observerEndpoint.workspaceID,
+                tabID: observerEndpoint.tabID,
+                sessionID: observerEndpoint.sessionID
+            )
+        }
+
+        /// VoiceOver label for the primary observer navigation affordance.
+        var viewActionLabel: String {
+            "View \(displayName), session \(shortID)"
         }
 
         /// Secondary line for this row.

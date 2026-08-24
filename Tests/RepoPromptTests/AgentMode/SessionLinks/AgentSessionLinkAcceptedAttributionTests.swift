@@ -5,11 +5,12 @@ import XCTest
 
 /// Where accepted lane attribution comes from, and where it does not.
 ///
-/// The immutable `RenderedPassiveBatch.entries` of the claim is the only permitted source. That
-/// array is what actually entered the provider fragment, so it naturally includes hitchhikers — a
-/// lane that did not admit the wake, one the observer never selected, one a later snooze will
-/// suppress — and it is frozen at claim construction, before a rename, unlink, or rebind can
-/// rewrite what the delivered turn claimed to have delivered.
+/// The immutable `RenderedPassiveBatch.entries` of the claim is the only permitted source of lane
+/// identity, order, and task. That array is what actually entered the provider fragment, so it
+/// naturally includes hitchhikers — a lane that did not admit the wake, one the observer never
+/// selected, one a later snooze will suppress. An optional UI location joins by exact reference at
+/// claim construction; both inputs are then frozen before a rename, unlink, or rebind can rewrite
+/// what the delivered turn claimed to have delivered.
 @MainActor
 final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
     private let observerSessionID = UUID(uuidString: "00000000-0000-0000-0000-0000000000AA")!
@@ -29,6 +30,18 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
 
     private func targetSessionID(_ index: Int) -> UUID {
         UUID(uuidString: String(format: "0000000%X-0000-0000-0000-00000000ABCD", index))!
+    }
+
+    private func reference(
+        _ index: Int,
+        generation: UInt64 = 1
+    ) -> DomainAgentSessionLinkReference {
+        DomainAgentSessionLinkReference(
+            linkID: UUID(
+                uuidString: String(format: "0000000%X-0000-0000-0000-000000001111", index)
+            )!,
+            generation: generation
+        )
     }
 
     private func inventory(
@@ -51,13 +64,11 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
 
     private func entry(
         _ index: Int,
-        name: String?
+        name: String?,
+        reference overrideReference: DomainAgentSessionLinkReference? = nil
     ) -> AgentSessionLinkPassiveStatusNotices.PendingEntry {
         AgentSessionLinkPassiveStatusNotices.PendingEntry(
-            reference: DomainAgentSessionLinkReference(
-                linkID: UUID(uuidString: String(format: "0000000%X-0000-0000-0000-000000001111", index))!,
-                generation: 1
-            ),
+            reference: overrideReference ?? reference(index),
             targetEndpoint: DomainAgentSessionLinkEndpointIdentity(
                 windowID: 2,
                 workspaceID: UUID(),
@@ -98,7 +109,8 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
         entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
         overflow: UInt64 = 0,
         overflowProduced: UInt64? = nil,
-        inventoryTargetCount: Int? = nil
+        inventoryTargetCount: Int? = nil,
+        locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:]
     ) throws -> AgentSessionLinkOutboundPromptClaim {
         let store = AgentSessionLinkOutboundPromptClaimStore()
         let live = inventory(targetCount: inventoryTargetCount ?? max(entries.count, 1))
@@ -111,6 +123,7 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
                 overflow: overflow,
                 overflowProduced: overflowProduced
             ),
+            locationLabelsByReference: locationLabelsByReference,
             render: AgentSessionLinkPrompts.rendered
         )
         return try XCTUnwrap(claimed)
@@ -136,6 +149,62 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
             attribution.labels.contains(where: { $0.hasPrefix("Inventory name") }),
             "attribution must read the delivered batch, not the membership inventory"
         )
+    }
+
+    func testClaimPrefixesLocationsOnlyForExactRenderedReferences() throws {
+        let claimed = try claim(
+            entries: [
+                entry(0, name: "Build API"),
+                entry(1, name: "Docs")
+            ],
+            locationLabelsByReference: [
+                reference(0): "kidfriendly-nova",
+                reference(1): "RepoPrompt (main)"
+            ]
+        )
+
+        let attribution = try XCTUnwrap(claimed.passive?.displayAttribution)
+        XCTAssertEqual(attribution.labels, [
+            "kidfriendly-nova: Build API",
+            "RepoPrompt (main): Docs"
+        ])
+        XCTAssertEqual(attribution.attributedLaneCount, 2)
+    }
+
+    func testOversizedLocationPrefixesCannotCollapseDistinctClaimedTasks() throws {
+        let location = String(repeating: "L", count: 100)
+        let firstTask = String(repeating: "T", count: 99) + "A"
+        let secondTask = String(repeating: "T", count: 99) + "B"
+        let claimed = try claim(
+            entries: [
+                entry(0, name: firstTask),
+                entry(1, name: secondTask)
+            ],
+            locationLabelsByReference: [
+                reference(0): location,
+                reference(1): location
+            ]
+        )
+
+        let attribution = try XCTUnwrap(claimed.passive?.displayAttribution)
+        XCTAssertEqual(attribution.labels, [firstTask, secondTask])
+        XCTAssertEqual(attribution.attributedLaneCount, 2)
+    }
+
+    func testMissingAndGenerationMismatchedLocationsFallBackWithoutSuppressingTasks() throws {
+        let claimed = try claim(
+            entries: [
+                entry(0, name: "Build API"),
+                entry(1, name: "Docs")
+            ],
+            locationLabelsByReference: [
+                reference(0, generation: 2): "replacement-worktree"
+            ]
+        )
+
+        let attribution = try XCTUnwrap(claimed.passive?.displayAttribution)
+        XCTAssertEqual(attribution.labels, ["Build API", "Docs"])
+        XCTAssertEqual(attribution.attributedLaneCount, 2)
     }
 
     /// The snapshot carries no Auto-wake lane membership at all here, so every entry is an
@@ -308,20 +377,67 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
         XCTAssertEqual(captured.labels, ["Build API", "Docs"])
     }
 
+    func testRetryKeepsItsLocationWhileANewDispatchUsesTheCurrentClaimTimeSnapshot() throws {
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let dispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
+        let live = inventory(targetCount: 1)
+        let passive = snapshot(entries: [entry(0, name: "Build API")])
+        var renderCount = 0
+        let render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult = {
+            renderCount += 1
+            return AgentSessionLinkPrompts.rendered($0)
+        }
+
+        let original = try XCTUnwrap(store.claim(
+            dispatchID: dispatchID,
+            epoch: epoch,
+            inventory: live,
+            passiveNotices: passive,
+            locationLabelsByReference: [reference(0): "kidfriendly-nova"],
+            render: render
+        ))
+        let retry = try XCTUnwrap(store.claim(
+            dispatchID: dispatchID,
+            epoch: epoch,
+            inventory: live,
+            passiveNotices: passive,
+            locationLabelsByReference: [reference(0): "repainted-location"],
+            render: render
+        ))
+        let nextDispatch = try XCTUnwrap(store.claim(
+            dispatchID: .codexNativeSend(UUID()),
+            epoch: epoch,
+            inventory: live,
+            passiveNotices: passive,
+            locationLabelsByReference: [reference(0): "repainted-location"],
+            render: render
+        ))
+
+        XCTAssertEqual(original, retry, "a transport retry must reuse immutable claim provenance")
+        XCTAssertEqual(original.passive?.displayAttribution?.labels, ["kidfriendly-nova: Build API"])
+        XCTAssertEqual(
+            nextDispatch.passive?.displayAttribution?.labels,
+            ["repainted-location: Build API"]
+        )
+        XCTAssertEqual(original.passive?.receipt, nextDispatch.passive?.receipt)
+        XCTAssertEqual(renderCount, 1, "location must not enter the provider render fingerprint")
+    }
+
     /// Display data must not migrate into the queue receipt: the receipt is authority the reducer
     /// settles against, and it stays exactly the delivered statuses plus the absolute watermark.
     func testReceiptCarriesNoDisplayDataAndIsUnchangedByAttribution() throws {
         let claimed = try claim(
             entries: [entry(0, name: "Build API")],
             overflow: 2,
-            overflowProduced: 5
+            overflowProduced: 5,
+            locationLabelsByReference: [reference(0): "kidfriendly-nova"]
         )
 
         let passive = try XCTUnwrap(claimed.passive)
         XCTAssertEqual(passive.receipt.deliveredStatuses.count, 1)
         XCTAssertEqual(passive.receipt.overflowProducedThrough, 5)
         XCTAssertEqual(passive.receipt.queueRevision, 1)
-        XCTAssertNotNil(passive.displayAttribution)
+        XCTAssertEqual(passive.displayAttribution?.labels, ["kidfriendly-nova: Build API"])
         XCTAssertEqual(
             passive.receipt,
             AgentSessionLinkPassiveStatusNotices.Receipt(
@@ -366,10 +482,16 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
     /// The seam the acceptance path consumes: `claim.passive?.displayAttribution` straight into the
     /// transcript factory, with the raw text still generic.
     func testAcceptedRowBuiltFromTheClaimNamesTheDeliveredLanes() throws {
-        let claimed = try claim(entries: [
-            entry(0, name: "Build API"),
-            entry(1, name: "Docs")
-        ])
+        let claimed = try claim(
+            entries: [
+                entry(0, name: "Build API"),
+                entry(1, name: "Docs")
+            ],
+            locationLabelsByReference: [
+                reference(0): "kidfriendly-nova",
+                reference(1): "RepoPrompt (main)"
+            ]
+        )
         let wakeID = UUID()
         let row = AgentChatItem.laneUpdateAutoWake(
             wakeID: wakeID,
@@ -383,7 +505,8 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
         XCTAssertEqual(
             AgentLaneUpdateDisplayAttribution.richDisplayText(for: row),
             "[lane-update] RepoPrompt auto-woke this session and delivered updates for overseen "
-                + "lanes \u{201C}Build API\u{201D} and \u{201C}Docs\u{201D}."
+                + "lanes \u{201C}kidfriendly-nova: Build API\u{201D} and "
+                + "\u{201C}RepoPrompt (main): Docs\u{201D}."
         )
     }
 }

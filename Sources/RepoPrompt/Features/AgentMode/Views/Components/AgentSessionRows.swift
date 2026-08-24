@@ -220,7 +220,9 @@ struct AgentSessionRow: View {
                                     targetEndpoint: menu.targetEndpoint,
                                     reference: reference
                                 )
-                                let label = "Stop \(option.menuLabel) overseeing \(menu.targetDisplayName)"
+                                let label = AgentSidebarOversightMenuCopy.stopTitle(
+                                    observerMenuLabel: option.menuLabel
+                                )
                                 Button(role: .destructive) {
                                     stopSidebarOversight(option, menu: menu, reference: reference)
                                 } label: {
@@ -232,7 +234,12 @@ struct AgentSessionRow: View {
                                     )
                                 }
                                 .disabled(sidebarOversightBusyKeys.contains(key))
-                                .accessibilityLabel(label)
+                                .accessibilityLabel(
+                                    AgentSidebarOversightMenuCopy.stopAccessibilityLabel(
+                                        observerMenuLabel: option.menuLabel,
+                                        targetDisplayName: menu.targetDisplayName
+                                    )
+                                )
                                 .accessibilityHint(option.fullIdentityDescription)
                                 .accessibilityValue(
                                     sidebarOversightBusyKeys.contains(key) ? "In progress" : ""
@@ -261,7 +268,7 @@ struct AgentSessionRow: View {
                             }
                             .disabled(sidebarOversightBusyKeys.contains(key))
                             .accessibilityLabel(
-                                "Add \(option.displayName) as an overseer of \(menu.targetDisplayName)"
+                                "Add \(option.menuLabel) as an overseer of \(menu.targetDisplayName)"
                             )
                             .accessibilityHint(option.fullIdentityDescription)
                             .accessibilityValue(

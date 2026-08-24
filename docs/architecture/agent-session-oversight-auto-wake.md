@@ -170,6 +170,13 @@ endpoints that the same authority projection says currently hold at least one ou
 link, other than the semantic self. Running, idle, waiting, failed, or completed display state does
 not affect availability.
 
+When a live observer supplies a UI-only execution-location label, both Add and Unlink choices prefix
+the task name with it (`location: task`). A relationship whose live candidate disappeared retains
+its existing task/identifier fallback rather than inventing location metadata. The destructive menu
+title quotes that compound label and says `Stop oversight by …`; its accessibility label additionally
+names the target. This keeps the location colon out of the surrounding grammar and never reduces the
+action to an ambiguous bare `Stop`.
+
 Linked relationships are projected independently of available-overseer membership and retain the
 exact observer endpoint and generation-qualified reference even when that observer's live candidate
 disappeared or became ineligible. Such a row remains unlinkable. Available options are different:
@@ -238,7 +245,9 @@ therefore cannot:
 
 The post-storage notification carries no sample, authority value, or mutation request, so its
 sidebar and title consumers cannot cross this boundary either. Auto-wake admission continues to read
-the canonical passive queue and the wake coordinator described above, never sidebar presentation.
+the canonical passive queue and the wake coordinator described above, never sidebar presentation. A
+location repaint before claim reservation may affect the claim's local display provenance described
+below, but it still cannot enqueue, authorize, or alter the Auto-wake itself.
 
 ## Snooze suppresses admission, never delivery
 
@@ -269,13 +278,31 @@ events. Copy and model guidance are written to that standard on purpose.
 
 ### The Auto-wake control is subordinate to its lane
 
-In the dashboard's Overseeing list, each lane is a compact two-line block. The primary lane identity
-and actions share the first line; task metadata and the smaller Snooze Auto-wake control share the
-secondary line. This keeps the control visibly attached to the metadata it qualifies and balances it
-beneath the primary actions. A faint rule may fall only *between* two complete blocks
+In the dashboard's Overseeing list, each lane is a compact two-line block. The primary location label
+is the lane's sole normal View affordance; only that label activates the existing exact deep-link
+route, and the separate View control has been removed. It remains a native SwiftUI `Button` with an
+accent treatment and a rectangular content shape; no cursor abstraction is part of this contract. If
+the presentation location is missing while the route remains valid, the actionable fallback reads
+`Open session` rather than presenting a clickable unavailable-state label. Its accessible name
+contains both the visible location/fallback and the task name. Route failure copy speaks only about
+whether the session can be opened, reserving “location” for the worktree/workspace label.
+
+New, Auto-wake, Snooze, and Unlink remain independent controls, but the location View action and the
+row's other primary mutations retain the same shared busy-row gate, exact route, and failure-feedback
+path as before. Task metadata and the smaller Snooze Auto-wake control share the secondary line. This
+keeps the control visibly attached to the metadata it qualifies and balances it beneath the primary
+actions. A faint rule may fall only *between* two complete blocks
 (`AgentMonitorLaneGrouping.drawsSeparator`) — never inside one, which would present a lane's snooze
 control as an entry with no lane, and never after the last, where the section's own `Divider()`
-already ends the list and a second rule reads as an empty lane.
+already ends the list and a second rule reads as an empty lane. Manual design review should verify
+enabled and disabled tooltip copy, keyboard and VoiceOver activation, exact routing and failure
+feedback, and the independence of New, Auto-wake, Snooze, and Unlink.
+
+The inbound **Overseen by** list applies the same navigation rule to only the observer's primary
+name/identifier label. Its route is derived from the authority-recorded exact observer endpoint, and
+it shares that generation-qualified row's busy and failure-feedback state with Unlink. Provider
+metadata remains static, and neither the secondary detail nor the complete row becomes a navigation
+target, so opening an observer cannot overlap or masquerade as revocation.
 
 ## The `.cancelledBeforeDispatch` tombstone is a fence, not bookkeeping
 
@@ -322,12 +349,23 @@ marker and must stay that way: transcript replay re-emits system rows verbatim i
 into trusted-looking provider context and could break the envelope.
 
 Richer wording is derived at render time from `AgentLaneUpdateDisplayAttribution`, typed metadata
-captured from the **immutable rendered batch of the accepted claim** — never from live links,
-selection, or snooze state, all of which can change between construction and acceptance. It carries
-at most two already-capped, sanitized labels, a distinct-lane count, and one overflow flag: no UUID,
-reference, endpoint, preview, path, or status payload. Labels are stripped of format and bidi
-scalars, and the sentence's own curly quote delimiters are folded to ASCII inside a label, so an
-untrusted name cannot close the quoted span the grammar opened around it.
+captured from the **immutable rendered batch of the accepted claim** — never from acceptance-time
+live links, selection, or snooze state. During claim reservation, the observer synchronously snapshots
+only its exact endpoint's current monitor projection and joins rendered entries to UI execution
+locations by generation-qualified link reference. A persisted local label may therefore read
+`location: task`; location means the UI location at immutable claim construction, not at the earlier
+status transition. A later repaint, unlink, relink, or acceptance cannot rewrite the claim. Missing,
+blank, invalid, or generation-mismatched display data degrades to the existing task-only attribution.
+
+The transient reference-to-location map does not enter prompt context, render requests, provider
+fragments, fingerprints, receipts, or link authority. Attribution still carries at most two
+already-capped, sanitized labels, a distinct-lane count, and one overflow flag: no UUID, reference,
+endpoint, preview, path, or status payload. Location and task are sanitized separately;
+`location: task` is used only when the complete sanitized pair fits the existing 120-byte label
+budget. Otherwise the optional location is omitted and the full sanitized task label is preserved.
+Labels are stripped of format and bidi scalars, and the sentence's own curly quote delimiters are
+folded to ASCII inside a label, so an untrusted name cannot close the
+quoted span the grammar opened around it. The transcript row's canonical raw text remains unchanged.
 
 ## Known deferred work
 

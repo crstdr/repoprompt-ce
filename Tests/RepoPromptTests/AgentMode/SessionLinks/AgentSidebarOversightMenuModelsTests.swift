@@ -30,6 +30,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         roleAllowsOutboundMonitoring: Bool = true,
         displayName: String? = "Agent",
         providerDisplayName: String? = "Codex CLI",
+        locationLabel: String? = nil,
         isDeletionInProgress: Bool = false
     ) -> AgentSessionLinkEndpointCandidate {
         AgentSessionLinkEndpointCandidate(
@@ -48,7 +49,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             roleAllowsOutboundMonitoring: roleAllowsOutboundMonitoring,
             displayName: displayName,
             providerDisplayName: providerDisplayName,
-            locationLabel: nil,
+            locationLabel: locationLabel,
             isDeletionInProgress: isDeletionInProgress
         )
     }
@@ -205,6 +206,67 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             inputs: inputs(target: loading),
             candidates: [loading]
         ))
+    }
+
+    func testMenuLabelsPrefixLiveObserverLocationAndFallBackWhenUnavailable() throws {
+        let target = candidate(windowID: 10, displayName: "Target")
+        let linked = candidate(
+            windowID: 2,
+            displayName: "Existing overseer",
+            locationLabel: "release-main"
+        )
+        let available = candidate(
+            windowID: 3,
+            displayName: "Coordinate PIN-boundary design review",
+            locationLabel: " kidfriendly-nova "
+        )
+        let unavailableEndpoint = candidate(
+            windowID: 4,
+            sessionID: id("F0000000-0000-0000-0000-000000000004"),
+            displayName: "Unavailable"
+        ).domainEndpoint
+        let relationships = [
+            Linked(endpoint: linked.domainEndpoint, linkID: UUID(), generation: 1),
+            Linked(endpoint: unavailableEndpoint, linkID: UUID(), generation: 2)
+        ]
+
+        let menu = try XCTUnwrap(AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                linked: relationships,
+                activeOutboundObserverEndpoints: [linked.domainEndpoint, available.domainEndpoint]
+            ),
+            candidates: [target, linked, available]
+        ))
+
+        XCTAssertEqual(
+            menu.linkedObservers.first { $0.observerEndpoint == linked.domainEndpoint }?.menuLabel,
+            "release-main: Existing overseer"
+        )
+        XCTAssertEqual(
+            menu.availableObservers.first?.menuLabel,
+            "kidfriendly-nova: Coordinate PIN-boundary design review"
+        )
+        XCTAssertEqual(
+            menu.linkedObservers.first { $0.observerEndpoint == unavailableEndpoint }?.menuLabel,
+            AgentMonitorSessionIDFormatter.short(unavailableEndpoint.sessionID)
+        )
+    }
+
+    func testStopCopyDelimitsCompoundObserverLabelAndNamesOversight() {
+        let observer = "release-main: Existing overseer"
+        XCTAssertEqual(
+            AgentSidebarOversightMenuCopy.stopTitle(observerMenuLabel: observer),
+            "Stop oversight by “release-main: Existing overseer”"
+        )
+        XCTAssertEqual(
+            AgentSidebarOversightMenuCopy.stopAccessibilityLabel(
+                observerMenuLabel: observer,
+                targetDisplayName: "Target"
+            ),
+            "Stop oversight of Target by “release-main: Existing overseer”"
+        )
     }
 
     func testCollisionLabelsWidenThroughSessionWindowTabAndFullExactIdentity() throws {
