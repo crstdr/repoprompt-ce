@@ -620,6 +620,365 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(control.failureError, .capabilityDenied, "an oversight grant never authorizes agent_run")
     }
 
+    func testRequestAttentionInverseAuthorizationRequiresExactGrantAndCurrentGeneration() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        let firstGrant = try await activateLink(authority, observer: observer, target: target)
+        let liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = [observer, target]
+
+        let authorization = try await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            liveEndpoints: liveEndpoints
+        ).get()
+        XCTAssertEqual(
+            authorization.reference,
+            DomainAgentSessionLinkReference(
+                linkID: firstGrant.id,
+                generation: firstGrant.generation
+            )
+        )
+        XCTAssertEqual(authorization.observer, observer)
+        XCTAssertEqual(authorization.target, target)
+        XCTAssertNil(authorization.requestedObserverSessionID)
+        let observerLinkSetRevision = await authority.observerLinkSetRevision(observer.sessionID)
+        let targetLinkSetRevision = await authority.targetLinkSetRevision(target.sessionID)
+        XCTAssertEqual(
+            authorization.observerLinkSetRevision,
+            observerLinkSetRevision
+        )
+        XCTAssertEqual(
+            authorization.targetLinkSetRevision,
+            targetLinkSetRevision
+        )
+        let initialValidation = await authority.validateRequestAttentionAuthorization(
+            authorization,
+            liveEndpoints: liveEndpoints
+        )
+        XCTAssertNil(initialValidation)
+
+        let unrelatedTarget = makeEndpoint(windowID: 20)
+        try await activateLink(authority, observer: observer, target: unrelatedTarget)
+        let expandedLiveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = [
+            observer,
+            target,
+            unrelatedTarget
+        ]
+        let staleReducerRevision = await authority.validateRequestAttentionAuthorization(
+            authorization,
+            liveEndpoints: expandedLiveEndpoints
+        )
+        XCTAssertEqual(
+            staleReducerRevision,
+            .denied,
+            "an otherwise-current grant cannot mutate a reducer baselined to an older link-set revision"
+        )
+        let currentAuthorization = try await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            liveEndpoints: expandedLiveEndpoints
+        ).get()
+
+        let duplicateTargetIncarnation = makeEndpoint(
+            windowID: target.windowID + 10,
+            sessionID: target.sessionID
+        )
+        let duplicateRoute = await authority.authorizeRequestAttention(
+            requesterEndpoint: duplicateTargetIncarnation,
+            liveEndpoints: expandedLiveEndpoints.union([duplicateTargetIncarnation])
+        )
+        XCTAssertEqual(duplicateRoute.requestAttentionFailure, .denied)
+
+        _ = await authority.revoke(
+            linkID: firstGrant.id,
+            generation: firstGrant.generation,
+            reason: .userRequested
+        )
+        let revokedValidation = await authority.validateRequestAttentionAuthorization(
+            currentAuthorization,
+            liveEndpoints: expandedLiveEndpoints
+        )
+        XCTAssertEqual(
+            revokedValidation,
+            .denied,
+            "a proof cannot survive revocation of its exact link generation"
+        )
+
+        let secondGrant = try await activateLink(authority, observer: observer, target: target)
+        let successor = try await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            observerSessionID: observer.sessionID,
+            liveEndpoints: expandedLiveEndpoints
+        ).get()
+        XCTAssertNotEqual(secondGrant.id, firstGrant.id)
+        XCTAssertNotEqual(successor.reference, currentAuthorization.reference)
+        let successorValidation = await authority.validateRequestAttentionAuthorization(
+            successor,
+            liveEndpoints: expandedLiveEndpoints
+        )
+        XCTAssertNil(successorValidation)
+    }
+
+    func testRequestAttentionCardinalityIsDecidedAfterStaleEndpointFiltering() async throws {
+        let authority = makeAuthority()
+        let staleObserver = makeEndpoint(windowID: 1)
+        let liveObserver = makeEndpoint(windowID: 2)
+        let target = makeEndpoint(windowID: 3)
+        try await activateLink(authority, observer: staleObserver, target: target)
+        let liveGrant = try await activateLink(authority, observer: liveObserver, target: target)
+        let filteredLiveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = [liveObserver, target]
+
+        let authorization = try await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            liveEndpoints: filteredLiveEndpoints
+        ).get()
+        XCTAssertEqual(authorization.reference.linkID, liveGrant.id)
+        XCTAssertEqual(authorization.observer, liveObserver)
+        let filteredValidation = await authority.validateRequestAttentionAuthorization(
+            authorization,
+            liveEndpoints: filteredLiveEndpoints
+        )
+        XCTAssertNil(filteredValidation)
+
+        let explicitlyStale = await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            observerSessionID: staleObserver.sessionID,
+            liveEndpoints: filteredLiveEndpoints
+        )
+        XCTAssertEqual(
+            explicitlyStale.requestAttentionFailure,
+            .denied,
+            "zero live matches for an explicit UUID is an indistinguishable denial"
+        )
+
+        let bothLive: Set<DomainAgentSessionLinkEndpointIdentity> = [staleObserver, liveObserver, target]
+        let ambiguousValidation = await authority.validateRequestAttentionAuthorization(
+            authorization,
+            liveEndpoints: bothLive
+        )
+        XCTAssertEqual(
+            ambiguousValidation,
+            .ambiguousObserver(
+                candidateObserverSessionIDs: [staleObserver.sessionID, liveObserver.sessionID]
+                    .sorted { $0.uuidString < $1.uuidString },
+                omittedCandidateCount: 0
+            ),
+            "validation must repeat omitted-selector cardinality when a stale grant becomes live"
+        )
+        let ambiguous = await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            liveEndpoints: bothLive
+        )
+        guard case let .ambiguousObserver(candidateIDs, omittedCount) = ambiguous.requestAttentionFailure
+        else { return XCTFail("Expected bounded omitted-selector ambiguity") }
+        XCTAssertEqual(
+            candidateIDs,
+            [staleObserver.sessionID, liveObserver.sessionID].sorted {
+                $0.uuidString < $1.uuidString
+            }
+        )
+        XCTAssertEqual(omittedCount, 0)
+    }
+
+    func testRequestAttentionExplicitObserverUUIDWithTwoLiveIncarnationsIsAmbiguous() async throws {
+        let authority = makeAuthority()
+        let sharedObserverSessionID = UUID()
+        let firstObserver = makeEndpoint(windowID: 1, sessionID: sharedObserverSessionID)
+        let secondObserver = makeEndpoint(windowID: 2, sessionID: sharedObserverSessionID)
+        let target = makeEndpoint(windowID: 3)
+        try await activateLink(authority, observer: firstObserver, target: target)
+        try await activateLink(authority, observer: secondObserver, target: target)
+        let liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = [
+            firstObserver,
+            secondObserver,
+            target
+        ]
+
+        let explicit = await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            observerSessionID: sharedObserverSessionID,
+            liveEndpoints: liveEndpoints
+        )
+        XCTAssertEqual(
+            explicit.requestAttentionFailure,
+            .ambiguousObserver(
+                candidateObserverSessionIDs: [],
+                omittedCandidateCount: 0
+            ),
+            "an explicit ambiguity must not enumerate any observer UUID"
+        )
+
+        let omitted = await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            liveEndpoints: liveEndpoints
+        )
+        XCTAssertEqual(
+            omitted.requestAttentionFailure,
+            .ambiguousObserver(
+                candidateObserverSessionIDs: [sharedObserverSessionID],
+                omittedCandidateCount: 0
+            ),
+            "one candidate UUID can still name multiple exact live incarnations"
+        )
+
+        let firstOnly: Set<DomainAgentSessionLinkEndpointIdentity> = [firstObserver, target]
+        let initiallyUnique = try await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            observerSessionID: sharedObserverSessionID,
+            liveEndpoints: firstOnly
+        ).get()
+        let lateExplicitAmbiguity = await authority.validateRequestAttentionAuthorization(
+            initiallyUnique,
+            liveEndpoints: liveEndpoints
+        )
+        XCTAssertEqual(
+            lateExplicitAmbiguity,
+            .ambiguousObserver(
+                candidateObserverSessionIDs: [],
+                omittedCandidateCount: 0
+            ),
+            "late explicit ambiguity remains explicit and never enumerates candidates"
+        )
+    }
+
+    func testRequestAttentionCandidateEnumerationIsSortedDeduplicatedAndBounded() async throws {
+        let authority = makeAuthority()
+        let target = makeEndpoint(windowID: 999)
+        let uniqueCandidateCount = DomainAgentSessionLinkAuthority
+            .requestAttentionObserverCandidateLimit + 3
+        var observers: [DomainAgentSessionLinkEndpointIdentity] = []
+        var liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = [target]
+
+        for index in 0 ..< uniqueCandidateCount {
+            let sessionID = try XCTUnwrap(UUID(uuidString: String(
+                format: "10000000-0000-0000-0000-%012d",
+                uniqueCandidateCount - index
+            )))
+            let observer = makeEndpoint(windowID: 100 + index, sessionID: sessionID)
+            observers.append(observer)
+            liveEndpoints.insert(observer)
+            try await activateLink(authority, observer: observer, target: target)
+        }
+        let duplicatedSessionID = try XCTUnwrap(observers.last?.sessionID)
+        let duplicateIncarnation = makeEndpoint(
+            windowID: 500,
+            sessionID: duplicatedSessionID
+        )
+        liveEndpoints.insert(duplicateIncarnation)
+        try await activateLink(authority, observer: duplicateIncarnation, target: target)
+
+        let result = await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            liveEndpoints: liveEndpoints
+        )
+        guard case let .ambiguousObserver(candidateIDs, omittedCount) = result.requestAttentionFailure
+        else { return XCTFail("Expected bounded candidate enumeration") }
+
+        let expectedAll = Array(Set(observers.map(\.sessionID)))
+            .sorted { $0.uuidString < $1.uuidString }
+        XCTAssertEqual(
+            candidateIDs,
+            Array(expectedAll.prefix(
+                DomainAgentSessionLinkAuthority.requestAttentionObserverCandidateLimit
+            ))
+        )
+        XCTAssertEqual(Set(candidateIDs).count, candidateIDs.count)
+        XCTAssertEqual(omittedCount, uniqueCandidateCount - candidateIDs.count)
+
+        let explicitDenial = await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            observerSessionID: UUID(),
+            liveEndpoints: liveEndpoints
+        )
+        XCTAssertEqual(
+            explicitDenial.requestAttentionFailure,
+            .denied,
+            "an explicit zero-match denial must not return the omitted selector's candidates"
+        )
+    }
+
+    func testRequestAttentionRouteRebindingInvalidatesAuthorization() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        try await activateLink(authority, observer: observer, target: target)
+        let authorization = try await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            liveEndpoints: [observer, target]
+        ).get()
+
+        let reboundTarget = makeEndpoint(
+            windowID: target.windowID,
+            workspaceID: target.workspaceID,
+            tabID: target.tabID,
+            sessionID: target.sessionID,
+            persistentBindingGeneration: target.persistentBindingGeneration,
+            bindingTransitionGeneration: target.bindingTransitionGeneration + 1
+        )
+        let reboundTargetValidation = await authority.validateRequestAttentionAuthorization(
+            authorization,
+            liveEndpoints: [observer, reboundTarget]
+        )
+        XCTAssertEqual(
+            reboundTargetValidation,
+            .denied
+        )
+        let reboundRoute = await authority.authorizeRequestAttention(
+            requesterEndpoint: reboundTarget,
+            observerSessionID: observer.sessionID,
+            liveEndpoints: [observer, reboundTarget]
+        )
+        XCTAssertEqual(
+            reboundRoute.requestAttentionFailure,
+            .denied,
+            "an exact target route must not inherit a previous incarnation's inbound grant"
+        )
+
+        let reboundObserver = makeEndpoint(
+            windowID: observer.windowID,
+            workspaceID: observer.workspaceID,
+            tabID: observer.tabID,
+            sessionID: observer.sessionID,
+            persistentBindingGeneration: observer.persistentBindingGeneration,
+            bindingTransitionGeneration: observer.bindingTransitionGeneration + 1
+        )
+        let reboundObserverValidation = await authority.validateRequestAttentionAuthorization(
+            authorization,
+            liveEndpoints: [reboundObserver, target]
+        )
+        XCTAssertEqual(
+            reboundObserverValidation,
+            .denied
+        )
+    }
+
+    func testRequestAttentionAuthorizationReportsShutdownDistinctly() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        try await activateLink(authority, observer: observer, target: target)
+        let liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = [observer, target]
+        let authorization = try await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            liveEndpoints: liveEndpoints
+        ).get()
+
+        await authority.beginDrain()
+
+        let rejected = await authority.authorizeRequestAttention(
+            requesterEndpoint: target,
+            liveEndpoints: liveEndpoints
+        )
+        XCTAssertEqual(rejected.requestAttentionFailure, .runtimeShuttingDown)
+        let validation = await authority.validateRequestAttentionAuthorization(
+            authorization,
+            liveEndpoints: liveEndpoints
+        )
+        XCTAssertEqual(
+            validation,
+            .runtimeShuttingDown
+        )
+    }
+
     func testRevokedGenerationCannotAuthorizeAndRelinkMintsFreshIdentity() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint()
@@ -1993,6 +2352,15 @@ private final class LinkTestClock: @unchecked Sendable {
 
 private extension Result where Failure == DomainAgentSessionLinkError {
     var failureError: DomainAgentSessionLinkError? {
+        guard case let .failure(error) = self else { return nil }
+        return error
+    }
+}
+
+private extension Result
+    where Failure == DomainAgentSessionLinkAuthority.RequestAttentionAuthorizationError
+{
+    var requestAttentionFailure: Failure? {
         guard case let .failure(error) = self else { return nil }
         return error
     }

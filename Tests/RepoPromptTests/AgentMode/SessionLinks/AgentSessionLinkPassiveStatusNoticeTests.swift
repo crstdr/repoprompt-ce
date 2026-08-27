@@ -505,6 +505,214 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         XCTAssertEqual(reducer.lastAcceptedReceiptRevision, revisionTwo.queueRevision)
     }
 
+    func testAttentionAtCapacityRefusesAtEnqueueAndNeverEvictsOrOverflows() {
+        var reducer = makeReducer()
+        reducer.enable(
+            samples: (0 ... Reducer.maximumPendingAttentionRequestCount)
+                .map { sample($0, status: .idle) },
+            linkSetRevision: 1
+        )
+
+        for index in 0 ..< Reducer.maximumPendingAttentionRequestCount {
+            XCTAssertEqual(
+                requestAttention(index, reducer: &reducer, requestedAt: Date(timeIntervalSince1970: Double(index))),
+                .accepted
+            )
+        }
+        let fullSnapshot = reducer.snapshot
+
+        XCTAssertEqual(
+            requestAttention(0, reducer: &reducer, requestedAt: Date(timeIntervalSince1970: 9000)),
+            .accepted,
+            "a duplicate must reveal no pending-versus-new state"
+        )
+        XCTAssertEqual(
+            reducer.snapshot,
+            fullSnapshot,
+            "a duplicate must not change ordering, timestamps, revision, or fingerprint"
+        )
+        XCTAssertEqual(
+            requestAttention(
+                Reducer.maximumPendingAttentionRequestCount,
+                reducer: &reducer,
+                requestedAt: Date(timeIntervalSince1970: 10000)
+            ),
+            .atCapacity
+        )
+        XCTAssertEqual(reducer.snapshot.attentionRequests.count, Reducer.maximumPendingAttentionRequestCount)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.first?.targetSessionID, sessionID(0))
+        XCTAssertEqual(reducer.snapshot.attentionRequests.last?.targetSessionID, sessionID(15))
+        XCTAssertEqual(reducer.overflowProduced, 0, "refused attention never enters status overflow")
+        XCTAssertEqual(reducer.overflowAcknowledged, 0)
+    }
+
+    func testStatusOverflowNeverConsumesOrAttributesAttention() {
+        var reducer = makeReducer()
+        reducer.enable(
+            samples: (0 ..< 18).map { sample($0, status: .running) },
+            linkSetRevision: 1
+        )
+        XCTAssertEqual(requestAttention(0, reducer: &reducer), .accepted)
+        let occurrence = tryUnwrap(reducer.snapshot.attentionRequests.first).occurrence
+
+        reducer.reconcile(
+            samples: (0 ..< 18).map { sample($0, status: .idle) },
+            linkSetRevision: 1,
+            deliverable: true
+        )
+
+        XCTAssertEqual(reducer.snapshot.entries.count, Reducer.maximumPendingTargetCount)
+        XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 2)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.map(\.occurrence), [occurrence])
+    }
+
+    func testAttentionSurvivesStatusChurnAndIsClearedByLifecycleInvalidation() {
+        var reducer = makeReducer()
+        reducer.enable(
+            samples: [sample(0, status: .running), sample(1, status: .running)],
+            linkSetRevision: 1
+        )
+        XCTAssertEqual(requestAttention(0, reducer: &reducer), .accepted)
+        XCTAssertEqual(requestAttention(1, reducer: &reducer), .accepted)
+
+        reducer.reconcile(
+            samples: [sample(0, status: .idle), sample(1, status: .waiting)],
+            linkSetRevision: 1,
+            deliverable: true
+        )
+        XCTAssertEqual(
+            Set(reducer.snapshot.attentionRequests.map(\.targetSessionID)),
+            [sessionID(0), sessionID(1)]
+        )
+
+        reducer.reconcile(
+            samples: [sample(1, status: .waiting)],
+            linkSetRevision: 2,
+            deliverable: true
+        )
+        XCTAssertEqual(reducer.snapshot.attentionRequests.map(\.targetSessionID), [sessionID(1)])
+
+        reducer.reconcile(
+            samples: [sample(1, status: .unavailable)],
+            linkSetRevision: 2,
+            deliverable: true
+        )
+        XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty)
+
+        reducer.enable(samples: [sample(0, status: .idle)], linkSetRevision: 3)
+        XCTAssertEqual(requestAttention(0, reducer: &reducer, linkSetRevision: 3), .accepted)
+        reducer.disable(linkSetRevision: 3)
+        XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty)
+    }
+
+    func testStaleReceiptDoesNotClearSuccessorAttentionOccurrence() {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle)], linkSetRevision: 1)
+        XCTAssertEqual(requestAttention(0, reducer: &reducer), .accepted)
+        let firstSnapshot = reducer.snapshot
+        let firstOccurrence = tryUnwrap(firstSnapshot.attentionRequests.first).occurrence
+
+        reducer.apply(Reducer.Receipt(snapshot: firstSnapshot))
+        XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty)
+        XCTAssertEqual(requestAttention(0, reducer: &reducer), .accepted)
+        let successorOccurrence = tryUnwrap(reducer.snapshot.attentionRequests.first).occurrence
+        XCTAssertNotEqual(successorOccurrence, firstOccurrence)
+
+        reducer.apply(Reducer.Receipt(snapshot: firstSnapshot))
+        XCTAssertEqual(reducer.snapshot.attentionRequests.map(\.occurrence), [successorOccurrence])
+    }
+
+    func testAttentionReceiptAppliesIndependentlyOfGlobalQueueRevisionGate() {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        XCTAssertEqual(requestAttention(0, reducer: &reducer), .accepted)
+        let olderAttentionClaim = reducer.snapshot
+
+        reducer.reconcile(samples: [sample(0, status: .idle)], linkSetRevision: 1, deliverable: true)
+        let newerStatusClaim = reducer.snapshot
+        reducer.apply(Reducer.Receipt(
+            snapshot: newerStatusClaim,
+            deliveredAttentionRequests: []
+        ))
+        XCTAssertEqual(reducer.lastAcceptedReceiptRevision, newerStatusClaim.queueRevision)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.count, 1)
+
+        reducer.apply(Reducer.Receipt(snapshot: olderAttentionClaim))
+        XCTAssertTrue(
+            reducer.snapshot.attentionRequests.isEmpty,
+            "an older claim that rendered the exact occurrence must still settle it"
+        )
+        XCTAssertEqual(reducer.lastAcceptedReceiptRevision, newerStatusClaim.queueRevision)
+    }
+
+    func testStandaloneAttentionRefreshesMetadataWithoutNewOccurrenceOrFingerprint() throws {
+        var reducer = makeReducer()
+        let baselineObservedAt = Date(timeIntervalSince1970: 900)
+        let initialWaitingOn = try XCTUnwrap(DomainAgentSessionWaitingOn(
+            summary: "Initial dependency",
+            declaredAt: Date(timeIntervalSince1970: 800)
+        ))
+        reducer.enable(
+            samples: [sample(
+                0,
+                name: "Initial target",
+                status: .idle,
+                waitingOn: initialWaitingOn,
+                preview: "Still working."
+            )],
+            linkSetRevision: 1,
+            observedAt: baselineObservedAt
+        )
+        let requestedAt = Date(timeIntervalSince1970: 1000)
+        XCTAssertEqual(requestAttention(0, reducer: &reducer, requestedAt: requestedAt), .accepted)
+        let originalSnapshot = reducer.snapshot
+        let original = try XCTUnwrap(originalSnapshot.attentionRequests.first)
+        XCTAssertEqual(original.displayName, "Initial target")
+        XCTAssertEqual(original.observedAt, baselineObservedAt)
+        XCTAssertEqual(original.waitingOn, initialWaitingOn)
+        XCTAssertEqual(original.latestVisibleAssistantPreview, "Still working.")
+        XCTAssertNotEqual(
+            original.observedAt,
+            original.requestedAt,
+            "the request timestamp must not be relabeled as the older status observation time"
+        )
+        let waitingOn = try XCTUnwrap(DomainAgentSessionWaitingOn(
+            summary: "Review the final build",
+            declaredAt: Date(timeIntervalSince1970: 1500)
+        ))
+
+        reducer.reconcile(
+            samples: [sample(
+                0,
+                name: "Current target",
+                status: .idle,
+                idleForSend: true,
+                waitingOn: waitingOn,
+                preview: "Build is ready."
+            )],
+            linkSetRevision: 1,
+            deliverable: true,
+            observedAt: Date(timeIntervalSince1970: 2000)
+        )
+
+        let refreshedSnapshot = reducer.snapshot
+        let refreshed = try XCTUnwrap(refreshedSnapshot.attentionRequests.first)
+        XCTAssertEqual(refreshed.occurrence, original.occurrence)
+        XCTAssertEqual(refreshed.requestedAt, requestedAt)
+        XCTAssertEqual(refreshed.displayName, "Current target")
+        XCTAssertEqual(refreshed.status, .idle)
+        XCTAssertTrue(refreshed.idleForSend)
+        XCTAssertEqual(refreshed.waitingOn, waitingOn)
+        XCTAssertEqual(refreshed.latestVisibleAssistantPreview, "Build is ready.")
+        XCTAssertEqual(refreshed.observedAt, Date(timeIntervalSince1970: 2000))
+        XCTAssertEqual(
+            refreshedSnapshot.wakeEligibilityFingerprint,
+            originalSnapshot.wakeEligibilityFingerprint,
+            "presentation-only refresh must not create a fresh attention occurrence"
+        )
+        XCTAssertGreaterThan(refreshedSnapshot.queueRevision, originalSnapshot.queueRevision)
+    }
+
     func testOldEpochReceiptDisableAndLastLinkRemovalCannotResurrectQueueState() throws {
         var reducer = makeReducer()
         reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
@@ -556,12 +764,30 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         return reducer
     }
 
+    @discardableResult
+    private func requestAttention(
+        _ index: Int,
+        reducer: inout Reducer,
+        linkSetRevision: UInt64 = 1,
+        requestedAt: Date = Date()
+    ) -> Reducer.AttentionRequestResult {
+        let target = sample(index, status: .idle)
+        return reducer.requestAttention(
+            reference: target.reference,
+            targetEndpoint: target.targetEndpoint,
+            targetSessionID: target.targetSessionID,
+            linkSetRevision: linkSetRevision,
+            requestedAt: requestedAt
+        )
+    }
+
     private func sample(
         _ index: Int,
         name: String? = nil,
         status: Status,
         endpointGeneration: UInt64 = 1,
         idleForSend: Bool = false,
+        waitingOn: DomainAgentSessionWaitingOn? = nil,
         preview: String? = nil
     ) -> Reducer.Sample {
         let targetSessionID = sessionID(index)
@@ -575,6 +801,7 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
             displayName: name ?? "Target \(index)",
             status: status,
             idleForSend: idleForSend,
+            waitingOn: waitingOn,
             latestVisibleAssistantPreview: preview
         )
     }

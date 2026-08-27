@@ -2540,34 +2540,81 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
                 let ready = try XCTUnwrap(finalProjection)
                 XCTAssertTrue(ready.isReady)
                 XCTAssertEqual(ready.routeToken, exactToken)
+                let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+                await manager.setRestrictedTools(
+                    for: connectionID,
+                    tools: [MCPWindowToolName.agentSessionLink]
+                )
 
-                let countBeforeRevocationRace = await testConnection.toolListChangedCount()
-                await manager.debugSetActiveSessionLinkEndpointsForTesting([])
+                // Removing the final outbound grant changes observer readiness, but an inbound grant
+                // keeps the same exact endpoint's catalog surface reachable for inverse/self ops.
+                let countBeforeOutboundRemoval = await testConnection.toolListChangedCount()
+                await manager.debugSetSessionLinkCatalogEndpointsForTesting(
+                    anyActive: [endpoint],
+                    outbound: []
+                )
+                await manager.notifyToolListChangedForAgentSession(sessionID)
+                let inboundOnlySnapshot = await manager.debugRunCatalogProjection(for: runID)
+                let inboundOnlyProjection = try XCTUnwrap(inboundOnlySnapshot)
+                XCTAssertFalse(inboundOnlyProjection.isReady)
+                XCTAssertEqual(inboundOnlyProjection.hasAgentSessionLink, true)
+                XCTAssertEqual(inboundOnlyProjection.hasActiveOutboundLink, false)
+                let countAfterOutboundRemoval = await testConnection.toolListChangedCount()
+                XCTAssertEqual(countAfterOutboundRemoval, countBeforeOutboundRemoval + 1)
+                let inboundOnlyNames = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertTrue(inboundOnlyNames.contains(MCPWindowToolName.agentSessionLink))
+
+                // The final inbound removal withdraws catalog presence. Complete a stale tools/list to
+                // exercise mismatch recovery before the next settled list publishes absence.
+                let countBeforeInboundRemoval = await testConnection.toolListChangedCount()
+                await manager.debugSetSessionLinkCatalogEndpointsForTesting(
+                    anyActive: [],
+                    outbound: []
+                )
                 await manager.debugCompleteRunCatalogObservation(
                     connectionID: connectionID,
                     initialRouteToken: exactToken,
                     returnedSessionLinkPresence: true
                 )
-                let staleProjection = await manager.debugRunCatalogProjection(for: runID)
-                let staleMembershipProjection = try XCTUnwrap(staleProjection)
-                XCTAssertFalse(staleMembershipProjection.isReady)
-                XCTAssertEqual(staleMembershipProjection.routeToken, exactToken)
-                XCTAssertEqual(staleMembershipProjection.hasAgentSessionLink, true)
-                XCTAssertEqual(staleMembershipProjection.hasActiveOutboundLink, false)
-                let countAfterRevocationRace = await testConnection.toolListChangedCount()
-                XCTAssertEqual(countAfterRevocationRace, countBeforeRevocationRace + 1)
+                let staleSnapshot = await manager.debugRunCatalogProjection(for: runID)
+                let staleProjection = try XCTUnwrap(staleSnapshot)
+                XCTAssertFalse(staleProjection.isReady)
+                XCTAssertEqual(staleProjection.routeToken, exactToken)
+                XCTAssertEqual(staleProjection.hasAgentSessionLink, true)
+                XCTAssertEqual(staleProjection.hasActiveOutboundLink, false)
+                let countAfterInboundRemoval = await testConnection.toolListChangedCount()
+                XCTAssertEqual(countAfterInboundRemoval, countBeforeInboundRemoval + 1)
 
-                let namesAfterRevocation = try await manager.debugListToolNames(for: connectionID)
-                XCTAssertFalse(namesAfterRevocation.contains(MCPWindowToolName.agentSessionLink))
+                let namesAfterFinalRemoval = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertFalse(namesAfterFinalRemoval.contains(MCPWindowToolName.agentSessionLink))
                 let countAfterSettledList = await testConnection.toolListChangedCount()
-                XCTAssertEqual(countAfterSettledList, countBeforeRevocationRace + 1)
+                XCTAssertEqual(countAfterSettledList, countBeforeInboundRemoval + 1)
+
+                // A linked incarnation sharing only the session UUID must not grant this routed
+                // incarnation catalog presence or cause a spurious exact-route invalidation.
+                let duplicateIncarnation = DomainAgentSessionLinkEndpointIdentity(
+                    windowID: endpoint.windowID,
+                    workspaceID: endpoint.workspaceID,
+                    tabID: UUID(),
+                    sessionID: endpoint.sessionID,
+                    persistentBindingGeneration: endpoint.persistentBindingGeneration,
+                    bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                )
+                await manager.debugSetSessionLinkCatalogEndpointsForTesting(
+                    anyActive: [duplicateIncarnation],
+                    outbound: [duplicateIncarnation]
+                )
+                await manager.notifyToolListChangedForAgentSession(sessionID)
+                let countAfterDuplicateIncarnation = await testConnection.toolListChangedCount()
+                XCTAssertEqual(countAfterDuplicateIncarnation, countAfterSettledList)
+                let duplicateNames = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertFalse(duplicateNames.contains(MCPWindowToolName.agentSessionLink))
 
                 await manager.debugSetActiveSessionLinkEndpointsForTesting([endpoint])
                 _ = try await manager.debugListToolNames(for: connectionID)
                 let restoredProjection = await manager.debugRunCatalogProjection(for: runID)
                 XCTAssertTrue(try XCTUnwrap(restoredProjection).isReady)
                 let countBeforeDuplicateInvalidations = await testConnection.toolListChangedCount()
-                let sessionID = try XCTUnwrap(session.activeAgentSessionID)
                 await manager.notifyToolListChangedForAgentSession(sessionID)
                 await manager.notifyToolListChangedForAgentSession(sessionID)
                 let projectionAfterDuplicates = await manager.debugRunCatalogProjection(for: runID)

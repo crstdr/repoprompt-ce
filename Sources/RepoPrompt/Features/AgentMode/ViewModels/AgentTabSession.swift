@@ -209,6 +209,14 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// Whether one queue publication was absorbed while the current Auto-wake could not schedule a
+    /// reevaluation of its own.
+    ///
+    /// Ephemeral and one-shot. A safe attempt release drains it through the ordinary gated
+    /// publication entry point; an accepted attempt discards it because applying that claim's receipt
+    /// immediately republishes whatever remains owed.
+    var agentSessionLinkAutoWakeReevaluationOwed = false
+
     /// The one structural wake shape this incarnation already failed to deliver, if any.
     ///
     /// Suppression rather than backoff: there is no timer and no retry loop, so a known pre-acceptance

@@ -1,9 +1,9 @@
 # Agent session oversight: presentation, lifecycle, and Auto-wake
 
 Cross-session oversight lets one Agent session (the **observer**) watch others (the **targets**)
-through a user-granted, directional, revocable link. When a target's lifecycle status changes,
-RepoPrompt may start an automatic follow-up turn on the observer — an **Auto-wake** — so the model
-learns about it without its user having to ask.
+through a user-granted, directional, revocable link. When a target's lifecycle status changes or the
+target purposefully requests attention, RepoPrompt may start an automatic follow-up turn on the
+observer — an **Auto-wake** — so the model learns about it without its user having to ask.
 
 This document covers the parts that are easy to break because their invariants are enforced in one
 file and depended on in another. For the tool contract a model sees, read the `agent_session_link`
@@ -18,17 +18,18 @@ defect in this subsystem.
 | Owner | Responsibility | Where |
 | --- | --- | --- |
 | Link authority | Grants, capabilities, generations, cursors, revocation. Process-memory. | `DomainAgentSessionLinkAuthority` |
-| Passive reducer | The canonical queue: observer-local, first-to-final coalescing of target status edges. Owns no authority and performs no delivery. | `AgentSessionLinkPassiveStatusNotices` |
-| Claim / receipt | What a provider was actually sent, and what an acceptance therefore acknowledges. | `AgentSessionLinkPromptContext` |
+| Passive reducer | The canonical observer-local queue: first-to-final coalescing of target status edges plus separate, non-lossy attention occurrences. Owns no authority and performs no delivery. | `AgentSessionLinkPassiveStatusNotices` |
+| Claim / receipt | The immutable rendered batch a provider was actually sent, including exact attention occurrence identities, and what that provider's acceptance therefore acknowledges. | `AgentSessionLinkPromptContext` |
 | Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentModeViewModel+SessionLinkAutoWake` |
 
 ## Autonomy is grant-scoped and prompt-governed
 
 The user's exact direct grant is the whole structural delegation.
-`DomainAgentSessionOperationAuthorizer` still requires an Agent-origin caller, a direct grant, exact
-observer identity, exact target identity, and the operation's capability on every call, and the
-bridge revalidates both live endpoint incarnations around every suspension point. Nothing else
-authorizes anything.
+`DomainAgentSessionOperationAuthorizer` still protects every outbound observer operation by requiring
+an Agent-origin caller, a direct grant, exact observer identity, exact target identity, and the
+operation's capability. `request_attention` instead requires generation-qualified exact inverse
+authorization through a current inbound grant. The bridge revalidates both live endpoint incarnations
+around every suspension point. Nothing else authorizes anything.
 
 What the transport deliberately no longer asks is **what started the observer's turn**. There is no
 turn-origin predicate, no observer local-input epoch, no target-local human re-arm, and no
@@ -48,26 +49,37 @@ change, a transcript, a preview, a `waiting_on` declaration, or an incoming mess
 
 Target-derived content informs; it never authorizes. It may change what the model does under an
 instruction it already has, and it may never become the instruction, approval, permission, or
-authority for one.
+authority for one. This includes `request_attention`: it is an attributed, potentially stale,
+untrusted target signal accepted only under an exact current inbound grant. It is not an instruction,
+permission, approval, interaction response, or source of authority. It exists to surface the target's
+current user-declared waiting context, not to invent work or infer a missing observer-user instruction.
 
-Because that guidance is versioned, a bump is load-bearing rather than cosmetic. Revision 3 is the one
-that retires the fence, so every provider context is re-owed the full block: the next accepted passive
-batch in a context that has not accepted revision 3 carries the whole text, later batches use the
-reminder, and an Auto-wake cannot physically dispatch while its required batch could not be rendered.
-No second persistence mechanism for guidance exists or is needed.
+Because that guidance is versioned, a bump is load-bearing rather than cosmetic. Revision 4 retains
+revision 3's retirement of the caller-origin fence and adds the purposeful-attention trust rule and
+truthful Snooze exception, so every provider context is re-owed the full block: the next accepted
+passive batch in a context that has not accepted revision 4 carries the whole text, later batches use
+the reminder, and an Auto-wake cannot physically dispatch while its required batch could not be
+rendered. No second persistence mechanism for guidance exists or is needed.
 
-### Reciprocal wakes are an accepted consequence
+### Feedback loops are an accepted consequence
 
-If the user independently creates a grant A → B *and* a grant B → A and selects Auto-wake for both
-lanes, the two sessions can keep waking each other: every accepted wake produces genuinely new
-lifecycle edges, and queue receipts, status deduplication, and failed-fingerprint suppression only
-collapse *duplicate* edges. This does not violate non-reciprocity — neither grant implies the other,
-and the user created both explicitly.
+A single grant A → B can now sustain repeated wakes. A, the observer, may send to B under that direct
+grant; B may then issue `request_attention` back through the grant's exact inverse signal path; A may
+wake and continue under the same original grant. The inverse signal does not create a B → A send grant,
+a generic reverse-send channel, transitive authority, reciprocity, or an interaction response. It only
+surfaces attributed, untrusted context for A to evaluate under A's own user's still-applicable
+instructions.
+
+If the user independently creates both A → B and B → A and selects Auto-wake for both lanes, the two
+sessions can also keep waking each other through ordinary lifecycle edges. Every accepted wake
+produces genuinely new edges, and queue receipts, status deduplication, and failed-fingerprint
+suppression only collapse *duplicates*. This does not violate non-reciprocity — neither grant implies
+the other, and the user created both explicitly.
 
 The transport contains no cycle damper, reciprocal-link detector, chain counter, or cooldown, and none
-may be added here. **Guidance is not a structural bound either**: revision 3 reduces pointless
-discretionary work by telling the model not to invent follow-on work from an update that needs none,
-but that is model judgement, not a guarantee, and no surface may describe it as one.
+may be added here. **Guidance is not a structural bound either**: revision 4 reduces pointless
+discretionary work by telling the model not to invent follow-on work from an update or attention signal
+that needs none, but that is model judgement, not a guarantee, and no surface may describe it as one.
 
 That clause is deliberately two sentences on every surface — *do not invent work from it*, then
 *continue what the instructions still require and end only when none remains*. A lane batch also
@@ -82,16 +94,20 @@ The controls are the user's, and they are the ones that already exist:
 
 | Control | Effect |
 | --- | --- |
-| Per-lane `snooze_auto_wake` | That lane stops being a reason to start an automatic turn, for a bounded window |
-| Auto-wake deselection | That lane stops admitting at all |
-| Unlink / revocation | The grant is gone, and any queued send with it |
+| Per-lane `snooze_auto_wake` | Ordinary status on that lane stops being a reason to start an automatic turn for a bounded window; one pending explicit attention occurrence from that exact lane may still admit |
+| Master Auto-wake off | Stops selecting every lane at once; a lane whose own Auto-wake toggle remains on stays selected and may still admit |
+| Effective lane deselection | With master Auto-wake off and that lane's toggle off, the lane stops admitting; attention has no exception |
+| Unlink / revocation | The grant and its queued sends or pending attention are gone; attention has no exception |
 
 New live sessions start with the observer-level Auto-wake preference enabled. That is only a
 creation default: hydration replaces it with the durable session value, and payloads written before
 the setting existed continue to decode as off rather than silently opting restored sessions in.
 
-Each prevents *subsequent* admission and may retract a pre-dispatch attempt. None of them claims to
-cancel a physical provider call already in flight.
+Effective lane deselection — master Auto-wake off *and* that lane's own toggle off — and unlink
+prevent *subsequent* admission without exception. Master-off alone does not: granular lane selection
+may remain effective. Snooze prevents ordinary status admission but deliberately retains the exact
+attention exception. Each control may retract a pre-dispatch attempt. None claims to cancel a
+physical provider call already in flight.
 
 ## Exact projection is presentation truth
 
@@ -249,6 +265,45 @@ the canonical passive queue and the wake coordinator described above, never side
 location repaint before claim reservation may affect the claim's local display provenance described
 below, but it still cannot enqueue, authorize, or alter the Auto-wake itself.
 
+## Purposeful attention is an inverse signal, not reverse send
+
+`request_attention` is an operation on the existing `agent_session_link` tool, not a new tool or
+capability. The target calls from its exact live endpoint. The bridge enumerates only active grants
+whose exact generation-qualified target endpoint matches, removes stale observer endpoints, and then
+resolves the optional `observer_session_id`. Omitting it succeeds only when exactly one live authorized
+observer remains; ambiguity is bounded and fails closed. An exact active link in either direction
+deliberately makes `agent_session_link` reachable even when the run profile's restricted-tool,
+policy-gated-grant, or role advertisement/execution filters would otherwise hide or reject it. The
+exception is limited to this tool and a server-routed exact endpoint: a static policy grant cannot
+manufacture it, global MCP disable remains absolute, and the disabled-tool setting still wins for
+catalog advertisement. Reachability never supplies outbound or inverse operation authority; the
+service authorizes each direction independently.
+
+An authorized request appends one immutable occurrence identity to separate, observer-local attention
+storage. A hard enqueue-time cap refuses excess attention rather than evicting an occurrence, and
+attention neither evicts nor consumes the reducer's coalesced status intervals. Publication lets the
+occurrence ride a natural observer turn or, if every admission gate permits, start an Auto-wake through
+its exact lane. The rendered immutable claim names the occurrence and grant. Before provider
+preparation and again at physical acquisition, the occurrence must still be pending under that exact
+current grant; omission from the rendered budget or loss of authority is a definite no-call.
+
+Every successfully accepted tool call returns the same `result: "accepted"`, whether it created a new
+pending occurrence or coalesced with one already pending. That result reveals neither queue state nor
+provider delivery and promises no wake. At the enqueue cap the tool instead returns exactly
+`result: "attention_queue_full", accepted: false`; no occurrence was stored, so the target reports the
+refusal rather than busy-retrying or treating it as accepted. Only acceptance of the observer's
+immutable rendered batch by the provider produces a receipt. The receipt acknowledges only the exact
+attention occurrences it carried: a stale or out-of-order receipt cannot clear a successor occurrence,
+an unaccepted batch leaves the occurrence pending, and a target may request attention again after the
+previous occurrence is receipted.
+
+`set_waiting_on` is related context, not part of the attention transaction. It is optional,
+self-scoped and session-global, shared with every linked observer, mutable, and published non-atomically
+through a separate state path. It is never a prerequisite for `request_attention`, is never auto-set or
+auto-cleared by attention, and may be absent or may change before or after the attention claim is
+composed. Both the declaration and the attention signal remain attributed untrusted target data; they
+never become an observer instruction or authority.
+
 ## Snooze suppresses admission, never delivery
 
 A snooze is observer-local policy on one exact lane. It is keyed by
@@ -256,9 +311,19 @@ A snooze is observer-local policy on one exact lane. It is keyed by
 owning `AgentTabSession`, and dies with that incarnation — a rebind, unlink/relink, or relaunch
 always starts unsnoozed.
 
-What it does: stops that lane from being the reason an automatic turn starts.
+What it does: stops ordinary status on that lane from being the reason an automatic turn starts.
+One still-pending attention occurrence from that exact lane may bypass only this Snooze. It does not
+clear or shorten the Snooze, and after the occurrence is receipted the still-active Snooze continues to
+suppress status-only admission.
 
-What it deliberately does **not** do, and must never be changed to do:
+The attention exception bypasses nothing else and cannot select a lane. A lane remains selected while
+either master Auto-wake or its own lane toggle is on, so master-off alone may leave granular lanes
+effective. With master Auto-wake off and that lane's toggle off, effective deselection admits no
+attention exception. Readiness, prompt eligibility and budget, immutable-claim reservation,
+physical-dispatch acquisition, exact grant revalidation or revocation, failure suppression, and
+unlink also remain unchanged.
+
+What Snooze deliberately does **not** do, and must never be changed to do:
 
 - filter, receipt, baseline, or discard the canonical queue;
 - change link authority, durable Auto-wake selection, or failure suppression;
@@ -272,9 +337,9 @@ Consequences that follow from that, and are intended rather than bugs:
   selection and suppression gates still decide, so content already delivered naturally, or a lane
   that net-reverted, correctly produces nothing.
 
-Because the reducer keeps one coalesced interval per lane and no event history, the only honest
-description of what survives a snooze is "the current coalesced summary" — never a count of missed
-events. Copy and model guidance are written to that standard on purpose.
+Because the reducer's status storage keeps one coalesced status interval per lane and no status event
+history, the only honest description of what survives a snooze is "the current coalesced summary" —
+never a count of missed events. Copy and model guidance are written to that standard on purpose.
 
 ### The Auto-wake control is subordinate to its lane
 
@@ -287,16 +352,17 @@ the presentation location is missing while the route remains valid, the actionab
 contains both the visible location/fallback and the task name. Route failure copy speaks only about
 whether the session can be opened, reserving “location” for the worktree/workspace label.
 
-New, Auto-wake, Snooze, and Unlink remain independent controls, but the location View action and the
-row's other primary mutations retain the same shared busy-row gate, exact route, and failure-feedback
-path as before. Task metadata and the smaller Snooze Auto-wake control share the secondary line. This
+New, Auto-wake, Snooze status Auto-wake, and Unlink remain independent controls, but the location
+View action and the row's other primary mutations retain the same shared busy-row gate, exact route,
+and failure-feedback path as before. Task metadata and the smaller Snooze status Auto-wake control
+share the secondary line. This
 keeps the control visibly attached to the metadata it qualifies and balances it beneath the primary
 actions. A faint rule may fall only *between* two complete blocks
 (`AgentMonitorLaneGrouping.drawsSeparator`) — never inside one, which would present a lane's snooze
 control as an entry with no lane, and never after the last, where the section's own `Divider()`
 already ends the list and a second rule reads as an empty lane. Manual design review should verify
 enabled and disabled tooltip copy, keyboard and VoiceOver activation, exact routing and failure
-feedback, and the independence of New, Auto-wake, Snooze, and Unlink.
+feedback, and the independence of New, Auto-wake, Snooze status Auto-wake, and Unlink.
 
 The inbound **Overseen by** list applies the same navigation rule to only the observer's primary
 name/identifier label. Its route is derived from the authority-recorded exact observer endpoint, and
@@ -367,27 +433,28 @@ Labels are stripped of format and bidi scalars, and the sentence's own curly quo
 folded to ASCII inside a label, so an untrusted name cannot close the
 quoted span the grammar opened around it. The transcript row's canonical raw text remains unchanged.
 
-## Known deferred work
+## Bounded race fixes and known deferred work
 
-These are accepted, not undiscovered. They share one root cause: **the wake attempt stays mutable
-after its provider claim is immutable, and the tombstone that fences an in-flight dispatch lives in
-the same single slot as the live attempt.** The remedy is one change — an immutable in-flight
-dispatch record on `AgentTabSession`, separate from the mutable reservation — not three patches.
+Purposeful attention could be a one-shot signal followed by target idleness, so three races that status
+could previously self-heal on a later edge required bounded fixes. Those fixes deliberately did not
+replace the wake attempt or tombstone architecture:
 
-1. **Post-final-composition absorption.** An edge arriving after the provider composed its claim but
-   before physical acquisition is absorbed into the mutable attempt's `attemptedFingerprint` without
-   being in the sent text, so the attempt's record of what was attempted outruns the immutable claim.
-   Nothing is *consumed* on acceptance any more — the target-local human-re-arm epochs that used to be
-   are gone — so what survives is the fingerprint divergence itself, which can suppress a later retry
-   of content that was never delivered. The sent *content* stays correct: the claim store re-renders rather than reusing a parked claim once
-   the queue moves, because `ClaimFingerprint` carries the passive queue epoch and revision. The
-   waiting-continuation route is synchronous through acceptance and has no window at all.
-2. **Acquire-path tombstone release skips the replay,** so a reevaluation absorbed while the
-   tombstone stood is lost. The fence still holds and it self-heals on the next status edge.
-   Replaying inside provider composition would be the wrong fix; a one-shot owed marker drained at
-   the next safe point is the right one.
-3. **Selection-fence and master-toggle release of a tombstone.** Both reach the same non-idempotent
-   cancel fall-through. Snooze widened this: it mints tombstones *and* holds eligibility false, so
-   one "snooze this lane… actually, deselect it" inside the preparation window now suffices where
-   two independent eligibility events were needed before. Every trigger requires an explicit user or
-   agent action; nothing fires autonomously.
+1. At the existing `attemptedFingerprint` assignment, the attention component comes from the reserved
+   immutable claim. The status component retains its prior behavior.
+2. One observer-session reevaluation-owed Boolean records publication absorbed by a non-schedulable
+   attempt. Safe release paths drain that one-shot debt rather than waiting for another target edge.
+3. The emptied-queue cancellation path phase-checks an existing `.cancelledBeforeDispatch` tombstone,
+   so a repeated cancellation cannot clear the transport fence while preparation may still acquire.
+
+The larger root cause remains accepted deferred work: **the status wake attempt stays mutable after its
+provider claim is immutable, and the tombstone that fences an in-flight dispatch lives in the same
+single slot as the live attempt.** A future general remedy is one immutable in-flight dispatch record
+on `AgentTabSession`, separate from the mutable reservation. The bounded attention fixes must be
+absorbed into that record rather than duplicated. The general non-idempotent-cancel refactor beyond the
+single phase guard also remains deferred.
+
+The feature intentionally has no reason payload, priority, broadcast, idempotency ledger, persistence,
+expiry, cooldown, target-side cancellation, delivery-ack API, reciprocal-link detector, new capability,
+new tool, per-caller schema variants, target-side prompt supplement, inbound inventory operation,
+generic reverse-send channel, provider-adapter changes, or broad immutable-dispatch refactor. These are
+YAGNI non-goals, not missing pieces to infer from the attention operation.

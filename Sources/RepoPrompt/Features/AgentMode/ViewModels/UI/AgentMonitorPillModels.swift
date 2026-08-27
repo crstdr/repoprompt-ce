@@ -237,20 +237,25 @@ enum AgentMonitorAutoWakeCopy {
     /// activity that is itself an update, so a chain — including two sessions the user pointed at each
     /// other — is a real outcome of turning this on. Leaving the old sentence in place would be the
     /// worst version of this control: a bounded-sounding promise next to unbounded behaviour. The
-    /// three existing controls that actually stop it are named instead of a new setting.
+    /// existing effective-selection and unlink controls that actually stop it are named instead of
+    /// a new setting.
     static let tooltip = """
     Status updates for these sessions are always attached to this agent’s next turn. Turning this on \
-    additionally lets RepoPrompt start one follow-up turn per update: a busy agent finishes its \
-    current and already-accepted work first, and that turn’s own activity can be an update in its \
-    own right — so follow-ups can continue, and two sessions that oversee each other can keep waking \
-    one another. Snooze a lane, deselect it, or unlink to stop that. The setting applies to this \
-    session rather than to individual links. Off by default, and saved with this session even when \
-    it oversees nothing.
+    additionally lets RepoPrompt start one follow-up turn for a status update or an explicit \
+    attention request: a busy agent finishes its current and already-accepted work first. A \
+    follow-up turn can create another update or attention request, so follow-ups can continue; one \
+    oversight link can sustain a feedback loop, and sessions that oversee each other can keep waking \
+    one another. Snoozing a lane pauses status-triggered wakes only — an explicit attention request \
+    from that session can bypass only that snooze. A lane can wake automatically only while selected, \
+    either by this master switch or by its own lane toggle. To prevent any automatic wake from it, \
+    turn this switch off and deselect that lane, or unlink it. The setting applies to this session \
+    rather than to individual links. Off by default, and saved with this session even when it \
+    oversees nothing.
     """
     static let accessibilityLabel = "Auto-wake on all updates"
     static let accessibilityHint = """
-    Lets RepoPrompt start one follow-up turn when overseen sessions change status; status updates \
-    are attached to your own next turn either way
+    Lets RepoPrompt start follow-up turns for selected linked sessions’ status changes and explicit \
+    attention requests; status updates are attached to your own next turn either way
     """
     static let unavailableMessage = "That Agent session is no longer active."
     /// Shown with zero links, where the setting is saved but has nothing to act on yet.
@@ -312,7 +317,7 @@ struct AgentMonitorAutoWakeSnoozeState: Equatable {
 /// so offering a choice that would not move the deadline is not unsafe — it is just a control that
 /// silently does nothing, which is what this hides.
 enum AgentMonitorAutoWakeSnoozeCopy {
-    static let menuLabel = "Snooze Auto-wake\u{2026}"
+    static let menuLabel = "Snooze status Auto-wake\u{2026}"
     static let clearLabel = "Clear"
 
     /// Shown between local expiry and the authoritative repaint that removes the row.
@@ -320,11 +325,13 @@ enum AgentMonitorAutoWakeSnoozeCopy {
     /// Deliberately not "delivering", "sending", or "waking": expiry promises exactly one ordinary
     /// re-evaluation, and the usual readiness, authority, selection, and suppression gates decide
     /// whether anything happens at all.
-    static let expired = "Auto-wake snooze expired \u{00B7} Re-evaluating eligibility\u{2026}"
+    static let expired = "Status Auto-wake snooze expired \u{00B7} Re-evaluating eligibility\u{2026}"
 
     /// The one informational — not failed — outcome a set or extension can report.
-    static let currentDispatchAlreadyStarted =
-        "Current Auto-wake already started. This snooze applies to later updates."
+    static let currentDispatchAlreadyStarted = """
+    Current Auto-wake already started. This snooze applies only to later status-triggered wakes; \
+    explicit attention requests can still wake the observer.
+    """
 
     static let unavailableMessage = "That oversight link is no longer active."
 
@@ -349,9 +356,19 @@ enum AgentMonitorAutoWakeSnoozeCopy {
     /// of every intermediate change — and a lane that ends where it started leaves nothing at all.
     /// “Collected” reads as an exhaustive history the reducer has never kept.
     static let menuTooltip = """
-    Stops this session\u{2019}s updates from starting an automatic follow-up turn for a while. They stay \
-    coalesced into the pending summary, they still ride along with your next turn, and clearing or \
-    expiry only lets RepoPrompt re-evaluate \u{2014} it never forces a turn.
+    Stops this session\u{2019}s status updates from starting an automatic follow-up turn for a while. \
+    They stay coalesced into the pending summary and still ride along with your next turn. An \
+    explicit attention request from this session can bypass only this snooze. A lane can wake \
+    automatically only while selected by the master switch or its own lane toggle. To prevent any \
+    automatic wake from it, turn the master switch off and deselect this lane, or unlink it. Clearing \
+    or expiry only lets RepoPrompt re-evaluate \u{2014} it never forces a turn.
+    """
+
+    static let accessibilityHint = """
+    Pauses status-triggered wakes only. An explicit attention request can bypass only this snooze. A \
+    lane can wake automatically only while selected by the master switch or its own lane toggle. To \
+    prevent any automatic wake from it, turn the master switch off and deselect this lane, or unlink \
+    it.
     """
 
     /// Who set the current deadline, phrased for the row rather than for the wire.
@@ -362,10 +379,10 @@ enum AgentMonitorAutoWakeSnoozeCopy {
         }
     }
 
-    /// `Auto-wake snoozed by you \u{00B7} 9 min left`, or the expiring state once local time passes it.
+    /// `Status Auto-wake snoozed by you \u{00B7} 9 min left`, or the expiring state once local time passes it.
     static func subrow(_ state: AgentMonitorAutoWakeSnoozeState, now: Date) -> String {
         guard !state.hasExpired(now: now) else { return expired }
-        return "Auto-wake snoozed by \(originPhrase(state.origin)) \u{00B7} "
+        return "Status Auto-wake snoozed by \(originPhrase(state.origin)) \u{00B7} "
             + "\(state.remainingMinutes(now: now)) min left"
     }
 
@@ -447,17 +464,17 @@ enum AgentMonitorAutoWakeSnoozeCopy {
         isExtension: Bool
     ) -> String {
         isExtension
-            ? "Extend Auto-wake snooze for \(displayName) to at least "
+            ? "Extend status Auto-wake snooze for \(displayName) to at least "
             + "\(minutes(forSeconds: seconds)) minutes from now"
-            : "Snooze Auto-wake for \(displayName) for \(minutes(forSeconds: seconds)) minutes"
+            : "Snooze status Auto-wake for \(displayName) for \(minutes(forSeconds: seconds)) minutes"
     }
 
     static func menuAccessibilityLabel(displayName: String) -> String {
-        "Snooze Auto-wake for \(displayName)"
+        "Snooze status Auto-wake for \(displayName)"
     }
 
     static func clearActionLabel(displayName: String) -> String {
-        "Clear Auto-wake snooze for \(displayName)"
+        "Clear status Auto-wake snooze for \(displayName)"
     }
 }
 

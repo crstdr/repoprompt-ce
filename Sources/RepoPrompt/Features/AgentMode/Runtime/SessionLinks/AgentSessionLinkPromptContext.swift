@@ -12,8 +12,18 @@ struct AgentSessionLinkPromptInventoryItem: Hashable {
     let targetSessionID: UUID
     let displayName: String?
     let capabilityNames: [String]
+    /// Hidden exact-grant identity used only to fence passive attention delivery.
+    ///
+    /// It is never rendered. Fixtures may omit it, but an attention request then fails closed rather
+    /// than falling back to the target UUID and accidentally surviving unlink/relink.
+    let reference: DomainAgentSessionLinkReference?
 
-    init(targetSessionID: UUID, displayName: String?, capabilityNames: [String]) {
+    init(
+        targetSessionID: UUID,
+        displayName: String?,
+        capabilityNames: [String],
+        reference: DomainAgentSessionLinkReference? = nil
+    ) {
         self.targetSessionID = targetSessionID
         // Re-normalized here rather than trusted from the authority: the renderer's byte budget is
         // only meaningful if the caps hold at the exact value it renders.
@@ -22,6 +32,7 @@ struct AgentSessionLinkPromptInventoryItem: Hashable {
             maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
         )
         self.capabilityNames = capabilityNames.sorted()
+        self.reference = reference
     }
 }
 
@@ -54,7 +65,11 @@ struct AgentSessionLinkPromptInventory: Hashable {
                 AgentSessionLinkPromptInventoryItem(
                     targetSessionID: item.targetSessionID,
                     displayName: item.displayName,
-                    capabilityNames: item.capabilityNames
+                    capabilityNames: item.capabilityNames,
+                    reference: DomainAgentSessionLinkReference(
+                        linkID: item.linkID,
+                        generation: item.generation
+                    )
                 )
             }
         )
@@ -532,6 +547,8 @@ struct AgentSessionLinkPromptRenderResult {
     struct RenderedPassiveBatch: Equatable {
         /// Entries actually rendered into `fragment`, in the order they appear.
         let entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry]
+        /// Attention requests actually rendered into `fragment`, including immutable occurrences.
+        let attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest]
         /// The absolute producer-side overflow watermark the rendered envelope accounted for. Never
         /// the displayed omitted delta, which cannot be acknowledged without under-counting.
         let overflowProducedThrough: UInt64
@@ -542,6 +559,18 @@ struct AgentSessionLinkPromptRenderResult {
         /// acknowledged, while this says whether *this* envelope showed a nonzero omitted count.
         /// Only the renderer knows that, and only the local display sentence consumes it.
         let includesUnattributedOverflow: Bool
+
+        init(
+            entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
+            attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest] = [],
+            overflowProducedThrough: UInt64,
+            includesUnattributedOverflow: Bool
+        ) {
+            self.entries = entries
+            self.attentionRequests = attentionRequests
+            self.overflowProducedThrough = overflowProducedThrough
+            self.includesUnattributedOverflow = includesUnattributedOverflow
+        }
     }
 
     let fragment: String
@@ -590,6 +619,13 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     struct PassiveStatusComponent: Hashable {
         let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
         let receipt: AgentSessionLinkPassiveStatusNotices.Receipt
+        /// Whether this immutable rendered batch actually disclosed unattributed overflow.
+        ///
+        /// Kept beside the receipt because the absolute overflow watermark alone cannot distinguish
+        /// an overflow-bearing envelope from a later batch rendered after that watermark was already
+        /// acknowledged. Auto-wake acquisition consumes this authority bit; display attribution does
+        /// not become load-bearing.
+        let includesUnattributedOverflow: Bool
         /// The lane-guidance revision this fragment actually rendered.
         ///
         /// Travels in the lane component rather than in its own store so it advances at exactly the
@@ -1082,8 +1118,10 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                     deliveredStatuses: renderedPassive.entries.map(
                         AgentSessionLinkPassiveStatusNotices.DeliveredStatus.init
                     ),
+                    deliveredAttentionOccurrences: renderedPassive.attentionRequests.map(\.occurrence),
                     overflowProducedThrough: renderedPassive.overflowProducedThrough
                 ),
+                includesUnattributedOverflow: renderedPassive.includesUnattributedOverflow,
                 guidanceRevision: AgentSessionLinkPrompts.currentLaneGuidanceRevision,
                 // Reference, order, and task come from the rendered entries, so this names the lanes
                 // actually delivered — snoozed and unselected hitchhikers included. The optional
@@ -1210,6 +1248,13 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         else { return nil }
         let granted = Set(inventory.items.map(\.targetSessionID))
         guard snapshot.entries.allSatisfy({ granted.contains($0.targetSessionID) }) else { return nil }
+        guard snapshot.attentionRequests.allSatisfy({ request in
+            request.occurrence.queueEpoch == snapshot.queueEpoch
+                && inventory.items.contains(where: {
+                    $0.targetSessionID == request.targetSessionID
+                        && $0.reference == request.reference
+                })
+        }) else { return nil }
         return snapshot
     }
 
@@ -1361,13 +1406,25 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         }
     }
 
+    /// The immutable claim currently reserved for one exact logical dispatch, if it is still live.
+    ///
+    /// Read-only and side-effect free. Auto-wake's shared physical-acquisition fence uses this to
+    /// bind its attempted attention component to what was actually rendered, rather than to mutable
+    /// queue state absorbed after composition.
+    func pendingClaim(
+        dispatchID: AgentSessionLinkPromptDispatchID,
+        observerSessionID: UUID
+    ) -> AgentSessionLinkOutboundPromptClaim? {
+        states[observerSessionID]?.pending[dispatchID]
+    }
+
     // MARK: Test support
 
     func test_pendingClaim(
         dispatchID: AgentSessionLinkPromptDispatchID,
         observerSessionID: UUID
     ) -> AgentSessionLinkOutboundPromptClaim? {
-        states[observerSessionID]?.pending[dispatchID]
+        pendingClaim(dispatchID: dispatchID, observerSessionID: observerSessionID)
     }
 
     func test_lastAcceptedLaneGuidanceRevision(observerSessionID: UUID) -> UInt64? {
@@ -1403,9 +1460,10 @@ final class AgentSessionLinkOutboundPromptClaimStore {
 
 /// Whether one observing session may be told about its links at all.
 ///
-/// Mirrors Oversee's Add eligibility so a session that could never be advertised
-/// `agent_session_link` is never handed a supplement naming it. Pure and value-based so the whole
-/// matrix is testable without a view model.
+/// Mirrors Oversee's Add eligibility so a session that could never perform outbound observer
+/// operations is never handed an outbound inventory supplement. Catalog visibility is independently
+/// retained by an inbound link. Pure and value-based so the whole matrix is testable without a view
+/// model.
 enum AgentSessionLinkPromptEligibility {
     struct Input: Equatable {
         var isChildSession: Bool

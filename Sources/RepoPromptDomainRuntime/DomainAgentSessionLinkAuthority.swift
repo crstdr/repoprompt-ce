@@ -36,6 +36,69 @@ package actor DomainAgentSessionLinkAuthority {
     /// accumulates a bucket per dead incarnation that nothing will ever read or dismiss. The bound is
     /// what keeps that key space from growing without limit.
     package static let recentRevocationNoticeEndpointLimit = 64
+    /// Maximum observer UUID candidates disclosed when an attention request omits its selector.
+    ///
+    /// The authority may hold any number of inbound links. Bounding this diagnostic projection keeps
+    /// one ambiguous request from turning that authority into an unbounded inventory surface.
+    package static let requestAttentionObserverCandidateLimit = 16
+
+    // MARK: - Inverse attention authorization
+
+    /// Capability-free proof that one exact target may enqueue an attention occurrence for one exact
+    /// observer link generation.
+    ///
+    /// This is deliberately not `DomainAgentSessionLinkLease`: that lease represents an
+    /// observer-origin monitor operation and carries a monitor capability. An attention request runs in
+    /// the inverse direction, and the exact active grant is its whole authority.
+    package struct RequestAttentionAuthorization: Hashable, Sendable {
+        package let runtimeID: UUID
+        package let runtimeGeneration: UInt64
+        package let reference: DomainAgentSessionLinkReference
+        package let observer: DomainAgentSessionLinkEndpointIdentity
+        package let target: DomainAgentSessionLinkEndpointIdentity
+        /// The caller's selector, retained so validation can re-prove the same cardinality after a
+        /// suspension. `nil` means the chosen grant must still be the sole live inbound grant.
+        package let requestedObserverSessionID: UUID?
+        /// Revision the observer-local reducer must already be baselined against before it stores the
+        /// occurrence.
+        package let observerLinkSetRevision: UInt64
+        /// Fences changes to the target's inbound grant set between authorization and reducer mutation.
+        package let targetLinkSetRevision: UInt64
+
+        fileprivate init(
+            runtimeID: UUID,
+            runtimeGeneration: UInt64,
+            reference: DomainAgentSessionLinkReference,
+            observer: DomainAgentSessionLinkEndpointIdentity,
+            target: DomainAgentSessionLinkEndpointIdentity,
+            requestedObserverSessionID: UUID?,
+            observerLinkSetRevision: UInt64,
+            targetLinkSetRevision: UInt64
+        ) {
+            self.runtimeID = runtimeID
+            self.runtimeGeneration = runtimeGeneration
+            self.reference = reference
+            self.observer = observer
+            self.target = target
+            self.requestedObserverSessionID = requestedObserverSessionID
+            self.observerLinkSetRevision = observerLinkSetRevision
+            self.targetLinkSetRevision = targetLinkSetRevision
+        }
+    }
+
+    package enum RequestAttentionAuthorizationError: Error, Equatable, Sendable {
+        /// Indistinguishable absence, stale routing, or authorization denial.
+        case denied
+        /// More than one exact live grant can satisfy the request.
+        ///
+        /// Candidate UUIDs are returned only for an omitted selector. An explicit UUID ambiguity uses
+        /// an empty array so it cannot enumerate any other observer.
+        case ambiguousObserver(
+            candidateObserverSessionIDs: [UUID],
+            omittedCandidateCount: Int
+        )
+        case runtimeShuttingDown
+    }
 
     // MARK: - Internal records
 
@@ -50,6 +113,12 @@ package actor DomainAgentSessionLinkAuthority {
         var waitCursorOrder: [String] = []
         /// At most one active waiter per link generation.
         var activeWaiterID: UUID?
+    }
+
+    private enum RequestAttentionSelection {
+        case selected(LinkRecord)
+        case denied
+        case ambiguous(candidateObserverSessionIDs: [UUID], omittedCandidateCount: Int)
     }
 
     private struct TargetRecord {
@@ -555,9 +624,10 @@ package actor DomainAgentSessionLinkAuthority {
 
     /// Whether one exact observer incarnation currently holds an outbound link.
     ///
-    /// This is the live input to dynamic tool advertisement and to targetless `list` authorization,
-    /// so it is endpoint-scoped: a second live incarnation of the same session UUID must not inherit
-    /// the advertised tool or the inventory of the incarnation the user granted.
+    /// This is the live input to outbound readiness and targetless `list` authorization, so it is
+    /// endpoint-scoped: a second live incarnation of the same session UUID must not inherit the
+    /// outbound inventory of the incarnation the user granted. Catalog visibility uses
+    /// `hasActiveLink(endpoint:)` independently.
     ///
     /// There is deliberately **no** session-UUID overload. Every caller of this predicate is deciding
     /// whether a live caller may be granted a capability, and a UUID-scoped answer would say yes to
@@ -572,6 +642,134 @@ package actor DomainAgentSessionLinkAuthority {
         links.values.contains { record in
             record.grant.observer == endpoint || record.grant.target == endpoint
         }
+    }
+
+    /// Authorizes the fixed inverse attention signal from one exact target endpoint.
+    ///
+    /// `liveEndpoints` is the bridge's already-resolved endpoint set. Stale exact observer or target
+    /// incarnations are removed before selector cardinality is decided, so a dead grant cannot turn a
+    /// sole live observer into a false ambiguity. The grant itself is the authority; this path never
+    /// consults the observer-origin operation authorizer and never mints or checks a capability.
+    package func authorizeRequestAttention(
+        requesterEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        observerSessionID: UUID? = nil,
+        liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+    ) -> Result<RequestAttentionAuthorization, RequestAttentionAuthorizationError> {
+        guard !isDraining, !isShutDown else { return .failure(.runtimeShuttingDown) }
+
+        switch requestAttentionSelection(
+            requesterEndpoint: requesterEndpoint,
+            observerSessionID: observerSessionID,
+            liveEndpoints: liveEndpoints
+        ) {
+        case let .selected(record):
+            let grant = record.grant
+            return .success(RequestAttentionAuthorization(
+                runtimeID: runtimeID,
+                runtimeGeneration: runtimeGeneration,
+                reference: DomainAgentSessionLinkReference(
+                    linkID: grant.id,
+                    generation: grant.generation
+                ),
+                observer: grant.observer,
+                target: grant.target,
+                requestedObserverSessionID: observerSessionID,
+                observerLinkSetRevision: observerLinkSetRevisions[grant.observer.sessionID] ?? 0,
+                targetLinkSetRevision: targetLinkSetRevisions[grant.target.sessionID] ?? 0
+            ))
+        case .denied:
+            return .failure(.denied)
+        case let .ambiguous(candidateObserverSessionIDs, omittedCandidateCount):
+            return .failure(.ambiguousObserver(
+                candidateObserverSessionIDs: candidateObserverSessionIDs,
+                omittedCandidateCount: omittedCandidateCount
+            ))
+        }
+    }
+
+    /// Revalidates an inverse attention proof immediately before observer-local reducer mutation.
+    ///
+    /// Besides runtime and exact generation fencing, this repeats the original selector decision using
+    /// the caller's current live endpoint set. That repetition is load-bearing: a previously stale
+    /// sibling grant can become live without changing authority membership, and must make a formerly
+    /// sole or uniquely selected observer ambiguous before any occurrence is stored.
+    package func validateRequestAttentionAuthorization(
+        _ authorization: RequestAttentionAuthorization,
+        liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+    ) -> RequestAttentionAuthorizationError? {
+        guard !isDraining, !isShutDown else { return .runtimeShuttingDown }
+        guard authorization.runtimeID == runtimeID,
+              authorization.runtimeGeneration == runtimeGeneration,
+              authorization.observerLinkSetRevision
+              == (observerLinkSetRevisions[authorization.observer.sessionID] ?? 0),
+              authorization.targetLinkSetRevision
+              == (targetLinkSetRevisions[authorization.target.sessionID] ?? 0)
+        else { return .denied }
+
+        switch requestAttentionSelection(
+            requesterEndpoint: authorization.target,
+            observerSessionID: authorization.requestedObserverSessionID,
+            liveEndpoints: liveEndpoints
+        ) {
+        case let .selected(record):
+            let grant = record.grant
+            guard grant.id == authorization.reference.linkID,
+                  grant.generation == authorization.reference.generation,
+                  grant.observer == authorization.observer,
+                  grant.target == authorization.target
+            else { return .denied }
+            return nil
+        case .denied:
+            return .denied
+        case let .ambiguous(candidateObserverSessionIDs, omittedCandidateCount):
+            return .ambiguousObserver(
+                candidateObserverSessionIDs: candidateObserverSessionIDs,
+                omittedCandidateCount: omittedCandidateCount
+            )
+        }
+    }
+
+    /// Selects one exact live inbound grant under request-attention's optional observer selector.
+    ///
+    /// The exact target inventory read is intentional. A UUID-scoped target inventory would let a
+    /// rebound caller inherit the previous incarnation's inbound grants.
+    private func requestAttentionSelection(
+        requesterEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        observerSessionID: UUID?,
+        liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+    ) -> RequestAttentionSelection {
+        let inbound = links(forTargetEndpoint: requesterEndpoint)
+        let liveRecords = inbound.items.compactMap { item -> LinkRecord? in
+            guard let record = links[item.linkID],
+                  record.grant.generation == item.generation,
+                  record.grant.target == requesterEndpoint,
+                  liveEndpoints.contains(record.grant.target),
+                  liveEndpoints.contains(record.grant.observer)
+            else { return nil }
+            return record
+        }
+
+        if let observerSessionID {
+            let matches = liveRecords.filter { $0.grant.observer.sessionID == observerSessionID }
+            guard !matches.isEmpty else { return .denied }
+            guard matches.count == 1 else {
+                // Explicit denials and ambiguities never enumerate observers.
+                return .ambiguous(candidateObserverSessionIDs: [], omittedCandidateCount: 0)
+            }
+            return .selected(matches[0])
+        }
+
+        guard !liveRecords.isEmpty else { return .denied }
+        guard liveRecords.count == 1 else {
+            let allCandidateIDs = Set(liveRecords.map { $0.grant.observer.sessionID })
+                .sorted { $0.uuidString < $1.uuidString }
+            let candidateIDs = Array(allCandidateIDs.prefix(Self.requestAttentionObserverCandidateLimit))
+            return .ambiguous(
+                candidateObserverSessionIDs: candidateIDs,
+                omittedCandidateCount: allCandidateIDs.count - candidateIDs.count
+            )
+        }
+        return .selected(liveRecords[0])
     }
 
     // MARK: - Authorization

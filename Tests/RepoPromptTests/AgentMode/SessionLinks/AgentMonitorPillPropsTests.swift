@@ -531,14 +531,15 @@ final class AgentMonitorPillPropsTests: XCTestCase {
 
     /// The switch is the only place the user learns what auto-wake does, so its copy has to carry the
     /// whole contract — and in particular the halves that are easy to assume wrongly: updates arrive
-    /// either way, a busy agent is never interrupted, and follow-up turns *can* continue.
+    /// either way, a busy agent is never interrupted, follow-up turns *can* continue, and attention
+    /// bypasses only Snooze while effective lane selection remains required.
     ///
     /// That last one used to read "automatic turns never chain", which was a transport guarantee that
     /// no longer exists. A follow-up turn may act on the user's standing instruction and produce
     /// activity that is itself an update, and two sessions the user explicitly pointed at each other
     /// can keep waking one another. A bounded-sounding promise beside unbounded behaviour is worse
     /// than no promise, so the copy states the outcome and names the controls that stop it.
-    func testAutoWakeCopyStatesTheAlwaysOnAndBoundedFollowUpContract() {
+    func testAutoWakeCopyStatesDeliveryAttentionAndEffectiveSelectionContract() {
         let tooltip = AgentMonitorAutoWakeCopy.tooltip
         XCTAssertTrue(
             tooltip.contains("always attached"),
@@ -558,8 +559,16 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             tooltip.contains("oversee each other can keep waking"),
             "reciprocal grants are the case a user is most likely to create by accident"
         )
-        // No new setting was added, so the copy has to point at the controls that already exist.
-        XCTAssertTrue(tooltip.contains("Snooze a lane, deselect it, or unlink"))
+        XCTAssertTrue(tooltip.contains("one oversight link can sustain a feedback loop"))
+        XCTAssertTrue(tooltip.contains("explicit attention request"))
+        XCTAssertTrue(tooltip.contains("Snoozing a lane pauses status-triggered wakes only"))
+        XCTAssertTrue(tooltip.contains("can bypass only that snooze"))
+        // No new setting was added. Snooze is deliberately excluded from effective lane selection,
+        // which remains required for both status and attention-triggered admission.
+        XCTAssertTrue(tooltip.contains("selected, either by this master switch or by its own lane toggle"))
+        XCTAssertTrue(tooltip.contains("turn this switch off and deselect that lane"))
+        XCTAssertTrue(tooltip.contains("unlink"))
+        XCTAssertFalse(tooltip.contains("Snooze a lane, deselect it, or unlink to stop"))
         XCTAssertTrue(
             tooltip.contains("this session"),
             "the scope is the observer session, not a link and not a global preference"
@@ -572,6 +581,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             AgentMonitorAutoWakeCopy.accessibilityHint.contains("either way"),
             "VoiceOver users must get the same contract, not just the label"
         )
+        XCTAssertTrue(AgentMonitorAutoWakeCopy.accessibilityHint.contains("explicit attention requests"))
         // Zero links is a real, saved state, and the note has to say so rather than read as an error.
         XCTAssertTrue(AgentMonitorAutoWakeCopy.noLinksNote.contains("Saved with this session"))
     }
@@ -1026,14 +1036,14 @@ final class AgentMonitorPillPropsTests: XCTestCase {
                 snooze(minutesFromNow: 9, origin: .user, now: now),
                 now: now
             ),
-            "Auto-wake snoozed by you · 9 min left"
+            "Status Auto-wake snoozed by you · 9 min left"
         )
         XCTAssertEqual(
             AgentMonitorAutoWakeSnoozeCopy.subrow(
                 snooze(minutesFromNow: 8.2, origin: .agent, now: now),
                 now: now
             ),
-            "Auto-wake snoozed by this agent · 9 min left"
+            "Status Auto-wake snoozed by this agent · 9 min left"
         )
         // Seconds left is still left.
         XCTAssertEqual(
@@ -1041,7 +1051,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
                 snooze(minutesFromNow: 0.1, origin: .user, now: now),
                 now: now
             ),
-            "Auto-wake snoozed by you · 1 min left"
+            "Status Auto-wake snoozed by you · 1 min left"
         )
     }
 
@@ -1050,7 +1060,10 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         let now = moment(hour: 16, minute: 11)
         let elapsed = snooze(minutesFromNow: -1, now: now)
         XCTAssertTrue(elapsed.hasExpired(now: now))
-        XCTAssertEqual(AgentMonitorAutoWakeSnoozeCopy.subrow(elapsed, now: now), "Auto-wake snooze expired · Re-evaluating eligibility…")
+        XCTAssertEqual(
+            AgentMonitorAutoWakeSnoozeCopy.subrow(elapsed, now: now),
+            "Status Auto-wake snooze expired · Re-evaluating eligibility…"
+        )
         XCTAssertEqual(
             AgentMonitorAutoWakeSnoozeCopy.accessibilityValue(
                 elapsed,
@@ -1108,16 +1121,40 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertFalse(tomorrow.contains("today"))
     }
 
+    /// The visible label and both assistive/help surfaces must scope Snooze to status admission. The
+    /// exception and its effective-selection controls are repeated in both places because hover help
+    /// is unavailable to a VoiceOver-only user.
+    func testSnoozeCopyScopesVisibleAndAccessiblePromisesAndNamesEffectiveSelectionControls() {
+        XCTAssertEqual(AgentMonitorAutoWakeSnoozeCopy.menuLabel, "Snooze status Auto-wake…")
+
+        for copy in [
+            AgentMonitorAutoWakeSnoozeCopy.menuTooltip,
+            AgentMonitorAutoWakeSnoozeCopy.accessibilityHint
+        ] {
+            XCTAssertTrue(copy.contains("status"))
+            XCTAssertTrue(copy.contains("explicit attention request"))
+            XCTAssertTrue(copy.contains("can bypass only this snooze"))
+            XCTAssertTrue(copy.contains("selected by the master switch or its own lane toggle"))
+            XCTAssertTrue(copy.contains("turn the master switch off and deselect this lane"))
+            XCTAssertTrue(copy.contains("unlink"))
+        }
+
+        XCTAssertFalse(
+            AgentMonitorAutoWakeSnoozeCopy.menuTooltip
+                .contains("Stops this session’s updates from starting")
+        )
+    }
+
     /// Action labels name the target, because four visually identical controls per row are
     /// indistinguishable in the rotor without it.
     func testSnoozeActionLabelsNameTheTargetAndDistinguishSettingFromExtending() {
         let now = moment(hour: 16, minute: 11)
         let fresh = outbound(isAutoWakeEffectivelySelected: true)
-        XCTAssertEqual(fresh.snoozeMenuAccessibilityLabel, "Snooze Auto-wake for Build API")
-        XCTAssertEqual(fresh.clearSnoozeActionLabel, "Clear Auto-wake snooze for Build API")
+        XCTAssertEqual(fresh.snoozeMenuAccessibilityLabel, "Snooze status Auto-wake for Build API")
+        XCTAssertEqual(fresh.clearSnoozeActionLabel, "Clear status Auto-wake snooze for Build API")
         XCTAssertEqual(
             fresh.snoozeActionLabel(seconds: 600, now: now),
-            "Snooze Auto-wake for Build API for 10 minutes"
+            "Snooze status Auto-wake for Build API for 10 minutes"
         )
         XCTAssertEqual(fresh.snoozeOptionLabel(seconds: 1200, now: now), "Snooze for 20 minutes")
 
@@ -1133,7 +1170,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         )
         XCTAssertEqual(
             active.snoozeActionLabel(seconds: 1200, now: now),
-            "Extend Auto-wake snooze for Build API to at least 20 minutes from now"
+            "Extend status Auto-wake snooze for Build API to at least 20 minutes from now"
         )
     }
 
@@ -1174,7 +1211,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     func testRowFeedbackSeparatesTheTooLateNoticeFromRealFailures() {
         XCTAssertEqual(
             AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted,
-            "Current Auto-wake already started. This snooze applies to later updates."
+            "Current Auto-wake already started. This snooze applies only to later "
+                + "status-triggered wakes; explicit attention requests can still wake the observer."
         )
         let notice = AgentMonitorRowFeedback.notice(
             AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted

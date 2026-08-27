@@ -236,6 +236,19 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
             ),
             "a wake must be claimable with the lane batch it exists to deliver"
         )
+        var preparing = try XCTUnwrap(node.session.pendingOversightAutoWake)
+        XCTAssertEqual(preparing.wakeID, wakeID)
+        preparing.task?.cancel()
+        preparing.task = nil
+        preparing.phase = .preparingDispatch
+        node.session.pendingOversightAutoWake = preparing
+        XCTAssertTrue(
+            node.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+                for: node.session,
+                dispatchID: claim.dispatchID
+            ),
+            "the idle follow-up must cross the shared immutable-claim acquisition fence"
+        )
         node.viewModel.acceptAgentSessionLinkPromptClaim(claim)
         XCTAssertNil(node.session.pendingOversightAutoWake, "an accepted wake settles")
     }

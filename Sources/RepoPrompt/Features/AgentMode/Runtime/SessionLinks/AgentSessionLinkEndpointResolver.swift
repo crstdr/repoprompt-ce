@@ -355,7 +355,7 @@ enum AgentSessionLinkEndpointEligibility {
     static let roleDeniedReason = "This session can’t oversee other sessions."
 
     /// A target only has to be a live, exactly-bound, top-level session. It does **not** need
-    /// outbound tool eligibility, because being observed grants it nothing.
+    /// outbound observer-operation eligibility, because being observed grants no outbound authority.
     ///
     /// Ordered so the most specific, most actionable reason wins. The UUID resolver owns not-found
     /// and ambiguity, then delegates its unique candidate here; exact sidebar projection and Add

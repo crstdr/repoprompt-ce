@@ -140,7 +140,7 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
         let fixture = try makeFixture()
         XCTAssertFalse(
             try publishedRow(fixture).isAutoWakeEffectivelySelected,
-            "an observer with Auto-wake off has no lane that could admit a turn"
+            "master Auto-wake off plus no granular lane selection leaves the lane unable to admit"
         )
 
         fixture.session.agentSessionLinkAutoWakeTargetSessionIDs = [fixture.targetSessionID]

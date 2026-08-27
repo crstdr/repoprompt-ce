@@ -395,13 +395,14 @@ struct AgentMonitorPopoverView: View {
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .accessibilityLabel("Auto-wake snooze")
+                        .accessibilityLabel("Status Auto-wake snooze")
                         // Spoken from the same instant the text is drawn from, and deliberately not a
                         // live region: a minute tick is not news, and announcing every countdown step
                         // would make the row unusable with VoiceOver.
                         .accessibilityValue(
                             AgentMonitorAutoWakeSnoozeCopy.accessibilityValue(snooze, now: now)
                         )
+                        .accessibilityHint(AgentMonitorAutoWakeSnoozeCopy.accessibilityHint)
                     Button(AgentMonitorAutoWakeSnoozeCopy.clearLabel) {
                         mutateAutoWakeSnooze(row, command: .clear)
                     }
@@ -446,6 +447,7 @@ struct AgentMonitorPopoverView: View {
         .disabled(isBusy)
         .hoverTooltip(AgentMonitorAutoWakeSnoozeCopy.menuTooltip, .top)
         .accessibilityLabel(row.snoozeMenuAccessibilityLabel)
+        .accessibilityHint(AgentMonitorAutoWakeSnoozeCopy.accessibilityHint)
     }
 
     /// Unlink remains independent from the location-only View affordance and the New control.

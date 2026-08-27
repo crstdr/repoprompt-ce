@@ -1084,7 +1084,8 @@ actor ServerNetworkManager {
     private var toolObserverUnregistrationsByRunID: [UUID: ToolObserverUnregistrationState] = [:]
     #if DEBUG
         private var debugBeforeToolEventObserverDeliveryForTesting: (@Sendable () async -> Void)?
-        private var debugActiveSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
+        private var debugAnyActiveSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
+        private var debugOutboundSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
     #endif
 
     // Per-connection restriction + routing state
@@ -2252,8 +2253,10 @@ actor ServerNetworkManager {
 
     /// Live additional grants that are **not** part of any installed run policy.
     ///
-    /// `agent_session_link` is advertised and callable only while the exact caller Agent session
-    /// currently holds at least one active outbound oversight link. The grant is therefore recomputed
+    /// `agent_session_link` is advertised and callable while the exact caller Agent session currently
+    /// holds at least one active link in either direction. This catalog grant is distinct from outbound
+    /// observer authority: list/read/send and observer readiness remain outbound-only, while an
+    /// inbound-only endpoint can reach self-scoped and inverse operations. Both facts are recomputed
     /// from the domain link authority on every `tools/list` and `tools/call` rather than cached in
     /// connection policy: link membership changes at user speed and in another window, so a cached
     /// grant would either linger after revocation or lag after an add.
@@ -2268,10 +2271,13 @@ actor ServerNetworkManager {
     /// incarnation the user never granted anything to.
     private struct LiveSessionLinkGrantSnapshot: Equatable {
         let routeToken: AgentSessionLinkRunCatalogRouteToken
+        /// Catalog reachability only. This confers no outbound observer authority.
+        let hasAnyActiveLink: Bool
+        /// Kept separate for observer prompt/catalog readiness and outbound operations.
         let hasActiveOutboundLink: Bool
 
         var additionalGrants: Set<String> {
-            hasActiveOutboundLink ? [MCPWindowToolName.agentSessionLink] : []
+            hasAnyActiveLink ? [MCPWindowToolName.agentSessionLink] : []
         }
     }
 
@@ -2289,16 +2295,27 @@ actor ServerNetworkManager {
         else {
             return nil
         }
+        let hasAnyActiveLink: Bool
         let hasActiveOutboundLink: Bool
         #if DEBUG
-            if let debugActiveSessionLinkEndpointsForTesting {
-                hasActiveOutboundLink = debugActiveSessionLinkEndpointsForTesting.contains(routeToken.observerEndpoint)
+            if let debugAnyActiveSessionLinkEndpointsForTesting {
+                hasAnyActiveLink = debugAnyActiveSessionLinkEndpointsForTesting.contains(routeToken.observerEndpoint)
+            } else {
+                hasAnyActiveLink = await AgentSessionLinkRuntimeBridge.shared.hasActiveLink(
+                    endpoint: routeToken.observerEndpoint
+                )
+            }
+            if let debugOutboundSessionLinkEndpointsForTesting {
+                hasActiveOutboundLink = debugOutboundSessionLinkEndpointsForTesting.contains(routeToken.observerEndpoint)
             } else {
                 hasActiveOutboundLink = await AgentSessionLinkRuntimeBridge.shared.hasActiveOutboundLink(
                     observerEndpoint: routeToken.observerEndpoint
                 )
             }
         #else
+            hasAnyActiveLink = await AgentSessionLinkRuntimeBridge.shared.hasActiveLink(
+                endpoint: routeToken.observerEndpoint
+            )
             hasActiveOutboundLink = await AgentSessionLinkRuntimeBridge.shared.hasActiveOutboundLink(
                 observerEndpoint: routeToken.observerEndpoint
             )
@@ -2312,12 +2329,9 @@ actor ServerNetworkManager {
         }
         return LiveSessionLinkGrantSnapshot(
             routeToken: routeToken,
+            hasAnyActiveLink: hasAnyActiveLink,
             hasActiveOutboundLink: hasActiveOutboundLink
         )
-    }
-
-    private func liveSessionLinkAdditionalGrants(connectionID: UUID) async -> Set<String> {
-        await liveSessionLinkGrantSnapshot(connectionID: connectionID)?.additionalGrants ?? []
     }
 
     private func completeRunCatalogObservation(
@@ -2331,8 +2345,9 @@ actor ServerNetworkManager {
         let finalSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
         let routeTokensAgree = finalSnapshot?.routeToken == initialRouteToken
         let routeIsCurrent = routeTokensAgree && finalSnapshot != nil
-        let livePresence = finalSnapshot?.hasActiveOutboundLink ?? false
-        let membershipAgrees = livePresence == returnedSessionLinkPresence
+        let liveCatalogPresence = finalSnapshot?.hasAnyActiveLink ?? false
+        let liveOutboundPresence = finalSnapshot?.hasActiveOutboundLink ?? false
+        let membershipAgrees = liveCatalogPresence == returnedSessionLinkPresence
         let currentRouteToken = runCatalogObservationByRunID[runID]?.routeToken
         // The currently authoritative successor may replace a preserved unready predecessor.
         // A late predecessor completion still fails `routeIsCurrent` and cannot overwrite a
@@ -2343,7 +2358,7 @@ actor ServerNetworkManager {
                 runID: runID,
                 routeToken: routeIsCurrent ? finalSnapshot?.routeToken : nil,
                 hasAgentSessionLink: routeIsCurrent ? returnedSessionLinkPresence : nil,
-                hasActiveOutboundLink: routeIsCurrent ? livePresence : nil,
+                hasActiveOutboundLink: routeIsCurrent ? liveOutboundPresence : nil,
                 supersedesWaiters: false
             )
         }
@@ -2558,9 +2573,10 @@ actor ServerNetworkManager {
 
     /// Re-advertises the catalog for every live connection owned by one Agent session.
     ///
-    /// Used when that session's outbound oversight links change. A target that merely gained an
-    /// inbound observer is deliberately not notified: being observed grants it nothing, so its own
-    /// advertised catalog is unchanged.
+    /// Used when that session's exact inbound or outbound link membership changes. Selection begins
+    /// at session UUID scope because one UUID can own several live runs, but every candidate connection
+    /// recomputes against its full routed endpoint before a notification is emitted. A duplicate
+    /// incarnation therefore receives no catalog grant from the incarnation the user linked.
     func notifyToolListChangedForAgentSession(_ sessionID: UUID) async {
         let candidateRunIDs = runPolicyStateByRunID.compactMap { runID, state -> (UUID, Int, UUID)? in
             guard state.purpose == .agentModeRun, let tabID = state.tabID else { return nil }
@@ -2584,8 +2600,10 @@ actor ServerNetworkManager {
             let snapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
             let observation = runCatalogObservationByRunID[runID]
             let routeToken = snapshot?.routeToken
+            let hasAnyActiveLink = snapshot?.hasAnyActiveLink
             let hasActiveOutboundLink = snapshot?.hasActiveOutboundLink
             if observation?.routeToken == routeToken,
+               observation?.hasAgentSessionLink == hasAnyActiveLink,
                observation?.hasActiveOutboundLink == hasActiveOutboundLink
             {
                 continue
@@ -2616,7 +2634,8 @@ actor ServerNetworkManager {
         restricted: Set<String>,
         additional: Set<String>,
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
-        allowsAgentExternalControlTools: Bool
+        allowsAgentExternalControlTools: Bool,
+        hasExactAgentSessionLinkGrant: Bool = false
     ) -> MCPDomainClientPolicySnapshot {
         let role: MCPClientTaskRole = switch taskLabelKind {
         case .explore:
@@ -2630,7 +2649,8 @@ actor ServerNetworkManager {
             restrictedToolNames: restricted,
             additionalToolNames: additional,
             role: role,
-            allowsAgentExternalControlTools: allowsAgentExternalControlTools
+            allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+            hasExactAgentSessionLinkGrant: hasExactAgentSessionLinkGrant
         )
     }
 
@@ -9965,33 +9985,25 @@ actor ServerNetworkManager {
             let disabled = await MainActor.run {
                 ToolAvailabilityStore.shared.effectiveDisabledTools
             }
-            let catalog = await domainHost.catalogSnapshot()
             let policy = effectivePolicyState(for: connectionID)
             let sessionLinkGrantSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
-            let restricted = policy.restricted
-            let additionalTools = policy.additional.union(
-                sessionLinkGrantSnapshot?.additionalGrants ?? []
+            let domainPolicy = Self.domainPolicySnapshot(
+                restricted: policy.restricted,
+                additional: policy.additional.union(
+                    sessionLinkGrantSnapshot?.additionalGrants ?? []
+                ),
+                taskLabelKind: policy.taskLabelKind,
+                allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+                hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true
             )
-
-            guard isEnabledState else { return [] }
-            let names: [String] = catalog.definitions.compactMap { definition in
-                guard !disabled.contains(definition.name),
-                      !restricted.contains(definition.name)
-                else { return nil }
-
-                if MCPPolicyGatedTools.names.contains(definition.name),
-                   !additionalTools.contains(definition.name)
-                {
-                    return nil
-                }
-
-                guard AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                    toolName: definition.name,
-                    taskLabelKind: policy.taskLabelKind,
-                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                ) else { return nil }
-                return definition.name
-            }.sorted()
+            let advertisement = await domainHost.advertisedCatalog(
+                MCPDomainCatalogAdvertisementRequest(
+                    isGloballyEnabled: isEnabledState,
+                    disabledToolNames: disabled,
+                    policy: domainPolicy
+                )
+            )
+            let names = advertisement.definitions.map(\.name).sorted()
             await completeRunCatalogObservation(
                 connectionID: connectionID,
                 initialRouteToken: sessionLinkGrantSnapshot?.routeToken,
@@ -10000,10 +10012,21 @@ actor ServerNetworkManager {
             return names
         }
 
+        /// Compatibility helper for tests whose linked endpoints are all outbound observers.
         func debugSetActiveSessionLinkEndpointsForTesting(
             _ endpoints: Set<DomainAgentSessionLinkEndpointIdentity>?
         ) {
-            debugActiveSessionLinkEndpointsForTesting = endpoints
+            debugAnyActiveSessionLinkEndpointsForTesting = endpoints
+            debugOutboundSessionLinkEndpointsForTesting = endpoints
+        }
+
+        /// Models catalog reachability independently from outbound observer authority.
+        func debugSetSessionLinkCatalogEndpointsForTesting(
+            anyActive: Set<DomainAgentSessionLinkEndpointIdentity>?,
+            outbound: Set<DomainAgentSessionLinkEndpointIdentity>?
+        ) {
+            debugAnyActiveSessionLinkEndpointsForTesting = anyActive
+            debugOutboundSessionLinkEndpointsForTesting = outbound
         }
 
         func debugRunCatalogProjection(for runID: UUID) -> AgentSessionLinkRunCatalogProjection? {
@@ -11421,7 +11444,8 @@ actor ServerNetworkManager {
                     sessionLinkGrantSnapshot?.additionalGrants ?? []
                 ),
                 taskLabelKind: policy.taskLabelKind,
-                allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+                hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true
             )
             // The domain host owns canonical filtering; this app shell retains only
             // purpose-specific schema/description and client annotation projection.
@@ -11730,15 +11754,18 @@ actor ServerNetworkManager {
                 // notification can lag a grant change in either direction, so stale advertisement
                 // must never decide execution. Scoped to the only tool whose grant is live link
                 // state, so no other tool call pays for the lookup or its actor hop.
-                let liveAdditional = toolName == MCPWindowToolName.agentSessionLink
-                    ? await effectivePolicy.additional
-                    .union(liveSessionLinkAdditionalGrants(connectionID: connectionID))
-                    : effectivePolicy.additional
+                let liveSessionLinkGrant = toolName == MCPWindowToolName.agentSessionLink
+                    ? await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+                    : nil
+                let liveAdditional = effectivePolicy.additional.union(
+                    liveSessionLinkGrant?.additionalGrants ?? []
+                )
                 let domainPolicy = Self.domainPolicySnapshot(
                     restricted: effectivePolicy.restricted,
                     additional: liveAdditional,
                     taskLabelKind: effectivePolicy.taskLabelKind,
-                    allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools
+                    allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools,
+                    hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true
                 )
                 do {
                     try await domainHost.evaluateEarlyCallPolicy(
@@ -11819,11 +11846,20 @@ actor ServerNetworkManager {
                     EditFlowPerf.Dimensions(toolName: toolName)
                 )
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.policyGating, policyState) }
+                // Rebuild with a fresh exact link fact. The early grant check and this role/profile
+                // gate are separated by routing work, so carrying the earlier answer would let a
+                // revocation stale-authorize this exception.
+                let liveSessionLinkGrant = toolName == MCPWindowToolName.agentSessionLink
+                    ? await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+                    : nil
                 let domainPolicy = Self.domainPolicySnapshot(
                     restricted: policy.restricted,
-                    additional: policy.additional,
+                    additional: policy.additional.union(
+                        liveSessionLinkGrant?.additionalGrants ?? []
+                    ),
                     taskLabelKind: policy.taskLabelKind,
-                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+                    hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true
                 )
                 preAdmissionDecision = try await domainHost.evaluatePreAdmissionCallPolicy(
                     toolName: toolName,

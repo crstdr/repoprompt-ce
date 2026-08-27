@@ -4,9 +4,10 @@ import RepoPromptDomainRuntime
 /// Effective outbound-oversight eligibility, derived from the canonical tool policy catalog rather
 /// than assumed.
 ///
-/// Oversee's Add button and the agent-facing `agent_session_link` tool must agree: a session whose
-/// effective role could never receive the tool must not be offered a control that promises it can
-/// oversee. Both sides therefore consult the same catalog decision.
+/// Oversee's Add button and the agent-facing `agent_session_link` role filter must agree: a session
+/// whose effective role could never perform outbound observer operations must not be offered a
+/// control that promises it can oversee. Live catalog visibility is decided separately from links in
+/// either direction.
 enum AgentSessionLinkToolPolicy {
     /// Maps an Agent Mode task label onto the canonical MCP client role.
     ///
@@ -23,7 +24,7 @@ enum AgentSessionLinkToolPolicy {
         }
     }
 
-    /// Whether the canonical policy would ever advertise `agent_session_link` to this role.
+    /// Whether the canonical role policy permits outbound monitoring for this role.
     ///
     /// This deliberately checks only the role filter, not the additional-grant gate: the grant is
     /// computed live from active links, so requiring it here would make Add impossible for a session

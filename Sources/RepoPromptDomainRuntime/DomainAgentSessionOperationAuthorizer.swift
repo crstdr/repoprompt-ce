@@ -265,8 +265,9 @@ package enum DomainAgentSessionOperationAuthorizer {
 
     /// Authorizes a targetless oversight operation against the caller's own grant set.
     ///
-    /// `agent_session_link.list` exists only while the caller retains at least one active outbound
-    /// link; after the final revocation the tool is no longer advertised and must not be probed.
+    /// `agent_session_link.list` remains outbound-only even when an inbound link keeps the shared
+    /// tool catalog entry visible. After the final outbound revocation, callers must receive the
+    /// operation-specific denial rather than probe an inventory they no longer hold.
     package static func authorizeObserverScoped(
         operation: DomainAgentSessionTargetOperation,
         caller: DomainAgentSessionCallerIdentity,

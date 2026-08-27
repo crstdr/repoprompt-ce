@@ -2955,6 +2955,59 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(outbound.isEmpty)
     }
 
+    func testDisqualifiedObserverIncarnationDoesNotRevokeLiveSiblingGrants() async {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture) else {
+            return XCTFail("first exact observer link was not created")
+        }
+        let siblingObserver = makeCandidate(
+            windowID: 3,
+            sessionID: fixture.observer.sessionID,
+            displayName: "Planning sibling"
+        )
+        let siblingTarget = makeCandidate(windowID: 4, displayName: "Sibling target")
+        fixture.host.candidates.append(contentsOf: [siblingObserver, siblingTarget])
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: siblingObserver.domainEndpoint,
+            targetEndpoint: siblingTarget.domainEndpoint
+        ) else {
+            return XCTFail("sibling exact observer link was not created")
+        }
+
+        let disqualified = makeCandidate(
+            windowID: fixture.observer.windowID,
+            sessionID: fixture.observer.sessionID,
+            workspaceID: fixture.observer.workspaceID,
+            tabID: fixture.observer.tabID,
+            persistentBindingGeneration: fixture.observer.persistentBindingGeneration,
+            bindingTransitionGeneration: fixture.observer.bindingTransitionGeneration,
+            roleAllowsOutboundMonitoring: false,
+            displayName: fixture.observer.displayName ?? "Planning"
+        )
+        fixture.host.candidates = fixture.host.candidates.map {
+            $0.domainEndpoint == fixture.observer.domainEndpoint ? disqualified : $0
+        }
+
+        let denied = await fixture.bridge.authorizeTarget(
+            operation: .monitorPoll,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        XCTAssertEqual(denied.failure, .denied)
+        let disqualifiedInventory = await fixture.authority.links(
+            forObserverEndpoint: fixture.observer.domainEndpoint
+        )
+        let siblingInventory = await fixture.authority.links(
+            forObserverEndpoint: siblingObserver.domainEndpoint
+        )
+        XCTAssertTrue(disqualifiedInventory.isEmpty)
+        XCTAssertEqual(
+            siblingInventory.items.map(\.targetSessionID),
+            [siblingTarget.sessionID],
+            "one disqualified incarnation must not revoke another exact incarnation's grants"
+        )
+    }
+
     func testTargetlessListIsAlsoReCheckedAgainstObserverCapability() async {
         let fixture = makeFixture()
         _ = await addLink(fixture)

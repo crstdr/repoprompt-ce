@@ -556,10 +556,10 @@ extension AgentModeViewModel {
     /// The last one is what stops a rebound tab from inheriting the previous incarnation's targets
     /// during the window before the bridge republishes.
     ///
-    /// A session whose effective role could never be advertised `agent_session_link` is reported as
-    /// having no links, so it can never receive a supplement that names a tool it cannot call. The
-    /// revision is preserved, which keeps the closing path intact: an observer that already accepted a
-    /// real inventory and then lost eligibility still gets exactly one closing notice.
+    /// A session whose effective role cannot perform outbound observer operations is reported as
+    /// having no outbound inventory, even if an inbound link keeps the shared tool visible. The
+    /// revision is preserved, which keeps the closing path intact: an observer that already accepted
+    /// a real inventory and then lost eligibility still gets exactly one closing notice.
     ///
     /// The eligibility bit travels with the epoch rather than being left implicit in the emptied
     /// inventory, and both are computed from the single `input` below. That pairing is load-bearing:

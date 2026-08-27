@@ -913,12 +913,11 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
-    /// Re-advertises `agent_session_link` for the observer whose outbound grant set just changed.
+    /// Re-advertises `agent_session_link` for either endpoint whose any-link catalog state changed.
     ///
-    /// Only an **observer** membership change can alter an advertised catalog: gaining an inbound
-    /// observer grants the target nothing, and a status change grants nobody anything. Advertisement
-    /// is never authority, so a lost or late notification only costs the observer one stale
-    /// `tools/list`; execution recomputes the grant live.
+    /// Outbound membership still decides observer operations, while any exact inbound or outbound
+    /// grant decides catalog visibility. Advertisement is never authority, so a lost or late
+    /// notification only costs one stale `tools/list`; execution recomputes the exact live grant.
     private func invalidateToolAdvertisement(for event: DomainAgentSessionLinkChangeEvent) async {
         switch event.kind {
         case .activated, .revoked:
@@ -1129,7 +1128,7 @@ final class AgentSessionLinkRuntimeBridge {
                 continue
             }
             await revokeOutboundLinks(
-                observerSessionID: candidate.sessionID,
+                observerEndpoint: candidate.domainEndpoint,
                 reason: .observerNoLongerEligible
             )
         }
@@ -4402,6 +4401,201 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
+    enum AttentionRequestDisposition: Equatable {
+        case accepted
+        case atCapacity
+        /// Candidate UUIDs are present only when the caller omitted `observer_session_id`.
+        case ambiguous(candidateObserverSessionIDs: [UUID]?, omittedCandidateCount: Int)
+        case denied
+        case shuttingDown
+    }
+
+    /// Enqueues one target-originated attention occurrence under an exact inverse grant.
+    ///
+    /// The authority proof is capability-free because this is not an observer operation. Stale exact
+    /// endpoints are pruned before selector cardinality, the selected observer's delivery eligibility
+    /// is checked without changing the target's role requirements, and final proof validation is the
+    /// last suspension point before the already-baselined reducer mutates.
+    func requestAttention(
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        observerSessionID: UUID?
+    ) async -> AttentionRequestDisposition {
+        guard !isFrozenForTermination else { return .shuttingDown }
+        guard let initialCandidates = await attentionCandidatesAfterPruning(
+            targetEndpoint: targetEndpoint
+        ) else {
+            return .denied
+        }
+        let initialLiveEndpoints = Set(initialCandidates.map(\.domainEndpoint))
+
+        let authorization: DomainAgentSessionLinkAuthority.RequestAttentionAuthorization
+        switch await authority.authorizeRequestAttention(
+            requesterEndpoint: targetEndpoint,
+            observerSessionID: observerSessionID,
+            liveEndpoints: initialLiveEndpoints
+        ) {
+        case let .success(value):
+            authorization = value
+        case let .failure(error):
+            return Self.attentionDisposition(for: error, selectorWasOmitted: observerSessionID == nil)
+        }
+
+        guard let host else { return .denied }
+        let registry = AgentSessionDeletionRegistry.shared
+        if registry.isPermanentlyDeleted(sessionID: authorization.target.sessionID) {
+            await invalidate(endpoint: authorization.target, reason: .sessionDeleted)
+            return .denied
+        }
+        if registry.isPermanentlyDeleted(sessionID: authorization.observer.sessionID) {
+            await invalidate(endpoint: authorization.observer, reason: .sessionDeleted)
+            return .denied
+        }
+        if registry.isDeletionInProgress(sessionID: authorization.target.sessionID)
+            || registry.isDeletionInProgress(sessionID: authorization.observer.sessionID)
+        {
+            return .denied
+        }
+
+        var currentCandidates = host.agentSessionLinkCandidates()
+        guard currentCandidates.contains(where: { $0.domainEndpoint == authorization.target }) else {
+            await invalidate(endpoint: authorization.target, reason: .targetIdentityDrift)
+            return .denied
+        }
+        guard let observer = currentCandidates.first(where: {
+            $0.domainEndpoint == authorization.observer
+        }) else {
+            await invalidate(endpoint: authorization.observer, reason: .observerIdentityDrift)
+            return .denied
+        }
+        guard await revalidateObserverCapability(observer) else { return .denied }
+
+        // Capability revalidation may revoke the link and may itself allow topology to move. Re-read
+        // exact endpoints, then make the authority's validator the final suspension point.
+        currentCandidates = host.agentSessionLinkCandidates()
+        let currentLiveEndpoints = Set(currentCandidates.map(\.domainEndpoint))
+        guard currentLiveEndpoints.contains(authorization.target),
+              currentLiveEndpoints.contains(authorization.observer),
+              let currentObserver = currentCandidates.first(where: {
+                  $0.domainEndpoint == authorization.observer
+              }),
+              Self.passiveDeliveryIsPermitted(for: currentObserver)
+        else {
+            return .denied
+        }
+        guard !isFrozenForTermination else { return .shuttingDown }
+        if let error = await authority.validateRequestAttentionAuthorization(
+            authorization,
+            liveEndpoints: currentLiveEndpoints
+        ) {
+            return Self.attentionDisposition(for: error, selectorWasOmitted: observerSessionID == nil)
+        }
+        guard !isFrozenForTermination else { return .shuttingDown }
+
+        // The authority hop above releases MainActor. Fence the host-owned half of the proof too:
+        // endpoint routing, selector-cardinality inputs, deletion state, and passive eligibility can
+        // all move without changing the authority record that just validated. Any topology change is
+        // a conservative denial; a retry will resolve the new stable cardinality truthfully.
+        let finalCandidates = host.agentSessionLinkCandidates()
+        let finalLiveEndpoints = Set(finalCandidates.map(\.domainEndpoint))
+        guard finalLiveEndpoints == currentLiveEndpoints,
+              finalLiveEndpoints.contains(authorization.target),
+              let finalObserver = finalCandidates.first(where: {
+                  $0.domainEndpoint == authorization.observer
+              }),
+              Self.passiveDeliveryIsPermitted(for: finalObserver),
+              !registry.isPermanentlyDeleted(sessionID: authorization.target.sessionID),
+              !registry.isPermanentlyDeleted(sessionID: authorization.observer.sessionID),
+              !registry.isDeletionInProgress(sessionID: authorization.target.sessionID),
+              !registry.isDeletionInProgress(sessionID: authorization.observer.sessionID)
+        else {
+            return .denied
+        }
+
+        // No `await` below this line: the proof, reducer revision, exact link generation, mutation,
+        // storage, and publication form one MainActor pass.
+        guard var notices = passiveNoticesByObserver[authorization.observer] else {
+            return .denied
+        }
+        let previousQueueRevision = notices.snapshot.queueRevision
+        let result = notices.requestAttention(
+            reference: authorization.reference,
+            targetEndpoint: authorization.target,
+            targetSessionID: authorization.target.sessionID,
+            linkSetRevision: authorization.observerLinkSetRevision,
+            requestedAt: now()
+        )
+        switch result {
+        case .accepted:
+            passiveNoticesByObserver[authorization.observer] = notices
+            if notices.snapshot.queueRevision != previousQueueRevision {
+                publishPassiveNotices(notices.snapshot, to: authorization.observer)
+            }
+            return .accepted
+        case .atCapacity:
+            return .atCapacity
+        case .unavailable:
+            return .denied
+        }
+    }
+
+    /// Removes stale exact endpoints before inverse selector cardinality is evaluated.
+    ///
+    /// Transiently ineligible or deletion-in-progress observers remain in the cardinality set and
+    /// cause the request to deny rather than silently selecting a sibling. Only an endpoint that is
+    /// actually absent or permanently deleted is pruned from authority.
+    private func attentionCandidatesAfterPruning(
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> [AgentSessionLinkEndpointCandidate]? {
+        guard let host else { return nil }
+        let registry = AgentSessionDeletionRegistry.shared
+        var candidates = host.agentSessionLinkCandidates()
+        guard candidates.contains(where: { $0.domainEndpoint == targetEndpoint }) else {
+            await invalidate(endpoint: targetEndpoint, reason: .targetIdentityDrift)
+            return nil
+        }
+        if registry.isPermanentlyDeleted(sessionID: targetEndpoint.sessionID) {
+            await invalidate(endpoint: targetEndpoint, reason: .sessionDeleted)
+            return nil
+        }
+        if registry.isDeletionInProgress(sessionID: targetEndpoint.sessionID) { return nil }
+
+        let liveEndpoints = Set(candidates.map(\.domainEndpoint))
+        let projection = await authority.projectionInputs(forEndpoint: targetEndpoint)
+        let staleObservers = Set(projection.inboundObserverEndpoints.values).filter { endpoint in
+            !liveEndpoints.contains(endpoint)
+                || registry.isPermanentlyDeleted(sessionID: endpoint.sessionID)
+        }
+        for endpoint in staleObservers {
+            await invalidate(
+                endpoint: endpoint,
+                reason: registry.isPermanentlyDeleted(sessionID: endpoint.sessionID)
+                    ? .sessionDeleted
+                    : .observerIdentityDrift
+            )
+        }
+        if !staleObservers.isEmpty {
+            candidates = host.agentSessionLinkCandidates()
+        }
+        return candidates
+    }
+
+    private static func attentionDisposition(
+        for error: DomainAgentSessionLinkAuthority.RequestAttentionAuthorizationError,
+        selectorWasOmitted: Bool
+    ) -> AttentionRequestDisposition {
+        switch error {
+        case .denied:
+            .denied
+        case let .ambiguousObserver(candidateObserverSessionIDs, omittedCandidateCount):
+            .ambiguous(
+                candidateObserverSessionIDs: selectorWasOmitted ? candidateObserverSessionIDs : nil,
+                omittedCandidateCount: selectorWasOmitted ? omittedCandidateCount : 0
+            )
+        case .runtimeShuttingDown:
+            .shuttingDown
+        }
+    }
+
     /// Authorizes one target operation and revalidates both live endpoint incarnations.
     ///
     /// The lease alone is not durable authority: a link can outlive a lifecycle notification this
@@ -4523,24 +4717,24 @@ final class AgentSessionLinkRuntimeBridge {
             return false
         case .disqualified:
             await revokeOutboundLinks(
-                observerSessionID: observer.sessionID,
+                observerEndpoint: observer.domainEndpoint,
                 reason: .observerNoLongerEligible
             )
             return false
         }
     }
 
-    /// Revokes only the links this session *observes through*.
+    /// Revokes only the links this exact endpoint incarnation *observes through*.
     ///
     /// Deliberately not `invalidate(endpoint:)`: that would also drop links where this session is the
-    /// target, and being observed requires no outbound eligibility at all. A session that loses the
-    /// ability to oversee must keep being overseeable.
+    /// target, and being observed requires no outbound eligibility at all. An incarnation that loses
+    /// the ability to oversee must keep being overseeable and must not revoke a live sibling's grants.
     private func revokeOutboundLinks(
-        observerSessionID: UUID,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         reason: DomainAgentSessionLinkRevocationReason
     ) async {
         let capturedBookkeeping = bookkeepingByReference
-        let inventory = await authority.links(forObserver: observerSessionID)
+        let inventory = await authority.links(forObserverEndpoint: observerEndpoint)
         guard !inventory.isEmpty else { return }
         var notices: [DomainAgentSessionLinkRevocationNotice] = []
         for item in inventory.items {
@@ -4647,14 +4841,19 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Whether the exact caller endpoint incarnation currently holds at least one outbound link.
     ///
-    /// This is the live input to dynamic tool visibility. Advertisement is never authority, so this
-    /// value is recomputed at both `tools/list` and `tools/call` rather than cached in a policy.
+    /// This remains the live readiness and authorization input for observer operations. Dynamic tool
+    /// visibility uses the separate exact-link predicate below, so an inbound-only caller can reach
+    /// its narrow inverse operation without acquiring outbound oversight.
     func hasActiveOutboundLink(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> Bool {
         await authority.hasActiveOutboundLink(observerEndpoint: observerEndpoint)
     }
 
+    /// Whether the exact caller endpoint holds any inbound or outbound grant.
+    ///
+    /// Catalog visibility only. Observer operations continue to authorize through the outbound-only
+    /// paths above, and `request_attention` continues to authorize through its exact inverse proof.
     func hasActiveLink(endpoint: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
         await authority.hasActiveLink(endpoint: endpoint)
     }
