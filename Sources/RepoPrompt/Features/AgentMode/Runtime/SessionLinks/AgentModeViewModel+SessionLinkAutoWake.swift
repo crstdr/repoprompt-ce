@@ -39,8 +39,8 @@ struct AgentSessionLinkAutoWakeAttempt {
     var queueRevision: UInt64
     /// The newest structural shape known to the reservation.
     var wakeFingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint
-    /// The exact purposeful-attention occurrence whose snooze exception was required to admit this
-    /// attempt, or `nil` when an ordinary status/overflow basis independently admitted it.
+    /// The exact purposeful-attention occurrence whose routine-policy exception was required to
+    /// admit this attempt, or `nil` when an ordinary status/overflow basis independently admitted it.
     ///
     /// Selected immediately before the claim is reserved. Once preparation begins it is left alone;
     /// the immutable claim, not later queue absorption, decides what the physical call attempted.
@@ -138,8 +138,8 @@ extension AgentModeViewModel {
         // in `.preparingDispatch`, `.cancelledBeforeDispatch`, or `.dispatching`. Clearing the
         // tombstone while a provider path is still preparing would make that rewrite stop firing, so
         // `agentSessionLinkAcquirePhysicalDispatch` would take its ordinary-dispatch early return and
-        // wave the call through unfenced — delivering a snoozed or deselected lane with no claim and
-        // no provenance row. The reevaluation this publication owes is replayed once the tombstone's
+        // wave the call through unfenced — delivering lane content with no claim, admission basis, or
+        // provenance row. The reevaluation this publication owes is replayed once the tombstone's
         // own finalizer settles instead; see `agentSessionLinkAwaitPhysicalDispatchSettlement`.
 
         // One attempt absorbs newer revisions. A metadata-only revision deliberately does not clear a
@@ -282,8 +282,8 @@ extension AgentModeViewModel {
     /// Clears suppression so an explicit off/on cycle can retry a known failure.
     ///
     /// Suppression is the only thing it clears. Admission still has to come from somewhere — a
-    /// selected, unsnoozed lane with a genuinely new edge — so this can retry a known failure but
-    /// cannot manufacture a wake out of a queue that has nothing new in it.
+    /// selected, unsnoozed routine basis or exact purposeful-attention occurrence — so this can retry
+    /// a known failure but cannot manufacture a wake out of a queue that has nothing new in it.
     func agentSessionLinkClearAutoWakeSuppression(for endpoint: DomainAgentSessionLinkEndpointIdentity) {
         sessions[endpoint.tabID]?.suppressedOversightWakeFingerprint = nil
     }
@@ -430,7 +430,7 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Freezes whether this dispatch needs purposeful attention to justify its snooze exception.
+    /// Freezes whether this dispatch needs purposeful attention to justify its routine-policy exception.
     ///
     /// Called immediately before claim reservation, after every readiness suspension. Status and
     /// overflow preserve their existing precedence: attention is required only when neither already
@@ -626,6 +626,7 @@ extension AgentModeViewModel {
         else {
             return false
         }
+        let lanesByReference = agentSessionLinkAutoWakeLanesByReference(snapshot)
         let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
         let currentAdmission = agentSessionLinkAutoWakeAdmission(
             snapshot,
@@ -638,7 +639,7 @@ extension AgentModeViewModel {
                    required,
                    snapshot: snapshot,
                    inventory: context.inventory,
-                   selectedLanes: selectedLanes
+                   lanesByReference: lanesByReference
                )
             {
                 return true
@@ -646,9 +647,9 @@ extension AgentModeViewModel {
         }
 
         // A rendered attention occurrence is an independent exact-lane basis only when it was not
-        // already part of the failure parked in suppression. Its snooze is deliberately irrelevant,
-        // while selection and grant identity are not. A post-composition successor is absent from
-        // the receipt and therefore cannot qualify here.
+        // already part of the failure parked in suppression. Routine Auto-wake selection and the
+        // exact lane's snooze are deliberately irrelevant, while grant identity is not. A
+        // post-composition successor is absent from the receipt and therefore cannot qualify here.
         let unsuppressedAttentionOccurrences = Set(
             currentAdmission.unsuppressedAdmittingAttentionOccurrences(
                 suppressed: session.suppressedOversightWakeFingerprint
@@ -660,7 +661,7 @@ extension AgentModeViewModel {
                     occurrence,
                     snapshot: snapshot,
                     inventory: context.inventory,
-                    selectedLanes: selectedLanes
+                    lanesByReference: lanesByReference
                 )
         }) {
             return true
@@ -673,8 +674,8 @@ extension AgentModeViewModel {
             )
         else {
             // The rendered status/overflow shape is exactly the previously failed one. Attention
-            // was the only selected structural change that re-armed this attempt, so losing or
-            // omitting it cannot let the suppressed ordinary basis call the provider again.
+            // was the only exact structural change that re-armed this attempt, so losing or omitting
+            // it cannot let the suppressed ordinary basis call the provider again.
             return false
         }
 
@@ -715,20 +716,37 @@ extension AgentModeViewModel {
             )
     }
 
+    /// The single exact-current-lane predicate shared by admission and physical liveness.
+    private func agentSessionLinkAttentionRequestMatchesExactCurrentLane(
+        _ request: AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest,
+        snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
+        lanesByReference:
+        [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane]
+    ) -> Bool {
+        guard request.occurrence.queueEpoch == snapshot.queueEpoch,
+              let lane = lanesByReference[request.reference]
+        else {
+            return false
+        }
+        return lane.targetEndpoint == request.targetEndpoint
+            && lane.targetSessionID == request.targetSessionID
+    }
+
     private func agentSessionLinkAttentionOccurrenceIsLive(
         _ occurrence: AgentSessionLinkPassiveStatusNotices.AttentionOccurrenceIdentity,
         snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
         inventory: AgentSessionLinkPromptInventory,
-        selectedLanes:
+        lanesByReference:
         [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane]
     ) -> Bool {
-        guard occurrence.queueEpoch == snapshot.queueEpoch,
-              let request = snapshot.attentionRequests.first(where: {
-                  $0.occurrence == occurrence
-              }),
-              let lane = selectedLanes[request.reference],
-              lane.targetEndpoint == request.targetEndpoint,
-              lane.targetSessionID == request.targetSessionID
+        guard let request = snapshot.attentionRequests.first(where: {
+            $0.occurrence == occurrence
+        }),
+            agentSessionLinkAttentionRequestMatchesExactCurrentLane(
+                request,
+                snapshot: snapshot,
+                lanesByReference: lanesByReference
+            )
         else {
             return false
         }
@@ -1336,15 +1354,27 @@ extension AgentModeViewModel {
             && session.pendingWorktreeMergeReview == nil
     }
 
-    /// The lanes this observer has selected for Auto-wake **right now**.
+    /// All exact lanes carried by this authoritative queue publication, regardless of routine
+    /// Auto-wake selection.
+    private func agentSessionLinkAutoWakeLanesByReference(
+        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot
+    ) -> [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane] {
+        // Last wins rather than trapping if a malformed publication duplicates a reference. Every
+        // attention occurrence still has to match the surviving lane's exact target identity.
+        snapshot.autoWakeLanes.reduce(into: [:]) { lanes, lane in
+            lanes[lane.reference] = lane
+        }
+    }
+
+    /// The lanes this observer has selected for routine status/overflow Auto-wake **right now**.
     ///
     /// The snapshot supplies the lanes; the selection comes from the session, never from the lane's
     /// own `isEffectivelySelected`. That flag is a projection frozen when the lane was last
     /// published, and a toggle the user just flipped reaches it only on the next authoritative
     /// refresh. Scheduling and the acceptance fence both run on the same main actor as the selection
-    /// write, so reading the setting directly is what linearizes them: a deselected lane cannot cross
-    /// the transport boundary on the strength of a stale republication, and a freshly selected one is
-    /// not left waiting for one.
+    /// write, so reading the setting directly is what linearizes them: routine status from a
+    /// deselected lane cannot cross the transport boundary on the strength of a stale republication,
+    /// and a freshly selected one is not left waiting for one.
     private func agentSessionLinkLiveSelectedAutoWakeLanes(
         _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
         session: TabSession
@@ -1400,9 +1430,9 @@ extension AgentModeViewModel {
         /// At least one pending entry belongs to a selected, unsnoozed lane.
         let hasConcreteAdmittingEntry: Bool
         let overflowAloneMayWake: Bool
-        /// Purposeful attention belongs to an exact selected lane, but deliberately ignores only
-        /// that lane's snooze. The request remains generation-qualified and never selects a lane on
-        /// its own.
+        /// Purposeful attention belongs to an exact live lane and deliberately ignores both routine
+        /// Auto-wake selection and that lane's snooze. The request remains generation-qualified; it
+        /// does not broaden status or overflow admission for that lane.
         let admittingAttentionOccurrences:
             [AgentSessionLinkPassiveStatusNotices.AttentionOccurrenceIdentity]
 
@@ -1466,9 +1496,9 @@ extension AgentModeViewModel {
         /// Whether the publication has a basis that is not the exact structural failure already
         /// parked in suppression.
         ///
-        /// A deselected attention occurrence is deliberately absent from
-        /// `admittingAttentionOccurrences`, so it cannot re-arm an otherwise suppressed status shape
-        /// merely by changing the queue's full fingerprint.
+        /// An attention occurrence without matching exact live lane membership is deliberately absent
+        /// from `admittingAttentionOccurrences`, so stale authority cannot re-arm an otherwise
+        /// suppressed status shape merely by changing the queue's full fingerprint.
         func hasUnsuppressedAdmissionBasis(
             fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint,
             suppressed: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
@@ -1521,6 +1551,7 @@ extension AgentModeViewModel {
         session: TabSession,
         endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionLinkAutoWakeAdmission {
+        let lanesByReference = agentSessionLinkAutoWakeLanesByReference(snapshot)
         let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
         let snoozedReferences = agentSessionLinkActiveAutoWakeSnoozedReferences(
             endpoint: endpoint,
@@ -1537,10 +1568,11 @@ extension AgentModeViewModel {
                 snoozedReferences: snoozedReferences
             ),
             admittingAttentionOccurrences: snapshot.attentionRequests.compactMap { request in
-                guard let lane = selectedLanes[request.reference],
-                      lane.targetEndpoint == request.targetEndpoint,
-                      lane.targetSessionID == request.targetSessionID
-                else {
+                guard agentSessionLinkAttentionRequestMatchesExactCurrentLane(
+                    request,
+                    snapshot: snapshot,
+                    lanesByReference: lanesByReference
+                ) else {
                     return nil
                 }
                 return request.occurrence
@@ -1550,14 +1582,15 @@ extension AgentModeViewModel {
 
     /// Linearizes one Auto-wake selection change with scheduling and the acceptance fence.
     ///
-    /// Runs synchronously, in the same main-actor step as the setting write, so it retracts an
-    /// attempt the change just made ineligible rather than leaving a deselected lane's wake alive
-    /// until something else happens to re-evaluate it.
+    /// Runs synchronously, in the same main-actor step as the setting write, so it retracts a routine
+    /// attempt the change just made ineligible rather than leaving it alive until something else
+    /// happens to re-evaluate it. An exact attention-backed attempt remains eligible by design.
     func agentSessionLinkFenceAutoWakeSelectionChange(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
         guard let session = agentSessionLinkAutoWakeSession(for: endpoint),
               let attempt = session.pendingOversightAutoWake,
+              attempt.phase != .cancelledBeforeDispatch,
               !agentSessionLinkAutoWakeAttemptIsStillEligible(attempt, session: session)
         else { return }
         cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
@@ -1566,9 +1599,9 @@ extension AgentModeViewModel {
     /// The shared final fence, evaluated identically at readiness settlement, selection changes, and
     /// the physical-acquisition boundary.
     ///
-    /// It reads live selection *and* live snoozes, because this is the last gate a wake crosses before
-    /// the provider transport: a lane the user deselected or snoozed a moment ago must be gone from it
-    /// whether or not the projection — or the deadline task — has caught up.
+    /// It reads live selection and live snoozes for routine status/overflow. Exact purposeful
+    /// attention deliberately bypasses those two policy controls but must still satisfy every exact
+    /// occurrence, authority, claim, readiness, and transport gate represented here.
     private func agentSessionLinkAutoWakeAttemptIsStillEligible(
         _ attempt: AgentSessionLinkAutoWakeAttempt,
         session: TabSession

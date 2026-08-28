@@ -245,36 +245,37 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
                 "**snooze_auto_wake**: session_id (required); optional duration_seconds (defaults to 600) or clear: true, never both"
             )
         )
-        XCTAssertTrue(definition.description.contains("- `snooze_auto_wake`:"))
+        XCTAssertEqual(Self.occurrences(of: Self.currentSnoozeBullet, in: definition.description), 1)
         XCTAssertTrue(definition.description.contains("temporarily suppress status-triggered Auto-wake"))
         XCTAssertTrue(definition.description.contains("max(current deadline, now + duration_seconds)"))
         XCTAssertTrue(definition.description.contains("nothing ever shortens an active snooze"))
         XCTAssertTrue(
             definition.description.contains("re-evaluate eligibility rather than forcing a turn")
         )
-        XCTAssertTrue(
-            definition.description.contains(
-                "An explicit attention request may bypass only that exact lane’s snooze without clearing or shortening it"
-            )
-        )
         for requiredLimit in [
-            "still requires that lane to be selected by master Auto-wake or its own lane toggle",
-            "unlink or revocation", "readiness", "suppression", "every other admission gate"
+            "An explicit attention request may bypass master Auto-wake",
+            "that lane’s own toggle",
+            "only that exact lane’s snooze without clearing or shortening it or changing either selection setting",
+            "Admission for routine status and overflow remains governed by selection and snooze.",
+            "Unlink, revocation, exact authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable claim and budget, physical acquisition, and tombstone fences admit no exception."
         ] {
             XCTAssertTrue(
                 definition.description.contains(requiredLimit),
                 "missing attention limit: \(requiredLimit)"
             )
         }
+        XCTAssertFalse(
+            definition.description.contains(
+                "still requires that lane to be selected by master Auto-wake or its own lane toggle"
+            )
+        )
         let durationDescription = try XCTUnwrap(duration["description"]?.stringValue)
-        XCTAssertTrue(durationDescription.contains("status updates may not start an automatic wake"))
-        for requiredLimit in [
-            "may bypass only that exact lane’s snooze",
-            "only while the lane is selected by master Auto-wake or its own lane toggle",
-            "unlink remains a hard control"
-        ] {
-            XCTAssertTrue(durationDescription.contains(requiredLimit), "missing duration limit: \(requiredLimit)")
-        }
+        XCTAssertEqual(durationDescription, Self.currentDurationDescription)
+        XCTAssertFalse(
+            durationDescription.contains(
+                "only while the lane is selected by master Auto-wake or its own lane toggle"
+            )
+        )
         // Poll is the only place the state is observable; without it the operation would be
         // write-only.
         XCTAssertTrue(definition.description.contains("`auto_wake_snooze`"))
@@ -594,12 +595,59 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     /// refresh that already carries some of these migrations produces.
     func testFullCanonicalizationReturnsTheCurrentDefinitionUnchanged() throws {
         let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        XCTAssertEqual(
+            MCPDomainCanonicalToolDefinitions.test_agentSessionLinkAutoWakeSnoozeContractState(current),
+            "current"
+        )
         let again = MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(current)
 
         XCTAssertEqual(again.description, current.description)
         XCTAssertEqual(again.inputSchema, current.inputSchema)
         XCTAssertEqual(again.annotations, current.annotations)
         XCTAssertEqual(again.isEnabledByDefault, current.isEnabledByDefault)
+    }
+
+    /// An exact revision-4 Snooze pair is a supported historical input. Both owned anchors advance
+    /// together, then a second pass leaves the revision-5 definition byte-for-byte unchanged.
+    func testAutoWakeSnoozeMigrationAdvancesTheExactRevisionFourPair() throws {
+        let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        let revisionFour = try restoringAutoWakeSnoozeContract(
+            to: current,
+            bullet: Self.revisionFourSnoozeBullet,
+            durationDescription: Self.revisionFourDurationDescription
+        )
+
+        XCTAssertEqual(
+            MCPDomainCanonicalToolDefinitions.test_agentSessionLinkAutoWakeSnoozeContractState(revisionFour),
+            "revisionFour"
+        )
+        let once = MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(revisionFour)
+        let twice = MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(once)
+        XCTAssertEqual(once, current)
+        XCTAssertEqual(twice, once)
+    }
+
+    /// A bullet and schema description from different revisions are not a migration input. The
+    /// classifier's partial state is the fail-closed path used by canonicalization.
+    func testAutoWakeSnoozeMigrationRejectsMixedRevisionPairs() throws {
+        let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        let revisionFourBulletWithCurrentSchema = try restoringAutoWakeSnoozeContract(
+            to: current,
+            bullet: Self.revisionFourSnoozeBullet,
+            durationDescription: Self.currentDurationDescription
+        )
+        let currentBulletWithRevisionFourSchema = try restoringAutoWakeSnoozeContract(
+            to: current,
+            bullet: Self.currentSnoozeBullet,
+            durationDescription: Self.revisionFourDurationDescription
+        )
+
+        for mixed in [revisionFourBulletWithCurrentSchema, currentBulletWithRevisionFourSchema] {
+            XCTAssertEqual(
+                MCPDomainCanonicalToolDefinitions.test_agentSessionLinkAutoWakeSnoozeContractState(mixed),
+                "partial"
+            )
+        }
     }
 
     /// A vendored refresh may still carry revision 3's exact pre-attention autonomy block. The
@@ -693,6 +741,10 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             isEnabledByDefault: current.isEnabledByDefault
         )
         XCTAssertNil(properties["observer_session_id"])
+        XCTAssertEqual(
+            MCPDomainCanonicalToolDefinitions.test_agentSessionLinkAutoWakeSnoozeContractState(prior),
+            "revisionThree"
+        )
         XCTAssertEqual(
             MCPDomainCanonicalToolDefinitions.test_agentSessionLinkAutonomyContractState(prior),
             "preAttentionRevisionThree"
@@ -1355,8 +1407,11 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     private static let sendingSectionAnchor = "Delivery makes the target run, so at most one message lands per idle period."
     private static let queueBulletTail = "swaps it for one under a different key."
     private static let revisionThreeSnoozeBullet = "- `snooze_auto_wake`: temporarily stop one currently selected overseen lane from starting an automatic follow-up turn of its own. Defaults to 600 seconds; `duration_seconds` accepts 60 through 3600 and is applied as max(current deadline, now + duration_seconds), so one call leaves at most a 60-minute horizon, repeated calls may extend indefinitely, and nothing ever shortens an active snooze. `clear: true` releases it. Collection and coalescing continue while snoozed, a turn your own user starts \u{2014} or another lane\u{2019}s wake \u{2014} may still deliver that lane, and clearing or expiry only asks RepoPrompt to re-evaluate eligibility rather than forcing a turn."
-    private static let currentSnoozeBullet = "- `snooze_auto_wake`: temporarily suppress status-triggered Auto-wake from one currently selected overseen lane. Defaults to 600 seconds; `duration_seconds` accepts 60 through 3600 and is applied as max(current deadline, now + duration_seconds), so one call leaves at most a 60-minute horizon, repeated calls may extend indefinitely, and nothing ever shortens an active snooze. `clear: true` releases it. Collection and status coalescing continue while snoozed, a turn your own user starts \u{2014} or another lane\u{2019}s wake \u{2014} may still deliver that lane, and clearing or expiry only asks RepoPrompt to re-evaluate eligibility rather than forcing a turn. An explicit attention request may bypass only that exact lane\u{2019}s snooze without clearing or shortening it; it still requires that lane to be selected by master Auto-wake or its own lane toggle, and unlink or revocation, readiness, suppression, and every other admission gate remain unchanged."
+    private static let revisionFourSnoozeBullet = "- `snooze_auto_wake`: temporarily suppress status-triggered Auto-wake from one currently selected overseen lane. Defaults to 600 seconds; `duration_seconds` accepts 60 through 3600 and is applied as max(current deadline, now + duration_seconds), so one call leaves at most a 60-minute horizon, repeated calls may extend indefinitely, and nothing ever shortens an active snooze. `clear: true` releases it. Collection and status coalescing continue while snoozed, a turn your own user starts \u{2014} or another lane\u{2019}s wake \u{2014} may still deliver that lane, and clearing or expiry only asks RepoPrompt to re-evaluate eligibility rather than forcing a turn. An explicit attention request may bypass only that exact lane\u{2019}s snooze without clearing or shortening it; it still requires that lane to be selected by master Auto-wake or its own lane toggle, and unlink or revocation, readiness, suppression, and every other admission gate remain unchanged."
+    private static let currentSnoozeBullet = "- `snooze_auto_wake`: temporarily suppress status-triggered Auto-wake from one currently selected overseen lane. Defaults to 600 seconds; `duration_seconds` accepts 60 through 3600 and is applied as max(current deadline, now + duration_seconds), so one call leaves at most a 60-minute horizon, repeated calls may extend indefinitely, and nothing ever shortens an active snooze. `clear: true` releases it. Collection and status coalescing continue while snoozed, a turn your own user starts \u{2014} or another lane\u{2019}s wake \u{2014} may still deliver that lane, and clearing or expiry only asks RepoPrompt to re-evaluate eligibility rather than forcing a turn. An explicit attention request may bypass master Auto-wake, that lane\u{2019}s own toggle, and only that exact lane\u{2019}s snooze without clearing or shortening it or changing either selection setting. Admission for routine status and overflow remains governed by selection and snooze. Unlink, revocation, exact authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable claim and budget, physical acquisition, and tombstone fences admit no exception."
     private static let revisionThreeDurationDescription = "[snooze_auto_wake] Seconds this lane may not start an automatic wake of its own, 60 through 3600. Defaults to 600. Applied as max(current deadline, now + duration_seconds), so it never shortens an active snooze. Mutually exclusive with clear: true."
+    private static let revisionFourDurationDescription = "[snooze_auto_wake] Seconds this lane\u{2019}s status updates may not start an automatic wake of their own, 60 through 3600. Defaults to 600. Applied as max(current deadline, now + duration_seconds), so it never shortens an active snooze. An explicit attention request may bypass only that exact lane\u{2019}s snooze, and only while the lane is selected by master Auto-wake or its own lane toggle; unlink remains a hard control. Mutually exclusive with clear: true."
+    private static let currentDurationDescription = "[snooze_auto_wake] Seconds this lane\u{2019}s status updates may not start an automatic wake of their own, 60 through 3600. Defaults to 600. Applied as max(current deadline, now + duration_seconds), so it never shortens an active snooze. An explicit attention request may bypass master Auto-wake, that lane\u{2019}s own toggle, and only that exact lane\u{2019}s snooze without changing any of them. Admission for routine status and overflow remains governed by selection and snooze. Unlink, revocation, exact authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable claim and budget, physical acquisition, and tombstone fences admit no exception. Mutually exclusive with clear: true."
     private static let revisionThreeIntroduction = "Observe Agent sessions this session has been explicitly granted access to (the **Oversee** control in RepoPrompt).\n\nAccess is per-target and granted only by the user. It is direct, non-transitive, non-reciprocal, and revocable at any time; knowing a session ID grants nothing. Only sessions returned by `list` can be named."
     private static let currentIntroduction = "Coordinate Agent sessions through direct links explicitly granted by the user (the **Oversee** control in RepoPrompt).\n\nDirect links are directional, per-endpoint, non-transitive, non-reciprocal, and revocable at any time; knowing a session ID grants nothing.\n\n**Direction and authority**: `list`, `poll`, `wait`, `read`, `send`, `cancel_pending_send`, and `snooze_auto_wake` are observer operations authorized only by an exact outbound grant. `list` returns outbound targets only; only those returned targets can be named by observer operations. `set_waiting_on` is self-scoped and available only while this exact endpoint holds at least one active link in either direction. `request_attention` is authorized only by an exact inbound grant from the observer to this target\u{2019}s current endpoint incarnation. `observer_session_id` only disambiguates an already-authorized inbound grant; it does not create or expand authority."
     private static let revisionThreeListBullet = "- `list`: current authorized targets. Available only while at least one link remains."
@@ -1388,6 +1443,33 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         [preAttentionAutonomyContractFirstParagraph]
             + preAttentionAutonomyContractTailParagraphs
     ).joined(separator: "\n\n")
+
+    /// Replaces both revision-owned Snooze anchors while preserving every operation, field, bound,
+    /// annotation, and unrelated byte of the current canonical definition.
+    private func restoringAutoWakeSnoozeContract(
+        to definition: MCPDomainToolDefinition,
+        bullet: String,
+        durationDescription: String
+    ) throws -> MCPDomainToolDefinition {
+        XCTAssertEqual(Self.occurrences(of: Self.currentSnoozeBullet, in: definition.description), 1)
+        var schema = try XCTUnwrap(definition.inputSchema.objectValue)
+        var properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        var duration = try XCTUnwrap(properties["duration_seconds"]?.objectValue)
+        duration["description"] = .string(durationDescription)
+        properties["duration_seconds"] = .object(duration)
+        schema["properties"] = .object(properties)
+
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: definition.description.replacingOccurrences(
+                of: Self.currentSnoozeBullet,
+                with: bullet
+            ),
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
 
     /// Exact spellings the `set_passive_updates` retirement owns, duplicated for the same reason the
     /// autonomy and completion fixtures duplicate theirs.

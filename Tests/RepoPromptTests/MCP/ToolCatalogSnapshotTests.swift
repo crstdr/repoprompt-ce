@@ -142,7 +142,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         }
     }
 
-    func testAgentSessionLinkInlineFallbackCarriesTheSameRevisionFourRequestContract() async throws {
+    func testAgentSessionLinkInlineFallbackCarriesTheSameRevisionFiveRequestContract() async throws {
         let window = Self.makeWindowWithoutAutoStart()
         let tools = await window.mcpServer.windowMCPTools
         let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentSessionLink })
@@ -275,8 +275,11 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         let definition = try tool.domainBinding().definition
         let schema = try XCTUnwrap(definition.inputSchema.objectValue)
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        let inlineSchema = try XCTUnwrap(Value(tool.inputSchema).objectValue)
+        let inlineProperties = try XCTUnwrap(inlineSchema["properties"]?.objectValue)
 
         let duration = try XCTUnwrap(properties["duration_seconds"]?.objectValue)
+        let inlineDuration = try XCTUnwrap(inlineProperties["duration_seconds"]?.objectValue)
         XCTAssertTrue(
             try XCTUnwrap(duration["description"]?.stringValue).hasPrefix("[snooze_auto_wake]"),
             "duration_seconds must advertise the one operation that accepts it"
@@ -295,27 +298,67 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                 "**snooze_auto_wake**: session_id (required); optional duration_seconds (defaults to 600) or clear: true, never both"
             )
         )
-        // The facts a caller most easily gets wrong: status-only suppression, exact-lane attention
-        // bypass, effective selection, a per-operation horizon, and re-evaluation-only expiry.
-        XCTAssertTrue(definition.description.contains("at most a 60-minute horizon"))
-        XCTAssertTrue(definition.description.contains("nothing ever shortens an active snooze"))
-        XCTAssertTrue(
-            definition.description.contains("attention request may bypass only that exact lane\u{2019}s snooze")
+        // The facts a caller most easily gets wrong: purposeful attention bypasses selection and only
+        // its exact lane’s snooze, routine status and overflow do not, and every other gate stays hard.
+        let canonicalSnoozeBullet = try XCTUnwrap(
+            definition.description.components(separatedBy: "\n")
+                .first { $0.hasPrefix("- `snooze_auto_wake`:") }
         )
-        XCTAssertTrue(definition.description.contains(
-            "still requires that lane to be selected by master Auto-wake or its own lane toggle"
-        ))
-        XCTAssertTrue(definition.description.contains("unlink or revocation"))
-        XCTAssertTrue(
-            definition.description.contains("re-evaluate eligibility rather than forcing a turn")
+        let inlineSnoozeBullet = try XCTUnwrap(
+            tool.description.components(separatedBy: "\n")
+                .first { $0.hasPrefix("- `snooze_auto_wake`:") }
         )
+        XCTAssertEqual(inlineSnoozeBullet, canonicalSnoozeBullet)
+        for description in [definition.description, tool.description] {
+            XCTAssertTrue(description.contains("at most a 60-minute horizon"))
+            XCTAssertTrue(description.contains("nothing ever shortens an active snooze"))
+            XCTAssertTrue(
+                description.contains(
+                    "attention request may bypass master Auto-wake, that lane’s own toggle, and only that exact lane’s snooze without clearing or shortening it or changing either selection setting"
+                )
+            )
+            XCTAssertTrue(
+                description.contains(
+                    "Admission for routine status and overflow remains governed by selection and snooze."
+                )
+            )
+            XCTAssertTrue(
+                description.contains(
+                    "Unlink, revocation, exact authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable claim and budget, physical acquisition, and tombstone fences admit no exception."
+                )
+            )
+            XCTAssertTrue(description.contains("re-evaluate eligibility rather than forcing a turn"))
+            XCTAssertFalse(
+                description.contains(
+                    "still requires that lane to be selected by master Auto-wake or its own lane toggle"
+                )
+            )
+        }
         let durationDescription = try XCTUnwrap(duration["description"]?.stringValue)
+        XCTAssertEqual(inlineDuration["description"]?.stringValue, durationDescription)
+        XCTAssertEqual(inlineDuration["minimum"]?.intValue, duration["minimum"]?.intValue)
+        XCTAssertEqual(inlineDuration["maximum"]?.intValue, duration["maximum"]?.intValue)
         XCTAssertTrue(durationDescription.contains("status updates may not start an automatic wake"))
-        XCTAssertTrue(durationDescription.contains("attention request may bypass only that exact lane’s snooze"))
-        XCTAssertTrue(durationDescription.contains(
-            "only while the lane is selected by master Auto-wake or its own lane toggle"
-        ))
-        XCTAssertTrue(durationDescription.contains("unlink remains a hard control"))
+        XCTAssertTrue(
+            durationDescription.contains(
+                "attention request may bypass master Auto-wake, that lane’s own toggle, and only that exact lane’s snooze without changing any of them"
+            )
+        )
+        XCTAssertTrue(
+            durationDescription.contains(
+                "Admission for routine status and overflow remains governed by selection and snooze."
+            )
+        )
+        XCTAssertTrue(
+            durationDescription.contains(
+                "Unlink, revocation, exact authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable claim and budget, physical acquisition, and tombstone fences admit no exception."
+            )
+        )
+        XCTAssertFalse(
+            durationDescription.contains(
+                "only while the lane is selected by master Auto-wake or its own lane toggle"
+            )
+        )
     }
 
     func testAgentRunSteeringInterruptionGuidanceAppearsOnceAfterCanonicalization() async throws {
@@ -1747,7 +1790,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=d367738ad179d8f6b39b98f73082d594f53c42d771c4f2e512790593c5b3f9f4",
         "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=2b5e211868964f961f2d369c2aa54da7035a92a83e900770ad433e4ceb00fd96|schema=0b4f819f3aa6624df0f54fdaba6f8717ac64667d07a0528240d26905ba480520",
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=80d302d4391d6136f8acfbe8fc0bafe394c5110c5e63aefcf8f4c59fcbdbf95f|schema=83f34927eacac4dc6352db72eae312ac3a5477b2f70c9031f09a2101dc8f2e97",
-        "20|agent_session_link|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=0467add186e9aae2efff74395694c134179d4eb40ba755378168bc5ae4457f66|schema=aabfe73de0a3a5ed8e4a8899b42fcc2cce332be38e63577cc0758173eb4e4d5d",
+        "20|agent_session_link|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=62fe05fc0ce6f37f12b8530fa8d4371de62b2a440584386d49d08f8590075459|schema=117e62e6341f02b3762e1488dce9d802dff66dfa7b7c9df1736aa35556263108",
         "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
         "23|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",

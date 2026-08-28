@@ -337,14 +337,13 @@ extension AgentModeViewModel {
             entry.autoWakeOnOversightUpdates = enabled
             sessionIndexStore.applyLocalUpsert(entry)
         }
-        // Disabling cancels not-yet-accepted wake work but never clears the lane queue: the content
-        // stays owed to a natural future turn. Re-enabling is an explicit recovery action and clears
-        // only failure suppression; it invents no admission basis, so a lane with no genuinely new
-        // edge stays silent.
+        // Re-enabling is an explicit recovery action and clears only failure suppression; it invents
+        // no admission basis, so a lane with no genuinely new content stays silent. Disabling never
+        // clears the queue and does not preemptively cancel: the shared selection fence below retracts
+        // routine status/overflow attempts while retaining exact purposeful attention, which is not
+        // governed by routine Auto-wake selection.
         if enabled {
             agentSessionLinkClearAutoWakeSuppression(for: endpoint)
-        } else if session.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty {
-            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .settingDisabled)
         }
         // Turning the master off may leave granular lanes effective, and turning it on selects every
         // lane at once. Either way the resulting per-target selection is fenced synchronously here

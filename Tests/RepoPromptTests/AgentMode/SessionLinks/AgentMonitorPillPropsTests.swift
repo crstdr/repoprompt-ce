@@ -529,17 +529,17 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(published.withCanAddReason("changed").sidebarOversightMenu, menu)
     }
 
-    /// The switch is the only place the user learns what auto-wake does, so its copy has to carry the
+    /// The switch is the only place the user learns what Auto-wake does, so its copy has to carry the
     /// whole contract — and in particular the halves that are easy to assume wrongly: updates arrive
-    /// either way, a busy agent is never interrupted, follow-up turns *can* continue, and attention
-    /// bypasses only Snooze while effective lane selection remains required.
+    /// either way, a busy agent is never interrupted, follow-up turns *can* continue, and exact
+    /// purposeful attention bypasses routine selection and its lane's snooze without mutating them.
     ///
     /// That last one used to read "automatic turns never chain", which was a transport guarantee that
     /// no longer exists. A follow-up turn may act on the user's standing instruction and produce
     /// activity that is itself an update, and two sessions the user explicitly pointed at each other
     /// can keep waking one another. A bounded-sounding promise beside unbounded behaviour is worse
-    /// than no promise, so the copy states the outcome and names the controls that stop it.
-    func testAutoWakeCopyStatesDeliveryAttentionAndEffectiveSelectionContract() {
+    /// than no promise, so the copy states the outcome and names each path's actual controls.
+    func testAutoWakeCopyStatesDeliveryAndPurposefulAttentionException() {
         let tooltip = AgentMonitorAutoWakeCopy.tooltip
         XCTAssertTrue(
             tooltip.contains("always attached"),
@@ -561,14 +561,16 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         )
         XCTAssertTrue(tooltip.contains("one oversight link can sustain a feedback loop"))
         XCTAssertTrue(tooltip.contains("explicit attention request"))
-        XCTAssertTrue(tooltip.contains("Snoozing a lane pauses status-triggered wakes only"))
-        XCTAssertTrue(tooltip.contains("can bypass only that snooze"))
-        // No new setting was added. Snooze is deliberately excluded from effective lane selection,
-        // which remains required for both status and attention-triggered admission.
-        XCTAssertTrue(tooltip.contains("selected, either by this master switch or by its own lane toggle"))
-        XCTAssertTrue(tooltip.contains("turn this switch off and deselect that lane"))
-        XCTAssertTrue(tooltip.contains("unlink"))
-        XCTAssertFalse(tooltip.contains("Snooze a lane, deselect it, or unlink to stop"))
+        XCTAssertTrue(tooltip.contains("can bypass this master switch"))
+        XCTAssertTrue(tooltip.contains("its own lane toggle"))
+        XCTAssertTrue(tooltip.contains("status Auto-wake snooze without changing any of them"))
+        XCTAssertTrue(tooltip.contains("Admission for routine status and overflow remains governed by selection and snooze"))
+        XCTAssertTrue(tooltip.contains("To stop those routine wakes"))
+        XCTAssertTrue(tooltip.contains("To prevent purposeful attention from that link"))
+        XCTAssertTrue(tooltip.contains("unlink it"))
+        XCTAssertTrue(tooltip.contains("revocation and all other safety and admission gates still apply"))
+        XCTAssertFalse(tooltip.contains("can bypass only that snooze"))
+        XCTAssertFalse(tooltip.contains("selected, either by this master switch or by its own lane toggle"))
         XCTAssertTrue(
             tooltip.contains("this session"),
             "the scope is the observer session, not a link and not a global preference"
@@ -577,11 +579,17 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             tooltip.contains("Off by default"),
             "the default has to be visible where the control is"
         )
+        let accessibilityHint = AgentMonitorAutoWakeCopy.accessibilityHint
         XCTAssertTrue(
-            AgentMonitorAutoWakeCopy.accessibilityHint.contains("either way"),
+            accessibilityHint.contains("either way"),
             "VoiceOver users must get the same contract, not just the label"
         )
-        XCTAssertTrue(AgentMonitorAutoWakeCopy.accessibilityHint.contains("explicit attention requests"))
+        XCTAssertTrue(accessibilityHint.contains("Explicit attention requests"))
+        XCTAssertTrue(accessibilityHint.contains("can bypass this master switch"))
+        XCTAssertTrue(accessibilityHint.contains("their lane toggle"))
+        XCTAssertTrue(accessibilityHint.contains("their exact lane’s snooze without changing them"))
+        XCTAssertTrue(accessibilityHint.contains("Unlink revokes attention"))
+        XCTAssertTrue(accessibilityHint.contains("all other safety and admission gates still apply"))
         // Zero links is a real, saved state, and the note has to say so rather than read as an error.
         XCTAssertTrue(AgentMonitorAutoWakeCopy.noLinksNote.contains("Saved with this session"))
     }
@@ -1121,23 +1129,35 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertFalse(tomorrow.contains("today"))
     }
 
-    /// The visible label and both assistive/help surfaces must scope Snooze to status admission. The
-    /// exception and its effective-selection controls are repeated in both places because hover help
-    /// is unavailable to a VoiceOver-only user.
-    func testSnoozeCopyScopesVisibleAndAccessiblePromisesAndNamesEffectiveSelectionControls() {
+    /// The visible label and both assistive/help surfaces must scope Snooze to routine admission. The
+    /// exact attention exception and unchanged-selection rule are repeated in both places because
+    /// hover help is unavailable to a VoiceOver-only user.
+    func testSnoozeCopyScopesRoutineAdmissionAndNamesPurposefulAttentionException() {
         XCTAssertEqual(AgentMonitorAutoWakeSnoozeCopy.menuLabel, "Snooze status Auto-wake…")
 
         for copy in [
             AgentMonitorAutoWakeSnoozeCopy.menuTooltip,
             AgentMonitorAutoWakeSnoozeCopy.accessibilityHint
         ] {
-            XCTAssertTrue(copy.contains("status"))
+            XCTAssertTrue(copy.contains("routine status and overflow"))
             XCTAssertTrue(copy.contains("explicit attention request"))
-            XCTAssertTrue(copy.contains("can bypass only this snooze"))
-            XCTAssertTrue(copy.contains("selected by the master switch or its own lane toggle"))
-            XCTAssertTrue(copy.contains("turn the master switch off and deselect this lane"))
-            XCTAssertTrue(copy.contains("unlink"))
+            XCTAssertTrue(copy.contains("can bypass this snooze"))
+            XCTAssertTrue(copy.contains("master switch"))
+            XCTAssertTrue(copy.contains("lane’s toggle"))
+            XCTAssertTrue(copy.contains("without changing"))
+            XCTAssertTrue(copy.contains("selection and snooze"))
+            XCTAssertTrue(copy.lowercased().contains("unlink"))
+            XCTAssertFalse(copy.contains("can bypass only this snooze"))
+            XCTAssertFalse(copy.contains("selected by the master switch or its own lane toggle"))
         }
+        XCTAssertTrue(
+            AgentMonitorAutoWakeSnoozeCopy.accessibilityHint
+                .contains("Unlink prevents further attention from this link")
+        )
+        XCTAssertTrue(
+            AgentMonitorAutoWakeSnoozeCopy.accessibilityHint
+                .contains("all other safety and admission gates still apply")
+        )
 
         XCTAssertFalse(
             AgentMonitorAutoWakeSnoozeCopy.menuTooltip
@@ -1211,8 +1231,9 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     func testRowFeedbackSeparatesTheTooLateNoticeFromRealFailures() {
         XCTAssertEqual(
             AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted,
-            "Current Auto-wake already started. This snooze applies only to later "
-                + "status-triggered wakes; explicit attention requests can still wake the observer."
+            "Current Auto-wake already started. This snooze applies only to later routine status "
+                + "and overflow wakes; explicit attention requests can bypass this snooze and "
+                + "routine selection without changing either."
         )
         let notice = AgentMonitorRowFeedback.notice(
             AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted

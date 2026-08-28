@@ -22,13 +22,14 @@ struct AgentSessionLinkPassiveStatusNotices {
         let reference: DomainAgentSessionLinkReference
         let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
         let targetSessionID: UUID
-        /// The observer's Auto-wake selection for this lane **as of publication**.
+        /// The observer's routine status/overflow Auto-wake selection for this lane **as of
+        /// publication**.
         ///
         /// A projection, not the authority: selection is live session state the user can flip at any
         /// time, and this snapshot is republished only on the next authoritative refresh. The
-        /// auto-wake coordinator therefore reads the session's own selection rather than this flag —
-        /// scheduling or accepting a wake on a value this stale is what let a deselected lane start a
-        /// turn.
+        /// auto-wake coordinator therefore reads the session's own selection for routine admission
+        /// rather than this flag. Exact purposeful attention deliberately ignores routine selection;
+        /// it still uses this lane's exact reference and target identity as hard authority gates.
         let isEffectivelySelected: Bool
     }
 
@@ -362,8 +363,9 @@ struct AgentSessionLinkPassiveStatusNotices {
 
         /// The lanes this snapshot was published believing were selected, keyed for lookup.
         ///
-        /// Reporting only. Scheduling and acceptance must resolve selection against the live session
-        /// instead; see `isEffectivelySelected`.
+        /// Reporting only. Routine status/overflow scheduling and acceptance must resolve selection
+        /// against the live session instead; see `isEffectivelySelected`. Purposeful attention is not
+        /// governed by routine selection.
         ///
         /// Built by reduction rather than `Dictionary(uniqueKeysWithValues:)` so a duplicated
         /// reference degrades to a last-wins lookup instead of trapping on the main actor.

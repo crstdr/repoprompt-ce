@@ -54,12 +54,14 @@ untrusted target signal accepted only under an exact current inbound grant. It i
 permission, approval, interaction response, or source of authority. It exists to surface the target's
 current user-declared waiting context, not to invent work or infer a missing observer-user instruction.
 
-Because that guidance is versioned, a bump is load-bearing rather than cosmetic. Revision 4 retains
-revision 3's retirement of the caller-origin fence and adds the purposeful-attention trust rule and
-truthful Snooze exception, so every provider context is re-owed the full block: the next accepted
-passive batch in a context that has not accepted revision 4 carries the whole text, later batches use
-the reminder, and an Auto-wake cannot physically dispatch while its required batch could not be
-rendered. No second persistence mechanism for guidance exists or is needed.
+Because that guidance is versioned, a bump is load-bearing rather than cosmetic. Revision 5 retains
+revision 4's purposeful-attention trust rule and makes its admission exception truthful: exact
+purposeful attention may bypass master Auto-wake, that lane's own toggle, and only that exact lane's
+status Auto-wake snooze without changing any of them. Admission for routine status and overflow
+remains governed by selection and snooze. Every provider context is therefore re-owed the full block:
+the next accepted passive batch in a context that has not accepted revision 5 carries the whole text;
+later batches use the reminder, and an Auto-wake cannot physically dispatch while its required batch
+could not be rendered. No second persistence mechanism for guidance exists or is needed.
 
 ### Feedback loops are an accepted consequence
 
@@ -77,7 +79,7 @@ suppression only collapse *duplicates*. This does not violate non-reciprocity �
 the other, and the user created both explicitly.
 
 The transport contains no cycle damper, reciprocal-link detector, chain counter, or cooldown, and none
-may be added here. **Guidance is not a structural bound either**: revision 4 reduces pointless
+may be added here. **Guidance is not a structural bound either**: revision 5 reduces pointless
 discretionary work by telling the model not to invent follow-on work from an update or attention signal
 that needs none, but that is model judgement, not a guarantee, and no surface may describe it as one.
 
@@ -94,19 +96,20 @@ The controls are the user's, and they are the ones that already exist:
 
 | Control | Effect |
 | --- | --- |
-| Per-lane `snooze_auto_wake` | Ordinary status on that lane stops being a reason to start an automatic turn for a bounded window; one pending explicit attention occurrence from that exact lane may still admit |
-| Master Auto-wake off | Stops selecting every lane at once; a lane whose own Auto-wake toggle remains on stays selected and may still admit |
-| Effective lane deselection | With master Auto-wake off and that lane's toggle off, the lane stops admitting; attention has no exception |
-| Unlink / revocation | The grant and its queued sends or pending attention are gone; attention has no exception |
+| Per-lane `snooze_auto_wake` | Routine status and overflow on that lane stop being reasons to start an automatic turn for a bounded window; one pending explicit attention occurrence from that exact lane may still admit without changing the snooze |
+| Master Auto-wake off | Stops master selection for routine status and overflow; a lane whose own Auto-wake toggle remains on stays selected, while exact purposeful attention may bypass the master setting |
+| Effective lane deselection | With master Auto-wake off and that lane's toggle off, routine status and overflow stop admitting; exact purposeful attention may still admit without changing either setting |
+| Unlink / revocation | The grant and its queued sends or pending attention are gone; this remains a hard gate with no attention exception |
 
 New live sessions start with the observer-level Auto-wake preference enabled. That is only a
 creation default: hydration replaces it with the durable session value, and payloads written before
 the setting existed continue to decode as off rather than silently opting restored sessions in.
 
-Effective lane deselection — master Auto-wake off *and* that lane's own toggle off — and unlink
-prevent *subsequent* admission without exception. Master-off alone does not: granular lane selection
-may remain effective. Snooze prevents ordinary status admission but deliberately retains the exact
-attention exception. Each control may retract a pre-dispatch attempt. None claims to cancel a
+Effective lane deselection — master Auto-wake off *and* that lane's own toggle off — prevents
+*subsequent routine* status and overflow admission. Exact purposeful attention may bypass that
+selection state and the exact lane's snooze without mutating any of them. Selection and snooze changes
+may retract a routine pre-dispatch attempt, but not an exact live attention-backed attempt. Unlink,
+revocation, and every other hard gate still retract either kind. No control claims to cancel a
 physical provider call already in flight.
 
 ## Exact projection is presentation truth
@@ -282,10 +285,12 @@ service authorizes each direction independently.
 An authorized request appends one immutable occurrence identity to separate, observer-local attention
 storage. A hard enqueue-time cap refuses excess attention rather than evicting an occurrence, and
 attention neither evicts nor consumes the reducer's coalesced status intervals. Publication lets the
-occurrence ride a natural observer turn or, if every admission gate permits, start an Auto-wake through
-its exact lane. The rendered immutable claim names the occurrence and grant. Before provider
-preparation and again at physical acquisition, the occurrence must still be pending under that exact
-current grant; omission from the rendered budget or loss of authority is a definite no-call.
+occurrence ride a natural observer turn or, if every hard admission gate permits, start an Auto-wake
+through its exact lane. Exact purposeful attention may bypass master and per-lane routine selection and
+that exact lane's snooze without changing them; admission for routine status and overflow remains
+selection- and snooze-governed. The rendered immutable claim names the occurrence and grant. Before
+provider preparation and again at physical acquisition, the occurrence must still be pending under
+that exact current grant; omission from the rendered budget or loss of authority is a definite no-call.
 
 Every successfully accepted tool call returns the same `result: "accepted"`, whether it created a new
 pending occurrence or coalesced with one already pending. That result reveals neither queue state nor
@@ -304,24 +309,23 @@ auto-cleared by attention, and may be absent or may change before or after the a
 composed. Both the declaration and the attention signal remain attributed untrusted target data; they
 never become an observer instruction or authority.
 
-## Snooze suppresses admission, never delivery
+## Snooze suppresses routine admission, never delivery
 
 A snooze is observer-local policy on one exact lane. It is keyed by
 `(observer endpoint, generation-qualified link reference)`, held only in process memory on the
 owning `AgentTabSession`, and dies with that incarnation — a rebind, unlink/relink, or relaunch
 always starts unsnoozed.
 
-What it does: stops ordinary status on that lane from being the reason an automatic turn starts.
-One still-pending attention occurrence from that exact lane may bypass only this Snooze. It does not
-clear or shorten the Snooze, and after the occurrence is receipted the still-active Snooze continues to
-suppress status-only admission.
+What it does: stops routine status and overflow on that lane from being reasons an automatic turn
+starts. One still-pending attention occurrence from that exact lane may bypass this snooze, master
+Auto-wake, and that lane's own toggle. It does not clear or shorten the snooze or change either
+selection setting, and after the occurrence is receipted the still-active snooze continues to suppress
+routine admission.
 
-The attention exception bypasses nothing else and cannot select a lane. A lane remains selected while
-either master Auto-wake or its own lane toggle is on, so master-off alone may leave granular lanes
-effective. With master Auto-wake off and that lane's toggle off, effective deselection admits no
-attention exception. Readiness, prompt eligibility and budget, immutable-claim reservation,
-physical-dispatch acquisition, exact grant revalidation or revocation, failure suppression, and
-unlink also remain unchanged.
+That exact purposeful-attention exception bypasses no other gate. Unlink and revocation, exact
+authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable
+claim and budget, physical-dispatch acquisition, and the tombstone fence all remain hard. The
+exception neither grants generalized priority nor changes routine status and overflow admission.
 
 What Snooze deliberately does **not** do, and must never be changed to do:
 
@@ -334,8 +338,8 @@ Consequences that follow from that, and are intended rather than bugs:
 - a snoozed lane's updates keep coalescing and still ride along on a turn the observer's own user
   starts, or on a wake another unsnoozed lane admitted (a *hitchhiker*);
 - expiry promises **one ordinary re-evaluation**, not a turn. The usual readiness, authority,
-  selection and suppression gates still decide, so content already delivered naturally, or a lane
-  that net-reverted, correctly produces nothing.
+  routine-selection and suppression gates still decide, so content already delivered naturally, or a
+  lane that net-reverted, correctly produces nothing.
 
 Because the reducer's status storage keeps one coalesced status interval per lane and no status event
 history, the only honest description of what survives a snooze is "the current coalesced summary" —
@@ -372,9 +376,9 @@ target, so opening an observer cannot overlap or masquerade as revocation.
 
 ## The `.cancelledBeforeDispatch` tombstone is a fence, not bookkeeping
 
-When a snooze — or any eligibility loss — retracts a wake that is already in `.preparingDispatch`,
-`cancelAgentSessionLinkAutoWake` does not clear the attempt. It converts it to
-`.cancelledBeforeDispatch` and leaves it in place.
+When a snooze or selection loss retracts a routine wake that is already in `.preparingDispatch`, or
+when any hard eligibility loss retracts either kind of wake, `cancelAgentSessionLinkAutoWake` does not
+clear the attempt. It converts it to `.cancelledBeforeDispatch` and leaves it in place.
 
 That tombstone looks like dead state and is not. Providers do not mint the wake's dispatch ID — they
 use their own (`codexNativeSend`, `claudeNativeSend`, `codexFallback`, and so on), and
@@ -385,7 +389,7 @@ exists in `.preparingDispatch`, `.cancelledBeforeDispatch`, or `.dispatching`**.
 Clear the tombstone while a provider path is still preparing and the rewrite stops happening: the
 provider's own ordinary ID reaches `agentSessionLinkAcquirePhysicalDispatch`, which correctly
 classifies it as *not* in the reserved Auto-wake family and returns `true`. The call goes through
-unfenced, and the snoozed lane wakes the model with no claim and no provenance row.
+unfenced, and the retracted lane wakes the model with no claim and no provenance row.
 
 The reserved family itself fails closed. An ID whose raw form is in the `lane.autowake:` family but
 does not parse as exactly one canonical UUID is refused rather than treated as ordinary, and
@@ -400,8 +404,8 @@ Two rules follow.
 2. **`cancelAgentSessionLinkAutoWake` is not idempotent across phases.** It converts
    `.preparingDispatch` into a tombstone, but a *second* cancel of an already-tombstoned attempt
    falls past both phase guards and clears the slot. Any new caller must check the phase first.
-   Repeated eligibility loss is the ordinary case, not an exotic one: the snoozed lane publishing
-   again, an extension, or even an idempotent repeat all re-drive that path.
+   Repeated eligibility loss is the ordinary case, not an exotic one: a hard gate publishing again,
+   or a routine lane's snooze extension or idempotent selection repeat, can all re-drive that path.
 
 A tombstone can never be rescheduled, so a publication absorbed while it stands schedules nothing.
 The preparation finalizer replays one ordinary evaluation after releasing it, which is what keeps

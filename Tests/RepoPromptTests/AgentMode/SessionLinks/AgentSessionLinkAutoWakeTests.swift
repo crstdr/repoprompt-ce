@@ -129,10 +129,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     // MARK: - Guidance revision
 
-    /// A provider context that physically accepted revision 3 is re-owed revision 4 in full. Merely
-    /// rendering or abandoning revision 4 does not advance the acknowledgement; only physical
+    /// A provider context that physically accepted revision 4 is re-owed revision 5 in full. Merely
+    /// rendering or abandoning revision 5 does not advance the acknowledgement; only physical
     /// acceptance earns the reminder, and a rebuilt context owes the full block again.
-    func testRevisionFourReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
+    func testRevisionFiveReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
         let observerSessionID = UUID()
         let epoch = Self.epoch(observerSessionID: observerSessionID)
         let inventory = Self.inventory(observerSessionID: observerSessionID, revision: 1)
@@ -151,7 +151,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         // physically accepted the prior guidance revision. The memberwise copy preserves all claim
         // authority; only the revision the provider is treated as having seen is historical.
         let passive = try XCTUnwrap(first.passive)
-        let revisionThreeClaim = AgentSessionLinkOutboundPromptClaim(
+        let revisionFourClaim = AgentSessionLinkOutboundPromptClaim(
             observerSessionID: first.observerSessionID,
             dispatchID: first.dispatchID,
             epochToken: first.epochToken,
@@ -161,16 +161,16 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 observerEndpoint: passive.observerEndpoint,
                 receipt: passive.receipt,
                 includesUnattributedOverflow: passive.includesUnattributedOverflow,
-                guidanceRevision: 3,
+                guidanceRevision: 4,
                 displayAttribution: passive.displayAttribution
             ),
             laneGuidanceMode: first.laneGuidanceMode,
             fragment: first.fragment
         )
-        store.accept(revisionThreeClaim)
+        store.accept(revisionFourClaim)
         XCTAssertEqual(
             store.test_lastAcceptedLaneGuidanceRevision(observerSessionID: observerSessionID),
-            3
+            4
         )
 
         let reOwed = try XCTUnwrap(store.claim(
@@ -181,9 +181,16 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 4 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 5 supersedes"))
         XCTAssertTrue(reOwed.fragment.contains("attributed attention request"))
+        XCTAssertTrue(reOwed.fragment.contains("master Auto-wake"))
+        XCTAssertTrue(reOwed.fragment.contains("lane&apos;s own toggle"))
         XCTAssertTrue(reOwed.fragment.contains("exact lane&apos;s status Auto-wake snooze"))
+        XCTAssertTrue(reOwed.fragment.contains("status and overflow"))
+        XCTAssertTrue(reOwed.fragment.contains("selection and snooze"))
+        XCTAssertTrue(reOwed.fragment.contains("without changing any of them"))
+        XCTAssertTrue(reOwed.fragment.contains("Unlink, revocation, exact authority, readiness"))
+        XCTAssertFalse(reOwed.fragment.contains("It cannot select a lane"))
         XCTAssertTrue(reOwed.fragment.contains("idle_for_send` describes readiness at `observed_at`"))
 
         // Rendering is not acceptance: an abandoned batch leaves the wording still owed.
@@ -212,6 +219,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         ))
         XCTAssertEqual(later.laneGuidanceMode, .reminder)
         XCTAssertTrue(later.fragment.contains("Lane update or attributed attention request:"))
+        XCTAssertTrue(later.fragment.contains("master Auto-wake"))
+        XCTAssertTrue(later.fragment.contains("lane&apos;s own toggle"))
+        XCTAssertTrue(later.fragment.contains("exact lane&apos;s status Auto-wake snooze"))
+        XCTAssertTrue(later.fragment.contains("status and overflow"))
+        XCTAssertTrue(later.fragment.contains("selection and snooze"))
+        XCTAssertTrue(later.fragment.contains("without changing any of them"))
+        XCTAssertTrue(later.fragment.contains("Unlink, revocation, exact authority, readiness"))
+        XCTAssertFalse(later.fragment.contains("It cannot select a lane"))
         XCTAssertFalse(later.fragment.contains("idle_for_send` describes readiness at `observed_at`"))
 
         // A rebuilt provider conversation never saw the wording, so it is owed in full again.
@@ -409,7 +424,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         let reserved = try XCTUnwrap(
             fixture.session.pendingOversightAutoWake,
-            "selected attention may re-arm an otherwise suppressed status shape"
+            "exact purposeful attention may re-arm an otherwise suppressed status shape"
         )
         reserved.task?.cancel()
         XCTAssertEqual(reserved.requiredAttentionOccurrence, attention.occurrence)
@@ -450,7 +465,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
-    func testDeselectedAttentionCannotRearmAnUnrelatedSuppressedStatus() throws {
+    func testPurposefulAttentionIgnoresRoutineSelectionWhenRearmingSuppressedStatus() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
         fixture.session.autoWakeOnOversightUpdates = false
@@ -471,7 +486,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         fixture.session.suppressedOversightWakeFingerprint = failedStatus.wakeFingerprint
 
-        let deselectedAttention = Self.attentionRequest(1)
+        let attention = Self.attentionRequest(1)
         try publishLane(
             fixture,
             linkSetRevision: 1,
@@ -479,13 +494,15 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             targetIndices: [0],
             laneIndices: [0, 1],
             selectedTargetIndices: [0],
-            attentionRequests: [deselectedAttention]
+            attentionRequests: [attention]
         )
 
-        XCTAssertNil(
+        let reserved = try XCTUnwrap(
             fixture.session.pendingOversightAutoWake,
-            "attention on a deselected lane must not re-arm another lane's suppressed status"
+            "purposeful attention must bypass lane-one's routine deselection"
         )
+        reserved.task?.cancel()
+        XCTAssertEqual(reserved.requiredAttentionOccurrence, attention.occurrence)
     }
 
     func testRenderedAttentionThatFailedIsSuppressedAndRemainsOwedForNaturalTurn() throws {
@@ -592,7 +609,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         let reserved = try XCTUnwrap(
             fixture.session.pendingOversightAutoWake,
-            "a new selected occurrence may re-arm an older failed occurrence"
+            "a new exact occurrence may re-arm an older failed occurrence"
         )
         reserved.task?.cancel()
         XCTAssertEqual(
@@ -635,7 +652,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertNil(fixture.session.pendingOversightAutoWake)
     }
 
-    func testDeselectedNewAttentionCannotRearmAnOlderFailedAttention() throws {
+    func testNewPurposefulAttentionIgnoresRoutineSelectionWhenRearmingOlderFailure() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
         fixture.session.autoWakeOnOversightUpdates = true
@@ -658,7 +675,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         fixture.session.suppressedOversightWakeFingerprint = failed.wakeFingerprint
 
         fixture.session.autoWakeOnOversightUpdates = false
-        let deselectedSuccessor = Self.attentionRequest(1)
+        let successor = Self.attentionRequest(1)
         try publishLane(
             fixture,
             linkSetRevision: 1,
@@ -666,12 +683,18 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             targetIndices: [],
             laneIndices: [0, 1],
             selectedTargetIndices: [0],
-            attentionRequests: [failedAttention, deselectedSuccessor]
+            attentionRequests: [failedAttention, successor]
         )
 
-        XCTAssertNil(
+        let reserved = try XCTUnwrap(
             fixture.session.pendingOversightAutoWake,
-            "a new occurrence on a deselected lane cannot re-arm an older failed occurrence"
+            "a new purposeful occurrence may re-arm an older failure despite routine deselection"
+        )
+        reserved.task?.cancel()
+        XCTAssertEqual(
+            reserved.requiredAttentionOccurrence,
+            successor.occurrence,
+            "the newly admitting exact occurrence owns the routine-policy bypass"
         )
     }
 
@@ -714,7 +737,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         ))
     }
 
-    func testAttentionBypassesOnlyItsOwnSnoozeAndStillRequiresEffectiveLaneSelection() throws {
+    func testPurposefulAttentionBypassesOnlyItsExactLaneSnooze() throws {
         let bypass = try makeFixture()
         installSnoozeClock(bypass)
         try publishInventory(bypass, revision: 1)
@@ -753,8 +776,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         let attentionDriven = try XCTUnwrap(
             bypass.session.pendingOversightAutoWake,
-            "purposeful attention may bypass its exact selected lane's snooze"
+            "purposeful attention may bypass its exact lane's snooze"
         )
+        attentionDriven.task?.cancel()
         XCTAssertEqual(attentionDriven.requiredAttentionOccurrence, attention.occurrence)
         XCTAssertEqual(bypass.session.agentSessionLinkAutoWakeSnoozes.count, 2)
 
@@ -772,73 +796,161 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         XCTAssertNil(
             bypass.session.pendingOversightAutoWake,
-            "attention for lane zero must not broadly unsnooze status on lane one"
+            "attention for lane zero must not broadly unsnooze routine status on lane one"
         )
+    }
 
-        let granular = try makeFixture()
-        try publishInventory(granular, revision: 1)
-        granular.session.autoWakeOnOversightUpdates = false
-        granular.session.runState = .running
-        let granularAttention = Self.attentionRequest(0)
+    func testPurposefulAttentionIgnoresRoutineSelectionThroughPhysicalAcquisition() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        let attention = Self.attentionRequest(0)
         try publishLane(
-            granular,
+            fixture,
             linkSetRevision: 1,
             queueRevision: 1,
             targetIndices: [],
             laneIndices: [0],
-            selectedTargetIndices: [0],
-            attentionRequests: [granularAttention]
+            attentionRequests: [attention]
         )
-        XCTAssertEqual(
-            try XCTUnwrap(granular.session.pendingOversightAutoWake)
-                .requiredAttentionOccurrence,
-            granularAttention.occurrence,
-            "master-off alone must not defeat a granular lane selection"
-        )
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        reserved.task?.cancel()
+        XCTAssertEqual(reserved.requiredAttentionOccurrence, attention.occurrence)
 
-        let controlled = try makeFixture()
-        try publishInventory(controlled, revision: 1)
-        controlled.session.autoWakeOnOversightUpdates = true
-        controlled.session.runState = .running
-        let controlledEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
-            controlled.viewModel,
-            tabID: controlled.tabID
+        // Master and per-lane routine selection are now both off, with no republication. The real
+        // master mutator must route through the shared live fence, retain the exact attention attempt,
+        // and let physical acquisition apply the same exception rather than trusting the stale
+        // routine-selection projection.
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+            false,
+            for: endpoint
+        ))
+        XCTAssertFalse(fixture.session.autoWakeOnOversightUpdates)
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty)
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.wakeID, reserved.wakeID)
+
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        var preparing = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        fixture.session.pendingOversightAutoWake = preparing
+
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: claim.dispatchID
+        ))
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .dispatching)
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(
+            for: fixture.session,
+            dispatchID: claim.dispatchID
         )
+    }
+
+    func testPurposefulAttentionSelectionBypassStillRequiresExactLaneGeneration() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = false
+        fixture.session.runState = .running
+        let staleAttention = Self.attentionRequest(0)
+
         try publishLane(
-            controlled,
+            fixture,
             linkSetRevision: 1,
             queueRevision: 1,
-            targetIndices: [],
-            laneIndices: [0]
-        )
-        XCTAssertTrue(controlled.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
-            false,
-            for: controlledEndpoint
-        ))
-        controlled.session.agentSessionLinkAutoWakeTargetSessionIDs = []
-        let naturallyDelivered = Self.attentionRequest(0)
-        try publishLane(
-            controlled,
-            linkSetRevision: 1,
-            queueRevision: 2,
             targetIndices: [],
             laneIndices: [0],
             selectedTargetIndices: [],
-            attentionRequests: [naturallyDelivered]
+            referenceGeneration: 2,
+            attentionRequests: [staleAttention]
         )
+
         XCTAssertNil(
-            controlled.session.pendingOversightAutoWake,
-            "attention cannot select an effectively deselected lane"
+            fixture.session.pendingOversightAutoWake,
+            "ignoring routine selection must not ignore the generation-qualified lane authority"
         )
-        let naturalClaim = try XCTUnwrap(controlled.viewModel.agentSessionLinkPromptClaim(
-            for: controlled.session,
-            dispatchID: .claudeNativeSend(UUID())
+    }
+
+    func testPostClaimUnlinkRefusesAttentionAndOldOccurrenceCannotReplayThroughRelinkedGeneration() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = false
+        fixture.session.runState = .running
+        let attention = Self.attentionRequest(0)
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0],
+            selectedTargetIndices: [],
+            attentionRequests: [attention]
+        )
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        reserved.task?.cancel()
+        XCTAssertEqual(reserved.requiredAttentionOccurrence, attention.occurrence)
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
         ))
         XCTAssertEqual(
-            try XCTUnwrap(naturalClaim.passive).receipt.deliveredAttentionOccurrences,
-            [naturallyDelivered.occurrence],
-            "effective deselection suppresses admission, never natural-turn delivery"
+            try XCTUnwrap(claim.passive).receipt.deliveredAttentionOccurrences,
+            [attention.occurrence]
         )
+
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        fixture.session.pendingOversightAutoWake = preparing
+
+        // Unlink generation 1 while its exact attention-backed claim is already reserved. Preparation
+        // must become a transport tombstone rather than trusting the immutable claim's stale grant.
+        try publishLane(
+            fixture,
+            linkSetRevision: 2,
+            queueRevision: 2,
+            targetIndices: [],
+            laneIndices: [1],
+            selectedTargetIndices: []
+        )
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.wakeID, reserved.wakeID)
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
+
+        // A relinked generation is a different authority. Even if a later projection still carries
+        // the retired occurrence, releasing the tombstone must not replay it through generation 2.
+        try publishLane(
+            fixture,
+            linkSetRevision: 3,
+            queueRevision: 3,
+            targetIndices: [],
+            laneIndices: [0],
+            selectedTargetIndices: [],
+            referenceGeneration: 2,
+            attentionRequests: [attention]
+        )
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.wakeID, reserved.wakeID)
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeReevaluationOwed)
+
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: claim.dispatchID
+        ))
+        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+        XCTAssertFalse(fixture.session.agentSessionLinkAutoWakeReevaluationOwed)
+        XCTAssertNil(fixture.session.suppressedOversightWakeFingerprint)
+        XCTAssertNil(fixture.viewModel.agentSessionLinkPromptClaimStore.pendingClaim(
+            dispatchID: claim.dispatchID,
+            observerSessionID: fixture.sessionID
+        ))
     }
 
     func testBudgetOmissionOfRequiredAttentionBasisIsADefiniteNoCall() throws {
@@ -863,6 +975,13 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             endpoint: endpoint,
             command: .set(durationSeconds: 600)
         ))
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+            false,
+            for: endpoint
+        ))
+        XCTAssertFalse(fixture.session.autoWakeOnOversightUpdates)
+        XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty)
+
         let attention = Self.attentionRequest(0)
         try publishLane(
             fixture,
@@ -1146,15 +1265,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     /// Two independently granted, independently selected directions each keep waking on their own
-    /// new edges — and a user control is what stops one of them.
+    /// new routine status edges — and routine selection is what stops one of them.
     ///
     /// This is the accepted product consequence of the deletion, pinned rather than papered over.
     /// Neither grant implies the other; the user created both. The transport deliberately encodes no
-    /// reciprocal detector, cycle counter, or cooldown, so the only things that stop the churn are
-    /// the visible controls: per-lane snooze, Auto-wake deselection, and unlink. This test proves
-    /// both halves — that reciprocal wakes really do continue, and that deselection really does end
-    /// the direction it is applied to without touching the other.
-    func testReciprocalExplicitGrantsKeepWakingUntilAUserControlStopsOneDirection() throws {
+    /// reciprocal detector, cycle counter, or cooldown. Per-lane snooze and Auto-wake deselection stop
+    /// this routine status churn; exact purposeful attention may bypass both, while unlink remains the
+    /// hard control for that signal. This test exercises only the routine-status half.
+    func testReciprocalRoutineStatusEdgesStopWhenOneDirectionIsDeselected() throws {
         let observerA = try makeFixture()
         let observerB = try makeFixture()
         for fixture in [observerA, observerB] {
@@ -1399,6 +1517,60 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
+    /// Once selection retracts a preparing attempt, later selection writes cannot release its transport
+    /// tombstone. Only a path that proves the provider call did not occur may retire that identity.
+    func testRepeatedSelectionChangesDoNotClearPreDispatchTombstone() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = true
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [0],
+            laneIndices: [0],
+            selectedTargetIndices: []
+        )
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        reserved.task?.cancel()
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        fixture.session.pendingOversightAutoWake = preparing
+
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(false, for: endpoint))
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.wakeID, reserved.wakeID)
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
+
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeTargetSessionIDs(
+            [Self.targetID(0)],
+            for: endpoint
+        ))
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.wakeID, reserved.wakeID)
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
+
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeTargetSessionIDs([], for: endpoint))
+        XCTAssertEqual(
+            fixture.session.pendingOversightAutoWake?.wakeID,
+            reserved.wakeID,
+            "repeated selection loss must not clear the dispatch-ID fence"
+        )
+        XCTAssertEqual(fixture.session.pendingOversightAutoWake?.phase, .cancelledBeforeDispatch)
+
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        XCTAssertNil(
+            fixture.session.pendingOversightAutoWake,
+            "the refused physical boundary safely releases the tombstone"
+        )
+    }
+
     /// Selecting a lane makes its *next* update wake-eligible and changes nothing retroactively.
     ///
     /// Selection is read live rather than from the lane's frozen projection, so a freshly selected
@@ -1577,6 +1749,17 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             XCTAssertEqual(
                 fixture.session.pendingOversightAutoWake?.requiredAttentionOccurrence,
                 attention.occurrence
+            )
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+                false,
+                for: routeToken.observerEndpoint
+            ))
+            XCTAssertFalse(fixture.session.autoWakeOnOversightUpdates)
+            XCTAssertTrue(fixture.session.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty)
+            XCTAssertEqual(
+                fixture.session.pendingOversightAutoWake?.requiredAttentionOccurrence,
+                attention.occurrence,
+                "routine deselection during readiness suspension must retain exact purposeful attention"
             )
             XCTAssertNotNil(
                 fixture.session.instructionContinuation,
@@ -3151,9 +3334,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             tabID: fixture.tabID
         )
         if let selectedTargetIndices {
-            // Selection is live session state; the lane flag is only the projection of it that this
-            // publication froze. Writing both keeps a fixture from advertising a selection the
-            // coordinator's live fence would (correctly) refuse.
+            // Routine selection is live session state; the lane flag is only the projection of it
+            // that this publication froze. Writing both keeps status/overflow fixtures from
+            // advertising a selection the coordinator's live fence would (correctly) refuse.
             fixture.session.agentSessionLinkAutoWakeTargetSessionIDs = Set(
                 selectedTargetIndices.map(Self.targetID)
             )
