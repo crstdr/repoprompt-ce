@@ -589,9 +589,11 @@ extension AgentModeViewModel {
             published.inventory,
             input: input
         )
-        if !effectiveInventory.items.isEmpty {
-            guard let runID = session.runID,
-                  let catalog = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+        // A missing process-local run identifies pre-run bootstrap: the wake this context admits is
+        // what creates the run and its catalog. Once any run exists, keep requiring its exact ready
+        // catalog and provider-input route; a stale or unready established run still fails closed.
+        if !effectiveInventory.items.isEmpty, let runID = session.runID {
+            guard let catalog = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
                   catalog.runID == runID,
                   catalog.isReady,
                   catalog.routeToken?.observerEndpoint == endpoint

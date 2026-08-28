@@ -1156,6 +1156,80 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
+    func testColdRestoredObserverSchedulesPurposefulAttentionWithoutPriorRunCatalog() throws {
+        let fixture = try makeFixture(catalogReady: false)
+        let priorRunID = try XCTUnwrap(fixture.session.runID)
+        XCTAssertTrue(fixture.session.clearRunID(ifCurrent: priorRunID))
+        try publishInventory(fixture, revision: 1)
+        XCTAssertEqual(fixture.session.runState, .idle)
+
+        let attention = Self.attentionRequest(0)
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0],
+            attentionRequests: [attention]
+        )
+
+        let reserved = try XCTUnwrap(
+            fixture.session.pendingOversightAutoWake,
+            "a cold-restored observer must be able to bootstrap the run that creates its catalog"
+        )
+        reserved.task?.cancel()
+        XCTAssertNil(fixture.session.runID)
+        XCTAssertEqual(reserved.requiredAttentionOccurrence, attention.occurrence)
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        XCTAssertEqual(
+            try XCTUnwrap(claim.passive).receipt.deliveredAttentionOccurrences,
+            [attention.occurrence]
+        )
+        fixture.viewModel.cancelAgentSessionLinkAutoWake(
+            for: reserved.observerEndpoint,
+            reason: .settingDisabled
+        )
+    }
+
+    func testColdRestoredRoutineWakeStillRequiresSelection() throws {
+        let fixture = try makeFixture(catalogReady: false)
+        let priorRunID = try XCTUnwrap(fixture.session.runID)
+        XCTAssertTrue(fixture.session.clearRunID(ifCurrent: priorRunID))
+        try publishInventory(fixture, revision: 1)
+        XCTAssertEqual(fixture.session.runState, .idle)
+
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        XCTAssertNil(
+            fixture.session.pendingOversightAutoWake,
+            "cold restoration must not broaden routine Auto-wake admission"
+        )
+
+        fixture.session.autoWakeOnOversightUpdates = true
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 2,
+            edgeSequenceOffset: 10
+        )
+        let reserved = try XCTUnwrap(
+            fixture.session.pendingOversightAutoWake,
+            "a selected routine update must bootstrap a cold-restored observer"
+        )
+        reserved.task?.cancel()
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        XCTAssertEqual(try XCTUnwrap(claim.passive).receipt.deliveredStatuses.count, 1)
+        fixture.viewModel.cancelAgentSessionLinkAutoWake(
+            for: reserved.observerEndpoint,
+            reason: .settingDisabled
+        )
+    }
+
     func testBusyWakeAwaitsOneCancellableObservationSubscription() async throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
