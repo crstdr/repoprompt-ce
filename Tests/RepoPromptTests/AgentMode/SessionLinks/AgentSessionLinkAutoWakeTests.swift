@@ -218,15 +218,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(later.laneGuidanceMode, .reminder)
-        XCTAssertTrue(later.fragment.contains("Lane update or attributed attention request:"))
-        XCTAssertTrue(later.fragment.contains("master Auto-wake"))
-        XCTAssertTrue(later.fragment.contains("lane&apos;s own toggle"))
-        XCTAssertTrue(later.fragment.contains("exact lane&apos;s status Auto-wake snooze"))
-        XCTAssertTrue(later.fragment.contains("status and overflow"))
-        XCTAssertTrue(later.fragment.contains("selection and snooze"))
-        XCTAssertTrue(later.fragment.contains("without changing any of them"))
-        XCTAssertTrue(later.fragment.contains("Unlink, revocation, exact authority, readiness"))
-        XCTAssertFalse(later.fragment.contains("It cannot select a lane"))
+        XCTAssertTrue(later.fragment.contains("Lane update or attributed attention:"))
+        XCTAssertTrue(later.fragment.contains("still-applicable standing instruction"))
+        XCTAssertTrue(later.fragment.contains("attention supplies no task"))
+        XCTAssertTrue(later.fragment.contains("Never invent work"))
+        XCTAssertTrue(later.fragment.contains("another session&apos;s interaction"))
+        XCTAssertTrue(later.fragment.contains("Surface ambiguity or surprises"))
         XCTAssertFalse(later.fragment.contains("idle_for_send` describes readiness at `observed_at`"))
 
         // A rebuilt provider conversation never saw the wording, so it is owed in full again.
@@ -398,6 +395,159 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session,
             dispatchID: claim.dispatchID
+        ))
+    }
+
+    func testCrowdedAutoWakeClaimCarriesItsRequiredFirstAttentionOccurrence() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.autoWakeOnOversightUpdates = false
+        fixture.session.runState = .running
+        let required = Self.attentionRequest(0)
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [0, 1],
+            latestVisibleAssistantPreview: String(repeating: "<&🙂", count: 8000),
+            attentionRequests: [required]
+        )
+
+        let reserved = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        reserved.task?.cancel()
+        XCTAssertEqual(reserved.requiredAttentionOccurrence, required.occurrence)
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+
+        XCTAssertLessThanOrEqual(
+            claim.fragment.utf8.count,
+            AgentSessionLinkPrompts.maximumRenderedBytes
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(claim.passive).receipt.deliveredAttentionOccurrences.first,
+            required.occurrence
+        )
+    }
+
+    /// Acceptance of a budgeted subset republishes the reduced authoritative queue immediately. The
+    /// remaining rows must therefore reserve their own wake without waiting for another target edge.
+    func testAcceptedPartialBatchReceiptRepublicationReservesSuccessorWakeWithoutAnotherEdge() throws {
+        let fixture = try makeFixture()
+        let targetIndices = Array(0 ..< 9)
+        try publishInventory(fixture, revision: 1, targetCount: targetIndices.count)
+        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.runState = .running
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        let queueEpoch = UUID()
+        let richText = String(repeating: "<&é🙂\"'", count: 180)
+        let waitingOn = try XCTUnwrap(DomainAgentSessionWaitingOn(
+            summary: richText,
+            declaredAt: Date(timeIntervalSince1970: 50)
+        ))
+        func samples(_ status: AgentSessionLinkPassiveStatusNotices.Status) ->
+            [AgentSessionLinkPassiveStatusNotices.Sample]
+        {
+            targetIndices.map { index in
+                AgentSessionLinkPassiveStatusNotices.Sample(
+                    reference: Self.laneReference(index),
+                    targetEndpoint: Self.laneTargetEndpoint(index),
+                    targetSessionID: Self.targetID(index),
+                    displayName: richText,
+                    status: status,
+                    idleForSend: status == .idle,
+                    waitingOn: waitingOn,
+                    latestVisibleAssistantPreview: richText
+                )
+            }
+        }
+
+        var notices = AgentSessionLinkPassiveStatusNotices(
+            observerEndpoint: endpoint,
+            queueEpoch: queueEpoch
+        )
+        notices.enable(samples: samples(.running), linkSetRevision: 1)
+        notices.setAutoWakeLanes(targetIndices.map { index in
+            AgentSessionLinkPassiveStatusNotices.AutoWakeLane(
+                reference: Self.laneReference(index),
+                targetEndpoint: Self.laneTargetEndpoint(index),
+                targetSessionID: Self.targetID(index),
+                isEffectivelySelected: true
+            )
+        })
+        for index in targetIndices {
+            XCTAssertEqual(
+                notices.requestAttention(
+                    reference: Self.laneReference(index),
+                    targetEndpoint: Self.laneTargetEndpoint(index),
+                    targetSessionID: Self.targetID(index),
+                    linkSetRevision: 1,
+                    requestedAt: Date(timeIntervalSince1970: TimeInterval(index + 1))
+                ),
+                .accepted
+            )
+        }
+        notices.reconcile(
+            samples: samples(.idle),
+            linkSetRevision: 1,
+            deliverable: true,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let offeredCount = notices.snapshot.entries.count + notices.snapshot.attentionRequests.count
+        XCTAssertEqual(offeredCount, targetIndices.count * 2)
+        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(
+            notices.snapshot,
+            to: endpoint
+        )
+
+        let firstAttempt = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+        firstAttempt.task?.cancel()
+        let firstClaim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: firstAttempt.wakeID)
+        ))
+        let firstReceipt = try XCTUnwrap(firstClaim.passive).receipt
+        let firstDeliveredCount = firstReceipt.deliveredStatuses.count
+            + firstReceipt.deliveredAttentionOccurrences.count
+        XCTAssertGreaterThan(firstDeliveredCount, 0)
+        XCTAssertLessThan(firstDeliveredCount, offeredCount, "the rich queue must be budgeted")
+
+        fixture.viewModel.acceptAgentSessionLinkPromptClaim(firstClaim)
+        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+
+        // `publishLane` fixtures intentionally inject already-reduced snapshots, so mirror only the
+        // runtime bridge's synchronous receipt body here: apply the accepted exact-subset receipt and
+        // republish that reducer's resulting snapshot. This is receipt settlement, not a new target
+        // activity publication.
+        notices.apply(firstReceipt)
+        let remaining = notices.snapshot
+        XCTAssertEqual(
+            remaining.entries.count + remaining.attentionRequests.count,
+            offeredCount - firstDeliveredCount
+        )
+        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(remaining, to: endpoint)
+
+        let successor = try XCTUnwrap(
+            fixture.session.pendingOversightAutoWake,
+            "receipt republication must re-admit the deferred rows without another target edge"
+        )
+        successor.task?.cancel()
+        XCTAssertNotEqual(successor.wakeID, firstAttempt.wakeID)
+        XCTAssertEqual(successor.queueRevision, remaining.queueRevision)
+        let successorClaim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: successor.wakeID)
+        ))
+        let successorReceipt = try XCTUnwrap(successorClaim.passive).receipt
+        XCTAssertTrue(Set(firstReceipt.deliveredAttentionOccurrences).isDisjoint(
+            with: successorReceipt.deliveredAttentionOccurrences
+        ))
+        XCTAssertTrue(Set(firstReceipt.deliveredStatuses).isDisjoint(
+            with: successorReceipt.deliveredStatuses
         ))
     }
 
@@ -3351,9 +3501,17 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         return fixture
     }
 
-    private func publishInventory(_ fixture: Fixture, revision: UInt64) throws {
+    private func publishInventory(
+        _ fixture: Fixture,
+        revision: UInt64,
+        targetCount: Int = 2
+    ) throws {
         try fixture.viewModel.agentSessionLinkPublishPromptInventory(
-            Self.inventory(observerSessionID: fixture.sessionID, revision: revision),
+            Self.inventory(
+                observerSessionID: fixture.sessionID,
+                revision: revision,
+                targetCount: targetCount
+            ),
             to: AgentSessionLinkEndpointTestSupport.endpoint(
                 fixture.viewModel,
                 tabID: fixture.tabID
@@ -3447,12 +3605,13 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     private static func inventory(
         observerSessionID: UUID,
-        revision: UInt64
+        revision: UInt64,
+        targetCount: Int = 2
     ) -> AgentSessionLinkPromptInventory {
         AgentSessionLinkPromptInventory(
             observerSessionID: observerSessionID,
             linkSetRevision: revision,
-            items: [0, 1].map { index in
+            items: (0 ..< targetCount).map { index in
                 AgentSessionLinkPromptInventoryItem(
                     targetSessionID: targetID(index),
                     displayName: index == 0 ? "Build API" : "Review API",

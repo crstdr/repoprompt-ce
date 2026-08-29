@@ -536,9 +536,9 @@ struct AgentSessionLinkPromptRenderRequest {
 
 /// One rendered fragment plus a truthful account of what of the passive batch it actually contains.
 ///
-/// The renderer, not the store, owns the shared byte budget, so only the renderer can say whether the
-/// passive component fit. Reporting a `nil` `passiveBatch` is how it leaves that batch owed instead of
-/// letting an acceptance acknowledge content the model never received.
+/// The renderer, not the store, owns the shared byte budget, so only the renderer can identify the
+/// deterministic passive subset the fragment actually contains. A receipt is minted from exactly
+/// that subset; any offered rows absent from it remain queued for a later accepted delivery.
 struct AgentSessionLinkPromptRenderResult {
     /// What one render actually put in front of the model for the batch it was offered.
     ///
@@ -1106,8 +1106,8 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             return .requiredLaneBatchUnavailable
         }
 
-        // A batch the renderer could not fit leaves no receipt, so acceptance acknowledges nothing
-        // and the queue keeps it owed to a later dispatch. Partial acknowledgement is never offered.
+        // The renderer is the authority on visible membership: the receipt names exactly its chosen
+        // subset, so deferred offered rows stay queued while accepted visible rows can make progress.
         var passiveComponent: AgentSessionLinkOutboundPromptClaim.PassiveStatusComponent?
         if let passiveBatch, let renderedPassive = rendered.passiveBatch {
             passiveComponent = AgentSessionLinkOutboundPromptClaim.PassiveStatusComponent(

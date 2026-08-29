@@ -449,9 +449,9 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
         )
     }
 
-    /// A batch the byte budget dropped was never delivered, so there is nothing to attribute and no
-    /// receipt to settle — the claim carries neither.
-    func testABatchOmittedByTheByteBudgetProducesNoAttribution() throws {
+    /// A crowded inventory now yields rows to the passive batch rather than crowding it out. UI
+    /// attribution follows exactly the subset that was rendered and receipted.
+    func testCrowdedInventoryStillAttributesTheRenderedPassiveSubset() throws {
         let store = AgentSessionLinkOutboundPromptClaimStore()
         let crowded = AgentSessionLinkPromptInventory(
             observerSessionID: observerSessionID,
@@ -474,7 +474,11 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
 
-        XCTAssertNil(claimed.passive, "an omitted batch acknowledges and attributes nothing")
+        let passive = try XCTUnwrap(claimed.passive)
+        XCTAssertEqual(passive.receipt.deliveredStatuses.count, 1)
+        XCTAssertEqual(passive.displayAttribution?.labels, ["Build API"])
+        XCTAssertTrue(claimed.fragment.contains("omitted_link_count="))
+        XCTAssertTrue(claimed.fragment.contains(AgentSessionLinkPrompts.statusChangeEnvelopeTag))
     }
 
     // MARK: - The row an acceptance will append

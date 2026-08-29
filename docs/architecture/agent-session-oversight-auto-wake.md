@@ -24,12 +24,15 @@ defect in this subsystem.
 
 ## Autonomy is grant-scoped and prompt-governed
 
-The user's exact direct grant is the whole structural delegation.
-`DomainAgentSessionOperationAuthorizer` still protects every outbound observer operation by requiring
-an Agent-origin caller, a direct grant, exact observer identity, exact target identity, and the
-operation's capability. `request_attention` instead requires generation-qualified exact inverse
-authorization through a current inbound grant. The bridge revalidates both live endpoint incarnations
-around every suspension point. Nothing else authorizes anything.
+The user's exact direct grant is the whole structural delegation. Target-bearing observer operations
+are authorized by `DomainAgentSessionLinkAuthority`, which resolves the exact observer endpoint and
+target session to one direct grant, checks that operation's capability, and returns a
+generation-qualified lease. `DomainAgentSessionOperationAuthorizer` participates only in the
+targetless outbound `list` path, where it requires an Agent-origin caller and at least one active
+outbound link before the authority returns the current inventory. `request_attention` instead requires
+generation-qualified exact inverse authorization through a current inbound grant. The bridge
+revalidates both live endpoint incarnations around every suspension point. Nothing else authorizes
+anything.
 
 What the transport deliberately no longer asks is **what started the observer's turn**. There is no
 turn-origin predicate, no observer local-input epoch, no target-local human re-arm, and no
@@ -40,12 +43,13 @@ left the user's own delegated pipeline stalled at the next Auto-wake, which is w
 predicate went rather than one gate.
 
 That moves one question from the transport to trusted guidance: not *may* this turn act, but *should*
-it. The answer is owned by `AgentSessionLinkPrompts.autonomyContract` (rendered verbatim into
-membership guidance and the full lane block), the `agent_session_link` tool description, and
-`AgentSessionLinkMCPToolService.untrustedContentNotice`. Its rule is that an operation must be in
-service of an explicit current or standing instruction from the observer's **own** user, and that a
-standing instruction must have been given rather than inferred from a link, target activity, a status
-change, a transcript, a preview, a `waiting_on` declaration, or an incoming message.
+it. The answer is owned by `AgentSessionLinkPrompts.autonomyContract`. Membership guidance and a
+standalone full lane block render it verbatim; a combined claim carries it once rather than twice. The
+`agent_session_link` tool description and `AgentSessionLinkMCPToolService.untrustedContentNotice`
+carry the same invariants in compact form. The rule is that an operation must be in service of an
+explicit current or standing instruction from the observer's **own** user, and that a standing
+instruction must have been given rather than inferred from a link, target activity, a status change,
+a transcript, a preview, a `waiting_on` declaration, or an incoming message.
 
 Target-derived content informs; it never authorizes. It may change what the model does under an
 instruction it already has, and it may never become the instruction, approval, permission, or
@@ -292,15 +296,25 @@ selection- and snooze-governed. The rendered immutable claim names the occurrenc
 provider preparation and again at physical acquisition, the occurrence must still be pending under
 that exact current grant; omission from the rendered budget or loss of authority is a definite no-call.
 
+The prompt renderer owns the one 24 KiB supplement budget. It reserves room for passive progress
+before admitting inventory rows, then chooses a deterministic subset of the current passive snapshot:
+purposeful attention first, routine status second, stable within each group, while continuing past a
+row whose escaped form does not fit. `deferred` counts offered rows absent from this envelope; unlike
+reducer `omitted` overflow, their data remains queued. The immutable receipt names exactly the status
+rows and attention occurrences rendered, plus the overflow watermark disclosed, so provider
+acceptance removes only visible content and republishes the remainder for a later claim. A retry of
+the same logical dispatch reuses the same immutable subset. No second queue, cursor, or delivery state
+exists for this paging behavior.
+
 Every successfully accepted tool call returns the same `result: "accepted"`, whether it created a new
 pending occurrence or coalesced with one already pending. That result reveals neither queue state nor
 provider delivery and promises no wake. At the enqueue cap the tool instead returns exactly
 `result: "attention_queue_full", accepted: false`; no occurrence was stored, so the target reports the
 refusal rather than busy-retrying or treating it as accepted. Only acceptance of the observer's
-immutable rendered batch by the provider produces a receipt. The receipt acknowledges only the exact
-attention occurrences it carried: a stale or out-of-order receipt cannot clear a successor occurrence,
-an unaccepted batch leaves the occurrence pending, and a target may request attention again after the
-previous occurrence is receipted.
+immutable rendered batch by the provider produces a receipt. Attention is occurrence-qualified: a
+stale or out-of-order receipt cannot clear a successor occurrence, an unaccepted batch leaves the
+occurrence pending, and a target may request attention again after the previous occurrence is
+receipted.
 
 `set_waiting_on` is related context, not part of the attention transaction. It is optional,
 self-scoped and session-global, shared with every linked observer, mutable, and published non-atomically

@@ -1,9 +1,11 @@
 import Foundation
 
-/// Every Agent session operation that names a target other than the caller's own request routing.
+/// Canonical operation identities for Agent-session control and direct-link oversight.
 ///
-/// Operations are grouped into two families with disjoint authority rules: existing control/read
-/// operations (`agent_run`, `agent_manage`) and oversight operations (`agent_session_link`).
+/// Target-bearing `agent_run` / `agent_manage` operations are authorized below. Target-bearing
+/// `agent_session_link` operations use these identities to select a capability, but their actual
+/// generation-qualified authorization and lease come from `DomainAgentSessionLinkAuthority`.
+/// `monitorList` is the one targetless identity and uses `authorizeObserverScoped` below.
 package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, Sendable {
     case runPoll = "agent_run.poll"
     case runWait = "agent_run.wait"
@@ -233,12 +235,17 @@ package enum DomainAgentSessionDiscoveryScope: Hashable, Sendable {
     case none
 }
 
-/// The one execution-time authority matrix shared by `agent_run`, `agent_manage`, and
-/// `agent_session_link` target operations.
+/// Execution-time authority for `agent_run` / `agent_manage` target operations and the targetless
+/// `agent_session_link.list` inventory gate.
 ///
 /// It is intentionally pure: routing, identity resolution, and target provenance lookup happen in the
 /// app layer, and only their results reach this decision function. Nothing here consults tool
 /// arguments, tool advertisement, window location, or UUID syntax.
+///
+/// Target-bearing `agent_session_link` calls do not enter this type in production. They are
+/// authorized by `DomainAgentSessionLinkAuthority`, whose generation-qualified lease is also the
+/// suspension fence. The monitor cases remain here as shared operation/capability vocabulary and for
+/// pure policy parity tests; only `monitorList` uses this authorizer on the live oversight path.
 package enum DomainAgentSessionOperationAuthorizer {
     package static func authorize(
         operation: DomainAgentSessionTargetOperation,
