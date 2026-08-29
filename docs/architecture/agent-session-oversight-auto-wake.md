@@ -1,6 +1,6 @@
 # Agent session oversight: presentation, lifecycle, and Auto-wake
 
-Cross-session oversight lets one Agent session (the **observer**) watch others (the **targets**)
+Cross-session oversight lets one Agent session (the **observer**, also called the **overseer**) watch others (the **targets**)
 through a user-granted, directional, revocable link. When a target's lifecycle status changes or the
 target purposefully requests attention, RepoPrompt may start an automatic follow-up turn on the
 observer — an **Auto-wake** — so the model learns about it without its user having to ask.

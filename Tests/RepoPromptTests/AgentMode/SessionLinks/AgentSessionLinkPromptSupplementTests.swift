@@ -80,6 +80,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         // changes what the observing agent believes it is allowed to do.
         for required in [
             "agent_session_link",
+            "observer, also called their overseer",
             "wait_already_pending",
             "busy-poll",
             "next_cursor",

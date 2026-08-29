@@ -689,7 +689,7 @@ enum AgentSessionLinkPrompts {
 
     private static func guidance(toolReference: String) -> String {
         var lines = [
-            "The user granted this session read-only observation of the Agent sessions listed below, plus the ability to send one attributed message to an idle one. Use `\(toolReference)` for all of it; it is the only oversight surface you have."
+            "The user granted this session read-only observation of the Agent sessions listed below, plus the ability to send one attributed message to an idle one. This session is their observer, also called their overseer. Use `\(toolReference)` for all of it; it is the only oversight surface you have."
         ]
         lines.append(contentsOf: hostNamingGuidance(toolReference: toolReference))
         // The trust/authority frame comes before the operation list on purpose: it is what bounds
