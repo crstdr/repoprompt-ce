@@ -33,8 +33,8 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         )
         let canonicalNames = MCPDomainCanonicalToolDefinitions.definitions.map(\.name)
         XCTAssertEqual(canonicalNames, MCPDomainToolCatalog.orderedToolNames)
-        XCTAssertEqual(canonicalNames.count, 27)
-        XCTAssertEqual(Set(canonicalNames).count, 27)
+        XCTAssertEqual(canonicalNames.count, 28)
+        XCTAssertEqual(Set(canonicalNames).count, 28)
 
         for name in MCPGlobalToolName.orderedToolNames {
             let resolution = await runtime.toolRegistry.resolve(toolName: name, scope: .application)
@@ -46,9 +46,9 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         }
 
         let snapshot = await runtime.toolRegistry.snapshot()
-        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 27)
+        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 28)
         XCTAssertEqual(Set(snapshot.fingerprintsByToolName.keys), Set(canonicalNames))
-        XCTAssertEqual(snapshot.catalogFingerprint, "17774798002a5456bb064839fa1a1536a2525bdc6fdc4e85405bafa08f490e55")
+        XCTAssertEqual(snapshot.catalogFingerprint, "62c7bdc0c035cc1a36096e4b3af7c26bcdfe800f8dc25b49740156d212e072de")
 
         let protectedCandidate = await runtime.toolRegistry.resolve(
             toolName: MCPWindowToolName.manageSelection,
@@ -320,6 +320,7 @@ private struct StandaloneCapabilityProbe: DomainGlobalControlBackend,
     func explore(_: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult { try result() }
     func run(_: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult { try result() }
     func manage(_: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult { try result() }
+    func monitorSessionLink(_: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult { try result() }
     func shareThoughts(_: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult { try result() }
     func publishStatus(_: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult { try result() }
     func waitForInstruction(_: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult { try result() }
