@@ -61,12 +61,30 @@ final class DirectHeadlessCompositionTests: XCTestCase {
     }
 
     func testHeadlessCodexExecUsesWorkspaceWriteWithoutRemovedFullAutoFlag() {
-        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil)
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .agent)
 
         XCTAssertFalse(arguments.contains("--full-auto"))
         XCTAssertEqual(
             Array(arguments.suffix(5)),
             ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        )
+    }
+
+    func testDirectHeadlessOracleCodexExecUsesWorkspaceWriteSandbox() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .directOracle)
+
+        XCTAssertEqual(
+            Array(arguments.suffix(5)),
+            ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        )
+    }
+
+    func testGroupedHeadlessOracleCodexExecUsesReadOnlySandbox() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .oracleGroup)
+
+        XCTAssertEqual(
+            Array(arguments.suffix(5)),
+            ["--skip-git-repo-check", "--sandbox", "read-only", "--json", "-"]
         )
     }
 
