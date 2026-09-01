@@ -984,7 +984,8 @@ final class ClaudeAgentModeCoordinator {
         session: AgentTabSession,
         text: String,
         attachments _: [AgentImageAttachment],
-        intent: NativeSessionIntent
+        intent: NativeSessionIntent,
+        allowsCatalogRouteControllerRecovery: Bool
     ) async -> NativeSendOutcome {
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         var handler = toolHandler(for: session)
@@ -997,7 +998,7 @@ final class ClaudeAgentModeCoordinator {
         let routeVerificationFailureMessage =
             "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run."
 
-        for _ in 0 ..< 3 {
+        for attempt in 0 ..< 3 {
             switch await ensureClaudeNativeSession(session: session, intent: intent) {
             case .ready:
                 break
@@ -1111,6 +1112,18 @@ final class ClaudeAgentModeCoordinator {
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                 return .superseded
             case .unavailable, .timedOut:
+                if allowsCatalogRouteControllerRecovery,
+                   attempt < 2,
+                   await recycleClaudeControllerForCatalogRouteRecovery(
+                       session: session,
+                       existingController: controller
+                   )
+                {
+                    guard intentIsCurrent(intent, for: session) else { return .superseded }
+                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
+                    handler = toolHandler(for: session)
+                    continue
+                }
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                 return recordSendFailure(
                     routeVerificationFailureMessage,
@@ -1134,9 +1147,21 @@ final class ClaudeAgentModeCoordinator {
                 continue
             }
 
-            guard !requiresFinalRouteFence
-                || hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
-            else {
+            if requiresFinalRouteFence,
+               !hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
+            {
+                if allowsCatalogRouteControllerRecovery,
+                   attempt < 2,
+                   await recycleClaudeControllerForCatalogRouteRecovery(
+                       session: session,
+                       existingController: controller
+                   )
+                {
+                    guard intentIsCurrent(intent, for: session) else { return .superseded }
+                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
+                    handler = toolHandler(for: session)
+                    continue
+                }
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                 return recordSendFailure(
                     routeVerificationFailureMessage,
@@ -1211,6 +1236,30 @@ final class ClaudeAgentModeCoordinator {
             session: session,
             intent: intent
         )
+    }
+
+    /// Replaces a retained Claude process whose MCP connection disappeared between turns.
+    ///
+    /// The provider message has not been attempted when this runs. Retiring the controller keeps the
+    /// process run and captured provider session ID, so the next iteration resumes the same Claude
+    /// conversation while establishing a fresh RepoPrompt MCP connection and exact catalog route.
+    private func recycleClaudeControllerForCatalogRouteRecovery(
+        session: AgentTabSession,
+        existingController: any NativeAgentRuntimeControlling
+    ) async -> Bool {
+        guard let detached = detachClaudeController(
+            existingController,
+            from: session,
+            removeToolTracking: true
+        ) else {
+            return false
+        }
+        _ = await retireClaudeController(
+            detached,
+            for: session,
+            captureProviderSessionID: true
+        )
+        return true
     }
 
     private func recordSendFailure(
