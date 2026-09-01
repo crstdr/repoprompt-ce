@@ -575,3 +575,22 @@ expiry, cooldown, target-side cancellation, delivery-ack API, reciprocal-link de
 new tool, per-caller schema variants, target-side prompt supplement, inbound inventory operation,
 generic reverse-send channel, provider-adapter changes, or broad immutable-dispatch refactor. These are
 YAGNI non-goals, not missing pieces to infer from the attention operation.
+
+## Catalog-convergence diagnostics
+
+Oversight catalog repair has one always-on, local diagnostic channel in normal builds. It uses macOS
+Unified Logging rather than a custom file, setting, exporter, or retention service, so macOS owns
+bounded storage and rotation. The category records only low-volume catalog lifecycle transitions:
+server projection publication, host projection acceptance or rejection, repair episode open/close and
+terminal spend outcomes, and receipt of an `agent_session_link` tool call.
+
+The diagnostic API is typed. Fields are closed enums, booleans, bounded revision/generation values,
+and one-way hashes used only to correlate run, tab, and connection lifecycles. It never accepts or
+records prompts, transcript text, tool arguments or results, workspace/session names, paths, raw UUIDs,
+URLs, credentials, provider payloads, or arbitrary error strings. The broad Agent Mode performance
+logger and raw provider-event capture remain DEBUG-only and opt-in.
+
+This channel observes existing authority; it does not add a refresh receipt, retry loop, timer, queue,
+state machine, or provider policy. Its purpose is to distinguish future failures where RepoPrompt never
+publishes the tool from failures where the server projection is ready but the provider/model catalog
+does not converge.
