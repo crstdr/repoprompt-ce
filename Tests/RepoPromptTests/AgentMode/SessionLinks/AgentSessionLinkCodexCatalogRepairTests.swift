@@ -456,6 +456,114 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         XCTAssertNotNil(fixture.session.runID)
     }
 
+    // MARK: - Production diagnostics contract
+
+    #if DEBUG
+        func testCatalogDiagnosticsReportOpenAndTerminalSpendWithoutRawIdentifiers() throws {
+            let fixture = try makeFixture()
+            let runID = try XCTUnwrap(fixture.session.runID)
+            AgentSessionLinkCatalogDiagnostics.beginCaptureForTesting()
+            do {
+                try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
+            } catch {
+                _ = AgentSessionLinkCatalogDiagnostics.endCaptureForTesting()
+                throw error
+            }
+            let records = AgentSessionLinkCatalogDiagnostics.endCaptureForTesting()
+
+            XCTAssertEqual(
+                records.map(\.event),
+                [.projectionEvaluated, .repairTransition, .repairTransition]
+            )
+            XCTAssertEqual(
+                records.compactMap(\.outcome),
+                [.accepted, .opened, .spentReplaced]
+            )
+            XCTAssertFalse(records.isEmpty)
+            let rendered = records.map(\.renderedLine).joined(separator: "\n")
+            for rawValue in [
+                runID.uuidString,
+                fixture.tabID.uuidString,
+                fixture.sessionID.uuidString,
+                Self.targetID.uuidString,
+                Self.conversationID,
+                Self.rolloutPath
+            ] {
+                XCTAssertFalse(rendered.lowercased().contains(rawValue.lowercased()), "raw diagnostic value leaked: \(rawValue)")
+            }
+        }
+
+        func testCatalogDiagnosticsDistinguishDuplicateStaleAndClose() throws {
+            let fixture = try makeFixture()
+            fixture.session.runState = .running
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+                fixture.viewModel,
+                tabID: fixture.tabID
+            )
+            AgentSessionLinkCatalogDiagnostics.beginCaptureForTesting()
+            do {
+                let projection = try publishCatalogProjection(
+                    fixture,
+                    revision: 2,
+                    hasAgentSessionLink: false
+                )
+                fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
+                try publishCatalogProjection(fixture, revision: 1, hasAgentSessionLink: false)
+                try publishCatalogProjection(fixture, revision: 3, hasAgentSessionLink: true)
+            } catch {
+                _ = AgentSessionLinkCatalogDiagnostics.endCaptureForTesting()
+                throw error
+            }
+            let outcomes = AgentSessionLinkCatalogDiagnostics.endCaptureForTesting().compactMap(\.outcome)
+
+            XCTAssertEqual(
+                outcomes,
+                [
+                    .accepted,
+                    .opened,
+                    .coalescedDuplicate,
+                    .rejectedStaleRevision,
+                    .accepted,
+                    .closedCatalogPresent
+                ]
+            )
+        }
+
+        func testCatalogDiagnosticsUseClosedPresenceAndOutcomeVocabulary() {
+            let runID = UUID()
+            let tabID = UUID()
+            let connectionID = UUID()
+            AgentSessionLinkCatalogDiagnostics.beginCaptureForTesting()
+
+            AgentSessionLinkCatalogDiagnostics.projectionEvaluated(
+                runID: runID,
+                tabID: tabID,
+                revision: 9,
+                catalog: nil,
+                outbound: true,
+                outcome: .rejectedStaleRevision
+            )
+            AgentSessionLinkCatalogDiagnostics.toolCallReceived(
+                runID: runID,
+                tabID: tabID,
+                connectionID: connectionID
+            )
+            let records = AgentSessionLinkCatalogDiagnostics.endCaptureForTesting()
+
+            XCTAssertEqual(records.count, 2)
+            XCTAssertEqual(records[0].catalog, .unknown)
+            XCTAssertEqual(records[0].outbound, .present)
+            XCTAssertEqual(records[0].outcome, .rejectedStaleRevision)
+            XCTAssertEqual(records[1].event, .toolCallReceived)
+            for record in records {
+                let rendered = record.renderedLine.lowercased()
+                XCTAssertFalse(rendered.contains(runID.uuidString.lowercased()))
+                XCTAssertFalse(rendered.contains(tabID.uuidString.lowercased()))
+                XCTAssertFalse(rendered.contains(connectionID.uuidString.lowercased()))
+            }
+        }
+    #endif
+
     // MARK: - Fixture
 
     private struct Fixture {

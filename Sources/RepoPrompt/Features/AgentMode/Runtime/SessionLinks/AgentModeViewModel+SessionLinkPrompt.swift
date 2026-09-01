@@ -310,21 +310,48 @@ extension AgentModeViewModel {
         _ projection: AgentSessionLinkRunCatalogProjection,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
-        guard projection.routeToken?.observerEndpoint == endpoint,
-              let session = sessions[endpoint.tabID],
-              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              session.runID == projection.runID
-        else {
+        func record(_ outcome: AgentSessionLinkCatalogDiagnostics.Outcome) {
+            AgentSessionLinkCatalogDiagnostics.projectionEvaluated(
+                runID: projection.runID,
+                tabID: endpoint.tabID,
+                revision: projection.projectionRevision,
+                catalog: projection.hasAgentSessionLink,
+                outbound: projection.hasActiveOutboundLink,
+                outcome: outcome
+            )
+        }
+
+        guard projection.routeToken?.observerEndpoint == endpoint else {
+            record(.rejectedEndpointMismatch)
             return
         }
+        guard let session = sessions[endpoint.tabID] else {
+            record(.rejectedMissingSession)
+            return
+        }
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint else {
+            record(.rejectedEndpointRebind)
+            return
+        }
+        guard session.runID == projection.runID else {
+            record(.rejectedRunMismatch)
+            return
+        }
+
         let existing = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint]
         if let existing,
            existing.runID == projection.runID,
            existing.projectionRevision > projection.projectionRevision
         {
+            record(.rejectedStaleRevision)
             return
         }
-        if existing == projection { return }
+        if existing == projection {
+            record(.coalescedDuplicate)
+            return
+        }
+
+        record(.accepted)
         let becameReady = projection.isReady && !(existing?.runID == projection.runID && existing?.isReady == true)
         agentSessionLinkRunCatalogProjectionByEndpoint[endpoint] = projection
         if projection.isReady {
@@ -375,7 +402,15 @@ extension AgentModeViewModel {
         // Only an exact current observation closes an episode. Unknown presence — a route torn down
         // or not yet observed — leaves it open, because it is not evidence that the catalog healed.
         if projection.hasAgentSessionLink == true || projection.hasActiveOutboundLink == false {
+            let hadEpisode = session.codexSessionLinkCatalogRepairSourceGeneration != nil
             session.codexSessionLinkCatalogRepairSourceGeneration = nil
+            if hadEpisode {
+                AgentSessionLinkCatalogDiagnostics.repairTransition(
+                    runID: projection.runID,
+                    tabID: session.tabID,
+                    outcome: projection.hasAgentSessionLink == true ? .closedCatalogPresent : .closedOutboundLost
+                )
+            }
             return
         }
         guard session.selectedAgent == .codexExec,
@@ -390,6 +425,11 @@ extension AgentModeViewModel {
         }
         if session.codexSessionLinkCatalogRepairSourceGeneration == nil {
             session.codexSessionLinkCatalogRepairSourceGeneration = session.codexControllerGeneration
+            AgentSessionLinkCatalogDiagnostics.repairTransition(
+                runID: projection.runID,
+                tabID: session.tabID,
+                outcome: .opened
+            )
         }
         codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: session)
     }

@@ -2404,6 +2404,13 @@ actor ServerNetworkManager {
             projectionRevision: runCatalogProjectionRevision
         )
         runCatalogObservationByRunID[runID] = observation
+        AgentSessionLinkCatalogDiagnostics.catalogPublished(
+            runID: runID,
+            routeToken: routeToken,
+            revision: runCatalogProjectionRevision,
+            catalog: hasAgentSessionLink,
+            outbound: hasActiveOutboundLink
+        )
         let projection = observation.projection
         #if DEBUG
             await debugSuspendRunCatalogPublicationBeforeMainActorIfRequested()
@@ -2652,6 +2659,13 @@ actor ServerNetworkManager {
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
             hasExactAgentSessionLinkGrant: hasExactAgentSessionLinkGrant
         )
+    }
+
+    private func agentSessionLinkCatalogDiagnosticContext(
+        for connectionID: UUID
+    ) -> (runID: UUID?, tabID: UUID?) {
+        let runID = runIDByConnectionID[connectionID]
+        return (runID, runID.flatMap { runPolicyStateByRunID[$0]?.tabID })
     }
 
     #if DEBUG
@@ -11524,6 +11538,14 @@ actor ServerNetworkManager {
             let originalName = params.name
             let toolName = Self.canonicalToolName(for: originalName)
             connectionLog("tools/call received original=\(originalName) canonical=\(toolName) connection=\(connectionID)")
+            if toolName == MCPWindowToolName.agentSessionLink {
+                let context = await agentSessionLinkCatalogDiagnosticContext(for: connectionID)
+                AgentSessionLinkCatalogDiagnostics.toolCallReceived(
+                    runID: context.runID,
+                    tabID: context.tabID,
+                    connectionID: connectionID
+                )
+            }
             #if DEBUG
                 await debugPolicyDiagnostic("toolsCallReceived", connectionID: connectionID, extra: [
                     "toolName": toolName,

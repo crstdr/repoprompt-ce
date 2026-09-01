@@ -3989,6 +3989,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if oldAgent == .codexExec, newAgent != .codexExec {
             // Closed before any teardown rotates the controller generation: leaving it would encode a
             // "consumed" episode on a session that no longer has a Codex catalog to repair.
+            if session.codexSessionLinkCatalogRepairSourceGeneration != nil {
+                AgentSessionLinkCatalogDiagnostics.repairTransition(
+                    runID: session.runID,
+                    tabID: session.tabID,
+                    outcome: .closedProviderChanged
+                )
+            }
             session.codexSessionLinkCatalogRepairSourceGeneration = nil
             cancelCodexThreadNameSync(for: session.tabID)
             cancelCodexIdleShutdown(for: session.tabID)
@@ -5728,6 +5735,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         else {
             return
         }
+        let episodeRunID = session.runID
         // Re-sampled rather than inherited from the open. An episode opened while the tool was
         // enabled can be spent much later, at a terminal commit that never passes through the
         // projection reconciler's own gate. Once the tool is disabled the absent catalog is truthful,
@@ -5735,6 +5743,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
             session.codexSessionLinkCatalogRepairSourceGeneration = nil
             logCodex("[AgentModeVM][CodexSessionLinkRepair] closed tab=\(session.tabID) reason=tool-disabled")
+            AgentSessionLinkCatalogDiagnostics.repairTransition(
+                runID: episodeRunID,
+                tabID: session.tabID,
+                outcome: .closedToolDisabled
+            )
             return
         }
         guard codexSessionLinkCatalogRepairIsQuiescent(for: session) else {
@@ -5760,6 +5773,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 AgentModeProcessRunIdentity.clearProcessRunID(for: session)
                 session.codexSessionLinkCatalogRepairSourceGeneration = nil
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] retired-stranded-run tab=\(session.tabID)")
+                AgentSessionLinkCatalogDiagnostics.repairTransition(
+                    runID: episodeRunID,
+                    tabID: session.tabID,
+                    outcome: .spentStrandedRunRetired
+                )
             } else {
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] consumed tab=\(session.tabID)")
             }
@@ -5777,6 +5795,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             preserveRunID: false
         )
         logCodex("[AgentModeVM][CodexSessionLinkRepair] replaced tab=\(session.tabID)")
+        AgentSessionLinkCatalogDiagnostics.repairTransition(
+            runID: episodeRunID,
+            tabID: session.tabID,
+            outcome: .spentReplaced
+        )
         viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
     }
 
