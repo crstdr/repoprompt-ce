@@ -336,6 +336,62 @@ extension AgentModeViewModel {
         {
             agentSessionLinkNoteAutoWakeOpportunity(passive, endpoint: endpoint)
         }
+        agentSessionLinkReconcileCodexCatalogRepair(projection, session: session)
+    }
+
+    /// Opens, holds, or closes the Codex session-link catalog-repair episode for one exact accepted
+    /// projection.
+    ///
+    /// The condition being recognized is a *returned* catalog that says `agent_session_link` is
+    /// absent while the link authority says this exact endpoint still holds a live outbound grant.
+    /// `notifyToolListChangedForAgentSession` republishes precisely that pair when a restored grant
+    /// activates against a run whose client has not yet re-read `tools/list`, and
+    /// `agentSessionLinkPromptContext` then fails closed for the whole established run — so Auto-wake
+    /// is blocked behind a projection nothing in the existing pipeline can heal.
+    ///
+    /// Opening belongs here rather than in the coordinator because this is the only frame where the
+    /// mismatch and the projection storage that produced it are visible in one synchronous MainActor
+    /// step. Writing the marker *before* invoking the coordinator is what makes the open atomic: a
+    /// nested or reentrant publication cannot reopen the same episode.
+    ///
+    /// Route currency is deliberately not re-derived, and `projection.isReady` is deliberately not
+    /// used — the state being recognized is intentionally unready. What the publish guard above
+    /// actually proves is *identity*: the projection carries a route token naming this tab's current
+    /// endpoint, for this session object's current run, at a revision no lower than the stored one.
+    /// It does not prove that the observing connection still owns the authoritative route at the
+    /// moment this side effect runs; only `hasCurrentRunCatalogRouteTokenInCurrentMCPServer` proves
+    /// that, and it additionally requires the positive catalog presence this state by definition
+    /// lacks.
+    ///
+    /// The accepted bound is therefore that a projection published for the current endpoint and run
+    /// may already be one connection generation stale by the time the repair runs. The cost is
+    /// bounded to one controller replacement for a session that was going to reconnect anyway, and
+    /// the episode marker prevents it from repeating; the alternative — an authority round trip on
+    /// every unready publication — buys a fresher answer that can go stale the same way.
+    private func agentSessionLinkReconcileCodexCatalogRepair(
+        _ projection: AgentSessionLinkRunCatalogProjection,
+        session: TabSession
+    ) {
+        // Only an exact current observation closes an episode. Unknown presence — a route torn down
+        // or not yet observed — leaves it open, because it is not evidence that the catalog healed.
+        if projection.hasAgentSessionLink == true || projection.hasActiveOutboundLink == false {
+            session.codexSessionLinkCatalogRepairSourceGeneration = nil
+            return
+        }
+        guard session.selectedAgent == .codexExec,
+              projection.hasAgentSessionLink == false,
+              projection.hasActiveOutboundLink == true,
+              session.codexController != nil,
+              // Disablement is a reason not to repair, never a reason to reconnect: the returned
+              // catalog is then truthfully absent and the user asked for that.
+              ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink)
+        else {
+            return
+        }
+        if session.codexSessionLinkCatalogRepairSourceGeneration == nil {
+            session.codexSessionLinkCatalogRepairSourceGeneration = session.codexControllerGeneration
+        }
+        codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: session)
     }
 
     /// Stores one exact incarnation's passive status-notice queue.

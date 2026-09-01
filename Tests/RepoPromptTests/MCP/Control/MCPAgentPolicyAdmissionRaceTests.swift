@@ -2631,6 +2631,134 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
         #endif
     }
 
+    /// The production trigger path for the Codex session-link catalog repair, end to end.
+    ///
+    /// Nothing here calls `agentSessionLinkPublishRunCatalogProjection` directly. A real `tools/list`
+    /// is served while the observer holds no grant, so the returned catalog truthfully omits
+    /// `agent_session_link`. Restoring the outbound grant then drives
+    /// `ServerNetworkManager.notifyToolListChangedForAgentSession` — the exact call
+    /// `AgentSessionLinkRuntimeBridge.invalidateToolAdvertisement(forObserverSession:)` makes on every
+    /// successful activation, including the launch coordinator's restored establishment — which
+    /// republishes the *preserved* returned presence (`false`) alongside the now-live outbound
+    /// presence (`true`).
+    ///
+    /// That false/live-true pair is the stuck state: `agentSessionLinkPromptContext` fails closed for
+    /// the established run, so the repair must retire the process run while preserving the Codex
+    /// conversation, exactly once.
+    @MainActor
+    func testRestoredOutboundGrantInvalidationRepairsCodexCatalogThroughServerProjection() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await manager.setEnabled(true)
+                let window = makeWindow()
+                await window.workspaceManager.awaitInitialized()
+                let registration = try await AppDomainRuntimeComposition.shared.register(
+                    window.mcpServer.windowMCPToolCatalogService
+                )
+                let runID = UUID()
+                let connectionID = UUID()
+                let tabID = UUID()
+                let conversationID = "restored-oversight-thread"
+                let rolloutPath = "/tmp/restored-oversight-rollout.jsonl"
+                try await installRoutingSnapshot(for: tabID, in: window)
+                let session = window.agentModeViewModel.session(for: tabID)
+                let controller = LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                session.selectedAgent = .codexExec
+                session.hasLoadedPersistedState = true
+                session.installRunID(runID)
+                session.codexConversationID = conversationID
+                session.codexRolloutPath = rolloutPath
+                session.codexController = controller
+                _ = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(session))
+                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+                    window.agentModeViewModel,
+                    tabID: tabID
+                )
+                addTeardownBlock { @MainActor in
+                    await self.manager.debugSetSessionLinkCatalogEndpointsForTesting(
+                        anyActive: nil,
+                        outbound: nil
+                    )
+                    await self.cleanup(
+                        runID: runID,
+                        connectionID: connectionID,
+                        windowID: window.windowID,
+                        expectedPID: getpid()
+                    )
+                    await AppDomainRuntimeComposition.shared.unregister(registration.handle)
+                    WindowStatesManager.shared.unregisterWindowState(window)
+                }
+
+                // Before restoration the observer holds no link at all, so the served catalog is
+                // truthfully missing the tool and the projection is honestly unready.
+                await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [], outbound: [])
+                await installAuthoritativePolicy(
+                    runID: runID,
+                    tabID: tabID,
+                    windowID: window.windowID
+                )
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                let testConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugInstallDirectAdmissionConnectionForTesting(
+                    connectionID: connectionID,
+                    connection: testConnection,
+                    pendingClientID: clientName
+                )
+                let applied = await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    sessionKey: "catalog-repair-\(runID.uuidString)",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+                XCTAssertEqual(applied.outcome, "applied")
+
+                let names = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertFalse(names.contains(MCPWindowToolName.agentSessionLink))
+                let unlinkedProjection = await manager.debugRunCatalogProjection(for: runID)
+                let unlinked = try XCTUnwrap(unlinkedProjection)
+                XCTAssertEqual(unlinked.hasAgentSessionLink, false)
+                XCTAssertEqual(unlinked.hasActiveOutboundLink, false)
+                XCTAssertNil(
+                    session.codexSessionLinkCatalogRepairSourceGeneration,
+                    "an honest false/false catalog is not a mismatch"
+                )
+                XCTAssertNotNil(session.codexController)
+
+                let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+                let sourceGeneration = session.codexControllerGeneration
+                await manager.debugSetSessionLinkCatalogEndpointsForTesting(
+                    anyActive: [endpoint],
+                    outbound: [endpoint]
+                )
+                await manager.notifyToolListChangedForAgentSession(sessionID)
+
+                let stuckProjection = await manager.debugRunCatalogProjection(for: runID)
+                let stuck = try XCTUnwrap(stuckProjection)
+                XCTAssertEqual(stuck.hasAgentSessionLink, false)
+                XCTAssertEqual(stuck.hasActiveOutboundLink, true)
+                XCTAssertEqual(stuck.routeToken?.observerEndpoint, endpoint)
+                XCTAssertFalse(stuck.isReady)
+
+                XCTAssertNil(session.runID, "the stale process run is retired so cold bootstrap applies")
+                XCTAssertNil(session.codexController, "exactly one controller replacement")
+                XCTAssertEqual(
+                    session.codexConversationID,
+                    conversationID,
+                    "the Codex conversation survives the repair"
+                )
+                XCTAssertEqual(session.codexRolloutPath, rolloutPath)
+                XCTAssertEqual(session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+                XCTAssertNotEqual(sourceGeneration, session.codexControllerGeneration)
+            }
+        #else
+            throw XCTSkip("Run catalog observation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
     @MainActor
     func testRunCatalogObservationHandoverRejectsLatePredecessorCompletionAndRemoval() async throws {
         #if DEBUG

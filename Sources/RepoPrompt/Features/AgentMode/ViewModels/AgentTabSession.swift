@@ -741,6 +741,33 @@ final class AgentTabSession: ObservableObject {
     }
 
     private(set) var codexControllerGeneration = UUID()
+    /// The open session-link catalog-repair episode, encoded as the controller generation the
+    /// mismatch was observed against.
+    ///
+    /// Three states in one field, because two are not enough: a Boolean can say "an episode exists"
+    /// but not whether this episode's single controller replacement is still owed or was already
+    /// spent by an unrelated reconnect.
+    ///
+    /// | Value | Meaning |
+    /// | --- | --- |
+    /// | `nil` | no episode |
+    /// | `== codexControllerGeneration` | repair pending on the controller that was observed |
+    /// | `!= codexControllerGeneration` | consumed — one replacement already happened |
+    ///
+    /// The consumed state is written by nobody: `codexController.didSet` rotates the generation on
+    /// every identity change, so surviving that rotation *is* the record that another reconnect
+    /// (computer-use settlement, a tool-preference recycle, stream recovery, or the repair itself)
+    /// already spent the episode. That is also why this must never be cleared from
+    /// `codexController.didSet` or generic controller teardown — clearing it there would erase the
+    /// evidence and let a later projection revision or terminal commit replace a second time.
+    ///
+    /// Only five paths write `nil`, and all of them mean the episode is over rather than spent: an
+    /// exact current positive catalog, exact outbound loss, a provider switch away from `.codexExec`,
+    /// the tool being disabled before the episode was spent, and the stranded-run recovery that
+    /// retires a run whose consuming reconnect left no controller behind.
+    ///
+    /// Never persisted: it describes a live process-local controller generation.
+    var codexSessionLinkCatalogRepairSourceGeneration: UUID?
     /// The permission profile the current Codex controller was created with.
     /// Used to detect when MCP control changes require controller recycling.
     var codexControllerPermissionProfile: AgentModeViewModel.AgentPermissionProfile?
