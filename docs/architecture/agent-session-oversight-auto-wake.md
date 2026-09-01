@@ -471,6 +471,105 @@ on `AgentTabSession`, separate from the mutable reservation. The bounded attenti
 absorbed into that record rather than duplicated. The general non-idempotent-cancel refactor beyond the
 single phase guard also remains deferred.
 
+### A returned catalog can get stuck saying the tool is gone
+
+One projection state cannot heal itself: the *returned* catalog says `agent_session_link` is absent
+while the link authority says that exact endpoint holds a live outbound grant. It is produced by
+ordinary code. `notifyToolListChangedForAgentSession` republishes the observation with the returned
+presence **preserved** and outbound presence recomputed, so a grant restored against a live run whose
+client has not re-read `tools/list` lands on exactly `hasAgentSessionLink == false` plus
+`hasActiveOutboundLink == true`. For any established run `agentSessionLinkPromptContext` then fails
+closed, and the only admission exception — the `session.runID == nil` cold bootstrap — is unreachable
+while that run identity persists. Auto-wake is blocked behind a projection nothing else will fix.
+
+The repair is Codex-only, bounded to **one controller replacement per episode**, and made of parts
+that already existed:
+
+| Piece | Where |
+| --- | --- |
+| Episode marker | `AgentTabSession.codexSessionLinkCatalogRepairSourceGeneration` |
+| Opens/closes the episode | `agentSessionLinkReconcileCodexCatalogRepair` in `AgentModeViewModel+SessionLinkPrompt` |
+| Spends the episode | `codexRepairSessionLinkCatalogIfQuiescent` in `CodexAgentModeCoordinator` |
+| Re-admits the queue | `agentSessionLinkRedriveCurrentPassiveSnapshot` in `AgentModeViewModel+SessionLinkAutoWake` |
+
+**The marker is a controller generation, not a Boolean.** `nil` is no episode; equal to
+`codexControllerGeneration` is pending; different is consumed. The consumed state is written by
+nobody — `codexController.didSet` rotates the generation on every identity change, so *surviving*
+that rotation is the record that some replacement already happened. That is why it must never be
+cleared from controller teardown, and why repeated higher-revision false publications cannot cause a
+second replacement: generation comparison, not projection revision, is the loop bound. A Boolean
+cannot express "an unrelated reconnect already spent this episode" without a second field or
+instrumenting all five teardown routes.
+
+One consumed shape is a dead end rather than a recovery, and is the one case the repair still acts
+on. A `preserveRunID: true` reconnect can retire the controller while its follow-up
+`ensureCodexNativeSession` fails, leaving an established run with no provider at all: nothing will
+ever publish a healed catalog for that run, so the established-run gate keeps failing closed forever.
+When the episode is consumed but `codexController == nil` and `runID != nil`, the repair retires the
+run identity through the same host-authoritative reset the pending path uses, clears the marker, and
+re-drives — no second controller replacement.
+
+**Opening happens in the projection reconciler**, which is the only frame where the mismatch and the
+storage that produced it are visible in one synchronous MainActor step; writing the marker before
+calling the coordinator is what makes the open atomic against a nested publication.
+`projection.isReady` is deliberately not used — the state being recognized is intentionally unready.
+
+What the publish guard proves is *identity*, not route currency: the projection carries a route token
+naming this tab's current endpoint, for this session object's current run, at a revision no lower than
+the stored one. It does not prove the observing connection still owns the authoritative route when the
+repair actually runs; only `hasCurrentRunCatalogRouteTokenInCurrentMCPServer` proves that, and it
+additionally demands the positive catalog presence this state by definition lacks. The accepted bound
+is therefore that a projection may already be one connection generation stale by the time the repair
+runs, costing one controller replacement on a session that was going to reconnect anyway — bounded by
+the episode marker, and no more accurate than an authority round trip that can go stale the same way.
+
+An episode is closed by exactly five paths, all of which mean it is *over* rather than spent:
+
+| Close path | Where |
+| --- | --- |
+| Exact current positive catalog (`hasAgentSessionLink == true`) | projection reconciler |
+| Exact outbound loss (`hasActiveOutboundLink == false`) | projection reconciler |
+| Provider switch away from `.codexExec` | `handleProviderSwitch` |
+| `agent_session_link` disabled when the episode is spent | repair entrypoint |
+| Stranded consumed run (`codexController == nil`, `runID != nil`) after its retirement | repair entrypoint |
+
+An unknown observation closes nothing and leaves the episode open, because it is not evidence that
+anything healed.
+
+**The repair retires the process run** (`invalidateCodexControllerForReconnect(… preserveRunID: false)`)
+and that is the point rather than a side effect. `codexConversationID` and `codexRolloutPath` are
+deliberately untouched, so the next start resumes the same Codex conversation while `runID == nil`
+lets the cold-bootstrap exception admit the *already published* passive snapshot. Preserving the run
+instead would leave the same false projection gating admission with no way to reach a successor
+catalog short of a route-successor protocol, which this design exists to avoid. Late completions from
+the retired route stay safe through the existing `session.runID == projection.runID` publish guard and
+`completeRunCatalogObservation`'s ownership rule.
+
+**Quiescence is mandatory, not advisory.** Invalidation deliberately abandons the fallback queue with
+the controller, so repairing under fallback ownership would drop the user's queued text; a terminal
+commit that has staged its revision but not finished publishing still owns the run; and a wake in
+`.preparingDispatch`, `.cancelledBeforeDispatch`, or `.dispatching` owns the same transport boundary
+the tombstone fences. A blocked episode is simply left pending — no task, timer, queue, or new phase —
+for the next projection reconciliation or the next winning terminal commit.
+
+**Enablement is re-sampled at spend time, not inherited from the open.** An episode opened while
+`agent_session_link` was enabled can be spent much later at a terminal commit that never passes
+through the reconciler's own gate. Once the tool is disabled the absent catalog is truthful, so the
+episode closes and nothing reconnects.
+
+**Terminal ordering is load-bearing.** In `finalizeCodexRun.postCommit` the repair runs *after*
+`settleCodexComputerUseActivationAfterTurn`, so a computer-use replacement rotates the generation
+first and the two coalesce into the episode's one replacement; and *before*
+`scheduleCodexIdleShutdownIfNeeded`, so shutdown is never armed against a controller about to be
+retired. It is deliberately **not** gated on `providerSuccessor == nil`: a successor that is still
+accepted or retryable *is* the fallback queue head, which the fallback-ownership guard already
+refuses, while a stale or permanently rejected successor leaves no queue behind and gating on its
+mere presence would strand the episode on a session with nothing left to re-drive it.
+
+The accepted cost is that a healthy idle controller may be recycled during the transient interval
+before a compliant client processes `list_changed`. That is bounded at one replacement per episode,
+which is the trade for having no grace timer, no retry task, and no successor protocol.
+
 The feature intentionally has no reason payload, priority, broadcast, idempotency ledger, persistence,
 expiry, cooldown, target-side cancellation, delivery-ack API, reciprocal-link detector, new capability,
 new tool, per-caller schema variants, target-side prompt supplement, inbound inventory operation,

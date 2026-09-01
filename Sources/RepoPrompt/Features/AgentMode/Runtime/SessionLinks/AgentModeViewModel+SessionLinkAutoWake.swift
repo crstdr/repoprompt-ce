@@ -887,6 +887,28 @@ extension AgentModeViewModel {
         agentSessionLinkNoteAutoWakeOpportunity(snapshot, endpoint: endpoint)
     }
 
+    /// Re-drives this observer's already-published passive snapshot through the ordinary Auto-wake
+    /// entry point, without changing anything about the queue.
+    ///
+    /// Used after a Codex session-link catalog repair leaves the session cold. The repair retires the
+    /// process run, so `agentSessionLinkPromptContext`'s existing cold-bootstrap exception
+    /// (`session.runID == nil`) can finally admit the unchanged snapshot that the stale false catalog
+    /// had been blocking. Every ordinary gate — routine selection, purposeful attention, snooze,
+    /// suppression, authority, budget, physical acquisition — still decides whether a turn starts.
+    ///
+    /// It deliberately creates no second queue, moves no queue revision, writes no receipt, does not
+    /// manufacture `agentSessionLinkAutoWakeReevaluationOwed` (that debt belongs to publications an
+    /// attempt absorbed), and never polls for readiness.
+    func agentSessionLinkRedriveCurrentPassiveSnapshot(for session: TabSession) {
+        guard sessions[session.tabID] === session,
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              let snapshot = agentSessionLinkCurrentPassiveSnapshot(for: endpoint)
+        else {
+            return
+        }
+        agentSessionLinkNoteAutoWakeOpportunity(snapshot, endpoint: endpoint)
+    }
+
     /// Records one physically accepted auto-wake, in the order the plan requires.
     ///
     /// Called from the shared claim-acceptance path, so every provider family reaches it through the
