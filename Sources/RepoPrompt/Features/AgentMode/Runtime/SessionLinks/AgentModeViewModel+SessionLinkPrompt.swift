@@ -614,7 +614,7 @@ extension AgentModeViewModel {
         // incarnation starts fresh, and a task still waiting on the dead one would otherwise hold
         // `idle_for_send` false for a session nothing is going to wake.
         for (tabID, session) in sessions {
-            guard let attempt = session.pendingOversightAutoWake else { continue }
+            guard let attempt = session.oversight.pendingAutoWake else { continue }
             guard !liveSessionIDs.contains(attempt.observerEndpoint.sessionID)
                 || agentSessionLinkObserverEndpoint(tabID: tabID) != attempt.observerEndpoint
             else {
@@ -829,7 +829,7 @@ extension AgentModeViewModel {
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkPromptDispatchID {
         guard !dispatchID.isAutoWakeFamily,
-              let attempt = session.pendingOversightAutoWake,
+              let attempt = session.oversight.pendingAutoWake,
               attempt.phase == .preparingDispatch
               || attempt.phase == .cancelledBeforeDispatch
               || attempt.phase == .dispatching
@@ -852,7 +852,7 @@ extension AgentModeViewModel {
         _ dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {
         guard !dispatchID.isAutoWakeFamily else { return true }
-        guard let phase = session.pendingOversightAutoWake?.phase else { return false }
+        guard let phase = session.oversight.pendingAutoWake?.phase else { return false }
         return phase == .preparingDispatch
             || phase == .cancelledBeforeDispatch
             || phase == .dispatching

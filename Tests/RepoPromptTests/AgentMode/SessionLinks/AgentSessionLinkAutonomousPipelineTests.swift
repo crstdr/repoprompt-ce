@@ -73,7 +73,7 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
         // Hop 0 → wake 1: target 2 finishes work the user had already started there.
         try await completeRun(pipeline, on: pipeline.targetTwo)
         let wakeOne = try XCTUnwrap(
-            observer.session.pendingOversightAutoWake,
+            observer.session.oversight.pendingAutoWake,
             "a selected target's completion edge must admit the first wake"
         ).wakeID
         try acceptWake(observer, wakeID: wakeOne)
@@ -102,7 +102,7 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
         // new edge, and it admits again. Under the retired fence this is where the pipeline stalled.
         try await completeRun(pipeline, on: pipeline.targetTwo)
         let wakeTwo = try XCTUnwrap(
-            observer.session.pendingOversightAutoWake,
+            observer.session.oversight.pendingAutoWake,
             "the observer's own delegated work completing must admit the next wake"
         ).wakeID
         XCTAssertNotEqual(wakeTwo, wakeOne, "each wake is its own occurrence")
@@ -134,7 +134,7 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
         // Hop 2 → wake 3.
         try await completeRun(pipeline, on: pipeline.targetThree)
         let wakeThree = try XCTUnwrap(
-            observer.session.pendingOversightAutoWake,
+            observer.session.oversight.pendingAutoWake,
             "the third session's completion must admit the third wake"
         ).wakeID
         XCTAssertEqual(Set([wakeOne, wakeTwo, wakeThree]).count, 3)
@@ -236,12 +236,12 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
             ),
             "a wake must be claimable with the lane batch it exists to deliver"
         )
-        var preparing = try XCTUnwrap(node.session.pendingOversightAutoWake)
+        var preparing = try XCTUnwrap(node.session.oversight.pendingAutoWake)
         XCTAssertEqual(preparing.wakeID, wakeID)
         preparing.task?.cancel()
         preparing.task = nil
         preparing.phase = .preparingDispatch
-        node.session.pendingOversightAutoWake = preparing
+        node.session.oversight.pendingAutoWake = preparing
         XCTAssertTrue(
             node.viewModel.agentSessionLinkAcquirePhysicalDispatch(
                 for: node.session,
@@ -250,7 +250,7 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
             "the idle follow-up must cross the shared immutable-claim acquisition fence"
         )
         node.viewModel.acceptAgentSessionLinkPromptClaim(claim)
-        XCTAssertNil(node.session.pendingOversightAutoWake, "an accepted wake settles")
+        XCTAssertNil(node.session.oversight.pendingAutoWake, "an accepted wake settles")
     }
 
     private struct Delivery {

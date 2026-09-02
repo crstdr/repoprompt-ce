@@ -44,7 +44,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         try publishInventory(fixture)
         try publishLane(fixture, queueRevision: 7)
         XCTAssertNil(
-            fixture.session.pendingOversightAutoWake,
+            fixture.session.oversight.pendingAutoWake,
             "an established run behind a false catalog must not be able to admit a wake"
         )
 
@@ -70,7 +70,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         )
 
         let attempt = try XCTUnwrap(
-            fixture.session.pendingOversightAutoWake,
+            fixture.session.oversight.pendingAutoWake,
             "the cold session must admit the already-published snapshot"
         )
         XCTAssertEqual(attempt.queueRevision, 7, "the same queue revision is re-driven, not a new publication")
@@ -159,7 +159,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
 
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
         XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
-        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
 
         // The one field that matters here: `clearCodexControllerInstanceState` nils `codexController`,
         // and with `preserveRunID: true` the run identity survives. The rest of that teardown
@@ -185,7 +185,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         XCTAssertEqual(fixture.session.codexConversationID, Self.conversationID)
         XCTAssertEqual(fixture.session.codexRolloutPath, Self.rolloutPath)
         let attempt = try XCTUnwrap(
-            fixture.session.pendingOversightAutoWake,
+            fixture.session.oversight.pendingAutoWake,
             "the now-cold session must admit the already-published snapshot"
         )
         XCTAssertEqual(attempt.queueRevision, 9)
@@ -417,7 +417,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
             fixture.viewModel,
             tabID: fixture.tabID
         )
-        fixture.session.pendingOversightAutoWake = AgentSessionLinkAutoWakeAttempt(
+        fixture.session.oversight.pendingAutoWake = AgentSessionLinkAutoWakeAttempt(
             wakeID: UUID(),
             observerEndpoint: endpoint,
             queueEpoch: Self.queueEpoch,
@@ -436,7 +436,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         XCTAssertNotNil(fixture.session.codexController, "no retirement while a wake owns the transport")
         XCTAssertNotNil(fixture.session.runID)
 
-        fixture.session.pendingOversightAutoWake = nil
+        fixture.session.oversight.pendingAutoWake = nil
         try publishCatalogProjection(fixture, revision: 3, hasAgentSessionLink: false)
 
         XCTAssertNil(fixture.session.codexController, "the still-pending episode is spent once released")
@@ -603,7 +603,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
         session.hasLoadedPersistedState = true
-        session.autoWakeOnOversightUpdates = true
+        session.oversight.autoWakeOnUpdates = true
         session.installRunID(UUID())
         session.codexConversationID = Self.conversationID
         session.codexRolloutPath = Self.rolloutPath

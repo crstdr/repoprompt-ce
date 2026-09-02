@@ -4146,8 +4146,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.selectedModelRaw = normalizedSelection.modelRaw
         session.selectedReasoningEffortRaw = indexEntry.agentReasoningEffortRaw
         session.autoEditEnabled = indexEntry.autoEditEnabled
-        session.autoWakeOnOversightUpdates = indexEntry.autoWakeOnOversightUpdates
-        session.agentSessionLinkAutoWakeTargetSessionIDs = indexEntry.agentSessionLinkAutoWakeTargetSessionIDs
+        session.oversight.autoWakeOnUpdates = indexEntry.autoWakeOnOversightUpdates
+        session.oversight.autoWakeTargetSessionIDs = indexEntry.agentSessionLinkAutoWakeTargetSessionIDs
     }
 
     func applyTranscriptViewportBindingState(
@@ -4981,8 +4981,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Applies the durable observer Auto-wake settings during hydration.
     /// Kept as one seam so tests exercise the same restoration transition as the full payload path.
     func restoreAgentSessionLinkState(from agentSession: AgentSession, to session: TabSession) {
-        session.autoWakeOnOversightUpdates = agentSession.autoWakeOnOversightUpdates
-        session.agentSessionLinkAutoWakeTargetSessionIDs = agentSession.agentSessionLinkAutoWakeTargetSessionIDs
+        session.oversight.autoWakeOnUpdates = agentSession.autoWakeOnOversightUpdates
+        session.oversight.autoWakeTargetSessionIDs = agentSession.agentSessionLinkAutoWakeTargetSessionIDs
     }
 
     @discardableResult
@@ -7423,8 +7423,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentModelRaw: session.selectedModelRaw,
             agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
             autoEditEnabled: session.autoEditEnabled,
-            autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
-            agentSessionLinkAutoWakeTargetSessionIDs: session.agentSessionLinkAutoWakeTargetSessionIDs,
+            autoWakeOnOversightUpdates: session.oversight.autoWakeOnUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: session.oversight.autoWakeTargetSessionIDs,
             parentSessionID: parentSessionID,
             isMCPOriginated: session.isMCPOriginated
         )
@@ -13266,8 +13266,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 codexRolloutPath: session.codexRolloutPath
             ),
             autoEditEnabled: session.autoEditEnabled,
-            autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
-            agentSessionLinkAutoWakeTargetSessionIDs: session.agentSessionLinkAutoWakeTargetSessionIDs,
+            autoWakeOnOversightUpdates: session.oversight.autoWakeOnUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: session.oversight.autoWakeTargetSessionIDs,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
             parentSessionID: session.parentSessionID,
             pendingHandoffPayload: session.pendingHandoff.payload,

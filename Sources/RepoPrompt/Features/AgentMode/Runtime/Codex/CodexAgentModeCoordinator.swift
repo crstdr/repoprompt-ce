@@ -5825,7 +5825,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         else {
             return false
         }
-        switch session.pendingOversightAutoWake?.phase {
+        switch session.oversight.pendingAutoWake?.phase {
         case .preparingDispatch, .cancelledBeforeDispatch, .dispatching:
             return false
         case .scheduled, .awaitingSettlement, nil:
