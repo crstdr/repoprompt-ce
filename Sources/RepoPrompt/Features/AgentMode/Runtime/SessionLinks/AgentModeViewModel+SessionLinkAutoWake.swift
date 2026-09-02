@@ -229,7 +229,8 @@ extension AgentModeViewModel {
                 if agentSessionLinkAutoWakeAttemptCanScheduleReevaluation(attempt) {
                     // Do not let a required attention basis disappear into the mutable status
                     // attempt race unless a genuinely unsuppressed ordinary basis replaced it.
-                    // Pure status attempts retain their pre-C4 mutable behavior.
+                    // Pure status attempts keep the mutable behavior they had before purposeful
+                    // attention existed.
                     if requiredAttentionOccurrence != nil
                         || attempt.requiredAttentionOccurrence == nil
                         || hasUnsuppressedAdmissionBasis
@@ -634,7 +635,7 @@ extension AgentModeViewModel {
             attempt.attemptedFingerprint = AgentSessionLinkPassiveStatusNotices
                 .WakeEligibilityFingerprint(
                     queueEpoch: attempt.wakeFingerprint.queueEpoch,
-                    // Deliberately preserve the status-side behavior documented before C4: only the
+                    // Deliberately preserve the pre-attention status-side behavior: only the
                     // attention component is frozen from the immutable claim at this assignment.
                     edges: attempt.wakeFingerprint.edges,
                     attentionOccurrences: claim.passive?.receipt
@@ -742,8 +743,9 @@ extension AgentModeViewModel {
                 return false
             }
             // A same-status metadata refresh advances receipt sequencing but preserves the status
-            // occurrence fingerprint. C4 must not turn that pre-existing status behavior into a
-            // definite no-call merely because the rendered line gained fresher presentation detail.
+            // occurrence fingerprint. The purposeful-attention fence must not turn that pre-existing
+            // status behavior into a definite no-call merely because the rendered line gained
+            // fresher presentation detail.
             return context.inventory.items.contains {
                 $0.targetSessionID == entry.targetSessionID
                     && ($0.reference == nil || $0.reference == entry.reference)
