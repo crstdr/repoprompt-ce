@@ -28,7 +28,12 @@ require_file "$APPLE_IDENTITY_POLICY"
 [[ "$TIP_SOURCE_BRANCH" == "main" ]] || fail "Tip publication source branch must remain main"
 [[ "$TIP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "TIP_COMMIT must be a full lowercase Git SHA"
 [[ "$TIP_TAG" =~ ^tip-[0-9a-f]{12}$ ]] || fail "TIP_TAG must be tip-<12 lowercase hex>"
-[[ "$#" -ge 1 ]] || fail "Usage: $0 <release-asset>..."
+[[ "${1:-}" == "--rollout-declaration" && "$#" -ge 2 ]] ||
+    fail "Usage: $0 --rollout-declaration <checked-in-declaration> <release-asset>..."
+ROLLOUT_DECLARATION="$2"
+shift 2
+require_file "$ROLLOUT_DECLARATION"
+[[ "$#" -ge 1 ]] || fail "Usage: $0 --rollout-declaration <checked-in-declaration> <release-asset>..."
 case "$TIP_UPDATE_REPOSITORY" in
     "$TIP_SOURCE_REPOSITORY"|repoprompt/repoprompt-ce-updates)
         fail "Tip publication repository must be separate from source and Stable updates"
@@ -215,8 +220,10 @@ require_live_main() {
 }
 
 LIVE_AUDIT_INDEX=0
+STABLE_AUDIT_INDEX=0
 LIVE_MANIFEST_PATH=""
 LIVE_APPCAST_PATH=""
+STABLE_APPCAST_PATH=""
 fetch_live_tip_rollout() {
     LIVE_AUDIT_INDEX=$((LIVE_AUDIT_INDEX + 1))
     local release_file="$TMP_DIR/live-release-$LIVE_AUDIT_INDEX.json" status report
@@ -386,16 +393,17 @@ PY
 
 audit_stable_tip_floor() {
     local phase="$1"
-    local stable_feed_url stable_appcast
+    local stable_feed_url
+    STABLE_AUDIT_INDEX=$((STABLE_AUDIT_INDEX + 1))
+    STABLE_APPCAST_PATH="$TMP_DIR/stable-floor-$STABLE_AUDIT_INDEX.xml"
     stable_feed_url="$(python3 "$ROLLOUT_TOOL" feed-url \
         --policy "$APPLE_IDENTITY_POLICY" --channel stable)"
-    stable_appcast="$TMP_DIR/stable-floor-$LIVE_AUDIT_INDEX.xml"
     curl --fail --location --silent --show-error \
         --connect-timeout 10 --max-time 30 \
-        "$stable_feed_url" --output "$stable_appcast"
+        "$stable_feed_url" --output "$STABLE_APPCAST_PATH"
     python3 "$ROLLOUT_TOOL" validate-stable-tip-floor \
         --policy "$APPLE_IDENTITY_POLICY" \
-        --stable-appcast "$stable_appcast" \
+        --stable-appcast "$STABLE_APPCAST_PATH" \
         --tip-manifest "$CANDIDATE_MANIFEST" \
         --tip-appcast "$CANDIDATE_APPCAST" ||
         fail "$phase rejected an unsafe Stable/Tip build floor"
@@ -411,6 +419,8 @@ audit_live_rollout_progression() {
         --policy "$APPLE_IDENTITY_POLICY"
         --candidate-manifest "$CANDIDATE_MANIFEST"
         --candidate-appcast "$CANDIDATE_APPCAST"
+        --declaration "$ROLLOUT_DECLARATION"
+        --stable-appcast "$STABLE_APPCAST_PATH"
     )
     if fetch_live_tip_rollout; then
         arguments+=(
@@ -422,10 +432,61 @@ audit_live_rollout_progression() {
     audit_retained_enclosures
 }
 
+# Returns 0 when found, 1 only for a confirmed absence, and 2 on observation error.
 lookup_release() {
-    GH_TOKEN="$TIP_GH_TOKEN" gh api --paginate --slurp \
-        "/repos/$TIP_UPDATE_REPOSITORY/releases?per_page=100" \
-        --jq "flatten | map(select(.tag_name == \"$TIP_TAG\")) | if length == 0 then empty elif length == 1 then .[0] else error(\"duplicate release tag\") end"
+    local output="$1" pages_file status
+    pages_file="$(mktemp "$TMP_DIR/release-pages.XXXXXX")"
+    rm -f "$output"
+    if ! GH_TOKEN="$TIP_GH_TOKEN" gh api --paginate \
+        "/repos/$TIP_UPDATE_REPOSITORY/releases?per_page=100" > "$pages_file"; then
+        rm -f "$pages_file"
+        return 2
+    fi
+    if python3 - "$pages_file" "$output" "$TIP_TAG" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+pages_path, output_path, tag = sys.argv[1:]
+raw = Path(pages_path).read_text(encoding="utf-8")
+decoder = json.JSONDecoder()
+offset = 0
+page_count = 0
+matches = []
+while True:
+    while offset < len(raw) and raw[offset].isspace():
+        offset += 1
+    if offset == len(raw):
+        break
+    try:
+        page, offset = decoder.raw_decode(raw, offset)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"ERROR: malformed paginated release response: {error}")
+    if not isinstance(page, list):
+        raise SystemExit("ERROR: paginated release response must contain JSON arrays")
+    page_count += 1
+    for release in page:
+        if not isinstance(release, dict):
+            raise SystemExit("ERROR: paginated release response contains a malformed release")
+        if release.get("tag_name") == tag:
+            matches.append(release)
+if page_count == 0:
+    raise SystemExit("ERROR: paginated release response contained no JSON pages")
+if len(matches) > 1:
+    raise SystemExit(f"ERROR: duplicate release tag: {tag}")
+if not matches:
+    raise SystemExit(3)
+Path(output_path).write_text(json.dumps(matches[0], separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+    then
+        rm -f "$pages_file"
+        return 0
+    else
+        status=$?
+        rm -f "$pages_file"
+        [[ "$status" == 3 ]] && return 1
+        return 2
+    fi
 }
 
 validate_release_metadata() {
@@ -458,10 +519,16 @@ PY
 }
 
 write_release_json() {
-    local output="$1" value
-    value="$(lookup_release)"
-    [[ -n "$value" ]] || return 1
-    printf '%s\n' "$value" > "$output"
+    local output="$1" status
+    if lookup_release "$output"; then
+        return 0
+    else
+        status=$?
+    fi
+    case "$status" in
+        1) return 1 ;;
+        *) fail "Authenticated Tip release lookup failed" ;;
+    esac
 }
 
 create_draft_if_missing() {
