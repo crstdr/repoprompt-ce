@@ -33,6 +33,26 @@ enum AgentSessionLinkAutoWakeSnooze {
     static func clampedDurationSeconds(_ requested: Int) -> Int {
         min(maximumDurationSeconds, max(minimumDurationSeconds, requested))
     }
+
+    /// The records one observer incarnation should keep: its own endpoint's, still active at `now`,
+    /// and still naming a lane the current snapshot carries.
+    ///
+    /// Pure and non-mutating. It is the single retention rule behind every cleanup boundary —
+    /// explicit mutation, deadline expiry, and membership pruning — so a stale or elapsed record can
+    /// never survive one path and not another. `currentReferences == nil` means no snapshot is
+    /// available, in which case membership is not a reason to drop anything.
+    static func retainedRecords(
+        _ records: [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord],
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        currentReferences: Set<DomainAgentSessionLinkReference>?,
+        now: ContinuousClock.Instant
+    ) -> [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord] {
+        records.filter { key, record in
+            key.observerEndpoint == observerEndpoint
+                && record.isActive(at: now)
+                && (currentReferences?.contains(key.reference) ?? true)
+        }
+    }
 }
 
 // MARK: - Identity

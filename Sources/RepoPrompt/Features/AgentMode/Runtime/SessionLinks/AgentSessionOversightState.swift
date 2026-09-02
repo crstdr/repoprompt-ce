@@ -90,6 +90,47 @@ struct AgentSessionOversightState {
 
     // MARK: Derived
 
+    /// Whether routine status and overflow from this lane may admit a wake under the durable
+    /// selection: the master setting covers every lane, and a granular selection covers its own.
+    ///
+    /// This is the one rule the wake coordinator admits lanes by and the dashboard overlays
+    /// `isEffectivelySelected` from. It says nothing about snooze or purposeful attention; those are
+    /// layered on top in `AgentModeViewModel+SessionLinkAutoWake`.
+    func isLaneEffectivelySelected(targetSessionID: UUID) -> Bool {
+        autoWakeOnUpdates || autoWakeTargetSessionIDs.contains(targetSessionID)
+    }
+
+    /// The exact lane references currently snoozed for this observer, evaluated against the
+    /// monotonic clock rather than dictionary membership.
+    ///
+    /// An elapsed record is inactive here whether or not the deadline task has removed it yet, so a
+    /// delayed task can never keep a lane suppressed past its own deadline.
+    func activeSnoozedReferences(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Set<DomainAgentSessionLinkReference> {
+        guard !autoWakeSnoozes.isEmpty else { return [] }
+        let now = snoozeClock.now()
+        return Set(
+            autoWakeSnoozes.values
+                .filter { $0.key.observerEndpoint == observerEndpoint && $0.isActive(at: now) }
+                .map(\.key.reference)
+        )
+    }
+
+    /// The nearest strictly-future snooze deadline for this observer, if any.
+    ///
+    /// Strictly-future only, which is what guarantees the deadline handler makes progress: after its
+    /// cleanup, every remaining record is still ahead of `now`.
+    func nextActiveSnoozeDeadline(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        now: ContinuousClock.Instant
+    ) -> ContinuousClock.Instant? {
+        autoWakeSnoozes.values
+            .filter { $0.key.observerEndpoint == observerEndpoint && $0.isActive(at: now) }
+            .map(\.deadline)
+            .min()
+    }
+
     /// Whether this incarnation has reserved its one automatic follow-up.
     ///
     /// The nil/non-nil transition is the only part of the attempt an outside observer can act on;

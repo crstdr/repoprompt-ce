@@ -650,11 +650,10 @@ extension AgentModeViewModel {
         else {
             return props
         }
-        // The same rule the coordinator admits lanes by: the master setting covers every lane, and a
-        // granular selection covers its own. Read live from the session rather than from the props
-        // being published, so a selection written in this same pass cannot render a frame late.
-        let masterEnabled = session.oversight.autoWakeOnUpdates
-        let selectedTargetSessionIDs = session.oversight.autoWakeTargetSessionIDs
+        // The same rule the coordinator admits lanes by. Read live from the session rather than from
+        // the props being published, so a selection written in this same pass cannot render a frame
+        // late.
+        let oversight = session.oversight
         let outbound = props.outbound.map { row in
             let reference = DomainAgentSessionLinkReference(
                 linkID: row.linkID,
@@ -684,8 +683,9 @@ extension AgentModeViewModel {
                         origin: $0.origin
                     )
                 },
-                isEffectivelySelected: masterEnabled
-                    || selectedTargetSessionIDs.contains(row.targetSessionID)
+                isEffectivelySelected: oversight.isLaneEffectivelySelected(
+                    targetSessionID: row.targetSessionID
+                )
             )
         }
         guard outbound != props.outbound else { return props }

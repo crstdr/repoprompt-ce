@@ -79,6 +79,61 @@ enum AgentSessionLinkAutoWakeCancellationReason: String {
     }
 }
 
+// MARK: - Admission decision
+
+/// The one answer the wake coordinator gives a fresh queue publication: may this lane state start an
+/// automatic turn right now, and if not, which gate said no.
+///
+/// Read top-down, the pipeline is three questions in a fixed order:
+///
+/// 1. **Basis** — is there a selected, unsnoozed routine status entry, admissible unattributed
+///    overflow, or one exact pending purposeful-attention occurrence? Attention is the named
+///    bypass of master Auto-wake, that lane's own toggle, and that lane's snooze; it changes none of
+///    them and broadens nothing else.
+/// 2. **Suppression** — is that basis exactly the structural shape a prior attempt already failed?
+/// 3. **Prompt eligibility** — can the observer's provider context carry a supplement at all?
+///
+/// Hitchhikers are deliberately outside this decision. A snoozed or unselected lane's coalesced rows
+/// ride along in whatever claim an admitted wake, or a turn the observer's own user started, renders
+/// (`AgentSessionLinkAutoWakeAdmission.routineLaneAdmits` is the predicate that tells the two
+/// apart at the physical fence); this type answers only whether a turn may start.
+enum AgentSessionLinkWakeAdmissionDecision: Equatable {
+    enum Basis: Equatable {
+        /// A selected, unsnoozed lane has a pending status entry, or unattributed overflow may wake
+        /// on its own.
+        case routineStatusOrOverflow
+        /// One exact pending purposeful-attention occurrence admits in spite of master Auto-wake,
+        /// that lane's own toggle, and that lane's snooze — without changing any of them. The
+        /// occurrence is frozen onto the attempt so preparation and physical acquisition can fail
+        /// closed if it stops being pending under the exact current grant.
+        case purposefulAttention(AgentSessionLinkPassiveStatusNotices.AttentionOccurrenceIdentity)
+    }
+
+    /// Raw values are the DEBUG gate-log vocabulary, single-sourced here.
+    enum SuppressionReason: String, Equatable {
+        /// No selected, unsnoozed routine content and no exact attention occurrence.
+        case noAdmissionBasis = "blocked.noAdmissionBasis"
+        /// The only basis is the exact structural shape already parked in failure suppression.
+        case failureSuppressed = "suppressed"
+        /// The observer's provider context cannot carry a supplement right now.
+        case promptIneligible = "blocked.ineligible"
+    }
+
+    case admit(Basis)
+    case suppress(SuppressionReason)
+}
+
+extension AgentSessionLinkWakeAdmissionDecision.Basis {
+    /// What the reserved attempt must carry: the exact occurrence for an attention-admitted wake,
+    /// nothing for a routine one.
+    var requiredAttentionOccurrence: AgentSessionLinkPassiveStatusNotices.AttentionOccurrenceIdentity? {
+        switch self {
+        case .routineStatusOrOverflow: nil
+        case let .purposefulAttention(occurrence): occurrence
+        }
+    }
+}
+
 // MARK: - Coordinator
 
 @MainActor
@@ -216,17 +271,13 @@ extension AgentModeViewModel {
             }
         }
 
-        guard admission.hasAdmissionBasis else {
-            agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, "blocked.noAdmissionBasis")
+        let admittedBasis: AgentSessionLinkWakeAdmissionDecision.Basis
+        switch agentSessionLinkWakeAdmissionDecision(admission, fingerprint: fingerprint, session: session) {
+        case let .suppress(reason):
+            agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, reason.rawValue)
             return
-        }
-        guard hasUnsuppressedAdmissionBasis else {
-            agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, "suppressed")
-            return
-        }
-        guard agentSessionLinkPromptContext(for: session)?.epoch.allowsSupplement == true else {
-            agentSessionLinkLogAutoWakeGate(endpoint, fingerprint, "blocked.ineligible")
-            return
+        case let .admit(basis):
+            admittedBasis = basis
         }
 
         let attempt = AgentSessionLinkAutoWakeAttempt(
@@ -235,7 +286,7 @@ extension AgentModeViewModel {
             queueEpoch: snapshot.queueEpoch,
             queueRevision: snapshot.queueRevision,
             wakeFingerprint: fingerprint,
-            requiredAttentionOccurrence: requiredAttentionOccurrence,
+            requiredAttentionOccurrence: admittedBasis.requiredAttentionOccurrence,
             attemptedFingerprint: nil,
             physicalOutcome: .notAttempted,
             phase: .scheduled,
@@ -627,7 +678,6 @@ extension AgentModeViewModel {
             return false
         }
         let lanesByReference = agentSessionLinkAutoWakeLanesByReference(snapshot)
-        let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
         let currentAdmission = agentSessionLinkAutoWakeAdmission(
             snapshot,
             session: session,
@@ -679,19 +729,15 @@ extension AgentModeViewModel {
             return false
         }
 
-        let snoozedReferences = agentSessionLinkActiveAutoWakeSnoozedReferences(
-            endpoint: attempt.observerEndpoint,
-            session: session
-        )
-        let wakeAdmittingLanes = selectedLanes.filter {
-            !snoozedReferences.contains($0.key)
-        }
+        // Only a rendered row from a routine-admitting lane is a basis. Every other rendered status
+        // row is a hitchhiker — delivered because the batch is immutable, but never the reason the
+        // provider gets called.
         let hasRenderedStatusBasis = passive.receipt.deliveredStatuses.contains { delivered in
             guard let entry = snapshot.entries.first(where: {
                 $0.reference == delivered.reference
                     && $0.toStatus == delivered.toStatus
             }),
-                wakeAdmittingLanes[entry.reference] != nil
+                currentAdmission.routineLaneAdmits(entry.reference)
             else {
                 return false
             }
@@ -709,11 +755,7 @@ extension AgentModeViewModel {
 
         return snapshot.linkSetRevision == context.inventory.linkSetRevision
             && passive.includesUnattributedOverflow
-            && agentSessionLinkOverflowAloneMayWake(
-                snapshot,
-                selectedLanes: selectedLanes,
-                snoozedReferences: snoozedReferences
-            )
+            && currentAdmission.overflowAloneMayWake
     }
 
     /// The single exact-current-lane predicate shared by admission and physical liveness.
@@ -1065,9 +1107,9 @@ extension AgentModeViewModel {
 
         let clock = session.oversight.snoozeClock
         let now = clock.now()
-        var records = agentSessionLinkCleanedAutoWakeSnoozes(
+        var records = AgentSessionLinkAutoWakeSnooze.retainedRecords(
             session.oversight.autoWakeSnoozes,
-            endpoint: endpoint,
+            observerEndpoint: endpoint,
             currentReferences: snapshot.map { Set($0.autoWakeLanes.map(\.reference)) },
             now: now
         )
@@ -1161,21 +1203,6 @@ extension AgentModeViewModel {
         }
     }
 
-    /// The exact lane references currently suppressed for this observer, evaluated against the
-    /// monotonic clock rather than dictionary membership.
-    private func agentSessionLinkActiveAutoWakeSnoozedReferences(
-        endpoint: DomainAgentSessionLinkEndpointIdentity,
-        session: TabSession
-    ) -> Set<DomainAgentSessionLinkReference> {
-        guard !session.oversight.autoWakeSnoozes.isEmpty else { return [] }
-        let now = session.oversight.snoozeClock.now()
-        return Set(
-            session.oversight.autoWakeSnoozes.values
-                .filter { $0.key.observerEndpoint == endpoint && $0.isActive(at: now) }
-                .map(\.key.reference)
-        )
-    }
-
     /// The one mutating cleanup boundary: remove due and stale records, re-arm, repaint if changed.
     ///
     /// It never invokes the wake pipeline. Every caller owns its own single reevaluation, which is
@@ -1188,27 +1215,14 @@ extension AgentModeViewModel {
         guard !session.oversight.autoWakeSnoozes.isEmpty
             || session.oversight.snoozeTaskToken != nil
         else { return }
-        let cleaned = agentSessionLinkCleanedAutoWakeSnoozes(
+        let cleaned = AgentSessionLinkAutoWakeSnooze.retainedRecords(
             session.oversight.autoWakeSnoozes,
-            endpoint: endpoint,
+            observerEndpoint: endpoint,
             currentReferences: currentReferences,
             now: session.oversight.snoozeClock.now()
         )
         agentSessionLinkCommitAutoWakeSnoozes(cleaned, endpoint: endpoint, session: session)
         agentSessionLinkRearmAutoWakeSnoozeDeadlineTask(endpoint: endpoint, session: session)
-    }
-
-    private func agentSessionLinkCleanedAutoWakeSnoozes(
-        _ records: [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord],
-        endpoint: DomainAgentSessionLinkEndpointIdentity,
-        currentReferences: Set<DomainAgentSessionLinkReference>?,
-        now: ContinuousClock.Instant
-    ) -> [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord] {
-        records.filter { key, record in
-            key.observerEndpoint == endpoint
-                && record.isActive(at: now)
-                && (currentReferences?.contains(key.reference) ?? true)
-        }
     }
 
     /// Publishes one map change through the existing monitor seams, or nothing at all.
@@ -1240,12 +1254,10 @@ extension AgentModeViewModel {
     ) {
         let clock = session.oversight.snoozeClock
         let now = clock.now()
-        // Strictly-future deadlines only, which is what guarantees the handler makes progress: after
-        // its cleanup, every remaining record is still in the future.
-        let nextDeadline = session.oversight.autoWakeSnoozes.values
-            .filter { $0.key.observerEndpoint == endpoint && $0.isActive(at: now) }
-            .map(\.deadline)
-            .min()
+        let nextDeadline = session.oversight.nextActiveSnoozeDeadline(
+            observerEndpoint: endpoint,
+            now: now
+        )
         session.oversight.snoozeDeadlineTask?.cancel()
         session.oversight.snoozeDeadlineTask = nil
         session.oversight.snoozeTaskToken = nil
@@ -1401,10 +1413,9 @@ extension AgentModeViewModel {
         _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
         session: TabSession
     ) -> [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane] {
-        let masterEnabled = session.oversight.autoWakeOnUpdates
-        let selectedTargetSessionIDs = session.oversight.autoWakeTargetSessionIDs
+        let oversight = session.oversight
         return snapshot.autoWakeLanes.reduce(into: [:]) { lanes, lane in
-            guard masterEnabled || selectedTargetSessionIDs.contains(lane.targetSessionID) else { return }
+            guard oversight.isLaneEffectivelySelected(targetSessionID: lane.targetSessionID) else { return }
             lanes[lane.reference] = lane
         }
     }
@@ -1449,7 +1460,12 @@ extension AgentModeViewModel {
     /// mutation, deadline expiry, readiness settlement, and the physical-acquisition fence all read
     /// this, so an attempt can never be admitted under a rule the fence does not share.
     private struct AgentSessionLinkAutoWakeAdmission {
-        /// At least one pending entry belongs to a selected, unsnoozed lane.
+        /// The lanes that may admit routine status right now: effectively selected and not under an
+        /// active snooze. Every other live lane is a hitchhiker — its coalesced rows still render in
+        /// any admitted claim, but they are never the reason a turn starts.
+        let routineAdmittingLanes:
+            [DomainAgentSessionLinkReference: AgentSessionLinkPassiveStatusNotices.AutoWakeLane]
+        /// At least one pending entry belongs to a routine-admitting lane.
         let hasConcreteAdmittingEntry: Bool
         let overflowAloneMayWake: Bool
         /// Purposeful attention belongs to an exact live lane and deliberately ignores both routine
@@ -1462,6 +1478,34 @@ extension AgentModeViewModel {
             hasConcreteAdmittingEntry
                 || overflowAloneMayWake
                 || !admittingAttentionOccurrences.isEmpty
+        }
+
+        /// Whether a status row from this lane counts as a routine basis rather than a hitchhiker.
+        func routineLaneAdmits(_ reference: DomainAgentSessionLinkReference) -> Bool {
+            routineAdmittingLanes[reference] != nil
+        }
+
+        /// The full fresh-reservation verdict, in the fixed order the pipeline asks its questions.
+        ///
+        /// `promptEligible` is a closure so the provider-context read happens only once the cheaper
+        /// basis and suppression gates have passed, exactly as the inline guards it replaced did.
+        func decision(
+            fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint,
+            suppressed: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?,
+            promptEligible: () -> Bool
+        ) -> AgentSessionLinkWakeAdmissionDecision {
+            guard hasAdmissionBasis else { return .suppress(.noAdmissionBasis) }
+            guard hasUnsuppressedAdmissionBasis(fingerprint: fingerprint, suppressed: suppressed) else {
+                return .suppress(.failureSuppressed)
+            }
+            guard promptEligible() else { return .suppress(.promptIneligible) }
+            if let occurrence = requiredAttentionOccurrence(
+                fingerprint: fingerprint,
+                suppressed: suppressed
+            ) {
+                return .admit(.purposefulAttention(occurrence))
+            }
+            return .admit(.routineStatusOrOverflow)
         }
 
         private var hasOrdinaryAdmissionBasis: Bool {
@@ -1575,14 +1619,12 @@ extension AgentModeViewModel {
     ) -> AgentSessionLinkAutoWakeAdmission {
         let lanesByReference = agentSessionLinkAutoWakeLanesByReference(snapshot)
         let selectedLanes = agentSessionLinkLiveSelectedAutoWakeLanes(snapshot, session: session)
-        let snoozedReferences = agentSessionLinkActiveAutoWakeSnoozedReferences(
-            endpoint: endpoint,
-            session: session
-        )
-        let wakeAdmittingLanes = selectedLanes.filter { !snoozedReferences.contains($0.key) }
+        let snoozedReferences = session.oversight.activeSnoozedReferences(observerEndpoint: endpoint)
+        let routineAdmittingLanes = selectedLanes.filter { !snoozedReferences.contains($0.key) }
         return AgentSessionLinkAutoWakeAdmission(
+            routineAdmittingLanes: routineAdmittingLanes,
             hasConcreteAdmittingEntry: snapshot.entries.contains {
-                wakeAdmittingLanes[$0.reference] != nil
+                routineAdmittingLanes[$0.reference] != nil
             },
             overflowAloneMayWake: agentSessionLinkOverflowAloneMayWake(
                 snapshot,
@@ -1599,6 +1641,20 @@ extension AgentModeViewModel {
                 }
                 return request.occurrence
             }
+        )
+    }
+
+    /// Resolves the fresh-reservation verdict for one publication, reading the provider context only
+    /// if the basis and suppression gates pass.
+    private func agentSessionLinkWakeAdmissionDecision(
+        _ admission: AgentSessionLinkAutoWakeAdmission,
+        fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint,
+        session: TabSession
+    ) -> AgentSessionLinkWakeAdmissionDecision {
+        admission.decision(
+            fingerprint: fingerprint,
+            suppressed: session.oversight.suppressedWakeFingerprint,
+            promptEligible: { agentSessionLinkPromptContext(for: session)?.epoch.allowsSupplement == true }
         )
     }
 
