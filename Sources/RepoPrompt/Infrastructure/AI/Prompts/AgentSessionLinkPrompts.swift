@@ -9,6 +9,14 @@ import Foundation
 ///
 /// Everything dynamic — display names and session IDs — is XML-escaped, so an overseen session whose
 /// name contains markup cannot close the envelope or forge a sibling element.
+///
+/// Ownership: this file is the **only** place oversight prompt text is authored or formatted — the
+/// canonical guidance strings, the membership/revocation/suspension supplements, the passive
+/// status/attention envelope, and the deterministic 24 KiB subset selection all live here.
+/// `AgentSessionLinkPromptContext` owns the *claim*: what inventory and passive snapshot a render
+/// request carries, and the immutable receipt of what was rendered. It calls `rendered(_:)` and
+/// never builds a fragment of its own. `AgentSessionLinkMCPToolService.untrustedContentNotice`
+/// mirrors the autonomy clauses in compact form for the per-response notice.
 enum AgentSessionLinkPrompts {
     /// Hard cap on the rendered supplement. An inventory that cannot fit keeps a deterministic,
     /// order-preserving subset — each row is kept only if it still fits, so a single oversized row
@@ -275,6 +283,31 @@ enum AgentSessionLinkPrompts {
         let attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest]
     }
 
+    /// One passive envelope for one candidate subset of the snapshot.
+    ///
+    /// The single call shape behind both the reservation probe and the deterministic subset builder:
+    /// revision, overflow watermark, and guidance come from the snapshot, and `deferred` is derived
+    /// as what the snapshot offered minus what this candidate renders. Two hand-maintained call
+    /// sites could disagree about that arithmetic; one cannot.
+    private static func passiveFragment(
+        _ passive: AgentSessionLinkPassiveStatusNotices.Snapshot,
+        entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
+        attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest],
+        guidanceMode: LaneGuidanceMode,
+        includesAutonomyContract: Bool
+    ) -> String {
+        let offeredCount = passive.entries.count + passive.attentionRequests.count
+        return statusChangeSupplement(
+            revision: passive.queueRevision,
+            entries: entries,
+            attentionRequests: attentionRequests,
+            omittedCount: passive.unacknowledgedOverflowCount,
+            deferredCount: offeredCount - entries.count - attentionRequests.count,
+            guidanceMode: guidanceMode,
+            includesAutonomyContract: includesAutonomyContract
+        )
+    }
+
     /// The reservation used when inventory is also owed. Field normalization bounds every offered
     /// row, so the first candidate that fits the overall cap is a sufficient progress guarantee.
     private static func minimumPassiveFragment(
@@ -283,42 +316,29 @@ enum AgentSessionLinkPrompts {
         guidanceMode: LaneGuidanceMode,
         includesAutonomyContract: Bool
     ) -> String? {
-        let offeredCount = passive.entries.count + passive.attentionRequests.count
-        if offeredCount == 0 {
-            let fragment = statusChangeSupplement(
-                revision: passive.queueRevision,
-                entries: [],
-                attentionRequests: [],
-                omittedCount: passive.unacknowledgedOverflowCount,
-                deferredCount: 0,
+        let fragment = { (
+            entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
+            attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest]
+        ) -> String in
+            passiveFragment(
+                passive,
+                entries: entries,
+                attentionRequests: attentionRequests,
                 guidanceMode: guidanceMode,
                 includesAutonomyContract: includesAutonomyContract
             )
-            return fragment.utf8.count <= maximumBytes ? fragment : nil
+        }
+        if passive.entries.isEmpty, passive.attentionRequests.isEmpty {
+            let candidate = fragment([], [])
+            return candidate.utf8.count <= maximumBytes ? candidate : nil
         }
         for request in passive.attentionRequests {
-            let fragment = statusChangeSupplement(
-                revision: passive.queueRevision,
-                entries: [],
-                attentionRequests: [request],
-                omittedCount: passive.unacknowledgedOverflowCount,
-                deferredCount: offeredCount - 1,
-                guidanceMode: guidanceMode,
-                includesAutonomyContract: includesAutonomyContract
-            )
-            if fragment.utf8.count <= maximumBytes { return fragment }
+            let candidate = fragment([], [request])
+            if candidate.utf8.count <= maximumBytes { return candidate }
         }
         for entry in passive.entries {
-            let fragment = statusChangeSupplement(
-                revision: passive.queueRevision,
-                entries: [entry],
-                attentionRequests: [],
-                omittedCount: passive.unacknowledgedOverflowCount,
-                deferredCount: offeredCount - 1,
-                guidanceMode: guidanceMode,
-                includesAutonomyContract: includesAutonomyContract
-            )
-            if fragment.utf8.count <= maximumBytes { return fragment }
+            let candidate = fragment([entry], [])
+            if candidate.utf8.count <= maximumBytes { return candidate }
         }
         return nil
     }
@@ -329,57 +349,41 @@ enum AgentSessionLinkPrompts {
         guidanceMode: LaneGuidanceMode,
         includesAutonomyContract: Bool
     ) -> RenderedPassiveSubset? {
-        let offeredCount = passive.entries.count + passive.attentionRequests.count
+        let fragment = { (
+            entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
+            attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest]
+        ) -> String in
+            passiveFragment(
+                passive,
+                entries: entries,
+                attentionRequests: attentionRequests,
+                guidanceMode: guidanceMode,
+                includesAutonomyContract: includesAutonomyContract
+            )
+        }
         var renderedAttention: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest] = []
         var renderedEntries: [AgentSessionLinkPassiveStatusNotices.PendingEntry] = []
 
         for request in passive.attentionRequests {
             let candidateAttention = renderedAttention + [request]
-            let candidate = statusChangeSupplement(
-                revision: passive.queueRevision,
-                entries: renderedEntries,
-                attentionRequests: candidateAttention,
-                omittedCount: passive.unacknowledgedOverflowCount,
-                deferredCount: offeredCount - renderedEntries.count - candidateAttention.count,
-                guidanceMode: guidanceMode,
-                includesAutonomyContract: includesAutonomyContract
-            )
-            if candidate.utf8.count <= maximumBytes {
+            if fragment(renderedEntries, candidateAttention).utf8.count <= maximumBytes {
                 renderedAttention = candidateAttention
             }
         }
         for entry in passive.entries {
             let candidateEntries = renderedEntries + [entry]
-            let candidate = statusChangeSupplement(
-                revision: passive.queueRevision,
-                entries: candidateEntries,
-                attentionRequests: renderedAttention,
-                omittedCount: passive.unacknowledgedOverflowCount,
-                deferredCount: offeredCount - candidateEntries.count - renderedAttention.count,
-                guidanceMode: guidanceMode,
-                includesAutonomyContract: includesAutonomyContract
-            )
-            if candidate.utf8.count <= maximumBytes {
+            if fragment(candidateEntries, renderedAttention).utf8.count <= maximumBytes {
                 renderedEntries = candidateEntries
             }
         }
 
-        let deferredCount = offeredCount - renderedEntries.count - renderedAttention.count
-        let fragment = statusChangeSupplement(
-            revision: passive.queueRevision,
-            entries: renderedEntries,
-            attentionRequests: renderedAttention,
-            omittedCount: passive.unacknowledgedOverflowCount,
-            deferredCount: deferredCount,
-            guidanceMode: guidanceMode,
-            includesAutonomyContract: includesAutonomyContract
-        )
-        guard fragment.utf8.count <= maximumBytes,
+        let rendered = fragment(renderedEntries, renderedAttention)
+        guard rendered.utf8.count <= maximumBytes,
               !renderedEntries.isEmpty || !renderedAttention.isEmpty
               || passive.unacknowledgedOverflowCount > 0
         else { return nil }
         return RenderedPassiveSubset(
-            fragment: fragment,
+            fragment: rendered,
             entries: renderedEntries,
             attentionRequests: renderedAttention
         )
@@ -499,22 +503,19 @@ enum AgentSessionLinkPrompts {
         }
         attributes += " from=\"\(statusToken(entry.fromStatus))\""
         attributes += " to=\"\(statusToken(entry.toStatus))\""
-        attributes += " observed_at=\"\(observedAtFormatter.string(from: entry.observedAt))\""
-        attributes += " idle_for_send=\"\(entry.idleForSend ? "true" : "false")\""
-        if let idleSince = entry.idleSince {
-            attributes += " idle_since=\"\(observedAtFormatter.string(from: idleSince))\""
-        }
-        var children: [String] = []
-        if let waitingOn = entry.waitingOn {
-            children.append(
-                "<waiting_on declared_at=\"\(observedAtFormatter.string(from: waitingOn.declaredAt))\">\(escaped(waitingOn.summary))</waiting_on>"
+        attributes += laneObservationAttributes(
+            observedAt: entry.observedAt,
+            idleForSend: entry.idleForSend,
+            idleSince: entry.idleSince
+        )
+        return laneElement(
+            "change",
+            attributes: attributes,
+            children: laneObservationChildren(
+                waitingOn: entry.waitingOn,
+                preview: entry.latestVisibleAssistantPreview
             )
-        }
-        if let preview = entry.latestVisibleAssistantPreview {
-            children.append("<latest_assistant_preview>\(escaped(preview))</latest_assistant_preview>")
-        }
-        guard !children.isEmpty else { return "<change \(attributes) />" }
-        return "<change \(attributes)>\n\(children.joined(separator: "\n"))\n</change>"
+        )
     }
 
     /// Target-originated attention is one typed, attributed item of untrusted lane data.
@@ -531,22 +532,57 @@ enum AgentSessionLinkPrompts {
             attributes += " name=\"\(escaped(displayName))\""
         }
         attributes += " status=\"\(statusToken(request.status))\""
-        attributes += " observed_at=\"\(observedAtFormatter.string(from: request.observedAt))\""
-        attributes += " idle_for_send=\"\(request.idleForSend ? "true" : "false")\""
-        if let idleSince = request.idleSince {
+        attributes += laneObservationAttributes(
+            observedAt: request.observedAt,
+            idleForSend: request.idleForSend,
+            idleSince: request.idleSince
+        )
+        return laneElement(
+            "attention_request",
+            attributes: attributes,
+            children: laneObservationChildren(
+                waitingOn: request.waitingOn,
+                preview: request.latestVisibleAssistantPreview
+            )
+        )
+    }
+
+    /// The observation metadata every lane row carries, in the one attribute order the model reads.
+    private static func laneObservationAttributes(
+        observedAt: Date,
+        idleForSend: Bool,
+        idleSince: Date?
+    ) -> String {
+        var attributes = " observed_at=\"\(observedAtFormatter.string(from: observedAt))\""
+        attributes += " idle_for_send=\"\(idleForSend ? "true" : "false")\""
+        if let idleSince {
             attributes += " idle_since=\"\(observedAtFormatter.string(from: idleSince))\""
         }
+        return attributes
+    }
+
+    /// The bounded target-derived context a lane row may carry as child content. Both values arrive
+    /// already normalized and byte-capped and are XML-escaped here; the preview is child content
+    /// rather than an attribute precisely because it is the one unbounded-looking field.
+    private static func laneObservationChildren(
+        waitingOn: DomainAgentSessionWaitingOn?,
+        preview: String?
+    ) -> [String] {
         var children: [String] = []
-        if let waitingOn = request.waitingOn {
+        if let waitingOn {
             children.append(
                 "<waiting_on declared_at=\"\(observedAtFormatter.string(from: waitingOn.declaredAt))\">\(escaped(waitingOn.summary))</waiting_on>"
             )
         }
-        if let preview = request.latestVisibleAssistantPreview {
+        if let preview {
             children.append("<latest_assistant_preview>\(escaped(preview))</latest_assistant_preview>")
         }
-        guard !children.isEmpty else { return "<attention_request \(attributes) />" }
-        return "<attention_request \(attributes)>\n\(children.joined(separator: "\n"))\n</attention_request>"
+        return children
+    }
+
+    private static func laneElement(_ tag: String, attributes: String, children: [String]) -> String {
+        guard !children.isEmpty else { return "<\(tag) \(attributes) />" }
+        return "<\(tag) \(attributes)>\n\(children.joined(separator: "\n"))\n</\(tag)>"
     }
 
     /// Maps the reducer's internal vocabulary onto the one the agent already reads from `poll`.
