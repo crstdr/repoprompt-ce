@@ -306,6 +306,12 @@ struct DomainWorkspaceAuthorityIssue: Equatable, Identifiable {
 
 struct DomainWorkspaceAuthorityOperationError: LocalizedError {
     let outcome: DomainCommandOutcome
+    let workingCommitted: Bool
+
+    init(outcome: DomainCommandOutcome, workingCommitted: Bool = false) {
+        self.outcome = outcome
+        self.workingCommitted = workingCommitted
+    }
 
     var errorDescription: String? {
         let code = outcome.errorCode?.rawValue ?? "workspace_authority_command_failed"
@@ -394,6 +400,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     @Published private(set) var domainWorkspaceAuthorityIssue: DomainWorkspaceAuthorityIssue?
+    /// Presentation union of restores owned by this manager and incomplete two-phase restores
+    /// recovered from the runtime authority. The component sets remain separate so a projection
+    /// can never clear an operation that this manager still owns.
+    @Published private(set) var pendingConsolidatedRestoreIDs: Set<UUID> = []
+    private var activeConsolidatedRestoreIDs: Set<UUID> = []
+    private var authorityIncompleteConsolidatedRestoreIDs: Set<UUID> = []
+    private var authorityIncompleteRestoreClassificationTask: Task<Void, Never>?
+    private var lastAuthorityRecoveryClassificationSequence: UInt64 = 0
 
     @Published private(set) var activeWorkspaceID: UUID? = nil {
         didSet {
@@ -1841,8 +1855,27 @@ class WorkspaceManagerViewModel: ObservableObject {
         DomainWorkspaceStoragePath.directoryName(name: workspace.name, id: workspace.id)
     }
 
+    private func resolvedWorkspaceDirectoryForMutation(
+        for workspace: WorkspaceModel
+    ) throws -> URL {
+        try WorkspaceStorageDirectoryResolver.shared.resolveDirectory(
+            workspaceID: workspace.id,
+            workspaceName: workspace.name,
+            customStoragePath: workspace.customStoragePath,
+            catalogFileURL: domainWorkspaceFileURLsByID[workspace.id],
+            baseRoot: currentBaseRoot
+        )
+    }
+
     func workspaceDirectory(for workspace: WorkspaceModel) -> URL {
-        workspaceDirectory(for: workspace, baseRoot: currentBaseRoot)
+        do {
+            return try resolvedWorkspaceDirectoryForMutation(for: workspace)
+        } catch {
+            Self.logger.error(
+                "Failed to resolve workspace directory for \(workspace.id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            return workspaceDirectory(for: workspace, baseRoot: currentBaseRoot)
+        }
     }
 
     nonisolated func workspaceDirectory(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
@@ -1861,33 +1894,35 @@ class WorkspaceManagerViewModel: ObservableObject {
         {
             return authoritativeURL
         }
-        return workspaceFileURL(for: workspace, baseRoot: currentBaseRoot)
+        return workspaceDirectory(for: workspace)
+            .appendingPathComponent("workspace.json", isDirectory: false)
     }
 
-    nonisolated func workspaceFileURL(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
-        workspaceDirectory(for: workspace, baseRoot: baseRoot).appendingPathComponent("workspace.json")
+    private nonisolated func resolvedWorkspaceDirectory(
+        for workspace: WorkspaceModel,
+        baseRoot: URL
+    ) throws -> URL {
+        try WorkspaceStorageDirectoryResolver.shared.resolveDirectory(
+            workspaceID: workspace.id,
+            workspaceName: workspace.name,
+            customStoragePath: workspace.customStoragePath,
+            catalogFileURL: nil,
+            baseRoot: baseRoot
+        )
     }
 
-    nonisolated func chatsFolder(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
-        workspaceDirectory(for: workspace, baseRoot: baseRoot)
-            .appendingPathComponent("Chats", isDirectory: true)
+    nonisolated func workspaceFileURL(for workspace: WorkspaceModel, baseRoot: URL) throws -> URL {
+        try resolvedWorkspaceDirectory(for: workspace, baseRoot: baseRoot)
+            .appendingPathComponent("workspace.json", isDirectory: false)
     }
 
-    func gitDataDirectory(for workspace: WorkspaceModel) -> URL {
-        gitDataDirectory(for: workspace, baseRoot: currentBaseRoot)
-    }
-
-    nonisolated func gitDataDirectory(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
-        workspaceDirectory(for: workspace, baseRoot: baseRoot)
+    func gitDataDirectory(for workspace: WorkspaceModel) throws -> URL {
+        try resolvedWorkspaceDirectoryForMutation(for: workspace)
             .appendingPathComponent("_git_data", isDirectory: true)
     }
 
-    func gitDataTabDirectory(for workspace: WorkspaceModel, tabID: UUID) -> URL {
-        gitDataTabDirectory(for: workspace, tabID: tabID, baseRoot: currentBaseRoot)
-    }
-
-    nonisolated func gitDataTabDirectory(for workspace: WorkspaceModel, tabID: UUID, baseRoot: URL) -> URL {
-        gitDataDirectory(for: workspace, baseRoot: baseRoot)
+    func gitDataTabDirectory(for workspace: WorkspaceModel, tabID: UUID) throws -> URL {
+        try gitDataDirectory(for: workspace)
             .appendingPathComponent(tabID.uuidString, isDirectory: true)
     }
 
@@ -2004,15 +2039,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         for entry in indexEntries {
             do {
-                let wURL: URL
-                if let customURL = entry.customStoragePath {
-                    wURL = customURL.appendingPathComponent("workspace.json")
-                } else {
-                    let folder = base.appendingPathComponent(
-                        DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id)
-                    )
-                    wURL = folder.appendingPathComponent("workspace.json")
-                }
+                let wURL = try Self.resolvedWorkspaceFileURL(for: entry, baseRoot: base)
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
                     guard let loadResult = try Self.loadPersistedWorkspaceFromFileResult(
@@ -2130,6 +2157,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         pollTimerSaveTask?.cancel()
         reloadWorkspacesTask?.cancel()
         reloadPresetsTask?.cancel()
+        authorityIncompleteRestoreClassificationTask?.cancel()
         composeTabApplyTask?.cancel()
         domainWorkingCommitTasks.values.forEach { $0.cancel() }
         domainWorkingCommitTasks.removeAll()
@@ -2146,6 +2174,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         reloadWorkspacesTask = nil
         reloadPresetsTask?.cancel()
         reloadPresetsTask = nil
+        authorityIncompleteRestoreClassificationTask?.cancel()
+        authorityIncompleteRestoreClassificationTask = nil
         composeTabApplyTask?.cancel()
         composeTabApplyTask = nil
         domainWorkingCommitTasks.values.forEach { $0.cancel() }
@@ -2228,6 +2258,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    private nonisolated static func resolvedWorkspaceFileURL(
+        for entry: WorkspaceIndexEntry,
+        baseRoot: URL
+    ) throws -> URL {
+        try WorkspaceStorageDirectoryResolver.shared.resolveDirectory(
+            workspaceID: entry.id,
+            workspaceName: entry.name,
+            customStoragePath: entry.customStoragePath,
+            catalogFileURL: nil,
+            baseRoot: baseRoot
+        ).appendingPathComponent("workspace.json", isDirectory: false)
+    }
+
     private func saveWorkspaceIndex(_ entries: [WorkspaceIndexEntry]) throws {
         guard domainWorkspaceAuthorityClient == nil else { return }
         try ensureBaseRootExists(at: currentBaseRoot)
@@ -2250,34 +2293,35 @@ class WorkspaceManagerViewModel: ObservableObject {
                 guard let self else { return }
                 let snapshot = await domainWorkspaceAuthorityClient.snapshot()
                 guard snapshot.isBootstrapped else { return }
-                do {
-                    let loaded = try snapshot.workspaces.map {
-                        try Self.decodeDomainWorkspaceProjection(
-                            documentBytes: $0.document.documentBytes,
-                            fileURL: $0.document.fileURL
+                let loaded = snapshot.workspaces.compactMap { authoritative -> WorkspaceModel? in
+                    do {
+                        return try Self.decodeDomainWorkspaceProjection(
+                            documentBytes: authoritative.document.documentBytes,
+                            fileURL: authoritative.document.fileURL
                         )
+                    } catch {
+                        reportDomainProjectionFailure(error)
+                        return nil
                     }
-                    applyDomainWorkspaceProjection(
-                        loaded,
-                        fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                            ($0.document.workspaceID, $0.document.fileURL)
-                        }),
-                        revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                            ($0.document.workspaceID, $0.revisions)
-                        }),
-                        digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                            ($0.document.workspaceID, $0.document.contentDigest)
-                        }),
-                        healthByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                            ($0.document.workspaceID, $0.health)
-                        }),
-                        catalogRevision: snapshot.catalogRevision,
-                        preferredActiveWorkspaceID: activeWorkspaceID,
-                        publicationSequence: snapshot.publicationSequence
-                    )
-                } catch {
-                    reportDomainProjectionFailure(error)
                 }
+                applyDomainWorkspaceProjection(
+                    loaded,
+                    fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                        ($0.document.workspaceID, $0.document.fileURL)
+                    }),
+                    revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                        ($0.document.workspaceID, $0.revisions)
+                    }),
+                    digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                        ($0.document.workspaceID, $0.document.contentDigest)
+                    }),
+                    healthByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                        ($0.document.workspaceID, $0.health)
+                    }),
+                    catalogRevision: snapshot.catalogRevision,
+                    preferredActiveWorkspaceID: activeWorkspaceID,
+                    publicationSequence: snapshot.publicationSequence
+                )
                 reloadWorkspacesTask = nil
             }
             return
@@ -2299,13 +2343,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 if Task.isCancelled { return }
 
                 let wURL: URL
-                if let customURL = entry.customStoragePath {
-                    wURL = customURL.appendingPathComponent("workspace.json")
-                } else {
-                    let folder = base.appendingPathComponent(
-                        DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id)
-                    )
-                    wURL = folder.appendingPathComponent("workspace.json")
+                do {
+                    wURL = try Self.resolvedWorkspaceFileURL(for: entry, baseRoot: base)
+                } catch {
+                    print("Unable to resolve workspace storage for \(entry.name): \(error)")
+                    continue
                 }
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
@@ -2386,27 +2428,51 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    /// Loads a fresh snapshot of all workspaces from workspace storage.
-    /// This bypasses this manager's in-memory state and may reuse the process-wide
-    /// decode cache when the on-disk file metadata is unchanged.
-    /// Use this when you need guaranteed accurate workspace data (e.g., for MCP tool responses).
+    /// Loads a fresh snapshot from the owning persistence authority. Runtime-owned managers use
+    /// the bootstrapped domain catalog; the complete legacy index/file loader remains the fallback
+    /// while that authority is not yet bootstrapped and for isolated legacy managers.
     func loadWorkspaceSnapshotFromDisk() async -> [WorkspaceModel] {
+        if let domainWorkspaceAuthorityClient {
+            let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+            if snapshot.isBootstrapped {
+                let loaded = snapshot.workspaces.compactMap { authoritative -> WorkspaceModel? in
+                    do {
+                        return try Self.decodeDomainWorkspaceProjection(
+                            documentBytes: authoritative.document.documentBytes,
+                            fileURL: authoritative.document.fileURL
+                        )
+                    } catch {
+                        reportDomainProjectionFailure(error)
+                        return nil
+                    }
+                }
+                await refreshAuthorityIncompleteRestoreClassification(
+                    workspaces: loaded,
+                    fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                        ($0.document.workspaceID, $0.document.fileURL)
+                    }),
+                    revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                        ($0.document.workspaceID, $0.revisions)
+                    }),
+                    publicationSequence: snapshot.publicationSequence
+                )
+                return loaded
+            }
+        }
+
         let base = currentBaseRoot
         let indexURL = workspaceIndexFileURL
-
         return await Task.detached(priority: .utility) {
             let indexEntries = Self.loadWorkspaceIndex(from: indexURL)
             var loaded: [WorkspaceModel] = []
 
             for entry in indexEntries {
                 let wURL: URL
-                if let customURL = entry.customStoragePath {
-                    wURL = customURL.appendingPathComponent("workspace.json")
-                } else {
-                    let folder = base.appendingPathComponent(
-                        DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id)
-                    )
-                    wURL = folder.appendingPathComponent("workspace.json")
+                do {
+                    wURL = try Self.resolvedWorkspaceFileURL(for: entry, baseRoot: base)
+                } catch {
+                    print("[WorkspaceSnapshot] Unable to resolve \(entry.name): \(error)")
+                    continue
                 }
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
@@ -2448,13 +2514,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 if Task.isCancelled { return }
 
                 let wURL: URL
-                if let customURL = entry.customStoragePath {
-                    wURL = customURL.appendingPathComponent("workspace.json")
-                } else {
-                    let folder = base.appendingPathComponent(
-                        DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id)
-                    )
-                    wURL = folder.appendingPathComponent("workspace.json")
+                do {
+                    wURL = try Self.resolvedWorkspaceFileURL(for: entry, baseRoot: base)
+                } catch {
+                    print("Unable to resolve workspace presets for \(entry.name): \(error)")
+                    continue
                 }
 
                 guard FileManager.default.fileExists(atPath: wURL.path) else {
@@ -2985,6 +3049,43 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
+        let currentBeforeAdmission = workspace(withID: newWorkspace.id)
+        if newWorkspace.consolidatedIntoWorkspaceID != nil
+            || currentBeforeAdmission?.consolidatedIntoWorkspaceID != nil
+        {
+            return userVisibleWorkspaceSwitchResult(
+                .blocked("Workspace \"\(newWorkspace.name)\" is a consolidated recovery copy. Restore it before opening it.")
+            )
+        }
+        if activeConsolidatedRestoreIDs.contains(newWorkspace.id) {
+            return userVisibleWorkspaceSwitchResult(
+                .blocked("Workspace \"\(newWorkspace.name)\" is still being restored and cannot be opened yet.")
+            )
+        }
+
+        let isSuspectIncompleteRestore = authorityIncompleteConsolidatedRestoreIDs.contains(newWorkspace.id)
+            || domainWorkspaceRevisionsByID[newWorkspace.id]?.dirtyRevision != nil
+        if isSuspectIncompleteRestore {
+            let classification = await refreshAuthorityConsolidatedRestoreClassification(
+                workspaceID: newWorkspace.id
+            )
+            let currentAfterAdmission = workspace(withID: newWorkspace.id)
+            let classificationBlocksSwitch = switch classification {
+            case .clear:
+                false
+            case .retired, .incomplete(_), .unavailable, .stale:
+                true
+            }
+            if newWorkspace.consolidatedIntoWorkspaceID != nil
+                || currentAfterAdmission?.consolidatedIntoWorkspaceID != nil
+                || pendingConsolidatedRestoreIDs.contains(newWorkspace.id)
+                || classificationBlocksSwitch
+            {
+                return userVisibleWorkspaceSwitchResult(
+                    .blocked("Workspace \"\(newWorkspace.name)\" has not finished restoration and cannot be opened yet.")
+                )
+            }
+        }
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace) {
             return userVisibleWorkspaceSwitchResult(
                 concurrentResult,
@@ -3592,17 +3693,36 @@ class WorkspaceManagerViewModel: ObservableObject {
         let diskLoadStart = Date()
         logWorkspaceSwitch("workspace disk load BEGIN target=\"\(newWorkspace.name)\"")
         if let wsIndex = workspaces.firstIndex(where: { $0.id == newWorkspace.id }) {
+            let targetBeforeLoad = workspaces[wsIndex]
             let diskURL = workspaceFileURL(for: newWorkspace)
             if FileManager.default.fileExists(atPath: diskURL.path) {
                 do {
                     let upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL, scheduleNormalizationWriteback: false)
-                    workspaces[wsIndex] = upgraded
+                    guard let publishIndex = workspaceIndex(for: targetBeforeLoad.id),
+                          workspaces[publishIndex] == targetBeforeLoad
+                    else {
+                        return .blocked("Workspace \"\(newWorkspace.name)\" changed while it was being loaded.")
+                    }
+                    workspaces[publishIndex] = upgraded
                     recordRepoPathBaseline(for: upgraded)
                 } catch {
                     print("Error reloading workspace from disk: \(error)")
                 }
             }
-            activeWorkspaceID = workspaces[wsIndex].id // Set the active ID
+            guard let loadedWorkspace = workspace(withID: newWorkspace.id) else {
+                return .blocked("Workspace \"\(newWorkspace.name)\" changed while it was being loaded.")
+            }
+            guard loadedWorkspace.consolidatedIntoWorkspaceID == nil,
+                  !pendingConsolidatedRestoreIDs.contains(loadedWorkspace.id)
+            else {
+                return .blocked("Workspace \"\(loadedWorkspace.name)\" is a consolidated recovery copy. Restore it before opening it.")
+            }
+            guard await canActivateWorkspaceAfterAuthorityCheck(
+                workspaceID: loadedWorkspace.id
+            ) else {
+                return .blocked("Workspace \"\(loadedWorkspace.name)\" could not be verified for activation. Refresh or restore it first.")
+            }
+            activeWorkspaceID = loadedWorkspace.id // Set the active ID
         } else {
             let diskURL = workspaceFileURL(for: newWorkspace)
             guard FileManager.default.fileExists(atPath: diskURL.path) else {
@@ -3613,8 +3733,21 @@ class WorkspaceManagerViewModel: ObservableObject {
 
             do {
                 let upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL, scheduleNormalizationWriteback: false)
+                guard workspaceIndex(for: upgraded.id) == nil else {
+                    return .blocked("Workspace \"\(newWorkspace.name)\" changed while it was being loaded.")
+                }
                 workspaces.append(upgraded)
                 recordRepoPathBaseline(for: upgraded)
+                guard upgraded.consolidatedIntoWorkspaceID == nil,
+                      !pendingConsolidatedRestoreIDs.contains(upgraded.id)
+                else {
+                    return .blocked("Workspace \"\(upgraded.name)\" is a consolidated recovery copy. Restore it before opening it.")
+                }
+                guard await canActivateWorkspaceAfterAuthorityCheck(
+                    workspaceID: upgraded.id
+                ) else {
+                    return .blocked("Workspace \"\(upgraded.name)\" could not be verified for activation. Refresh or restore it first.")
+                }
                 activeWorkspaceID = upgraded.id
             } catch {
                 let message = "Workspace switch could not load \"\(newWorkspace.name)\" from disk: \(error.localizedDescription)"
@@ -4449,6 +4582,246 @@ class WorkspaceManagerViewModel: ObservableObject {
             || outcome.disposition == .deduplicated
     }
 
+    private struct AuthorityIncompleteRestoreCandidate {
+        let workspaceID: UUID
+        let savedFileURL: URL
+    }
+
+    private enum SavedConsolidationMarkerStatus {
+        case marked
+        case unmarked
+        case unreadable
+    }
+
+    private struct AuthorityIncompleteRestoreState {
+        let workspace: WorkspaceModel
+        let fileURL: URL
+        let revisions: DomainRevisionState
+        let contentDigest: String
+        let health: DomainAuthorityHealth
+        let catalogRevision: UInt64
+    }
+
+    private enum AuthorityConsolidatedRestoreClassification {
+        case clear
+        case retired
+        case incomplete(AuthorityIncompleteRestoreState)
+        case unavailable
+        case stale
+    }
+
+    private func publishPendingConsolidatedRestoreIDs() {
+        let pending = activeConsolidatedRestoreIDs
+            .union(authorityIncompleteConsolidatedRestoreIDs)
+        if pendingConsolidatedRestoreIDs != pending {
+            pendingConsolidatedRestoreIDs = pending
+        }
+    }
+
+    private func removeConsolidatedRestoreTracking(workspaceID: UUID) {
+        activeConsolidatedRestoreIDs.remove(workspaceID)
+        authorityIncompleteConsolidatedRestoreIDs.remove(workspaceID)
+        publishPendingConsolidatedRestoreIDs()
+    }
+
+    private func authorityIncompleteRestoreCandidates(
+        workspaces: [WorkspaceModel],
+        fileURLsByWorkspaceID: [UUID: URL],
+        revisionsByWorkspaceID: [UUID: DomainRevisionState]
+    ) -> [AuthorityIncompleteRestoreCandidate] {
+        workspaces.compactMap { workspace in
+            guard workspace.consolidatedIntoWorkspaceID == nil,
+                  revisionsByWorkspaceID[workspace.id]?.dirtyRevision != nil,
+                  let fileURL = fileURLsByWorkspaceID[workspace.id]
+            else { return nil }
+            return AuthorityIncompleteRestoreCandidate(
+                workspaceID: workspace.id,
+                savedFileURL: fileURL
+            )
+        }
+    }
+
+    /// Reads the saved workspace document directly. The decode cache represents presentation
+    /// state and may already contain the marker-cleared working document, so it cannot classify
+    /// whether the separate saved phase completed.
+    private nonisolated static func savedConsolidationMarkerStatus(
+        for candidate: AuthorityIncompleteRestoreCandidate
+    ) -> SavedConsolidationMarkerStatus {
+        guard FileManager.default.fileExists(atPath: candidate.savedFileURL.path) else {
+            return .unreadable
+        }
+        do {
+            let data = try Data(contentsOf: candidate.savedFileURL)
+            let saved = try JSONDecoder().decode(WorkspaceModel.self, from: data)
+            guard saved.id == candidate.workspaceID else { return .unreadable }
+            return saved.consolidatedIntoWorkspaceID == nil ? .unmarked : .marked
+        } catch {
+            return .unreadable
+        }
+    }
+
+    private nonisolated static func authorityIncompleteRestoreIDs(
+        from candidates: [AuthorityIncompleteRestoreCandidate]
+    ) async -> Set<UUID> {
+        await Task.detached(priority: .utility) {
+            Set(candidates.compactMap { candidate in
+                switch Self.savedConsolidationMarkerStatus(for: candidate) {
+                case .marked, .unreadable:
+                    candidate.workspaceID
+                case .unmarked:
+                    nil
+                }
+            })
+        }.value
+    }
+
+    private func scheduleAuthorityIncompleteRestoreClassification(
+        workspaces: [WorkspaceModel],
+        fileURLsByWorkspaceID: [UUID: URL],
+        revisionsByWorkspaceID: [UUID: DomainRevisionState],
+        publicationSequence: UInt64
+    ) {
+        authorityIncompleteRestoreClassificationTask?.cancel()
+        authorityIncompleteRestoreClassificationTask = nil
+        guard publicationSequence >= lastDomainProjectionSequence,
+              publicationSequence >= lastAuthorityRecoveryClassificationSequence
+        else { return }
+        let candidates = authorityIncompleteRestoreCandidates(
+            workspaces: workspaces,
+            fileURLsByWorkspaceID: fileURLsByWorkspaceID,
+            revisionsByWorkspaceID: revisionsByWorkspaceID
+        )
+        let candidateIDs = Set(candidates.map(\.workspaceID))
+        authorityIncompleteConsolidatedRestoreIDs.formIntersection(candidateIDs)
+        lastAuthorityRecoveryClassificationSequence = publicationSequence
+        publishPendingConsolidatedRestoreIDs()
+        guard !candidates.isEmpty else {
+            authorityIncompleteRestoreClassificationTask = nil
+            return
+        }
+
+        authorityIncompleteRestoreClassificationTask = Task { @MainActor [weak self] in
+            let incompleteIDs = await Self.authorityIncompleteRestoreIDs(from: candidates)
+            guard let self,
+                  !Task.isCancelled,
+                  publicationSequence >= lastDomainProjectionSequence,
+                  publicationSequence >= lastAuthorityRecoveryClassificationSequence
+            else { return }
+            authorityIncompleteConsolidatedRestoreIDs = incompleteIDs
+            lastAuthorityRecoveryClassificationSequence = publicationSequence
+            publishPendingConsolidatedRestoreIDs()
+            authorityIncompleteRestoreClassificationTask = nil
+        }
+    }
+
+    private func refreshAuthorityIncompleteRestoreClassification(
+        workspaces: [WorkspaceModel],
+        fileURLsByWorkspaceID: [UUID: URL],
+        revisionsByWorkspaceID: [UUID: DomainRevisionState],
+        publicationSequence: UInt64
+    ) async {
+        let candidates = authorityIncompleteRestoreCandidates(
+            workspaces: workspaces,
+            fileURLsByWorkspaceID: fileURLsByWorkspaceID,
+            revisionsByWorkspaceID: revisionsByWorkspaceID
+        )
+        let incompleteIDs = await Self.authorityIncompleteRestoreIDs(from: candidates)
+        guard publicationSequence >= lastDomainProjectionSequence,
+              publicationSequence >= lastAuthorityRecoveryClassificationSequence
+        else { return }
+        authorityIncompleteConsolidatedRestoreIDs = incompleteIDs
+        lastAuthorityRecoveryClassificationSequence = publicationSequence
+        publishPendingConsolidatedRestoreIDs()
+    }
+
+    /// Revalidates only a workspace already suspected by local projection metadata. Ordinary
+    /// switches do not pay for a catalog snapshot or direct saved-document read.
+    private func refreshAuthorityConsolidatedRestoreClassification(
+        workspaceID: UUID
+    ) async -> AuthorityConsolidatedRestoreClassification {
+        guard let domainWorkspaceAuthorityClient else { return .clear }
+        let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+        guard snapshot.isBootstrapped,
+              let authoritative = snapshot.workspaces.first(where: {
+                  $0.document.workspaceID == workspaceID
+              }),
+              let working = try? Self.decodeDomainWorkspaceProjection(
+                  documentBytes: authoritative.document.documentBytes,
+                  fileURL: authoritative.document.fileURL
+              )
+        else { return .unavailable }
+
+        if working.consolidatedIntoWorkspaceID != nil {
+            guard snapshot.publicationSequence >= lastDomainProjectionSequence,
+                  snapshot.publicationSequence >= lastAuthorityRecoveryClassificationSequence
+            else { return .stale }
+            authorityIncompleteConsolidatedRestoreIDs.remove(workspaceID)
+            lastAuthorityRecoveryClassificationSequence = snapshot.publicationSequence
+            publishPendingConsolidatedRestoreIDs()
+            return .retired
+        }
+        guard authoritative.revisions.dirtyRevision != nil else {
+            guard snapshot.publicationSequence >= lastDomainProjectionSequence,
+                  snapshot.publicationSequence >= lastAuthorityRecoveryClassificationSequence
+            else { return .stale }
+            authorityIncompleteConsolidatedRestoreIDs.remove(workspaceID)
+            lastAuthorityRecoveryClassificationSequence = snapshot.publicationSequence
+            publishPendingConsolidatedRestoreIDs()
+            return .clear
+        }
+
+        let candidate = AuthorityIncompleteRestoreCandidate(
+            workspaceID: workspaceID,
+            savedFileURL: authoritative.document.fileURL
+        )
+        let savedStatus = await Task.detached(priority: .utility) {
+            Self.savedConsolidationMarkerStatus(for: candidate)
+        }.value
+        guard snapshot.publicationSequence >= lastDomainProjectionSequence,
+              snapshot.publicationSequence >= lastAuthorityRecoveryClassificationSequence
+        else { return .stale }
+        lastAuthorityRecoveryClassificationSequence = snapshot.publicationSequence
+        switch savedStatus {
+        case .marked:
+            authorityIncompleteConsolidatedRestoreIDs.insert(workspaceID)
+            publishPendingConsolidatedRestoreIDs()
+            return .incomplete(AuthorityIncompleteRestoreState(
+                workspace: working,
+                fileURL: authoritative.document.fileURL,
+                revisions: authoritative.revisions,
+                contentDigest: authoritative.document.contentDigest,
+                health: authoritative.health,
+                catalogRevision: snapshot.catalogRevision
+            ))
+        case .unmarked:
+            authorityIncompleteConsolidatedRestoreIDs.remove(workspaceID)
+            publishPendingConsolidatedRestoreIDs()
+            return .clear
+        case .unreadable:
+            authorityIncompleteConsolidatedRestoreIDs.insert(workspaceID)
+            publishPendingConsolidatedRestoreIDs()
+            return .unavailable
+        }
+    }
+
+    /// Disk load may observe the older saved phase while authority already owns a newer working
+    /// lifecycle transition. Authority-backed activation therefore proceeds only from a fresh,
+    /// clear classification, followed by one final local projection check.
+    private func canActivateWorkspaceAfterAuthorityCheck(workspaceID: UUID) async -> Bool {
+        guard let target = workspace(withID: workspaceID) else { return false }
+        if domainWorkspaceAuthorityClient != nil, !target.isEphemeral {
+            switch await refreshAuthorityConsolidatedRestoreClassification(workspaceID: workspaceID) {
+            case .clear:
+                break
+            case .retired, .incomplete(_), .unavailable, .stale:
+                return false
+            }
+        }
+        guard let current = workspace(withID: workspaceID) else { return false }
+        return current.consolidatedIntoWorkspaceID == nil
+            && !pendingConsolidatedRestoreIDs.contains(workspaceID)
+    }
+
     func applyDomainWorkspaceProjection(
         _ projectedWorkspaces: [WorkspaceModel],
         fileURLsByWorkspaceID: [UUID: URL],
@@ -4476,7 +4849,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 previousDigestsByWorkspaceID: domainWorkspaceDigestsByID,
                 projectedDigestsByWorkspaceID: digestsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
             )
-            domainWorkspaceFileURLsByID = fileURLsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
+            let projectedFileURLs = fileURLsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
+            domainWorkspaceFileURLsByID = projectedFileURLs
             domainWorkspaceRevisionsByID = revisionsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
             domainWorkspaceDigestsByID = digestsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
             domainWorkspaceHealthByID = healthByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
@@ -4494,13 +4868,44 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
         let reconciledWorkspaces = lifecycleProjection?.workspaces ?? localProjection
         workspaces = reconciledWorkspaces
+        scheduleAuthorityIncompleteRestoreClassification(
+            workspaces: reconciledWorkspaces,
+            fileURLsByWorkspaceID: domainWorkspaceFileURLsByID,
+            revisionsByWorkspaceID: domainWorkspaceRevisionsByID,
+            publicationSequence: publicationSequence
+        )
         recordRepoPathBaselines(for: reconciledWorkspaces)
-        if let preferredActiveWorkspaceID,
-           reconciledWorkspaces.contains(where: { $0.id == preferredActiveWorkspaceID })
-        {
+        let preferredWorkspace = preferredActiveWorkspaceID.flatMap { preferredID in
+            reconciledWorkspaces.first { $0.id == preferredID }
+        }
+        let canPreservePreferred = preferredWorkspace.map { workspace in
+            workspace.consolidatedIntoWorkspaceID == nil
+                && !pendingConsolidatedRestoreIDs.contains(workspace.id)
+                && (
+                    workspace.id == activeWorkspaceID
+                        || domainWorkspaceRevisionsByID[workspace.id]?.dirtyRevision == nil
+                )
+        } ?? false
+        if canPreservePreferred {
             adoptProjectedActiveWorkspaceID(preferredActiveWorkspaceID)
-        } else if !reconciledWorkspaces.contains(where: { $0.id == activeWorkspaceID }) {
-            adoptProjectedActiveWorkspaceID(reconciledWorkspaces.first?.id)
+        } else {
+            let activeWorkspaceIsEligible = activeWorkspaceID.flatMap { activeID in
+                reconciledWorkspaces.first { $0.id == activeID }
+            }.map { workspace in
+                workspace.consolidatedIntoWorkspaceID == nil
+                    && !pendingConsolidatedRestoreIDs.contains(workspace.id)
+            } ?? false
+            if !activeWorkspaceIsEligible {
+                let fallback = reconciledWorkspaces.first { workspace in
+                    workspace.consolidatedIntoWorkspaceID == nil
+                        && !pendingConsolidatedRestoreIDs.contains(workspace.id)
+                        && (
+                            workspace.isEphemeral
+                                || domainWorkspaceRevisionsByID[workspace.id]?.dirtyRevision == nil
+                        )
+                }
+                adoptProjectedActiveWorkspaceID(fallback?.id)
+            }
         }
         if let protectedWorkspaceIDs = lifecycleProjection?.protectedWorkspaceIDs {
             for workspaceID in protectedWorkspaceIDs {
@@ -4535,11 +4940,18 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func adoptProjectedActiveWorkspaceID(_ workspaceID: UUID?) {
-        guard workspaceID != activeWorkspaceID else { return }
         guard let workspaceID else {
             activeWorkspaceID = nil
             return
         }
+        guard let workspace = workspace(withID: workspaceID),
+              workspace.consolidatedIntoWorkspaceID == nil,
+              !pendingConsolidatedRestoreIDs.contains(workspaceID)
+        else {
+            activeWorkspaceID = nil
+            return
+        }
+        guard workspaceID != activeWorkspaceID else { return }
         guard let activationLease = workspaceActivityCoordinator.beginActivation(workspaceID: workspaceID) else {
             activeWorkspaceID = nil
             return
@@ -4565,6 +4977,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         domainWorkspaceDigestsByID = digestsByWorkspaceID
         domainWorkspaceHealthByID = healthByWorkspaceID
         domainWorkspaceCatalogRevision = catalogRevision
+        scheduleAuthorityIncompleteRestoreClassification(
+            workspaces: workspaces,
+            fileURLsByWorkspaceID: domainWorkspaceFileURLsByID,
+            revisionsByWorkspaceID: revisionsByWorkspaceID,
+            publicationSequence: publicationSequence
+        )
         synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_health_projection")
     }
 
@@ -6362,13 +6780,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         let skippedWorkspaceIDs: Set<UUID>
     }
 
+    private var duplicateCleanupExcludedWorkspaceIDs: Set<UUID> {
+        pendingConsolidatedRestoreIDs
+    }
+
     @MainActor
     func duplicateWorkspaceGroups(windowStates: WindowStatesManager? = nil) -> [WorkspaceDuplicateGroupSummary] {
         let windowStates = windowStates ?? WindowStatesManager.shared
         let windowSnapshots = Self.duplicateWindowSnapshots(from: windowStates)
         return Self.duplicateWorkspaceGroupPlans(
             workspaces: workspaces,
-            windowSnapshots: windowSnapshots
+            windowSnapshots: windowSnapshots,
+            excludingWorkspaceIDs: duplicateCleanupExcludedWorkspaceIDs
         ).map(\.summary)
     }
 
@@ -6378,7 +6801,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         let initialWindowSnapshots = Self.duplicateWindowSnapshots(from: windowStates)
         let initialPlans = Self.duplicateWorkspaceGroupPlans(
             workspaces: workspaces,
-            windowSnapshots: initialWindowSnapshots
+            windowSnapshots: initialWindowSnapshots,
+            excludingWorkspaceIDs: duplicateCleanupExcludedWorkspaceIDs
         )
         let groupsDetected = initialPlans.count
         guard !initialPlans.isEmpty else {
@@ -6476,6 +6900,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             do {
                 let projection = try await loadDuplicateCleanupAuthorityProjection()
                 applyDuplicateCleanupAuthorityProjection(projection)
+                await refreshAuthorityIncompleteRestoreClassification(
+                    workspaces: workspaces,
+                    fileURLsByWorkspaceID: domainWorkspaceFileURLsByID,
+                    revisionsByWorkspaceID: domainWorkspaceRevisionsByID,
+                    publicationSequence: projection.snapshot.publicationSequence
+                )
             } catch {
                 reportDomainProjectionFailure(error)
                 for plan in initialPlans {
@@ -6518,7 +6948,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         let postSwitchWindowSnapshots = Self.duplicateWindowSnapshots(from: windowStates)
         let postSwitchPlans = Self.duplicateWorkspaceGroupPlans(
             workspaces: workspaces,
-            windowSnapshots: postSwitchWindowSnapshots
+            windowSnapshots: postSwitchWindowSnapshots,
+            excludingWorkspaceIDs: duplicateCleanupExcludedWorkspaceIDs
         )
         let postSwitchPlansByRoot = Dictionary(
             uniqueKeysWithValues: postSwitchPlans.map {
@@ -6543,6 +6974,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return nil
             }
             return postSwitchPlan
+        }
+
+        let retirementClaim = workspaceActivityCoordinator.claimDeletion(
+            workspaceIDs: Set(stablePostSwitchPlans.flatMap { $0.duplicates.map(\.id) })
+        )
+        protectedWorkspaceIDs.formUnion(retirementClaim.blockedReasonsByWorkspaceID.keys)
+        defer { workspaceActivityCoordinator.releaseDeletion(retirementClaim.lease) }
+        for workspaceID in retirementClaim.lease.workspaceIDs {
+            for window in windowStates.allWindows {
+                await window.oracleViewModel.drainTrackedAutosaves(for: workspaceID)
+            }
         }
 
         var groupsConsolidated = 0
@@ -6599,23 +7041,37 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard !commitDuplicates.isEmpty else { continue }
 
             let canonicalBeforeMerge = workspaces[canonicalIndex]
-            let canonicalDirectory = workspaceFileURL(for: canonicalBeforeMerge)
-                .deletingLastPathComponent()
             var sidecarReadyDuplicates: [WorkspaceModel] = []
             for duplicate in commitDuplicates {
-                let duplicateDirectory = workspaceFileURL(for: duplicate)
-                    .deletingLastPathComponent()
+                let agentBatch: WorkspaceSessionSidecarPreparedBatch?
+                let chatBatch: WorkspaceSessionSidecarPreparedBatch?
                 do {
-                    try await AgentSessionDataService.shared.rehomeWorkspaceSessions(
-                        from: duplicateDirectory,
-                        to: canonicalDirectory,
-                        canonicalWorkspaceID: canonicalBeforeMerge.id
+                    agentBatch = try await AgentSessionDataService.shared.prepareWorkspaceSessionRehome(
+                        from: duplicate,
+                        to: canonicalBeforeMerge
                     )
-                    try await ChatDataService.rehomeWorkspaceSessions(
-                        from: duplicateDirectory,
-                        to: canonicalDirectory,
-                        canonicalWorkspaceID: canonicalBeforeMerge.id
+                    chatBatch = try await ChatDataService.prepareWorkspaceSessionRehome(
+                        from: duplicate,
+                        to: canonicalBeforeMerge
                     )
+                } catch {
+                    skipped.append(
+                        WorkspaceDuplicateCleanupSkippedItem(
+                            workspaceID: duplicate.id,
+                            workspaceName: duplicate.name,
+                            windowID: nil,
+                            reason: "sidecar_preflight_failed: \(error.localizedDescription)"
+                        )
+                    )
+                    continue
+                }
+                do {
+                    if let agentBatch {
+                        try await AgentSessionDataService.shared.commitWorkspaceSessionRehome(agentBatch)
+                    }
+                    if let chatBatch {
+                        try await ChatDataService.commitWorkspaceSessionRehome(chatBatch)
+                    }
                     sidecarReadyDuplicates.append(duplicate)
                 } catch {
                     skipped.append(
@@ -6629,7 +7085,24 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
             }
             guard !sidecarReadyDuplicates.isEmpty else { continue }
-            guard workspace(withID: canonicalBeforeMerge.id) == canonicalBeforeMerge else {
+            let preparedWorkspaceIDs = Set(sidecarReadyDuplicates.map(\.id))
+                .union([canonicalBeforeMerge.id])
+            guard duplicateCleanupExcludedWorkspaceIDs.isDisjoint(with: preparedWorkspaceIDs) else {
+                for duplicate in sidecarReadyDuplicates {
+                    skipped.append(
+                        WorkspaceDuplicateCleanupSkippedItem(
+                            workspaceID: duplicate.id,
+                            workspaceName: duplicate.name,
+                            windowID: nil,
+                            reason: "workspace_dirty_or_restoring"
+                        )
+                    )
+                }
+                continue
+            }
+            guard let commitCanonicalIndex = workspaceIndex(for: canonicalBeforeMerge.id),
+                  workspaces[commitCanonicalIndex] == canonicalBeforeMerge
+            else {
                 for duplicate in sidecarReadyDuplicates {
                     skipped.append(
                         WorkspaceDuplicateCleanupSkippedItem(
@@ -6650,7 +7123,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             // `saveWorkspaceToFileAsync` suppresses the originating window's authority echo using
             // this manager's current model. Publish the exact outbound value before the await so the
             // bridge cannot cache the old model under the new authoritative digest.
-            workspaces[canonicalIndex] = merged
+            workspaces[commitCanonicalIndex] = merged
 
             do {
                 await WorkspaceDiskWriter.shared.flush(url: workspaceFileURL(for: canonicalBeforeMerge))
@@ -6668,7 +7141,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 await WorkspaceDiskWriter.shared.flush(url: mergedURL)
             } catch {
                 if domainWorkspaceAuthorityClient != nil {
-                    await reconcileDuplicateCleanupAuthorityAfterFailedSave()
+                    _ = await reconcileDuplicateCleanupAuthorityAfterFailedSave()
                 } else if let rollbackIndex = workspaceIndex(for: canonicalBeforeMerge.id),
                           workspaces[rollbackIndex] == merged
                 {
@@ -6680,7 +7153,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                             workspaceID: duplicate.id,
                             workspaceName: duplicate.name,
                             windowID: nil,
-                            reason: "persist_failed: \(error.localizedDescription)"
+                            reason: Self.duplicateCleanupPersistenceFailureReason(error)
                         )
                     )
                 }
@@ -6714,7 +7187,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                                 workspaceID: duplicate.id,
                                 workspaceName: duplicate.name,
                                 windowID: nil,
-                                reason: "persist_failed: \(error.localizedDescription)"
+                                reason: Self.duplicateCleanupPersistenceFailureReason(error)
                             )
                         )
                         continue
@@ -6724,9 +7197,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
                 retiredInGroup.insert(duplicate.id)
             }
-            workspaces.removeAll { retiredInGroup.contains($0.id) }
+            if domainWorkspaceAuthorityClient == nil {
+                workspaces.removeAll { retiredInGroup.contains($0.id) }
+            }
             retiredWorkspaceIDs.formUnion(retiredInGroup)
-            if !retiredInGroup.isEmpty {
+            if retiredInGroup == Set(plan.duplicates.map(\.id)) {
                 groupsConsolidated += 1
             }
 
@@ -6742,7 +7217,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
 
-        if groupsConsolidated > 0 {
+        if !retiredWorkspaceIDs.isEmpty {
             await rebuildAndSaveIndexAsync()
             await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
             for window in windowStates.allWindows {
@@ -6822,8 +7297,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// outcome is therefore uncertain: rolling back locally can teach the presentation bridge a
     /// false model for the authoritative digest. Re-project the complete catalog instead. An empty
     /// bootstrapped catalog is valid here and authoritatively removes any local records.
-    private func reconcileDuplicateCleanupAuthorityAfterFailedSave() async {
-        guard let domainWorkspaceAuthorityClient else { return }
+    private func reconcileDuplicateCleanupAuthorityAfterFailedSave() async -> Bool {
+        guard let domainWorkspaceAuthorityClient else { return false }
         let snapshot = await domainWorkspaceAuthorityClient.snapshot()
         guard snapshot.isBootstrapped else {
             reportDomainProjectionFailure(NSError(
@@ -6831,7 +7306,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 code: 7,
                 userInfo: [NSLocalizedDescriptionKey: "Runtime workspace catalog is not ready after a failed cleanup save."]
             ))
-            return
+            return false
         }
         do {
             let projectedWorkspaces = try snapshot.workspaces.map {
@@ -6841,10 +7316,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                 )
             }
             applyDuplicateCleanupAuthorityProjection((projectedWorkspaces, snapshot))
+            return true
         } catch {
             // Keep the attempted prepublication until the bridge can provide a valid projection;
             // restoring a guessed fallback is what poisons its self-echo cache.
             reportDomainProjectionFailure(error)
+            return false
         }
     }
 
@@ -6862,13 +7339,15 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private nonisolated static func duplicateWorkspaceGroupPlans(
         workspaces: [WorkspaceModel],
-        windowSnapshots: [WorkspaceDuplicateWindowSnapshot]
+        windowSnapshots: [WorkspaceDuplicateWindowSnapshot],
+        excludingWorkspaceIDs: Set<UUID> = []
     ) -> [WorkspaceDuplicateGroupPlan] {
         let eligible = workspaces.filter { workspace in
             let key = WorkspaceRootSetKey(paths: workspace.repoPaths)
             return !workspace.isSystemWorkspace
                 && !workspace.isEphemeral
                 && workspace.consolidatedIntoWorkspaceID == nil
+                && !excludingWorkspaceIDs.contains(workspace.id)
                 && !key.isEmpty
         }
         let grouped = Dictionary(grouping: eligible) { workspace in
@@ -7078,7 +7557,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(backup).write(to: fileURL, options: .withoutOverwriting)
+        try WorkspaceFileWrite.atomicallyWithoutOverwriting(
+            encoder.encode(backup),
+            to: fileURL
+        )
         return fileURL
     }
 
@@ -7148,7 +7630,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             await WorkspaceDiskWriter.shared.flush(url: retiredURL)
         } catch {
             if domainWorkspaceAuthorityClient != nil {
-                await reconcileDuplicateCleanupAuthorityAfterFailedSave()
+                _ = await reconcileDuplicateCleanupAuthorityAfterFailedSave()
             } else if let rollbackIndex = workspaceIndex(for: duplicate.id),
                       workspaces[rollbackIndex] == retired
             {
@@ -7198,6 +7680,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             ].joined(separator: "|")
             return seen.insert(key).inserted
         }
+    }
+
+    private nonisolated static func duplicateCleanupPersistenceFailureReason(
+        _ error: Error
+    ) -> String {
+        let prefix = (error as? DomainWorkspaceAuthorityOperationError)?.workingCommitted == true
+            ? "persist_incomplete_working_committed"
+            : "persist_failed"
+        return "\(prefix): \(error.localizedDescription)"
     }
 
     // MARK: - CRUD
@@ -7279,8 +7770,16 @@ class WorkspaceManagerViewModel: ObservableObject {
                     result.skippedReasonsByWorkspaceID[workspaceID] = blockReason
                     continue
                 }
+                let workspaceDirectory: URL
+                do {
+                    workspaceDirectory = try resolvedWorkspaceDirectoryForMutation(for: localWorkspace)
+                } catch {
+                    result.failedReasonsByWorkspaceID[workspaceID] = error.localizedDescription
+                    continue
+                }
                 await finalizeWorkspaceDeletion(
                     localWorkspace,
+                    workspaceDirectory: workspaceDirectory,
                     saveLegacyIndex: false,
                     cleanupLocalArtifacts: true
                 )
@@ -7411,8 +7910,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                 guard Self.localEphemeralDeletionBlockReason(workspace) == nil else {
                     return false
                 }
+                guard let workspaceDirectory = try? resolvedWorkspaceDirectoryForMutation(for: workspace) else {
+                    return false
+                }
                 await finalizeWorkspaceDeletion(
                     workspace,
+                    workspaceDirectory: workspaceDirectory,
                     saveLegacyIndex: false,
                     cleanupLocalArtifacts: true
                 )
@@ -7433,15 +7936,27 @@ class WorkspaceManagerViewModel: ObservableObject {
                 reportDomainAuthorityIssue(outcome, operation: "delete_workspace")
                 return false
             }
-            await finalizeWorkspaceDeletion(workspace, saveLegacyIndex: false)
+            await finalizeWorkspaceDeletion(
+                workspace,
+                workspaceDirectory: authoritative.document.fileURL.deletingLastPathComponent(),
+                saveLegacyIndex: false
+            )
             return true
         }
-        await finalizeWorkspaceDeletion(workspace, saveLegacyIndex: true)
+        guard let workspaceDirectory = try? resolvedWorkspaceDirectoryForMutation(for: workspace) else {
+            return false
+        }
+        await finalizeWorkspaceDeletion(
+            workspace,
+            workspaceDirectory: workspaceDirectory,
+            saveLegacyIndex: true
+        )
         return true
     }
 
     private func finalizeWorkspaceDeletion(
         _ workspace: WorkspaceModel,
+        workspaceDirectory: URL,
         saveLegacyIndex: Bool,
         cleanupLocalArtifacts: Bool = false
     ) async {
@@ -7452,17 +7967,17 @@ class WorkspaceManagerViewModel: ObservableObject {
         domainWorkspaceFileURLsByID.removeValue(forKey: workspace.id)
         workspaceRenameIntentByID.removeValue(forKey: workspace.id)
         workspaceHiddenIntentByID.removeValue(forKey: workspace.id)
+        removeConsolidatedRestoreTracking(workspaceID: workspace.id)
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
         }
         if saveLegacyIndex || cleanupLocalArtifacts {
-            let workspaceDir = workspaceDirectory(for: workspace)
             await Task.detached(priority: .utility) {
-                await GitDiffDataMaintenance.shared.deleteAllGitData(workspaceDirectory: workspaceDir)
+                await GitDiffDataMaintenance.shared.deleteAllGitData(workspaceDirectory: workspaceDirectory)
                 if workspace.customStoragePath == nil,
-                   FileManager.default.fileExists(atPath: workspaceDir.path)
+                   FileManager.default.fileExists(atPath: workspaceDirectory.path)
                 {
-                    try? FileManager.default.removeItem(at: workspaceDir)
+                    try? FileManager.default.removeItem(at: workspaceDirectory)
                 }
             }.value
         }
@@ -7493,23 +8008,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             != AgentMonitorLocationLabelFormatter.label(worktreeLabel: nil, workspaceName: finalName)
         {
             AgentSessionLinkLocationInvalidationSink.locationLabelsChanged(inWorkspace: workspace.id)
-        }
-
-        if domainWorkspaceAuthorityClient == nil, workspaces[index].customStoragePath == nil {
-            // Preserve the original base location (global or default)
-            let baseLocation = currentBaseRoot
-            // 'workspace' param still holds the old name – use it to locate old folder
-            let oldFolder = workspaceDirectory(for: workspace)
-            let newFolder = baseLocation.appendingPathComponent(
-                "Workspace-\(finalName)-\(workspace.id.uuidString)"
-            )
-            do {
-                if FileManager.default.fileExists(atPath: oldFolder.path) {
-                    try FileManager.default.moveItem(at: oldFolder, to: newFolder)
-                }
-            } catch {
-                Self.logger.error("Failed to rename legacy workspace folder: \(error.localizedDescription, privacy: .public)")
-            }
         }
 
         // Schedule async save of the specific workspace and index update, with flushes before notify.
@@ -7556,11 +8054,32 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func setWorkspaceHidden(_ workspace: WorkspaceModel, hidden: Bool) {
+        let current = self.workspace(withID: workspace.id) ?? workspace
+        if !hidden,
+           current.consolidatedIntoWorkspaceID != nil || pendingConsolidatedRestoreIDs.contains(current.id)
+        {
+            // The manager owns restore routing. Views and MCP callers can keep using the ordinary
+            // hidden-state API without duplicating consolidation lifecycle policy.
+            guard !activeConsolidatedRestoreIDs.contains(current.id) else { return }
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let latest = self.workspace(withID: current.id)
+                else { return }
+                do {
+                    _ = try await setWorkspaceHiddenFromSnapshot(latest, hidden: false)
+                } catch {
+                    print("Error restoring consolidated workspace: \(error)")
+                }
+            }
+            return
+        }
+        setOrdinaryWorkspaceHidden(current, hidden: hidden)
+    }
+
+    /// Preserves the predecessor optimistic hidden-state flow for ordinary UI mutations.
+    private func setOrdinaryWorkspaceHidden(_ workspace: WorkspaceModel, hidden: Bool) {
         guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
         workspaces[index].isHiddenInMenus = hidden
-        if !hidden {
-            workspaces[index].consolidatedIntoWorkspaceID = nil
-        }
         workspaces[index].dateModified = Date()
 
         let workspaceID = workspace.id
@@ -7578,13 +8097,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
             }
             workspaceToSave.isHiddenInMenus = hidden
-            if !hidden {
-                workspaceToSave.consolidatedIntoWorkspaceID = nil
-            }
             workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].isHiddenInMenus = workspaceToSave.isHiddenInMenus
-                workspaces[currentIndex].consolidatedIntoWorkspaceID = workspaceToSave.consolidatedIntoWorkspaceID
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
             }
             do {
@@ -7607,35 +8122,206 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    private func validateConsolidationLifecycle(_ workspace: WorkspaceModel) throws {
+        guard !pendingConsolidatedRestoreIDs.contains(workspace.id),
+              let current = self.workspace(withID: workspace.id),
+              current.consolidatedIntoWorkspaceID == workspace.consolidatedIntoWorkspaceID
+        else {
+            throw NSError(
+                domain: "WorkspaceDuplicateCleanup",
+                code: 13,
+                userInfo: [NSLocalizedDescriptionKey: "Workspace restoration state changed before its hidden state could be saved."]
+            )
+        }
+    }
+
     func setWorkspaceHiddenFromSnapshot(_ workspace: WorkspaceModel, hidden: Bool) async throws -> WorkspaceModel {
-        var updated = workspace
-        updated.isHiddenInMenus = hidden
+        var current = self.workspace(withID: workspace.id)
+        var isAuthorityIncompleteRestore = authorityIncompleteConsolidatedRestoreIDs.contains(workspace.id)
+        let isDirtyAuthorityCandidate = domainWorkspaceRevisionsByID[workspace.id]?.dirtyRevision != nil
+        if isAuthorityIncompleteRestore
+            || (current?.consolidatedIntoWorkspaceID == nil && isDirtyAuthorityCandidate)
+        {
+            switch await refreshAuthorityConsolidatedRestoreClassification(workspaceID: workspace.id) {
+            case let .incomplete(authoritativeState):
+                isAuthorityIncompleteRestore = true
+                domainWorkspaceFileURLsByID[workspace.id] = authoritativeState.fileURL
+                applyDomainAuthorityBaseline(
+                    workspaceID: workspace.id,
+                    revisions: authoritativeState.revisions,
+                    digest: authoritativeState.contentDigest,
+                    health: authoritativeState.health,
+                    catalogRevision: authoritativeState.catalogRevision
+                )
+                if let index = workspaces.firstIndex(where: { $0.id == workspace.id }) {
+                    workspaces[index] = authoritativeState.workspace
+                } else {
+                    workspaces.append(authoritativeState.workspace)
+                }
+            case .clear:
+                isAuthorityIncompleteRestore = false
+            case .retired:
+                throw NSError(
+                    domain: "WorkspaceDuplicateCleanup",
+                    code: 11,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Workspace retirement changed while restoration was being prepared. Retry after the workspace list refreshes."
+                    ]
+                )
+            case .unavailable, .stale:
+                throw NSError(
+                    domain: "WorkspaceDuplicateCleanup",
+                    code: 12,
+                    userInfo: [NSLocalizedDescriptionKey: "Workspace restoration state could not be verified. Retry after the workspace list refreshes."]
+                )
+            }
+            current = self.workspace(withID: workspace.id)
+        }
+
         if !hidden {
+            guard let current,
+                  current.consolidatedIntoWorkspaceID == workspace.consolidatedIntoWorkspaceID
+            else {
+                throw NSError(
+                    domain: "WorkspaceDuplicateCleanup",
+                    code: 13,
+                    userInfo: [NSLocalizedDescriptionKey: "Workspace restoration state changed before its hidden state could be saved."]
+                )
+            }
+        }
+
+        let isConsolidatedRestore = !hidden
+            && (
+                current?.consolidatedIntoWorkspaceID != nil
+                    || isAuthorityIncompleteRestore
+            )
+        guard isConsolidatedRestore else {
+            // Keep ordinary MCP hide/unhide on its established tolerant snapshot path. Exact
+            // model equality and fail-closed CAS are feature-owned only by consolidation
+            // restoration; only its lifecycle marker is fenced here.
+            guard let current else {
+                throw NSError(
+                    domain: "WorkspaceDuplicateCleanup",
+                    code: 13,
+                    userInfo: [NSLocalizedDescriptionKey: "Workspace restoration state changed before its hidden state could be saved."]
+                )
+            }
+            if hidden, current.consolidatedIntoWorkspaceID != nil {
+                return current
+            }
+            try validateConsolidationLifecycle(workspace)
+            var updated = current
+            updated.isHiddenInMenus = hidden
+            updated.dateModified = Date()
+
+            if let index = workspaces.firstIndex(where: { $0.id == updated.id }) {
+                workspaces[index].isHiddenInMenus = hidden
+                workspaces[index].dateModified = updated.dateModified
+            } else {
+                workspaces.append(updated)
+            }
+
+            let finalURL = try await saveWorkspaceToFileAsync(
+                updated,
+                source: .setWorkspaceHiddenFromSnapshot
+            )
+            await WorkspaceDiskWriter.shared.flush(url: finalURL)
+
+            await rebuildAndSaveIndexAsync()
+            await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
+
+            NotificationCenter.default.post(
+                name: .workspaceListDidChange,
+                object: nil,
+                userInfo: ["managerID": instanceID]
+            )
+            return updated
+        }
+
+        guard !activeConsolidatedRestoreIDs.contains(workspace.id) else {
+            throw NSError(
+                domain: "WorkspaceDuplicateCleanup",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "Workspace restoration is already in progress."]
+            )
+        }
+        guard let current,
+              let index = workspaces.firstIndex(where: { $0.id == current.id }),
+              workspaces[index] == current
+        else {
+            throw NSError(
+                domain: "WorkspaceDuplicateCleanup",
+                code: 9,
+                userInfo: [NSLocalizedDescriptionKey: "Workspace changed before its hidden state could be saved."]
+            )
+        }
+
+        let original = current
+        let isExactWorkingResume = isAuthorityIncompleteRestore
+            && current.consolidatedIntoWorkspaceID == nil
+        var updated = current
+        if !isExactWorkingResume {
+            updated.isHiddenInMenus = false
             updated.consolidatedIntoWorkspaceID = nil
-        }
-        updated.dateModified = Date()
-
-        if let index = workspaces.firstIndex(where: { $0.id == updated.id }) {
-            workspaces[index].isHiddenInMenus = hidden
-            workspaces[index].consolidatedIntoWorkspaceID = updated.consolidatedIntoWorkspaceID
-            workspaces[index].dateModified = updated.dateModified
-        } else {
-            workspaces.append(updated)
+            updated.dateModified = Date()
         }
 
-        let finalURL = try await saveWorkspaceToFileAsync(updated, source: .setWorkspaceHiddenFromSnapshot)
-        await WorkspaceDiskWriter.shared.flush(url: finalURL)
+        authorityIncompleteRestoreClassificationTask?.cancel()
+        authorityIncompleteRestoreClassificationTask = nil
+        activeConsolidatedRestoreIDs.insert(updated.id)
+        publishPendingConsolidatedRestoreIDs()
+        defer {
+            activeConsolidatedRestoreIDs.remove(updated.id)
+            publishPendingConsolidatedRestoreIDs()
+        }
+        workspaces[index] = updated
 
-        await rebuildAndSaveIndexAsync()
-        await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
+        do {
+            let finalURL = try await saveWorkspaceToFileAsync(
+                updated,
+                preserveDiskRepoPathsIfUnchangedSinceBaseline: false,
+                source: .consolidatedWorkspaceRestore
+            )
+            await WorkspaceDiskWriter.shared.flush(url: finalURL)
 
-        NotificationCenter.default.post(
-            name: .workspaceListDidChange,
-            object: nil,
-            userInfo: ["managerID": instanceID]
-        )
+            await rebuildAndSaveIndexAsync()
+            await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
 
-        return updated
+            if domainWorkspaceAuthorityClient != nil {
+                switch await refreshAuthorityConsolidatedRestoreClassification(
+                    workspaceID: updated.id
+                ) {
+                case .clear:
+                    break
+                case .retired, .incomplete, .unavailable, .stale:
+                    authorityIncompleteConsolidatedRestoreIDs.insert(updated.id)
+                    publishPendingConsolidatedRestoreIDs()
+                }
+            } else {
+                authorityIncompleteConsolidatedRestoreIDs.remove(updated.id)
+                publishPendingConsolidatedRestoreIDs()
+            }
+            NotificationCenter.default.post(
+                name: .workspaceListDidChange,
+                object: nil,
+                userInfo: ["managerID": instanceID]
+            )
+            return updated
+        } catch {
+            if domainWorkspaceAuthorityClient != nil {
+                let reconciled = await reconcileDuplicateCleanupAuthorityAfterFailedSave()
+                if reconciled {
+                    _ = await refreshAuthorityConsolidatedRestoreClassification(
+                        workspaceID: original.id
+                    )
+                }
+            } else if let rollbackIndex = workspaceIndex(for: original.id),
+                      workspaces[rollbackIndex] == updated
+            {
+                workspaces[rollbackIndex] = original
+            }
+            throw error
+        }
     }
 
     func applyWorkspaceHiddenStateInMemory(
@@ -7645,8 +8331,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         dateModified: Date
     ) {
         guard let index = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+        guard workspaces[index].consolidatedIntoWorkspaceID == consolidatedIntoWorkspaceID else { return }
         workspaces[index].isHiddenInMenus = hidden
-        workspaces[index].consolidatedIntoWorkspaceID = consolidatedIntoWorkspaceID
         workspaces[index].dateModified = dateModified
     }
 
@@ -9168,44 +9854,32 @@ class WorkspaceManagerViewModel: ObservableObject {
             await pending.value
         }
 
-        // The pending same-window commit above is an intentional serialization point: if it landed,
-        // its revision is the baseline this explicit save supersedes. A cross-window projection can
-        // also land during that await without bumping the local dirty version, so retry from its
-        // projected model before pinning the baseline. No suspension separates this comparison from
-        // the pin.
-        let current = self.workspace(withID: workspace.id)
-        let requiresExactCleanupAttempt = source == .duplicateCleanupCanonicalMerge
+        let requiresExactSnapshotAttempt = source == .duplicateCleanupCanonicalMerge
             || source == .duplicateCleanupRetireDuplicate
+            || source == .consolidatedWorkspaceRestore
         let staleCleanupAttemptError = NSError(
             domain: "WorkspaceDuplicateCleanup",
             code: 8,
             userInfo: [NSLocalizedDescriptionKey: "Workspace changed before the exact cleanup save could begin."]
         )
-        if requiresExactCleanupAttempt {
-            guard let current,
+        if requiresExactSnapshotAttempt {
+            // Feature-owned consolidation writes pin their exact model and CAS baseline before any
+            // later suspension. Ordinary saves retain their predecessor payload and CAS flow.
+            guard let current = self.workspace(withID: workspace.id),
                   current == workspace,
                   domainWorkspaceRevisionsByID[workspace.id]?.workingRevision != nil,
                   domainWorkspaceDigestsByID[workspace.id] != nil
             else {
                 throw staleCleanupAttemptError
             }
-        } else if let current, current != workspace {
-            guard remainingRetryCount > 0 else { throw CancellationError() }
-            return try await persistWorkspaceThroughDomainAuthority(
-                current,
-                targetURL: targetURL,
-                preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
-                source: source,
-                remainingRetryCount: remainingRetryCount - 1
-            )
         }
-        // Every later suspension is fenced by this exact authority precondition. Reading the maps
-        // only at command submission would let a stale payload borrow a concurrent winner's newer
-        // revision and overwrite it.
-        let expectedWorkspaceRevision = domainWorkspaceRevisionsByID[
-            workspace.id
-        ]?.workingRevision
-        let expectedContentDigest = domainWorkspaceDigestsByID[workspace.id]
+        let exactExpectedRevisionState = requiresExactSnapshotAttempt
+            ? domainWorkspaceRevisionsByID[workspace.id]
+            : nil
+        let exactExpectedWorkspaceRevision = exactExpectedRevisionState?.workingRevision
+        let exactExpectedContentDigest = requiresExactSnapshotAttempt
+            ? domainWorkspaceDigestsByID[workspace.id]
+            : nil
 
         let capturedStateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
         let lastSyncedRepoPaths = lastSyncedRepoPathsByWorkspaceID[workspace.id]
@@ -9213,7 +9887,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceSaveAttemptCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
         #endif
 
-        let mergeResult: (workspace: WorkspaceModel, preservedDiskRepoPaths: Bool) = if preserveDiskRepoPathsIfUnchangedSinceBaseline {
+        let mergeResult: (workspace: WorkspaceModel, preservedDiskRepoPaths: Bool) = if requiresExactSnapshotAttempt,
+                                                                                        !preserveDiskRepoPathsIfUnchangedSinceBaseline
+        {
+            (workspace, false)
+        } else {
+            // This is intentionally the predecessor ordinary-save merge behavior. The preservation
+            // flag is narrowed only for the feature-owned exact path above.
             await Task.detached(priority: .utility) {
                 let diskWorkspace: WorkspaceModel? = if FileManager.default.fileExists(atPath: targetURL.path) {
                     try? Self.loadWorkspaceFromFile(at: targetURL, scheduleNormalizationWriteback: false)
@@ -9227,8 +9907,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                     modificationDate: workspace.dateModified
                 )
             }.value
-        } else {
-            (workspace, false)
         }
         let workspaceToSave = mergeResult.workspace
         guard self.workspace(withID: workspaceToSave.id)?.isEphemeral != true else {
@@ -9243,10 +9921,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         #endif
         try Task.checkCancellation()
+        if !requiresExactSnapshotAttempt {
+            try validateConsolidationLifecycle(workspaceToSave)
+        }
         guard self.workspace(withID: workspace.id)?.isEphemeral != true else {
             throw WorkspaceDirectWriteError.ephemeralWorkspace
         }
-        if requiresExactCleanupAttempt {
+        if requiresExactSnapshotAttempt {
             guard let current = self.workspace(withID: workspace.id), current == workspace else {
                 throw staleCleanupAttemptError
             }
@@ -9265,6 +9946,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                     ]
                 )
             #endif
+            if requiresExactSnapshotAttempt {
+                throw staleCleanupAttemptError
+            }
             guard remainingRetryCount > 0 else { throw CancellationError() }
             return try await persistWorkspaceThroughDomainAuthority(
                 workspaces[index],
@@ -9276,24 +9960,42 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         let outcome: DomainCommandOutcome
-        if requiresExactCleanupAttempt {
+        var workingCommitted = false
+        if requiresExactSnapshotAttempt {
             // Exact cleanup attempts established presence and pinned CAS above. Avoid the ordinary
             // create-or-save discovery suspension: a local edit could land during it, and a
             // concurrent deletion must conflict rather than recreate the retired record.
-            guard let expectedWorkspaceRevision,
-                  let expectedContentDigest
+            guard let exactExpectedWorkspaceRevision,
+                  let exactExpectedContentDigest
             else {
                 throw staleCleanupAttemptError
             }
-            outcome = try await domainWorkspaceAuthorityClient.saveFailClosed(
+            let phasedOutcome = try await domainWorkspaceAuthorityClient.saveFailClosed(
                 workspaceToSave,
                 fileURL: targetURL,
-                expectedWorkspaceRevision: expectedWorkspaceRevision,
-                expectedContentDigest: expectedContentDigest,
+                expectedWorkspaceRevision: exactExpectedWorkspaceRevision,
+                expectedContentDigest: exactExpectedContentDigest,
                 operationIDs: .init()
             )
+            if let working = phasedOutcome.working {
+                applyDomainAuthorityOutcome(working, workspaceID: workspaceToSave.id)
+            }
+            if let saved = phasedOutcome.saved {
+                applyDomainAuthorityOutcome(saved, workspaceID: workspaceToSave.id)
+            }
+            guard let finalOutcome = phasedOutcome.finalOutcome else {
+                throw NSError(
+                    domain: "RepoPrompt.DomainWorkspaceAuthority",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "Fail-closed save produced no persistence outcome."]
+                )
+            }
+            outcome = finalOutcome
+            workingCommitted = phasedOutcome.workingCommitted
+                || (phasedOutcome.working == nil && exactExpectedRevisionState?.dirtyRevision != nil)
         } else {
             let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+            try validateConsolidationLifecycle(workspaceToSave)
             let exists = snapshot.workspaces.contains {
                 $0.document.workspaceID == workspaceToSave.id
             }
@@ -9301,8 +10003,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                 try await domainWorkspaceAuthorityClient.save(
                     workspaceToSave,
                     fileURL: targetURL,
-                    expectedWorkspaceRevision: expectedWorkspaceRevision,
-                    expectedContentDigest: expectedContentDigest,
+                    expectedWorkspaceRevision: domainWorkspaceRevisionsByID[
+                        workspaceToSave.id
+                    ]?.workingRevision,
+                    expectedContentDigest: domainWorkspaceDigestsByID[workspaceToSave.id],
                     operationIDs: .init()
                 )
             } else {
@@ -9313,9 +10017,14 @@ class WorkspaceManagerViewModel: ObservableObject {
                 )
             }
         }
-        applyDomainAuthorityOutcome(outcome, workspaceID: workspaceToSave.id)
+        if !requiresExactSnapshotAttempt {
+            applyDomainAuthorityOutcome(outcome, workspaceID: workspaceToSave.id)
+        }
         guard Self.isSuccessfulDomainOutcome(outcome) else {
-            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
+            throw DomainWorkspaceAuthorityOperationError(
+                outcome: outcome,
+                workingCommitted: workingCommitted
+            )
         }
 
         if let index = workspaceIndex(for: workspaceToSave.id) {
@@ -9409,6 +10118,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             return try await saveWorkspaceToFileAsync(workspaces[index], preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline, source: source)
         }
 
+        let changesConsolidationLifecycle = source == .duplicateCleanupCanonicalMerge
+            || source == .duplicateCleanupRetireDuplicate
+            || source == .consolidatedWorkspaceRestore
+        if !changesConsolidationLifecycle {
+            try validateConsolidationLifecycle(workspaceToSave)
+        }
+
         let metadata = workspaceSaveMetadata(for: workspaceToSave, source: source)
         WorkspaceSaveTracer.event("workspaceSave.direct.enqueue", metadata: metadata, url: targetURL)
         let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, baseRoot: currentBaseRoot, metadata: metadata)
@@ -9421,7 +10137,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         baseRoot: URL,
         metadata: WorkspaceSavePayloadMetadata? = nil
     ) async throws -> URL {
-        let finalURL = workspaceFileURL(for: workspace, baseRoot: baseRoot)
+        let finalURL = try workspaceFileURL(for: workspace, baseRoot: baseRoot)
         guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard domainWorkspaceAuthorityClient == nil else {
             WorkspaceSaveTracer.event(
@@ -9584,8 +10300,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     nonisolated func ensureWorkspaceDirectoryExists(for workspace: WorkspaceModel, baseRoot: URL) throws -> URL {
-        let dir = workspaceDirectory(for: workspace, baseRoot: baseRoot)
-        let chats = chatsFolder(for: workspace, baseRoot: baseRoot)
+        let dir = try resolvedWorkspaceDirectory(for: workspace, baseRoot: baseRoot)
+        let chats = dir.appendingPathComponent("Chats", isDirectory: true)
         let fm = FileManager.default
 
         // Create the main directory if missing
