@@ -1,5 +1,19 @@
 import Foundation
 
+// The wake coordinator: temporary admission policy for one observer's automatic lane-update turns.
+//
+// Owns the single reserved `AgentSessionLinkAutoWakeAttempt` slot on each `AgentTabSession.oversight`,
+// the admission decision (`AgentSessionLinkWakeAdmissionDecision`), failure suppression, the
+// per-lane snooze mutation/expiry bookkeeping, and the physical-dispatch acquisition fence. It owns
+// no authority, no queue, and no prompt text: `DomainAgentSessionLinkAuthority` decides grants,
+// `AgentSessionLinkPassiveStatusNotices` is the canonical queue it reads, and
+// `AgentSessionLinkPromptContext` renders the immutable claim it reserves before any provider call.
+// Invariants worth reading twice: snooze suppresses routine *admission*, never delivery; exact
+// purposeful attention bypasses selection and snooze but no other gate; and a
+// `.cancelledBeforeDispatch` tombstone is a transport fence, not dead state — only a path that can
+// prove no transport call happened may release it, and `cancelAgentSessionLinkAutoWake` is not
+// idempotent across phases.
+
 // MARK: - Attempt state
 
 /// The single automatic lane-update follow-up one exact observer incarnation may reserve.

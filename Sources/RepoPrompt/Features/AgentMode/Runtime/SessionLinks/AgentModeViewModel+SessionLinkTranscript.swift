@@ -1,6 +1,15 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// The canonical transcript an observer may `read` from a live target endpoint.
+//
+// Owns `AgentSessionLinkCanonicalTranscript` — the exact user-visible conversation plus the cursor
+// metadata — the view-model accessor that snapshots it for one generation-bearing endpoint, and the
+// `read` accessor that hands that snapshot to `AgentSessionLinkTranscriptSanitizer` for the coarse,
+// budgeted, redacted page the tool returns. It authors no sanitization rule of its own. Invariant:
+// the snapshot names the exact incarnation it was taken from, so a rebind cannot serve a
+// predecessor's transcript.
+
 // MARK: - Canonical transcript snapshot
 
 /// The canonical user-visible conversation for one live endpoint, plus the metadata the sanitizer

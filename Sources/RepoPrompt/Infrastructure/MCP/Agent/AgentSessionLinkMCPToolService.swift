@@ -2,6 +2,17 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
+// The `agent_session_link` MCP tool surface: argument validation, operation dispatch, the
+// per-response untrusted-content notice, and response rendering.
+//
+// It parses and validates, then delegates every operation to `AgentSessionLinkRuntimeBridge`; it
+// authorizes nothing and holds no state beyond the list cursor it hands back. The tool schema,
+// operation set, and prompt text are frozen by `MCPDomainCanonicalToolDefinitions`, and
+// `untrustedContentNotice` mirrors `AgentSessionLinkPrompts.autonomyContract` in compact form.
+// Invariant: every result is attributed target data the observer must treat as untrusted, and the
+// "do not invent work / continue what the instructions still require" clause stays two sentences
+// on this surface as on the other three.
+
 // MARK: - List pagination cursor
 
 /// Opaque `list` pagination cursor bound to the observer's link-set revision.

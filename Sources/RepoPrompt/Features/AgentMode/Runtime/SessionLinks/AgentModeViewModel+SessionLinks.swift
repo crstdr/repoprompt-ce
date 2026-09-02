@@ -2,6 +2,19 @@ import Combine
 import Foundation
 import RepoPromptDomainRuntime
 
+// The window-local host surface for oversight: candidates, exact projections, and observation.
+//
+// This extension is where the view model exposes its live sessions to the oversight subsystem —
+// endpoint candidates for `AgentSessionLinkEndpointResolver`, the exact per-endpoint monitor
+// projection and its single post-storage invalidation seam
+// (`agentSessionLinkMutateProjectionStorage`), durable Auto-wake selection writes, `waiting_on`
+// publication, and the status observation the runtime bridge subscribes to. It coordinates with
+// `AgentSessionLinkRuntimeBridge` (process-wide owner of links and observations) and
+// `AgentModeViewModel+SessionLinkAutoWake` (which it fences on every selection change).
+// Invariants: the projection map is mutated in exactly one place and posts exactly one notification
+// per logical batch, and a presentation-only repaint can never publish prompt inventory, reconcile
+// the passive queue, or become an Auto-wake.
+
 // MARK: - Narrow lifecycle-identity adapter
 
 extension AgentSessionLifecycleAuthority.Identity {

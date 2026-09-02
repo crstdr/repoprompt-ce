@@ -1,5 +1,15 @@
 import Foundation
 
+// Durable oversight intents: the user's directed overseer → overseen relationships and nothing else.
+//
+// Owns the Codable document, the persistence mode, the runtime token that fences one load/mutate
+// attempt, and the load/mutation contracts. `AgentSessionOversightLaunchCoordinator` replays these
+// intents into live links once both endpoints are restoration-ready; `AgentSessionLinkRuntimeBridge`
+// writes them on link creation and removal. Invariants: the durable payload carries no link IDs,
+// generations, endpoint incarnations, or Auto-wake/snooze state — those are process-local and are
+// re-derived on restore — and every mutation is token-fenced so a stale attempt cannot overwrite a
+// newer document.
+
 // MARK: - Durable model
 
 /// One directed overseer → overseen relationship the user explicitly created.

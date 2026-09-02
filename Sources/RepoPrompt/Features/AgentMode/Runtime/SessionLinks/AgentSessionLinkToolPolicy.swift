@@ -8,6 +8,12 @@ import RepoPromptDomainRuntime
 /// whose effective role could never perform outbound observer operations must not be offered a
 /// control that promises it can oversee. Live catalog visibility is decided separately from links in
 /// either direction.
+///
+/// This file owns only the task-label → role mapping and the role-filter query. It coordinates
+/// with `MCPClientToolPolicyCatalog` (the canonical policy it reads), `AgentMonitorPillModels`
+/// (whose `canAddReason` it informs), and `AgentSessionLinkMCPToolService` (whose role
+/// advertisement filter must agree with it). Invariant: it checks the role filter alone, never the
+/// live-link grant, because the grant is what a first Add is about to create.
 enum AgentSessionLinkToolPolicy {
     /// Maps an Agent Mode task label onto the canonical MCP client role.
     ///

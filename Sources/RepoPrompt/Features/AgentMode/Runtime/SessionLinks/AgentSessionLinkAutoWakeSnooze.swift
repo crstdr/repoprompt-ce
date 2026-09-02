@@ -1,6 +1,18 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// The per-lane Auto-wake snooze vocabulary: constants, exact lane identity, records, projections,
+// mutation outcomes, typed failures, the injected monotonic clock, and the pure retention rule.
+//
+// Everything here is a value; the records themselves live on `AgentTabSession.oversight` and are
+// mutated only by `AgentModeViewModel+SessionLinkAutoWake`, which also owns the one deadline task.
+// `AgentMonitorPillModels` and `AgentSessionLinkMCPToolService` render and accept these values
+// without interpreting them. Invariants: a snooze is observer-local admission policy for routine
+// status and overflow and nothing more — it never filters, receipts, or baselines the canonical
+// queue, never touches link authority or durable selection, and never reads or notifies the target;
+// an elapsed record is inactive whether or not bookkeeping has removed it; and every accepted
+// set/extend leaves at most `maximumDurationSeconds` on the clock while never shortening a deadline.
+
 // MARK: - Constants
 
 /// Temporary, observer-local admission suppression for one exact Auto-wake lane.
