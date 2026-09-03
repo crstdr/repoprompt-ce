@@ -818,7 +818,10 @@ final class AgentModeRunService {
                     session: session,
                     text: augmentedSteeringText,
                     attachments: [],
-                    intent: .runAttempt(ownership: ownership, runID: runID)
+                    intent: .runAttempt(ownership: ownership, runID: runID),
+                    // The active runner owns the current controller's event stream. Replacing it
+                    // here would strand the runner, so steering must keep failing closed.
+                    allowsCatalogRouteControllerRecovery: false
                 )
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush send completed id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) outcome=\(String(describing: sendOutcome))")
                 switch sendOutcome {

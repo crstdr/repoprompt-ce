@@ -1569,7 +1569,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             session: fixture.session,
             text: "claude turn",
             attachments: [],
-            intent: intent
+            intent: intent,
+            allowsCatalogRouteControllerRecovery: false
         )
 
         let sent = await controller.sentMessages
@@ -1585,7 +1586,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             session: fixture.session,
             text: "second turn",
             attachments: [],
-            intent: intent
+            intent: intent,
+            allowsCatalogRouteControllerRecovery: false
         )
         let after = await controller.sentMessages
         try MonitorSupplementAssertions.assertCarriesNoSupplement(XCTUnwrap(after.last))
@@ -1604,7 +1606,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             session: fixture.session,
             text: "linked",
             attachments: [],
-            intent: intent
+            intent: intent,
+            allowsCatalogRouteControllerRecovery: false
         )
 
         fixture.inventory.publish(revision: 2, targetCount: 0)
@@ -1612,13 +1615,180 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             session: fixture.session,
             text: "after revoke",
             attachments: [],
-            intent: intent
+            intent: intent,
+            allowsCatalogRouteControllerRecovery: false
         )
 
         let sent = await controller.sentMessages
         let closing = try XCTUnwrap(sent.last)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(closing, userContent: "after revoke")
         XCTAssertTrue(closing.contains("status=\"ended\""))
+    }
+
+    func testClaudeNativeLostCatalogRouteRecyclesControllerBeforeDispatch() async throws {
+        try await assertClaudeNativeLostCatalogRouteRecovery(
+            readiness: [.timedOut, .ready],
+            finalRoutePresence: [true]
+        )
+    }
+
+    func testClaudeNativeFinalCatalogFenceLossRecyclesControllerBeforeDispatch() async throws {
+        try await assertClaudeNativeLostCatalogRouteRecovery(
+            readiness: [.ready, .ready],
+            finalRoutePresence: [false, true]
+        )
+    }
+
+    func testClaudeNativeActiveSteeringFailsClosedWithoutRecyclingOwnedEventStream() async {
+        let controller = MonitorFakeNativeController()
+        var factoryCalls = 0
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1,
+            workspacePathProvider: { _ in nil },
+            claudeControllerFactory: { _, _, _, _ in
+                factoryCalls += 1
+                return controller
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let runID = UUID()
+        session.installRunID(runID)
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.claude.active-steering-route-loss")
+        let intent = ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(
+            ownership: ownership,
+            runID: runID
+        )
+
+        var physicalDispatchNotAttemptedCount = 0
+        coordinator.installHostCapabilities(
+            .init(
+                isSessionCurrent: { candidate in candidate === session },
+                requestUIRefresh: { _, _ in },
+                scheduleSave: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in },
+                prependPendingHandoff: { text, _ in text },
+                ensureAgentSessionLinkProviderInputCatalogReady: { _ in .timedOut },
+                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in false },
+                decorateAgentSessionLinkPrompt: { text, _, _ in
+                    .init(text: text, claim: nil, mustAbortDispatch: false)
+                },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in
+                    physicalDispatchNotAttemptedCount += 1
+                },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
+                acceptAgentSessionLinkPromptClaim: { _ in }
+            ),
+            providerBindingService: AgentModeProviderBindingService()
+        )
+        let initialSessionOutcome = await coordinator.ensureClaudeNativeSession(
+            session: session,
+            intent: intent
+        )
+        XCTAssertEqual(initialSessionOutcome, .ready)
+
+        let outcome = await coordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "steer active run",
+            attachments: [],
+            intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        let shutdownCount = await controller.shutdownCount
+        let sentCount = await controller.sentCount
+
+        guard case let .failed(message) = outcome else {
+            return XCTFail("expected route loss to fail closed, got \(outcome)")
+        }
+        XCTAssertTrue(message.contains("could not verify the exact RepoPrompt MCP route"))
+        XCTAssertEqual(factoryCalls, 1)
+        XCTAssertEqual(physicalDispatchNotAttemptedCount, 1)
+        XCTAssertEqual(shutdownCount, 0)
+        XCTAssertEqual(sentCount, 0)
+        XCTAssertTrue(session.claudeController === controller)
+    }
+
+    private func assertClaudeNativeLostCatalogRouteRecovery(
+        readiness: [AgentModeViewModel.ProviderInputCatalogReadiness],
+        finalRoutePresence: [Bool]
+    ) async throws {
+        let firstController = MonitorFakeNativeController()
+        let replacementController = MonitorFakeNativeController()
+        var controllers = [firstController, replacementController]
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1,
+            workspacePathProvider: { _ in nil },
+            claudeControllerFactory: { _, _, _, _ in
+                controllers.removeFirst()
+            }
+        )
+        let providerBindingService = AgentModeProviderBindingService()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let runID = UUID()
+        session.installRunID(runID)
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.claude.catalog-route-recovery")
+
+        var pendingReadiness = readiness
+        var pendingFinalRoutePresence = finalRoutePresence
+        var physicalDispatchNotAttemptedCount = 0
+        coordinator.installHostCapabilities(
+            .init(
+                isSessionCurrent: { candidate in candidate === session },
+                requestUIRefresh: { _, _ in },
+                scheduleSave: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in },
+                prependPendingHandoff: { text, _ in text },
+                ensureAgentSessionLinkProviderInputCatalogReady: { _ in
+                    pendingReadiness.removeFirst()
+                },
+                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in
+                    pendingFinalRoutePresence.removeFirst()
+                },
+                decorateAgentSessionLinkPrompt: { text, _, _ in
+                    .init(text: text, claim: nil, mustAbortDispatch: false)
+                },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in
+                    physicalDispatchNotAttemptedCount += 1
+                },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
+                acceptAgentSessionLinkPromptClaim: { _ in }
+            ),
+            providerBindingService: providerBindingService
+        )
+
+        let outcome = await coordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "continue oversight",
+            attachments: [],
+            intent: .runAttempt(ownership: ownership, runID: runID),
+            allowsCatalogRouteControllerRecovery: true
+        )
+        let firstSentCount = await firstController.sentCount
+        let firstShutdownCount = await firstController.shutdownCount
+        let firstResumeIDs = await firstController.startOrResumeExistingSessionIDs
+        let replacementMessages = await replacementController.sentMessages
+        let replacementResumeIDs = await replacementController.startOrResumeExistingSessionIDs
+
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertTrue(pendingReadiness.isEmpty)
+        XCTAssertTrue(pendingFinalRoutePresence.isEmpty)
+        XCTAssertEqual(physicalDispatchNotAttemptedCount, 0)
+        XCTAssertEqual(firstSentCount, 0)
+        XCTAssertEqual(firstShutdownCount, 1)
+        XCTAssertEqual(firstResumeIDs.count, 1)
+        XCTAssertNil(firstResumeIDs[0])
+        XCTAssertEqual(replacementResumeIDs, ["monitor-native-session"])
+        XCTAssertEqual(replacementMessages, ["continue oversight"])
+        XCTAssertEqual(session.runID, runID, "route recovery preserves the logical process run")
     }
 
     func testClaudeNativeCatalogReadinessUsesExactReadyRoute() async throws {
@@ -2092,6 +2262,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private(set) var sentMessages: [String] = []
+    private(set) var shutdownCount = 0
+    private(set) var startOrResumeExistingSessionIDs: [String?] = []
     private var stream: AsyncStream<NativeAgentRuntimeEvent>?
     private var continuation: AsyncStream<NativeAgentRuntimeEvent>.Continuation?
 
@@ -2127,7 +2299,8 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         effortLevel _: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
-        NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
+        startOrResumeExistingSessionIDs.append(existingSessionID)
+        return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
     }
 
     func currentSessionRef() async -> NativeAgentRuntimeSessionRef {
@@ -2146,6 +2319,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func shutdown() async {
+        shutdownCount += 1
         continuation?.finish()
     }
 
