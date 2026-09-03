@@ -2570,11 +2570,35 @@ actor ServerNetworkManager {
                     continuation: continuation,
                     timeoutTask: timeoutTask
                 )
+                // Registered first, so the re-list this triggers cannot settle ahead of the waiter.
+                Task { [weak self] in
+                    await self?.requestRunCatalogRelist(runID: runID)
+                }
             }
         } onCancel: {
             Task { [weak self] in
                 await self?.finishRunCatalogWaiter(runID: runID, waiterID: waiterID, outcome: .cancelled)
             }
+        }
+    }
+
+    /// Asks this run's live connections to re-read their tool catalog.
+    ///
+    /// Catalog observations are keyed per run, but a provider that keeps one long-lived MCP
+    /// connection across runs (the Claude native runtime) reuses a connection whose last
+    /// `tools/list` predates the run being qualified. `notifyToolListChangedForAgentSession` only
+    /// fires when a link changes while a run is already active, so a link added to an idle session
+    /// leaves the next run with no observation and nothing that would ever produce one. Waiting
+    /// alone could then only time out, which surfaced as a refused send for an overseer that was
+    /// correctly linked.
+    ///
+    /// A redundant `tools/list` is idempotent and advertisement is never authority, so nudging a
+    /// connection that is already current costs one extra round trip and nothing else.
+    private func requestRunCatalogRelist(runID: UUID) async {
+        for (connectionID, mappedRunID) in runIDByConnectionID
+            where mappedRunID == runID && !connectionsBeingRemoved.contains(connectionID)
+        {
+            await notifyToolListChanged(connectionID: connectionID)
         }
     }
 
