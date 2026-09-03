@@ -832,8 +832,9 @@ struct AgentSessionRow: View {
             }
         }
         // Deliberately does not refresh `menuSnapshot`: an endpoint rebind while the menu is open
-        // would change its item count, which is the crash the snapshot exists to prevent. Actions
-        // stay bound to the captured endpoint and revalidate, so stale presentation is harmless.
+        // would change its item count, which is the crash the snapshot exists to prevent. Stale
+        // presentation is safe because Add re-resolves current eligibility, while Stop is
+        // exact-endpoint and generation-reference qualified.
         .onChange(of: sidebarOversightTargetEndpoint) { previous, current in
             guard previous != current else { return }
             resetSidebarOversightPresentation()
