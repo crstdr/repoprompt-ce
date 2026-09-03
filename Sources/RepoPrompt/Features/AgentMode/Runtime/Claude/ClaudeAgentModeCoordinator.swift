@@ -997,6 +997,7 @@ final class ClaudeAgentModeCoordinator {
         let routeVerificationFailureMessage =
             "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run."
 
+        var exhaustedRetryMessage: String?
         for _ in 0 ..< 3 {
             switch await ensureClaudeNativeSession(session: session, intent: intent) {
             case .ready:
@@ -1134,15 +1135,23 @@ final class ClaudeAgentModeCoordinator {
                 continue
             }
 
-            guard !requiresFinalRouteFence
-                || hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
-            else {
+            if requiresFinalRouteFence,
+               !hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
+            {
+                // Link membership can change between the asynchronous qualification above and this
+                // synchronous composition check -- adding a lane to an idle session does exactly
+                // that -- and the fence is what detects it. That is a signal to re-qualify, not a
+                // reason to refuse the user's message: re-entering the bounded loop republishes the
+                // observation and asks the provider to re-read its catalog. Only a fence that still
+                // misses after the loop is exhausted fails the send.
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
-                return recordSendFailure(
-                    routeVerificationFailureMessage,
-                    session: session,
-                    intent: intent
-                )
+                guard intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else {
+                    return .superseded
+                }
+                exhaustedRetryMessage = routeVerificationFailureMessage
+                continue
             }
 
             do {
@@ -1207,7 +1216,8 @@ final class ClaudeAgentModeCoordinator {
         }
 
         return recordSendFailure(
-            "Claude native send failed because launch settings changed repeatedly before dispatch.",
+            exhaustedRetryMessage
+                ?? "Claude native send failed because launch settings changed repeatedly before dispatch.",
             session: session,
             intent: intent
         )
