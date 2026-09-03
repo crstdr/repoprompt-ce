@@ -223,7 +223,7 @@ package enum DomainBlockingIO {
 
 package struct DomainPersistenceCoordinator {
     private struct RuntimeWorkspaceCatalog: Codable {
-        static let schemaVersion = 1
+        static let schemaVersion = DomainWorkspaceCatalogSchema.version
 
         struct Entry: Codable, Equatable {
             let workspaceID: UUID
@@ -338,16 +338,10 @@ package struct DomainPersistenceCoordinator {
     }
 
     private var runtimeRoot: URL {
-        let safe = configuration.profileIdentifier
-            .unicodeScalars
-            .map { CharacterSet.alphanumerics.contains($0) ? String($0) : "_" }
-            .joined()
-            .prefix(48)
-        let digest = DomainContentDigest.sha256(Data(configuration.profileIdentifier.utf8)).prefix(12)
-        return configuration.storageDirectory
-            .appendingPathComponent("DomainRuntime", isDirectory: true)
-            .appendingPathComponent("v1", isDirectory: true)
-            .appendingPathComponent("\(safe)-\(digest)", isDirectory: true)
+        DomainWorkspaceCatalogReader.runtimeRoot(
+            storageDirectory: configuration.storageDirectory,
+            profileIdentifier: configuration.profileIdentifier
+        )
     }
 
     package var oracleStorageRoot: URL {
@@ -930,7 +924,7 @@ package struct DomainPersistenceCoordinator {
 
         let entries: [RuntimeWorkspaceCatalog.Entry]
         if let catalog {
-            entries = catalog.entries.filter { !deletedIDs.contains($0.workspaceID) }
+            entries = recoveringMissingFiles(catalog.entries.filter { !deletedIDs.contains($0.workspaceID) })
         } else {
             do {
                 entries = try legacyCatalogEntries().filter { !deletedIDs.contains($0.workspaceID) }
@@ -1007,7 +1001,10 @@ package struct DomainPersistenceCoordinator {
 
     private func legacyCatalogEntries() throws -> [RuntimeWorkspaceCatalog.Entry] {
         guard fileManager.fileExists(atPath: indexURL.path) else { return [] }
-        return try decoder.decode([LegacyWorkspaceIndexEntry].self, from: Data(contentsOf: indexURL)).map { entry in
+        let legacy = try decoder.decode([LegacyWorkspaceIndexEntry].self, from: Data(contentsOf: indexURL))
+
+        var entries: [RuntimeWorkspaceCatalog.Entry] = []
+        for entry in legacy {
             let fileURL = entry.customStoragePath?.appendingPathComponent("workspace.json")
                 ?? workspaceRoot
                 .appendingPathComponent(
@@ -1015,8 +1012,75 @@ package struct DomainPersistenceCoordinator {
                     isDirectory: true
                 )
                 .appendingPathComponent("workspace.json")
-            return RuntimeWorkspaceCatalog.Entry(workspaceID: entry.id, fileURL: fileURL)
+            entries.append(RuntimeWorkspaceCatalog.Entry(workspaceID: entry.id, fileURL: fileURL))
         }
+
+        return recoveringMissingFiles(entries)
+    }
+
+    /// Rebinds catalog entries whose file is missing to the directory that actually carries
+    /// their identity.
+    ///
+    /// Storage directories embed the workspace name at creation time and renaming never moves
+    /// them, so a name-derived path goes stale the moment a workspace is renamed. That affects
+    /// both a catalog being seeded from the legacy index and a catalog previously seeded by a
+    /// build without this recovery, which would otherwise stay wrong forever because nothing
+    /// re-derives a catalog once written.
+    ///
+    /// Cost is bounded: the workspace root is enumerated at most once per call and only when at
+    /// least one entry is actually unresolved, inside `DomainBlockingIO` and off the main actor.
+    /// This is deliberately unlike the reverted `WorkspaceStorageDirectoryResolver`, which
+    /// rescanned the root on every lookup on every launch.
+    private func recoveringMissingFiles(
+        _ entries: [RuntimeWorkspaceCatalog.Entry]
+    ) -> [RuntimeWorkspaceCatalog.Entry] {
+        // Scope recovery to the workspace root. A custom storage path can point at an external
+        // or network volume, and an unmounted volume also reads as "missing" - rebinding that
+        // to a leftover husk under the default root would present stale content as current.
+        let rootPrefix = workspaceRoot.standardizedFileURL.path + "/"
+        let missing = entries.indices.filter {
+            !fileManager.fileExists(atPath: entries[$0].fileURL.path)
+                && entries[$0].fileURL.standardizedFileURL.path.hasPrefix(rootPrefix)
+        }
+        guard !missing.isEmpty else { return entries }
+
+        let directoriesByID = workspaceDirectoriesByWorkspaceID()
+        guard !directoriesByID.isEmpty else { return entries }
+
+        var recovered = entries
+        for index in missing {
+            let workspaceID = recovered[index].workspaceID
+            guard let directory = directoriesByID[workspaceID] else { continue }
+            let candidate = directory.appendingPathComponent("workspace.json")
+            guard fileManager.fileExists(atPath: candidate.path) else { continue }
+            recovered[index] = RuntimeWorkspaceCatalog.Entry(workspaceID: workspaceID, fileURL: candidate)
+        }
+        return recovered
+    }
+
+    /// Unique `workspaceID -> directory` map for the workspace root, built from the trailing
+    /// UUID of each `Workspace-<name>-<uuid>` directory. Identifiers claimed by more than one
+    /// directory are dropped rather than guessed, so an ambiguous layout falls back to the
+    /// name-derived path instead of silently binding to the wrong incarnation.
+    private func workspaceDirectoriesByWorkspaceID() -> [UUID: URL] {
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: workspaceRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [:] }
+
+        var result: [UUID: URL] = [:]
+        var ambiguous: Set<UUID> = []
+        for child in children {
+            let name = child.lastPathComponent
+            guard name.count >= 36,
+                  let workspaceID = UUID(uuidString: String(name.suffix(36)))
+            else { continue }
+            if result[workspaceID] != nil { ambiguous.insert(workspaceID) }
+            result[workspaceID] = child
+        }
+        for workspaceID in ambiguous { result.removeValue(forKey: workspaceID) }
+        return result
     }
 
     private func loadWorkspace(

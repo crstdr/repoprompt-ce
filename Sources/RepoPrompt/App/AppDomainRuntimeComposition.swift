@@ -62,6 +62,10 @@ final class AppDomainRuntimeComposition: Sendable {
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         let root = applicationSupport.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        // One source for the profile identifier: the runtime root and the workspace catalog URL
+        // are derived from it independently, and a silent divergence would just yield an empty
+        // map and reinstate the name-derived bug with no diagnostic.
+        let profileIdentifier = "default"
         let defaults = UserDefaults.standard
         let customStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
         var legacyRuntimeDefaults = Self.collectLegacyRuntimeDefaults(from: defaults)
@@ -76,7 +80,7 @@ final class AppDomainRuntimeComposition: Sendable {
         let runtime = MCPDomainRuntime(
             configuration: DomainRuntimeConfiguration(
                 mode: .app,
-                profileIdentifier: "default",
+                profileIdentifier: profileIdentifier,
                 storageDirectory: root,
                 workspaceStorageDirectory: workspaceStorageDirectory,
                 eventDirectory: root.appendingPathComponent("Events", isDirectory: true),
@@ -87,6 +91,9 @@ final class AppDomainRuntimeComposition: Sendable {
             )
         )
         self.runtime = runtime
+        // Bind workspace path resolution to the same runtime storage location, so an existing
+        // workspace is still found by identity after a rename leaves its directory name stale.
+        WorkspaceStorageCatalog.configure(storageDirectory: root, profileIdentifier: profileIdentifier)
         oracleConversationStore = DomainOracleConversationStore(
             persistence: runtime.persistenceCoordinator,
             identity: runtime.identity

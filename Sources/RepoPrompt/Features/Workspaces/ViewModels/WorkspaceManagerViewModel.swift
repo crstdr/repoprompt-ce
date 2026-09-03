@@ -1855,37 +1855,20 @@ class WorkspaceManagerViewModel: ObservableObject {
         DomainWorkspaceStoragePath.directoryName(name: workspace.name, id: workspace.id)
     }
 
-    private func resolvedWorkspaceDirectoryForMutation(
-        for workspace: WorkspaceModel
-    ) throws -> URL {
-        try WorkspaceStorageDirectoryResolver.shared.resolveDirectory(
-            workspaceID: workspace.id,
-            workspaceName: workspace.name,
-            customStoragePath: workspace.customStoragePath,
-            catalogFileURL: domainWorkspaceFileURLsByID[workspace.id],
-            baseRoot: currentBaseRoot
-        )
-    }
-
     func workspaceDirectory(for workspace: WorkspaceModel) -> URL {
-        do {
-            return try resolvedWorkspaceDirectoryForMutation(for: workspace)
-        } catch {
-            Self.logger.error(
-                "Failed to resolve workspace directory for \(workspace.id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
-            return workspaceDirectory(for: workspace, baseRoot: currentBaseRoot)
-        }
+        workspaceDirectory(for: workspace, baseRoot: currentBaseRoot)
     }
 
+    /// Single chokepoint for every existing-workspace path: `workspaceFileURL`, `chatsFolder`,
+    /// `gitDataDirectory` and deletion all route through here, so resolving by identity rather
+    /// than by the mutable display name fixes them together.
     nonisolated func workspaceDirectory(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
-        // ➊ Honour per-workspace override first
-        if let customRoot = workspace.customStoragePath {
-            return customRoot
-        }
-
-        // ➋ Fall back to global custom storage set by the user or the default location
-        return baseRoot.appendingPathComponent(directoryName(for: workspace))
+        WorkspaceStorageCatalog.resolveWorkspaceDirectory(
+            id: workspace.id,
+            name: workspace.name,
+            customStoragePath: workspace.customStoragePath,
+            baseRoot: baseRoot
+        )
     }
 
     func workspaceFileURL(for workspace: WorkspaceModel) -> URL {
@@ -1894,35 +1877,33 @@ class WorkspaceManagerViewModel: ObservableObject {
         {
             return authoritativeURL
         }
-        return workspaceDirectory(for: workspace)
-            .appendingPathComponent("workspace.json", isDirectory: false)
+        return workspaceFileURL(for: workspace, baseRoot: currentBaseRoot)
     }
 
-    private nonisolated func resolvedWorkspaceDirectory(
-        for workspace: WorkspaceModel,
-        baseRoot: URL
-    ) throws -> URL {
-        try WorkspaceStorageDirectoryResolver.shared.resolveDirectory(
-            workspaceID: workspace.id,
-            workspaceName: workspace.name,
-            customStoragePath: workspace.customStoragePath,
-            catalogFileURL: nil,
-            baseRoot: baseRoot
-        )
+    nonisolated func workspaceFileURL(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
+        workspaceDirectory(for: workspace, baseRoot: baseRoot).appendingPathComponent("workspace.json")
     }
 
-    nonisolated func workspaceFileURL(for workspace: WorkspaceModel, baseRoot: URL) throws -> URL {
-        try resolvedWorkspaceDirectory(for: workspace, baseRoot: baseRoot)
-            .appendingPathComponent("workspace.json", isDirectory: false)
+    nonisolated func chatsFolder(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
+        workspaceDirectory(for: workspace, baseRoot: baseRoot)
+            .appendingPathComponent("Chats", isDirectory: true)
     }
 
-    func gitDataDirectory(for workspace: WorkspaceModel) throws -> URL {
-        try resolvedWorkspaceDirectoryForMutation(for: workspace)
+    func gitDataDirectory(for workspace: WorkspaceModel) -> URL {
+        gitDataDirectory(for: workspace, baseRoot: currentBaseRoot)
+    }
+
+    nonisolated func gitDataDirectory(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
+        workspaceDirectory(for: workspace, baseRoot: baseRoot)
             .appendingPathComponent("_git_data", isDirectory: true)
     }
 
-    func gitDataTabDirectory(for workspace: WorkspaceModel, tabID: UUID) throws -> URL {
-        try gitDataDirectory(for: workspace)
+    func gitDataTabDirectory(for workspace: WorkspaceModel, tabID: UUID) -> URL {
+        gitDataTabDirectory(for: workspace, tabID: tabID, baseRoot: currentBaseRoot)
+    }
+
+    nonisolated func gitDataTabDirectory(for workspace: WorkspaceModel, tabID: UUID, baseRoot: URL) -> URL {
+        gitDataDirectory(for: workspace, baseRoot: baseRoot)
             .appendingPathComponent(tabID.uuidString, isDirectory: true)
     }
 
@@ -2039,7 +2020,12 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         for entry in indexEntries {
             do {
-                let wURL = try Self.resolvedWorkspaceFileURL(for: entry, baseRoot: base)
+                let wURL = WorkspaceStorageCatalog.resolveWorkspaceFileURL(
+                    id: entry.id,
+                    name: entry.name,
+                    customStoragePath: entry.customStoragePath,
+                    baseRoot: base
+                )
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
                     guard let loadResult = try Self.loadPersistedWorkspaceFromFileResult(
@@ -2258,19 +2244,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    private nonisolated static func resolvedWorkspaceFileURL(
-        for entry: WorkspaceIndexEntry,
-        baseRoot: URL
-    ) throws -> URL {
-        try WorkspaceStorageDirectoryResolver.shared.resolveDirectory(
-            workspaceID: entry.id,
-            workspaceName: entry.name,
-            customStoragePath: entry.customStoragePath,
-            catalogFileURL: nil,
-            baseRoot: baseRoot
-        ).appendingPathComponent("workspace.json", isDirectory: false)
-    }
-
     private func saveWorkspaceIndex(_ entries: [WorkspaceIndexEntry]) throws {
         guard domainWorkspaceAuthorityClient == nil else { return }
         try ensureBaseRootExists(at: currentBaseRoot)
@@ -2342,13 +2315,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             for entry in indexEntries {
                 if Task.isCancelled { return }
 
-                let wURL: URL
-                do {
-                    wURL = try Self.resolvedWorkspaceFileURL(for: entry, baseRoot: base)
-                } catch {
-                    print("Unable to resolve workspace storage for \(entry.name): \(error)")
-                    continue
-                }
+                let wURL = WorkspaceStorageCatalog.resolveWorkspaceFileURL(
+                    id: entry.id,
+                    name: entry.name,
+                    customStoragePath: entry.customStoragePath,
+                    baseRoot: base
+                )
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
                     do {
@@ -2467,13 +2439,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             var loaded: [WorkspaceModel] = []
 
             for entry in indexEntries {
-                let wURL: URL
-                do {
-                    wURL = try Self.resolvedWorkspaceFileURL(for: entry, baseRoot: base)
-                } catch {
-                    print("[WorkspaceSnapshot] Unable to resolve \(entry.name): \(error)")
-                    continue
-                }
+                let wURL = WorkspaceStorageCatalog.resolveWorkspaceFileURL(
+                    id: entry.id,
+                    name: entry.name,
+                    customStoragePath: entry.customStoragePath,
+                    baseRoot: base
+                )
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
                     do {
@@ -2513,13 +2484,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             for entry in indexEntries {
                 if Task.isCancelled { return }
 
-                let wURL: URL
-                do {
-                    wURL = try Self.resolvedWorkspaceFileURL(for: entry, baseRoot: base)
-                } catch {
-                    print("Unable to resolve workspace presets for \(entry.name): \(error)")
-                    continue
-                }
+                let wURL = WorkspaceStorageCatalog.resolveWorkspaceFileURL(
+                    id: entry.id,
+                    name: entry.name,
+                    customStoragePath: entry.customStoragePath,
+                    baseRoot: base
+                )
 
                 guard FileManager.default.fileExists(atPath: wURL.path) else {
                     continue
@@ -7770,13 +7740,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                     result.skippedReasonsByWorkspaceID[workspaceID] = blockReason
                     continue
                 }
-                let workspaceDirectory: URL
-                do {
-                    workspaceDirectory = try resolvedWorkspaceDirectoryForMutation(for: localWorkspace)
-                } catch {
-                    result.failedReasonsByWorkspaceID[workspaceID] = error.localizedDescription
-                    continue
-                }
+                let workspaceDirectory = workspaceDirectory(for: localWorkspace)
                 await finalizeWorkspaceDeletion(
                     localWorkspace,
                     workspaceDirectory: workspaceDirectory,
@@ -7910,12 +7874,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 guard Self.localEphemeralDeletionBlockReason(workspace) == nil else {
                     return false
                 }
-                guard let workspaceDirectory = try? resolvedWorkspaceDirectoryForMutation(for: workspace) else {
-                    return false
-                }
                 await finalizeWorkspaceDeletion(
                     workspace,
-                    workspaceDirectory: workspaceDirectory,
+                    workspaceDirectory: workspaceDirectory(for: workspace),
                     saveLegacyIndex: false,
                     cleanupLocalArtifacts: true
                 )
@@ -7943,12 +7904,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
             return true
         }
-        guard let workspaceDirectory = try? resolvedWorkspaceDirectoryForMutation(for: workspace) else {
-            return false
-        }
         await finalizeWorkspaceDeletion(
             workspace,
-            workspaceDirectory: workspaceDirectory,
+            workspaceDirectory: workspaceDirectory(for: workspace),
             saveLegacyIndex: true
         )
         return true
@@ -10137,7 +10095,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         baseRoot: URL,
         metadata: WorkspaceSavePayloadMetadata? = nil
     ) async throws -> URL {
-        let finalURL = try workspaceFileURL(for: workspace, baseRoot: baseRoot)
+        let finalURL = workspaceFileURL(for: workspace, baseRoot: baseRoot)
         guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard domainWorkspaceAuthorityClient == nil else {
             WorkspaceSaveTracer.event(
@@ -10300,8 +10258,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     nonisolated func ensureWorkspaceDirectoryExists(for workspace: WorkspaceModel, baseRoot: URL) throws -> URL {
-        let dir = try resolvedWorkspaceDirectory(for: workspace, baseRoot: baseRoot)
-        let chats = dir.appendingPathComponent("Chats", isDirectory: true)
+        let dir = workspaceDirectory(for: workspace, baseRoot: baseRoot)
+        let chats = chatsFolder(for: workspace, baseRoot: baseRoot)
         let fm = FileManager.default
 
         // Create the main directory if missing
