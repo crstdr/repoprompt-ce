@@ -1,6 +1,17 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// Exact endpoint discovery and restoration readiness for oversight links.
+//
+// Owns the binding-qualified hydration proof (`AgentSessionRestorationReadiness`), the discovery
+// epoch that fences a candidate snapshot, the `AgentSessionLinkEndpointCandidate` value, the typed
+// resolve failures, and the resolver that maps a session UUID or endpoint onto exactly one live,
+// generation-bearing candidate. `AgentSessionLinkRuntimeBridge` calls it on every operation and
+// `AgentSessionOversightLaunchCoordinator` waits on its readiness before restoring durable intents.
+// Invariant: resolution fails closed — a session UUID reused by a rebind, replacement, or namesake
+// never resolves to a retired incarnation, and a candidate is offered only once its binding proof
+// matches the current transition generation.
+
 // MARK: - Restoration readiness
 
 /// The exact binding a hydration proof was recorded against.

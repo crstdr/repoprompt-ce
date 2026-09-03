@@ -12,7 +12,7 @@ import XCTest
 /// behind a projection nothing in the existing pipeline can heal.
 ///
 /// The ordinary paths are driven black-box, through the same publication hook the server uses: what
-/// must be true is that one episode spends at most one controller replacement, that the replacement
+/// must be true is that one cycle spends at most one controller replacement, that the replacement
 /// retires the *process* run while preserving the provider conversation, and that the
 /// already-published passive snapshot is re-driven so the cold-bootstrap exception can admit it.
 ///
@@ -44,7 +44,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         try publishInventory(fixture)
         try publishLane(fixture, queueRevision: 7)
         XCTAssertNil(
-            fixture.session.pendingOversightAutoWake,
+            fixture.session.oversight.pendingAutoWake,
             "an established run behind a false catalog must not be able to admit a wake"
         )
 
@@ -61,22 +61,22 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         XCTAssertEqual(fixture.session.codexRolloutPath, Self.rolloutPath)
         XCTAssertTrue(fixture.session.codexNeedsReconnect)
 
-        let marker = try XCTUnwrap(fixture.session.codexSessionLinkCatalogRepairSourceGeneration)
+        let marker = try XCTUnwrap(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
         XCTAssertEqual(marker, sourceGeneration, "the marker records the controller it was opened against")
         XCTAssertNotEqual(
             marker,
             fixture.session.codexControllerGeneration,
-            "the replacement's own generation rotation is what consumes the episode"
+            "the replacement's own generation rotation is what spends the cycle"
         )
 
         let attempt = try XCTUnwrap(
-            fixture.session.pendingOversightAutoWake,
+            fixture.session.oversight.pendingAutoWake,
             "the cold session must admit the already-published snapshot"
         )
         XCTAssertEqual(attempt.queueRevision, 7, "the same queue revision is re-driven, not a new publication")
     }
 
-    /// A run that is still active never has its provider retired underneath it. The episode is opened
+    /// A run that is still active never has its provider retired underneath it. The cycle is opened
     /// at projection time and spent by the winning terminal commit.
     func testActiveRunDefersRepairUntilWinningTerminalCommit() async throws {
         let fixture = try makeFixture(runService: true)
@@ -86,9 +86,9 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
 
         XCTAssertEqual(
-            fixture.session.codexSessionLinkCatalogRepairSourceGeneration,
+            fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration,
             sourceGeneration,
-            "the episode opens while active"
+            "the cycle opens while active"
         )
         XCTAssertNotNil(fixture.session.codexController, "no retirement while the run owns the provider")
         XCTAssertNotNil(fixture.session.runID)
@@ -99,28 +99,28 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         )
 
         XCTAssertEqual(fixture.session.runState, .completed)
-        XCTAssertNil(fixture.session.codexController, "the winning terminal commit spends the episode once")
+        XCTAssertNil(fixture.session.codexController, "the winning terminal commit spends the cycle once")
         XCTAssertNil(fixture.session.runID, "the stale process run is retired")
         XCTAssertEqual(fixture.session.codexConversationID, Self.conversationID)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
         XCTAssertNotEqual(
-            fixture.session.codexSessionLinkCatalogRepairSourceGeneration,
+            fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration,
             fixture.session.codexControllerGeneration
         )
     }
 
     /// An unrelated reconnect that *succeeded* — it installed a live successor controller — has
-    /// already spent the episode's one replacement, and the run it kept is serviceable.
+    /// already spent the cycle's one replacement, and the run it kept is serviceable.
     ///
     /// The sibling case, where that reconnect left no controller at all, is covered by
     /// `testUnrelatedReconnectThatLeftNoControllerRetiresTheStrandedRunAndColdRedrives`.
-    func testUnrelatedReconnectWithLiveSuccessorControllerConsumesEpisodeWithoutSecondReplacement() async throws {
+    func testUnrelatedReconnectWithLiveSuccessorControllerSpendsCycleWithoutSecondReplacement() async throws {
         let fixture = try makeFixture(runService: true)
         beginActiveTurn(fixture)
         let sourceGeneration = fixture.session.codexControllerGeneration
 
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
 
         let replacement = LifecycleNoopCodexController(recorder: LifecycleRecorder())
         fixture.session.codexController = replacement
@@ -134,32 +134,32 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
 
         XCTAssertTrue(
             fixture.session.codexController === replacement,
-            "a consumed episode must never perform a second replacement"
+            "a spent cycle must never perform a second replacement"
         )
         XCTAssertEqual(
             fixture.session.runID,
             runIDBeforeTerminal,
             "a run that still has a provider is not retired"
         )
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
     }
 
     /// The consumed dead end: a `preserveRunID: true` reconnect retired the controller and its
     /// follow-up start never produced a replacement, so the session holds an established run with no
     /// provider. Nothing will publish a healed catalog for that run, so the repair finishes what the
-    /// episode was for — retire the run identity, close the episode, cold-redrive — without a second
+    /// cycle was for — retire the run identity, close the cycle, cold-redrive — without a second
     /// controller replacement.
     func testUnrelatedReconnectThatLeftNoControllerRetiresTheStrandedRunAndColdRedrives() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture)
         try publishLane(fixture, queueRevision: 9)
-        // Deferred at open so the episode is still pending when the unrelated reconnect lands.
+        // Deferred at open so the cycle is still pending when the unrelated reconnect lands.
         fixture.session.runState = .running
         let sourceGeneration = fixture.session.codexControllerGeneration
 
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
-        XCTAssertNil(fixture.session.pendingOversightAutoWake)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
 
         // The one field that matters here: `clearCodexControllerInstanceState` nils `codexController`,
         // and with `preserveRunID: true` the run identity survives. The rest of that teardown
@@ -178,14 +178,14 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
 
         XCTAssertNil(fixture.session.runID, "the stranded established run is retired")
         XCTAssertNil(
-            fixture.session.codexSessionLinkCatalogRepairSourceGeneration,
-            "the episode is over rather than left holding"
+            fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration,
+            "the cycle is over rather than left holding"
         )
         XCTAssertNil(fixture.session.codexController, "no second controller replacement")
         XCTAssertEqual(fixture.session.codexConversationID, Self.conversationID)
         XCTAssertEqual(fixture.session.codexRolloutPath, Self.rolloutPath)
         let attempt = try XCTUnwrap(
-            fixture.session.pendingOversightAutoWake,
+            fixture.session.oversight.pendingAutoWake,
             "the now-cold session must admit the already-published snapshot"
         )
         XCTAssertEqual(attempt.queueRevision, 9)
@@ -202,9 +202,9 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
 
         XCTAssertEqual(
-            fixture.session.codexSessionLinkCatalogRepairSourceGeneration,
+            fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration,
             sourceGeneration,
-            "the episode opens but stays pending"
+            "the cycle opens but stays pending"
         )
         XCTAssertNotNil(fixture.session.codexController, "a settling terminal commit still owns the run")
         XCTAssertNotNil(fixture.session.runID)
@@ -212,20 +212,20 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         fixture.session.runLifecycle.completeTerminalCommit()
         try publishCatalogProjection(fixture, revision: 3, hasAgentSessionLink: false)
 
-        XCTAssertNil(fixture.session.codexController, "the pending episode is spent once it is safe")
+        XCTAssertNil(fixture.session.codexController, "the pending cycle is spent once it is safe")
         XCTAssertNil(fixture.session.runID)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
     }
 
     /// Fallback ownership is what makes the terminal call site safe without a `providerSuccessor`
     /// wrapper: an accepted or retryable successor *is* the queue head, and abandoning it would drop
-    /// the user's queued text. Once ownership is gone the still-pending episode is spent exactly once.
+    /// the user's queued text. Once ownership is gone the still-pending cycle is spent exactly once.
     func testFallbackOwnershipRefusesTheRepairUntilTheSuccessorQueueIsGone() throws {
         let fixture = try makeFixture()
         fixture.session.runState = .running
         let sourceGeneration = fixture.session.codexControllerGeneration
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
 
         fixture.session.runState = .completed
         fixture.session.codexFallbackQueue = [
@@ -236,7 +236,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         )
         XCTAssertNotNil(fixture.session.codexController, "a queued successor must not be abandoned")
         XCTAssertNotNil(fixture.session.runID)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
 
         fixture.session.codexFallbackQueue = []
         fixture.session.codexFallbackHookGateOwnerBlocker = AgentTabSession.CodexFallbackBlockingTurn(
@@ -251,15 +251,15 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
             for: fixture.session
         )
         XCTAssertNotNil(fixture.session.codexController, "a hook-gate owner is fallback ownership too")
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
 
         fixture.session.codexFallbackHookGateOwnerBlocker = nil
         fixture.viewModel.test_codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(
             for: fixture.session
         )
-        XCTAssertNil(fixture.session.codexController, "released ownership spends the episode once")
+        XCTAssertNil(fixture.session.codexController, "released ownership spends the cycle once")
         XCTAssertNil(fixture.session.runID)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
     }
 
     /// Generation comparison — not projection revision or value equality — is the loop bound.
@@ -272,7 +272,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         for revision in UInt64(2) ... 4 {
             try publishCatalogProjection(fixture, revision: revision, hasAgentSessionLink: false)
         }
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
         XCTAssertTrue(fixture.session.codexController === originalController)
 
         let replacement = LifecycleNoopCodexController(recorder: LifecycleRecorder())
@@ -281,30 +281,30 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
 
         XCTAssertTrue(
             fixture.session.codexController === replacement,
-            "a higher revision must not re-open a consumed episode"
+            "a higher revision must not re-open a spent cycle"
         )
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
     }
 
-    // MARK: - Episode closure
+    // MARK: - Cycle closure
 
-    /// The three projection/provider exits exercised together here. The other two episode closes —
+    /// The three projection/provider exits exercised together here. The other two cycle closes —
     /// delayed tool disablement and stranded-run recovery — happen at the repair entrypoint and have
     /// their own tests.
-    func testCurrentTrueProjectionOutboundLossAndProviderSwitchCloseTheEpisode() throws {
+    func testCurrentTrueProjectionOutboundLossAndProviderSwitchCloseTheCycle() throws {
         let fixture = try makeFixture()
         fixture.session.runState = .running
 
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
-        XCTAssertNotNil(fixture.session.codexSessionLinkCatalogRepairSourceGeneration)
+        XCTAssertNotNil(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
         try publishCatalogProjection(fixture, revision: 3, hasAgentSessionLink: true)
         XCTAssertNil(
-            fixture.session.codexSessionLinkCatalogRepairSourceGeneration,
-            "an exact current positive catalog closes the episode"
+            fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration,
+            "an exact current positive catalog closes the cycle"
         )
 
         try publishCatalogProjection(fixture, revision: 4, hasAgentSessionLink: false)
-        XCTAssertNotNil(fixture.session.codexSessionLinkCatalogRepairSourceGeneration)
+        XCTAssertNotNil(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
         try publishCatalogProjection(
             fixture,
             revision: 5,
@@ -312,40 +312,40 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
             hasActiveOutboundLink: false
         )
         XCTAssertNil(
-            fixture.session.codexSessionLinkCatalogRepairSourceGeneration,
-            "exact outbound loss closes the episode"
+            fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration,
+            "exact outbound loss closes the cycle"
         )
 
         try publishCatalogProjection(fixture, revision: 6, hasAgentSessionLink: false)
-        XCTAssertNotNil(fixture.session.codexSessionLinkCatalogRepairSourceGeneration)
+        XCTAssertNotNil(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
         fixture.viewModel.test_codexCoordinator.handleProviderSwitch(
             from: .codexExec,
             to: .openCode,
             session: fixture.session
         )
         XCTAssertNil(
-            fixture.session.codexSessionLinkCatalogRepairSourceGeneration,
-            "switching away from Codex closes the episode"
+            fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration,
+            "switching away from Codex closes the cycle"
         )
     }
 
     /// An unknown catalog observation is not evidence that the mismatch healed, so it neither opens
-    /// nor closes an episode.
-    func testUnknownCatalogPresenceNeitherOpensNorClosesTheEpisode() throws {
+    /// nor closes a cycle.
+    func testUnknownCatalogPresenceNeitherOpensNorClosesTheCycle() throws {
         let fixture = try makeFixture()
         fixture.session.runState = .running
 
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: nil)
-        XCTAssertNil(fixture.session.codexSessionLinkCatalogRepairSourceGeneration)
+        XCTAssertNil(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
 
         try publishCatalogProjection(fixture, revision: 3, hasAgentSessionLink: false)
-        let marker = try XCTUnwrap(fixture.session.codexSessionLinkCatalogRepairSourceGeneration)
+        let marker = try XCTUnwrap(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
 
         try publishCatalogProjection(fixture, revision: 4, hasAgentSessionLink: nil)
         XCTAssertEqual(
-            fixture.session.codexSessionLinkCatalogRepairSourceGeneration,
+            fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration,
             marker,
-            "an unknown observation leaves the open episode alone"
+            "an unknown observation leaves the open cycle alone"
         )
     }
 
@@ -353,7 +353,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
 
     /// Disablement is a reason not to repair, never a reason to reconnect: with the tool off the
     /// returned catalog is truthfully absent because the user asked for that.
-    func testDisabledSessionLinkToolDoesNotOpenTheEpisode() async throws {
+    func testDisabledSessionLinkToolDoesNotOpenTheCycle() async throws {
         let store = ToolAvailabilityStore.shared
         try XCTSkipUnless(
             store.isEnabled(MCPWindowToolName.agentSessionLink),
@@ -373,15 +373,15 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         await store.toggle(MCPWindowToolName.agentSessionLink, enabled: true)
         if let publicationFailure { throw publicationFailure }
 
-        XCTAssertNil(fixture.session.codexSessionLinkCatalogRepairSourceGeneration)
+        XCTAssertNil(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
         XCTAssertNotNil(fixture.session.codexController)
         XCTAssertNotNil(fixture.session.runID)
     }
 
-    /// Enablement is re-sampled where the episode is *spent*, not inherited from where it was opened.
-    /// A deferred episode can reach a terminal commit long after the user turned the tool off, and
+    /// Enablement is re-sampled where the cycle is *spent*, not inherited from where it was opened.
+    /// A deferred cycle can reach a terminal commit long after the user turned the tool off, and
     /// that never justifies a reconnect.
-    func testToolDisabledAfterTheEpisodeOpenedClosesItWithoutReconnecting() async throws {
+    func testToolDisabledAfterTheCycleOpenedClosesItWithoutReconnecting() async throws {
         let store = ToolAvailabilityStore.shared
         try XCTSkipUnless(
             store.isEnabled(MCPWindowToolName.agentSessionLink),
@@ -391,7 +391,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         fixture.session.runState = .running
         let sourceGeneration = fixture.session.codexControllerGeneration
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
 
         // Restored synchronously before any assertion can fail out of this test.
         await store.toggle(MCPWindowToolName.agentSessionLink, enabled: false)
@@ -402,22 +402,22 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         await store.toggle(MCPWindowToolName.agentSessionLink, enabled: true)
 
         XCTAssertNil(
-            fixture.session.codexSessionLinkCatalogRepairSourceGeneration,
-            "a disabled tool closes the episode"
+            fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration,
+            "a disabled tool closes the cycle"
         )
         XCTAssertNotNil(fixture.session.codexController, "and never justifies a reconnect")
         XCTAssertNotNil(fixture.session.runID)
     }
 
     /// An Auto-wake that may already own a physical call must not have its provider retired
-    /// underneath it. The pending episode survives and is spent by the next reconciliation.
-    func testAutoWakeTransportBoundaryDefersRepairThenSpendsTheEpisodeOnce() throws {
+    /// underneath it. The pending cycle survives and is spent by the next reconciliation.
+    func testAutoWakeTransportBoundaryDefersRepairThenSpendsTheCycleOnce() throws {
         let fixture = try makeFixture()
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
         )
-        fixture.session.pendingOversightAutoWake = AgentSessionLinkAutoWakeAttempt(
+        fixture.session.oversight.pendingAutoWake = AgentSessionLinkAutoWakeAttempt(
             wakeID: UUID(),
             observerEndpoint: endpoint,
             queueEpoch: Self.queueEpoch,
@@ -432,26 +432,26 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         let sourceGeneration = fixture.session.codexControllerGeneration
 
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
         XCTAssertNotNil(fixture.session.codexController, "no retirement while a wake owns the transport")
         XCTAssertNotNil(fixture.session.runID)
 
-        fixture.session.pendingOversightAutoWake = nil
+        fixture.session.oversight.pendingAutoWake = nil
         try publishCatalogProjection(fixture, revision: 3, hasAgentSessionLink: false)
 
-        XCTAssertNil(fixture.session.codexController, "the still-pending episode is spent once released")
+        XCTAssertNil(fixture.session.codexController, "the still-pending cycle is spent once released")
         XCTAssertNil(fixture.session.runID)
-        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+        XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
     }
 
     /// A non-Codex observer is out of scope entirely: this repair is Codex-only by contract.
-    func testNonCodexObserverNeverOpensTheEpisode() throws {
+    func testNonCodexObserverNeverOpensTheCycle() throws {
         let fixture = try makeFixture()
         fixture.session.selectedAgent = .openCode
 
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
 
-        XCTAssertNil(fixture.session.codexSessionLinkCatalogRepairSourceGeneration)
+        XCTAssertNil(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
         XCTAssertNotNil(fixture.session.codexController)
         XCTAssertNotNil(fixture.session.runID)
     }
@@ -603,7 +603,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
         session.hasLoadedPersistedState = true
-        session.autoWakeOnOversightUpdates = true
+        session.oversight.autoWakeOnUpdates = true
         session.installRunID(UUID())
         session.codexConversationID = Self.conversationID
         session.codexRolloutPath = Self.rolloutPath

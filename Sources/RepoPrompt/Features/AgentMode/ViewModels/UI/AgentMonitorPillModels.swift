@@ -1,6 +1,16 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// Presentation models for the oversight dashboard and its toolbar pill.
+//
+// Owns identifier formatting, link status descriptors, Seen/notice outcomes, Auto-wake and snooze
+// copy, and the exact `AgentMonitorPillProps` projection one endpoint publishes.
+// `AgentModeViewModel+SessionLinks` builds and overlays these props; `AgentMonitorPill` renders them
+// (and owns the lane-grouping separator rule).
+// Invariants: props are an exact-endpoint projection, never a session-UUID lookup, so a rebind
+// cannot inherit a predecessor's role or rows; and nothing here reads the passive queue or wake
+// state directly — snooze and selection arrive already projected.
+
 // MARK: - Identifier formatting
 
 /// Short display form for an Agent session ID.

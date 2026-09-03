@@ -2,6 +2,19 @@ import Combine
 import Foundation
 import RepoPromptDomainRuntime
 
+// The window-local host surface for oversight: candidates, exact projections, and observation.
+//
+// This extension is where the view model exposes its live sessions to the oversight subsystem —
+// endpoint candidates for `AgentSessionLinkEndpointResolver`, the exact per-endpoint monitor
+// projection and its single post-storage invalidation seam
+// (`agentSessionLinkMutateProjectionStorage`), durable Auto-wake selection writes, `waiting_on`
+// publication, and the status observation the runtime bridge subscribes to. It coordinates with
+// `AgentSessionLinkRuntimeBridge` (process-wide owner of links and observations) and
+// `AgentModeViewModel+SessionLinkAutoWake` (which it fences on every selection change).
+// Invariants: the projection map is mutated in exactly one place and posts exactly one notification
+// per logical batch, and a presentation-only repaint can never publish prompt inventory, reconcile
+// the passive queue, or become an Auto-wake.
+
 // MARK: - Narrow lifecycle-identity adapter
 
 extension AgentSessionLifecycleAuthority.Identity {
@@ -301,7 +314,7 @@ extension AgentModeViewModel {
         else {
             return false
         }
-        return session.autoWakeOnOversightUpdates
+        return session.oversight.autoWakeOnUpdates
     }
 
     func agentSessionLinkAutoWakeTargetSessionIDs(
@@ -310,7 +323,7 @@ extension AgentModeViewModel {
         guard let session = sessions[candidate.tabID],
               session.activeAgentSessionID == candidate.sessionID
         else { return [] }
-        return session.agentSessionLinkAutoWakeTargetSessionIDs
+        return session.oversight.autoWakeTargetSessionIDs
     }
 
     /// Writes that setting to one exact observer incarnation.
@@ -329,8 +342,8 @@ extension AgentModeViewModel {
         else {
             return false
         }
-        guard session.autoWakeOnOversightUpdates != enabled else { return true }
-        session.autoWakeOnOversightUpdates = enabled
+        guard session.oversight.autoWakeOnUpdates != enabled else { return true }
+        session.oversight.autoWakeOnUpdates = enabled
         session.isDirty = true
         scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
@@ -362,8 +375,8 @@ extension AgentModeViewModel {
               let session = sessions[endpoint.tabID],
               session.hasLoadedPersistedState
         else { return false }
-        guard session.agentSessionLinkAutoWakeTargetSessionIDs != targetSessionIDs else { return true }
-        session.agentSessionLinkAutoWakeTargetSessionIDs = targetSessionIDs
+        guard session.oversight.autoWakeTargetSessionIDs != targetSessionIDs else { return true }
+        session.oversight.autoWakeTargetSessionIDs = targetSessionIDs
         session.isDirty = true
         scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
@@ -386,8 +399,8 @@ extension AgentModeViewModel {
         guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = sessions[endpoint.tabID]
         else { return false }
-        guard session.agentSessionLinkWaitingOn != waitingOn else { return true }
-        session.agentSessionLinkWaitingOn = waitingOn
+        guard session.oversight.waitingOn != waitingOn else { return true }
+        session.oversight.waitingOn = waitingOn
         session.monitorObservationSignal.send(())
         return true
     }
@@ -434,7 +447,7 @@ extension AgentModeViewModel {
                 candidate: candidate,
                 status: projection.status
             ),
-            waitingOn: session.agentSessionLinkWaitingOn,
+            waitingOn: session.oversight.waitingOn,
             pendingInteractionKind: projection.pendingInteractionKind,
             latestVisibleAssistantPreview: latestVisibleAssistantPreview(for: session),
             visibleRowCount: session.transcriptCanonicalVisibleRowCount,
@@ -650,11 +663,10 @@ extension AgentModeViewModel {
         else {
             return props
         }
-        // The same rule the coordinator admits lanes by: the master setting covers every lane, and a
-        // granular selection covers its own. Read live from the session rather than from the props
-        // being published, so a selection written in this same pass cannot render a frame late.
-        let masterEnabled = session.autoWakeOnOversightUpdates
-        let selectedTargetSessionIDs = session.agentSessionLinkAutoWakeTargetSessionIDs
+        // The same rule the coordinator admits lanes by. Read live from the session rather than from
+        // the props being published, so a selection written in this same pass cannot render a frame
+        // late.
+        let oversight = session.oversight
         let outbound = props.outbound.map { row in
             let reference = DomainAgentSessionLinkReference(
                 linkID: row.linkID,
@@ -684,8 +696,9 @@ extension AgentModeViewModel {
                         origin: $0.origin
                     )
                 },
-                isEffectivelySelected: masterEnabled
-                    || selectedTargetSessionIDs.contains(row.targetSessionID)
+                isEffectivelySelected: oversight.isLaneEffectivelySelected(
+                    targetSessionID: row.targetSessionID
+                )
             )
         }
         guard outbound != props.outbound else { return props }
@@ -977,7 +990,7 @@ extension AgentModeViewModel {
             && session.pendingInstructions.isEmpty
             && session.pendingACPSteeringInstructions.isEmpty
             && session.pendingClaudeSteeringInstructions.isEmpty
-            && session.pendingOversightAutoWake == nil
+            && session.oversight.pendingAutoWake == nil
             && !candidate.isClosing
     }
 

@@ -196,79 +196,23 @@ final class AgentTabSession: ObservableObject {
         .eraseToAnyPublisher()
     }
 
-    /// The one automatic lane-update follow-up this exact incarnation has reserved, if any.
+    /// Every oversight-subsystem value this exact incarnation owns: durable Auto-wake selection, the
+    /// one reserved automatic follow-up, failure suppression, per-lane snooze policy, and the
+    /// target-declared waiting context. `AgentSessionOversightState` documents each field's
+    /// lifetime; this is the subsystem's single mutation surface on the session.
     ///
-    /// Ephemeral by construction: it lives beside the run lifecycle it competes with, is never
-    /// persisted, and dies with the incarnation. Appearing or clearing feeds the observation signal,
-    /// because another observer must not `send` into a session that has already reserved a turn.
-    var pendingOversightAutoWake: AgentSessionLinkAutoWakeAttempt? {
+    /// Only two transitions reach the observation signal, because only they change what an
+    /// overseeing caller can see: the reserved wake appearing or clearing, and snooze *content*
+    /// changing. Snooze task/token churn and the durable selection pair publish nothing here — the
+    /// selection surfaces republish through their own authoritative refresh.
+    var oversight = AgentSessionOversightState() {
         didSet {
-            if (oldValue == nil) != (pendingOversightAutoWake == nil) {
+            if oldValue.hasPendingAutoWake != oversight.hasPendingAutoWake
+                || oldValue.autoWakeSnoozes != oversight.autoWakeSnoozes
+            {
                 noteMonitorObservationInputsChanged()
             }
         }
-    }
-
-    /// Whether one queue publication was absorbed while the current Auto-wake could not schedule a
-    /// reevaluation of its own.
-    ///
-    /// Ephemeral and one-shot. A safe attempt release drains it through the ordinary gated
-    /// publication entry point; an accepted attempt discards it because applying that claim's receipt
-    /// immediately republishes whatever remains owed.
-    var agentSessionLinkAutoWakeReevaluationOwed = false
-
-    /// The one structural wake shape this incarnation already failed to deliver, if any.
-    ///
-    /// Suppression rather than backoff: there is no timer and no retry loop, so a known pre-acceptance
-    /// failure simply parks that exact shape until a structurally new edge, generation, or overflow
-    /// arrives — or the user cycles the setting.
-    ///
-    /// A single slot rather than an accumulating set, and that is load-bearing rather than tidiness:
-    /// the fingerprint now carries per-edge occurrence identity, so a shape that has been superseded
-    /// can never recur. Keeping only the current one means suppression is released by exactly the
-    /// events that should release it — the failed content being acknowledged, removed, or replaced by
-    /// a genuinely new transition — instead of surviving indefinitely in a set nothing prunes.
-    var suppressedOversightWakeFingerprint:
-        AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
-
-    /// Temporary per-lane Auto-wake suppression owned by *this exact* observer incarnation.
-    ///
-    /// Ephemeral in the strongest sense: absent from every Codable/save/restore model, never marking
-    /// the session dirty, never scheduling persistence, and bounded by the observer's current outbound
-    /// link references. Keyed by endpoint *and* generation-qualified reference so a rebind, an
-    /// unlink/relink, or a namesake replacement can never inherit a predecessor's policy.
-    ///
-    /// Content changes feed the existing observation signal, because the monitor renders the active
-    /// subrow from it. Task/token changes deliberately do not: they publish no user-visible state.
-    var agentSessionLinkAutoWakeSnoozes:
-        [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord] = [:]
-    {
-        didSet {
-            if oldValue != agentSessionLinkAutoWakeSnoozes {
-                noteMonitorObservationInputsChanged()
-            }
-        }
-    }
-
-    /// The single nearest-deadline task for this session, plus the never-reused token that fences it.
-    ///
-    /// One task rather than one per record: a replacement always cancels its predecessor, and the
-    /// token is what makes a cancelled-but-already-resumed callback fail closed instead of expiring a
-    /// record the newer arming is responsible for.
-    var agentSessionLinkAutoWakeSnoozeDeadlineTask: Task<Void, Never>?
-    var agentSessionLinkAutoWakeSnoozeTaskToken: UUID?
-    /// Injected monotonic seam. Production is `ContinuousClock`; tests advance it explicitly.
-    var agentSessionLinkAutoWakeSnoozeClock: AgentSessionLinkAutoWakeSnoozeClock = .continuous
-
-    /// Cancels the deadline task and drops every snooze record.
-    ///
-    /// Retirement, never transfer: an endpoint that is going away must not leave a task that could
-    /// resume against the incarnation replacing it.
-    func cancelAgentSessionLinkAutoWakeSnoozeState() {
-        agentSessionLinkAutoWakeSnoozeDeadlineTask?.cancel()
-        agentSessionLinkAutoWakeSnoozeDeadlineTask = nil
-        agentSessionLinkAutoWakeSnoozeTaskToken = nil
-        agentSessionLinkAutoWakeSnoozes.removeAll()
     }
 
     func noteMonitorObservationInputsChanged() {
@@ -673,11 +617,6 @@ final class AgentTabSession: ObservableObject {
     var selectedModelRaw: String = AgentModel.defaultModel.rawValue
     var selectedReasoningEffortRaw: String?
     var autoEditEnabled: Bool = true
-    /// Persisted with the session. New sessions default on and remain inert while overseeing
-    /// nothing; restoration replaces this creation default with the durable saved value.
-    var autoWakeOnOversightUpdates: Bool = true
-    /// Granular target UUIDs; preserved while the master setting is enabled.
-    var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = []
     var selectedModel: AgentModel {
         get { AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent) ?? .defaultModel }
         set { selectedModelRaw = newValue.rawValue }
@@ -741,33 +680,22 @@ final class AgentTabSession: ObservableObject {
     }
 
     private(set) var codexControllerGeneration = UUID()
-    /// The open session-link catalog-repair episode, encoded as the controller generation the
-    /// mismatch was observed against.
+    /// The open session-link catalog-repair cycle, if any: the controller generation a stuck
+    /// catalog projection was observed against.
     ///
-    /// Three states in one field, because two are not enough: a Boolean can say "an episode exists"
-    /// but not whether this episode's single controller replacement is still owed or was already
-    /// spent by an unrelated reconnect.
+    /// `nil` is no cycle. Otherwise `cycle.state(currentControllerGeneration:)` says whether this
+    /// cycle's single controller replacement is still owed or was already spent by an unrelated
+    /// reconnect; see `AgentSessionLinkCodexCatalogRepair.Cycle` for why a generation rather than a
+    /// Boolean is what makes that distinction expressible.
     ///
-    /// | Value | Meaning |
-    /// | --- | --- |
-    /// | `nil` | no episode |
-    /// | `== codexControllerGeneration` | repair pending on the controller that was observed |
-    /// | `!= codexControllerGeneration` | consumed — one replacement already happened |
-    ///
-    /// The consumed state is written by nobody: `codexController.didSet` rotates the generation on
-    /// every identity change, so surviving that rotation *is* the record that another reconnect
-    /// (computer-use settlement, a tool-preference recycle, stream recovery, or the repair itself)
-    /// already spent the episode. That is also why this must never be cleared from
-    /// `codexController.didSet` or generic controller teardown — clearing it there would erase the
-    /// evidence and let a later projection revision or terminal commit replace a second time.
-    ///
-    /// Only five paths write `nil`, and all of them mean the episode is over rather than spent: an
+    /// Only five paths write `nil`, and all of them mean the cycle is over rather than spent: an
     /// exact current positive catalog, exact outbound loss, a provider switch away from `.codexExec`,
-    /// the tool being disabled before the episode was spent, and the stranded-run recovery that
-    /// retires a run whose consuming reconnect left no controller behind.
+    /// the tool being disabled before the cycle was spent, and the stranded-run recovery that
+    /// retires a run whose consuming reconnect left no controller behind. It must never be cleared
+    /// from `codexController.didSet` or generic controller teardown.
     ///
     /// Never persisted: it describes a live process-local controller generation.
-    var codexSessionLinkCatalogRepairSourceGeneration: UUID?
+    var codexSessionLinkCatalogRepairCycle: AgentSessionLinkCodexCatalogRepair.Cycle?
     /// The permission profile the current Codex controller was created with.
     /// Used to detect when MCP control changes require controller recycling.
     var codexControllerPermissionProfile: AgentModeViewModel.AgentPermissionProfile?
@@ -870,12 +798,9 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
-    /// Ephemeral, agent-declared dependency metadata shared with current inbound observers.
-    var agentSessionLinkWaitingOn: DomainAgentSessionWaitingOn?
-
     func clearAgentSessionLinkWaitingOnAfterAcceptedTurn() {
-        guard agentSessionLinkWaitingOn != nil else { return }
-        agentSessionLinkWaitingOn = nil
+        guard oversight.waitingOn != nil else { return }
+        oversight.waitingOn = nil
         monitorObservationSignal.send(())
     }
 
@@ -931,7 +856,7 @@ final class AgentTabSession: ObservableObject {
 
     deinit {
         applyEditsApprovalSubscriptionTask?.cancel()
-        agentSessionLinkAutoWakeSnoozeDeadlineTask?.cancel()
+        oversight.snoozeDeadlineTask?.cancel()
     }
 
     /// Cancels all ephemeral runtime tasks and clears transient state on this
@@ -969,7 +894,7 @@ final class AgentTabSession: ObservableObject {
         applyEditsApprovalSubscriptionTask?.cancel()
         applyEditsApprovalSubscriptionTask = nil
         applyEditsApprovalSubscriptionID = nil
-        cancelAgentSessionLinkAutoWakeSnoozeState()
+        oversight.retireSnoozeState()
     }
 
     var hasPendingCodexHookReviewRequest: Bool {

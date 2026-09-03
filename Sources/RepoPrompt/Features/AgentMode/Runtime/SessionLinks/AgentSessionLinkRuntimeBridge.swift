@@ -2,6 +2,18 @@ import Combine
 import Foundation
 import RepoPromptDomainRuntime
 
+// The process-wide runtime bridge between the MCP tool surface, the domain link authority, and
+// every window's live sessions.
+//
+// Owns the exact-endpoint host protocol, per-target Combine observations and their explicit
+// teardown, the pending-send queue, purposeful-attention enqueue, and the operation bodies behind
+// `agent_session_link` (list, poll, wait, read, send, cancel, set_waiting_on, snooze,
+// request_attention). It resolves endpoints through `AgentSessionLinkEndpointResolver`, authorizes
+// through `DomainAgentSessionLinkAuthority`, and executes target-side work through the owning
+// `AgentModeViewModel` extensions. Invariants: both live endpoint incarnations are revalidated
+// around every suspension point; nothing here authorizes anything the authority did not lease; and
+// unlink/revocation is the hard gate with no attention exception.
+
 // MARK: - Observation token
 
 /// Retains one target-scoped Combine observation. Teardown is always explicit: an implicit `deinit`

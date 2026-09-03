@@ -367,7 +367,7 @@ extension AgentModeViewModel {
         agentSessionLinkReconcileCodexCatalogRepair(projection, session: session)
     }
 
-    /// Opens, holds, or closes the Codex session-link catalog-repair episode for one exact accepted
+    /// Opens, holds, or closes the Codex session-link catalog-repair cycle for one exact accepted
     /// projection.
     ///
     /// The condition being recognized is a *returned* catalog that says `agent_session_link` is
@@ -379,8 +379,8 @@ extension AgentModeViewModel {
     ///
     /// Opening belongs here rather than in the coordinator because this is the only frame where the
     /// mismatch and the projection storage that produced it are visible in one synchronous MainActor
-    /// step. Writing the marker *before* invoking the coordinator is what makes the open atomic: a
-    /// nested or reentrant publication cannot reopen the same episode.
+    /// step. Writing the cycle *before* invoking the coordinator is what makes the open atomic: a
+    /// nested or reentrant publication cannot reopen the same cycle.
     ///
     /// Route currency is deliberately not re-derived, and `projection.isReady` is deliberately not
     /// used — the state being recognized is intentionally unready. What the publish guard above
@@ -394,18 +394,16 @@ extension AgentModeViewModel {
     /// The accepted bound is therefore that a projection published for the current endpoint and run
     /// may already be one connection generation stale by the time the repair runs. The cost is
     /// bounded to one controller replacement for a session that was going to reconnect anyway, and
-    /// the episode marker prevents it from repeating; the alternative — an authority round trip on
-    /// every unready publication — buys a fresher answer that can go stale the same way.
+    /// the cycle prevents it from repeating; the alternative — an authority round trip on every
+    /// unready publication — buys a fresher answer that can go stale the same way.
     private func agentSessionLinkReconcileCodexCatalogRepair(
         _ projection: AgentSessionLinkRunCatalogProjection,
         session: TabSession
     ) {
-        // Only an exact current observation closes an episode. Unknown presence — a route torn down
-        // or not yet observed — leaves it open, because it is not evidence that the catalog healed.
-        if projection.hasAgentSessionLink == true || projection.hasActiveOutboundLink == false {
-            let hadEpisode = session.codexSessionLinkCatalogRepairSourceGeneration != nil
-            session.codexSessionLinkCatalogRepairSourceGeneration = nil
-            if hadEpisode {
+        if AgentSessionLinkCodexCatalogRepair.projectionResolvesCycle(projection) {
+            let hadCycle = session.codexSessionLinkCatalogRepairCycle != nil
+            session.codexSessionLinkCatalogRepairCycle = nil
+            if hadCycle {
                 AgentSessionLinkCatalogDiagnostics.repairTransition(
                     runID: projection.runID,
                     tabID: session.tabID,
@@ -415,8 +413,7 @@ extension AgentModeViewModel {
             return
         }
         guard session.selectedAgent == .codexExec,
-              projection.hasAgentSessionLink == false,
-              projection.hasActiveOutboundLink == true,
+              AgentSessionLinkCodexCatalogRepair.isStuckProjection(projection),
               session.codexController != nil,
               // Disablement is a reason not to repair, never a reason to reconnect: the returned
               // catalog is then truthfully absent and the user asked for that.
@@ -424,8 +421,10 @@ extension AgentModeViewModel {
         else {
             return
         }
-        if session.codexSessionLinkCatalogRepairSourceGeneration == nil {
-            session.codexSessionLinkCatalogRepairSourceGeneration = session.codexControllerGeneration
+        if session.codexSessionLinkCatalogRepairCycle == nil {
+            session.codexSessionLinkCatalogRepairCycle = AgentSessionLinkCodexCatalogRepair.Cycle(
+                observedControllerGeneration: session.codexControllerGeneration
+            )
             AgentSessionLinkCatalogDiagnostics.repairTransition(
                 runID: projection.runID,
                 tabID: session.tabID,
@@ -615,7 +614,7 @@ extension AgentModeViewModel {
         // incarnation starts fresh, and a task still waiting on the dead one would otherwise hold
         // `idle_for_send` false for a session nothing is going to wake.
         for (tabID, session) in sessions {
-            guard let attempt = session.pendingOversightAutoWake else { continue }
+            guard let attempt = session.oversight.pendingAutoWake else { continue }
             guard !liveSessionIDs.contains(attempt.observerEndpoint.sessionID)
                 || agentSessionLinkObserverEndpoint(tabID: tabID) != attempt.observerEndpoint
             else {
@@ -830,10 +829,8 @@ extension AgentModeViewModel {
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkPromptDispatchID {
         guard !dispatchID.isAutoWakeFamily,
-              let attempt = session.pendingOversightAutoWake,
-              attempt.phase == .preparingDispatch
-              || attempt.phase == .cancelledBeforeDispatch
-              || attempt.phase == .dispatching
+              let attempt = session.oversight.pendingAutoWake,
+              attempt.phase.ownsTransportBoundary
         else {
             return dispatchID
         }
@@ -853,10 +850,7 @@ extension AgentModeViewModel {
         _ dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {
         guard !dispatchID.isAutoWakeFamily else { return true }
-        guard let phase = session.pendingOversightAutoWake?.phase else { return false }
-        return phase == .preparingDispatch
-            || phase == .cancelledBeforeDispatch
-            || phase == .dispatching
+        return session.oversight.pendingAutoWakeOwnsTransportBoundary
     }
 
     /// Re-owes the supplement to a session whose **provider context** is being rebuilt from the app

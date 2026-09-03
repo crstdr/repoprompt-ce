@@ -1,6 +1,20 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// The claim/receipt owner of the oversight subsystem.
+//
+// This file owns what a provider was actually sent: the agent-facing link inventory, the prompt
+// epoch and eligibility that decide whether a supplement may ride on a dispatch, the immutable
+// outbound claim with its passive-batch receipt (exact status rows and attention occurrence
+// identities), and the store that reserves, accepts, or abandons those claims. It authors no prompt
+// text. Every string and every byte-budget decision comes from `AgentSessionLinkPrompts.rendered(_:)`,
+// which this file calls exactly once per claim; `AgentSessionLinkPromptComposer` only appends the
+// finished fragment. Coordinates with `AgentModeViewModel+SessionLinkPrompt` (the window-local seam
+// that builds render requests from live state) and `AgentSessionLinkPassiveStatusNotices` (whose
+// snapshot is the input and whose receipt application is the output). Invariant: acceptance is
+// occurrence-qualified — a receipt removes only what its own rendered batch named, so a stale or
+// out-of-order receipt can never clear a successor occurrence.
+
 // MARK: - Prompt inventory
 
 /// One overseen target as the agent-facing prompt sees it.

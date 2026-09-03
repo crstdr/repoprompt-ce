@@ -1,6 +1,18 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// The per-lane Auto-wake snooze vocabulary: constants, exact lane identity, records, projections,
+// mutation outcomes, typed failures, the injected monotonic clock, and the pure retention rule.
+//
+// Everything here is a value; the records themselves live on `AgentTabSession.oversight` and are
+// mutated only by `AgentModeViewModel+SessionLinkAutoWake`, which also owns the one deadline task.
+// `AgentMonitorPillModels` and `AgentSessionLinkMCPToolService` render and accept these values
+// without interpreting them. Invariants: a snooze is observer-local admission policy for routine
+// status and overflow and nothing more — it never filters, receipts, or baselines the canonical
+// queue, never touches link authority or durable selection, and never reads or notifies the target;
+// an elapsed record is inactive whether or not bookkeeping has removed it; and every accepted
+// set/extend leaves at most `maximumDurationSeconds` on the clock while never shortening a deadline.
+
 // MARK: - Constants
 
 /// Temporary, observer-local admission suppression for one exact Auto-wake lane.
@@ -32,6 +44,26 @@ enum AgentSessionLinkAutoWakeSnooze {
     /// the per-operation horizon invariant for *every* caller, including a future one.
     static func clampedDurationSeconds(_ requested: Int) -> Int {
         min(maximumDurationSeconds, max(minimumDurationSeconds, requested))
+    }
+
+    /// The records one observer incarnation should keep: its own endpoint's, still active at `now`,
+    /// and still naming a lane the current snapshot carries.
+    ///
+    /// Pure and non-mutating. It is the single retention rule behind every cleanup boundary —
+    /// explicit mutation, deadline expiry, and membership pruning — so a stale or elapsed record can
+    /// never survive one path and not another. `currentReferences == nil` means no snapshot is
+    /// available, in which case membership is not a reason to drop anything.
+    static func retainedRecords(
+        _ records: [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord],
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        currentReferences: Set<DomainAgentSessionLinkReference>?,
+        now: ContinuousClock.Instant
+    ) -> [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord] {
+        records.filter { key, record in
+            key.observerEndpoint == observerEndpoint
+                && record.isActive(at: now)
+                && (currentReferences?.contains(key.reference) ?? true)
+        }
     }
 }
 

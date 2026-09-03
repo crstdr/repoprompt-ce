@@ -132,7 +132,7 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             )]
         )
         // Forces the private publish-time Auto-wake copy rather than taking its identity fast path.
-        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.oversight.autoWakeOnUpdates = true
         fixture.viewModel.agentSessionLinkPublishProjection(
             props(endpoint: fixture.endpoint, sidebarOversightMenu: menu),
             to: fixture.endpoint

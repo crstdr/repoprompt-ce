@@ -24,13 +24,13 @@ final class AgentSessionLinkAutoWakePersistenceTests: XCTestCase {
             mcpServerEnabler: { true }
         )
         let live = viewModel.session(for: UUID())
-        XCTAssertTrue(live.autoWakeOnOversightUpdates, "fresh sessions default on")
+        XCTAssertTrue(live.oversight.autoWakeOnUpdates, "fresh sessions default on")
 
         viewModel.restoreAgentSessionLinkState(from: decodedOff, to: live)
 
-        XCTAssertFalse(live.autoWakeOnOversightUpdates, "the durable saved choice wins")
-        XCTAssertTrue(live.agentSessionLinkAutoWakeTargetSessionIDs.isEmpty)
-        XCTAssertNil(live.pendingOversightAutoWake, "restoration must not reserve a provider turn")
+        XCTAssertFalse(live.oversight.autoWakeOnUpdates, "the durable saved choice wins")
+        XCTAssertTrue(live.oversight.autoWakeTargetSessionIDs.isEmpty)
+        XCTAssertNil(live.oversight.pendingAutoWake, "restoration must not reserve a provider turn")
 
         let selectedTargetID = UUID()
         let savedOn = AgentSession(
@@ -43,9 +43,9 @@ final class AgentSessionLinkAutoWakePersistenceTests: XCTestCase {
         let decodedOn = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(savedOn))
         viewModel.restoreAgentSessionLinkState(from: decodedOn, to: live)
 
-        XCTAssertTrue(live.autoWakeOnOversightUpdates)
-        XCTAssertEqual(live.agentSessionLinkAutoWakeTargetSessionIDs, [selectedTargetID])
-        XCTAssertNil(live.pendingOversightAutoWake, "restoration must not reserve a provider turn")
+        XCTAssertTrue(live.oversight.autoWakeOnUpdates)
+        XCTAssertEqual(live.oversight.autoWakeTargetSessionIDs, [selectedTargetID])
+        XCTAssertNil(live.oversight.pendingAutoWake, "restoration must not reserve a provider turn")
     }
 
     func testLegacyPayloadsDecodeAutoWakeFailClosed() throws {

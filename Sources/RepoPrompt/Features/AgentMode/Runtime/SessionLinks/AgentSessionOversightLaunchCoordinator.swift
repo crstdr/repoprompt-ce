@@ -1,6 +1,16 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// Restores durable oversight intents into live links after launch and window restore.
+//
+// Owns the restore topology state, the terminal reasons a restore can end with, and the coordinator
+// that waits on `AgentSessionLinkEndpointResolver` readiness for both endpoints before asking
+// `AgentSessionLinkRuntimeBridge` to recreate each link; `AgentSessionOversightIntentStore` is its
+// source and `AgentSessionDeletionRegistry` tells it which sessions are gone for good. Invariants:
+// an intent is replayed against exact restoration-ready incarnations only, never against a UUID
+// match alone; restore never starts a run, publishes prompt inventory, or arms an Auto-wake by
+// itself — the bootstrap after restore goes through the ordinary publication path.
+
 // MARK: - Restore topology
 
 /// Why the window-restore gate became idle.

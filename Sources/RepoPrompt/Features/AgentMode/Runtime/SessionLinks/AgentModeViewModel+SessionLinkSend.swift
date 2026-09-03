@@ -1,6 +1,17 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// The target-side execution of one attributed cross-session `send`.
+//
+// Assembles the pure `AgentSessionLinkDeliveryReadiness.Snapshot` from live target state, claims
+// composer submission atomically on the target's MainActor, re-evaluates the same snapshot after
+// the authorization commit hop, and hands the framed envelope to the ordinary run start. It owns no
+// authority (`DomainAgentSessionLinkAuthority` grants the lease before this runs) and no queueing
+// (`AgentSessionLinkPendingSend` holds `when_sendable` entries until this path admits them).
+// Invariant: readiness is decided entirely from facts about the target — never from what started
+// the caller's turn — and a waiting target is never ready, because answering an interaction is a
+// capability `send` does not have.
+
 // MARK: - Atomic idle-only attributed send
 
 extension AgentModeViewModel {
@@ -34,7 +45,7 @@ extension AgentModeViewModel {
             pendingInstructionCount: session.pendingInstructions.count,
             pendingACPSteeringCount: session.pendingACPSteeringInstructions.count,
             pendingClaudeSteeringCount: session.pendingClaudeSteeringInstructions.count,
-            pendingOversightAutoWake: session.pendingOversightAutoWake != nil,
+            pendingOversightAutoWake: session.oversight.pendingAutoWake != nil,
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,
             hasPendingUserInputRequest: session.pendingUserInputRequest != nil,
