@@ -2537,14 +2537,28 @@ actor ServerNetworkManager {
         waiter.continuation.resume(returning: outcome)
     }
 
+    /// - Parameter expectedRouteToken: the route token the caller has already determined to be
+    ///   authoritative, or nil when it has none.
+    ///
+    ///   When a token is supplied, the fast path below must not hand back an observation carrying a
+    ///   *different* one: the caller would reject it immediately, and because the shortcut returns
+    ///   before a waiter is registered, the relist that would refresh the observation never runs.
+    ///   The caller then fails closed with `.unavailable` in the same millisecond, which no amount
+    ///   of retrying can clear. Falling through instead lets the relist resolve the disagreement.
+    ///
+    ///   When the caller has no authoritative token, a ready observation is still returned so it can
+    ///   apply its own rejection: waiting cannot help, because the token is recomputed from live
+    ///   route state rather than produced by the catalog.
     func awaitRunCatalogReadiness(
         runID: UUID,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        expectedRouteToken: AgentSessionLinkRunCatalogRouteToken?,
         timeout: TimeInterval
     ) async -> AgentSessionLinkRunCatalogWaitOutcome {
         if let projection = runCatalogObservationByRunID[runID]?.projection,
            projection.isReady,
-           projection.routeToken?.observerEndpoint == observerEndpoint
+           projection.routeToken?.observerEndpoint == observerEndpoint,
+           expectedRouteToken == nil || projection.routeToken == expectedRouteToken
         {
             return .ready(projection)
         }
