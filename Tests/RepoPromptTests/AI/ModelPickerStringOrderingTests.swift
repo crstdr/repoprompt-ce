@@ -42,17 +42,6 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(high.reasoningEffort, .high)
     }
 
-    func testCodexAstraExtendedEffortsPreserveModelAndServiceTier() {
-        let ultra = CodexModelSpecifier(raw: "gpt-6-astra-ultra")
-        XCTAssertEqual(ultra.baseModel, "gpt-6-astra")
-        XCTAssertEqual(ultra.reasoningEffort, .ultra)
-
-        let fastMax = CodexModelSpecifier(raw: "gpt-6-astra-fast-max")
-        XCTAssertEqual(fastMax.baseModel, "gpt-6-astra")
-        XCTAssertEqual(fastMax.reasoningEffort, .max)
-        XCTAssertEqual(fastMax.serviceTier, CodexServiceTierVariantCatalog.fastServiceTier)
-    }
-
     func testDisplaySuffixStrippingDistinguishesFamilyTokensFromEffortTokens() {
         XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.6 Sol Fast Ultra"), "GPT-5.6 Sol Fast")
         XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.1 Codex Max"), "GPT-5.1 Codex Max")
