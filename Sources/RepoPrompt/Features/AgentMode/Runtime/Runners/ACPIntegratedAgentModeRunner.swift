@@ -32,6 +32,15 @@ final class ACPIntegratedAgentModeRunner {
         let errorText: String?
     }
 
+    private struct StaleModelParameterSelectionError: LocalizedError {
+        let selections: [ACPModelParameterSelection]
+
+        var errorDescription: String? {
+            let values = selections.map { "\($0.configID)=\($0.valueRaw)" }.joined(separator: ", ")
+            return "The selected model settings are stale or unsupported for this ACP session: \(values). Refresh the model settings and try again."
+        }
+    }
+
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
@@ -584,6 +593,8 @@ final class ACPIntegratedAgentModeRunner {
                 hooks.bindingObservation.updateBindings(session)
 
                 try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
+                try Self.validateModelParameterApplicationReport(parameterReport)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
                 try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
                 setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
@@ -663,6 +674,8 @@ final class ACPIntegratedAgentModeRunner {
                 }
 
                 try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
+                try Self.validateModelParameterApplicationReport(parameterReport)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
                 try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
 
@@ -820,30 +833,47 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
-        guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor || runRequest.agentKind == .grokBuild || runRequest.agentKind == .antigravity else { return }
-        guard let model = runRequest.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty,
-              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-        else {
+        guard let model = try Self.explicitSelectedModel(
+            agentKind: runRequest.agentKind,
+            modelString: runRequest.modelString
+        ) else {
             return
-        }
-        if runRequest.agentKind == .cursor,
-           model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
-           AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.contains(rawModel: model) != true
-        {
-            return
-        }
-        if runRequest.agentKind == .grokBuild || runRequest.agentKind == .antigravity,
-           AgentACPModelRegistry.shared.resolvedSnapshot(for: runRequest.agentKind.acpProviderID!)?.contains(rawModel: model) != true
-        {
-            // Grok has no provider-side alias surface: an unknown concrete model fails the
-            // run instead of silently running Grok's current default.
-            throw AIProviderError.invalidConfiguration(
-                detail: "ACP model `\(model)` is not in the discovered model set. Refresh Antigravity models and retry."
-            )
         }
         log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
         try await controller.setSessionModel(model)
+    }
+
+    private static func explicitSelectedModel(
+        agentKind: AgentProviderKind,
+        modelString: String?
+    ) throws -> String? {
+        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity else {
+            return nil
+        }
+        guard let model = modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty,
+              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+        else {
+            return nil
+        }
+        if agentKind == .cursor,
+           model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
+           !CursorAIModelCatalog.contains(modelRaw: model)
+        {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Cursor model `\(model)` is not in this release's supported model catalog. Update RepoPrompt CE or choose Cursor Auto."
+            )
+        }
+        if agentKind == .grokBuild || agentKind == .antigravity,
+           let providerID = agentKind.acpProviderID,
+           AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)?.contains(rawModel: model) != true
+        {
+            let providerName = agentKind == .antigravity ? "Antigravity" : "Grok Build"
+            throw AIProviderError.invalidConfiguration(
+                detail: "\(providerName) model `\(model)` is not in the discovered model set. Refresh \(providerName) models and retry."
+            )
+        }
+        return model
     }
 
     private func promptFailureErrorText(
@@ -1696,7 +1726,28 @@ final class ACPIntegratedAgentModeRunner {
                 classification.report.trace
             )
         }
+
+        static func testValidateModelParameterApplicationReport(
+            _ report: ACPModelParameterApplicationReport
+        ) throws {
+            try validateModelParameterApplicationReport(report)
+        }
+
+        static func testExplicitSelectedModel(
+            agentKind: AgentProviderKind,
+            modelString: String?
+        ) throws -> String? {
+            try explicitSelectedModel(agentKind: agentKind, modelString: modelString)
+        }
     #endif
+
+    private static func validateModelParameterApplicationReport(
+        _ report: ACPModelParameterApplicationReport
+    ) throws {
+        guard report.skipped.isEmpty else {
+            throw StaleModelParameterSelectionError(selections: report.skipped)
+        }
+    }
 
     // MARK: - Provider Stream Tool Event Handling
 
@@ -1705,6 +1756,7 @@ final class ACPIntegratedAgentModeRunner {
         session: AgentTabSession
     ) -> Bool {
         guard let providerID = agentKind.acpProviderID,
+              providerID != .cursor,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)
         else {
             return false

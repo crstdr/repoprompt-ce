@@ -344,19 +344,7 @@ enum AgentModelCatalog {
     ) -> [AgentModelOption] {
         guard isAgentAvailable(agentKind, availability: availability) else { return [] }
         if agentKind == .cursor {
-            let fallbacks = [
-                staticOption(.cursorAuto, for: .cursor),
-                staticOption(.cursorComposer2, for: .cursor)
-            ]
-            if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
-               !discoveredOptions.isEmpty
-            {
-                let discoveredWithoutFallbacks = discoveredOptions.filter {
-                    !isCursorAutoOption($0) && !isCursorComposer2Option($0)
-                }
-                return fallbacks + discoveredWithoutFallbacks
-            }
-            return fallbacks
+            return CursorAIModelCatalog.options
         }
         if agentKind == .antigravity {
             return resolvedACPDiscoveredModels(for: .antigravity)?.options ?? []
@@ -410,15 +398,8 @@ enum AgentModelCatalog {
         guard isAgentAvailable(agentKind, availability: availability) else { return false }
         let normalized = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return false }
-        if agentKind == .cursor,
-           normalized.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) == .orderedSame
-        {
-            return true
-        }
-        if agentKind == .cursor,
-           normalized.caseInsensitiveCompare(AgentModel.cursorComposer2.rawValue) == .orderedSame
-        {
-            return true
+        if agentKind == .cursor {
+            return CursorAIModelCatalog.contains(modelRaw: normalized)
         }
         if agentKind == .grokBuild,
            normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
@@ -429,9 +410,6 @@ enum AgentModelCatalog {
             return resolvedACPDiscoveredModels(for: .antigravity)?.contains(rawModel: normalized) == true
         }
         if let discoveredModels = resolvedACPDiscoveredModels(for: agentKind) {
-            if agentKind == .cursor {
-                return cursorSnapshotContains(rawModel: normalized, snapshot: discoveredModels)
-            }
             return discoveredModels.contains(rawModel: normalized)
         }
         if agentKind.usesClaudeTooling,
@@ -1632,15 +1610,7 @@ enum AgentModelCatalog {
 
     private static func canonicalModelRaw(_ rawModel: String, for agentKind: AgentProviderKind) -> String {
         guard agentKind == .cursor else { return rawModel }
-        if rawModel.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) == .orderedSame {
-            return AgentModel.cursorAuto.rawValue
-        }
-        guard let discoveredOption = resolvedACPDiscoveredModels(for: .cursor)?.option(matching: rawModel),
-              isCursorAutoOption(discoveredOption)
-        else {
-            return rawModel
-        }
-        return AgentModel.cursorAuto.rawValue
+        return CursorAIModelCatalog.option(matching: rawModel)?.rawValue ?? rawModel
     }
 
     private static func canonicalClaudeGLMModelRaw(_ rawModel: String?) -> String? {
@@ -1658,45 +1628,6 @@ enum AgentModelCatalog {
             return ClaudeModelSpecifier.encodedRaw(baseModelRaw: mappedBaseModel, effort: effort)
         }
         return mappedBaseModel
-    }
-
-    private static func isCursorAutoOption(_ option: AgentModelOption) -> Bool {
-        let normalizedRaw = normalizedCursorModelAlias(option.rawValue)
-        let normalizedDisplayName = normalizedCursorModelAlias(option.displayName)
-        return normalizedRaw == AgentModel.cursorAuto.rawValue
-            || normalizedDisplayName == AgentModel.cursorAuto.rawValue
-    }
-
-    private static func isCursorComposer2Option(_ option: AgentModelOption) -> Bool {
-        let normalizedRaw = normalizedCursorModelAlias(option.rawValue)
-        let normalizedDisplayName = normalizedCursorModelAlias(option.displayName)
-        return normalizedRaw == AgentModel.cursorComposer2.rawValue
-            || normalizedDisplayName == AgentModel.cursorComposer2.rawValue
-    }
-
-    private static func cursorSnapshotContains(
-        rawModel: String,
-        snapshot: ACPDiscoveredSessionModels
-    ) -> Bool {
-        if snapshot.contains(rawModel: rawModel) {
-            return true
-        }
-        let normalized = normalizedCursorModelAlias(rawModel)
-        guard !normalized.isEmpty else { return false }
-        return snapshot.options.contains { option in
-            normalizedCursorModelAlias(option.rawValue) == normalized
-                || normalizedCursorModelAlias(option.displayName) == normalized
-        }
-    }
-
-    private static func normalizedCursorModelAlias(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let base: Substring = if let bracketIndex = trimmed.firstIndex(of: "[") {
-            trimmed[..<bracketIndex]
-        } else {
-            trimmed[...]
-        }
-        return String(base).replacingOccurrences(of: " ", with: "-")
     }
 
     private static func staticOption(_ model: AgentModel, for agentKind: AgentProviderKind) -> AgentModelOption {
