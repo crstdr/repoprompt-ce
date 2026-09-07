@@ -184,8 +184,10 @@ struct AgentMonitorPopoverView: View {
                         TimelineView(.periodic(from: freshnessTickAnchor, by: 60)) { timeline in
                             observerControlsSection(now: timeline.date)
                         }
-                        Divider()
-                        pendingUpdatesSection
+                        if let pending = props.pendingUpdates, !pending.isEmpty {
+                            Divider()
+                            pendingUpdatesSection
+                        }
                     }
                     if hasPersistenceContent {
                         Divider()
