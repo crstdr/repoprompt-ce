@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -45,13 +46,77 @@ final class AntigravityHeadlessBoundaryTests: XCTestCase {
         XCTAssertThrowsError(try AgentMCPSelectionResolver.resolve(
             modelID: "antigravity:\(model)", availability: availability, surface: .headless
         ))
-        let headlessRole = try AgentMCPSelectionResolver.resolve(
-            modelID: "explore",
-            availability: availability,
-            roleSelectionProvider: { _, _ in .init(agent: .antigravity, modelRaw: model) },
-            surface: .headless
+        for modelID: String? in ["explore", nil] {
+            XCTAssertThrowsError(try AgentMCPSelectionResolver.resolve(
+                modelID: modelID,
+                defaultTaskLabel: .explore,
+                availability: availability,
+                roleSelectionProvider: { _, _ in .init(agent: .antigravity, modelRaw: model) },
+                surface: .headless
+            )) { error in
+                self.assertInteractiveOnlyRoleError(error)
+            }
+        }
+    }
+
+    @MainActor
+    func testStoredExploreOverrideRejectsHeadlessResolutionBeforeDispatch() throws {
+        let registry = AgentACPModelRegistry.shared
+        registry.test_reset(providerID: .antigravity)
+        let settings = GlobalSettingsStore.shared
+        let previousOverrides = settings.mcpAgentRoleOverrides(scope: .global)
+        defer {
+            settings.updateMCPAgentRoleOverrides(previousOverrides, scope: .global, commit: true)
+            registry.test_reset(providerID: .antigravity)
+        }
+        let model = "gemini-test-model"
+        _ = registry.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [AgentModelOption(rawValue: model, displayName: model, description: nil, isDefault: true)],
+                currentModelRaw: model
+            ),
+            for: .antigravity
         )
-        XCTAssertNotEqual(headlessRole.agentRaw, AgentProviderKind.antigravity.rawValue)
+        MCPAgentRoleDefaultsService.setSelection(
+            .init(agent: .antigravity, modelRaw: model), for: .explore, scope: .global
+        )
+        let effective = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(for: .explore, availability: availability))
+        XCTAssertTrue(effective.hasStoredOverride)
+        XCTAssertFalse(effective.overrideUnavailable)
+        XCTAssertEqual(effective.effective.agent, .antigravity)
+
+        for modelID: String? in ["explore", nil] {
+            let interactive = try AgentMCPSelectionResolver.resolve(
+                modelID: modelID, defaultTaskLabel: .explore, availability: availability
+            )
+            XCTAssertEqual(interactive.agentRaw, AgentProviderKind.antigravity.rawValue)
+            XCTAssertEqual(interactive.modelRaw, model)
+            XCTAssertThrowsError(try AgentMCPSelectionResolver.resolve(
+                modelID: modelID, defaultTaskLabel: .explore, availability: availability, surface: .headless
+            )) { error in
+                self.assertInteractiveOnlyRoleError(error)
+            }
+
+            let unavailable = AgentModelCatalog.AvailabilityContext(
+                claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: true,
+                cursorAvailable: true, grokBuildAvailable: true, antigravityAvailable: false
+            )
+            let fallback = try AgentMCPSelectionResolver.resolve(
+                modelID: modelID, defaultTaskLabel: .explore, availability: unavailable, surface: .headless
+            )
+            XCTAssertNotNil(fallback.agentRaw)
+            XCTAssertNotEqual(fallback.agentRaw, AgentProviderKind.antigravity.rawValue)
+        }
+    }
+
+    private func assertInteractiveOnlyRoleError(_ error: Error, file: StaticString = #filePath, line: UInt = #line) {
+        guard case let MCPError.invalidParams(detail) = error, let detail else {
+            return XCTFail("Unexpected error: \(error)", file: file, line: line)
+        }
+        XCTAssertTrue(detail.contains("antigravity"), file: file, line: line)
+        XCTAssertTrue(detail.contains("explore"), file: file, line: line)
+        XCTAssertTrue(detail.contains("interactive Agent Mode"), file: file, line: line)
+        XCTAssertTrue(detail.contains("Agent Models settings"), file: file, line: line)
     }
 
     func testHeadlessFactoryFailsClosedInsteadOfFallingBackToAnotherProvider() async {

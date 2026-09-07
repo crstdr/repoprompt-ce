@@ -48,7 +48,7 @@ enum AgentMCPSelectionResolver {
         guard let trimmed, !trimmed.isEmpty else {
             // No explicit model_id — use default global role if provided
             if let defaultKind = defaultTaskLabel,
-               let resolved = resolveRoleSelection(defaultKind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider, surface: surface)
+               let resolved = try resolveRoleSelection(defaultKind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider, surface: surface)
             {
                 return ResolvedSelection(agentRaw: resolved.agent.rawValue, modelRaw: resolved.modelRaw, taskLabelKind: defaultKind)
             }
@@ -59,7 +59,7 @@ enum AgentMCPSelectionResolver {
         if !trimmed.contains(":") {
             let lowered = trimmed.lowercased()
             if let entry = AgentModelCatalog.taskLabels.first(where: { $0.label == lowered }) {
-                guard let resolved = resolveRoleSelection(entry.kind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider, surface: surface) else {
+                guard let resolved = try resolveRoleSelection(entry.kind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider, surface: surface) else {
                     throw MCPError.invalidParams("No available agent/model for task label '\(trimmed)'.")
                 }
                 return ResolvedSelection(agentRaw: resolved.agent.rawValue, modelRaw: resolved.modelRaw, taskLabelKind: entry.kind)
@@ -114,17 +114,15 @@ enum AgentMCPSelectionResolver {
         workspaceID: UUID?,
         roleSelectionProvider: RoleSelectionProvider?,
         surface: AgentModelCatalog.AgentSelectionSurface
-    ) -> AgentModelCatalog.NormalizedAgentSelection? {
-        if let provided = roleSelectionProvider?(role, availability),
-           surface.allows(provided.agent)
-        {
-            return provided
+    ) throws -> AgentModelCatalog.NormalizedAgentSelection? {
+        let resolved = roleSelectionProvider?(role, availability)
+            ?? MCPAgentRoleDefaultsService.effectiveNormalizedSelection(for: role, availability: availability, workspaceID: workspaceID)
+            ?? AgentModelCatalog.resolveTaskLabelKind(role, availability: availability)
+        if let resolved, !surface.allows(resolved.agent) {
+            throw MCPError.invalidParams(
+                "Agent '\(resolved.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
+            )
         }
-        if let effective = MCPAgentRoleDefaultsService.effectiveNormalizedSelection(for: role, availability: availability, workspaceID: workspaceID),
-           surface.allows(effective.agent)
-        {
-            return effective
-        }
-        return AgentModelCatalog.resolveTaskLabelKind(role, availability: availability)
+        return resolved
     }
 }
