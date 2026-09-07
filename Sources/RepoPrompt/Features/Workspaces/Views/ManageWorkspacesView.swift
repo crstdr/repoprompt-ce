@@ -13,6 +13,14 @@ struct ManageWorkspacesView: View {
     @State private var workspaceBeingRenamed: WorkspaceModel?
     @State private var renameField: String = ""
     @State private var showGlobalStorage: Bool = false
+    @State private var showConsolidatedWorkspaces = false
+    private enum LibraryScope: String, CaseIterable {
+        case saved = "Saved"
+        case temporary = "Temporary"
+        case all = "All"
+    }
+
+    @State private var libraryScope: LibraryScope = .saved
     @State private var searchText: String = ""
     @State private var showDuplicateCleanupConfirmation = false
     @State private var duplicateCleanupResultMessage: String?
@@ -50,7 +58,6 @@ struct ManageWorkspacesView: View {
             headerSection
             autoRestoreToggle
             duplicateCleanupCallout
-            leakedWorkspaceCleanupCallout
 
             // Collapsible Global Storage Management Section
             DisclosureGroup(
@@ -242,43 +249,6 @@ struct ManageWorkspacesView: View {
         }
     }
 
-    @ViewBuilder
-    private var leakedWorkspaceCleanupCallout: some View {
-        if !leakCleanupPreview.records.isEmpty {
-            let deletableCount = leakCleanupPreview.deletableRecords.count
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "testtube.2")
-                    .foregroundColor(.orange)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Leaked Test Workspaces Detected")
-                        .font(fontPreset.headlineFont)
-                    Text("\(leakCleanupPreview.records.count) runtime-catalog \(leakCleanupPreview.records.count == 1 ? "record matches" : "records match") narrow persisted test-fixture evidence. No catalog records are removed until you review and confirm.")
-                        .font(fontPreset.subheadlineFont)
-                        .foregroundColor(.secondary)
-                    if deletableCount != leakCleanupPreview.records.count {
-                        Text("\(leakCleanupPreview.records.count - deletableCount) active or referenced \(leakCleanupPreview.records.count - deletableCount == 1 ? "record is" : "records are") protected.")
-                            .font(fontPreset.captionFont)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                Spacer()
-                Button("Review…") {
-                    managementSelection.begin()
-                }
-                .buttonStyle(CustomButtonStyle(verticalPadding: 6, horizontalPadding: 12, height: fontPreset.scaledMetric(32)))
-            }
-            .padding(12)
-            .background(Color.orange.opacity(0.12))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.orange.opacity(0.35), lineWidth: 1)
-            )
-            .cornerRadius(8)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-        }
-    }
-
     private func duplicateCleanupConfirmationSheet(groups: [WorkspaceDuplicateGroupSummary]) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Consolidate Duplicate Workspaces")
@@ -370,14 +340,11 @@ struct ManageWorkspacesView: View {
                         .font(fontPreset.subheadlineFont)
                         .fontWeight(.medium)
                 }
-                ForEach(group.duplicateWorkspaceIDs.indices, id: \.self) { index in
-                    let workspaceID = group.duplicateWorkspaceIDs[index]
-                    let name = group.duplicateWorkspaceNames[index]
-                    let windowIDs = group.windowIDsByWorkspaceID[workspaceID] ?? []
+                ForEach(group.duplicateWorkspaceRows) { row in
                     HStack(spacing: 0) {
-                        Text("  • \(name)")
+                        Text("  • \(row.name)")
                             .font(fontPreset.captionFont)
-                        Text(" — \(windowStatusText(for: windowIDs))")
+                        Text(" — \(windowStatusText(for: row.windowIDs))")
                             .font(fontPreset.captionFont)
                             .foregroundColor(.secondary)
                     }
@@ -428,13 +395,19 @@ struct ManageWorkspacesView: View {
 
         let backupNote = result.backupURL.map { "\n\nBackup saved at:\n\($0.path)" } ?? ""
 
-        if result.groupsConsolidated == result.groupsDetected && result.skipped.isEmpty {
+        if result.groupsConsolidated == result.groupsDetected, result.skipped.isEmpty {
             return "Successfully consolidated \(result.groupsConsolidated) duplicate workspace \(result.groupsConsolidated == 1 ? "group" : "groups").\(backupNote)"
         }
 
-        let skippedNote = result.skipped.isEmpty
-            ? ""
-            : " \(result.skipped.count) \(result.skipped.count == 1 ? "item was" : "items were") skipped due to active sessions or failed switches \u{2014} try again after those sessions finish."
+        let skippedNote: String
+        if result.skipped.isEmpty {
+            skippedNote = ""
+        } else {
+            let itemDescription = result.skipped.count == 1 ? "item was" : "items were"
+            skippedNote = " \(result.skipped.count) \(itemDescription) not fully consolidated."
+                + " Some steps may have partially completed, but the original recovery copies were preserved."
+                + " Review the remaining entries and retry."
+        }
 
         return "Consolidated \(result.groupsConsolidated) of \(result.groupsDetected) duplicate \(result.groupsDetected == 1 ? "group" : "groups").\(skippedNote)\(backupNote)"
     }
@@ -473,15 +446,33 @@ struct ManageWorkspacesView: View {
     // MARK: - Existing Workspaces
 
     private var existingWorkspacesSection: some View {
-        let userWorkspaces = workspaceManager.workspaces.filter { !$0.isSystemWorkspace }
-        let ordinaryFilteredWorkspaces = filterWorkspaces(userWorkspaces)
-        let managementItems = workspaceManagementItems(userWorkspaces: userWorkspaces)
+        let managementItems = workspaceManagementItems(
+            userWorkspaces: workspaceManager.workspaces.filter { !$0.isSystemWorkspace }
+        )
+        let userWorkspaces = managementItems.map(\.workspace)
+        let ordinaryWorkspaces = userWorkspaces.filter {
+            $0.consolidatedIntoWorkspaceID == nil
+                && !workspaceManager.pendingConsolidatedRestoreIDs.contains($0.id)
+        }
+        let consolidatedWorkspaces = userWorkspaces.filter {
+            $0.consolidatedIntoWorkspaceID != nil
+                || workspaceManager.pendingConsolidatedRestoreIDs.contains($0.id)
+        }
+        let ordinaryFilteredWorkspaces = filterWorkspaces(ordinaryWorkspaces).filter(matchesLibraryScope)
+        let filteredConsolidatedWorkspaces = libraryScope == .all ? filterWorkspaces(consolidatedWorkspaces) : []
+        let filteredWorkspaceCount = ordinaryFilteredWorkspaces.count + filteredConsolidatedWorkspaces.count
         let filteredManagementItems = filterManagementItems(managementItems)
 
         return VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Existing Workspaces")
-                    .font(fontPreset.headlineFont)
+                Picker("Workspace collection", selection: $libraryScope) {
+                    ForEach(LibraryScope.allCases, id: \.self) { scope in
+                        Text(scope.rawValue).tag(scope)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 240)
                 Spacer()
                 HStack {
                     Image(systemName: "magnifyingglass")
@@ -517,9 +508,9 @@ struct ManageWorkspacesView: View {
             }
 
             if managementSelection.isSelecting {
-                selectionActionBar(filteredItems: filteredManagementItems)
-            } else if !searchText.isEmpty, !ordinaryFilteredWorkspaces.isEmpty {
-                Text("Showing \(ordinaryFilteredWorkspaces.count) of \(userWorkspaces.count) workspaces")
+                selectionActionBar(allItems: managementItems, filteredItems: filteredManagementItems)
+            } else if !searchText.isEmpty, filteredWorkspaceCount > 0 {
+                Text("Showing \(filteredWorkspaceCount) of \(userWorkspaces.count) workspaces")
                     .font(fontPreset.captionFont)
                     .foregroundColor(.secondary)
             }
@@ -540,7 +531,7 @@ struct ManageWorkspacesView: View {
                 Text("No workspaces found. Create one below.")
                     .foregroundColor(.secondary)
                     .padding(.top, 2)
-            } else if ordinaryFilteredWorkspaces.isEmpty {
+            } else if ordinaryFilteredWorkspaces.isEmpty, filteredConsolidatedWorkspaces.isEmpty {
                 Text("No workspaces match '\(searchText)'")
                     .foregroundColor(.secondary)
                     .padding(.top, 2)
@@ -551,7 +542,7 @@ struct ManageWorkspacesView: View {
                             workspace: ws,
                             onSwitch: {
                                 Task {
-                                    let result = await workspaceManager.requestWorkspaceSwitch(to: ws)
+                                    let result = await workspaceManager.openWorkspaceFromLibrary(ws)
                                     if result.didSwitch {
                                         isPresented = false
                                     }
@@ -565,35 +556,77 @@ struct ManageWorkspacesView: View {
                                 toggleHiddenState(for: ws)
                             },
                             onDelete: {
-                                workspaceManager.deleteWorkspace(ws)
+                                deleteWorkspaceWithFeedback(ws)
                             }
                         )
                     }
                 }
             }
+
+            if !managementSelection.isSelecting, !filteredConsolidatedWorkspaces.isEmpty {
+                consolidatedWorkspacesSection(filteredConsolidatedWorkspaces)
+            }
         }
+    }
+
+    private func consolidatedWorkspacesSection(_ workspaces: [WorkspaceModel]) -> some View {
+        DisclosureGroup(isExpanded: $showConsolidatedWorkspaces) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Hidden recovery copies retained by workspace consolidation. Use the eye control to restore one.")
+                    .font(fontPreset.captionFont)
+                    .foregroundColor(.secondary)
+
+                ForEach(workspaces) { workspace in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Consolidated into \(canonicalWorkspaceName(for: workspace))")
+                            .font(fontPreset.captionFont)
+                            .foregroundColor(.secondary)
+                        OptimizedWorkspaceRow(
+                            workspace: workspace,
+                            onSwitch: nil,
+                            onRename: {
+                                workspaceBeingRenamed = workspace
+                                renameField = workspace.name
+                            },
+                            onToggleHidden: {
+                                toggleHiddenState(for: workspace)
+                            },
+                            onDelete: {
+                                deleteWorkspaceWithFeedback(workspace)
+                            }
+                        )
+                    }
+                }
+            }
+            .padding(.top, 8)
+        } label: {
+            Text("Consolidated workspaces (\(workspaces.count))")
+                .font(fontPreset.subheadlineFont)
+        }
+    }
+
+    private func canonicalWorkspaceName(for workspace: WorkspaceModel) -> String {
+        guard let canonicalID = workspace.consolidatedIntoWorkspaceID,
+              let canonical = workspaceManager.workspaces.first(where: { $0.id == canonicalID })
+        else {
+            return "another workspace"
+        }
+        return canonical.name
     }
 
     private func workspaceManagementItems(
         userWorkspaces: [WorkspaceModel]
     ) -> [WorkspaceManagementItem] {
-        let activeIDs = activeWorkspaceIDs
         var items = userWorkspaces.map { workspace in
             WorkspaceManagementItem(
-                workspace: workspace,
-                isLeakCleanupCandidate: false,
-                evidence: [],
-                deletionBlockReason: deletionBlockReason(for: workspace, activeWorkspaceIDs: activeIDs)
+                workspace: workspace
             )
         }
         let existingIDs = Set(items.map(\.id))
         items.append(contentsOf: leakCleanupPreview.records.compactMap { record in
-            guard !existingIDs.contains(record.id) else { return nil }
+            guard !existingIDs.contains(record.id), !record.workspace.isSystemWorkspace else { return nil }
             return WorkspaceManagementItem(
-                workspace: record.workspace,
-                isLeakCleanupCandidate: true,
-                evidence: record.evidence,
-                deletionBlockReason: record.deletionBlockReason
+                workspace: record.workspace
             )
         })
         return items.sorted {
@@ -604,8 +637,16 @@ struct ManageWorkspacesView: View {
         }
     }
 
+    private func matchesLibraryScope(_ workspace: WorkspaceModel) -> Bool {
+        switch libraryScope {
+        case .saved: !workspace.isTemporaryWorkspace
+        case .temporary: workspace.isTemporaryWorkspace
+        case .all: true
+        }
+    }
+
     private func filterManagementItems(_ items: [WorkspaceManagementItem]) -> [WorkspaceManagementItem] {
-        let matchingIDs = Set(filterWorkspaces(items.map(\.workspace)).map(\.id))
+        let matchingIDs = Set(filterWorkspaces(items.map(\.workspace)).filter(matchesLibraryScope).map(\.id))
         return items.filter { matchingIDs.contains($0.id) }
     }
 
@@ -613,32 +654,16 @@ struct ManageWorkspacesView: View {
         Set(windowStatesManager.allWindows.compactMap { $0.workspaceManager.activeWorkspace?.id })
     }
 
-    private func deletionBlockReason(
-        for workspace: WorkspaceModel,
-        activeWorkspaceIDs: Set<UUID>
-    ) -> String? {
-        if workspace.isSystemWorkspace {
-            return "System workspaces cannot be deleted."
-        }
-        if activeWorkspaceIDs.contains(workspace.id) {
-            return "Active in an open window."
-        }
-        let protectedTabs = workspace.composeTabs + workspace.stashedTabs.map(\.tab)
-        if protectedTabs.contains(where: { $0.activeAgentSessionID != nil || $0.isPinned }) {
-            return "Contains an active or pinned agent session."
-        }
-        return nil
-    }
-
-    private func selectionActionBar(filteredItems: [WorkspaceManagementItem]) -> some View {
+    private func selectionActionBar(allItems: [WorkspaceManagementItem], filteredItems: [WorkspaceManagementItem]) -> some View {
         let matchingIDs = Set(filteredItems.map(\.id))
-        let deletableMatchingIDs = filteredItems.compactMap { $0.isDeletable ? $0.id : nil }
+        let allIDs = allItems.map(\.id)
         let selectedMatchingCount = managementSelection.selectedCount(in: matchingIDs)
         return HStack(spacing: 10) {
-            Button("Select All Results") {
-                handleSelectionMutation(managementSelection.selectAllResults(deletableMatchingIDs))
+            Button("Select All") {
+                managementSelection.selectAllResults(allIDs)
             }
-            .disabled(deletableMatchingIDs.isEmpty)
+            .disabled(allIDs.isEmpty)
+            .hoverTooltip("Select every workspace, including those outside the current search or collection.")
             Text("\(managementSelection.selectedWorkspaceIDs.count) selected (\(selectedMatchingCount) of \(filteredItems.count) matching)")
                 .font(fontPreset.captionFont)
                 .foregroundColor(.secondary)
@@ -650,7 +675,6 @@ struct ManageWorkspacesView: View {
             Button("Delete…") { showBulkDeleteConfirmation = true }
                 .disabled(
                     managementSelection.selectedWorkspaceIDs.isEmpty
-                        || managementSelection.selectedWorkspaceIDs.count > WorkspaceBulkDeletePolicy.maximumWorkspaceCount
                         || isRunningBulkDelete
                 )
                 .foregroundColor(.red)
@@ -662,23 +686,24 @@ struct ManageWorkspacesView: View {
 
     private func selectionWorkspaceRow(_ item: WorkspaceManagementItem) -> some View {
         let selected = managementSelection.selectedWorkspaceIDs.contains(item.id)
+        let consolidatedDescription = item.workspace.consolidatedIntoWorkspaceID == nil
+            ? ""
+            : ", consolidated recovery copy"
         return Button {
-            handleSelectionMutation(
-                managementSelection.toggle(item.id, isDeletable: item.isDeletable)
-            )
+            managementSelection.toggle(item.id)
         } label: {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: selected ? "checkmark.square.fill" : "square")
-                    .foregroundColor(item.isDeletable ? (selected ? .accentColor : .secondary) : .secondary.opacity(0.5))
+                    .foregroundColor(selected ? .accentColor : .secondary)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(item.workspace.name)
                             .font(fontPreset.subheadlineFont)
-                        if item.isLeakCleanupCandidate {
-                            Text("TEST CLEANUP")
+                        if item.workspace.consolidatedIntoWorkspaceID != nil {
+                            Text("CONSOLIDATED")
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
-                                .foregroundColor(.orange)
+                                .foregroundColor(.secondary)
                         }
                     }
                     if let path = item.workspace.repoPaths.first {
@@ -687,15 +712,10 @@ struct ManageWorkspacesView: View {
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                     }
-                    if let reason = item.deletionBlockReason {
-                        Text(reason)
+                    if item.workspace.isTemporaryWorkspace {
+                        Text("Temporary workspace")
                             .font(fontPreset.captionFont)
                             .foregroundColor(.secondary)
-                    } else if item.isLeakCleanupCandidate {
-                        Text(item.evidence.joined(separator: " • "))
-                            .font(fontPreset.captionFont)
-                            .foregroundColor(.secondary)
-                            .lineLimit(2)
                     }
                 }
                 Spacer()
@@ -706,9 +726,18 @@ struct ManageWorkspacesView: View {
             .cornerRadius(7)
         }
         .buttonStyle(.plain)
-        .disabled(!item.isDeletable)
-        .accessibilityLabel("\(item.workspace.name), \(selected ? "selected" : "not selected")")
-        .accessibilityHint(item.deletionBlockReason ?? "Toggle workspace selection")
+        .accessibilityLabel("\(item.workspace.name)\(consolidatedDescription), \(selected ? "selected" : "not selected")")
+        .accessibilityHint("Toggle workspace selection")
+    }
+
+    private func deleteWorkspaceWithFeedback(_ workspace: WorkspaceModel) {
+        Task {
+            let result = await workspaceManager.deleteWorkspacesAsync(workspaceIDs: [workspace.id], closeOpenWorkspaces: true)
+            await refreshLeakCleanupPreview()
+            if !result.isCompleteSuccess || !result.artifactCleanupWarningsByWorkspaceID.isEmpty {
+                bulkDeleteResultMessage = makeBulkDeleteResultMessage(result, namesByWorkspaceID: [workspace.id: workspace.name])
+            }
+        }
     }
 
     private var bulkDeleteConfirmationSheet: some View {
@@ -721,24 +750,23 @@ struct ManageWorkspacesView: View {
         return VStack(alignment: .leading, spacing: 14) {
             Text("Delete \(selectedItems.count) \(selectedItems.count == 1 ? "Workspace" : "Workspaces")?")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 21, weight: .semibold))
-            Text("This deletes the selected workspaces. Persisted records are removed from the authoritative runtime catalog; local temporary workspaces are discarded from this app session. Saved artifacts are then cleaned up on a best-effort basis, and any files that could not be removed will be reported. This cannot be undone.")
+            Text("This deletes the selected workspaces and their saved tabs and session history, including pinned tabs. Your project folders are kept. Running work in these workspaces will be stopped, and affected windows will return to the welcome screen. Any saved workspace files that could not be removed will be reported. This cannot be undone.")
                 .font(fontPreset.subheadlineFont)
                 .foregroundColor(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 5) {
-                    ForEach(selectedItems.prefix(20)) { item in
+                    ForEach(selectedItems) { item in
                         Text("• \(item.workspace.name)")
                             .font(fontPreset.subheadlineFont)
-                    }
-                    if selectedItems.count > 20 {
-                        Text("…and \(selectedItems.count - 20) more")
-                            .font(fontPreset.captionFont)
-                            .foregroundColor(.secondary)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 280)
+            if isRunningBulkDelete {
+                ProgressView("Deleting workspaces…")
+                    .controlSize(.small)
+            }
             HStack {
                 Spacer()
                 Button("Cancel") { showBulkDeleteConfirmation = false }
@@ -750,7 +778,6 @@ struct ManageWorkspacesView: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(
                     selectedItems.isEmpty
-                        || selectedItems.count > WorkspaceBulkDeletePolicy.maximumWorkspaceCount
                         || isRunningBulkDelete
                 )
             }
@@ -762,10 +789,6 @@ struct ManageWorkspacesView: View {
 
     private func runBulkDelete(approvedItems: [WorkspaceManagementItem]) {
         guard !approvedItems.isEmpty, !isRunningBulkDelete else { return }
-        guard approvedItems.count <= WorkspaceBulkDeletePolicy.maximumWorkspaceCount else {
-            bulkDeleteResultMessage = bulkDeleteLimitMessage(attemptedCount: approvedItems.count)
-            return
-        }
         isRunningBulkDelete = true
         let namesByWorkspaceID = Dictionary(uniqueKeysWithValues: approvedItems.map {
             ($0.id, $0.workspace.name)
@@ -773,9 +796,7 @@ struct ManageWorkspacesView: View {
         Task {
             let result = await workspaceManager.deleteWorkspacesAsync(
                 workspaceIDs: Set(approvedItems.map(\.id)),
-                leakedTestFixtureWorkspaceIDs: Set(
-                    approvedItems.filter(\.isLeakCleanupCandidate).map(\.id)
-                )
+                closeOpenWorkspaces: true
             )
             await refreshLeakCleanupPreview()
             isRunningBulkDelete = false
@@ -790,15 +811,6 @@ struct ManageWorkspacesView: View {
                 namesByWorkspaceID: namesByWorkspaceID
             )
         }
-    }
-
-    private func handleSelectionMutation(_ result: WorkspaceSelectionMutationResult) {
-        guard case let .limitExceeded(maximum, attemptedCount) = result else { return }
-        bulkDeleteResultMessage = "You tried to select \(attemptedCount) workspaces. Bulk deletion is limited to \(maximum) per request; the existing selection was kept. Narrow the search or clear the selection and try again."
-    }
-
-    private func bulkDeleteLimitMessage(attemptedCount: Int) -> String {
-        "Bulk deletion is limited to \(WorkspaceBulkDeletePolicy.maximumWorkspaceCount) workspaces per request. The \(attemptedCount)-workspace request was not submitted and no records were changed."
     }
 
     private func makeBulkDeleteResultMessage(
@@ -861,7 +873,12 @@ struct ManageWorkspacesView: View {
     }
 
     private func toggleHiddenState(for ws: WorkspaceModel) {
-        workspaceManager.setWorkspaceHidden(ws, hidden: !ws.isHiddenInMenus)
+        let isRecoveryCopy = ws.consolidatedIntoWorkspaceID != nil
+            || workspaceManager.pendingConsolidatedRestoreIDs.contains(ws.id)
+        workspaceManager.setWorkspaceHidden(
+            ws,
+            hidden: isRecoveryCopy ? false : !ws.isHiddenInMenus
+        )
     }
 
     // MARK: - Create New Workspace
@@ -1010,15 +1027,8 @@ struct ManageWorkspacesView: View {
 
 private struct WorkspaceManagementItem: Identifiable {
     let workspace: WorkspaceModel
-    let isLeakCleanupCandidate: Bool
-    let evidence: [String]
-    let deletionBlockReason: String?
 
     var id: UUID {
         workspace.id
-    }
-
-    var isDeletable: Bool {
-        deletionBlockReason == nil
     }
 }

@@ -56,6 +56,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var agentKindRaw: String?
     var agentModelRaw: String?
     var agentReasoningEffortRaw: String?
+    var acpModelParameterSelections: [ACPModelParameterSelection]
     var lastRunStateRaw: String?
     var autoEditEnabled: Bool
     /// Deliberately **not** listed in `lacksTranscriptDerivedFields`: this is session configuration,
@@ -127,6 +128,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         agentKindRaw: String?,
         agentModelRaw: String?,
         agentReasoningEffortRaw: String?,
+        acpModelParameterSelections: [ACPModelParameterSelection] = [],
         lastRunStateRaw: String?,
         autoEditEnabled: Bool,
         autoWakeOnOversightUpdates: Bool = false,
@@ -159,6 +161,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.agentKindRaw = agentKindRaw
         self.agentModelRaw = agentModelRaw
         self.agentReasoningEffortRaw = agentReasoningEffortRaw
+        self.acpModelParameterSelections = ACPModelParameterSelection.normalized(acpModelParameterSelections)
         self.lastRunStateRaw = lastRunStateRaw
         self.autoEditEnabled = autoEditEnabled
         self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
@@ -193,6 +196,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case agentKindRaw
         case agentModelRaw
         case agentReasoningEffortRaw
+        case acpModelParameterSelections
         case lastRunStateRaw
         case autoEditEnabled
         case autoWakeOnOversightUpdates
@@ -228,6 +232,12 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         agentKindRaw = try container.decodeIfPresent(String.self, forKey: .agentKindRaw)
         agentModelRaw = try container.decodeIfPresent(String.self, forKey: .agentModelRaw)
         agentReasoningEffortRaw = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffortRaw)
+        acpModelParameterSelections = try ACPModelParameterSelection.normalized(
+            container.decodeIfPresent(
+                [ACPModelParameterSelection].self,
+                forKey: .acpModelParameterSelections
+            ) ?? []
+        )
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
         autoWakeOnOversightUpdates = try container.decodeIfPresent(
@@ -267,6 +277,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentKindRaw: agentKindRaw,
             agentModelRaw: agentModelRaw,
             agentReasoningEffortRaw: agentReasoningEffortRaw,
+            acpModelParameterSelections: acpModelParameterSelections,
             autoEditEnabled: autoEditEnabled,
             autoWakeOnOversightUpdates: autoWakeOnOversightUpdates,
             agentSessionLinkAutoWakeTargetSessionIDs: agentSessionLinkAutoWakeTargetSessionIDs,
@@ -288,6 +299,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentKind: agentKindRaw,
             agentModel: agentModelRaw,
             lastRunState: lastRunStateRaw,
+            acpModelParameterSelections: acpModelParameterSelections,
             parentSessionID: parentSessionID,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -309,6 +321,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && agentKindRaw == other.agentKindRaw
             && agentModelRaw == other.agentModelRaw
             && agentReasoningEffortRaw == other.agentReasoningEffortRaw
+            && acpModelParameterSelections == other.acpModelParameterSelections
             && lastRunStateRaw == other.lastRunStateRaw
             && autoEditEnabled == other.autoEditEnabled
             && autoWakeOnOversightUpdates == other.autoWakeOnOversightUpdates
@@ -355,6 +368,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentKindRaw: session.agentKind,
             agentModelRaw: session.agentModel,
             agentReasoningEffortRaw: session.agentReasoningEffort,
+            acpModelParameterSelections: session.acpModelParameterSelections,
             lastRunStateRaw: session.lastRunState,
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,

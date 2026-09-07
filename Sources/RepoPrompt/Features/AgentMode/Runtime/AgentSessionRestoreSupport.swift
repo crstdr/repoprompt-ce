@@ -349,6 +349,7 @@ enum AgentSessionRestoreSupport {
             agentKindRaw: session.agentKind,
             agentModelRaw: session.agentModel,
             agentReasoningEffortRaw: session.agentReasoningEffort,
+            acpModelParameterSelections: session.acpModelParameterSelections,
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
             agentSessionLinkAutoWakeTargetSessionIDs: session.agentSessionLinkAutoWakeTargetSessionIDs,
