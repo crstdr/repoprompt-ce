@@ -52,6 +52,47 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         super.tearDown()
     }
 
+    func testRepeatedCancellationKeepsRawProviderDispatchFenced() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        fixture.session.runState = .running
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        attempt.task?.cancel()
+        attempt.phase = .preparingDispatch
+        fixture.session.oversight.pendingAutoWake = attempt
+        let dispatchID = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        let gate = AutoWakeCatalogAuthorityGate()
+        let itemCount = fixture.session.items.count
+        let producer = Task { @MainActor in
+            _ = await gate.requirement()
+            let decorated = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+                "", session: fixture.session, dispatchID: dispatchID
+            )
+            let acquired = fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+                for: fixture.session, dispatchID: dispatchID
+            )
+            return !decorated.mustAbortDispatch && acquired
+        }
+        await gate.waitUntilEntered()
+        for reason: AgentSessionLinkAutoWakeCancellationReason in [.localUserWon, .localUserWon, .endpointInvalidated] {
+            fixture.viewModel.cancelAgentSessionLinkAutoWake(for: attempt.observerEndpoint, reason: reason)
+        }
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, attempt.wakeID)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkEffectiveDispatchID(
+            for: fixture.session, dispatchID: dispatchID
+        ).autoWakeID, attempt.wakeID)
+        await gate.open()
+        let wouldCallTransport = await producer.value
+        XCTAssertFalse(wouldCallTransport)
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: fixture.session, dispatchID: dispatchID)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertEqual(fixture.session.items.count, itemCount)
+        XCTAssertNotNil(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID])
+    }
+
     // MARK: - Dispatch identity
 
     /// The wake ID survives a round trip through the opaque dispatch ID.

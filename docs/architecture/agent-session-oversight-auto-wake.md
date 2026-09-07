@@ -415,11 +415,9 @@ Two rules follow.
 
 1. **Only a path that can prove no transport call happened may release a tombstone** — the
    preparation finalizer, the physical-acquisition refusal, or an explicit not-attempted settlement.
-2. **`cancelAgentSessionLinkAutoWake` is not idempotent across phases.** It converts
-   `.preparingDispatch` into a tombstone, but a *second* cancel of an already-tombstoned attempt
-   falls past both phase guards and clears the slot. Any new caller must check the phase first.
-   Repeated eligibility loss is the ordinary case, not an exotic one: a hard gate publishing again,
-   or a routine lane's snooze extension or idempotent selection repeat, can all re-drive that path.
+2. **Repeated cancellation preserves a tombstone for every wake type.** Once preparation is
+   cancelled, settings changes, local submits, and endpoint invalidation cannot clear its dispatch
+   fence. Only the owning preparation finalizer or a definitive no-call settlement may release it.
 
 A tombstone can never be rescheduled, so a publication absorbed while it stands schedules nothing.
 The preparation finalizer replays one ordinary evaluation after releasing it, which is what keeps
@@ -468,8 +466,7 @@ The larger root cause remains accepted deferred work: **the status wake attempt 
 provider claim is immutable, and the tombstone that fences an in-flight dispatch lives in the same
 single slot as the live attempt.** A future general remedy is one immutable in-flight dispatch record
 on `AgentTabSession`, separate from the mutable reservation. The bounded attention fixes must be
-absorbed into that record rather than duplicated. The general non-idempotent-cancel refactor beyond the
-single phase guard also remains deferred.
+absorbed into that record rather than duplicated.
 
 ### A returned catalog can get stuck saying the tool is gone
 

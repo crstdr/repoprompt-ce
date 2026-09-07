@@ -327,6 +327,7 @@ extension AgentModeViewModel {
         // cancellation" would be a lie in both directions. Let it settle instead — unless this is one
         // of the coordinator's own pre-dispatch decisions, which provably retracts nothing.
         guard attempt.phase != .dispatching || reason.definitivelyNoPhysicalCall else { return }
+        if attempt.phase == .cancelledBeforeDispatch, !reason.definitivelyNoPhysicalCall { return }
         if attempt.phase == .preparingDispatch, !reason.definitivelyNoPhysicalCall {
             // Preparation owns the only finalizer that can prove the transport was never called.
             // Mark cancellation intent, but do not cancel that finalizer out from under the attempt.

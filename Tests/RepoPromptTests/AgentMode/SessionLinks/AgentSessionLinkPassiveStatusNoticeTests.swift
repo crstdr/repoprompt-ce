@@ -486,6 +486,35 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         XCTAssertGreaterThan(reducer.snapshot.unacknowledgedOverflowCount, 0)
     }
 
+    func testPartialStatusReceiptsSettleAfterEqualOrNewerReceipt() {
+        for newer in [false, true] {
+            var reducer = overflowReducer()
+            let old = reducer.snapshot
+            let delivered = Array(old.entries.prefix(2))
+            if newer {
+                XCTAssertEqual(requestAttention(0, reducer: &reducer), .accepted)
+            }
+            let later = reducer.snapshot
+            reducer.apply(Reducer.Receipt(
+                snapshot: later, deliveredEntries: [],
+                deliveredAttentionRequests: later.attentionRequests,
+                overflowProducedThrough: later.overflowProduced
+            ))
+            let before = reducer.snapshot.queueRevision
+            let receipt = Reducer.Receipt(snapshot: old, deliveredEntries: delivered, overflowProducedThrough: 0)
+            reducer.apply(receipt)
+            XCTAssertTrue(reducer.snapshot.entries.allSatisfy { entry in
+                !delivered.contains { $0.reference == entry.reference }
+            })
+            XCTAssertGreaterThan(reducer.snapshot.queueRevision, before)
+            XCTAssertEqual(reducer.lastAcceptedReceiptRevision, later.queueRevision)
+            XCTAssertEqual(reducer.overflowAcknowledged, later.overflowProduced)
+            let settled = reducer.snapshot
+            reducer.apply(receipt)
+            XCTAssertEqual(reducer.snapshot, settled)
+        }
+    }
+
     func testDuplicateAndOutOfOrderReceiptsAreMonotonicAndIdempotent() {
         var reducer = makeReducer()
         reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
