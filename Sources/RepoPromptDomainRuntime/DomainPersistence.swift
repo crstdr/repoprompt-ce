@@ -651,6 +651,8 @@ package struct DomainPersistenceCoordinator {
         contextRevisions: [UUID: DomainRevisionState],
         contextTombstones: [UUID: UInt64],
         operations: [DomainRecordedOperation],
+        requiresMatchingConsolidationLifecycle: Bool = false,
+        requiresMatchingSavedDigest: Bool = true,
         now: Date
     ) async throws -> DomainPersistenceWorkingCommit {
         try await DomainBlockingIO.run { cancellation in
@@ -661,6 +663,8 @@ package struct DomainPersistenceCoordinator {
                 contextRevisions: contextRevisions,
                 contextTombstones: contextTombstones,
                 operations: operations,
+                requiresMatchingConsolidationLifecycle: requiresMatchingConsolidationLifecycle,
+                requiresMatchingSavedDigest: requiresMatchingSavedDigest,
                 now: now
             )
         }
@@ -808,14 +812,16 @@ package struct DomainPersistenceCoordinator {
 
     func refreshWorkspace(
         workspaceID: UUID,
-        fallbackFileURL: URL
+        fallbackFileURL: URL,
+        requireCatalogMembership: Bool = false
     ) async -> DomainPersistenceWorkspaceRefresh? {
         do {
             return try await DomainBlockingIO.run { cancellation in
                 try cancellation.check()
                 return blockingWorker(cancellation).refreshWorkspaceBlocking(
                     workspaceID: workspaceID,
-                    fallbackFileURL: fallbackFileURL
+                    fallbackFileURL: fallbackFileURL,
+                    requireCatalogMembership: requireCatalogMembership
                 )
             }
         } catch DomainPersistenceError.cancelled {
@@ -834,8 +840,14 @@ package struct DomainPersistenceCoordinator {
 
     private func refreshWorkspaceBlocking(
         workspaceID: UUID,
-        fallbackFileURL: URL
+        fallbackFileURL: URL,
+        requireCatalogMembership: Bool
     ) -> DomainPersistenceWorkspaceRefresh {
+        if requireCatalogMembership, fileManager.fileExists(atPath: deletionURL(workspaceID).path) {
+            return DomainPersistenceWorkspaceRefresh(
+                workspace: nil, workspaceIsDeleted: true, health: .writable, catalogRevision: 0
+            )
+        }
         guard let catalogData = try? Data(contentsOf: catalogURL) else {
             return DomainPersistenceWorkspaceRefresh(
                 workspace: loadWorkspace(workspaceID: workspaceID, fileURL: fallbackFileURL)?.workspace,
@@ -869,6 +881,9 @@ package struct DomainPersistenceCoordinator {
                 health: .degradedReadOnly(reason: "duplicate_workspace_catalog_id"),
                 catalogRevision: catalog.revision
             )
+        }
+        if requireCatalogMembership, matchingEntries.isEmpty {
+            return DomainPersistenceWorkspaceRefresh(workspace: nil, workspaceIsDeleted: isDeleted, health: .removed, catalogRevision: catalog.revision)
         }
         let fileURL = matchingEntries.first?.fileURL ?? fallbackFileURL
         return DomainPersistenceWorkspaceRefresh(
@@ -1326,6 +1341,8 @@ package struct DomainPersistenceCoordinator {
         contextRevisions: [UUID: DomainRevisionState],
         contextTombstones: [UUID: UInt64],
         operations: [DomainRecordedOperation],
+        requiresMatchingConsolidationLifecycle: Bool,
+        requiresMatchingSavedDigest: Bool,
         now: Date
     ) throws -> DomainPersistenceWorkingCommit {
         try ensureLazyMigration(now: now)
@@ -1335,6 +1352,13 @@ package struct DomainPersistenceCoordinator {
                 throw DomainPersistenceError.stateConflict(
                     expected: expectedRevision,
                     actual: durable.revisions.workingRevision
+                )
+            }
+            if requiresMatchingConsolidationLifecycle {
+                try requireConsolidationLifecycleMatch(
+                    document: document,
+                    durable: durable,
+                    requiresMatchingSavedDigest: requiresMatchingSavedDigest
                 )
             }
             let journal = DomainWorkingJournal(
@@ -1353,6 +1377,36 @@ package struct DomainPersistenceCoordinator {
             )
             try DomainPersistenceLock.atomicWrite(encoder.encode(journal), to: journalURL(document.workspaceID))
             return DomainPersistenceWorkingCommit(journal: journal, catalogRevision: catalogRevision)
+        }
+    }
+
+    private func requireConsolidationLifecycleMatch(
+        document: DomainWorkspaceDocument,
+        durable: DomainWorkingJournal,
+        requiresMatchingSavedDigest: Bool
+    ) throws {
+        guard let savedBytes = try? Data(contentsOf: document.fileURL),
+              !requiresMatchingSavedDigest
+              || DomainContentDigest.sha256(savedBytes) == durable.savedDigest,
+              let savedDocument = try? DomainWorkspaceDocument.decode(
+                  documentBytes: savedBytes,
+                  fileURL: document.fileURL
+              ),
+              let workingDocument = try? DomainWorkspaceDocument.decode(
+                  documentBytes: durable.workingDocument ?? savedBytes,
+                  fileURL: document.fileURL
+              ),
+              savedDocument.workspaceID == document.workspaceID,
+              workingDocument.workspaceID == document.workspaceID,
+              savedDocument.metadata.consolidatedIntoWorkspaceID
+              == document.metadata.consolidatedIntoWorkspaceID,
+              workingDocument.metadata.consolidatedIntoWorkspaceID
+              == document.metadata.consolidatedIntoWorkspaceID
+        else {
+            throw DomainPersistenceError.stateConflict(
+                expected: durable.revisions.workingRevision,
+                actual: durable.revisions.workingRevision
+            )
         }
     }
 

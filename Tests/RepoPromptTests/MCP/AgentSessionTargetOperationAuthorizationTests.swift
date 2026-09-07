@@ -502,6 +502,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
             agentKind: AgentProviderKind.codexExec.rawValue,
             agentModel: "codex",
             lastRunState: AgentSessionRunState.completed.rawValue,
+            acpModelParameterSelections: [],
             parentSessionID: parentSessionID,
             isMCPOriginated: true,
             worktreeBindingSummaries: [],

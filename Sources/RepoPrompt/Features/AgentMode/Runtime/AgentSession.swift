@@ -162,6 +162,9 @@ struct AgentSession: Codable, Identifiable {
     /// User-selected reasoning effort (Codex-only)
     var agentReasoningEffort: String?
 
+    /// Explicit provider-advertised ACP model parameters, stored independently from the base model.
+    var acpModelParameterSelections: [ACPModelParameterSelection]
+
     /// State of the last run
     var lastRunState: String?
 
@@ -242,6 +245,7 @@ struct AgentSession: Codable, Identifiable {
         agentKind: String? = nil,
         agentModel: String? = nil,
         agentReasoningEffort: String? = nil,
+        acpModelParameterSelections: [ACPModelParameterSelection] = [],
         lastRunState: String? = nil,
         providerSessionID: String? = nil,
         providerCleanupHandle: ProviderConversationCleanupHandle? = nil,
@@ -285,6 +289,7 @@ struct AgentSession: Codable, Identifiable {
         self.agentKind = agentKind
         self.agentModel = agentModel
         self.agentReasoningEffort = agentReasoningEffort
+        self.acpModelParameterSelections = ACPModelParameterSelection.normalized(acpModelParameterSelections)
         self.lastRunState = lastRunState
         self.providerSessionID = providerSessionID
         self.providerCleanupHandle = providerCleanupHandle
@@ -330,6 +335,7 @@ struct AgentSession: Codable, Identifiable {
         case agentKind
         case agentModel
         case agentReasoningEffort
+        case acpModelParameterSelections
         case lastRunState
         case providerSessionID
         case providerCleanupHandle
@@ -378,6 +384,9 @@ struct AgentSession: Codable, Identifiable {
         agentKind = try container.decodeIfPresent(String.self, forKey: .agentKind)
         agentModel = try container.decodeIfPresent(String.self, forKey: .agentModel)
         agentReasoningEffort = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffort)
+        acpModelParameterSelections = try ACPModelParameterSelection.normalized(
+            container.decodeIfPresent([ACPModelParameterSelection].self, forKey: .acpModelParameterSelections) ?? []
+        )
         lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
         providerCleanupHandle = try container.decodeIfPresent(ProviderConversationCleanupHandle.self, forKey: .providerCleanupHandle)

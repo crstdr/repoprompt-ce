@@ -122,6 +122,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
     package let customStoragePath: URL?
     package let isSystemWorkspace: Bool
     package let isHiddenInMenus: Bool
+    package let consolidatedIntoWorkspaceID: UUID?
     package let isEphemeral: Bool
     package let activeContextID: UUID?
     package let contexts: [DomainContextMetadata]
@@ -135,6 +136,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
         customStoragePath: URL?,
         isSystemWorkspace: Bool,
         isHiddenInMenus: Bool,
+        consolidatedIntoWorkspaceID: UUID? = nil,
         isEphemeral: Bool,
         activeContextID: UUID?,
         contexts: [DomainContextMetadata],
@@ -147,6 +149,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
         self.customStoragePath = customStoragePath
         self.isSystemWorkspace = isSystemWorkspace
         self.isHiddenInMenus = isHiddenInMenus
+        self.consolidatedIntoWorkspaceID = consolidatedIntoWorkspaceID
         self.isEphemeral = isEphemeral
         self.activeContextID = activeContextID
         self.contexts = contexts
@@ -191,6 +194,13 @@ package struct DomainWorkspaceSnapshot: Codable, Equatable {
     package let revisions: DomainRevisionState
     package let health: DomainAuthorityHealth
     package let contexts: [DomainContextSnapshot]
+}
+
+/// A target-only activation read. It never claims that the full catalog is ready.
+package struct DomainWorkspaceActivationSnapshot {
+    package let workspace: DomainWorkspaceSnapshot?
+    package let publicationSequence: UInt64
+    package let catalogRevision: UInt64
 }
 
 package struct DomainWorkspaceCatalogSnapshot: Equatable {
@@ -335,6 +345,8 @@ private enum DomainWorkspaceDocumentDecoder {
             customStoragePath: customStoragePath,
             isSystemWorkspace: object["isSystemWorkspace"] as? Bool ?? false,
             isHiddenInMenus: object["isHiddenInMenus"] as? Bool ?? false,
+            consolidatedIntoWorkspaceID: (object["consolidatedIntoWorkspaceID"] as? String)
+                .flatMap(UUID.init(uuidString:)),
             isEphemeral: object["ephemeralFlag"] as? Bool ?? false,
             activeContextID: (object["activeComposeTabID"] as? String).flatMap(UUID.init(uuidString:)),
             contexts: contexts,

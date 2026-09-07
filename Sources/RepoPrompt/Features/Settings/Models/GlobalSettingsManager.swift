@@ -330,6 +330,12 @@ protocol CodexHookApprovalSettingsProviding {
 @MainActor
 class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding {
     static let shared = GlobalSettingsStore()
+    private static let defaultUserDefaults: UserDefaults = {
+        if AppLaunchConfiguration.isUnitTestProcess {
+            return UserDefaults(suiteName: "RepoPromptCE.unit-settings.\(UUID().uuidString)")!
+        }
+        return .standard
+    }()
 
     private let defaults: UserDefaults
     private let fileStore: GlobalSettingsFileStoring
@@ -340,9 +346,15 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     @Published private(set) var agentModelsSettingsByWorkspaceID: [UUID: WorkspaceAgentModelsSettings] = [:]
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
-    /// UI surfaces this so the user can recover; RepoPrompt never auto-recovers.
+    /// UI surfaces this when the store cannot safely repair the document automatically.
     @Published private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason? {
         didSet { reconcilePersistenceBlockDismissal() }
+    }
+
+    /// True when a failed startup migration must be retried through the raw-preserving
+    /// transaction instead of the ordinary typed save path.
+    var isPendingPreservingMigrationRetry: Bool {
+        fileStore.hasPendingStartupMigration
     }
 
     @Published private(set) var sessionDismissedPersistenceBlockReason: GlobalSettingsPersistenceBlockReason?
@@ -361,11 +373,11 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     private var settingsWriteDiagnostics: [GlobalSettingsWriteDiagnostic] = []
 
     init(
-        defaults: UserDefaults = .standard,
+        defaults: UserDefaults? = nil,
         fileStore: GlobalSettingsFileStoring = GlobalSettingsFileStore(),
         invalidAgentModelsProfileAssertion: @escaping (String) -> Void = { assertionFailure($0) }
     ) {
-        self.defaults = defaults
+        self.defaults = defaults ?? Self.defaultUserDefaults
         self.fileStore = fileStore
         self.invalidAgentModelsProfileAssertion = invalidAgentModelsProfileAssertion
         load()
@@ -2349,6 +2361,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             }
         }
         let document = loadedExistingDocument ?? fileStore.loadOrCreateDefault()
+        let needsSchemaVersionUpgrade = document.requiredSchemaVersion > document.schemaVersion
         copySettings = document.copySettings
         let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
             chatSettings: document.chatSettings,
@@ -2367,7 +2380,10 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
         persistenceBlockReason = fileStore.blockReason
         if persistenceBlockReason == nil,
-           migratedContextBuilderState.didChange || seededFileSystemDefaults || disabledInvalidSync
+           migratedContextBuilderState.didChange
+           || seededFileSystemDefaults
+           || disabledInvalidSync
+           || needsSchemaVersionUpgrade
         {
             saveStartupMigration(includeModelSelectionRepair: disabledInvalidSync)
         }
@@ -2386,15 +2402,23 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
 
     /// User-initiated recovery when `persistenceBlockReason` is non-nil. The file store backs
     /// up the offending on-disk file, writes the current in-memory settings as a fresh
-    /// current-schema document, and clears the block; this method then re-reads state so the
-    /// store and observers refresh.
+    /// current-schema document, and clears the block on success. A failed replacement keeps
+    /// the current in-memory document and the file store's blocked state intact.
     /// Returns true only when recovery completed successfully.
     @discardableResult
     func recoverBlockedPersistenceAfterBackup() -> Bool {
-        let backedUp = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
+        let recovered = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
         objectWillChange.send()
-        load(notifyAgentModelsChanges: true)
-        return backedUp
+        if recovered {
+            load(notifyAgentModelsChanges: true)
+        } else {
+            // Recovery may have moved the original file before its replacement write failed.
+            // Do not reload a missing primary file: that would install and persist defaults.
+            // Keep the live document intact and surface the store's actionable blocked state so
+            // the user can retry the intended settings after fixing the underlying failure.
+            persistenceBlockReason = fileStore.blockReason
+        }
+        return recovered
     }
 
     /// User-initiated compatible import from a blocked newer/different-schema settings file.
@@ -2416,7 +2440,20 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     /// backing up or resetting the user's settings. Returns true when persistence is unblocked.
     @discardableResult
     func retryBlockedPersistenceSave() -> Bool {
-        save()
+        // Reload is an explicit, separate action: never overwrite another writer or
+        // persist provisional defaults through the generic save retry.
+        guard persistenceBlockReason != .changedOnDisk,
+              persistenceBlockReason != .missingOnDisk,
+              persistenceBlockReason != .loadFailed
+        else {
+            return false
+        }
+        if fileStore.hasPendingStartupMigration {
+            return persist {
+                try fileStore.retryStartupMigrationPreservingUnknownFields(makeDocument())
+            }
+        }
+        return save()
     }
 
     @discardableResult
@@ -2425,6 +2462,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             let oldGlobalProfile = globalAgentModelsProfile()
             let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
             let document = try fileStore.load()
+            let needsSchemaVersionUpgrade = document.requiredSchemaVersion > document.schemaVersion
             objectWillChange.send()
             copySettings = document.copySettings
             let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
@@ -2442,7 +2480,10 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
             persistenceBlockReason = fileStore.blockReason
             if persistenceBlockReason == nil,
-               migratedContextBuilderState.didChange || seededFileSystemDefaults || disabledInvalidSync
+               migratedContextBuilderState.didChange
+               || seededFileSystemDefaults
+               || disabledInvalidSync
+               || needsSchemaVersionUpgrade
             {
                 saveStartupMigration(includeModelSelectionRepair: disabledInvalidSync)
             }
