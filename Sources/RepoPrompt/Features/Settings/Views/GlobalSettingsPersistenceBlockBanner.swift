@@ -199,7 +199,7 @@ struct GlobalSettingsPersistenceBlockBanner: View {
         case .incompatibleSchema:
             "Global settings can't be saved: this settings file was written by a different or unrecognized RepoPrompt settings schema. The file is preserved and won't be modified. Changes won't persist until you import or recover."
         case .corruptUnrecoverable:
-            "Global settings can't be saved: the settings file is unreadable and couldn't be backed up. Changes won't persist until you recover."
+            "Global settings can't be saved: the settings file is unreadable or malformed and remains preserved. Changes won't persist until you explicitly recover it."
         case .saveFailed:
             if store.isPendingPreservingMigrationRetry {
                 "RepoPrompt could not finish updating your settings. Your original settings file is preserved. Check file permissions or available disk space, then try again."
@@ -215,7 +215,7 @@ struct GlobalSettingsPersistenceBlockBanner: View {
         case .loadFailed:
             "Global settings could not be loaded safely. Changes are only in memory and cannot be saved. Check file access and reload settings; reloading replaces unsaved in-memory changes."
         case .automaticSchemaNormalizationFailed:
-            "Global settings can't be saved: RepoPrompt identified a same-lineage schema v4 file that may only require schema v2, but couldn't safely verify, back up, and atomically normalize it. The original file is preserved. You can show the file or explicitly reset after a backup."
+            "Global settings can't be saved: RepoPrompt identified a settings file that may need only a version-marker repair, but couldn't safely verify, back up, and atomically repair it. The original file is preserved. You can show the file or explicitly reset after a backup."
         }
     }
 

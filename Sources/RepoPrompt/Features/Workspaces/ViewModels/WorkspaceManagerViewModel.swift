@@ -227,6 +227,7 @@ enum WorkspaceOpenBehavior {
 struct WorkspaceMenuQuery {
     var includeSystem: Bool = false
     var includeHidden: Bool = false
+    var includeTemporary: Bool = false
     var sortMostRecentFirst: Bool = true
 }
 
@@ -323,6 +324,7 @@ struct DomainWorkspaceAuthorityOperationError: LocalizedError {
 private enum WorkspaceDirectWriteError: LocalizedError {
     case domainAuthorityRequired
     case ephemeralWorkspace
+    case workspaceUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -330,6 +332,8 @@ private enum WorkspaceDirectWriteError: LocalizedError {
             "Runtime-owned workspaces must be written through the domain workspace authority."
         case .ephemeralWorkspace:
             "Ephemeral workspaces cannot be persisted."
+        case .workspaceUnavailable:
+            "The workspace is no longer available for persistence."
         }
     }
 }
@@ -666,10 +670,13 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var domainWorkspaceHealthByID: [UUID: DomainAuthorityHealth] = [:]
     private var workspaceRenameIntentByID: [UUID: UUID] = [:]
     private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
+    private var workspaceCreationTasksByID: [UUID: Task<Void, Never>] = [:]
     private var domainWorkspaceCatalogRevision: UInt64 = 0
     #if DEBUG
         private var workspaceSavePreparationDidFinishHandlerForTesting:
             (@Sendable (UUID, URL, Int) async -> Void)?
+        private var workspaceSaveAfterAuthoritySnapshotHandlerForTesting:
+            (@Sendable (UUID) async -> Void)?
         private var workspaceSaveAttemptCountByWorkspaceIDForTesting: [UUID: Int] = [:]
         private var workspaceSaveCapturePublicationCountByWorkspaceIDForTesting: [UUID: Int] = [:]
         private var cancelWorkingCommitAfterOutcomeWorkspaceIDsForTesting: Set<UUID> = []
@@ -1059,6 +1066,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
 
+        func setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(
+            _ handler: (@Sendable (UUID) async -> Void)?
+        ) {
+            workspaceSaveAfterAuthoritySnapshotHandlerForTesting = handler
+        }
+
         func resetWorkspaceSaveDiagnosticsForTesting() {
             workspaceSaveAttemptCountByWorkspaceIDForTesting.removeAll()
             workspaceSaveCapturePublicationCountByWorkspaceIDForTesting.removeAll()
@@ -1348,6 +1361,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         private var workspaceSwitchRecoveryWillBeginHandlerForTesting: (@MainActor () async -> Void)?
         private var workspaceSwitchReadinessDidInvalidateHandlerForTesting: (@MainActor () async -> Void)?
         private var workspaceHydrationGenerationDidAdvanceHandlerForTesting: (@MainActor () -> Void)?
+        private var workspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting: (@MainActor (UUID) async -> Void)?
+        private var workspaceSwitchDidFinishHandlerForTesting: (@MainActor (UUID) -> Void)?
     #endif
 
     private struct WorkspaceDidSwitchListener {
@@ -1468,6 +1483,11 @@ class WorkspaceManagerViewModel: ObservableObject {
     @MainActor
     func cancelActiveSessions() async {
         await switchSessionRegistry.cancelActiveSessions()
+    }
+
+    @MainActor
+    func cancelActiveSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
+        await switchSessionRegistry.cancelActiveSessions(for: deletionToken)
     }
 
     /// Registers a listener for active-workspace switches.
@@ -1674,6 +1694,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var workspaceSearchReadinessWaiters: [UUID: WorkspaceSearchReadinessWaiter] = [:]
     private var postCatalogRootWorkTasks: [UInt64: [Task<WorkspaceRootLoadFailure?, Never>]] = [:]
     private var returnToSystemAfterSwitchCancellationOperationID: UUID?
+    private var deletionCancellationTokenByWorkspaceSwitchOperationID: [UUID: WorkspaceDeletionCancellationToken] = [:]
     private var committedWorkspaceSwitchOperationID: UUID?
     private var recoveringWorkspaceSwitchOperationID: UUID?
     private var rootsUnloadedWorkspaceSwitchOperationID: UUID?
@@ -2990,8 +3011,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     // MARK: - CREATE
 
     @discardableResult
-    func createWorkspace(name: String, repoPaths: [String], ephemeral: Bool = false) -> WorkspaceModel {
-        var newWorkspace = WorkspaceModel(name: name, repoPaths: repoPaths)
+    func createWorkspace(name: String, repoPaths: [String], ephemeral: Bool = false, savedInLibrary: Bool = true) -> WorkspaceModel {
+        var newWorkspace = WorkspaceModel(name: name, repoPaths: repoPaths, isSavedWorkspace: savedInLibrary)
 
         // Mark as ephemeral if needed
         newWorkspace.isEphemeral = ephemeral
@@ -3010,7 +3031,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // Only save to disk and index if not ephemeral
         if !ephemeral {
-            Task {
+            workspaceCreationTasksByID[newWorkspace.id] = Task {
+                defer { workspaceCreationTasksByID.removeValue(forKey: newWorkspace.id) }
                 do {
                     _ = try ensureWorkspaceDirectoryExists(for: newWorkspace)
                     // Persist this new workspace file and flush before proceeding
@@ -3055,13 +3077,23 @@ class WorkspaceManagerViewModel: ObservableObject {
         return newWorkspace
     }
 
+    /// Wait for the target's own creation before taking the window's switch lease.
+    func finishWorkspaceCreation(workspaceIDs: Set<UUID>) async {
+        for workspaceID in workspaceIDs {
+            await workspaceCreationTasksByID[workspaceID]?.value
+        }
+    }
+
     // MARK: - Switch
 
     private func beginWorkspaceSwitchOperation(
         to newWorkspace: WorkspaceModel,
-        reason: String
+        reason: String,
+        deletionToken: WorkspaceDeletionCancellationToken? = nil
     ) -> UUID? {
-        guard activeWorkspaceSwitch == nil else { return nil }
+        guard activeWorkspaceSwitch == nil,
+              deletionToken?.isActive ?? true
+        else { return nil }
         let operationID = UUID()
         let now = switchTimingPolicy.now()
         activeWorkspaceSwitch = WorkspaceSwitchActivity(
@@ -3076,6 +3108,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             phaseStartedAt: now
         )
         isSwitchingWorkspace = true
+        if let deletionToken {
+            deletionCancellationTokenByWorkspaceSwitchOperationID[operationID] = deletionToken
+        }
         #if DEBUG
             debugRecordCodemapFullLoadAccepted(
                 operationID: operationID,
@@ -3087,6 +3122,13 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private func ownsWorkspaceSwitchOperation(_ operationID: UUID) -> Bool {
         activeWorkspaceSwitch?.operationID == operationID
+    }
+
+    private func deletionTokenAllowsSwitchMutation(_ operationID: UUID) -> Bool {
+        guard let deletionToken = deletionCancellationTokenByWorkspaceSwitchOperationID[operationID] else {
+            return true
+        }
+        return deletionToken.isActive || recoveringWorkspaceSwitchOperationID == operationID
     }
 
     private func advanceWorkspaceSwitchOperation(
@@ -3121,7 +3163,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             pendingSwitchConfirmation = nil
             pending.continuation.resume(returning: false)
         }
-        guard ownsWorkspaceSwitchOperation(operationID) else { return }
+        guard ownsWorkspaceSwitchOperation(operationID) else {
+            deletionCancellationTokenByWorkspaceSwitchOperationID.removeValue(forKey: operationID)
+            return
+        }
+        let finishedTargetWorkspaceID = activeWorkspaceSwitch?.targetWorkspaceID
         if returnToSystemAfterSwitchCancellationOperationID == operationID {
             returnToSystemAfterSwitchCancellationOperationID = nil
         }
@@ -3136,12 +3182,20 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         activeWorkspaceSwitch = nil
         isSwitchingWorkspace = false
+        deletionCancellationTokenByWorkspaceSwitchOperationID.removeValue(forKey: operationID)
         drainPendingRepoPathSyncIfNeeded()
         notifySwitchingComplete()
+        #if DEBUG
+            if let finishedTargetWorkspaceID {
+                workspaceSwitchDidFinishHandlerForTesting?(finishedTargetWorkspaceID)
+            }
+        #endif
     }
 
     private func markWorkspaceSwitchCommitted(_ operationID: UUID) {
-        guard ownsWorkspaceSwitchOperation(operationID) else { return }
+        guard ownsWorkspaceSwitchOperation(operationID),
+              deletionTokenAllowsSwitchMutation(operationID)
+        else { return }
         committedWorkspaceSwitchOperationID = operationID
     }
 
@@ -3161,7 +3215,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         reason: String
     ) {
         guard let activity = activeWorkspaceSwitch,
-              activity.operationID == operationID
+              activity.operationID == operationID,
+              deletionTokenAllowsSwitchMutation(operationID)
         else { return }
         activeWorkspaceSwitch = WorkspaceSwitchActivity(
             operationID: activity.operationID,
@@ -3183,11 +3238,25 @@ class WorkspaceManagerViewModel: ObservableObject {
         _ operationID: UUID,
         originalResult: WorkspaceSwitchResult
     ) async -> WorkspaceSwitchResult {
-        var finalResult = originalResult
         let originalActivity = activeWorkspaceSwitch
-        let explicitlyRequestedRecovery = returnToSystemAfterSwitchCancellationOperationID == operationID
         let crossedDestructiveBoundary = rootsUnloadedWorkspaceSwitchOperationID == operationID
             || activeWorkspaceID != originalActivity?.previousWorkspaceID
+        let deletionTokenExpired = deletionCancellationTokenByWorkspaceSwitchOperationID[operationID]?.isActive == false
+        if deletionTokenExpired, !originalResult.didSwitch, !crossedDestructiveBoundary {
+            let finalResult: WorkspaceSwitchResult
+            let targetName = activeWorkspaceSwitch?.targetWorkspaceName ?? "workspace"
+            finalResult = .cancelled(
+                "Workspace switch to \"\(targetName)\" was cancelled because deletion teardown timed out."
+            )
+            invalidateWorkspaceSearchReadiness()
+            #if DEBUG
+                debugRecordCodemapFullLoadCompletion(operationID: operationID, result: finalResult)
+            #endif
+            finishWorkspaceSwitchOperation(operationID)
+            return finalResult
+        }
+        var finalResult = originalResult
+        let explicitlyRequestedRecovery = returnToSystemAfterSwitchCancellationOperationID == operationID
         let needsRecovery = !originalResult.didSwitch
             && committedWorkspaceSwitchOperationID != operationID
             && (explicitlyRequestedRecovery || crossedDestructiveBoundary)
@@ -3204,7 +3273,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             let recoveryResult = await recoverWorkspaceSwitch(
                 operationID: operationID,
                 originalActivity: originalActivity,
-                explicitlyReturnToSystem: explicitlyRequestedRecovery
+                explicitlyReturnToSystem: explicitlyRequestedRecovery,
+                allowExpiredDeletionRecovery: deletionTokenExpired && crossedDestructiveBoundary
             )
             if !recoveryResult.didSwitch {
                 let detail = recoveryResult.message ?? "Unknown recovery failure."
@@ -3226,10 +3296,17 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func recoverWorkspaceSwitch(
         operationID: UUID,
         originalActivity: WorkspaceSwitchActivity,
-        explicitlyReturnToSystem: Bool
+        explicitlyReturnToSystem: Bool,
+        allowExpiredDeletionRecovery: Bool = false
     ) async -> WorkspaceSwitchResult {
         guard ownsWorkspaceSwitchOperation(operationID) else {
             return .blocked("Workspace switch recovery lost operation ownership.")
+        }
+        if let deletionToken = deletionCancellationTokenByWorkspaceSwitchOperationID[operationID],
+           !deletionToken.isActive,
+           !allowExpiredDeletionRecovery
+        {
+            return .cancelled("Workspace switch recovery was cancelled because deletion teardown timed out.")
         }
 
         let fallback = workspaces.first(where: { $0.isSystemWorkspace }) ?? getOrCreateSystemWorkspace()
@@ -3257,11 +3334,23 @@ class WorkspaceManagerViewModel: ObservableObject {
                 await workspaceSwitchRecoveryWillBeginHandlerForTesting()
             }
         #endif
+        if let deletionToken = deletionCancellationTokenByWorkspaceSwitchOperationID[operationID],
+           !deletionToken.isActive,
+           !allowExpiredDeletionRecovery
+        {
+            return .cancelled("Workspace switch recovery was cancelled because deletion teardown timed out.")
+        }
 
         var failures: [String] = []
         for recoveryTarget in recoveryTargets {
             guard ownsWorkspaceSwitchOperation(operationID) else {
                 return .blocked("Workspace switch recovery was superseded before fallback activation.")
+            }
+            if let deletionToken = deletionCancellationTokenByWorkspaceSwitchOperationID[operationID],
+               !deletionToken.isActive,
+               !allowExpiredDeletionRecovery
+            {
+                return .cancelled("Workspace switch recovery was cancelled because deletion teardown timed out.")
             }
             if activeWorkspaceID == recoveryTarget.id,
                rootsUnloadedWorkspaceSwitchOperationID != operationID
@@ -3278,6 +3367,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 to: recoveryTarget,
                 reason: recoveryReason
             )
+            let deletionToken = allowExpiredDeletionRecovery
+                ? nil
+                : deletionCancellationTokenByWorkspaceSwitchOperationID[operationID]
             let recoveryTask = Task { @MainActor [weak self] in
                 guard let self else {
                     return WorkspaceSwitchResult.blocked("Workspace switch recovery manager was released.")
@@ -3286,10 +3378,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                     to: recoveryTarget,
                     saveState: false,
                     reason: recoveryReason,
-                    operationID: operationID
+                    operationID: operationID,
+                    deletionToken: deletionToken
                 )
             }
             let result = await recoveryTask.value
+            if let deletionToken = deletionCancellationTokenByWorkspaceSwitchOperationID[operationID],
+               !deletionToken.isActive,
+               !allowExpiredDeletionRecovery
+            {
+                return .cancelled("Workspace switch recovery was cancelled because deletion teardown timed out.")
+            }
             if result.didSwitch {
                 return result
             }
@@ -3358,6 +3457,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         {
             return nil
         }
+        if let deletionToken = deletionCancellationTokenByWorkspaceSwitchOperationID[operationID],
+           !deletionToken.isActive
+        {
+            return .cancelled(
+                "Workspace switch to \"\(targetWorkspace.name)\" was cancelled because deletion teardown timed out at \(boundary)."
+            )
+        }
         guard Task.isCancelled || returnToSystemAfterSwitchCancellationOperationID == operationID else { return nil }
         return .cancelled("Workspace switch to \"\(targetWorkspace.name)\" was cancelled at \(boundary).")
     }
@@ -3387,6 +3493,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
+        await finishWorkspaceCreation(workspaceIDs: [newWorkspace.id])
         let currentBeforeAdmission = workspace(withID: newWorkspace.id)
         if newWorkspace.consolidatedIntoWorkspaceID != nil
             || currentBeforeAdmission?.consolidatedIntoWorkspaceID != nil
@@ -3644,6 +3751,18 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceSwitchRecoveryWillBeginHandlerForTesting = handler
         }
 
+        func setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting(
+            _ handler: (@MainActor (UUID) async -> Void)?
+        ) {
+            workspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting = handler
+        }
+
+        func setWorkspaceSwitchDidFinishHandlerForTesting(
+            _ handler: (@MainActor (UUID) -> Void)?
+        ) {
+            workspaceSwitchDidFinishHandlerForTesting = handler
+        }
+
         func setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(
             _ handler: (@MainActor () async -> Void)?
         ) {
@@ -3815,7 +3934,19 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     @discardableResult
-    func switchWorkspace(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "internal") async -> WorkspaceSwitchResult {
+    func switchWorkspace(
+        to newWorkspace: WorkspaceModel,
+        saveState: Bool = true,
+        reason: String = "internal",
+        deletionToken: WorkspaceDeletionCancellationToken? = nil
+    ) async -> WorkspaceSwitchResult {
+        guard deletionToken?.isActive ?? true else {
+            return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out.")
+        }
+        await finishWorkspaceCreation(workspaceIDs: [newWorkspace.id])
+        guard deletionToken?.isActive ?? true else {
+            return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out.")
+        }
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace) {
             return concurrentResult
         }
@@ -3832,7 +3963,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         #if DEBUG
             await workspaceActivationLeaseDidAcquireHandlerForTesting?(newWorkspace.id)
         #endif
-        guard let operationID = beginWorkspaceSwitchOperation(to: newWorkspace, reason: reason) else {
+        guard let operationID = beginWorkspaceSwitchOperation(
+            to: newWorkspace,
+            reason: reason,
+            deletionToken: deletionToken
+        ) else {
             return concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace)
                 ?? .blocked("Workspace switch already in progress.")
         }
@@ -3840,7 +3975,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             to: newWorkspace,
             saveState: saveState,
             reason: reason,
-            operationID: operationID
+            operationID: operationID,
+            deletionToken: deletionToken
         )
         return await completeWorkspaceSwitchOperation(
             operationID,
@@ -3852,10 +3988,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         to newWorkspace: WorkspaceModel,
         saveState: Bool,
         reason: String,
-        operationID: UUID
+        operationID: UUID,
+        deletionToken: WorkspaceDeletionCancellationToken? = nil
     ) async -> WorkspaceSwitchResult {
         guard ownsWorkspaceSwitchOperation(operationID) else {
             return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was superseded before preparation.")
+        }
+        guard deletionToken?.isActive ?? true else {
+            return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out.")
         }
         guard !isRefreshing else {
             return .blocked("Cannot switch workspaces while refresh is in progress.")
@@ -4036,6 +4176,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             if FileManager.default.fileExists(atPath: diskURL.path) {
                 do {
                     let upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL, scheduleNormalizationWriteback: false)
+                    if let cancellation = cancellationResult(
+                        operationID: operationID,
+                        targetWorkspace: newWorkspace,
+                        boundary: "loading target workspace"
+                    ) {
+                        return cancellation
+                    }
                     guard let publishIndex = workspaceIndex(for: targetBeforeLoad.id),
                           workspaces[publishIndex] == targetBeforeLoad
                     else {
@@ -4060,6 +4207,16 @@ class WorkspaceManagerViewModel: ObservableObject {
             ) else {
                 return .blocked("Workspace \"\(loadedWorkspace.name)\" could not be verified for activation. Refresh or restore it first.")
             }
+            #if DEBUG
+                await workspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting?(loadedWorkspace.id)
+            #endif
+            if let cancellation = cancellationResult(
+                operationID: operationID,
+                targetWorkspace: newWorkspace,
+                boundary: "publishing active workspace"
+            ) {
+                return cancellation
+            }
             activeWorkspaceID = loadedWorkspace.id // Set the active ID
         } else {
             let diskURL = workspaceFileURL(for: newWorkspace)
@@ -4071,6 +4228,13 @@ class WorkspaceManagerViewModel: ObservableObject {
 
             do {
                 let upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL, scheduleNormalizationWriteback: false)
+                if let cancellation = cancellationResult(
+                    operationID: operationID,
+                    targetWorkspace: newWorkspace,
+                    boundary: "loading target workspace"
+                ) {
+                    return cancellation
+                }
                 guard workspaceIndex(for: upgraded.id) == nil else {
                     return .blocked("Workspace \"\(newWorkspace.name)\" changed while it was being loaded.")
                 }
@@ -4085,6 +4249,16 @@ class WorkspaceManagerViewModel: ObservableObject {
                     workspaceID: upgraded.id
                 ) else {
                     return .blocked("Workspace \"\(upgraded.name)\" could not be verified for activation. Refresh or restore it first.")
+                }
+                #if DEBUG
+                    await workspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting?(upgraded.id)
+                #endif
+                if let cancellation = cancellationResult(
+                    operationID: operationID,
+                    targetWorkspace: newWorkspace,
+                    boundary: "publishing active workspace"
+                ) {
+                    return cancellation
                 }
                 activeWorkspaceID = upgraded.id
             } catch {
@@ -4389,7 +4563,53 @@ class WorkspaceManagerViewModel: ObservableObject {
         #endif
         let fallback = workspaces.first(where: { $0.isSystemWorkspace }) ?? getOrCreateSystemWorkspace()
         guard activeWorkspaceID != fallback.id else { return }
-        await switchWorkspace(to: fallback, saveState: false)
+        _ = await switchWorkspace(to: fallback, saveState: false)
+    }
+
+    /// Called only after the user confirms deletion, while the coordinator owns its lease.
+    func closeForConfirmedWorkspaceDeletion(
+        workspaceID: UUID,
+        deletionToken: WorkspaceDeletionCancellationToken? = nil
+    ) async -> String? {
+        guard deletionToken?.isActive ?? true else { return nil }
+        guard activeWorkspaceID == workspaceID else { return nil }
+        guard activeWorkspace?.isSystemWorkspace != true else {
+            return "The welcome workspace is not a saved workspace."
+        }
+        guard !isSwitchingWorkspace else {
+            return "Workspace switch is in progress. Wait for it to finish and try deleting this workspace again."
+        }
+        await cancelActiveSessions(for: deletionToken)
+        guard deletionToken?.isActive ?? true else { return nil }
+        guard !isSwitchingWorkspace else {
+            return "Workspace switch is in progress. Wait for it to finish and try deleting this workspace again."
+        }
+        fileManager.cancelAllLoadingTasks()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while isSwitchingWorkspace || isRefreshing || isChatBusy,
+              deletionToken?.isActive ?? true,
+              ContinuousClock.now < deadline
+        {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        guard deletionToken?.isActive ?? true else { return nil }
+        guard activeWorkspaceID == workspaceID else { return nil }
+        let fallback = workspaces.first(where: { $0.isSystemWorkspace }) ?? getOrCreateSystemWorkspace()
+        guard deletionToken?.isActive ?? true else { return nil }
+        let result = await switchWorkspace(
+            to: fallback,
+            saveState: false,
+            reason: "confirmedWorkspaceDeletion",
+            deletionToken: deletionToken
+        )
+        guard deletionToken?.isActive ?? true else { return nil }
+        guard result.didSwitch else {
+            return "Could not close the workspace after stopping its running work: \(result)"
+        }
+        guard activeWorkspaceID != workspaceID else {
+            return "Could not close the workspace because it remained active after switch recovery. Try deleting it again."
+        }
+        return nil
     }
 
     /// Runs git data maintenance when a workspace is opened.
@@ -5121,19 +5341,18 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Revalidates one workspace's consolidated-restore state against the authority.
     ///
-    /// `canActivateWorkspaceAfterAuthorityCheck` calls this for every non-ephemeral switch in
-    /// authority mode, so a switch does pay for a catalog snapshot and, when the workspace is
-    /// suspected, a direct saved-document read. That is deliberate: activation must not be decided
-    /// from the decode cache, which is exactly what let a retired workspace be activated.
+    /// Read only the target's authoritative document and recovery state. Catalog-wide bootstrap
+    /// and reconciliation must not hold the window's only workspace switch.
     private func refreshAuthorityConsolidatedRestoreClassification(
         workspaceID: UUID
     ) async -> AuthorityConsolidatedRestoreClassification {
         guard let domainWorkspaceAuthorityClient else { return .clear }
-        let snapshot = await domainWorkspaceAuthorityClient.snapshot()
-        guard snapshot.isBootstrapped,
-              let authoritative = snapshot.workspaces.first(where: {
-                  $0.document.workspaceID == workspaceID
-              }),
+        guard let target = workspace(withID: workspaceID) else { return .unavailable }
+        let snapshot = await domainWorkspaceAuthorityClient.activationSnapshot(
+            workspaceID: workspaceID,
+            fileURL: workspaceFileURL(for: target)
+        )
+        guard let authoritative = snapshot.workspace,
               let working = try? Self.decodeDomainWorkspaceProjection(
                   documentBytes: authoritative.document.documentBytes,
                   fileURL: authoritative.document.fileURL
@@ -5198,6 +5417,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// clear classification, followed by one final local projection check.
     private func canActivateWorkspaceAfterAuthorityCheck(workspaceID: UUID) async -> Bool {
         guard let target = workspace(withID: workspaceID) else { return false }
+        // The empty system workspace is the window shell, not a saved project activation.
+        // Its initialization must be independent of catalog migration and recovery.
+        if target.isSystemWorkspace, target.repoPaths.isEmpty,
+           target.consolidatedIntoWorkspaceID == nil,
+           !pendingConsolidatedRestoreIDs.contains(workspaceID)
+        {
+            return true
+        }
         if domainWorkspaceAuthorityClient != nil, !target.isEphemeral {
             switch await refreshAuthorityConsolidatedRestoreClassification(workspaceID: workspaceID) {
             case .clear:
@@ -5225,10 +5452,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         lastDomainProjectionSequence = publicationSequence
         let persistedProjection = projectedWorkspaces.filter { !$0.isEphemeral }
         let persistedWorkspaceIDs = Set(persistedProjection.map(\.id))
-        let localProjection = Self.preservingLocalEphemeralWorkspaces(
+        var localProjection = Self.preservingLocalEphemeralWorkspaces(
             in: persistedProjection,
             currentWorkspaces: workspaces
         )
+        // A confirmed deletion can time out while an explicitly created workspace is still
+        // publishing its first authority record. Keep that local creation visible until its own
+        // task finishes; otherwise the reload below would make the later create fail closed and
+        // strand the user's new workspace after a deletion retry.
+        localProjection.append(contentsOf: workspaces.filter { workspace in
+            !workspace.isEphemeral
+                && !persistedWorkspaceIDs.contains(workspace.id)
+                && workspaceCreationTasksByID[workspace.id] != nil
+        })
         if domainWorkspaceAuthorityClient != nil {
             // A projected canonical transition (external reload, cross-window commit, deletion)
             // can replace workspace content without touching this manager's dirty-tracking
@@ -9494,8 +9730,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "System workspaces cannot be deleted."
             } else if protectedWorkspaceIDs.contains(metadata.workspaceID) {
                 "Workspace is active in an open window."
-            } else if metadata.agentIdentityClaims.contains(where: \.requiresProtection) {
-                "Workspace contains an active or pinned agent session."
             } else {
                 nil
             }
@@ -9516,19 +9750,20 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func deleteWorkspacesAsync(
         workspaceIDs: Set<UUID>,
+        closeOpenWorkspaces: Bool = false,
         leakedTestFixtureWorkspaceIDs: Set<UUID> = []
     ) async -> WorkspaceBulkDeleteResult {
         var result = WorkspaceBulkDeleteResult()
-        guard workspaceIDs.count <= WorkspaceBulkDeletePolicy.maximumWorkspaceCount else {
-            result.requestFailureReason = "Bulk deletion is limited to \(WorkspaceBulkDeletePolicy.maximumWorkspaceCount) workspaces per request; no records were changed."
-            return result
-        }
         guard let domainWorkspaceAuthorityClient else {
             result.requestFailureReason = "Authoritative workspace runtime is unavailable; no records were changed."
             return result
         }
 
-        let deletionClaim = workspaceActivityCoordinator.claimDeletion(workspaceIDs: workspaceIDs)
+        let deletionClaim: WorkspaceActivityCoordinator.DeletionClaim = if closeOpenWorkspaces {
+            await workspaceActivityCoordinator.claimConfirmedDeletion(workspaceIDs: workspaceIDs)
+        } else {
+            workspaceActivityCoordinator.claimDeletion(workspaceIDs: workspaceIDs)
+        }
         defer { workspaceActivityCoordinator.releaseDeletion(deletionClaim.lease) }
         result.skippedReasonsByWorkspaceID = deletionClaim.blockedReasonsByWorkspaceID
 
@@ -9575,18 +9810,19 @@ class WorkspaceManagerViewModel: ObservableObject {
                 result.skippedReasonsByWorkspaceID[workspaceID] = "System workspaces cannot be deleted."
                 continue
             }
-            if metadata.agentIdentityClaims.contains(where: \.requiresProtection) {
-                result.skippedReasonsByWorkspaceID[workspaceID] = "Workspace contains an active or pinned agent session."
-                continue
-            }
 
             #if DEBUG
                 await workspaceDeleteWillExecuteHandlerForTesting?(workspaceID)
             #endif
+            // Confirmation authorizes deleting these identities, including their latest
+            // saved history. Closing a window can publish a final save or update Default;
+            // those revisions must not invalidate the user's deletion. The authority
+            // captures current revisions under its mutation lock. Automatic cleanup
+            // still requires the exact reviewed catalog and workspace revisions.
             let outcome = await domainWorkspaceAuthorityClient.delete(
                 workspaceID: workspaceID,
-                expectedCatalogRevision: snapshot.catalogRevision,
-                expectedWorkspaceRevision: authoritative.revisions.workingRevision
+                expectedCatalogRevision: closeOpenWorkspaces ? nil : snapshot.catalogRevision,
+                expectedWorkspaceRevision: closeOpenWorkspaces ? nil : authoritative.revisions.workingRevision
             )
             if Self.isSuccessfulDomainOutcome(outcome) {
                 result.deletedWorkspaceIDs.append(workspaceID)
@@ -9644,10 +9880,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         if workspace.isSystemWorkspace {
             return "System workspaces cannot be deleted."
         }
-        let protectedTabs = workspace.composeTabs + workspace.stashedTabs.map(\.tab)
-        if protectedTabs.contains(where: { $0.activeAgentSessionID != nil || $0.isPinned }) {
-            return "Workspace contains an active or pinned agent session."
-        }
         return nil
     }
 
@@ -9697,9 +9929,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return true
             }
             let metadata = authoritative.document.metadata
-            guard !metadata.isSystemWorkspace,
-                  !metadata.agentIdentityClaims.contains(where: \.requiresProtection)
-            else { return false }
+            guard !metadata.isSystemWorkspace else { return false }
 
             let outcome = await domainWorkspaceAuthorityClient.delete(
                 workspaceID: workspace.id,
@@ -11721,7 +11951,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             }.value
         }
         let workspaceToSave = mergeResult.workspace
-        guard self.workspace(withID: workspaceToSave.id)?.isEphemeral != true else {
+        guard let currentWorkspace = self.workspace(withID: workspaceToSave.id) else {
+            throw WorkspaceDirectWriteError.workspaceUnavailable
+        }
+        guard !currentWorkspace.isEphemeral else {
             throw WorkspaceDirectWriteError.ephemeralWorkspace
         }
 
@@ -11735,6 +11968,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         try Task.checkCancellation()
         if !requiresExactSnapshotAttempt {
             try validateConsolidationLifecycle(workspaceToSave)
+        }
+        guard self.workspace(withID: workspace.id) != nil else {
+            throw WorkspaceDirectWriteError.workspaceUnavailable
         }
         guard self.workspace(withID: workspace.id)?.isEphemeral != true else {
             throw WorkspaceDirectWriteError.ephemeralWorkspace
@@ -11827,6 +12063,15 @@ class WorkspaceManagerViewModel: ObservableObject {
                 || (phasedOutcome.working == nil && exactExpectedRevisionState?.dirtyRevision != nil)
         } else {
             let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+            #if DEBUG
+                await workspaceSaveAfterAuthoritySnapshotHandlerForTesting?(workspaceToSave.id)
+            #endif
+            guard self.workspace(withID: workspaceToSave.id) != nil else {
+                throw WorkspaceDirectWriteError.workspaceUnavailable
+            }
+            guard self.workspace(withID: workspaceToSave.id)?.isEphemeral != true else {
+                throw WorkspaceDirectWriteError.ephemeralWorkspace
+            }
             try validateConsolidationLifecycle(workspaceToSave)
             let exists = snapshot.workspaces.contains {
                 $0.document.workspaceID == workspaceToSave.id
@@ -11841,12 +12086,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                     expectedContentDigest: domainWorkspaceDigestsByID[workspaceToSave.id],
                     operationIDs: .init()
                 )
-            } else {
+            } else if source == .createWorkspace {
+                // Only the explicit new-workspace path may create an authority record. Every
+                // ordinary save must fail closed when its UUID is absent; otherwise a stale save
+                // that resumes after confirmed deletion would recreate the tombstoned identity.
                 try await domainWorkspaceAuthorityClient.create(
                     workspaceToSave,
                     fileURL: targetURL,
                     operationID: UUID()
                 )
+            } else {
+                throw WorkspaceDirectWriteError.workspaceUnavailable
             }
         }
         if !requiresExactSnapshotAttempt {
@@ -12588,10 +12838,36 @@ class WorkspaceManagerViewModel: ObservableObject {
         if !query.includeHidden {
             items = items.filter { !$0.isHiddenInMenus }
         }
+        if !query.includeTemporary {
+            items = items.filter { !$0.isTemporaryWorkspace }
+        }
         if query.sortMostRecentFirst {
-            items = items.sorted { $0.dateModified > $1.dateModified }
+            items = items.sorted {
+                if $0.lastUsed != $1.lastUsed { return $0.lastUsed > $1.lastUsed }
+                let order = $0.name.localizedCaseInsensitiveCompare($1.name)
+                return order == .orderedSame ? $0.id.uuidString < $1.id.uuidString : order == .orderedAscending
+            }
         }
         return items
+    }
+
+    /// Only explicit UI opens advance library recency; autosave and MCP activity do not.
+    @discardableResult
+    func openWorkspaceFromLibrary(_ workspace: WorkspaceModel) async -> WorkspaceSwitchResult {
+        let result = await requestWorkspaceSwitch(to: workspace, reason: "user")
+        if result.didSwitch, let index = workspaceIndex(for: workspace.id) {
+            workspaces[index].lastUsed = Date()
+            bumpStateVersion(for: workspace.id)
+            await saveWorkspaceAsync(workspaceID: workspace.id, fileURL: workspaceFileURL(for: workspaces[index]), source: "libraryOpen")
+        }
+        return result
+    }
+
+    func setWorkspaceLibraryMembership(_ workspace: WorkspaceModel, saved: Bool) async {
+        guard let index = workspaceIndex(for: workspace.id), !workspaces[index].isEphemeral else { return }
+        workspaces[index].isSavedWorkspace = saved
+        bumpStateVersion(for: workspace.id)
+        await saveWorkspaceAsync(workspaceID: workspace.id, fileURL: workspaceFileURL(for: workspaces[index]), source: "libraryMembership")
     }
 
     @MainActor
