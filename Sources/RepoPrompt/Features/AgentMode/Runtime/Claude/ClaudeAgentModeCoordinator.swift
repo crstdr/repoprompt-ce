@@ -96,7 +96,7 @@ final class ClaudeAgentModeCoordinator {
             _ session: AgentTabSession,
             _ dispatchID: AgentSessionLinkPromptDispatchID
         ) -> Void
-        let acceptAgentSessionLinkPromptClaim: @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
+        let acceptAgentSessionLinkPromptClaim: @MainActor (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
 
         init(
             isSessionCurrent: @escaping @MainActor (_ session: AgentTabSession) -> Bool,
@@ -127,7 +127,7 @@ final class ClaudeAgentModeCoordinator {
                 _ session: AgentTabSession,
                 _ dispatchID: AgentSessionLinkPromptDispatchID
             ) -> Void,
-            acceptAgentSessionLinkPromptClaim: @escaping @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
+            acceptAgentSessionLinkPromptClaim: @escaping @MainActor (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
         ) {
             self.isSessionCurrent = isSessionCurrent
             self.requestUIRefresh = requestUIRefresh
@@ -158,7 +158,7 @@ final class ClaudeAgentModeCoordinator {
                 acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
                 recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
                 recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
-                acceptAgentSessionLinkPromptClaim: { _ in }
+                acceptAgentSessionLinkPromptClaim: { _, _, _ in }
             )
         }
     }
@@ -1206,7 +1206,7 @@ final class ClaudeAgentModeCoordinator {
                 let turnID = try await controller.sendUserMessage(providerBoundText)
                 // The returned provider turn ID is the acceptance signal. Acknowledge before the
                 // currency guard: even a locally superseded turn delivered this supplement.
-                hostCapabilities.acceptAgentSessionLinkPromptClaim(monitoring.claim)
+                hostCapabilities.acceptAgentSessionLinkPromptClaim(session, monitoring.dispatchContext, monitoring.claim)
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {

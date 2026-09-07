@@ -423,7 +423,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
             queueEpoch: Self.queueEpoch,
             queueRevision: 1,
             wakeFingerprint: Self.laneSnapshot(observerEndpoint: endpoint).wakeEligibilityFingerprint,
-            requiredAttentionOccurrence: nil,
+            admissionBasis: .routineStatusOrOverflow,
             attemptedFingerprint: nil,
             physicalOutcome: .notAttempted,
             phase: .dispatching,

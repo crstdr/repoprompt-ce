@@ -419,6 +419,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             queueEpoch: queueEpoch,
             queueRevision: 1,
             wakeFingerprint: snapshot.wakeEligibilityFingerprint,
+            admissionBasis: .routineStatusOrOverflow,
             attemptedFingerprint: nil,
             physicalOutcome: .notAttempted,
             phase: .preparingDispatch,
@@ -1681,7 +1682,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     physicalDispatchNotAttemptedCount += 1
                 },
                 recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
-                acceptAgentSessionLinkPromptClaim: { _ in }
+                acceptAgentSessionLinkPromptClaim: { _, _, _ in }
             ),
             providerBindingService: AgentModeProviderBindingService()
         )
@@ -1760,7 +1761,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     physicalDispatchNotAttemptedCount += 1
                 },
                 recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
-                acceptAgentSessionLinkPromptClaim: { _ in }
+                acceptAgentSessionLinkPromptClaim: { _, _, _ in }
             ),
             providerBindingService: providerBindingService
         )

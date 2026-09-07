@@ -657,6 +657,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Ephemeral per-observer claim bookkeeping for the oversight prompt supplement.
     let agentSessionLinkPromptClaimStore = AgentSessionLinkOutboundPromptClaimStore()
 
+    /// Host liveness is read synchronously at every periodic admission/fence; injectable for clock tests.
+    var agentSessionLinkPeriodicObserverIsLive: (DomainAgentSessionLinkEndpointIdentity) -> Bool = {
+        AgentSessionLinkRuntimeBridge.shared.isPeriodicWakeObserverLive(for: $0)
+    }
+
     // MARK: - Dependencies
 
     let windowID: Int
@@ -1825,8 +1830,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             recordAgentSessionLinkPhysicalDispatchFailure: { [weak self] session, dispatchID in
                 self?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
             },
-            acceptAgentSessionLinkPromptClaim: { [weak self] claim in
-                self?.acceptAgentSessionLinkPromptClaim(claim)
+            acceptAgentSessionLinkPromptClaim: { [weak self] session, context, claim in
+                self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
             }
         )
     }
@@ -2677,8 +2682,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 recordAgentSessionLinkPhysicalDispatchFailure: { [weak self] session, dispatchID in
                     self?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
                 },
-                acceptAgentSessionLinkPrompt: { [weak self] claim in
-                    self?.acceptAgentSessionLinkPromptClaim(claim)
+                acceptAgentSessionLinkPrompt: { [weak self] session, context, claim in
+                    self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
                 }
             ),
             interactions: .init(
@@ -4161,6 +4166,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.autoEditEnabled = indexEntry.autoEditEnabled
         session.oversight.autoWakeOnUpdates = indexEntry.autoWakeOnOversightUpdates
         session.oversight.autoWakeTargetSessionIDs = indexEntry.agentSessionLinkAutoWakeTargetSessionIDs
+        session.oversight.routineWakeIntervalEnabled = indexEntry.routineWakeIntervalEnabled
+        session.oversight.routineWakeIntervalSeconds = AgentSessionLinkRoutineWakeInterval.normalized(indexEntry.routineWakeIntervalSeconds)
+        session.oversight.periodicIdleWakeEnabled = indexEntry.periodicIdleWakeEnabled
+        session.oversight.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(indexEntry.periodicIdleWakeIntervalSeconds)
     }
 
     func applyTranscriptViewportBindingState(
@@ -4996,6 +5005,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func restoreAgentSessionLinkState(from agentSession: AgentSession, to session: TabSession) {
         session.oversight.autoWakeOnUpdates = agentSession.autoWakeOnOversightUpdates
         session.oversight.autoWakeTargetSessionIDs = agentSession.agentSessionLinkAutoWakeTargetSessionIDs
+        session.oversight.routineWakeIntervalEnabled = agentSession.routineWakeIntervalEnabled
+        session.oversight.routineWakeIntervalSeconds = AgentSessionLinkRoutineWakeInterval.normalized(agentSession.routineWakeIntervalSeconds)
+        session.oversight.periodicIdleWakeEnabled = agentSession.periodicIdleWakeEnabled
+        session.oversight.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(agentSession.periodicIdleWakeIntervalSeconds)
     }
 
     @discardableResult
@@ -7414,6 +7427,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 autoEditEnabled: existingEntry.autoEditEnabled,
                 autoWakeOnOversightUpdates: existingEntry.autoWakeOnOversightUpdates,
                 agentSessionLinkAutoWakeTargetSessionIDs: existingEntry.agentSessionLinkAutoWakeTargetSessionIDs,
+                routineWakeIntervalEnabled: existingEntry.routineWakeIntervalEnabled,
+                routineWakeIntervalSeconds: existingEntry.routineWakeIntervalSeconds,
+                periodicIdleWakeEnabled: existingEntry.periodicIdleWakeEnabled,
+                periodicIdleWakeIntervalSeconds: existingEntry.periodicIdleWakeIntervalSeconds,
                 parentSessionID: parentSessionID,
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
@@ -7438,6 +7455,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.oversight.autoWakeOnUpdates,
             agentSessionLinkAutoWakeTargetSessionIDs: session.oversight.autoWakeTargetSessionIDs,
+            routineWakeIntervalEnabled: session.oversight.routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: session.oversight.routineWakeIntervalSeconds,
+            periodicIdleWakeEnabled: session.oversight.periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: session.oversight.periodicIdleWakeIntervalSeconds,
             parentSessionID: parentSessionID,
             isMCPOriginated: session.isMCPOriginated
         )
@@ -11664,6 +11685,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         autoEditEnabled: Bool,
         autoWakeOnOversightUpdates: Bool = false,
         agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
+        routineWakeIntervalEnabled: Bool = false,
+        routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds,
+        periodicIdleWakeEnabled: Bool = false,
+        periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         parentSessionID: UUID? = nil,
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
@@ -11684,6 +11709,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEditEnabled: autoEditEnabled,
             autoWakeOnOversightUpdates: autoWakeOnOversightUpdates,
             agentSessionLinkAutoWakeTargetSessionIDs: agentSessionLinkAutoWakeTargetSessionIDs,
+            routineWakeIntervalEnabled: routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: AgentSessionLinkRoutineWakeInterval.normalized(routineWakeIntervalSeconds),
+            periodicIdleWakeEnabled: periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: AgentSessionLinkPeriodicWakeInterval.normalized(periodicIdleWakeIntervalSeconds),
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
@@ -13281,6 +13310,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.oversight.autoWakeOnUpdates,
             agentSessionLinkAutoWakeTargetSessionIDs: session.oversight.autoWakeTargetSessionIDs,
+            routineWakeIntervalEnabled: session.oversight.routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: session.oversight.routineWakeIntervalSeconds,
+            periodicIdleWakeEnabled: session.oversight.periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: session.oversight.periodicIdleWakeIntervalSeconds,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
             parentSessionID: session.parentSessionID,
             pendingHandoffPayload: session.pendingHandoff.payload,
@@ -13332,6 +13365,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 autoEditEnabled: agentSession.autoEditEnabled,
                 autoWakeOnOversightUpdates: agentSession.autoWakeOnOversightUpdates,
                 agentSessionLinkAutoWakeTargetSessionIDs: agentSession.agentSessionLinkAutoWakeTargetSessionIDs,
+                routineWakeIntervalEnabled: agentSession.routineWakeIntervalEnabled,
+                routineWakeIntervalSeconds: agentSession.routineWakeIntervalSeconds,
+                periodicIdleWakeEnabled: agentSession.periodicIdleWakeEnabled,
+                periodicIdleWakeIntervalSeconds: agentSession.periodicIdleWakeIntervalSeconds,
                 parentSessionID: agentSession.parentSessionID,
                 isMCPOriginated: agentSession.isMCPOriginated,
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
@@ -15959,7 +15996,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ text: String,
         session: TabSession
     ) -> String {
-        guard let handoffPayload = session.pendingHandoff.payload,
+        guard session.oversight.pendingAutoWake?.isPeriodic != true,
+              let handoffPayload = session.pendingHandoff.payload,
               session.pendingHandoff.isStagedForSend == false
         else {
             return text
@@ -15977,6 +16015,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // conversational context after a forced fresh session start.
     @MainActor
     func stageResumeRecoveryHandoffIfNeeded(for session: TabSession) async {
+        guard session.oversight.pendingAutoWake?.isPeriodic != true else { return }
         // Don't overwrite an existing staged payload.
         if let existingPayload = session.pendingHandoff.payload,
            !existingPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -16021,7 +16060,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @MainActor
     private func recordPendingHandoffSendOutcome(for session: TabSession, didSend: Bool) {
-        guard session.pendingHandoff.isStagedForSend else { return }
+        guard session.oversight.pendingAutoWake?.isPeriodic != true, session.pendingHandoff.isStagedForSend else { return }
         if didSend {
             session.pendingHandoff.clearAfterSend()
             session.isDirty = true
@@ -16189,7 +16228,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         directStartOptions: AgentDirectRunStartOptions = .default,
         startOutcome: AgentRunStartOutcomeRecorder? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
-        let session = session(for: tabID)
+        let session: TabSession
+        if directStartOptions.periodicWakeID != nil {
+            guard let existing = sessions[tabID] else { return nil }
+            session = existing
+        } else {
+            session = self.session(for: tabID)
+        }
+        func periodicStartIsCurrent() -> Bool {
+            guard let wakeID = directStartOptions.periodicWakeID else { return true }
+            guard directStartOptions.laneUpdateWakeID == nil,
+                  let attempt = session.oversight.pendingAutoWake,
+                  attempt.isPeriodic, attempt.wakeID == wakeID, attempt.phase == .preparingDispatch,
+                  let submissionID = attempt.periodicComposerAttemptID,
+                  session.activeComposerSubmitAttempt?.id == submissionID,
+                  agentSessionLinkPeriodicWakeIsEligible(session, endpoint: attempt.observerEndpoint),
+                  agentSessionLinkPeriodicPreparationIsUnblocked(session) else { return false }
+            return true
+        }
+        guard periodicStartIsCurrent() else { return nil }
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
             if session.mcpFollowUpRunPending {
                 session.mcpFollowUpRunPending = false
@@ -16234,12 +16291,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
+        guard periodicStartIsCurrent() else { return nil }
         await prepareMCPWaitTrackingForRunStart(session: session)
+        guard periodicStartIsCurrent() else { return nil }
         // A lane update has no user-authored base instruction, so every augmentation this applies —
         // skill context, tagged-file expansion, attachment rendering, staged handoff — is user-only
         // work with nothing to act on. Skipping it is what keeps the turn's only new provider input
         // the rendered lane claim the supplement path attaches.
-        let augmentedInitialMessage = directStartOptions.isLaneUpdate
+        let augmentedInitialMessage = directStartOptions.skipsUserAugmentation
             ? initialMessage
             : await augmentUserMessageForProviderSend(
                 initialMessage,
@@ -16255,6 +16314,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session: session,
             initialMessage: augmentedInitialMessage
         )
+        guard periodicStartIsCurrent() else { return nil }
         let preparedCodexFallbackContext = codexFallbackContext.map { context in
             TabSession.CodexFallbackSubmissionContext(
                 queueID: context.queueID,
@@ -16295,7 +16355,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // prepended into `initialMessageForRun`, and staging is the only signal that it actually was.
         // A direct start that deliberately left a payload untouched must still replay history, or the
         // turn would carry neither the handoff nor the conversation.
-        let shouldBypassHistoryReplay = session.pendingHandoff.isStagedForSend
+        let shouldBypassHistoryReplay = (session.oversight.pendingAutoWake?.isPeriodic != true && session.pendingHandoff.isStagedForSend)
             || (supportsSessionResume && (session.providerSessionID != nil || !attachments.isEmpty))
         let fullMessage: String
         let resumeSessionID: String?
