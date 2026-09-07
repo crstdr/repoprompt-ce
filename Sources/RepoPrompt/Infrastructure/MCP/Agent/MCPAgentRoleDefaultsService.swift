@@ -294,7 +294,9 @@ enum MCPAgentRoleDefaultsService {
             // providers must still expose the stored model or the stale pin is non-executable.
             let modelIsExecutable = agent == .codexExec
                 || AgentModelCatalog.isValid(rawModel: parsed.modelRaw, for: agent, availability: availability)
-            if AgentModelCatalog.isAgentAvailable(agent, availability: availability), modelIsExecutable {
+            if AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),
+               AgentModelCatalog.isAgentAvailable(agent, availability: availability), modelIsExecutable
+            {
                 let sel = AgentModelCatalog.NormalizedAgentSelection(agent: agent, modelRaw: parsed.modelRaw)
                 effective = sel
                 hasCustomOverride = (sel != recommended)

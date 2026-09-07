@@ -82,6 +82,12 @@ enum AgentMCPSelectionResolver {
             )
         }
 
+        guard AgentModelCatalog.AgentSelectionSurface.headless.allows(agent) else {
+            throw MCPError.invalidParams(
+                "Agent '\(parsed.agentRaw)' is available only in interactive Agent Mode and cannot run headlessly."
+            )
+        }
+
         guard AgentModelCatalog.isAgentAvailable(agent, availability: availability) else {
             throw MCPError.invalidParams(
                 "Agent '\(parsed.agentRaw)' is currently unavailable."
@@ -107,10 +113,14 @@ enum AgentMCPSelectionResolver {
         workspaceID: UUID?,
         roleSelectionProvider: RoleSelectionProvider?
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
-        if let provided = roleSelectionProvider?(role, availability) {
+        if let provided = roleSelectionProvider?(role, availability),
+           AgentModelCatalog.AgentSelectionSurface.headless.allows(provided.agent)
+        {
             return provided
         }
-        if let effective = MCPAgentRoleDefaultsService.effectiveNormalizedSelection(for: role, availability: availability, workspaceID: workspaceID) {
+        if let effective = MCPAgentRoleDefaultsService.effectiveNormalizedSelection(for: role, availability: availability, workspaceID: workspaceID),
+           AgentModelCatalog.AgentSelectionSurface.headless.allows(effective.agent)
+        {
             return effective
         }
         return AgentModelCatalog.resolveTaskLabelKind(role, availability: availability)
