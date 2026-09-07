@@ -850,8 +850,8 @@ struct AgentSessionLinkPassiveStatusNotices {
 
         var changed = false
 
-        // Attention is occurrence-qualified and settles independently of the aggregate status /
-        // overflow watermark. An older claim may physically arrive after a newer receipt that did
+        // Attention is occurrence-qualified and settles independently of the aggregate
+        // receipt watermark. An older claim may physically arrive after a newer receipt that did
         // not render this occurrence; refusing it solely for age would leave accepted attention owed.
         for occurrence in receipt.deliveredAttentionOccurrences {
             guard let current = pendingAttentionByReference[occurrence.reference],
@@ -861,16 +861,18 @@ struct AgentSessionLinkPassiveStatusNotices {
             changed = true
         }
 
+        // Each receipt names only rendered rows; a newer partial receipt may omit these statuses.
+        for delivered in receipt.deliveredStatuses {
+            guard let current = pendingByReference[delivered.reference],
+                  current.toStatus == delivered.toStatus,
+                  current.changeSequence <= delivered.changeSequence
+            else { continue }
+            pendingByReference.removeValue(forKey: delivered.reference)
+            changed = true
+        }
+
         if receipt.queueRevision > lastAcceptedReceiptRevision {
             lastAcceptedReceiptRevision = receipt.queueRevision
-
-            for delivered in receipt.deliveredStatuses {
-                guard let current = pendingByReference[delivered.reference],
-                      current.toStatus == delivered.toStatus,
-                      current.changeSequence <= delivered.changeSequence
-                else { continue }
-                pendingByReference.removeValue(forKey: delivered.reference)
-            }
 
             overflowAcknowledged = max(
                 overflowAcknowledged,
