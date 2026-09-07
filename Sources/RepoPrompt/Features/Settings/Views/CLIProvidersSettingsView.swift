@@ -1979,7 +1979,7 @@ struct CLIProvidersSettingsView: View {
                             .foregroundColor(.red)
                             .fixedSize(horizontal: false, vertical: true)
                         if viewModel.isCodexExecutableUnavailable {
-                            Text("Choose another custom executable under Advanced or restore the included runtime, then click Connect to check again.")
+                            Text("Choose another custom executable under Advanced or restore the included runtime, then relaunch RepoPrompt. After relaunch, click Connect to check again.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
