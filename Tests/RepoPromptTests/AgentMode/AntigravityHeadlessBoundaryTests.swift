@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class AntigravityHeadlessBoundaryTests: XCTestCase {
@@ -15,6 +15,43 @@ final class AntigravityHeadlessBoundaryTests: XCTestCase {
     func testInteractiveCatalogIncludesAntigravityButHeadlessSurfaceExcludesIt() {
         XCTAssertTrue(AgentModelCatalog.selectableAgents(availability: availability).contains(.antigravity))
         XCTAssertFalse(AgentModelCatalog.selectableAgents(availability: availability, surface: .headless).contains(.antigravity))
+    }
+
+    @MainActor
+    func testMCPInteractiveSelectionAndDiscoveryPreserveAntigravity() throws {
+        let registry = AgentACPModelRegistry.shared
+        registry.test_reset(providerID: .antigravity)
+        defer { registry.test_reset(providerID: .antigravity) }
+        let model = "gemini-test-model"
+        _ = registry.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [AgentModelOption(rawValue: model, displayName: model, description: nil, isDefault: true)],
+                currentModelRaw: model
+            ),
+            for: .antigravity
+        )
+
+        let direct = try AgentMCPSelectionResolver.resolve(modelID: "antigravity:\(model)", availability: availability)
+        XCTAssertEqual(direct.agentRaw, AgentProviderKind.antigravity.rawValue)
+        let role = try AgentMCPSelectionResolver.resolve(
+            modelID: "pair",
+            availability: availability,
+            roleSelectionProvider: { _, _ in .init(agent: .antigravity, modelRaw: model) }
+        )
+        XCTAssertEqual(role.agentRaw, AgentProviderKind.antigravity.rawValue)
+        XCTAssertEqual(role.modelRaw, model)
+        XCTAssertTrue(AgentModelCatalog.discoveryAgents(availability: availability).contains { $0.agent == .antigravity })
+        XCTAssertFalse(AgentModelCatalog.discoveryAgents(availability: availability, surface: .headless).contains { $0.agent == .antigravity })
+        XCTAssertThrowsError(try AgentMCPSelectionResolver.resolve(
+            modelID: "antigravity:\(model)", availability: availability, surface: .headless
+        ))
+        let headlessRole = try AgentMCPSelectionResolver.resolve(
+            modelID: "explore",
+            availability: availability,
+            roleSelectionProvider: { _, _ in .init(agent: .antigravity, modelRaw: model) },
+            surface: .headless
+        )
+        XCTAssertNotEqual(headlessRole.agentRaw, AgentProviderKind.antigravity.rawValue)
     }
 
     func testHeadlessFactoryFailsClosedInsteadOfFallingBackToAnotherProvider() async {

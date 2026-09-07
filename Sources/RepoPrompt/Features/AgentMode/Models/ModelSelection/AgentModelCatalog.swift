@@ -1916,10 +1916,11 @@ enum AgentModelCatalog {
 
     /// Builds a comprehensive discovery payload for all agents, suitable for `list_agents`.
     static func discoveryAgents(
-        availability: AvailabilityContext = .current
+        availability: AvailabilityContext = .current,
+        surface: AgentSelectionSurface = .general
     ) -> [DiscoveryAgent] {
         AgentProviderKind.allCases
-            .filter { AgentSelectionSurface.headless.allows($0) }
+            .filter { surface.allows($0) }
             .map { agent in
                 discoveryAgent(agent, availability: availability)
             }

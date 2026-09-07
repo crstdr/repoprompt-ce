@@ -417,7 +417,7 @@ struct AgentModelsPopoverView: View {
     private func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
-        var items = AgentModelCatalog.selectableAgents(availability: availability, surface: .headless).map { agent in
+        var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),

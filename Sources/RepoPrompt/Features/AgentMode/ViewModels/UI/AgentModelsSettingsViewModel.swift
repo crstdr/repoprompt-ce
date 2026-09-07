@@ -497,7 +497,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
-        AgentModelCatalog.selectableAgents(availability: availability, surface: .headless).map { agent in
+        AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
