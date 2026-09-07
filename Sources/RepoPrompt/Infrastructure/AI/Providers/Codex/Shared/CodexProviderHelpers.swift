@@ -65,8 +65,9 @@ enum CodexProviderHelpers {
     }
 
     struct CodexRuntimeSettingsPreflight: Equatable {
+        let bundledResolution: CodexExecutableResolution
         let effectiveResolution: CodexExecutableResolution
-        let systemCandidate: CodexExecutableResolution?
+        let ignoredLegacyEnvironmentOverride: Bool
     }
 
     static func resolveCodexExecutable(
@@ -102,7 +103,8 @@ enum CodexProviderHelpers {
                 .unsupportedArchitecture
             case .externalOverrideTooOld:
                 .externalOverrideIncompatible
-            case .externalOverrideMustBeAbsolute,
+            case .externalPreferenceMalformed,
+                 .externalOverrideMustBeAbsolute,
                  .externalOverrideMissing,
                  .externalOverrideNotExecutable,
                  .externalOverrideVersionUnreadable:
@@ -157,31 +159,23 @@ enum CodexProviderHelpers {
         enableDebugLogging: Bool = false,
         logCollector: CLIProcessLogCollector? = nil,
         inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-        shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider? = nil
+        shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider? = nil,
+        selection injectedSelection: CodexRuntimePreferences.Selection? = nil
     ) async -> CodexRuntimeSettingsPreflight {
         let environment = await codexPreflightEnvironment(
             enableDebugLogging: enableDebugLogging,
             inheritedEnvironment: inheritedEnvironment,
             shellEnvironmentProvider: shellEnvironmentProvider
         )
-        let selection = CodexRuntimePreferences.selection()
+        let selection = injectedSelection ?? CodexRuntimePreferences.selection()
         let preflight = await Task.detached(priority: .utility) {
-            let effectiveResolution = resolveCodexExecutable(environment: environment, selection: selection)
-            let discoveredCommand = CommandPathResolver.resolve(
-                CLILaunchProfiles.codex.commandName,
-                environment: environment,
-                additionalPaths: CLILaunchProfiles.codex.supplementalSearchPaths,
-                preferredBasenames: CLILaunchProfiles.codex.preferredBasenames,
-                shellLookupMode: .disabled
-            )
-            let systemCandidate: CodexExecutableResolution? = if CommandPathResolver.launchability(of: discoveredCommand) == .launchable {
-                resolveCodexExecutable(commandName: discoveredCommand, environment: environment)
-            } else {
-                nil
-            }
-            return CodexRuntimeSettingsPreflight(
-                effectiveResolution: effectiveResolution,
-                systemCandidate: systemCandidate?.status == .available ? systemCandidate : nil
+            CodexRuntimeSettingsPreflight(
+                bundledResolution: resolveCodexExecutable(environment: environment, selection: .bundled),
+                effectiveResolution: resolveCodexExecutable(environment: environment, selection: selection),
+                ignoredLegacyEnvironmentOverride: CodexRuntimeAuthority.ignoredLegacyEnvironmentOverride(
+                    environment: environment,
+                    selection: selection
+                )
             )
         }.value
         logPreflightResolution(
@@ -315,6 +309,7 @@ enum CodexProviderHelpers {
         case .bundledMetadataUnreadable: "bundled-metadata-unreadable"
         case .bundledMetadataMismatch: "bundled-metadata-mismatch"
         case .bundledLayoutIncomplete: "bundled-layout-incomplete"
+        case .externalPreferenceMalformed: "external-preference-malformed"
         case .externalOverrideMustBeAbsolute: "override-not-absolute"
         case .externalOverrideMissing: "override-missing"
         case .externalOverrideNotExecutable: "override-not-executable"

@@ -21,9 +21,9 @@ consumes at its current integration boundary.
 
 ## Version contract
 
-- The contract floor is **Codex CLI 0.149.0**.
-- Local validation accepts 0.149.0 or newer so a developer can detect drift before CI moves.
-- CI installs exactly `@openai/codex@0.149.0`, making the required check deterministic.
+- The contract floor is **Codex CLI 0.153.4**.
+- Local validation accepts 0.153.4 or newer so a developer can detect drift before CI moves.
+- CI installs exactly `@openai/codex@0.153.4`, making the required check deterministic.
 - The gate fails before generation when the installed CLI is older than the floor.
 
 When advancing Codex, install the intended version, run the gate, reconcile RPCE with the generated
@@ -60,7 +60,7 @@ hook-key → `{trusted_hash}` object shape cannot be expressed by the current ch
 After a trust write, the post-write `hooks/list` result is the semantic success authority;
 `config/batchWrite.status` alone is not.
 
-The hardened 0.149.0 baseline checks 45 methods, 193 parameter paths, and 93 response paths. A failure names
+The hardened 0.153.4 baseline checks 45 methods, 193 parameter paths, and 93 response paths. A failure names
 the union, method, and exact missing field, required field, response path, or enum value.
 
 This is intentionally not a complete protocol mirror. New upstream methods do not fail the gate
@@ -81,7 +81,7 @@ differences:
    eligibility, but resume config does not reconcile an existing stored thread's persisted mode. RPCE
    therefore calls experimental `thread/memoryMode/set` with `enabled` or `disabled` before
    `thread/resume` so resumed startup observes the requested mode. It does not issue a redundant
-   post-start request. The 0.149.0 runtime floor and `experimentalApi` initialization capability make
+   post-start request. The 0.153.4 runtime floor and `experimentalApi` initialization capability make
    resume reconciliation a required contract rather than an optional compatibility fallback.
 6. The generated `goal.status` enum includes `blocked` and `usageLimited`, while RPCE previously
    rejected both as invalid responses. The same six-value enum is also declared for
@@ -157,6 +157,26 @@ independent, human-owned settings can enable these capabilities separately for d
 native Agent Mode app-server sessions. Each setting is absent/default false and is intentionally
 absent from the MCP `app_settings` catalog. Standard chat, headless exec, and every MCP-related
 Agent Mode session force all four false for the session lifetime, including after live control ends.
+
+## 0.153.4 rotation findings (2026-09-07)
+
+The repository candidate flow verified both official `rust-v0.153.4` macOS packages, including
+exact release URLs and checksums, complete matching layouts, thin architectures, OpenAI signing
+identities, hardened runtime, and trusted timestamps. The exact candidate CLI passes the bounded
+experimental projection at 45 methods, 193 parameter paths, and 93 response paths after one
+additive enum adoption: `thread/read` command items can now report `interrupted`. RepoPrompt's
+thread snapshot parser already classifies `interrupted` as terminal, so the compact contract was
+expanded without adding a version adapter or weakening exhaustive enum validation.
+
+Codex 0.153.4 fixes Astra visibility in the bundled model picker and makes Astra the upstream
+bundled default only when no model is explicitly configured. RepoPrompt continues to derive model
+availability from live or cached runtime metadata; this rotation adds no static Astra identifier,
+does not change role recommendations, and does not rewrite explicit saved model selections.
+
+The verified candidate retains the normalized Zsh 5.9 and `rg` payloads. Upstream `LICENSE` and
+`NOTICE` are byte-identical to the 0.149.0 legal copies. Runtime selection now defaults predictably
+to the included package even when a legacy environment override exists; previously saved explicit
+custom paths remain launch-snapshotted and fail visibly if malformed or incompatible.
 
 ## Files and tests
 

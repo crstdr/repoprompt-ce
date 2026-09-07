@@ -63,6 +63,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isKimiCodeExpanded: Bool = false
     @State private var isCustomCompatibleExpanded: Bool = false
     @State private var isCodexExpanded: Bool = false
+    @State private var isCodexRuntimeAdvancedExpanded: Bool = false
     @State private var codexRuntimeSelection = CodexRuntimePreferences.selection()
     @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
     @State private var isLoadingCodexRuntimePreflight = false
@@ -1560,89 +1561,94 @@ struct CLIProvidersSettingsView: View {
     }
 
     private var codexRuntimeSelectionControl: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 8) {
-                Text("Runtime")
-                    .font(.caption)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "shippingbox.fill")
                     .foregroundColor(.secondary)
 
-                Menu {
-                    Button {
-                        setCodexRuntimeSelection(.bundled)
-                    } label: {
-                        if codexRuntimeSelection == .bundled {
-                            Label("Bundled Codex \(CodexRuntimeAuthority.bundledVersion)", systemImage: "checkmark")
-                        } else {
-                            Text("Bundled Codex \(CodexRuntimeAuthority.bundledVersion)")
-                        }
-                    }
-
-                    if let systemCandidate = codexRuntimePreflight?.systemCandidate,
-                       let runtime = systemCandidate.runtime
-                    {
-                        Button {
-                            setCodexRuntimeSelection(.external(path: systemCandidate.resolvedCommand))
-                        } label: {
-                            let title = "System Codex " + runtime.version.description
-                            if codexSelectedExecutablePath == systemCandidate.resolvedCommand {
-                                Label(title, systemImage: "checkmark")
-                            } else {
-                                Text(title)
-                            }
-                        }
-                    }
-
-                    Button {
-                        setCodexRuntimeSelection(.inherited)
-                    } label: {
-                        let title = "Environment override, otherwise bundled"
-                        if codexRuntimeSelection == .inherited {
-                            Label(title, systemImage: "checkmark")
-                        } else {
-                            Text(title)
-                        }
-                    }
-
-                    if case let .external(path) = codexRuntimeSelection,
-                       path != codexRuntimePreflight?.systemCandidate?.resolvedCommand
-                    {
-                        Button {
-                            setCodexRuntimeSelection(.external(path: path))
-                        } label: {
-                            Label("Local Codex (\(URL(fileURLWithPath: path).lastPathComponent))", systemImage: "checkmark")
-                        }
-                    }
-
-                    Divider()
-
-                    Button("Choose Local Executable…", action: chooseLocalCodexExecutable)
-                } label: {
-                    Text(codexRuntimeSelectionLabel)
-                }
-                .fixedSize()
-
-                Spacer()
-            }
-
-            if isLoadingCodexRuntimePreflight {
-                Text("Resolving selected runtime…")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            } else if let resolution = codexRuntimePreflight?.effectiveResolution {
-                if resolution.status == .available,
-                   let description = resolution.displayDescription,
-                   let executablePath = resolution.runtime?.executableURL.path
-                {
-                    Text("Selection resolves to \(description)")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Included with RepoPrompt")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Text("Codex \(CodexRuntimeAuthority.bundledVersion.description)")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    Text(executablePath)
-                        .font(.caption.monospaced())
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .hoverTooltip(executablePath)
+                }
+
+                Spacer()
+
+                if isLoadingCodexRuntimePreflight {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if codexRuntimePreflight?.bundledResolution.status == .available {
+                    Label("Ready", systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundColor(.green)
                 } else {
+                    Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+            }
+
+            if !isLoadingCodexRuntimePreflight,
+               let bundledResolution = codexRuntimePreflight?.bundledResolution,
+               bundledResolution.status != .available
+            {
+                Text(bundledResolution.userMessage)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if codexCustomRuntimeIsConfigured {
+                Label("A custom executable is selected for the next RepoPrompt launch.", systemImage: "wrench.and.screwdriver")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+
+                if !isLoadingCodexRuntimePreflight,
+                   let resolution = codexRuntimePreflight?.effectiveResolution,
+                   resolution.status != .available
+                {
+                    Text(resolution.userMessage)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if codexRuntimePreflight?.ignoredLegacyEnvironmentOverride == true {
+                Text("RepoPrompt ignored the legacy \(CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey) override. Choose a custom executable under Advanced if you still need it.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isCodexRuntimeAdvancedExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .rotationEffect(.degrees(isCodexRuntimeAdvancedExpanded ? 90 : 0))
+                    Text("Advanced")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            if isCodexRuntimeAdvancedExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Custom Codex executables are not verified or managed by RepoPrompt and may be incompatible with its app-server integration. Use the included runtime unless you need an explicit compatibility escape hatch.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
                     if let codexSelectedExecutablePath {
                         Text(codexSelectedExecutablePath)
                             .font(.caption.monospaced())
@@ -1651,38 +1657,49 @@ struct CLIProvidersSettingsView: View {
                             .truncationMode(.middle)
                             .hoverTooltip(codexSelectedExecutablePath)
                     }
-                    Text(resolution.userMessage)
+
+                    if codexCustomRuntimeIsConfigured,
+                       let resolution = codexRuntimePreflight?.effectiveResolution,
+                       resolution.status == .available,
+                       let description = resolution.displayDescription
+                    {
+                        Text("Selected: \(description)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Choose Custom Executable…", action: chooseLocalCodexExecutable)
+                            .buttonStyle(CustomButtonStyle())
+
+                        if codexRuntimeSelection != .bundled {
+                            Button("Restore Included Runtime") {
+                                setCodexRuntimeSelection(.bundled)
+                            }
+                            .buttonStyle(CustomButtonStyle())
+                        }
+                    }
+
+                    Text("Runtime changes apply after the next RepoPrompt launch and then refresh the model list. Existing saved model selections are not changed.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-            } else if let codexSelectedExecutablePath {
-                Text(codexSelectedExecutablePath)
-                    .font(.caption.monospaced())
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .hoverTooltip(codexSelectedExecutablePath)
+                .padding(.top, 2)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
-
-            Text("After changing this option, restart RepoPrompt to apply it and refresh the model list.")
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
         .task(id: codexRuntimeSelectionTaskID) {
             await refreshCodexRuntimePreflight()
         }
     }
 
-    private var codexRuntimeSelectionLabel: String {
+    private var codexCustomRuntimeIsConfigured: Bool {
         switch codexRuntimeSelection {
-        case .bundled:
-            "Bundled Codex \(CodexRuntimeAuthority.bundledVersion)"
-        case let .external(path):
-            "Local Codex (\(URL(fileURLWithPath: path).lastPathComponent))"
-        case .inherited:
-            "Environment override, otherwise bundled"
+        case .external, .invalidExternalPreference:
+            true
+        case .inherited, .bundled:
+            false
         }
     }
 
@@ -1690,7 +1707,7 @@ struct CLIProvidersSettingsView: View {
         switch codexRuntimeSelection {
         case let .external(path):
             path
-        case .inherited, .bundled:
+        case .inherited, .bundled, .invalidExternalPreference:
             nil
         }
     }
@@ -1703,6 +1720,8 @@ struct CLIProvidersSettingsView: View {
             "bundled"
         case let .external(path):
             "external:\(path)"
+        case .invalidExternalPreference:
+            "invalid-external"
         }
     }
 
@@ -1889,7 +1908,7 @@ struct CLIProvidersSettingsView: View {
                             .foregroundColor(.red)
                             .fixedSize(horizontal: false, vertical: true)
                         if viewModel.isCodexExecutableUnavailable {
-                            Text("Choose another runtime above, or fix/remove REPOPROMPT_CODEX_EXECUTABLE, then click Connect to check again.")
+                            Text("Choose another custom executable under Advanced or restore the included runtime, then click Connect to check again.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)

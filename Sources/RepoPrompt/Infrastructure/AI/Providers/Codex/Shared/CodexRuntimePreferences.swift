@@ -2,13 +2,15 @@ import Foundation
 
 /// Persists the Codex runtime source explicitly selected in Settings.
 ///
-/// An absent selection preserves the existing environment-override behavior. The runtime authority
-/// owns executable validation; this type only normalizes and stores the user's choice.
+/// An absent selection is retained as `.inherited` only so Settings can explain that a legacy
+/// environment override was ignored. Runtime resolution treats absence as bundled; the runtime
+/// authority owns executable validation, while this type only normalizes and stores user choice.
 enum CodexRuntimePreferences {
     enum Selection: Equatable {
         case inherited
         case bundled
         case external(path: String)
+        case invalidExternalPreference
     }
 
     /// Returns the process-active choice from the single runtime authority. Pending choices only
@@ -26,7 +28,7 @@ enum CodexRuntimePreferences {
             .bundled
         case "external":
             normalizedPath(defaults.string(forKey: executablePathKey)).map { .external(path: $0) }
-                ?? .inherited
+                ?? .invalidExternalPreference
         default:
             .inherited
         }
@@ -42,11 +44,15 @@ enum CodexRuntimePreferences {
             defaults.removeObject(forKey: executablePathKey)
         case let .external(path):
             guard let path = normalizedPath(path) else {
-                setSelection(.inherited, defaults: defaults)
+                defaults.set("external", forKey: selectionModeKey)
+                defaults.removeObject(forKey: executablePathKey)
                 return
             }
             defaults.set("external", forKey: selectionModeKey)
             defaults.set(path, forKey: executablePathKey)
+        case .invalidExternalPreference:
+            defaults.set("external", forKey: selectionModeKey)
+            defaults.removeObject(forKey: executablePathKey)
         }
     }
 
