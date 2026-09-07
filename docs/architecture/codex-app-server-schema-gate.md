@@ -26,6 +26,11 @@ consumes at its current integration boundary.
 - CI installs exactly `@openai/codex@0.153.4`, making the required check deterministic.
 - The gate fails before generation when the installed CLI is older than the floor.
 
+This schema baseline and exact CI pin are distinct from
+`CodexRuntimeAuthority.minimumExternalVersion`, the compatibility floor for an explicitly selected
+custom executable. That external floor remains 0.149.0 unless an observed consumed request or
+response incompatibility requires it to move.
+
 When advancing Codex, install the intended version, run the gate, reconcile RPCE with the generated
 schema, then update the CI pin and contract floor together. Do not copy the complete generated
 protocol into this repository and do not add per-version adapters without a demonstrated runtime
@@ -166,7 +171,9 @@ identities, hardened runtime, and trusted timestamps. The exact candidate CLI pa
 experimental projection at 45 methods, 193 parameter paths, and 93 response paths after one
 additive enum adoption: `thread/read` command items can now report `interrupted`. RepoPrompt's
 thread snapshot parser already classifies `interrupted` as terminal, so the compact contract was
-expanded without adding a version adapter or weakening exhaustive enum validation.
+expanded without adding a version adapter or weakening exhaustive enum validation. No new outgoing
+request requires 0.153.4, so explicit custom runtimes from the proven 0.149.0 compatibility floor
+remain supported.
 
 Codex 0.153.4 fixes Astra visibility in the bundled model picker and makes Astra the upstream
 bundled default only when no model is explicitly configured. RepoPrompt continues to derive model

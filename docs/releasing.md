@@ -102,13 +102,17 @@ may explicitly select one custom executable with a compatibility warning and can
 restore the included runtime at any time. A legacy `REPOPROMPT_CODEX_EXECUTABLE`
 value is ignored when no runtime preference was ever saved, with a redacted notice
 in Settings rather than implicit execution. Previously saved explicit external path
-selections remain intact. Settings saves the next-launch choice while all runtime
-consumers retain the process-wide active selection until relaunch; model availability
-continues to come from runtime metadata and existing explicit model selections are not
-rewritten. External version validation uses the captured launch environment, including
-its interpreter search path.
-RepoPrompt rejects custom executables older than 0.153.4, matching the bundled runtime and
-the documented app-server contract floor. Bundled and external runtimes both use
+selections remain intact. Settings separately reports the immutable active launch
+selection and a saved next-launch selection when they differ, while all runtime consumers
+retain the process-wide active selection until relaunch. Model availability continues to
+come from runtime metadata and existing explicit model selections are not rewritten.
+External version validation uses the captured launch environment, including its interpreter
+search path.
+RepoPrompt rejects custom executables older than 0.149.0, the last proven external
+compatibility floor. This is intentionally distinct from the exact bundled and schema-gate
+pin at 0.153.4: the only consumed schema delta in this rotation is the additive incoming
+`interrupted` status, which RepoPrompt already handles, and no new outgoing request requires
+0.153.4. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
 `~/.codex` and official Codex App state untouched.

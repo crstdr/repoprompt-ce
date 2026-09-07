@@ -6,6 +6,7 @@ struct CLIProvidersSettingsView: View {
     @ObservedObject var promptViewModel: PromptViewModel
     @ObservedObject private var codexSessionFence = CodexManagedSessionFence.shared
     let windowID: Int
+    private let codexRuntimeActiveSelection: CodexRuntimePreferences.Selection
     var onAPIKeyUpdated: (() -> Void)?
     var closeAction: (() -> Void)?
     /// Optional navigation callback so provider cards can deep-link into Agent Permissions
@@ -28,6 +29,7 @@ struct CLIProvidersSettingsView: View {
         self.viewModel = viewModel
         self.promptViewModel = promptViewModel
         self.windowID = windowID
+        codexRuntimeActiveSelection = CodexRuntimePreferences.activeSelection
         self.onAPIKeyUpdated = onAPIKeyUpdated
         self.closeAction = closeAction
         self.onNavigate = onNavigate
@@ -64,7 +66,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isCustomCompatibleExpanded: Bool = false
     @State private var isCodexExpanded: Bool = false
     @State private var isCodexRuntimeAdvancedExpanded: Bool = false
-    @State private var codexRuntimeSelection = CodexRuntimePreferences.selection()
+    @State private var codexRuntimePendingSelection = CodexRuntimePreferences.selection()
     @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
     @State private var isLoadingCodexRuntimePreflight = false
     @State private var isOpenCodeExpanded: Bool = false
@@ -1601,16 +1603,38 @@ struct CLIProvidersSettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if codexCustomRuntimeIsConfigured {
-                Label("A custom executable is selected for the next RepoPrompt launch.", systemImage: "wrench.and.screwdriver")
+            if !isLoadingCodexRuntimePreflight, let preflight = codexRuntimePreflight {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(
+                        "Active now: \(codexRuntimeChoiceDescription(codexRuntimeActiveSelection, resolution: preflight.activeResolution))",
+                        systemImage: "play.circle.fill"
+                    )
                     .font(.caption)
-                    .foregroundColor(.orange)
+                    .foregroundColor(.secondary)
 
-                if !isLoadingCodexRuntimePreflight,
-                   let resolution = codexRuntimePreflight?.effectiveResolution,
-                   resolution.status != .available
+                    if codexRuntimeProjection.changesAfterRelaunch {
+                        Label(
+                            "After relaunch: \(codexRuntimeChoiceDescription(codexRuntimePendingSelection, resolution: preflight.pendingResolution))",
+                            systemImage: "arrow.forward.circle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    }
+                }
+
+                if codexRuntimeSelectionIsCustom(codexRuntimeActiveSelection),
+                   preflight.activeResolution.status != .available
                 {
-                    Text(resolution.userMessage)
+                    Text("Active runtime: \(preflight.activeResolution.userMessage)")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if codexRuntimeProjection.changesAfterRelaunch,
+                   preflight.pendingResolution.status != .available
+                {
+                    Text("After relaunch: \(preflight.pendingResolution.userMessage)")
                         .font(.caption)
                         .foregroundColor(.red)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1649,30 +1673,45 @@ struct CLIProvidersSettingsView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    if let codexSelectedExecutablePath {
-                        Text(codexSelectedExecutablePath)
+                    if codexRuntimeProjection.changesAfterRelaunch,
+                       let activePath = codexRuntimeExecutablePath(codexRuntimeActiveSelection)
+                    {
+                        Text("Active path: \(activePath)")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
-                            .hoverTooltip(codexSelectedExecutablePath)
+                            .hoverTooltip(activePath)
+                    }
+
+                    if let pendingPath = codexRuntimeExecutablePath(codexRuntimePendingSelection) {
+                        Text("\(codexRuntimeProjection.changesAfterRelaunch ? "After relaunch path" : "Selected path"): \(pendingPath)")
+                            .font(.caption.monospaced())
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .hoverTooltip(pendingPath)
                     }
 
                     if codexCustomRuntimeIsConfigured,
-                       let resolution = codexRuntimePreflight?.effectiveResolution,
+                       let resolution = codexRuntimePreflight?.pendingResolution,
                        resolution.status == .available,
                        let description = resolution.displayDescription
                     {
-                        Text("Selected: \(description)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        Text(
+                            codexRuntimeProjection.changesAfterRelaunch
+                                ? "After relaunch selection: \(description)"
+                                : "Selected: \(description)"
+                        )
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                     }
 
                     HStack(spacing: 8) {
                         Button("Choose Custom Executable…", action: chooseLocalCodexExecutable)
                             .buttonStyle(CustomButtonStyle())
 
-                        if codexRuntimeSelection != .bundled {
+                        if codexCustomRuntimeIsConfigured {
                             Button("Restore Included Runtime") {
                                 setCodexRuntimeSelection(.bundled)
                             }
@@ -1694,8 +1733,19 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
+    private var codexRuntimeProjection: CodexRuntimePreferences.RuntimeSelectionProjection {
+        CodexRuntimePreferences.runtimeSelectionProjection(
+            active: codexRuntimeActiveSelection,
+            pending: codexRuntimePendingSelection
+        )
+    }
+
     private var codexCustomRuntimeIsConfigured: Bool {
-        switch codexRuntimeSelection {
+        codexRuntimeSelectionIsCustom(codexRuntimePendingSelection)
+    }
+
+    private func codexRuntimeSelectionIsCustom(_ selection: CodexRuntimePreferences.Selection) -> Bool {
+        switch selection {
         case .external, .invalidExternalPreference:
             true
         case .inherited, .bundled:
@@ -1703,8 +1753,8 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
-    private var codexSelectedExecutablePath: String? {
-        switch codexRuntimeSelection {
+    private func codexRuntimeExecutablePath(_ selection: CodexRuntimePreferences.Selection) -> String? {
+        switch selection {
         case let .external(path):
             path
         case .inherited, .bundled, .invalidExternalPreference:
@@ -1712,8 +1762,26 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
+    private func codexRuntimeChoiceDescription(
+        _ selection: CodexRuntimePreferences.Selection,
+        resolution: CodexProviderHelpers.CodexExecutableResolution
+    ) -> String {
+        switch selection {
+        case .inherited, .bundled:
+            "Included Codex \(CodexRuntimeAuthority.bundledVersion)"
+        case let .external(path):
+            if let runtime = resolution.runtime {
+                "Custom Codex \(runtime.version) (\(runtime.executableURL.lastPathComponent))"
+            } else {
+                "Custom Codex (\(URL(fileURLWithPath: path).lastPathComponent))"
+            }
+        case .invalidExternalPreference:
+            "Invalid custom executable preference"
+        }
+    }
+
     private var codexRuntimeSelectionTaskID: String {
-        switch codexRuntimeSelection {
+        switch codexRuntimePendingSelection {
         case .inherited:
             "inherited"
         case .bundled:
@@ -1727,14 +1795,17 @@ struct CLIProvidersSettingsView: View {
 
     private func setCodexRuntimeSelection(_ selection: CodexRuntimePreferences.Selection) {
         CodexRuntimePreferences.setSelection(selection)
-        codexRuntimeSelection = CodexRuntimePreferences.selection()
+        codexRuntimePendingSelection = CodexRuntimePreferences.selection()
     }
 
     private func refreshCodexRuntimePreflight() async {
-        let selection = codexRuntimeSelection
+        let pendingSelection = codexRuntimePendingSelection
         isLoadingCodexRuntimePreflight = true
-        let preflight = await CodexProviderHelpers.preflightCodexRuntimeSettings()
-        guard !Task.isCancelled, codexRuntimeSelection == selection else { return }
+        let preflight = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+            activeSelection: codexRuntimeActiveSelection,
+            pendingSelection: pendingSelection
+        )
+        guard !Task.isCancelled, codexRuntimePendingSelection == pendingSelection else { return }
         codexRuntimePreflight = preflight
         isLoadingCodexRuntimePreflight = false
     }
@@ -2432,8 +2503,8 @@ struct CLIProvidersSettingsView: View {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.resolvesAliases = false
-        if let codexSelectedExecutablePath {
-            panel.directoryURL = URL(fileURLWithPath: codexSelectedExecutablePath).deletingLastPathComponent()
+        if let pendingPath = codexRuntimeExecutablePath(codexRuntimePendingSelection) {
+            panel.directoryURL = URL(fileURLWithPath: pendingPath).deletingLastPathComponent()
         }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         setCodexRuntimeSelection(.external(path: url.path))

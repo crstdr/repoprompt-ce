@@ -13,6 +13,15 @@ enum CodexRuntimePreferences {
         case invalidExternalPreference
     }
 
+    struct RuntimeSelectionProjection: Equatable {
+        let active: Selection
+        let pending: Selection
+
+        var changesAfterRelaunch: Bool {
+            !CodexRuntimePreferences.areSemanticallyEquivalent(active, pending)
+        }
+    }
+
     /// Returns the process-active choice from the single runtime authority. Pending choices only
     /// become active in the next process, including when Settings opens before any client.
     static var activeSelection: Selection {
@@ -31,6 +40,22 @@ enum CodexRuntimePreferences {
                 ?? .invalidExternalPreference
         default:
             .inherited
+        }
+    }
+
+    static func runtimeSelectionProjection(
+        active: Selection = activeSelection,
+        pending: Selection = selection()
+    ) -> RuntimeSelectionProjection {
+        RuntimeSelectionProjection(active: active, pending: pending)
+    }
+
+    static func areSemanticallyEquivalent(_ lhs: Selection, _ rhs: Selection) -> Bool {
+        switch (lhs, rhs) {
+        case (.inherited, .bundled), (.bundled, .inherited):
+            true
+        default:
+            lhs == rhs
         }
     }
 

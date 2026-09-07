@@ -138,28 +138,30 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         let override = temporaryDirectory.appendingPathComponent("external/codex")
         try makeExecutable(at: override)
 
-        let accepted = try CodexRuntimeAuthority.resolve(
-            resourcesURL: nil,
-            applicationSupportURL: temporaryDirectory,
-            explicitExecutableOverride: override.path,
-            externalVersionReader: { _ in "codex-cli 0.153.4" }
-        ).get()
-        XCTAssertEqual(accepted.source, .externalOverride)
-        XCTAssertEqual(accepted.version, .init(major: 0, minor: 153, patch: 4))
-        XCTAssertTrue(accepted.redactedDiagnosticSummary.contains("provenance=external-override:codex"))
-        XCTAssertFalse(accepted.redactedDiagnosticSummary.contains(temporaryDirectory.path))
+        for supportedVersion in ["0.149.0", "0.153.3", "0.153.4"] {
+            let accepted = try CodexRuntimeAuthority.resolve(
+                resourcesURL: nil,
+                applicationSupportURL: temporaryDirectory,
+                explicitExecutableOverride: override.path,
+                externalVersionReader: { _ in "codex-cli \(supportedVersion)" }
+            ).get()
+            XCTAssertEqual(accepted.source, .externalOverride)
+            XCTAssertEqual(accepted.version, CodexRuntimeAuthority.Version.parse(supportedVersion))
+            XCTAssertTrue(accepted.redactedDiagnosticSummary.contains("provenance=external-override:codex"))
+            XCTAssertFalse(accepted.redactedDiagnosticSummary.contains(temporaryDirectory.path))
+        }
 
         let old = CodexRuntimeAuthority.resolve(
             resourcesURL: nil,
             applicationSupportURL: temporaryDirectory,
             explicitExecutableOverride: override.path,
-            externalVersionReader: { _ in "codex-cli 0.153.3" }
+            externalVersionReader: { _ in "codex-cli 0.148.9" }
         )
         XCTAssertEqual(
             failure(from: old),
             .externalOverrideTooOld(
-                actual: .init(major: 0, minor: 153, patch: 3),
-                minimum: .init(major: 0, minor: 153, patch: 4)
+                actual: .init(major: 0, minor: 148, patch: 9),
+                minimum: .init(major: 0, minor: 149, patch: 0)
             )
         )
         XCTAssertTrue(
@@ -170,13 +172,13 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             resourcesURL: nil,
             applicationSupportURL: temporaryDirectory,
             explicitExecutableOverride: override.path,
-            externalVersionReader: { _ in "codex-cli 0.153.4-rc.1" }
+            externalVersionReader: { _ in "codex-cli 0.149.0-rc.1" }
         )
         XCTAssertEqual(
             failure(from: prerelease),
             .externalOverrideTooOld(
-                actual: .init(major: 0, minor: 153, patch: 4, prerelease: "rc.1"),
-                minimum: .init(major: 0, minor: 153, patch: 4)
+                actual: .init(major: 0, minor: 149, patch: 0, prerelease: "rc.1"),
+                minimum: .init(major: 0, minor: 149, patch: 0)
             )
         )
 
@@ -412,7 +414,30 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         XCTAssertEqual(fallback.executableURL, bundledExecutable)
     }
 
-    func testSettingsPreflightReportsIgnoredLegacyOverrideAndKeepsExplicitSelection() async throws {
+    func testRuntimeSelectionProjectionKeepsActiveAndPendingDistinct() {
+        let custom = CodexRuntimePreferences.Selection.external(path: "/tmp/custom-codex")
+
+        XCTAssertFalse(
+            CodexRuntimePreferences.runtimeSelectionProjection(
+                active: .inherited,
+                pending: .bundled
+            ).changesAfterRelaunch
+        )
+        XCTAssertTrue(
+            CodexRuntimePreferences.runtimeSelectionProjection(
+                active: .bundled,
+                pending: custom
+            ).changesAfterRelaunch
+        )
+        XCTAssertTrue(
+            CodexRuntimePreferences.runtimeSelectionProjection(
+                active: custom,
+                pending: .bundled
+            ).changesAfterRelaunch
+        )
+    }
+
+    func testSettingsPreflightKeepsActiveAndPendingRuntimeSelectionsSeparate() async throws {
         let legacyOverride = temporaryDirectory.appendingPathComponent("legacy/codex")
         try makeExecutable(at: legacyOverride, content: "#!/bin/sh\necho 'codex 0.153.4'\n")
 
@@ -429,26 +454,40 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         let inherited = await CodexProviderHelpers.preflightCodexRuntimeSettings(
             inheritedEnvironment: ["HOME": temporaryPath],
             shellEnvironmentProvider: shellEnvironmentProvider,
-            selection: .inherited
+            activeSelection: .inherited,
+            pendingSelection: .inherited
         )
 
         XCTAssertTrue(inherited.ignoredLegacyEnvironmentOverride)
-        XCTAssertNotEqual(inherited.effectiveResolution.resolvedCommand, legacyOverride.path)
-        XCTAssertNotEqual(inherited.effectiveResolution.runtime?.source, .externalOverride)
-        XCTAssertFalse(inherited.effectiveResolution.debugMessage.contains(legacyOverride.path))
+        XCTAssertNotEqual(inherited.activeResolution.resolvedCommand, legacyOverride.path)
+        XCTAssertNotEqual(inherited.pendingResolution.resolvedCommand, legacyOverride.path)
+        XCTAssertFalse(inherited.activeResolution.debugMessage.contains(legacyOverride.path))
 
-        let explicit = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+        let customAfterRelaunch = await CodexProviderHelpers.preflightCodexRuntimeSettings(
             inheritedEnvironment: ["HOME": temporaryPath],
             shellEnvironmentProvider: shellEnvironmentProvider,
-            selection: .external(path: legacyOverride.path)
+            activeSelection: .inherited,
+            pendingSelection: .external(path: legacyOverride.path)
         )
 
-        XCTAssertFalse(explicit.ignoredLegacyEnvironmentOverride)
-        XCTAssertEqual(explicit.effectiveResolution.status, .available)
-        XCTAssertEqual(explicit.effectiveResolution.resolvedCommand, legacyOverride.path)
-        XCTAssertEqual(explicit.effectiveResolution.runtime?.source, .externalOverride)
-        XCTAssertEqual(explicit.effectiveResolution.runtime?.version, .init(major: 0, minor: 153, patch: 4))
-        XCTAssertFalse(explicit.effectiveResolution.debugMessage.contains(legacyOverride.path))
+        XCTAssertTrue(customAfterRelaunch.ignoredLegacyEnvironmentOverride)
+        XCTAssertNotEqual(customAfterRelaunch.activeResolution.resolvedCommand, legacyOverride.path)
+        XCTAssertEqual(customAfterRelaunch.pendingResolution.status, .available)
+        XCTAssertEqual(customAfterRelaunch.pendingResolution.resolvedCommand, legacyOverride.path)
+        XCTAssertEqual(customAfterRelaunch.pendingResolution.runtime?.source, .externalOverride)
+        XCTAssertFalse(customAfterRelaunch.pendingResolution.debugMessage.contains(legacyOverride.path))
+
+        let bundledAfterRelaunch = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+            inheritedEnvironment: ["HOME": temporaryPath],
+            shellEnvironmentProvider: shellEnvironmentProvider,
+            activeSelection: .external(path: legacyOverride.path),
+            pendingSelection: .bundled
+        )
+
+        XCTAssertFalse(bundledAfterRelaunch.ignoredLegacyEnvironmentOverride)
+        XCTAssertEqual(bundledAfterRelaunch.activeResolution.resolvedCommand, legacyOverride.path)
+        XCTAssertEqual(bundledAfterRelaunch.activeResolution.runtime?.source, .externalOverride)
+        XCTAssertNotEqual(bundledAfterRelaunch.pendingResolution.runtime?.source, .externalOverride)
     }
 
     func testCapturedShellEnvironmentIsUsedByVersionProbeForInterpreterScripts() async throws {
@@ -536,12 +575,14 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
                     source: .capturedLoginShell
                 )
             },
-            selection: .inherited
+            activeSelection: .inherited,
+            pendingSelection: .inherited
         )
 
         XCTAssertFalse(preflight.ignoredLegacyEnvironmentOverride)
-        XCTAssertNotEqual(preflight.effectiveResolution.resolvedCommand, codex.path)
-        XCTAssertNotEqual(preflight.effectiveResolution.runtime?.source, .externalOverride)
+        XCTAssertNotEqual(preflight.activeResolution.resolvedCommand, codex.path)
+        XCTAssertNotEqual(preflight.pendingResolution.resolvedCommand, codex.path)
+        XCTAssertNotEqual(preflight.pendingResolution.runtime?.source, .externalOverride)
     }
 
     func testExternalVersionProbeUsesEnvironmentAndSeparatesCachedResults() throws {

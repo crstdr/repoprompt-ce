@@ -66,7 +66,8 @@ enum CodexProviderHelpers {
 
     struct CodexRuntimeSettingsPreflight: Equatable {
         let bundledResolution: CodexExecutableResolution
-        let effectiveResolution: CodexExecutableResolution
+        let activeResolution: CodexExecutableResolution
+        let pendingResolution: CodexExecutableResolution
         let ignoredLegacyEnvironmentOverride: Bool
     }
 
@@ -160,26 +161,29 @@ enum CodexProviderHelpers {
         logCollector: CLIProcessLogCollector? = nil,
         inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
         shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider? = nil,
-        selection injectedSelection: CodexRuntimePreferences.Selection? = nil
+        activeSelection injectedActiveSelection: CodexRuntimePreferences.Selection? = nil,
+        pendingSelection injectedPendingSelection: CodexRuntimePreferences.Selection? = nil
     ) async -> CodexRuntimeSettingsPreflight {
         let environment = await codexPreflightEnvironment(
             enableDebugLogging: enableDebugLogging,
             inheritedEnvironment: inheritedEnvironment,
             shellEnvironmentProvider: shellEnvironmentProvider
         )
-        let selection = injectedSelection ?? CodexRuntimePreferences.selection()
+        let activeSelection = injectedActiveSelection ?? CodexRuntimePreferences.activeSelection
+        let pendingSelection = injectedPendingSelection ?? CodexRuntimePreferences.selection()
         let preflight = await Task.detached(priority: .utility) {
             CodexRuntimeSettingsPreflight(
                 bundledResolution: resolveCodexExecutable(environment: environment, selection: .bundled),
-                effectiveResolution: resolveCodexExecutable(environment: environment, selection: selection),
+                activeResolution: resolveCodexExecutable(environment: environment, selection: activeSelection),
+                pendingResolution: resolveCodexExecutable(environment: environment, selection: pendingSelection),
                 ignoredLegacyEnvironmentOverride: CodexRuntimeAuthority.ignoredLegacyEnvironmentOverride(
                     environment: environment,
-                    selection: selection
+                    selection: activeSelection
                 )
             )
         }.value
         logPreflightResolution(
-            preflight.effectiveResolution,
+            preflight.pendingResolution,
             enableDebugLogging: enableDebugLogging,
             logCollector: logCollector
         )

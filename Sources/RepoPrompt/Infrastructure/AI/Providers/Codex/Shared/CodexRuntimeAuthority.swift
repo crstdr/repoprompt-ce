@@ -7,7 +7,7 @@ import Foundation
 /// lookup are intentionally not runtime authorities.
 enum CodexRuntimeAuthority {
     static let bundledVersion = Version(major: 0, minor: 153, patch: 4)
-    static let minimumExternalVersion = bundledVersion
+    static let minimumExternalVersion = Version(major: 0, minor: 149, patch: 0)
     static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
 
     /// The persisted preference captured for this application process. Settings writes remain
@@ -147,9 +147,9 @@ enum CodexRuntimeAuthority {
             case let .externalOverrideNotExecutable(path):
                 "RepoPrompt could not start Codex: the configured local executable is not executable at `\(path)`. Choose another in Settings or restore the included runtime."
             case let .externalOverrideVersionUnreadable(path):
-                "RepoPrompt could not start Codex: the local executable at `\(path)` did not report a compatible Codex version. Version \(minimumExternalVersion) or newer is required by RepoPrompt's app-server contract."
+                "RepoPrompt could not start Codex: the local executable at `\(path)` did not report a compatible Codex version. Version \(minimumExternalVersion) or newer is required by RepoPrompt's external-runtime compatibility contract."
             case let .externalOverrideTooOld(actual, minimum):
-                "RepoPrompt could not start Codex: local version \(actual) is too old. Version \(minimum) or newer is required by RepoPrompt's app-server contract; update the configured executable or remove it to use bundled Codex \(bundledVersion)."
+                "RepoPrompt could not start Codex: local version \(actual) is too old. Version \(minimum) or newer is required by RepoPrompt's external-runtime compatibility contract; update the configured executable or remove it to use bundled Codex \(bundledVersion)."
             }
         }
     }
