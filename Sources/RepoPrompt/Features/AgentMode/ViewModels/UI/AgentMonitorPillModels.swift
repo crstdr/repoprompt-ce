@@ -461,7 +461,7 @@ struct AgentMonitorPendingUpdates: Equatable {
 }
 
 enum AgentMonitorPeriodicWakeCopy {
-    static let label = "Wake periodically when idle"
+    static let label = "Wake when idle for"
     static let intervalLabel = "Periodic wake interval"
     static let tooltip = """
     While overseeing another session, wake after this much idle time, even without updates. \
@@ -475,7 +475,7 @@ enum AgentMonitorPeriodicWakeCopy {
 
 /// Pure routine-interval formatting; the coordinator decides whether a countdown is truthful.
 enum AgentMonitorRoutineWakeCopy {
-    static let limitLabel = "Limit routine wake-ups"
+    static let limitLabel = "Routine wake-ups no more often than"
     static let intervalLabel = "Minimum interval"
     static let tooltip = """
     Applies across every session this observer oversees, and counts from the last oversight wake \

@@ -3920,6 +3920,88 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
     }
 
+    func testBusyPeriodicObserverSkipsEligibilityButMaintainsPreparingAttempt() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        fixture.session.runState = .running
+        var probes = 0
+        fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { _ in
+            probes += 1
+            return true
+        }
+        for _ in 0 ..< 20 {
+            fixture.session.noteMonitorObservationInputsChanged()
+            fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        }
+        await settleSnoozeTasks()
+        XCTAssertEqual(probes, 0)
+        XCTAssertNil(fixture.session.oversight.periodicDeadline)
+        fixture.session.runState = .completed
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        fixture.session.runState = .running
+        fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { _ in false }
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+    }
+
+    func testPeriodicCommittedDeletionFencesPreparedProducerBeforeCleanup() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let host = LiveWindowEndpointHost()
+        host.register(fixture.viewModel, windowID: endpoint.windowID)
+        let bridge = AgentSessionLinkRuntimeBridge(authority: DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+            runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date(timeIntervalSince1970: 0)
+        )), host: host)
+        let registry = AgentSessionDeletionRegistry.shared
+        let oldCommit = registry.commitObserver
+        let oldChange = registry.changeObserver
+        let oldInvalidation = AgentSessionLinkInvalidationSink.invalidateBinding
+        let oldReadiness = AgentSessionLinkCandidateReadinessSignal.onChange
+        let oldExact = AgentSessionLinkLocationInvalidationSink.refreshExactTargets
+        let oldObserved = AgentSessionLinkLocationInvalidationSink.refreshObservedTargets
+        bridge.attach(host: host)
+        defer {
+            registry.commitObserver = oldCommit
+            registry.changeObserver = oldChange
+            AgentSessionLinkInvalidationSink.invalidateBinding = oldInvalidation
+            AgentSessionLinkCandidateReadinessSignal.onChange = oldReadiness
+            AgentSessionLinkLocationInvalidationSink.refreshExactTargets = oldExact
+            AgentSessionLinkLocationInvalidationSink.refreshObservedTargets = oldObserved
+            fixture.session.oversight.retirePeriodicScheduling()
+        }
+        fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { bridge.isPeriodicWakeObserverLive(for: $0) }
+        let failed = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        registry.didFailDurableDeletion(failed)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint))
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        let rawID = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        _ = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+            "periodic", session: fixture.session, dispatchID: rawID
+        )
+        let gate = AutoWakeCatalogAuthorityGate()
+        let cleanup = registry.commitObserver
+        registry.commitObserver = { sessionID in
+            _ = await gate.requirement()
+            await cleanup?(sessionID)
+        }
+        let token = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }
+        await gate.waitUntilEntered()
+        // Assert the contested state, so an unrelated inventory withdrawal cannot make this pass.
+        XCTAssertTrue(registry.isPermanentlyDeleted(sessionID: fixture.sessionID))
+        XCTAssertEqual(host.agentSessionLinkCandidates().first { $0.domainEndpoint == endpoint }?.isClosing, true)
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkPromptInventoryBySessionID[fixture.sessionID]?.inventory.isEmpty ?? true)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .preparingDispatch)
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: rawID))
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: fixture.session, dispatchID: rawID)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertNil(fixture.session.oversight.periodicDeadline)
+        await gate.open()
+        await deletion.value
+    }
+
     // MARK: - Periodic idle scheduling and shared dispatch ownership
 
     private func periodicFixture() throws -> (Fixture, AgentSessionLinkAutoWakeSnoozeTestClock, DomainAgentSessionLinkEndpointIdentity) {

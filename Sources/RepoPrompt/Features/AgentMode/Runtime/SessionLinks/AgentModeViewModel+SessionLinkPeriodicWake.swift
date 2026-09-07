@@ -73,6 +73,17 @@ extension AgentModeViewModel {
                     }
                 }
         }
+        // A busy observer cannot start an idle span, but an owned periodic producer still needs
+        // eligibility-loss settlement and the continuation handling above.
+        if session.oversight.pendingAutoWake?.isPeriodic != true,
+           !Self.agentSessionLinkPeriodicWakeSessionIsIdle(session)
+        {
+            session.oversight.invalidatePeriodicIdleSpan()
+            if !session.oversight.periodicIdleWakeEnabled {
+                session.oversight.periodicObservation = nil
+            }
+            return
+        }
         let preparing = session.oversight.pendingAutoWake?.isPeriodic == true
             && session.oversight.pendingAutoWake?.phase.ownsTransportBoundary == true
         guard agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint, requiresReadyCatalog: !preparing) else {

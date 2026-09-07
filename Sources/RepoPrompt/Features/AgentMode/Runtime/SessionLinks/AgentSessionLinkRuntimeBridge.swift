@@ -4273,7 +4273,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     func isPeriodicWakeObserverLive(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
         guard !isFrozenForTermination, let host else { return false }
-        return host.agentSessionLinkCandidates().contains { $0.domainEndpoint == endpoint }
+        return host.agentSessionLinkCandidates().contains { $0.domainEndpoint == endpoint && !$0.isClosing }
     }
 
     /// Requests one manual wake for pending updates on the exact live incarnation.
