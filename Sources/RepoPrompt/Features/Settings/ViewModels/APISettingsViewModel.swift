@@ -389,6 +389,7 @@ public class APISettingsViewModel: ObservableObject {
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
             grokBuildAvailable: isGrokBuildConnected,
+            antigravityAvailable: AntigravityRuntimeManager.installedRuntimeSync() != nil,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -496,6 +497,8 @@ public class APISettingsViewModel: ObservableObject {
             isCursorConnected
         case .grokBuild:
             isGrokBuildConnected
+        case .antigravity:
+            AntigravityRuntimeManager.installedRuntimeSync() != nil
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -3589,6 +3592,15 @@ public class APISettingsViewModel: ObservableObject {
             )
             if let snapshot {
                 collector.append("Discovered \(snapshot.models.options.count) Cursor model option(s)")
+                let reconciliationIssues = CursorAIModelCatalog.reconciliationIssues(comparedTo: snapshot.models)
+                if reconciliationIssues.isEmpty {
+                    collector.append("Release-gated Cursor model metadata matches the live catalog")
+                } else {
+                    collector.append("Release-gated Cursor model metadata has \(reconciliationIssues.count) live difference(s)")
+                    for issue in reconciliationIssues {
+                        collector.append("Cursor metadata difference: \(issue)")
+                    }
+                }
                 availableCursorModelOptions = cursorOptions
             } else {
                 collector.append("Cursor ACP preflight completed without dynamic model metadata; using Auto fallback")
@@ -3658,16 +3670,16 @@ public class APISettingsViewModel: ObservableObject {
         let message = error.localizedDescription
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
-            return "Cursor Agent CLI ACP server was not found. Install Cursor Agent CLI and ensure `cursor-agent acp` is available."
+            return "Cursor Agent CLI ACP server was not found. Install Cursor Agent CLI and ensure `cursor-agent acp` or the verified `agent acp` entrypoint is available."
         }
         if lowered.contains("permission denied") {
-            return "Permission denied. Ensure the `cursor-agent` executable is accessible."
+            return "Permission denied. Ensure the Cursor `cursor-agent` or `agent` executable is accessible."
         }
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") || lowered.contains("login") {
             return "Cursor Agent CLI is not authenticated. Set `CURSOR_API_KEY`/`CURSOR_AUTH_TOKEN` or complete Cursor login."
         }
         if lowered.contains("does not advertise acp") || lowered.contains("acp support") {
-            return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` works."
+            return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` or `agent acp --help` identifies Cursor ACP."
         }
         return message
     }

@@ -245,6 +245,7 @@ enum AgentSessionLinkPromptProviderContext: String, Hashable, CaseIterable {
     case openCode
     case cursor
     case grokBuild
+    case antigravity
 
     init(agentKind: AgentProviderKind?) {
         guard let agentKind else {
@@ -260,6 +261,7 @@ enum AgentSessionLinkPromptProviderContext: String, Hashable, CaseIterable {
         case .openCode: self = .openCode
         case .cursor: self = .cursor
         case .grokBuild: self = .grokBuild
+        case .antigravity: self = .antigravity
         }
     }
 }

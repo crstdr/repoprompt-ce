@@ -11,6 +11,19 @@ struct DomainWorkspaceSaveOperationIDs {
     }
 }
 
+struct DomainWorkspaceFailClosedSaveOutcome {
+    let working: DomainCommandOutcome?
+    let saved: DomainCommandOutcome?
+
+    var finalOutcome: DomainCommandOutcome? {
+        saved ?? working
+    }
+
+    var workingCommitted: Bool {
+        working?.isSuccessfulDomainMutation == true
+    }
+}
+
 /// Revisioned app-process client for the runtime-owned workspace/context authority.
 /// It is the only production persistence dependency injected into a workspace manager.
 struct DomainWorkspaceAuthorityClient {
@@ -19,6 +32,10 @@ struct DomainWorkspaceAuthorityClient {
 
     func snapshot() async -> DomainWorkspaceCatalogSnapshot {
         await store.snapshot()
+    }
+
+    func activationSnapshot(workspaceID: UUID, fileURL: URL) async -> DomainWorkspaceActivationSnapshot {
+        await store.activationSnapshot(workspaceID: workspaceID, fileURL: fileURL)
     }
 
     func canonicalWorkspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
@@ -100,6 +117,50 @@ struct DomainWorkspaceAuthorityClient {
             origin: .appPresentation(windowID: windowID),
             command: .saveWorkspaceDocument(workspaceID: workspace.id)
         ))
+    }
+
+    /// Saves one exact captured document without replaying or rebasing it after any durable or
+    /// external conflict. Used by operations whose preflight authority must remain their authority.
+    func saveFailClosed(
+        _ workspace: WorkspaceModel,
+        fileURL: URL,
+        expectedWorkspaceRevision: UInt64,
+        expectedContentDigest: String,
+        operationIDs: DomainWorkspaceSaveOperationIDs = .init()
+    ) async throws -> DomainWorkspaceFailClosedSaveOutcome {
+        let document = try document(for: workspace, fileURL: fileURL)
+        var saveRevision = expectedWorkspaceRevision
+        var workingOutcome: DomainCommandOutcome?
+        if document.contentDigest != expectedContentDigest {
+            let working = await executeStable(.init(
+                operationID: operationIDs.working,
+                expectedWorkspaceRevision: expectedWorkspaceRevision,
+                conflictRecoveryPolicy: .failClosed,
+                origin: .appPresentation(windowID: windowID),
+                command: .replaceWorkingDocument(document)
+            ))
+            workingOutcome = working
+            guard working.isSuccessfulDomainMutation else {
+                return DomainWorkspaceFailClosedSaveOutcome(
+                    working: working,
+                    saved: nil
+                )
+            }
+            saveRevision = working.after?.workingRevision
+                ?? working.workspace?.revisions.workingRevision
+                ?? saveRevision
+        }
+        let saved = await executeStable(.init(
+            operationID: operationIDs.saved,
+            expectedWorkspaceRevision: saveRevision,
+            conflictRecoveryPolicy: .failClosed,
+            origin: .appPresentation(windowID: windowID),
+            command: .saveWorkspaceDocument(workspaceID: workspace.id)
+        ))
+        return DomainWorkspaceFailClosedSaveOutcome(
+            working: workingOutcome,
+            saved: saved
+        )
     }
 
     func delete(
@@ -198,6 +259,10 @@ final class DomainWorkspacePresentationBridge {
             } while clock.now < deadline
             return lastPublicationSequence >= publicationSequence
         }
+
+        func suppressSelfEchoForTesting(_ event: DomainWorkspaceEvent) async -> Bool {
+            await suppressSelfEcho(for: event)
+        }
     #endif
 
     func start() {
@@ -265,10 +330,15 @@ final class DomainWorkspacePresentationBridge {
               let workspaceID = event.workspaceID,
               projectedModels[workspaceID] != nil
         else { return false }
-        guard let workspace = await client.store.workspaceSnapshot(workspaceID),
+        guard let workspace = await client.canonicalWorkspaceSnapshot(workspaceID),
               workspace.health.acceptsMutations,
               let model = workspaceManager?.workspace(withID: workspaceID)
         else { return false }
+        // A same-window commit can be accepted just before a newer local edit is captured. Keep the
+        // local model in both the manager and bridge cache: advancing the baseline below lets the
+        // newer edit commit from the accepted revision, and explicit failed-save reconciliation
+        // remains responsible for authoritative replacement when a two-phase cleanup save does not
+        // complete. The outcome does not depend on re-encoding the model to compare digests.
         projectedModels[workspaceID] = model
         projectedDigests[workspaceID] = workspace.document.contentDigest
         projectedHealth[workspaceID] = workspace.health

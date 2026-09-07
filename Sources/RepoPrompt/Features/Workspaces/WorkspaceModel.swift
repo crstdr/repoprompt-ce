@@ -45,6 +45,13 @@ struct WorkspaceRootSetKey: Hashable {
 }
 
 struct WorkspaceDuplicateGroupSummary: Identifiable, Equatable {
+    struct DuplicateWorkspaceRow: Identifiable, Equatable {
+        let id: Int
+        let workspaceID: UUID
+        let name: String
+        let windowIDs: [Int]
+    }
+
     let id: String
     let normalizedRepoPaths: [String]
     let canonicalWorkspaceID: UUID
@@ -52,6 +59,19 @@ struct WorkspaceDuplicateGroupSummary: Identifiable, Equatable {
     let duplicateWorkspaceIDs: [UUID]
     let duplicateWorkspaceNames: [String]
     let windowIDsByWorkspaceID: [UUID: [Int]]
+
+    /// A value snapshot for display. Ordinal IDs keep repeated recovered workspace IDs distinct.
+    var duplicateWorkspaceRows: [DuplicateWorkspaceRow] {
+        zip(duplicateWorkspaceIDs, duplicateWorkspaceNames).enumerated().map { entry in
+            let (workspaceID, name) = entry.element
+            return DuplicateWorkspaceRow(
+                id: entry.offset,
+                workspaceID: workspaceID,
+                name: name,
+                windowIDs: windowIDsByWorkspaceID[workspaceID] ?? []
+            )
+        }
+    }
 }
 
 struct WorkspaceDuplicateCleanupSkippedItem: Equatable {
@@ -65,7 +85,7 @@ struct WorkspaceDuplicateCleanupResult: Equatable {
     let groupsDetected: Int
     let groupsConsolidated: Int
     let reassignedWindowIDs: [Int]
-    let deletedWorkspaceIDs: [UUID]
+    let retiredWorkspaceIDs: [UUID]
     let skipped: [WorkspaceDuplicateCleanupSkippedItem]
     let backupURL: URL?
 }
@@ -350,6 +370,15 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
 
     var isSystemWorkspace: Bool
     var isHiddenInMenus: Bool
+    /// Library membership is independent of persistence: automation can retain history without
+    /// occupying the user workspace list. nil preserves legacy classification until chosen.
+    var isSavedWorkspace: Bool?
+    /// The canonical workspace this recoverable duplicate was consolidated into.
+    ///
+    /// Distinct from `isHiddenInMenus`, which is a user-controlled visibility preference. A
+    /// non-`nil` value retires this record from duplicate detection without deleting its unmerged
+    /// sidecar data.
+    var consolidatedIntoWorkspaceID: UUID?
 
     /// When true, the workspace is temporary and should not be persisted to disk
     var ephemeralFlag: Bool?
@@ -412,6 +441,8 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         customStoragePath: URL? = nil,
         ephemeralFlag: Bool? = nil,
         isHiddenInMenus: Bool = false,
+        isSavedWorkspace: Bool? = nil,
+        consolidatedIntoWorkspaceID: UUID? = nil,
         copyPresetId: UUID? = nil,
         copyCustomizations: CopyCustomizations? = nil,
         chatPresetId: UUID? = nil,
@@ -435,6 +466,8 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         self.customStoragePath = customStoragePath
         self.ephemeralFlag = ephemeralFlag
         self.isHiddenInMenus = isHiddenInMenus
+        self.isSavedWorkspace = isSavedWorkspace
+        self.consolidatedIntoWorkspaceID = consolidatedIntoWorkspaceID
         self.copyPresetId = copyPresetId
         self.copyCustomizations = copyCustomizations
         self.chatPresetId = chatPresetId
@@ -456,6 +489,8 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         customStoragePath = (try? c.decode(URL.self, forKey: .customStoragePath))
         isSystemWorkspace = (try? c.decode(Bool.self, forKey: .isSystemWorkspace)) ?? false
         isHiddenInMenus = (try? c.decode(Bool.self, forKey: .isHiddenInMenus)) ?? false
+        isSavedWorkspace = try? c.decodeIfPresent(Bool.self, forKey: .isSavedWorkspace)
+        consolidatedIntoWorkspaceID = try? c.decodeIfPresent(UUID.self, forKey: .consolidatedIntoWorkspaceID)
         ephemeralFlag = (try? c.decode(Bool?.self, forKey: .ephemeralFlag)) ?? nil
         name = (try? c.decode(String.self, forKey: .name)) ?? "Untitled Workspace"
         repoPaths = (try? c.decode([String].self, forKey: .repoPaths)) ?? []
@@ -489,6 +524,8 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         try c.encodeIfPresent(customStoragePath, forKey: .customStoragePath)
         try c.encode(isSystemWorkspace, forKey: .isSystemWorkspace)
         try c.encode(isHiddenInMenus, forKey: .isHiddenInMenus)
+        try c.encodeIfPresent(isSavedWorkspace, forKey: .isSavedWorkspace)
+        try c.encodeIfPresent(consolidatedIntoWorkspaceID, forKey: .consolidatedIntoWorkspaceID)
         try c.encode(name, forKey: .name)
         try c.encode(repoPaths, forKey: .repoPaths)
         try c.encode(presets, forKey: .presets)
@@ -521,6 +558,8 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
             lhs.lastSearchQuery == rhs.lastSearchQuery &&
             lhs.selectedMetaPromptIDs == rhs.selectedMetaPromptIDs &&
             lhs.isHiddenInMenus == rhs.isHiddenInMenus &&
+            lhs.isSavedWorkspace == rhs.isSavedWorkspace &&
+            lhs.consolidatedIntoWorkspaceID == rhs.consolidatedIntoWorkspaceID &&
             lhs.isSystemWorkspace == rhs.isSystemWorkspace &&
             lhs.customStoragePath == rhs.customStoragePath &&
             lhs.ephemeralFlag == rhs.ephemeralFlag &&
@@ -539,6 +578,8 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         case customStoragePath
         case isSystemWorkspace
         case isHiddenInMenus
+        case isSavedWorkspace
+        case consolidatedIntoWorkspaceID
         case name
         case repoPaths
         case presets
@@ -559,6 +600,21 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
 }
 
 extension WorkspaceModel {
+    /// Legacy managed scratch roots are grouped for presentation only. No document is migrated
+    /// or deleted from this heuristic, and an explicit library choice always takes precedence.
+    var isTemporaryWorkspace: Bool {
+        if isEphemeral { return true }
+        if let isSavedWorkspace { return !isSavedWorkspace }
+        return !repoPaths.isEmpty && repoPaths.allSatisfy { rawPath in
+            let path = URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath).standardizedFileURL.path
+            let components = URL(fileURLWithPath: path).pathComponents
+            return path.hasPrefix("/tmp/") || path.hasPrefix("/private/tmp/")
+                || path.hasPrefix(FileManager.default.temporaryDirectory.standardizedFileURL.path + "/")
+                || components.contains(".repoprompt-worktrees")
+                || zip(components, components.dropFirst()).contains { $0 == ".codex" && $1 == "worktrees" }
+        }
+    }
+
     /// Indicates whether this workspace should not be persisted to disk
     var isEphemeral: Bool {
         get { ephemeralFlag ?? false }
