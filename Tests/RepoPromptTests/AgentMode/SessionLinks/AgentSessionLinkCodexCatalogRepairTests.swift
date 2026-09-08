@@ -34,6 +34,32 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         super.tearDown()
     }
 
+    func testFallbackResetSettlesOnlyItsUnattemptedWake() throws {
+        for ownsWake in [false, true] {
+            for acquired in [false, true] {
+                let fixture = try makeFixture()
+                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+                let wakeID = UUID()
+                fixture.session.pendingOversightAutoWake = AgentSessionLinkAutoWakeAttempt(
+                    wakeID: wakeID, observerEndpoint: endpoint, queueEpoch: Self.queueEpoch,
+                    queueRevision: 1,
+                    wakeFingerprint: Self.laneSnapshot(observerEndpoint: endpoint).wakeEligibilityFingerprint,
+                    requiredAttentionOccurrence: nil, attemptedFingerprint: nil,
+                    physicalOutcome: acquired ? .ambiguous : .notAttempted,
+                    phase: acquired ? .dispatching : .preparingDispatch, task: nil
+                )
+                var entry = Self.fallbackQueueEntry(controller: fixture.controller, session: fixture.session)
+                entry.monitoringWakeID = ownsWake ? wakeID : UUID()
+                fixture.session.codexFallbackQueue = [entry]
+                fixture.viewModel.test_codexCoordinator.handleMCPControlReset(for: fixture.session, reason: "test reset")
+                XCTAssertTrue(fixture.session.codexFallbackQueue.isEmpty)
+                XCTAssertEqual(fixture.session.pendingOversightAutoWake == nil, ownsWake && !acquired)
+                fixture.viewModel.test_codexCoordinator.handleMCPControlReset(for: fixture.session, reason: "repeat reset")
+                XCTAssertEqual(fixture.session.pendingOversightAutoWake == nil, ownsWake && !acquired)
+            }
+        }
+    }
+
     // MARK: - Repair
 
     /// The whole contract in one pass: an idle Codex observer behind a false/live-outbound catalog

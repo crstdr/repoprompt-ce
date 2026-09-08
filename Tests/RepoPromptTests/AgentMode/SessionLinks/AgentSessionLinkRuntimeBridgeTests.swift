@@ -558,6 +558,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertFalse(state.waitCursor.isEmpty)
     }
 
+    func testEndpointDriftAfterFinalAwaitRefusesBeforeSeeding() async {
+        let fixture = makeFixture()
+        fixture.bridge.test_beforeSynchronousSeed = {
+            fixture.host.candidates = [fixture.observer]
+        }
+        let outcome = await addLink(fixture)
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        XCTAssertEqual(fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0], 0)
+        let snapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(snapshot.activeLinkCount, 0)
+        XCTAssertEqual(snapshot.pendingReservationCount, 0)
+    }
+
     func testSeedFailureRollsBackTheReservationAndLeavesNoActiveLink() async {
         let fixture = makeFixture()
         // Drift between the resolution read and the post-reservation revalidation read.
