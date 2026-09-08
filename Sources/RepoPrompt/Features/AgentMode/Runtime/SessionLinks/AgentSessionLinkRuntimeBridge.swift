@@ -790,6 +790,8 @@ final class AgentSessionLinkRuntimeBridge {
     #if DEBUG
         /// Deterministic interleaving seam after authority revocation and before durable cleanup enters
         /// the pair lane. Tests use it to reassert the same token in the exact stale-owner window.
+        var test_beforeSynchronousSeed: (@MainActor () -> Void)?
+
         var test_beforeDurableIntentSettlement: (@MainActor (AgentSessionOversightIntent) async -> Void)?
         /// Deterministic interleaving seam after activation is live and bookkeeping is installed, but
         /// before the post-activation deletion/token fence.
@@ -2552,10 +2554,26 @@ final class AgentSessionLinkRuntimeBridge {
             return EstablishmentResult(outcome: .failed(.closing))
         }
 
+        // Second token fence: the reservation authorizes nothing, so a Stop that committed during
+        // the reserve hop is settled by abandoning here rather than by revoking a grant that this
+        // task would otherwise be about to create.
+        guard await tokenIsCurrent(token) else {
+            await authority.abandonReservation(reservation)
+            bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
+            return EstablishmentResult(outcome: .rejected(message: Self.retiredMessage))
+        }
+        guard await deletionFenceAllowsEstablishment(pair) else {
+            await authority.abandonReservation(reservation)
+            bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
+            return EstablishmentResult(outcome: .failed(.closing))
+        }
+        #if DEBUG
+            test_beforeSynchronousSeed?()
+        #endif
         // Synchronous seed: revalidate both live identities on MainActor, then build the initial
         // sanitized snapshot before the link can become visible to any operation.
         let liveCandidates = host.agentSessionLinkCandidates()
-        guard let liveTarget = liveCandidates.first(where: { $0.domainEndpoint == targetEndpoint }),
+        guard !isFrozenForTermination, let liveTarget = liveCandidates.first(where: { $0.domainEndpoint == targetEndpoint }),
               liveCandidates.contains(where: { $0.domainEndpoint == observerEndpoint }),
               expectedEndpoints.isEmpty || liveCandidatesMatch(
                   expectedEndpoints,
@@ -2575,19 +2593,6 @@ final class AgentSessionLinkRuntimeBridge {
             await authority.abandonReservation(reservation)
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
             return EstablishmentResult(outcome: .failed(.rebinding))
-        }
-        // Second token fence: the reservation authorizes nothing, so a Stop that committed during
-        // the reserve hop is settled by abandoning here rather than by revoking a grant that this
-        // task would otherwise be about to create.
-        guard await tokenIsCurrent(token), !isFrozenForTermination else {
-            await authority.abandonReservation(reservation)
-            bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
-            return EstablishmentResult(outcome: .rejected(message: Self.retiredMessage))
-        }
-        guard await deletionFenceAllowsEstablishment(pair) else {
-            await authority.abandonReservation(reservation)
-            bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
-            return EstablishmentResult(outcome: .failed(.closing))
         }
         let seed = host.agentSessionLinkObservationSnapshot(for: liveTarget)
         let seedSequence = allocateSourcePublicationSequence(for: targetEndpoint.sessionID)

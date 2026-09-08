@@ -3052,7 +3052,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             originRunID: runID,
             originRunAttemptID: runAttemptID,
             blockingTurn: recoverableCodexFallbackBlockingTurn(session: session),
-            state: .queued
+            state: .queued,
+            monitoringWakeID: viewModel?.agentSessionLinkEffectiveDispatchID(
+                for: session, dispatchID: .codexFallback(queueID: submission.queueID)
+            ).autoWakeID
         )
         detachCodexFallbackAttachmentReservation(attachmentReservationID, session: session)
         session.codexFallbackQueue.append(entry)
@@ -3263,6 +3266,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ head: AgentTabSession.CodexFallbackQueueEntry,
         session: AgentTabSession
     ) async -> Bool {
+        guard session.codexFallbackDispatchInFlight?.id == head.id else { return false }
         guard let controller = session.codexController,
               ObjectIdentifier(controller) == head.originControllerInstanceID
         else {
@@ -3417,6 +3421,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexFallbackSuccessorRetryTask = nil
         session.mcpFollowUpRunPending = false
         session.codexFallbackHookGateOwnerBlocker = nil
+        // Capture the original producer before teardown; settlement may admit a successor.
+        let abandonedWakeID = session.oversight.pendingAutoWake.flatMap { attempt in
+            session.codexFallbackQueue.contains(where: { $0.monitoringWakeID == attempt.wakeID })
+                || session.codexFallbackDispatchInFlight?.monitoringWakeID == attempt.wakeID
+                ? attempt.wakeID : nil
+        }
         let queued = session.codexFallbackQueue
         session.codexFallbackQueue.removeAll()
         for entry in queued {
@@ -3461,6 +3471,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if mode == .restoreInput {
                 session.appendItem(.error(reason, sequenceIndex: session.nextSequenceIndex))
             }
+        }
+        if let abandonedWakeID {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                for: session,
+                dispatchID: .autoWake(wakeID: abandonedWakeID)
+            )
         }
         viewModel?.publishMCPStateChange(for: session)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)

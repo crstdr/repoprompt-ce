@@ -548,6 +548,7 @@ final class AgentTabSession: ObservableObject {
         let originRunAttemptID: UUID
         var blockingTurn: CodexFallbackBlockingTurn?
         var state: CodexFallbackQueueState
+        var monitoringWakeID: UUID?
     }
 
     var codexPendingTurnKind: CodexTurnKind?
