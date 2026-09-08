@@ -97,7 +97,7 @@ package enum MCPClientToolPolicyCatalog {
         .direct: .init(
             profile: .direct,
             restrictedCapabilities: [],
-            grantedCapabilities: [],
+            grantedCapabilities: [.agentConversationSend],
             role: .direct,
             allowsAgentExternalControlTools: false,
             annotationProfile: .canonical
