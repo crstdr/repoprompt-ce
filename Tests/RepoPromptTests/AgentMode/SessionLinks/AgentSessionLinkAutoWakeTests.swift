@@ -4231,6 +4231,71 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertNil(fixture.session.oversight.periodicDeadline)
     }
 
+    func testPeriodicACPResumeFailurePreservesIdentityAndHandoffWithoutPrompting() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let (harness, provider, responseGate, directory) = try makePeriodicACPHarness(
+            fixture, holdMethod: "unused", failLoad: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = responseGate
+        fixture.session.selectedAgent = .openCode
+        fixture.session.providerSessionID = "missing-original-session"
+        fixture.session.pendingHandoff.payload = "Preserve user handoff"
+        let handoff = fixture.session.pendingHandoff
+        let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        let startup = try startPeriodicACP(fixture, harness: harness, wakeID: wakeID, endpoint: endpoint)
+        await startup.value
+        XCTAssertEqual(fixture.session.providerSessionID, "missing-original-session")
+        XCTAssertEqual(fixture.session.pendingHandoff, handoff)
+        XCTAssertTrue(provider.promptedMessages.isEmpty)
+        XCTAssertEqual(harness.acceptedDispatchCount, 0)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        XCTAssertNil(fixture.session.acpController)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+    }
+
+    func testPeriodicClaudeResumeFailureDoesNotStartFreshButUserRecoveryStillWorks() async throws {
+        for periodic in [true, false] {
+            let (fixture, clock, endpoint) = try periodicFixture()
+            if periodic { _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint) }
+            else { fixture.session.oversight.retirePeriodicScheduling() }
+            let session = AgentTabSession(tabID: fixture.tabID)
+            session.hasLoadedPersistedState = true
+            session.testInstallPersistentSessionBinding(sessionID: UUID())
+            session.oversight.pendingAutoWake = fixture.session.oversight.pendingAutoWake
+            session.selectedAgent = .claudeCode
+            session.providerSessionID = "missing-original-session"
+            let controller = MonitorFakeNativeController()
+            await controller.setRejectResume(true)
+            var creations = 0
+            let coordinator = ClaudeAgentModeCoordinator(
+                windowID: 1, workspacePathProvider: { _ in nil },
+                claudeControllerFactory: { _, _, _, _ in
+                    creations += 1
+                    return controller
+                }
+            )
+            let runID = UUID()
+            session.installRunID(runID)
+            let ownership = session.beginRunAttempt(source: "test.periodic.resume")
+            let result = await coordinator.ensureClaudeNativeSession(
+                session: session, intent: .runAttempt(ownership: ownership, runID: runID)
+            )
+            let attempts = await controller.startOrResumeExistingSessionIDs
+            if periodic {
+                guard case .failed = result else { return XCTFail("periodic resume must fail closed: \(result)") }
+                XCTAssertEqual(attempts, ["missing-original-session"])
+                XCTAssertEqual(creations, 1)
+                XCTAssertEqual(session.providerSessionID, "missing-original-session")
+            } else {
+                XCTAssertEqual(result, .ready)
+                XCTAssertEqual(attempts, ["missing-original-session", nil])
+                XCTAssertEqual(creations, 2)
+            }
+            await controller.shutdown()
+        }
+    }
+
     func testPeriodicACPCancelledStartupLatchesLateProducerAndPreservesHandoff() async throws {
         let (fixture, clock, endpoint) = try periodicFixture()
         let factoryGate = AutoWakeCatalogAuthorityGate()
@@ -4370,14 +4435,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     private func makePeriodicACPHarness(
-        _ fixture: Fixture, holdMethod: String, factoryGate: AutoWakeCatalogAuthorityGate? = nil
+        _ fixture: Fixture, holdMethod: String, factoryGate: AutoWakeCatalogAuthorityGate? = nil, failLoad: Bool = false
     ) throws -> (AgentSessionLinkRunnerHarness, AgentSessionLinkCapturingACPProvider, AgentSessionLinkACPResponseGate, URL) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PeriodicACP-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let gate = try AgentSessionLinkACPResponseGate(directory: directory)
         let script = try AgentSessionLinkACPServerScript.write(to: directory)
         let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path, environment: [
-            "ACP_HOLD_METHOD": holdMethod, "ACP_RESPONSE_GATE": gate.path
+            "ACP_HOLD_METHOD": holdMethod, "ACP_RESPONSE_GATE": gate.path, "ACP_FAIL_LOAD": failLoad ? "1" : ""
         ])
         let harness = AgentSessionLinkRunnerHarness(
             headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },

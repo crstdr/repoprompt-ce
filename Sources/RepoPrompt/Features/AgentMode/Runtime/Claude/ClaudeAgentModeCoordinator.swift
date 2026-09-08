@@ -724,6 +724,7 @@ final class ClaudeAgentModeCoordinator {
         effectiveAllowNativeBashTool: Bool?,
         effectiveMCPStrictMode: Bool?
     ) async throws -> NativeAgentRuntimeSessionRef {
+        let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
         let existingSessionID = session.providerSessionID
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
         let effortLevel = currentClaudeEffortLevel(for: session)
@@ -754,7 +755,8 @@ final class ClaudeAgentModeCoordinator {
                 }
                 throw ControllerLifecycleError.superseded
             }
-            guard intent.allowsFreshStartRecovery,
+            // A periodic turn cannot recover into a fresh conversation without its handoff.
+            guard !isPeriodic, intent.allowsFreshStartRecovery,
                   shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID)
             else {
                 throw error

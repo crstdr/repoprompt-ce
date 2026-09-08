@@ -398,7 +398,7 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
         ACPSessionConfiguration(
-            mode: .new,
+            mode: request.resumeSessionID.map { .load(existingSessionID: $0) } ?? .new,
             workingDirectory: request.workspacePath ?? FileManager.default.temporaryDirectory.path,
             mcpServers: []
         )
@@ -527,6 +527,8 @@ enum AgentSessionLinkACPServerScript {
                     gate.read(1)
             if method == "initialize":
                 respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
+            elif method == "session/load" and os.environ.get("ACP_FAIL_LOAD"):
+                respond_error(request.get("id"), "session not found: invalid params")
             elif method == "session/new":
                 respond(request.get("id"), {
                     "sessionId": "monitor-acp-session",

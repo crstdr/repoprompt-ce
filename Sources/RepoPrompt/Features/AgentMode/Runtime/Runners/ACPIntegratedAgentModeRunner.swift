@@ -573,6 +573,7 @@ final class ACPIntegratedAgentModeRunner {
         lease: MCPBootstrapLease,
         attachmentReservationID: UUID?
     ) async {
+        let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
         let modelDescription = runRequest.modelString ?? "default"
         let resumeDescription = runRequest.resumeSessionID ?? "nil"
         let workspaceDescription = runRequest.workspacePath ?? "nil"
@@ -610,6 +611,10 @@ final class ACPIntegratedAgentModeRunner {
                 }
                 var initialMessageForPromptTurn = initialMessageForRun
                 if bootstrap.didFallbackToNewSessionAfterLoadFailure {
+                    // Periodic turns preserve handoffs, so they cannot adopt a contextless replacement.
+                    // Existing cancellation cleanup retires this unprompted controller.
+                    guard !isPeriodic else { throw CancellationError() }
+
                     await hooks.providerInput.stageResumeRecoveryHandoffIfNeeded(session)
                     initialMessageForPromptTurn = hooks.providerInput.prependPendingHandoffIfNeeded(initialMessageForRun, session)
                 }

@@ -2265,6 +2265,12 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private(set) var sentMessages: [String] = []
     private(set) var shutdownCount = 0
     private(set) var startOrResumeExistingSessionIDs: [String?] = []
+    private var rejectResume = false
+
+    func setRejectResume(_ value: Bool) {
+        rejectResume = value
+    }
+
     private var stream: AsyncStream<NativeAgentRuntimeEvent>?
     private var continuation: AsyncStream<NativeAgentRuntimeEvent>.Continuation?
 
@@ -2301,6 +2307,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
         startOrResumeExistingSessionIDs.append(existingSessionID)
+        if rejectResume, existingSessionID != nil { throw NativeAgentRuntimeControllerError.processNotRunning }
         return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
     }
 
