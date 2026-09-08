@@ -3272,6 +3272,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ head: AgentTabSession.CodexFallbackQueueEntry,
         session: AgentTabSession
     ) async -> Bool {
+        guard session.codexFallbackDispatchInFlight?.id == head.id else { return false }
         guard let controller = session.codexController,
               ObjectIdentifier(controller) == head.originControllerInstanceID
         else {
@@ -3432,6 +3433,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexFallbackSuccessorRetryTask = nil
         session.mcpFollowUpRunPending = false
         session.codexFallbackHookGateOwnerBlocker = nil
+        // Capture the original producer before teardown; settlement may admit a successor.
+        let abandonedWake = session.oversight.pendingAutoWake.flatMap { attempt -> (UUID, AgentSessionLinkPromptDispatchID)? in
+            let entry = session.codexFallbackQueue.first(where: { $0.monitoringDispatchContext?.dispatchID.autoWakeID == attempt.wakeID })
+                ?? session.codexFallbackDispatchInFlight.flatMap { $0.monitoringDispatchContext?.dispatchID.autoWakeID == attempt.wakeID ? $0 : nil }
+            guard let entry else { return nil }
+            return (attempt.wakeID, attempt.isPeriodic ? .codexFallback(queueID: entry.id) : .autoWake(wakeID: attempt.wakeID))
+        }
         let queued = session.codexFallbackQueue
         session.codexFallbackQueue.removeAll()
         for entry in queued {
@@ -3476,6 +3484,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if mode == .restoreInput {
                 session.appendItem(.error(reason, sequenceIndex: session.nextSequenceIndex))
             }
+        }
+        if let (wakeID, dispatchID) = abandonedWake, session.oversight.pendingAutoWake?.wakeID == wakeID {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                for: session,
+                dispatchID: dispatchID
+            )
         }
         viewModel?.publishMCPStateChange(for: session)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)

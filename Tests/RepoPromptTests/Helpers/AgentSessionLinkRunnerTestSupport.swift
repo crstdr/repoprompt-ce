@@ -398,7 +398,8 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
         ACPSessionConfiguration(
-            mode: request.resumeSessionID.map { .load(existingSessionID: $0) } ?? .new,
+            mode: environment["ACP_FAIL_LOAD"] == "1"
+                ? request.resumeSessionID.map { .load(existingSessionID: $0) } ?? .new : .new,
             workingDirectory: request.workspacePath ?? FileManager.default.temporaryDirectory.path,
             mcpServers: []
         )
