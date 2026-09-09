@@ -293,6 +293,7 @@ extension AgentModeViewModel {
             inventory: inventory
         )
         if existing == published { return }
+        defer { agentSessionLinkReconcilePeriodicWake(for: endpoint) }
         agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID] = published
         // An accepted publication names the incarnation this session UUID currently *is*, so a passive
         // queue filed under that UUID for any other incarnation belongs to a retired one. Collected
@@ -353,6 +354,7 @@ extension AgentModeViewModel {
         }
 
         record(.accepted)
+        defer { agentSessionLinkReconcilePeriodicWake(for: endpoint) }
         let becameReady = projection.isReady && !(existing?.runID == projection.runID && existing?.isReady == true)
         agentSessionLinkRunCatalogProjectionByEndpoint[endpoint] = projection
         if projection.isReady {
@@ -367,7 +369,7 @@ extension AgentModeViewModel {
         agentSessionLinkReconcileCodexCatalogRepair(projection, session: session)
     }
 
-    /// Opens, holds, or closes the Codex session-link catalog-repair episode for one exact accepted
+    /// Opens, holds, or closes the Codex session-link catalog-repair cycle for one exact accepted
     /// projection.
     ///
     /// The condition being recognized is a *returned* catalog that says `agent_session_link` is
@@ -379,8 +381,8 @@ extension AgentModeViewModel {
     ///
     /// Opening belongs here rather than in the coordinator because this is the only frame where the
     /// mismatch and the projection storage that produced it are visible in one synchronous MainActor
-    /// step. Writing the marker *before* invoking the coordinator is what makes the open atomic: a
-    /// nested or reentrant publication cannot reopen the same episode.
+    /// step. Writing the cycle *before* invoking the coordinator is what makes the open atomic: a
+    /// nested or reentrant publication cannot reopen the same cycle.
     ///
     /// Route currency is deliberately not re-derived, and `projection.isReady` is deliberately not
     /// used — the state being recognized is intentionally unready. What the publish guard above
@@ -394,18 +396,16 @@ extension AgentModeViewModel {
     /// The accepted bound is therefore that a projection published for the current endpoint and run
     /// may already be one connection generation stale by the time the repair runs. The cost is
     /// bounded to one controller replacement for a session that was going to reconnect anyway, and
-    /// the episode marker prevents it from repeating; the alternative — an authority round trip on
-    /// every unready publication — buys a fresher answer that can go stale the same way.
+    /// the cycle prevents it from repeating; the alternative — an authority round trip on every
+    /// unready publication — buys a fresher answer that can go stale the same way.
     private func agentSessionLinkReconcileCodexCatalogRepair(
         _ projection: AgentSessionLinkRunCatalogProjection,
         session: TabSession
     ) {
-        // Only an exact current observation closes an episode. Unknown presence — a route torn down
-        // or not yet observed — leaves it open, because it is not evidence that the catalog healed.
-        if projection.hasAgentSessionLink == true || projection.hasActiveOutboundLink == false {
-            let hadEpisode = session.codexSessionLinkCatalogRepairSourceGeneration != nil
-            session.codexSessionLinkCatalogRepairSourceGeneration = nil
-            if hadEpisode {
+        if AgentSessionLinkCodexCatalogRepair.projectionResolvesCycle(projection) {
+            let hadCycle = session.codexSessionLinkCatalogRepairCycle != nil
+            session.codexSessionLinkCatalogRepairCycle = nil
+            if hadCycle {
                 AgentSessionLinkCatalogDiagnostics.repairTransition(
                     runID: projection.runID,
                     tabID: session.tabID,
@@ -415,8 +415,7 @@ extension AgentModeViewModel {
             return
         }
         guard session.selectedAgent == .codexExec,
-              projection.hasAgentSessionLink == false,
-              projection.hasActiveOutboundLink == true,
+              AgentSessionLinkCodexCatalogRepair.isStuckProjection(projection),
               session.codexController != nil,
               // Disablement is a reason not to repair, never a reason to reconnect: the returned
               // catalog is then truthfully absent and the user asked for that.
@@ -424,8 +423,10 @@ extension AgentModeViewModel {
         else {
             return
         }
-        if session.codexSessionLinkCatalogRepairSourceGeneration == nil {
-            session.codexSessionLinkCatalogRepairSourceGeneration = session.codexControllerGeneration
+        if session.codexSessionLinkCatalogRepairCycle == nil {
+            session.codexSessionLinkCatalogRepairCycle = AgentSessionLinkCodexCatalogRepair.Cycle(
+                observedControllerGeneration: session.codexControllerGeneration
+            )
             AgentSessionLinkCatalogDiagnostics.repairTransition(
                 runID: projection.runID,
                 tabID: session.tabID,
@@ -466,6 +467,9 @@ extension AgentModeViewModel {
         // rather than a second channel: whatever publishes deliverable content is exactly what a wake
         // would be scheduled against, and whatever clears it is exactly what cancels one.
         agentSessionLinkNoteAutoWakeOpportunity(snapshot, endpoint: endpoint)
+        // The dashboard's pending-updates section is derived from this queue, and a receipt changes
+        // it without changing any link row, so no projection publication is guaranteed.
+        requestUIRefresh(tabID: endpoint.tabID)
     }
 
     /// Fences one exact incarnation's prompt inventory and retracts its published value.
@@ -490,6 +494,7 @@ extension AgentModeViewModel {
     func agentSessionLinkWithholdPromptInventory(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UInt64 {
+        defer { agentSessionLinkReconcilePeriodicWake(for: endpoint) }
         agentSessionLinkNextPromptInventoryHoldToken &+= 1
         let token = agentSessionLinkNextPromptInventoryHoldToken
         // An overlapping write *joins* the existing fence rather than replacing it: the baseline to
@@ -615,7 +620,7 @@ extension AgentModeViewModel {
         // incarnation starts fresh, and a task still waiting on the dead one would otherwise hold
         // `idle_for_send` false for a session nothing is going to wake.
         for (tabID, session) in sessions {
-            guard let attempt = session.pendingOversightAutoWake else { continue }
+            guard let attempt = session.oversight.pendingAutoWake else { continue }
             guard !liveSessionIDs.contains(attempt.observerEndpoint.sessionID)
                 || agentSessionLinkObserverEndpoint(tabID: tabID) != attempt.observerEndpoint
             else {
@@ -631,6 +636,13 @@ extension AgentModeViewModel {
         // invalidate its deadline token rather than let a successor inherit suppression it never
         // asked for. Accepted-provenance-before-receipt ordering is untouched by this.
         agentSessionLinkPruneAutoWakeSnoozeState()
+        for session in sessions.values {
+            if let endpoint = session.oversight.periodicEndpoint,
+               agentSessionLinkObserverEndpoint(tabID: session.tabID) != endpoint
+            {
+                session.oversight.retirePeriodicScheduling()
+            }
+        }
         agentSessionLinkPromptClaimStore.retainOnly(observerSessionIDs: liveSessionIDs)
     }
 
@@ -759,6 +771,14 @@ extension AgentModeViewModel {
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkPromptClaimOutcome {
         let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
+        let periodicAttempt = session.oversight.pendingAutoWake.flatMap { attempt in
+            attempt.isPeriodic && attempt.wakeID == effectiveID.autoWakeID ? attempt : nil
+        }
+        if let periodicAttempt {
+            guard periodicAttempt.phase != .cancelledBeforeDispatch,
+                  agentSessionLinkPeriodicWakeIsEligible(session, endpoint: periodicAttempt.observerEndpoint)
+            else { return .requiredLaneBatchUnavailable }
+        }
         guard let context = agentSessionLinkPromptContext(for: session) else {
             // No prompt context at all still refuses a wake: the batch it exists to deliver cannot be
             // rendered, so the turn has nothing to say. Classified by reserved family, exactly as the
@@ -793,6 +813,7 @@ extension AgentModeViewModel {
             inventory: context.inventory,
             passiveNotices: context.passiveNotices,
             locationLabelsByReference: locationLabelsByReference,
+            allowsClaimlessAutoWake: periodicAttempt != nil,
             render: AgentSessionLinkPrompts.rendered
         )
     }
@@ -830,10 +851,8 @@ extension AgentModeViewModel {
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkPromptDispatchID {
         guard !dispatchID.isAutoWakeFamily,
-              let attempt = session.pendingOversightAutoWake,
-              attempt.phase == .preparingDispatch
-              || attempt.phase == .cancelledBeforeDispatch
-              || attempt.phase == .dispatching
+              let attempt = session.oversight.pendingAutoWake,
+              attempt.phase.ownsTransportBoundary
         else {
             return dispatchID
         }
@@ -853,10 +872,7 @@ extension AgentModeViewModel {
         _ dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {
         guard !dispatchID.isAutoWakeFamily else { return true }
-        guard let phase = session.pendingOversightAutoWake?.phase else { return false }
-        return phase == .preparingDispatch
-            || phase == .cancelledBeforeDispatch
-            || phase == .dispatching
+        return session.oversight.pendingAutoWakeOwnsTransportBoundary
     }
 
     /// Re-owes the supplement to a session whose **provider context** is being rebuilt from the app
@@ -884,15 +900,18 @@ extension AgentModeViewModel {
         session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkDecoratedProviderText {
+        let captured = AgentSessionLinkDispatchContext(session: session, dispatchID: dispatchID)
         let outcome = agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
         guard let claim = outcome.claim else {
             return AgentSessionLinkDecoratedProviderText(
+                dispatchContext: captured,
                 text: providerText,
                 claim: nil,
                 mustAbortDispatch: outcome.mustAbortDispatch
             )
         }
         return AgentSessionLinkDecoratedProviderText(
+            dispatchContext: captured,
             text: AgentSessionLinkPromptComposer.decorated(providerText, with: claim),
             claim: claim,
             mustAbortDispatch: false
@@ -911,6 +930,38 @@ extension AgentModeViewModel {
     /// Ordering is load-bearing for an accepted auto-wake: the wake's visible provenance row is
     /// recorded *before* the receipt is applied, so the queue republication the receipt triggers
     /// already sees the settled attempt rather than a still-pending one.
+    func acceptAgentSessionLinkDispatch(
+        session: TabSession,
+        context: AgentSessionLinkDispatchContext?,
+        claim: AgentSessionLinkOutboundPromptClaim?
+    ) {
+        guard context?.isPeriodic == true else {
+            acceptAgentSessionLinkPromptClaim(claim)
+            return
+        }
+        if let attempt = session.oversight.pendingAutoWake,
+           attempt.isPeriodic, attempt.wakeID == context?.dispatchID.autoWakeID
+        {
+            attempt.task?.cancel()
+            session.oversight.pendingAutoWake = nil
+            if sessions[session.tabID] === session,
+               agentSessionLinkObserverEndpoint(tabID: session.tabID) == attempt.observerEndpoint
+            {
+                agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
+            }
+            session.noteMonitorObservationInputsChanged()
+        }
+        if let claim {
+            agentSessionLinkPromptClaimStore.accept(claim)
+            if let passive = claim.passive {
+                AgentSessionLinkRuntimeBridge.shared.applyPassiveMonitorNoticeReceipt(
+                    passive.receipt, observerEndpoint: passive.observerEndpoint
+                )
+            }
+        }
+        agentSessionLinkDrainAutoWakeReevaluationIfOwed(session: session)
+    }
+
     func acceptAgentSessionLinkPromptClaim(_ claim: AgentSessionLinkOutboundPromptClaim?) {
         guard let claim else { return }
         agentSessionLinkPromptClaimStore.accept(claim)

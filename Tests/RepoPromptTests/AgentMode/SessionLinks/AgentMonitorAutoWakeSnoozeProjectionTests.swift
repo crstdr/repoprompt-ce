@@ -53,13 +53,13 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
         session.hasLoadedPersistedState = true
         // This suite exercises the projection transition from master-off to granular/master-on;
         // keep that baseline explicit now that fresh live sessions default Auto-wake on.
-        session.autoWakeOnOversightUpdates = false
+        session.oversight.autoWakeOnUpdates = false
         _ = try XCTUnwrap(
             viewModel.test_ensureSessionBoundToTab(session),
             "expected a durable persistent binding"
         )
         let clock = AgentSessionLinkAutoWakeSnoozeTestClock()
-        session.agentSessionLinkAutoWakeSnoozeClock = clock.clock
+        session.oversight.snoozeClock = clock.clock
         return try Fixture(
             viewModel: viewModel,
             session: session,
@@ -104,7 +104,7 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
             observerEndpoint: fixture.endpoint,
             reference: fixture.reference
         )
-        fixture.session.agentSessionLinkAutoWakeSnoozes[key] = AgentSessionLinkAutoWakeSnoozeRecord(
+        fixture.session.oversight.autoWakeSnoozes[key] = AgentSessionLinkAutoWakeSnoozeRecord(
             key: key,
             deadline: fixture.clock.instant.advanced(by: .seconds(seconds)),
             origin: origin
@@ -143,11 +143,11 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
             "master Auto-wake off plus no granular lane selection leaves the lane unable to admit"
         )
 
-        fixture.session.agentSessionLinkAutoWakeTargetSessionIDs = [fixture.targetSessionID]
+        fixture.session.oversight.autoWakeTargetSessionIDs = [fixture.targetSessionID]
         XCTAssertTrue(try publishedRow(fixture).isAutoWakeEffectivelySelected)
 
-        fixture.session.agentSessionLinkAutoWakeTargetSessionIDs = []
-        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.oversight.autoWakeTargetSessionIDs = []
+        fixture.session.oversight.autoWakeOnUpdates = true
         XCTAssertTrue(
             try publishedRow(fixture).isAutoWakeEffectivelySelected,
             "the master setting covers every lane"
@@ -176,7 +176,7 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
             "expiry is decided by the deadline, not by whether bookkeeping caught up"
         )
         XCTAssertEqual(
-            fixture.session.agentSessionLinkAutoWakeSnoozes.count,
+            fixture.session.oversight.autoWakeSnoozes.count,
             1,
             "a projection read must not remove records"
         )
@@ -185,8 +185,8 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
             0,
             "a projection read must not arm a deadline task"
         )
-        XCTAssertNil(fixture.session.agentSessionLinkAutoWakeSnoozeTaskToken)
-        XCTAssertNil(fixture.session.pendingOversightAutoWake, "a read must not re-drive the pipeline")
+        XCTAssertNil(fixture.session.oversight.snoozeTaskToken)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake, "a read must not re-drive the pipeline")
     }
 
     /// A record filed under another incarnation is never inherited by the one that replaced it.
@@ -204,7 +204,7 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
             observerEndpoint: superseded,
             reference: fixture.reference
         )
-        fixture.session.agentSessionLinkAutoWakeSnoozes[key] = AgentSessionLinkAutoWakeSnoozeRecord(
+        fixture.session.oversight.autoWakeSnoozes[key] = AgentSessionLinkAutoWakeSnoozeRecord(
             key: key,
             deadline: fixture.clock.instant.advanced(by: .seconds(600)),
             origin: .user
@@ -224,7 +224,7 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
             observerEndpoint: fixture.endpoint,
             reference: stale
         )
-        fixture.session.agentSessionLinkAutoWakeSnoozes[key] = AgentSessionLinkAutoWakeSnoozeRecord(
+        fixture.session.oversight.autoWakeSnoozes[key] = AgentSessionLinkAutoWakeSnoozeRecord(
             key: key,
             deadline: fixture.clock.instant.advanced(by: .seconds(600)),
             origin: .user
@@ -292,7 +292,7 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
             "Sources/RepoPrompt/Features/AgentMode/Runtime/SessionLinks/AgentModeViewModel+SessionLinkAutoWake.swift"
         )
         XCTAssertEqual(
-            coordinator.components(separatedBy: "session.agentSessionLinkAutoWakeSnoozes = ").count - 1,
+            coordinator.components(separatedBy: "session.oversight.autoWakeSnoozes = ").count - 1,
             1,
             "the map must have exactly one assignment site for the repaint to be unmissable"
         )

@@ -1,6 +1,17 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// The `delivery: "when_sendable"` queue: one pre-authorized send waiting for its target to become
+// sendable, plus the terminal outcomes and queue results the tool reports.
+//
+// Entries are values held by `AgentSessionLinkRuntimeBridge`, keyed by exact observer and
+// generation-qualified link reference, and re-evaluated through
+// `AgentSessionLinkDeliveryReadiness` whenever the target's readiness publisher fires. Invariants:
+// a queued entry is bound to the grant that authorized it, so unlink or revocation discards it
+// rather than delivering it; replacement and cancellation are per-lane and never touch another
+// observer's entry; and a queued send never bypasses the same readiness matrix a direct `send`
+// must clear.
+
 // MARK: - Pending entry
 
 /// One pre-authorized send waiting for its target to become sendable.

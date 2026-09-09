@@ -1,5 +1,17 @@
 import Foundation
 
+// The pure, table-provable admission decision for an attributed cross-session `send`.
+//
+// Owns the `Snapshot` of target facts, the wire-stable `BlockReason` vocabulary the observer's
+// guidance names, and `evaluate(snapshot:)`. `AgentModeViewModel+SessionLinkSend` assembles the
+// snapshot from live `AgentTabSession` state (including `oversight.hasPendingAutoWake`) and the
+// `AgentSessionLinkPendingSend` queue re-evaluates it when a target may have become sendable.
+// Invariants: every blocker is a fact about the target and nothing about the caller; precedence is
+// fixed so a permanent endpoint invalidation is never reported as a retryable state; and a waiting
+// target is never ready. `AgentModeViewModel+SessionLinkAutoWake` reuses this same blocker set,
+// minus the two that describe the wake itself, so no blocker can be enforced for one caller and
+// forgotten for the other.
+
 // MARK: - Readiness
 
 /// Pure admission decision for an attributed cross-session send.

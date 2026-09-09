@@ -3,6 +3,16 @@ import RepoPromptDomainRuntime
 
 /// Observer-local, process-memory coalescing for passive target status notices.
 ///
+/// This is the canonical observer-local queue — one of the four deliberately disjoint owners of
+/// the oversight subsystem. It coordinates with `AgentModeViewModel+SessionLinks` (which
+/// reconciles authoritative samples into it), `AgentSessionLinkPromptContext` (which renders a
+/// snapshot and applies the occurrence-qualified receipt back), and
+/// `AgentModeViewModel+SessionLinkAutoWake` (which reads `wakeEligibilityFingerprint` and the
+/// lanes to decide admission). Invariants: one coalesced first-to-final status interval per lane
+/// with no event history, so the only honest summary of a snoozed lane is "the current coalesced
+/// state"; attention occurrences are separate, non-lossy, hard-capped at enqueue, and never evict
+/// or consume a status interval; and a receipt removes only what its own rendered batch named.
+///
 /// This reducer owns no authority and performs no delivery. Callers reconcile authoritative samples,
 /// publish `snapshot`, and apply only receipts produced by an accepted provider dispatch.
 struct AgentSessionLinkPassiveStatusNotices {

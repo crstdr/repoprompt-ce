@@ -2,6 +2,15 @@ import CryptoKit
 import Foundation
 import RepoPromptDomainRuntime
 
+// The value model of one cross-session send: request, liveness probe, commit fence, outcomes, the
+// RepoPrompt-authored provider envelope, and the message digest.
+//
+// Everything here is a value the target's MainActor consumes; `AgentModeViewModel+SessionLinkSend`
+// runs the transaction and `AgentSessionLinkRuntimeBridge` constructs the request. Invariant: the
+// envelope preamble is a reviewed security contract, not prose — it is what tells the receiving
+// model that the body is attributed cross-session coordination rather than its own user, and it is
+// free of XML entities so escaping is a no-op.
+
 // MARK: - Request
 
 /// Everything the target's MainActor needs to run one cross-session send, as a value.

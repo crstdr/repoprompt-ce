@@ -3033,6 +3033,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         {
             return .queuedFallback(queueID: submission.queueID, reason: reason)
         }
+        if var attempt = session.oversight.pendingAutoWake, attempt.isPeriodic,
+           attempt.phase == .dispatching
+        {
+            attempt.phase = .preparingDispatch
+            attempt.physicalOutcome = .notAttempted
+            attempt.periodicProducerDispatchID = .codexFallback(queueID: submission.queueID)
+            session.oversight.pendingAutoWake = attempt
+        }
         let entry = AgentTabSession.CodexFallbackQueueEntry(
             id: submission.queueID,
             providerText: submission.providerText,
@@ -3053,9 +3061,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             originRunAttemptID: runAttemptID,
             blockingTurn: recoverableCodexFallbackBlockingTurn(session: session),
             state: .queued,
-            monitoringWakeID: viewModel?.agentSessionLinkEffectiveDispatchID(
-                for: session, dispatchID: .codexFallback(queueID: submission.queueID)
-            ).autoWakeID
+            monitoringDispatchContext: AgentSessionLinkDispatchContext(session: session, dispatchID: .codexFallback(queueID: submission.queueID))
         )
         detachCodexFallbackAttachmentReservation(attachmentReservationID, session: session)
         session.codexFallbackQueue.append(entry)
@@ -3285,6 +3291,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // fallback dispatch, so an entry that sat in the queue while the user added or removed an oversight link
         // ships the current membership revision rather than the one that was live at enqueue time.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.codexFallback(queueID: head.id)
+        if let captured = head.monitoringDispatchContext, captured.isPeriodic,
+           session.oversight.pendingAutoWake?.wakeID != captured.dispatchID.autoWakeID
+        {
+            await failCodexFallbackDispatch(session: session, entry: head, message: nil)
+            return false
+        }
         let monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
             head.providerText,
             session: session,
@@ -3323,7 +3335,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             // Acceptance is the non-throwing `startUserTurn` return that produces the enclosing `.sent`
             // path; the in-flight bookkeeping below is local state, not provider acceptance.
-            viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
             guard var inFlight = session.codexFallbackDispatchInFlight,
                   inFlight.id == head.id,
                   session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID
@@ -3422,10 +3434,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.mcpFollowUpRunPending = false
         session.codexFallbackHookGateOwnerBlocker = nil
         // Capture the original producer before teardown; settlement may admit a successor.
-        let abandonedWakeID = session.pendingOversightAutoWake.flatMap { attempt in
-            session.codexFallbackQueue.contains(where: { $0.monitoringWakeID == attempt.wakeID })
-                || session.codexFallbackDispatchInFlight?.monitoringWakeID == attempt.wakeID
-                ? attempt.wakeID : nil
+        let abandonedWake = session.oversight.pendingAutoWake.flatMap { attempt -> (UUID, AgentSessionLinkPromptDispatchID)? in
+            let entry = session.codexFallbackQueue.first(where: { $0.monitoringDispatchContext?.dispatchID.autoWakeID == attempt.wakeID })
+                ?? session.codexFallbackDispatchInFlight.flatMap { $0.monitoringDispatchContext?.dispatchID.autoWakeID == attempt.wakeID ? $0 : nil }
+            guard let entry else { return nil }
+            return (attempt.wakeID, attempt.isPeriodic ? .codexFallback(queueID: entry.id) : .autoWake(wakeID: attempt.wakeID))
         }
         let queued = session.codexFallbackQueue
         session.codexFallbackQueue.removeAll()
@@ -3472,10 +3485,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.appendItem(.error(reason, sequenceIndex: session.nextSequenceIndex))
             }
         }
-        if let abandonedWakeID {
+        if let (wakeID, dispatchID) = abandonedWake, session.oversight.pendingAutoWake?.wakeID == wakeID {
             viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
-                dispatchID: .autoWake(wakeID: abandonedWakeID)
+                dispatchID: dispatchID
             )
         }
         viewModel?.publishMCPStateChange(for: session)
@@ -4025,15 +4038,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if oldAgent == .codexExec, newAgent != .codexExec {
             // Closed before any teardown rotates the controller generation: leaving it would encode a
-            // "consumed" episode on a session that no longer has a Codex catalog to repair.
-            if session.codexSessionLinkCatalogRepairSourceGeneration != nil {
+            // spent repair cycle on a session that no longer has a Codex catalog to repair.
+            if session.codexSessionLinkCatalogRepairCycle != nil {
                 AgentSessionLinkCatalogDiagnostics.repairTransition(
                     runID: session.runID,
                     tabID: session.tabID,
                     outcome: .closedProviderChanged
                 )
             }
-            session.codexSessionLinkCatalogRepairSourceGeneration = nil
+            session.codexSessionLinkCatalogRepairCycle = nil
             cancelCodexThreadNameSync(for: session.tabID)
             cancelCodexIdleShutdown(for: session.tabID)
             cancelCodexTransportClosedFallback(for: session.tabID)
@@ -5454,8 +5467,30 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ?? replayTurn.monitoringClaim?.dispatchID
             let monitoring: AgentSessionLinkDecoratedProviderText?
             let replayText: String
-            if let originalMonitoringDispatchID,
-               originalMonitoringDispatchID.isAutoWakeFamily
+            if replayTurn.monitoringDispatchContext?.isPeriodic == true {
+                guard let endpoint = viewModel?.agentSessionLinkObserverEndpoint(tabID: session.tabID),
+                      viewModel?.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint) == true else { return false }
+                if var attempt = session.oversight.pendingAutoWake {
+                    guard attempt.isPeriodic,
+                          attempt.wakeID == replayTurn.monitoringDispatchContext?.dispatchID.autoWakeID,
+                          attempt.phase == .dispatching else { return false }
+                    attempt.periodicProducerDispatchID = replayDispatchID
+                    session.oversight.pendingAutoWake = attempt
+                }
+                monitoring = AgentSessionLinkDecoratedProviderText(
+                    dispatchContext: replayTurn.monitoringDispatchContext,
+                    text: replayTurn.text, claim: nil, mustAbortDispatch: false
+                )
+                if let claim = replayTurn.monitoringClaim {
+                    guard viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                        claim, for: session, dispatchID: claim.dispatchID
+                    ) == true else { return false }
+                    replayText = AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: claim)
+                } else {
+                    replayText = replayTurn.text
+                }
+            } else if let originalMonitoringDispatchID,
+                      originalMonitoringDispatchID.isAutoWakeFamily
             {
                 guard let acknowledged = replayTurn.monitoringClaim,
                       viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
@@ -5530,7 +5565,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -5753,12 +5788,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return true
     }
 
-    /// Spends — at most once per episode — the controller replacement a stuck session-link catalog
-    /// projection needs, then re-drives the observer's existing passive snapshot.
+    /// Spends — at most once per repair cycle — the controller replacement a stuck session-link
+    /// catalog projection needs, then re-drives the observer's existing passive snapshot.
     ///
-    /// The episode is opened by the projection reconciler, which is the only place the mismatch is
-    /// observable atomically. This entrypoint only *consumes* it, so it is safe to re-enter from
-    /// repeated higher-revision false publications and from the winning terminal commit.
+    /// The cycle is opened by the projection reconciler, which is the only place the mismatch is
+    /// observable atomically (`AgentSessionLinkCodexCatalogRepair.isStuckProjection`). This
+    /// entrypoint only *spends* it, so it is safe to re-enter from repeated higher-revision false
+    /// publications and from the winning terminal commit.
     ///
     /// Retiring the process run is the point, not a side effect: `preserveRunID: false` clears the
     /// process run ID while deliberately preserving `codexConversationID`/`codexRolloutPath`, so the
@@ -5767,51 +5803,52 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     /// same false projection gating admission, with no way to reach a successor catalog short of the
     /// route-successor protocol this design exists to avoid.
     func codexRepairSessionLinkCatalogIfQuiescent(for session: AgentTabSession) {
-        guard let sourceGeneration = session.codexSessionLinkCatalogRepairSourceGeneration,
+        guard let cycle = session.codexSessionLinkCatalogRepairCycle,
               session.selectedAgent == .codexExec
         else {
             return
         }
-        let episodeRunID = session.runID
-        // Re-sampled rather than inherited from the open. An episode opened while the tool was
-        // enabled can be spent much later, at a terminal commit that never passes through the
-        // projection reconciler's own gate. Once the tool is disabled the absent catalog is truthful,
-        // so the episode closes and nothing reconnects.
+        let cycleRunID = session.runID
+        // Re-sampled rather than inherited from the open. A cycle opened while the tool was enabled
+        // can be spent much later, at a terminal commit that never passes through the projection
+        // reconciler's own gate. Once the tool is disabled the absent catalog is truthful, so the
+        // cycle closes and nothing reconnects.
         guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
-            session.codexSessionLinkCatalogRepairSourceGeneration = nil
+            session.codexSessionLinkCatalogRepairCycle = nil
             logCodex("[AgentModeVM][CodexSessionLinkRepair] closed tab=\(session.tabID) reason=tool-disabled")
             AgentSessionLinkCatalogDiagnostics.repairTransition(
-                runID: episodeRunID,
+                runID: cycleRunID,
                 tabID: session.tabID,
                 outcome: .closedToolDisabled
             )
             return
         }
-        guard codexSessionLinkCatalogRepairIsQuiescent(for: session) else {
-            // Leave the episode pending. The next projection reconciliation or the winning terminal
+        guard isQuiescentForControllerReplacement(session) else {
+            // Leave the cycle pending. The next projection reconciliation or the winning terminal
             // commit re-evaluates it; no task, timer, queue, or new phase is introduced.
             logCodex("[AgentModeVM][CodexSessionLinkRepair] deferred tab=\(session.tabID) reason=not-quiescent")
             return
         }
-        guard sourceGeneration == session.codexControllerGeneration else {
-            // Consumed: computer-use settlement, a feature-state or tool-preference recycle, stream
-            // recovery, or any other reconnect already spent this episode's one replacement. Never
-            // invalidate again — only re-drive, because that replacement may have left the session
-            // cold with the same passive snapshot still unadmitted.
+        switch cycle.state(currentControllerGeneration: session.codexControllerGeneration) {
+        case .spent:
+            // Computer-use settlement, a feature-state or tool-preference recycle, stream recovery,
+            // or any other reconnect already spent this cycle's one replacement. Never invalidate
+            // again — only re-drive, because that replacement may have left the session cold with
+            // the same passive snapshot still unadmitted.
             //
-            // One consumed shape is a dead end rather than a recovery: a `preserveRunID: true`
+            // One spent shape is a dead end rather than a recovery: a `preserveRunID: true`
             // reconnect retired the controller but its `ensureCodexNativeSession` never produced a
             // replacement, so the session holds an established run with no provider at all. Nothing
             // will publish a healed catalog for that run, and the established-run gate in
             // `agentSessionLinkPromptContext` keeps failing closed. Retiring the run identity here
-            // completes what the episode was for, using the same host-authoritative reset the
+            // completes what the cycle was for, using the same host-authoritative reset the
             // pending path performs, without a second controller replacement.
             if session.codexController == nil, session.runID != nil {
                 AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-                session.codexSessionLinkCatalogRepairSourceGeneration = nil
+                session.codexSessionLinkCatalogRepairCycle = nil
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] retired-stranded-run tab=\(session.tabID)")
                 AgentSessionLinkCatalogDiagnostics.repairTransition(
-                    runID: episodeRunID,
+                    runID: cycleRunID,
                     tabID: session.tabID,
                     outcome: .spentStrandedRunRetired
                 )
@@ -5819,55 +5856,47 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] consumed tab=\(session.tabID)")
             }
             viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
-            return
+        case .pending:
+            guard let expectedController = session.codexController else { return }
+            // The expected controller is read and compared inside this one synchronous MainActor
+            // frame, so the identity check inside the invalidation cannot fail: a `false` return is
+            // unreachable in this call shape, and the replacement's own generation rotation spends
+            // the cycle.
+            invalidateCodexControllerForReconnect(
+                session: session,
+                expectedController: expectedController,
+                source: "session-link-catalog-repair",
+                preserveRunID: false
+            )
+            logCodex("[AgentModeVM][CodexSessionLinkRepair] replaced tab=\(session.tabID)")
+            AgentSessionLinkCatalogDiagnostics.repairTransition(
+                runID: cycleRunID,
+                tabID: session.tabID,
+                outcome: .spentReplaced
+            )
+            viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
         }
-        guard let expectedController = session.codexController else { return }
-        // The expected controller is read and compared inside this one synchronous MainActor frame,
-        // so the identity check inside the invalidation cannot fail: a `false` return is unreachable
-        // in this call shape, and the replacement's own generation rotation consumes the episode.
-        invalidateCodexControllerForReconnect(
-            session: session,
-            expectedController: expectedController,
-            source: "session-link-catalog-repair",
-            preserveRunID: false
-        )
-        logCodex("[AgentModeVM][CodexSessionLinkRepair] replaced tab=\(session.tabID)")
-        AgentSessionLinkCatalogDiagnostics.repairTransition(
-            runID: episodeRunID,
-            tabID: session.tabID,
-            outcome: .spentReplaced
-        )
-        viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
     }
 
     /// Whether this session provably owns no provider transport, fallback work, or interaction that
     /// a controller replacement would abandon.
     ///
+    /// The quiescence gate for anything that retires a Codex controller out from under a session.
     /// Fallback ownership is mandatory rather than advisory: `invalidateCodexControllerForReconnect`
-    /// deliberately abandons the queue with the controller, so repairing under fallback ownership
-    /// would drop the user's queued text. The Auto-wake transport phases are the same fence the
-    /// tombstone protects — a wake that may already own a physical call must not have its provider
-    /// retired underneath it.
-    private func codexSessionLinkCatalogRepairIsQuiescent(for session: AgentTabSession) -> Bool {
-        guard !session.runState.isActive,
-              // A terminal commit that has staged its revision but not finished publishing still owns
-              // the run. Retiring the controller and run identity underneath it would pull the
-              // provider out from under an in-flight settlement, and the barrier's own `postCommit`
-              // already re-drives this repair from the safe side of that phase.
-              !session.terminalCommitInProgress,
-              !hasPendingCodexInteraction(for: session),
-              session.codexFallbackQueue.isEmpty,
-              session.codexFallbackDispatchInFlight == nil,
-              session.codexFallbackHookGateOwnerBlocker == nil
-        else {
-            return false
-        }
-        switch session.pendingOversightAutoWake?.phase {
-        case .preparingDispatch, .cancelledBeforeDispatch, .dispatching:
-            return false
-        case .scheduled, .awaitingSettlement, nil:
-            return true
-        }
+    /// deliberately abandons the queue with the controller, so replacing under fallback ownership
+    /// would drop the user's queued text. A terminal commit that has staged its revision but not
+    /// finished publishing still owns the run, and the barrier's own `postCommit` re-drives callers
+    /// from the safe side of that phase. The Auto-wake transport boundary is the same fence the
+    /// tombstone protects (`pendingAutoWakeOwnsTransportBoundary`) — a wake that may already own a
+    /// physical call must not have its provider retired underneath it.
+    private func isQuiescentForControllerReplacement(_ session: AgentTabSession) -> Bool {
+        !session.runState.isActive
+            && !session.terminalCommitInProgress
+            && !hasPendingCodexInteraction(for: session)
+            && session.codexFallbackQueue.isEmpty
+            && session.codexFallbackDispatchInFlight == nil
+            && session.codexFallbackHookGateOwnerBlocker == nil
+            && !session.oversight.pendingAutoWakeOwnsTransportBoundary
     }
 
     private func scheduleCodexTransportClosedFallback(
@@ -7074,10 +7103,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 return .cancelled
             }
-            if let monitoringDispatchID = candidate?.claim?.dispatchID,
+            if let monitoringDispatchID = candidate?.dispatchContext?.dispatchID,
                var pendingAuthTurn = session.codexPendingAuthRetryTurn
             {
                 pendingAuthTurn.monitoringDispatchID = monitoringDispatchID
+                pendingAuthTurn.monitoringDispatchContext = candidate?.dispatchContext
                 session.codexPendingAuthRetryTurn = pendingAuthTurn
             }
             let acquired = self.viewModel?.agentSessionLinkAcquirePhysicalDispatch(
@@ -7234,7 +7264,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // `startUserTurn`, or a `steerUserTurn` receipt carrying an accepted turn ID. Acknowledge
             // before the staleness guard below, because a dispatch the provider accepted after the
             // local run changed still delivered the supplement exactly once.
-            viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
             // Managed-auth recovery can still replay this exact turn after acceptance. Hand it the
             // acknowledged claim so the replay can re-attach the identical fragment instead of
             // shipping the bare stored text and silently dropping the revision forever.
@@ -8273,15 +8303,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 guard let self else { return }
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 // Computer-use settlement runs first on purpose: when it replaces the controller the
-                // generation rotates, the repair below sees a consumed episode, and the two coalesce
-                // into the one replacement the episode allows. Idle shutdown is scheduled last so it
-                // is never armed against a controller the repair is about to retire.
+                // generation rotates, the repair below sees a spent cycle, and the two coalesce into
+                // the one replacement the cycle allows. Idle shutdown is scheduled last so it is
+                // never armed against a controller the repair is about to retire.
                 //
                 // The repair is deliberately *not* gated on `providerSuccessor == nil`. A successor
                 // that is still accepted or retryable is the fallback queue head, so the repair's
                 // fallback-ownership guard already refuses to abandon it. A successor that was stale
                 // or permanently rejected leaves no queue behind — gating on its mere presence would
-                // strand the episode on a session that has nothing left to re-drive it.
+                // strand the cycle on a session that has nothing left to re-drive it.
                 settleCodexComputerUseActivationAfterTurn(session, reason: reason)
                 codexRepairSessionLinkCatalogIfQuiescent(for: session)
                 if session.codexController != nil {

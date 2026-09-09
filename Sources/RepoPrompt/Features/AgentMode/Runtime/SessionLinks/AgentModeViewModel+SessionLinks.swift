@@ -2,6 +2,19 @@ import Combine
 import Foundation
 import RepoPromptDomainRuntime
 
+// The window-local host surface for oversight: candidates, exact projections, and observation.
+//
+// This extension is where the view model exposes its live sessions to the oversight subsystem —
+// endpoint candidates for `AgentSessionLinkEndpointResolver`, the exact per-endpoint monitor
+// projection and its single post-storage invalidation seam
+// (`agentSessionLinkMutateProjectionStorage`), durable Auto-wake selection writes, `waiting_on`
+// publication, and the status observation the runtime bridge subscribes to. It coordinates with
+// `AgentSessionLinkRuntimeBridge` (process-wide owner of links and observations) and
+// `AgentModeViewModel+SessionLinkAutoWake` (which it fences on every selection change).
+// Invariants: the projection map is mutated in exactly one place and posts exactly one notification
+// per logical batch, and a presentation-only repaint can never publish prompt inventory, reconcile
+// the passive queue, or become an Auto-wake.
+
 // MARK: - Narrow lifecycle-identity adapter
 
 extension AgentSessionLifecycleAuthority.Identity {
@@ -301,7 +314,7 @@ extension AgentModeViewModel {
         else {
             return false
         }
-        return session.autoWakeOnOversightUpdates
+        return session.oversight.autoWakeOnUpdates
     }
 
     func agentSessionLinkAutoWakeTargetSessionIDs(
@@ -310,7 +323,7 @@ extension AgentModeViewModel {
         guard let session = sessions[candidate.tabID],
               session.activeAgentSessionID == candidate.sessionID
         else { return [] }
-        return session.agentSessionLinkAutoWakeTargetSessionIDs
+        return session.oversight.autoWakeTargetSessionIDs
     }
 
     /// Writes that setting to one exact observer incarnation.
@@ -329,8 +342,8 @@ extension AgentModeViewModel {
         else {
             return false
         }
-        guard session.autoWakeOnOversightUpdates != enabled else { return true }
-        session.autoWakeOnOversightUpdates = enabled
+        guard session.oversight.autoWakeOnUpdates != enabled else { return true }
+        session.oversight.autoWakeOnUpdates = enabled
         session.isDirty = true
         scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
@@ -349,6 +362,7 @@ extension AgentModeViewModel {
         // lane at once. Either way the resulting per-target selection is fenced synchronously here
         // rather than waiting for the projection this signal schedules.
         agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
+        syncStatusPillsUIState()
         session.monitorObservationSignal.send(())
         return true
     }
@@ -362,8 +376,8 @@ extension AgentModeViewModel {
               let session = sessions[endpoint.tabID],
               session.hasLoadedPersistedState
         else { return false }
-        guard session.agentSessionLinkAutoWakeTargetSessionIDs != targetSessionIDs else { return true }
-        session.agentSessionLinkAutoWakeTargetSessionIDs = targetSessionIDs
+        guard session.oversight.autoWakeTargetSessionIDs != targetSessionIDs else { return true }
+        session.oversight.autoWakeTargetSessionIDs = targetSessionIDs
         session.isDirty = true
         scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
@@ -374,6 +388,77 @@ extension AgentModeViewModel {
         // change made ineligible, both before the republication can observe a target that moved in
         // between.
         agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
+        syncStatusPillsUIState()
+        session.monitorObservationSignal.send(())
+        return true
+    }
+
+    /// Writes this observer's minimum routine wake interval to one exact incarnation.
+    ///
+    /// Uses the existing save/index path and reevaluates pending work without clearing failure
+    /// suppression. Disabling retains both the chosen duration and the last wake stamp.
+    @discardableResult
+    func agentSessionLinkSetRoutineWakeInterval(
+        enabled: Bool,
+        seconds: Int,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = sessions[endpoint.tabID],
+              session.hasLoadedPersistedState
+        else {
+            return false
+        }
+        let normalizedSeconds = AgentSessionLinkRoutineWakeInterval.normalized(seconds)
+        guard session.oversight.routineWakeIntervalEnabled != enabled
+            || session.oversight.routineWakeIntervalSeconds != normalizedSeconds
+        else {
+            return true
+        }
+        session.oversight.routineWakeIntervalEnabled = enabled
+        session.oversight.routineWakeIntervalSeconds = normalizedSeconds
+        session.isDirty = true
+        scheduleSave(for: endpoint.tabID)
+        if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
+            entry.routineWakeIntervalEnabled = enabled
+            entry.routineWakeIntervalSeconds = normalizedSeconds
+            sessionIndexStore.applyLocalUpsert(entry)
+        }
+        // Fences an attempt this change just made ineligible and replays exactly one evaluation of
+        // the retained snapshot, which is also where the shared deadline is re-armed.
+        agentSessionLinkNoteRoutineWakeIntervalChanged(for: endpoint)
+        // Oversight preferences have no mirrored-field invalidation in a full binding refresh.
+        syncStatusPillsUIState()
+        session.monitorObservationSignal.send(())
+        return true
+    }
+
+    /// Saves periodic idle policy without changing notification selection or snoozes.
+    @discardableResult
+    func agentSessionLinkSetPeriodicIdleWake(
+        enabled: Bool,
+        seconds: Int,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = sessions[endpoint.tabID],
+              session.hasLoadedPersistedState
+        else { return false }
+        let normalizedSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(seconds)
+        guard session.oversight.periodicIdleWakeEnabled != enabled
+            || session.oversight.periodicIdleWakeIntervalSeconds != normalizedSeconds
+        else { return true }
+        session.oversight.periodicIdleWakeEnabled = enabled
+        session.oversight.periodicIdleWakeIntervalSeconds = normalizedSeconds
+        session.isDirty = true
+        scheduleSave(for: endpoint.tabID)
+        if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
+            entry.periodicIdleWakeEnabled = enabled
+            entry.periodicIdleWakeIntervalSeconds = normalizedSeconds
+            sessionIndexStore.applyLocalUpsert(entry)
+        }
+        agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        syncStatusPillsUIState()
         session.monitorObservationSignal.send(())
         return true
     }
@@ -386,8 +471,8 @@ extension AgentModeViewModel {
         guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = sessions[endpoint.tabID]
         else { return false }
-        guard session.agentSessionLinkWaitingOn != waitingOn else { return true }
-        session.agentSessionLinkWaitingOn = waitingOn
+        guard session.oversight.waitingOn != waitingOn else { return true }
+        session.oversight.waitingOn = waitingOn
         session.monitorObservationSignal.send(())
         return true
     }
@@ -434,7 +519,7 @@ extension AgentModeViewModel {
                 candidate: candidate,
                 status: projection.status
             ),
-            waitingOn: session.agentSessionLinkWaitingOn,
+            waitingOn: session.oversight.waitingOn,
             pendingInteractionKind: projection.pendingInteractionKind,
             latestVisibleAssistantPreview: latestVisibleAssistantPreview(for: session),
             visibleRowCount: session.transcriptCanonicalVisibleRowCount,
@@ -644,17 +729,27 @@ extension AgentModeViewModel {
         _ props: AgentMonitorPillProps,
         endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentMonitorPillProps {
-        guard !props.outbound.isEmpty,
-              let session = sessions[endpoint.tabID],
+        guard let session = sessions[endpoint.tabID],
               session.activeAgentSessionID == endpoint.sessionID
         else {
             return props
         }
-        // The same rule the coordinator admits lanes by: the master setting covers every lane, and a
-        // granular selection covers its own. Read live from the session rather than from the props
-        // being published, so a selection written in this same pass cannot render a frame late.
-        let masterEnabled = session.autoWakeOnOversightUpdates
-        let selectedTargetSessionIDs = session.agentSessionLinkAutoWakeTargetSessionIDs
+        // The same rule the coordinator admits lanes by. Read live from the session rather than from
+        // the props being published, so a selection written in this same pass cannot render a frame
+        // late.
+        let oversight = session.oversight
+        // Saved preferences remain live even before the bridge republishes link rows, including
+        // while this observer has no links. A cached projection must not roll a setting back.
+        var overlaid = props
+        overlaid.autoWakeOnUpdatesEnabled = oversight.autoWakeOnUpdates
+        overlaid.autoWakeTargetSessionIDs = oversight.autoWakeTargetSessionIDs
+        overlaid.routineWakeIntervalEnabled = oversight.routineWakeIntervalEnabled
+        overlaid.routineWakeIntervalSeconds = oversight.normalizedRoutineWakeIntervalSeconds
+        overlaid.periodicIdleWakeEnabled = oversight.periodicIdleWakeEnabled
+        overlaid.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(
+            oversight.periodicIdleWakeIntervalSeconds
+        )
+        guard !props.outbound.isEmpty else { return overlaid }
         let outbound = props.outbound.map { row in
             let reference = DomainAgentSessionLinkReference(
                 linkID: row.linkID,
@@ -684,23 +779,29 @@ extension AgentModeViewModel {
                         origin: $0.origin
                     )
                 },
-                isEffectivelySelected: masterEnabled
-                    || selectedTargetSessionIDs.contains(row.targetSessionID)
+                isEffectivelySelected: oversight.isLaneEffectivelySelected(
+                    targetSessionID: row.targetSessionID
+                )
             )
         }
-        guard outbound != props.outbound else { return props }
+        guard outbound != props.outbound else { return overlaid }
         return AgentMonitorPillProps(
-            sessionID: props.sessionID,
-            endpoint: props.endpoint,
-            sidebarOversightMenu: props.sidebarOversightMenu,
+            sessionID: overlaid.sessionID,
+            endpoint: overlaid.endpoint,
+            sidebarOversightMenu: overlaid.sidebarOversightMenu,
             outbound: outbound,
-            inbound: props.inbound,
-            recentNotices: props.recentNotices,
-            canAddReason: props.canAddReason,
-            autoWakeOnUpdatesEnabled: props.autoWakeOnUpdatesEnabled,
-            autoWakeTargetSessionIDs: props.autoWakeTargetSessionIDs,
-            autoWakeUnavailableReason: props.autoWakeUnavailableReason,
-            persistence: props.persistence
+            inbound: overlaid.inbound,
+            recentNotices: overlaid.recentNotices,
+            canAddReason: overlaid.canAddReason,
+            autoWakeOnUpdatesEnabled: overlaid.autoWakeOnUpdatesEnabled,
+            autoWakeTargetSessionIDs: overlaid.autoWakeTargetSessionIDs,
+            autoWakeUnavailableReason: overlaid.autoWakeUnavailableReason,
+            routineWakeIntervalEnabled: overlaid.routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: overlaid.routineWakeIntervalSeconds,
+            periodicIdleWakeEnabled: overlaid.periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: overlaid.periodicIdleWakeIntervalSeconds,
+            pendingUpdates: overlaid.pendingUpdates,
+            persistence: overlaid.persistence
         )
     }
 
@@ -822,9 +923,9 @@ extension AgentModeViewModel {
         // from whatever was last cached under this session UUID. A rebind that has not yet been
         // republished therefore renders eligibility-only props instead of the previous incarnation's
         // links and notices.
-        let published = agentSessionLinkObserverEndpoint(tabID: tabID)
-            .flatMap { monitorPillPropsByEndpoint[$0] }
-        return Self.monitorPillProps(
+        let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID)
+        let published = endpoint.flatMap { monitorPillPropsByEndpoint[$0] }
+        var props = Self.monitorPillProps(
             sessionID: sessionID,
             published: published,
             eligibility: agentSessionLinkEligibilityInput(for: session, tabID: tabID),
@@ -833,6 +934,17 @@ extension AgentModeViewModel {
             ),
             persistence: agentSessionLinkPersistencePresentation
         )
+        // Overlaid here rather than baked into the stored projection: queue depth, Wake now
+        // availability, and the countdown change on receipts and busy/idle transitions that move no
+        // link. Every read below is pure.
+        if let endpoint {
+            props = agentSessionLinkOverlayingAutoWakePolicy(props, endpoint: endpoint)
+            props.pendingUpdates = agentSessionLinkPendingUpdatesProjection(
+                for: endpoint,
+                outbound: props.outbound
+            )
+        }
+        return props
     }
 
     /// Combines the authoritative link/notice projection with a **synchronously recomputed**
@@ -977,7 +1089,7 @@ extension AgentModeViewModel {
             && session.pendingInstructions.isEmpty
             && session.pendingACPSteeringInstructions.isEmpty
             && session.pendingClaudeSteeringInstructions.isEmpty
-            && session.pendingOversightAutoWake == nil
+            && session.oversight.pendingAutoWake == nil
             && !candidate.isClosing
     }
 

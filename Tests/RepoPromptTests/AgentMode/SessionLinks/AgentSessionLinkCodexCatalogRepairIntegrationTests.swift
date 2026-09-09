@@ -96,7 +96,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let unlinked = try XCTUnwrap(unlinkedProjection)
             XCTAssertEqual(unlinked.hasAgentSessionLink, false)
             XCTAssertEqual(unlinked.hasActiveOutboundLink, false)
-            XCTAssertNil(session.codexSessionLinkCatalogRepairSourceGeneration)
+            XCTAssertNil(session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
             XCTAssertNotNil(session.codexController)
 
             let sessionID = try XCTUnwrap(session.activeAgentSessionID)
@@ -117,7 +117,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             XCTAssertNil(session.codexController, "exactly one controller replacement")
             XCTAssertEqual(session.codexConversationID, conversationID)
             XCTAssertEqual(session.codexRolloutPath, rolloutPath)
-            XCTAssertEqual(session.codexSessionLinkCatalogRepairSourceGeneration, sourceGeneration)
+            XCTAssertEqual(session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
             XCTAssertNotEqual(sourceGeneration, session.codexControllerGeneration)
         #else
             throw XCTSkip("Run catalog observation diagnostics require DEBUG helpers.")

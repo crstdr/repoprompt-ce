@@ -103,6 +103,8 @@ The controls are the user's, and they are the ones that already exist:
 | Per-lane `snooze_auto_wake` | Routine status and overflow on that lane stop being reasons to start an automatic turn for a bounded window; one pending explicit attention occurrence from that exact lane may still admit without changing the snooze |
 | Master Auto-wake off | Stops master selection for routine status and overflow; a lane whose own Auto-wake toggle remains on stays selected, while exact purposeful attention may bypass the master setting |
 | Effective lane deselection | With master Auto-wake off and that lane's toggle off, routine status and overflow stop admitting; exact purposeful attention may still admit without changing either setting |
+| `Limit routine wake-ups` + `Minimum interval` | Routine status and overflow must wait a minimum interval after the observer's last oversight wake; exact purposeful attention and `Wake now` bypass it without changing it |
+| `Wake now` | Processes the currently pending updates in one turn, ignoring routine selection, snooze, the interval, and failure suppression for that one attempt and changing none of them |
 | Unlink / revocation | The grant and its queued sends or pending attention are gone; this remains a hard gate with no attention exception |
 
 New live sessions start with the observer-level Auto-wake preference enabled. That is only a
@@ -388,6 +390,93 @@ it shares that generation-qualified row's busy and failure-feedback state with U
 metadata remains static, and neither the secondary detail nor the complete row becomes a navigation
 target, so opening an observer cannot overlap or masquerade as revocation.
 
+## The routine wake interval is admission spacing, not a schedule
+
+An observer may require a minimum interval between *routine* automatic wakes. It is durable
+observer-session configuration (`routineWakeIntervalEnabled`, `routineWakeIntervalSeconds`), default
+off, retained while off, and normalized to one of 60/300/600/900/1800/3600/10800 seconds by
+`AgentSessionLinkRoutineWakeInterval.normalized` — the one helper every decode, restore, and write
+path shares.
+
+Timing is measured from the **transport boundary**, not from a clock: the first successful transition
+to `.dispatching` in `agentSessionLinkAcquirePhysicalDispatch` records an endpoint-qualified monotonic
+stamp on `oversight.lastOversightWakeDispatch`. Four consequences are deliberate. Every oversight wake
+stamps — routine, purposeful attention, and manual alike — so an attention wake restarts the interval.
+The stamp is recorded even while limiting is off, so enabling it later measures from the wake that
+actually happened. A re-entrant acquire cannot restamp, and a definite no-call never stamps at all.
+And because the stamp names the exact observer endpoint, a rebind fails open rather than inheriting
+its predecessor's timing, while an unlink/relink inside one incarnation does not reset it.
+
+The interval filters `AgentSessionLinkAutoWakeAdmission.routineAdmittingLanes` and overflow, not just
+the initial scheduling decision. That is load-bearing: `routineLaneAdmits` is what the physical fence
+uses to tell a basis from a hitchhiker, so a boolean-only gate would still let a deferred rendered
+status row justify a provider call. Deferral is admission-only in the usual sense — nothing is
+receipted, baselined, or dropped, and deferred rows still ride along on the observer's own next turn
+or on any admitted wake.
+
+Expiry owes **one ordinary reevaluation**, and it shares the snooze deadline task rather than adding a
+second scheduler: `nextAutoWakeDeadline` takes whichever of the two comes first, so simultaneous
+deadlines produce one evaluation. The interval is armed only when routine content is actually waiting
+on it (`routineDeferralOwingReevaluation`: pending routine content, not the shape already parked in
+failure suppression, and a prompt context that could carry it). Without that condition this would be a
+periodic timer, which it is not.
+
+## `Wake now` is one attempt, not a second queue
+
+`Wake now` reserves an ordinary `AgentSessionLinkAutoWakeAttempt` whose stored
+`admissionBasis` is `.manual`, alongside `.routineStatusOrOverflow` and `.purposefulAttention`. The
+basis is what every later gate re-evaluates under — pre-claim reselection, the shared eligibility
+fence, and physical acquisition — which is why it is stored rather than re-derived: nothing in the
+queue could recover a user's click.
+
+For that one attempt, manual policy admits every exact live lane and ignores snooze, the interval, and
+failure suppression. It **writes** none of them: the stored `suppressedWakeFingerprint` survives a
+manual attempt, so a later automatic publication of the same failed shape stays suppressed, and
+ordinary acceptance remains the only thing that clears it. Every hard gate still applies — authority,
+readiness, the immutable claim and its budget, physical acquisition, and the tombstone fence — and a
+manual attempt still requires rendered content that is live under exact current membership.
+
+A request is answered for the instant it was made. `AgentMonitorWakeNowRefusal` refuses an empty queue,
+an occupied slot (including a tombstone), a busy observer, and an ineligible prompt context; a busy
+refusal stores nothing to run later, and a manual reservation is released rather than parked if the
+observer stops being dispatchable before preparation. `.scheduled` says a reservation was accepted,
+never that a provider call happened.
+
+The dashboard renders the same predicate it acts on. `AgentMonitorPendingUpdates` counts *coalesced*
+queue content — status entries plus attention occurrences, grouped by target and labelled from the
+existing lane rows — and discloses unattributed overflow separately, so an overflow-only queue reads
+as `Additional changes pending` rather than empty. The `Next wake in …` countdown appears only when
+the interval is the one thing delaying a wake that would otherwise be accepted right now, and it is
+omitted rather than shown as zero once elapsed. `agent_session_link` is unchanged: the interval and
+`Wake now` have no agent-facing surface.
+
+## Periodic idle wake
+
+Periodic waking is a separate, default-off observer-session preference, not notification admission
+spacing. It applies only while the session has at least one live outbound oversight relationship.
+The compact `Wake periodically when idle` checkbox and adjacent picker offer 10/30/60/120/360 minutes
+(default 30). The existing routine-limit checkbox likewise keeps its picker on the same row. The entire
+wake-controls block is visible only with outbound oversight; inbound-only sessions do not show it.
+Hiding these controls does not clear the session's saved preferences.
+
+A periodic wake starts an ordinary turn after the observer has remained idle for the chosen interval
+since its last completed turn. It may run with no pending notifications. The turn receives:
+
+> [Periodic wake-up. Perform only checks or follow-ups previously requested by the user. If none are due, take no action and return to idle.]
+
+Periodic waking never interrupts an active turn or answers an approval/user interaction. Missed ticks
+are not accumulated. It is independent of routine notification selection, throttling, and per-target
+snoozes; explicit attention remains immediate. The timer grants no new tool or task authority, and
+an otherwise empty check still consumes a model turn. Enabling or restoring the preference while idle
+starts a fresh interval; there is no restart catch-up.
+
+The independent idle timer reserves the existing `pendingAutoWake` slot with a periodic basis, not a
+fabricated notification. Exact session/composer ownership fences preparation and cancellation; a
+cancelled producer remains fenced until refusal or proven settlement. Provider acceptance releases
+execution ownership even without a notification claim. ACP's ordinary instruction wait also releases
+its exact acquired reservation, because ACP reports acceptance only after its prompt completes;
+optional notification receipts still belong to that captured completion callback.
+
 ## The `.cancelledBeforeDispatch` tombstone is a fence, not bookkeeping
 
 When a snooze or selection loss retracts a routine wake that is already in `.preparingDispatch`, or
@@ -479,37 +568,41 @@ client has not re-read `tools/list` lands on exactly `hasAgentSessionLink == fal
 closed, and the only admission exception — the `session.runID == nil` cold bootstrap — is unreachable
 while that run identity persists. Auto-wake is blocked behind a projection nothing else will fix.
 
-The repair is Codex-only, bounded to **one controller replacement per episode**, and made of parts
-that already existed:
+The repair is Codex-only, bounded to **one controller replacement per repair cycle**, and made of
+parts that already existed:
 
 | Piece | Where |
 | --- | --- |
-| Episode marker | `AgentTabSession.codexSessionLinkCatalogRepairSourceGeneration` |
-| Opens/closes the episode | `agentSessionLinkReconcileCodexCatalogRepair` in `AgentModeViewModel+SessionLinkPrompt` |
-| Spends the episode | `codexRepairSessionLinkCatalogIfQuiescent` in `CodexAgentModeCoordinator` |
+| Mismatch and close predicates, cycle value | `AgentSessionLinkCodexCatalogRepair` (`isStuckProjection`, `projectionResolvesCycle`, `Cycle`) |
+| Cycle record | `AgentTabSession.codexSessionLinkCatalogRepairCycle` |
+| Opens/closes the cycle | `agentSessionLinkReconcileCodexCatalogRepair` in `AgentModeViewModel+SessionLinkPrompt` |
+| Spends the cycle | `codexRepairSessionLinkCatalogIfQuiescent` in `CodexAgentModeCoordinator` |
+| Quiescence gate | `isQuiescentForControllerReplacement` in `CodexAgentModeCoordinator`, reading `oversight.pendingAutoWakeOwnsTransportBoundary` |
 | Re-admits the queue | `agentSessionLinkRedriveCurrentPassiveSnapshot` in `AgentModeViewModel+SessionLinkAutoWake` |
 
-**The marker is a controller generation, not a Boolean.** `nil` is no episode; equal to
-`codexControllerGeneration` is pending; different is consumed. The consumed state is written by
+**The cycle records a controller generation, not a Boolean.** `nil` on the session is no cycle;
+`Cycle.state(currentControllerGeneration:)` answers `.pending` while the recorded generation still
+equals `codexControllerGeneration` and `.spent` once it differs. The spent state is written by
 nobody — `codexController.didSet` rotates the generation on every identity change, so *surviving*
 that rotation is the record that some replacement already happened. That is why it must never be
 cleared from controller teardown, and why repeated higher-revision false publications cannot cause a
 second replacement: generation comparison, not projection revision, is the loop bound. A Boolean
-cannot express "an unrelated reconnect already spent this episode" without a second field or
+cannot express "an unrelated reconnect already spent this cycle" without a second field or
 instrumenting all five teardown routes.
 
-One consumed shape is a dead end rather than a recovery, and is the one case the repair still acts
+One spent shape is a dead end rather than a recovery, and is the one case the repair still acts
 on. A `preserveRunID: true` reconnect can retire the controller while its follow-up
 `ensureCodexNativeSession` fails, leaving an established run with no provider at all: nothing will
 ever publish a healed catalog for that run, so the established-run gate keeps failing closed forever.
-When the episode is consumed but `codexController == nil` and `runID != nil`, the repair retires the
-run identity through the same host-authoritative reset the pending path uses, clears the marker, and
+When the cycle is spent but `codexController == nil` and `runID != nil`, the repair retires the
+run identity through the same host-authoritative reset the pending path uses, clears the cycle, and
 re-drives — no second controller replacement.
 
 **Opening happens in the projection reconciler**, which is the only frame where the mismatch and the
 storage that produced it are visible in one synchronous MainActor step; writing the marker before
 calling the coordinator is what makes the open atomic against a nested publication.
-`projection.isReady` is deliberately not used — the state being recognized is intentionally unready.
+`projection.isReady` is deliberately not used — the state being recognized is intentionally unready,
+and `AgentSessionLinkCodexCatalogRepair.isStuckProjection` names it.
 
 What the publish guard proves is *identity*, not route currency: the projection carries a route token
 naming this tab's current endpoint, for this session object's current run, at a revision no lower than
@@ -518,20 +611,20 @@ repair actually runs; only `hasCurrentRunCatalogRouteTokenInCurrentMCPServer` pr
 additionally demands the positive catalog presence this state by definition lacks. The accepted bound
 is therefore that a projection may already be one connection generation stale by the time the repair
 runs, costing one controller replacement on a session that was going to reconnect anyway — bounded by
-the episode marker, and no more accurate than an authority round trip that can go stale the same way.
+the cycle record, and no more accurate than an authority round trip that can go stale the same way.
 
-An episode is closed by exactly five paths, all of which mean it is *over* rather than spent:
+A cycle is closed by exactly five paths, all of which mean it is *over* rather than spent:
 
 | Close path | Where |
 | --- | --- |
 | Exact current positive catalog (`hasAgentSessionLink == true`) | projection reconciler |
 | Exact outbound loss (`hasActiveOutboundLink == false`) | projection reconciler |
 | Provider switch away from `.codexExec` | `handleProviderSwitch` |
-| `agent_session_link` disabled when the episode is spent | repair entrypoint |
+| `agent_session_link` disabled when the cycle is spent | repair entrypoint |
 | Stranded consumed run (`codexController == nil`, `runID != nil`) after its retirement | repair entrypoint |
 
-An unknown observation closes nothing and leaves the episode open, because it is not evidence that
-anything healed.
+An unknown observation closes nothing and leaves the cycle open, because it is not evidence that
+anything healed (`projectionResolvesCycle` is deliberately not the negation of `isStuckProjection`).
 
 **The repair retires the process run** (`invalidateCodexControllerForReconnect(… preserveRunID: false)`)
 and that is the point rather than a side effect. `codexConversationID` and `codexRolloutPath` are
@@ -546,25 +639,25 @@ the retired route stay safe through the existing `session.runID == projection.ru
 the controller, so repairing under fallback ownership would drop the user's queued text; a terminal
 commit that has staged its revision but not finished publishing still owns the run; and a wake in
 `.preparingDispatch`, `.cancelledBeforeDispatch`, or `.dispatching` owns the same transport boundary
-the tombstone fences. A blocked episode is simply left pending — no task, timer, queue, or new phase —
+the tombstone fences. A blocked cycle is simply left pending — no task, timer, queue, or new phase —
 for the next projection reconciliation or the next winning terminal commit.
 
-**Enablement is re-sampled at spend time, not inherited from the open.** An episode opened while
+**Enablement is re-sampled at spend time, not inherited from the open.** A cycle opened while
 `agent_session_link` was enabled can be spent much later at a terminal commit that never passes
 through the reconciler's own gate. Once the tool is disabled the absent catalog is truthful, so the
-episode closes and nothing reconnects.
+cycle closes and nothing reconnects.
 
 **Terminal ordering is load-bearing.** In `finalizeCodexRun.postCommit` the repair runs *after*
 `settleCodexComputerUseActivationAfterTurn`, so a computer-use replacement rotates the generation
-first and the two coalesce into the episode's one replacement; and *before*
+first and the two coalesce into the cycle's one replacement; and *before*
 `scheduleCodexIdleShutdownIfNeeded`, so shutdown is never armed against a controller about to be
 retired. It is deliberately **not** gated on `providerSuccessor == nil`: a successor that is still
 accepted or retryable *is* the fallback queue head, which the fallback-ownership guard already
 refuses, while a stale or permanently rejected successor leaves no queue behind and gating on its
-mere presence would strand the episode on a session with nothing left to re-drive it.
+mere presence would strand the cycle on a session with nothing left to re-drive it.
 
 The accepted cost is that a healthy idle controller may be recycled during the transient interval
-before a compliant client processes `list_changed`. That is bounded at one replacement per episode,
+before a compliant client processes `list_changed`. That is bounded at one replacement per cycle,
 which is the trade for having no grace timer, no retry task, and no successor protocol.
 
 The feature intentionally has no reason payload, priority, broadcast, idempotency ledger, persistence,
@@ -578,7 +671,7 @@ YAGNI non-goals, not missing pieces to infer from the attention operation.
 Oversight catalog repair has one always-on, local diagnostic channel in normal builds. It uses macOS
 Unified Logging rather than a custom file, setting, exporter, or retention service, so macOS owns
 bounded storage and rotation. The category records only low-volume catalog lifecycle transitions:
-server projection publication, host projection acceptance or rejection, repair episode open/close and
+server projection publication, host projection acceptance or rejection, repair cycle open/close and
 terminal spend outcomes, and receipt of an `agent_session_link` tool call.
 
 The diagnostic API is typed. Fields are closed enums, booleans, bounded revision/generation values,

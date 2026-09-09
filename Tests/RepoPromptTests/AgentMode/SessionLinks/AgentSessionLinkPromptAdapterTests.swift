@@ -411,14 +411,15 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             )]
         )
         fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
-        fixture.session.autoWakeOnOversightUpdates = true
+        fixture.session.oversight.autoWakeOnUpdates = true
         let wakeID = UUID()
-        fixture.session.pendingOversightAutoWake = AgentSessionLinkAutoWakeAttempt(
+        fixture.session.oversight.pendingAutoWake = AgentSessionLinkAutoWakeAttempt(
             wakeID: wakeID,
             observerEndpoint: endpoint,
             queueEpoch: queueEpoch,
             queueRevision: 1,
             wakeFingerprint: snapshot.wakeEligibilityFingerprint,
+            admissionBasis: .routineStatusOrOverflow,
             attemptedFingerprint: nil,
             physicalOutcome: .notAttempted,
             phase: .preparingDispatch,
@@ -1070,9 +1071,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             .cancelledBeforeDispatch,
             .dispatching
         ] {
-            var attempt = try XCTUnwrap(fixture.session.pendingOversightAutoWake)
+            var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
             attempt.phase = phase
-            fixture.session.pendingOversightAutoWake = attempt
+            fixture.session.oversight.pendingAutoWake = attempt
 
             let effective = fixture.viewModel.agentSessionLinkEffectiveDispatchID(
                 for: fixture.session,
@@ -1115,7 +1116,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let original = try XCTUnwrap(fixture.controller.startedTurns.last)
         XCTAssertFalse(original.isEmpty)
         XCTAssertEqual(MonitorSupplementAssertions.fragmentCount(in: original), 1)
-        XCTAssertNil(fixture.session.pendingOversightAutoWake, "the accepted wake must be settled")
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake, "the accepted wake must be settled")
         XCTAssertEqual(
             fixture.session.codexPendingAuthRetryTurn?.monitoringDispatchID?.autoWakeID,
             wakeID
@@ -1372,7 +1373,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
         let accepted = try XCTUnwrap(fixture.controller.startedTurns.last)
         XCTAssertEqual(fixture.controller.startedTurns.count, 1)
-        XCTAssertNil(fixture.session.pendingOversightAutoWake, "the accepted wake must be settled")
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake, "the accepted wake must be settled")
         XCTAssertEqual(
             fixture.viewModel.agentSessionLinkPromptClaimStore
                 .test_lastAcceptedRevision(observerSessionID: fixture.sessionID),
@@ -1423,7 +1424,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             "the refused replay must not acknowledge the membership it never delivered"
         )
         XCTAssertNil(
-            fixture.session.pendingOversightAutoWake,
+            fixture.session.oversight.pendingAutoWake,
             "a refusal must not resurrect wake state either"
         )
         // Recovery reports refusal rather than success, so the status a dispatched replay would have
@@ -1681,7 +1682,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     physicalDispatchNotAttemptedCount += 1
                 },
                 recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
-                acceptAgentSessionLinkPromptClaim: { _ in }
+                acceptAgentSessionLinkPromptClaim: { _, _, _ in }
             ),
             providerBindingService: AgentModeProviderBindingService()
         )
@@ -1760,7 +1761,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     physicalDispatchNotAttemptedCount += 1
                 },
                 recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
-                acceptAgentSessionLinkPromptClaim: { _ in }
+                acceptAgentSessionLinkPromptClaim: { _, _, _ in }
             ),
             providerBindingService: providerBindingService
         )
@@ -2264,6 +2265,12 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private(set) var sentMessages: [String] = []
     private(set) var shutdownCount = 0
     private(set) var startOrResumeExistingSessionIDs: [String?] = []
+    private var rejectResume = false
+
+    func setRejectResume(_ value: Bool) {
+        rejectResume = value
+    }
+
     private var stream: AsyncStream<NativeAgentRuntimeEvent>?
     private var continuation: AsyncStream<NativeAgentRuntimeEvent>.Continuation?
 
@@ -2300,6 +2307,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
         startOrResumeExistingSessionIDs.append(existingSessionID)
+        if rejectResume, existingSessionID != nil { throw NativeAgentRuntimeControllerError.processNotRunning }
         return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
     }
 

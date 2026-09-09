@@ -501,9 +501,9 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         )
     }
 
-    /// Revision 3 also existed before C3 installed the inverse operation. This reconstructs that
+    /// Revision 3 also existed before `request_attention` was installed. This reconstructs that
     /// complete intermediate shape rather than relying on the much older embedded definition, then
-    /// proves the whole pipeline adds attention and advances every C5-owned contract in one pass.
+    /// proves the whole pipeline adds attention and advances every revision-5 contract in one pass.
     func testCanonicalPipelineAdvancesTheExactPreAttentionRevisionThreeState() throws {
         let legacyCurrent = legacyCurrentDefinition()
         let shipped = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))

@@ -1,5 +1,16 @@
 import Foundation
 
+// The observer-facing transcript reduction for `read`: coarse roles, byte budgets, redaction, and
+// stable cursors.
+//
+// Consumes the `AgentSessionLinkCanonicalTranscript` snapshot taken by
+// `AgentModeViewModel+SessionLinkTranscript` (which is also its only caller) and produces the page
+// the `read` operation returns. Invariants: an observer learns *that* a tool ran, never its
+// arguments or results;
+// every emitted string is normalized and byte-capped before it can reach a prompt or tool result;
+// and a cursor is anchored to exact item identity so a truncated or rewritten transcript resets
+// rather than silently skipping.
+
 // MARK: - Sanitized item model
 
 /// Roles an observer may ever see. Deliberately coarser than `AgentChatItemKind`: an observer learns

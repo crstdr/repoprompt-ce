@@ -64,13 +64,13 @@ final class AgentSessionLinkObservationSignalTests: XCTestCase {
     func testAcceptedTurnClearsWaitingOnAndPublishesExactlyOnce() throws {
         let (session, count, cancellable) = makeSession()
         defer { cancellable.cancel() }
-        session.agentSessionLinkWaitingOn = try XCTUnwrap(DomainAgentSessionWaitingOn(
+        session.oversight.waitingOn = try XCTUnwrap(DomainAgentSessionWaitingOn(
             summary: "external review",
             declaredAt: Date(timeIntervalSince1970: 1)
         ))
 
         session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()
-        XCTAssertNil(session.agentSessionLinkWaitingOn)
+        XCTAssertNil(session.oversight.waitingOn)
         XCTAssertEqual(count(), 1)
 
         session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()

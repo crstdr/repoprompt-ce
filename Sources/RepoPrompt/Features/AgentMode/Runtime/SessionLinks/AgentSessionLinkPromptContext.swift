@@ -1,6 +1,20 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+// The claim/receipt owner of the oversight subsystem.
+//
+// This file owns what a provider was actually sent: the agent-facing link inventory, the prompt
+// epoch and eligibility that decide whether a supplement may ride on a dispatch, the immutable
+// outbound claim with its passive-batch receipt (exact status rows and attention occurrence
+// identities), and the store that reserves, accepts, or abandons those claims. It authors no prompt
+// text. Every string and every byte-budget decision comes from `AgentSessionLinkPrompts.rendered(_:)`,
+// which this file calls exactly once per claim; `AgentSessionLinkPromptComposer` only appends the
+// finished fragment. Coordinates with `AgentModeViewModel+SessionLinkPrompt` (the window-local seam
+// that builds render requests from live state) and `AgentSessionLinkPassiveStatusNotices` (whose
+// snapshot is the input and whose receipt application is the output). Invariant: acceptance is
+// occurrence-qualified — a receipt removes only what its own rendered batch named, so a stale or
+// out-of-order receipt can never clear a successor occurrence.
+
 // MARK: - Prompt inventory
 
 /// One overseen target as the agent-facing prompt sees it.
@@ -725,7 +739,34 @@ enum AgentSessionLinkPromptClaimOutcome: Equatable {
 /// A named type rather than a tuple so `mustAbortDispatch` cannot be dropped by a call site that only
 /// destructures the two fields it already knew about: adding a third tuple element would compile
 /// everywhere it was ignored, which is exactly the failure this exists to prevent.
+/// Captured before transport; a late callback must never infer origin from a successor slot.
+struct AgentSessionLinkDispatchContext: Equatable {
+    let dispatchID: AgentSessionLinkPromptDispatchID
+    let isPeriodic: Bool
+
+    @MainActor
+    init(session: AgentTabSession, dispatchID: AgentSessionLinkPromptDispatchID) {
+        if var attempt = session.oversight.pendingAutoWake,
+           attempt.phase.ownsTransportBoundary,
+           !dispatchID.isAutoWakeFamily || dispatchID.autoWakeID == attempt.wakeID
+        {
+            self.dispatchID = .autoWake(wakeID: attempt.wakeID)
+            isPeriodic = attempt.isPeriodic
+            if attempt.isPeriodic, attempt.phase == .preparingDispatch,
+               attempt.periodicProducerDispatchID == nil, !dispatchID.isAutoWakeFamily
+            {
+                attempt.periodicProducerDispatchID = dispatchID
+                session.oversight.pendingAutoWake = attempt
+            }
+        } else {
+            self.dispatchID = dispatchID
+            isPeriodic = false
+        }
+    }
+}
+
 struct AgentSessionLinkDecoratedProviderText {
+    var dispatchContext: AgentSessionLinkDispatchContext?
     let text: String
     /// Acknowledge at this dispatch's own physical-acceptance signal, and only then.
     let claim: AgentSessionLinkOutboundPromptClaim?
@@ -1015,9 +1056,10 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         inventory: AgentSessionLinkPromptInventory,
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
         locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:],
+        allowsClaimlessAutoWake: Bool = false,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkPromptClaimOutcome {
-        let requiresLaneBatch = dispatchID.isAutoWakeFamily
+        let requiresLaneBatch = dispatchID.isAutoWakeFamily && !(allowsClaimlessAutoWake && dispatchID.autoWakeID != nil)
         // Every refusal below means "send undecorated" for an ordinary dispatch and "do not dispatch"
         // for a wake, so the mapping is decided once here instead of being restated — and possibly
         // forgotten — at each exit.
