@@ -454,30 +454,31 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         }
         XCTAssertEqual(revalidationCode, "graph_revalidation_failed")
 
-        // Recovery cannot establish the replacement inventory, so its barrier must keep every
-        // admission entrance closed instead of letting work run against the retired catalog. The
-        // window is sampled past the original cleanup flight and several reconciliation retries, so
-        // the barrier — not the cleanup flight — is what keeps these closed.
-        let fenceDeadline = ContinuousClock().now.advanced(by: .milliseconds(1500))
-        while ContinuousClock().now < fenceDeadline {
-            let fencedDemand = await store.requestCodemapArtifact(forFileID: replacedFile.id)
-            guard case let .unavailable(fencedReason) = fencedDemand else {
-                return XCTFail("Demand must not be admitted while catalog recovery is unresolved")
-            }
-            XCTAssertEqual(fencedReason, .busy(retryAfterMilliseconds: nil))
-            let fencedPrioritize = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
-            XCTAssertEqual(
-                fencedPrioritize,
-                .unavailable,
-                "A build must not be scheduled against the retired inventory"
-            )
-            let fencedFiles = await store.files(inRoot: loaded.id).map(\.standardizedRelativePath)
-            XCTAssertFalse(
-                fencedFiles.contains("src/Second.ts"),
-                "A failed reconciliation must not be reported as completed recovery"
-            )
-            try await Task.sleep(for: .milliseconds(50))
+        // Observing exhaustion proves the predecessor cleanup drained and all reconciliation
+        // attempts finished. A time window could pass while only the earlier cleanup fence held.
+        try await AsyncTestWait.waitUntil("catalog recovery reports retry exhaustion", timeout: 30) {
+            await store.currentCodemapRootStatusUpdate().roots.first {
+                $0.rootEpoch == rootEpoch
+            }?.unavailableReason == .retryExhausted
         }
+        let exhaustedUpdate = await store.currentCodemapRootStatusUpdate()
+        let exhaustedStatus = try XCTUnwrap(exhaustedUpdate.roots.first { $0.rootEpoch == rootEpoch })
+        XCTAssertEqual(exhaustedStatus.availability, .unavailable)
+        let exhaustedPresentation = AgentWorkspaceCodemapPresentation.make(exhaustedStatus)
+        XCTAssertTrue(exhaustedPresentation.canRetry)
+        XCTAssertFalse(exhaustedPresentation.isActivelyMapping)
+        let fencedDemand = await store.requestCodemapArtifact(forFileID: replacedFile.id)
+        guard case let .unavailable(fencedReason) = fencedDemand else {
+            return XCTFail("Demand must not be admitted after catalog recovery exhausts")
+        }
+        XCTAssertEqual(fencedReason, .busy(retryAfterMilliseconds: nil))
+        let fencedFiles = await store.files(inRoot: loaded.id).map(\.standardizedRelativePath)
+        XCTAssertFalse(fencedFiles.contains("src/Second.ts"))
+
+        // Retry uses the existing UI action; a subsequent suspension must retain the requirement
+        // whether it cancels that retry or arrives after its attempts have already exhausted.
+        let retry = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+        XCTAssertEqual(retry, .scheduled)
 
         // A non-terminal detach must not discard the outstanding reconciliation requirement.
         // Suspending cancels the recovery task; resume has to restart it under the same barrier,
@@ -494,26 +495,21 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         )
         XCTAssertEqual(unresolvedResume, .changed)
 
-        let resumedFenceDeadline = ContinuousClock().now.advanced(by: .milliseconds(750))
-        while ContinuousClock().now < resumedFenceDeadline {
-            let resumedDemand = await store.requestCodemapArtifact(forFileID: replacedFile.id)
-            guard case let .unavailable(resumedReason) = resumedDemand else {
-                return XCTFail("Resume must not admit demand while catalog recovery is unresolved")
-            }
-            XCTAssertEqual(resumedReason, .busy(retryAfterMilliseconds: nil))
-            let resumedPrioritize = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
-            XCTAssertEqual(
-                resumedPrioritize,
-                .unavailable,
-                "Resume must not schedule a build against the retired inventory"
-            )
-            let resumedFiles = await store.files(inRoot: loaded.id).map(\.standardizedRelativePath)
-            XCTAssertFalse(
-                resumedFiles.contains("src/Second.ts"),
-                "A still-failing reconciliation must not be reported as completed recovery"
-            )
-            try await Task.sleep(for: .milliseconds(50))
+        try await AsyncTestWait.waitUntil("resumed catalog recovery also exhausts", timeout: 30) {
+            await store.currentCodemapRootStatusUpdate().roots.first {
+                $0.rootEpoch == rootEpoch
+            }?.unavailableReason == .retryExhausted
         }
+        let resumedDemand = await store.requestCodemapArtifact(forFileID: replacedFile.id)
+        guard case let .unavailable(resumedReason) = resumedDemand else {
+            return XCTFail("Resume must not admit demand while catalog recovery is unresolved")
+        }
+        XCTAssertEqual(resumedReason, .busy(retryAfterMilliseconds: nil))
+        let resumedFiles = await store.files(inRoot: loaded.id).map(\.standardizedRelativePath)
+        XCTAssertFalse(
+            resumedFiles.contains("src/Second.ts"),
+            "A still-failing reconciliation must not be reported as completed recovery"
+        )
 
         // Once the scans can succeed, the restarted recovery has to reconcile the replacement
         // inventory itself. No watcher delta and no manual reconciliation are delivered here, and
@@ -522,16 +518,8 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         for folder in ["", "src"] {
             await service.setFolderScanFailureCountForTesting(0, folder: folder)
         }
-        let repairedSuspension = await store.setCodemapGenerationSuspended(
-            rootID: loaded.id,
-            suspended: true
-        )
-        XCTAssertEqual(repairedSuspension, .changed)
-        let repairedResume = await store.setCodemapGenerationSuspended(
-            rootID: loaded.id,
-            suspended: false
-        )
-        XCTAssertEqual(repairedResume, .changed)
+        let repairedRetry = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+        XCTAssertEqual(repairedRetry, .scheduled)
         try await AsyncTestWait.waitUntil(
             "restarted recovery reconciles the replacement inventory",
             timeout: 60
@@ -554,6 +542,10 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
                 Self.definitions(in: snapshot, fileID: secondFile.id) == ["SecondOnlyProps"]
         }
         XCTAssertEqual(definitions(in: repairedSnapshot, fileID: secondFile.id), ["SecondOnlyProps"])
+        let repairedStatus = await store.currentCodemapRootStatusUpdate().roots.first {
+            $0.rootEpoch == rootEpoch
+        }
+        XCTAssertNil(try XCTUnwrap(repairedStatus).unavailableReason)
 
         // Case (c) unloads from an unresolved recovery, so the repair above is undone: the physical
         // binding is replaced once more and this recovery is again denied a successful scan.

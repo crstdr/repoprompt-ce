@@ -508,6 +508,7 @@ actor WorkspaceFileContextStore {
     /// construction: it exists only between an accepted authority invalidation and that scan.
     private struct CodemapCatalogRecoveryRequirement {
         let authority: CodemapRootAuthority
+        var retryExhausted = false
     }
 
     /// UI-status lower bound for coverage that remains valid while a path-level
@@ -10744,6 +10745,13 @@ actor WorkspaceFileContextStore {
             rootEpoch: rootEpoch,
             phase: codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase ?? .notScheduled
         )
+        if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
+            // Retry the catalog scan, not the graph: the retained requirement keeps every
+            // admission route fenced until reconciliation actually succeeds.
+            restartCodemapCatalogRecoveryIfPending(rootEpoch: rootEpoch)
+            return codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch] == nil
+                ? .unavailable : .scheduled
+        }
         if let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine {
             let disposition = await engine.prioritizeGraphIndexNow(rootEpoch: rootEpoch)
             if disposition != .unavailable {
@@ -10832,7 +10840,9 @@ actor WorkspaceFileContextStore {
         let suspended = codemapGenerationIsSuspended(rootEpoch: rootEpoch)
         let accounting = codemapGraphAccountingByRootEpoch[rootEpoch]
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
-        let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
+        let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
+            .retryExhausted
+        } else if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
             .workerRecoveryExhausted
         } else {
             switch launchPhase {
@@ -13581,6 +13591,7 @@ actor WorkspaceFileContextStore {
             authority: authority,
             task: task
         )
+        publishCodemapRootStatusesIfChanged()
     }
 
     /// Registration value `performCodemapSetup` hands to the engine for one setup authority.
@@ -13657,6 +13668,10 @@ actor WorkspaceFileContextStore {
             // every build route from enumerating the retired inventory, and what a later resume
             // restarts. Only a successful scan, or the unload that ends the epoch, discharges it.
             guard attempt <= codemapGraphIndexBuildRetryPolicy.maximumRetryCount else {
+                // A superseded scan must not mark its replacement as exhausted.
+                if codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch]?.id == flightID {
+                    codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted = true
+                }
                 finishCodemapRootAuthorityRecovery(
                     rootEpoch: rootEpoch,
                     flightID: flightID,
@@ -13701,6 +13716,7 @@ actor WorkspaceFileContextStore {
         didReconcile: Bool
     ) {
         guard codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch]?.id == flightID else { return }
+        defer { publishCodemapRootStatusesIfChanged() }
         codemapRootAuthorityRecoveryFlightsByRootEpoch.removeValue(forKey: rootEpoch)
         guard didReconcile else { return }
         codemapCatalogRecoveryRequirementsByRootEpoch.removeValue(forKey: rootEpoch)
