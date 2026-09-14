@@ -1,17 +1,85 @@
 import Foundation
 import MCP
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class AgentMCPModelParameterSupportTests: XCTestCase {
     func testCursorDefinitionsPreserveExactWireIdentifiersAndChoices() {
-        let definitions = AgentMCPModelParameterSupport.definitions(modelRaw: "grok-4.6")
+        let definitions = AgentMCPModelParameterSupport.definitions(agent: .cursor, modelRaw: "grok-4.6")
 
         XCTAssertEqual(definitions.count, 2)
         XCTAssertEqual(definitions[0].configID, "effort")
         XCTAssertEqual(definitions[0].choices.map(\.rawValue), ["low", "medium", "high", "xhigh"])
         XCTAssertEqual(definitions[1].configID, "fast")
         XCTAssertEqual(definitions[1].choices.map(\.rawValue), ["false", "true"])
+    }
+
+    func testCursorDefinitionValuesPreserveListAgentsWireShape() {
+        let values = AgentMCPModelParameterSupport.definitionValues(agent: .cursor, modelRaw: "grok-4.6")
+
+        XCTAssertEqual(values.count, 2)
+        XCTAssertEqual(values[0].objectValue?["kind"]?.stringValue, "thinking")
+        XCTAssertEqual(values[0].objectValue?["config_id"]?.stringValue, "effort")
+        XCTAssertEqual(values[0].objectValue?["name"]?.stringValue, "Effort")
+        XCTAssertEqual(values[0].objectValue?["current_value"]?.stringValue, "high")
+        XCTAssertEqual(
+            values[0].objectValue?["choices"]?.arrayValue?.compactMap { $0.objectValue?["value"]?.stringValue },
+            ["low", "medium", "high", "xhigh"]
+        )
+        XCTAssertEqual(values[1].objectValue?["kind"]?.stringValue, "speed")
+        XCTAssertEqual(values[1].objectValue?["config_id"]?.stringValue, "fast")
+        XCTAssertEqual(values[1].objectValue?["name"]?.stringValue, "Speed")
+        XCTAssertEqual(values[1].objectValue?["current_value"]?.stringValue, "true")
+        XCTAssertEqual(
+            values[1].objectValue?["choices"]?.arrayValue?.compactMap { $0.objectValue?["value"]?.stringValue },
+            ["false", "true"]
+        )
+    }
+
+    func testOpenCodeDefinitionsAdvertiseEffortWhenMetadataExists() {
+        installOpenCodeEffortMetadata()
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        let definitions = AgentMCPModelParameterSupport.definitions(
+            agent: .openCode,
+            modelRaw: "ollama-cloud/kimi-k3"
+        )
+        XCTAssertEqual(definitions.map(\.configID), ["effort"])
+        XCTAssertEqual(definitions[0].choices.map(\.rawValue), ["low", "high"])
+
+        let values = AgentMCPModelParameterSupport.definitionValues(
+            agent: .openCode,
+            modelRaw: "ollama-cloud/kimi-k3"
+        )
+        XCTAssertEqual(values.count, 1)
+        XCTAssertEqual(values[0].objectValue?["config_id"]?.stringValue, "effort")
+        XCTAssertEqual(
+            values[0].objectValue?["choices"]?.arrayValue?.compactMap { $0.objectValue?["value"]?.stringValue },
+            ["low", "high"]
+        )
+    }
+
+    func testOpenCodeDefinitionsEmptyWithoutDiscoveryMetadata() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        XCTAssertTrue(
+            AgentMCPModelParameterSupport.definitions(
+                agent: .openCode,
+                modelRaw: "anthropic/claude-sonnet"
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            AgentMCPModelParameterSupport.definitionValues(
+                agent: .openCode,
+                modelRaw: "anthropic/claude-sonnet"
+            ).isEmpty
+        )
+    }
+
+    func testNonACPDefinitionsReturnEmpty() {
+        XCTAssertTrue(AgentMCPModelParameterSupport.definitions(agent: .codexExec, modelRaw: "gpt-5").isEmpty)
+        XCTAssertTrue(AgentMCPModelParameterSupport.definitionValues(agent: .codexExec, modelRaw: "gpt-5").isEmpty)
     }
 
     func testResolveRejectsUnknownConfigBeforeProducingSelections() throws {
@@ -96,16 +164,74 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
         ))
     }
 
-    func testNonCursorProviderRejectsModelParameters() throws {
+    func testNonACPProviderRejectsModelParameters() throws {
         let requested: Value = .array([
             .object(["config_id": .string("effort"), "value": .string("high")])
         ])
 
         XCTAssertThrowsError(try AgentMCPModelParameterSupport.resolve(
             value: requested,
+            agent: .codexExec,
+            modelRaw: "gpt-5"
+        )) { error in
+            XCTAssertTrue(String(describing: error).contains("ACP"))
+        }
+    }
+
+    func testOpenCodeResolveAcceptsSupportedEffort() throws {
+        installOpenCodeEffortMetadata()
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        let selections = try AgentMCPModelParameterSupport.resolve(
+            value: .array([
+                .object(["config_id": .string("effort"), "value": .string("high")])
+            ]),
             agent: .openCode,
-            modelRaw: "grok"
-        ))
+            modelRaw: "ollama-cloud/kimi-k3"
+        )
+
+        XCTAssertEqual(selections.map(\.providerID), [.openCode])
+        XCTAssertEqual(selections.map(\.valueRaw), ["high"])
+        XCTAssertEqual(selections.map(\.baseModelRaw), ["ollama-cloud/kimi-k3"])
+    }
+
+    func testOpenCodeResolveRejectsMissingMetadata() throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        XCTAssertThrowsError(try AgentMCPModelParameterSupport.resolve(
+            value: .array([
+                .object(["config_id": .string("effort"), "value": .string("high")])
+            ]),
+            agent: .openCode,
+            modelRaw: "anthropic/claude-sonnet"
+        )) { error in
+            XCTAssertTrue(String(describing: error).contains("metadata is unavailable"))
+        }
+    }
+
+    func testEffectiveSelectionsIncludeOpenCodeProvider() {
+        installOpenCodeEffortMetadata()
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        let selections = [
+            ACPModelParameterSelection(
+                providerID: .openCode,
+                baseModelRaw: "ollama-cloud/kimi-k3",
+                kind: .thinking,
+                configID: "effort",
+                valueRaw: "high"
+            )
+        ]
+
+        XCTAssertEqual(
+            AgentMCPModelParameterSupport.effectiveSelections(
+                selections,
+                agentRaw: AgentProviderKind.openCode.rawValue,
+                modelRaw: "ollama-cloud/kimi-k3"
+            ),
+            selections
+        )
     }
 
     func testAgentRunSnapshotPublishesEffectiveModelParameterSelections() throws {
@@ -177,17 +303,44 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
                     providerID: .cursor,
                     baseModelRaw: "grok-4.6",
                     kind: .thinking,
-                    configID: "effort",
+                    configID: "Cursor.Thought-Level",
                     valueRaw: "high"
-                ),
-                ACPModelParameterSelection(
-                    providerID: .cursor,
-                    baseModelRaw: "grok-4.6",
-                    kind: .speed,
-                    configID: "fast",
-                    valueRaw: "true"
                 )
             ]
+        )
+    }
+
+    private func installOpenCodeEffortMetadata() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        let parameterSet = ACPModelParameterSet(
+            baseModelRaw: "ollama-cloud/kimi-k3",
+            parameters: [
+                .init(
+                    kind: .thinking,
+                    configID: "effort",
+                    displayName: "Effort",
+                    choices: [
+                        .init(rawValue: "low", displayName: "Low"),
+                        .init(rawValue: "high", displayName: "High")
+                    ],
+                    currentValueRaw: "low"
+                )
+            ]
+        )
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            .init(
+                options: [
+                    .init(
+                        rawValue: "ollama-cloud/kimi-k3",
+                        displayName: "Kimi K3",
+                        description: nil,
+                        isDefault: true
+                    )
+                ],
+                currentModelRaw: "ollama-cloud/kimi-k3",
+                modelParameterSets: [parameterSet]
+            ),
+            for: .openCode
         )
     }
 }

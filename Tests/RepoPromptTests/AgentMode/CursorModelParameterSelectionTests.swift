@@ -296,7 +296,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         ).isEmpty)
     }
 
-    func testEffectiveSelectionsCanonicalizeLegacyAliasesAndReplaceStaleValuesWithDisplayedDefaults() {
+    func testEffectiveSelectionsForwardStoredIntentWithoutMetadataLookup() {
         let stale = ACPModelParameterSelection(
             providerID: .cursor,
             baseModelRaw: "Grok 4.6",
@@ -311,9 +311,39 @@ final class CursorModelParameterSelectionTests: XCTestCase {
             persistedSelections: [stale]
         )
 
-        XCTAssertEqual(effective.map(\.baseModelRaw), ["grok-4.6", "grok-4.6"])
-        XCTAssertEqual(effective.map(\.configID), ["effort", "fast"])
-        XCTAssertEqual(effective.map(\.valueRaw), ["high", "true"])
+        XCTAssertEqual(effective, [stale])
+    }
+
+    func testEffectiveSelectionsOmitOtherProviderAndBaseModelSelections() {
+        let active = ACPModelParameterSelection(
+            providerID: .cursor,
+            baseModelRaw: "grok-4.6",
+            kind: .thinking,
+            configID: "effort",
+            valueRaw: "high"
+        )
+        let otherModel = ACPModelParameterSelection(
+            providerID: .cursor,
+            baseModelRaw: "composer-2.5",
+            kind: .speed,
+            configID: "fast",
+            valueRaw: "true"
+        )
+        let otherProvider = ACPModelParameterSelection(
+            providerID: .openCode,
+            baseModelRaw: "ollama-cloud/kimi-k3",
+            kind: .thinking,
+            configID: "effort",
+            valueRaw: "max"
+        )
+
+        let effective = ACPModelParameterResolver.effectiveSelections(
+            providerID: .cursor,
+            selectedModelRaw: "Grok 4.6",
+            persistedSelections: [active, otherModel, otherProvider]
+        )
+
+        XCTAssertEqual(effective, [active])
     }
 
     func testSemanticIdentityCanonicalizesLegacyComposerAlias() {
@@ -355,7 +385,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         viewModel.applySessionToBindings(session)
 
         XCTAssertTrue(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
-        viewModel.selectCursorModelParameter(configID: "effort", valueRaw: "high")
+        viewModel.selectACPModelParameter(cursorEffortSelection(valueRaw: "high"))
         XCTAssertTrue(session.acpModelParameterSelections.isEmpty)
 
         session.runState = .idle
@@ -363,7 +393,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertFalse(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
         session.isDirty = false
         let previousGeneration = session.persistenceMutationGeneration
-        viewModel.selectCursorModelParameter(configID: "effort", valueRaw: "high")
+        viewModel.selectACPModelParameter(cursorEffortSelection(valueRaw: "high"))
         XCTAssertEqual(session.acpModelParameterSelections.map(\.valueRaw), ["high"])
 
         XCTAssertTrue(session.isDirty)
@@ -371,12 +401,13 @@ final class CursorModelParameterSelectionTests: XCTestCase {
 
         viewModel.test_setMCPControlledTabIDs([tabID])
         XCTAssertTrue(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
-        viewModel.selectCursorModelParameter(configID: "fast", valueRaw: "true")
+        viewModel.selectACPModelParameter(cursorSpeedSelection(valueRaw: "true"))
         XCTAssertEqual(session.acpModelParameterSelections.map(\.valueRaw), ["high"])
     }
 
     func testCompactParameterControlExposesAccessibleNameAndSelection() {
         let control = AgentComposerModelParameterControlProps(
+            providerID: .cursor,
             kind: .thinking,
             baseModelRaw: "grok-4.6",
             configID: "thought_level",
@@ -406,7 +437,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         viewModel.test_installLiveSession(session)
         viewModel.applySessionToBindings(session)
 
-        let controls = viewModel.makeComposerProps(tabID: tabID).cursorModelParameterControls
+        let controls = viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls
         XCTAssertEqual(controls.map(\.displayName), ["Effort", "Speed"])
         XCTAssertEqual(controls.map(\.selectedDisplayName), ["High", "Fast"])
     }
@@ -424,16 +455,242 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         viewModel.test_installLiveSession(session)
         viewModel.applySessionToBindings(session)
         XCTAssertEqual(
-            viewModel.makeComposerProps(tabID: tabID).cursorModelParameterControls.map(\.displayName),
+            viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls.map(\.displayName),
             ["Effort", "Speed"]
         )
 
         session.selectedModelRaw = "composer-2.5"
         viewModel.applySessionToBindings(session)
         XCTAssertEqual(
-            viewModel.makeComposerProps(tabID: tabID).cursorModelParameterControls.map(\.displayName),
+            viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls.map(\.displayName),
             ["Speed"]
         )
+    }
+
+    func testNonACPComposerHasNoParameterControls() {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-5"
+        viewModel.test_installLiveSession(session)
+        viewModel.applySessionToBindings(session)
+
+        XCTAssertTrue(viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls.isEmpty)
+    }
+
+    func testOpenCodeComposerPublishesEffortControlWhenMetadataExists() {
+        installOpenCodeEffortMetadata()
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .openCode
+        session.selectedModelRaw = "ollama-cloud/kimi-k3"
+        viewModel.test_installLiveSession(session)
+        viewModel.applySessionToBindings(session)
+
+        let controls = viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls
+        XCTAssertEqual(controls.map(\.displayName), ["Effort"])
+        XCTAssertEqual(controls.map(\.selectedDisplayName), ["Low"])
+    }
+
+    func testOpenCodeComposerHasNoControlsWhenMetadataMissing() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .openCode
+        session.selectedModelRaw = "anthropic/claude-sonnet"
+        viewModel.test_installLiveSession(session)
+        viewModel.applySessionToBindings(session)
+
+        XCTAssertTrue(viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls.isEmpty)
+    }
+
+    func testSelectingDisplayedFallbackCreatesExplicitOpenCodeIntent() {
+        installOpenCodeEffortMetadata()
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .openCode
+        session.selectedModelRaw = "ollama-cloud/kimi-k3"
+        viewModel.test_installLiveSession(session)
+        viewModel.applySessionToBindings(session)
+        XCTAssertTrue(session.acpModelParameterSelections.isEmpty)
+
+        viewModel.selectACPModelParameter(
+            ACPModelParameterSelection(
+                providerID: .openCode,
+                baseModelRaw: "ollama-cloud/kimi-k3",
+                kind: .thinking,
+                configID: "effort",
+                valueRaw: "low"
+            )
+        )
+
+        XCTAssertEqual(session.acpModelParameterSelections.map(\.valueRaw), ["low"])
+        XCTAssertEqual(
+            ACPModelParameterResolver.effectiveSelections(
+                providerID: .openCode,
+                selectedModelRaw: session.selectedModelRaw,
+                persistedSelections: session.acpModelParameterSelections
+            ).map(\.valueRaw),
+            ["low"]
+        )
+    }
+
+    func testStaleModelParameterSelectionIsRejected() {
+        installOpenCodeEffortMetadata()
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .openCode
+        session.selectedModelRaw = "ollama-cloud/kimi-k3"
+        viewModel.test_installLiveSession(session)
+        viewModel.applySessionToBindings(session)
+
+        viewModel.selectACPModelParameter(
+            ACPModelParameterSelection(
+                providerID: .openCode,
+                baseModelRaw: "anthropic/claude-sonnet",
+                kind: .thinking,
+                configID: "effort",
+                valueRaw: "high"
+            )
+        )
+
+        XCTAssertTrue(session.acpModelParameterSelections.isEmpty)
+    }
+
+    func testStaleProviderParameterSelectionIsRejected() {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .cursor
+        session.selectedModelRaw = "grok-4.6"
+        viewModel.test_installLiveSession(session)
+        viewModel.applySessionToBindings(session)
+
+        viewModel.selectACPModelParameter(
+            ACPModelParameterSelection(
+                providerID: .openCode,
+                baseModelRaw: "grok-4.6",
+                kind: .thinking,
+                configID: "effort",
+                valueRaw: "high"
+            )
+        )
+
+        XCTAssertTrue(session.acpModelParameterSelections.isEmpty)
+    }
+
+    func testOpenCodeSavedIntentSurvivesAbsentCachedMetadataForLiveValidation() {
+        let saved = ACPModelParameterSelection(
+            providerID: .openCode,
+            baseModelRaw: "ollama-cloud/kimi-k3",
+            kind: .thinking,
+            configID: "effort",
+            valueRaw: "max"
+        )
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        XCTAssertNil(
+            ACPModelParameterResolver.parameterSet(
+                providerID: .openCode,
+                selectedModelRaw: "ollama-cloud/kimi-k3"
+            )
+        )
+        XCTAssertEqual(
+            ACPModelParameterResolver.effectiveSelections(
+                providerID: .openCode,
+                selectedModelRaw: "ollama-cloud/kimi-k3",
+                persistedSelections: [saved]
+            ),
+            [saved]
+        )
+    }
+
+    func testActiveOpenCodeRunLocksParameterControls() {
+        installOpenCodeEffortMetadata()
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .openCode
+        session.selectedModelRaw = "ollama-cloud/kimi-k3"
+        session.runState = .running
+        viewModel.test_installLiveSession(session)
+        viewModel.applySessionToBindings(session)
+
+        XCTAssertTrue(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
+        viewModel.selectACPModelParameter(
+            ACPModelParameterSelection(
+                providerID: .openCode,
+                baseModelRaw: "ollama-cloud/kimi-k3",
+                kind: .thinking,
+                configID: "effort",
+                valueRaw: "high"
+            )
+        )
+        XCTAssertTrue(session.acpModelParameterSelections.isEmpty)
+    }
+
+    func testActiveOpenCodeRunWithoutParameterMetadataDoesNotLockModelControls() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .openCode
+        session.selectedModelRaw = "anthropic/claude-sonnet"
+        session.runState = .running
+        viewModel.test_installLiveSession(session)
+        viewModel.applySessionToBindings(session)
+
+        XCTAssertFalse(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
     }
 
     func testUnknownCursorModelHasNoControls() {
@@ -450,6 +707,60 @@ final class CursorModelParameterSelectionTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Picker-only tests must not start a Codex session")
             }
+        )
+    }
+
+    private func cursorEffortSelection(valueRaw: String) -> ACPModelParameterSelection {
+        ACPModelParameterSelection(
+            providerID: .cursor,
+            baseModelRaw: "grok-4.6",
+            kind: .thinking,
+            configID: "effort",
+            valueRaw: valueRaw
+        )
+    }
+
+    private func cursorSpeedSelection(valueRaw: String) -> ACPModelParameterSelection {
+        ACPModelParameterSelection(
+            providerID: .cursor,
+            baseModelRaw: "grok-4.6",
+            kind: .speed,
+            configID: "fast",
+            valueRaw: valueRaw
+        )
+    }
+
+    private func installOpenCodeEffortMetadata() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        let parameterSet = ACPModelParameterSet(
+            baseModelRaw: "ollama-cloud/kimi-k3",
+            parameters: [
+                .init(
+                    kind: .thinking,
+                    configID: "effort",
+                    displayName: "Effort",
+                    choices: [
+                        .init(rawValue: "low", displayName: "Low"),
+                        .init(rawValue: "high", displayName: "High")
+                    ],
+                    currentValueRaw: "low"
+                )
+            ]
+        )
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            .init(
+                options: [
+                    .init(
+                        rawValue: "ollama-cloud/kimi-k3",
+                        displayName: "Kimi K3",
+                        description: nil,
+                        isDefault: true
+                    )
+                ],
+                currentModelRaw: "ollama-cloud/kimi-k3",
+                modelParameterSets: [parameterSet]
+            ),
+            for: .openCode
         )
     }
 }

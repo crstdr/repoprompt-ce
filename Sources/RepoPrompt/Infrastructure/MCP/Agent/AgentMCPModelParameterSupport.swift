@@ -7,19 +7,18 @@ enum AgentMCPModelParameterSupport {
         let valueRaw: String
     }
 
-    static func definitions(modelRaw: String) -> [ACPModelParameterDefinition] {
-        guard let parameterSet = CursorAIModelCatalog.parameterSet(for: modelRaw)
+    static func definitions(agent: AgentProviderKind, modelRaw: String) -> [ACPModelParameterDefinition] {
+        guard let providerID = agent.acpProviderID,
+              let parameterSet = ACPModelParameterResolver.parameterSet(
+                  providerID: providerID,
+                  selectedModelRaw: modelRaw
+              )
         else { return [] }
-        return parameterSet.parameters.sorted {
-            if $0.kind.sortOrder != $1.kind.sortOrder {
-                return $0.kind.sortOrder < $1.kind.sortOrder
-            }
-            return $0.configID < $1.configID
-        }
+        return sortedDefinitions(from: parameterSet)
     }
 
-    static func definitionValues(modelRaw: String) -> [Value] {
-        definitions(modelRaw: modelRaw).map { definition in
+    static func definitionValues(agent: AgentProviderKind, modelRaw: String) -> [Value] {
+        definitions(agent: agent, modelRaw: modelRaw).map { definition in
             let object: [String: Value] = [
                 "kind": .string(definition.kind.rawValue),
                 "config_id": .string(definition.configID),
@@ -48,31 +47,36 @@ enum AgentMCPModelParameterSupport {
         guard let value else { return [] }
         let requests = try parseRequests(value)
         guard !requests.isEmpty else { return [] }
-        guard agent == .cursor else {
-            throw MCPError.invalidParams("model_parameters are supported only for Cursor models.")
+        guard let agent,
+              let providerID = agent.acpProviderID
+        else {
+            throw MCPError.invalidParams("model_parameters are supported only for ACP models.")
         }
         guard let modelRaw,
-              let parameterSet = CursorAIModelCatalog.parameterSet(for: modelRaw)
+              let parameterSet = ACPModelParameterResolver.parameterSet(
+                  providerID: providerID,
+                  selectedModelRaw: modelRaw
+              )
         else {
             throw MCPError.invalidParams(
-                "Cursor model parameter metadata is unavailable for the selected model. Use a model advertised by this RepoPrompt release."
+                "Model parameter metadata is unavailable for the selected model."
             )
         }
 
         return try requests.map { request in
             guard let definition = parameterSet.definition(configID: request.configID) else {
                 throw MCPError.invalidParams(
-                    "Unknown Cursor model parameter config_id '\(request.configID)' for model '\(modelRaw)'."
+                    "Unknown model parameter config_id '\(request.configID)' for model '\(modelRaw)'."
                 )
             }
             guard let choice = definition.choice(matching: request.valueRaw) else {
                 let allowed = definition.choices.map(\.rawValue).joined(separator: ", ")
                 throw MCPError.invalidParams(
-                    "Unknown value '\(request.valueRaw)' for Cursor model parameter '\(request.configID)'. Allowed values: \(allowed)."
+                    "Unknown value '\(request.valueRaw)' for model parameter '\(request.configID)'. Allowed values: \(allowed)."
                 )
             }
             return ACPModelParameterSelection(
-                providerID: .cursor,
+                providerID: providerID,
                 baseModelRaw: parameterSet.baseModelRaw,
                 kind: definition.kind,
                 configID: definition.configID,
@@ -98,14 +102,25 @@ enum AgentMCPModelParameterSupport {
         agentRaw: String?,
         modelRaw: String?
     ) -> [ACPModelParameterSelection] {
-        guard agentRaw == AgentProviderKind.cursor.rawValue,
+        guard let agentRaw,
+              let agent = AgentProviderKind(rawValue: agentRaw),
+              let providerID = agent.acpProviderID,
               let modelRaw
         else { return [] }
         return ACPModelParameterResolver.effectiveSelections(
-            providerID: .cursor,
+            providerID: providerID,
             selectedModelRaw: modelRaw,
             persistedSelections: selections
         )
+    }
+
+    private static func sortedDefinitions(from parameterSet: ACPModelParameterSet) -> [ACPModelParameterDefinition] {
+        parameterSet.parameters.sorted {
+            if $0.kind.sortOrder != $1.kind.sortOrder {
+                return $0.kind.sortOrder < $1.kind.sortOrder
+            }
+            return $0.configID < $1.configID
+        }
     }
 
     private static func parseRequests(_ value: Value) throws -> [Request] {

@@ -19,8 +19,8 @@ extension AgentModeViewModel {
             return makeRunCancelTarget(tabID: tabID, session: session)
         }()
         let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
-        let cursorRunLocksModelControls = selectedAgent == .cursor
-            && session?.runState.isActive == true
+        let acpControls = acpModelParameterControls(session: session)
+        let acpRunLocksModelControls = session?.runState.isActive == true && !acpControls.isEmpty
         return AgentComposerProps(
             currentTabID: tabID,
             submitTarget: submitTarget,
@@ -35,7 +35,7 @@ extension AgentModeViewModel {
             isWaitingForInstruction: isWaitingForInstruction,
             canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
             isCurrentTabMCPControlled: isMCPControlled,
-            areModelControlsDisabled: isMCPControlled || cursorRunLocksModelControls,
+            areModelControlsDisabled: isMCPControlled || acpRunLocksModelControls,
             providerControls: activeProviderControlsBinding,
             isCodexRunActive: isCodexRunActive,
             hasAvailableAgentProviders: hasAvailableAgentProviders,
@@ -46,7 +46,7 @@ extension AgentModeViewModel {
             selectedModelDisplayName: selectedModelDisplayName,
             selectedReasoningEffortRaw: selectedReasoningEffortRaw,
             selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
-            cursorModelParameterControls: cursorModelParameterControls(session: session),
+            acpModelParameterControls: acpControls,
             availableAgents: availableAgents,
             isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
             lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
@@ -57,14 +57,16 @@ extension AgentModeViewModel {
         )
     }
 
-    private func cursorModelParameterControls(session: TabSession?) -> [AgentComposerModelParameterControlProps] {
+    private func acpModelParameterControls(session: TabSession?) -> [AgentComposerModelParameterControlProps] {
+        guard let providerID = selectedAgent.acpProviderID else { return [] }
         let resolved = ACPModelParameterResolver.resolve(
-            providerID: selectedAgent.acpProviderID ?? .openCode,
+            providerID: providerID,
             selectedModelRaw: selectedModelRaw,
             persistedSelections: session?.acpModelParameterSelections ?? []
         )
         return resolved.map { parameter in
             .init(
+                providerID: providerID,
                 kind: parameter.definition.kind,
                 baseModelRaw: parameter.baseModelRaw,
                 configID: parameter.definition.configID,
