@@ -984,7 +984,13 @@ actor ACPAgentSessionController {
                   let models = discoveredSessionModels,
                   let currentModel = models.currentModelRaw,
                   let parameterSet = models.modelParameterSets.first(where: {
-                      normalizedCursorModelAlias($0.baseModelRaw) == normalizedCursorModelAlias(currentModel)
+                      ACPModelParameterIdentity.canonicalBaseModelRaw(
+                          $0.baseModelRaw,
+                          providerID: provider.providerID
+                      ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                          currentModel,
+                          providerID: provider.providerID
+                      )
                   }),
                   let definition = parameterSet.definition(kind: selection.kind),
                   selection.identity == ACPModelParameterIdentity(
@@ -2023,15 +2029,27 @@ actor ACPAgentSessionController {
               let models = discoveredSessionModels,
               let currentModel = models.currentModelRaw,
               let parameterSet = models.modelParameterSets.first(where: {
-                  normalizedCursorModelAlias($0.baseModelRaw) == normalizedCursorModelAlias(currentModel)
+                  ACPModelParameterIdentity.canonicalBaseModelRaw(
+                      $0.baseModelRaw,
+                      providerID: provider.providerID
+                  ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                      currentModel,
+                      providerID: provider.providerID
+                  )
               })
         else {
-            throw ControllerError.requestFailed("Cursor model parameters are unavailable before prompt submission.")
+            throw ControllerError.requestFailed("Model parameters are unavailable before prompt submission.")
         }
         if let requestedModel = normalizedModelString(request.modelString),
-           normalizedCursorModelAlias(requestedModel) != normalizedCursorModelAlias(currentModel)
+           ACPModelParameterIdentity.canonicalBaseModelRaw(
+               requestedModel,
+               providerID: provider.providerID
+           ) != ACPModelParameterIdentity.canonicalBaseModelRaw(
+               currentModel,
+               providerID: provider.providerID
+           )
         {
-            throw ControllerError.requestFailed("Cursor model changed before prompt submission. Retry the requested configuration.")
+            throw ControllerError.requestFailed("Model changed before prompt submission. Retry the requested configuration.")
         }
         for selection in ACPModelParameterSelection.normalized(request.modelParameterSelections) {
             guard selection.identity == ACPModelParameterIdentity(
@@ -2044,7 +2062,7 @@ actor ACPAgentSessionController {
                 definition.currentValueRaw == choice.rawValue
             else {
                 throw ControllerError.requestFailed(
-                    "Cursor \(selection.kind.rawValue) selection is no longer current before prompt submission. Retry the requested configuration."
+                    "\(selection.kind.rawValue.capitalized) selection is no longer current before prompt submission. Retry the requested configuration."
                 )
             }
         }

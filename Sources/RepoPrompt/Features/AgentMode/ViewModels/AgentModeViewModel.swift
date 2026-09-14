@@ -1517,19 +1517,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedModelRaw = rawModel
     }
 
-    func selectCursorModelParameter(configID: String, valueRaw: String) {
-        guard selectedAgent == .cursor,
+    func selectACPModelParameter(_ target: ACPModelParameterSelection) {
+        guard let providerID = selectedAgent.acpProviderID,
+              providerID == target.providerID,
               let session = activeSession,
               !session.runState.isActive,
               !isMCPControlled(tabID: session.tabID),
-              let parameterSet = ACPModelParameterResolver.cursorParameterSet(selectedModelRaw: selectedModelRaw)
+              let parameterSet = ACPModelParameterResolver.parameterSet(
+                  providerID: providerID,
+                  selectedModelRaw: selectedModelRaw
+              )
         else { return }
-        guard let definition = parameterSet.definition(configID: configID),
-              let choice = definition.choice(matching: valueRaw)
+        guard ACPModelParameterIdentity.canonicalBaseModelRaw(target.baseModelRaw, providerID: providerID)
+            == ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: providerID)
+        else { return }
+        guard let definition = parameterSet.definition(configID: target.configID),
+              let choice = definition.choice(matching: target.valueRaw)
         else { return }
 
         let selection = ACPModelParameterSelection(
-            providerID: .cursor,
+            providerID: providerID,
             baseModelRaw: parameterSet.baseModelRaw,
             kind: definition.kind,
             configID: definition.configID,

@@ -232,8 +232,11 @@ struct AgentManageMCPToolService {
                         if let effort = target.reasoningEffort {
                             obj["reasoning_effort"] = .string(effort.rawValue)
                         }
-                        if entry.agent == .cursor {
-                            let parameters = AgentMCPModelParameterSupport.definitionValues(modelRaw: target.modelRaw)
+                        if entry.agent.acpProviderID != nil {
+                            let parameters = AgentMCPModelParameterSupport.definitionValues(
+                                agent: entry.agent,
+                                modelRaw: target.modelRaw
+                            )
                             if !parameters.isEmpty {
                                 obj["model_parameters"] = .array(parameters)
                             }
@@ -247,8 +250,11 @@ struct AgentManageMCPToolService {
                     if let modelID = model.modelID {
                         obj["model_id"] = .string(modelID)
                     }
-                    if entry.agent == .cursor {
-                        let parameters = AgentMCPModelParameterSupport.definitionValues(modelRaw: model.id)
+                    if entry.agent.acpProviderID != nil {
+                        let parameters = AgentMCPModelParameterSupport.definitionValues(
+                            agent: entry.agent,
+                            modelRaw: model.id
+                        )
                         if !parameters.isEmpty {
                             obj["model_parameters"] = .array(parameters)
                         }

@@ -55,7 +55,7 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
         let controller = try controllerFactory(provider, request)
         do {
             _ = try await controller.bootstrap()
-            let snapshot = AgentACPModelRegistry.shared.currentSnapshot(for: .openCode)
+            let snapshot = await controller.currentDiscoveredSessionModels()
             await controller.shutdown()
             return snapshot
         } catch {

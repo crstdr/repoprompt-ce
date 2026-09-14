@@ -139,9 +139,10 @@ enum ACPModelParameterResolver {
         selectedModelRaw: String,
         persistedSelections: [ACPModelParameterSelection]
     ) -> [ACPResolvedModelParameter] {
-        guard providerID == .cursor,
-              let parameterSet = cursorParameterSet(selectedModelRaw: selectedModelRaw)
-        else { return [] }
+        guard let parameterSet = parameterSet(
+            providerID: providerID,
+            selectedModelRaw: selectedModelRaw
+        ) else { return [] }
         return resolve(
             parameterSet: parameterSet,
             providerID: providerID,
@@ -174,8 +175,32 @@ enum ACPModelParameterResolver {
         }
     }
 
-    static func cursorParameterSet(selectedModelRaw: String) -> ACPModelParameterSet? {
-        CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+    static func parameterSet(
+        providerID: ACPProviderID,
+        selectedModelRaw: String
+    ) -> ACPModelParameterSet? {
+        switch providerID {
+        case .cursor:
+            return CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+        case .openCode:
+            guard let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode) else {
+                return nil
+            }
+            let targetIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(
+                selectedModelRaw,
+                providerID: .openCode
+            )
+            let matches = snapshot.modelParameterSets.filter {
+                ACPModelParameterIdentity.canonicalBaseModelRaw(
+                    $0.baseModelRaw,
+                    providerID: .openCode
+                ) == targetIdentity
+            }
+            guard matches.count == 1 else { return nil }
+            return matches[0]
+        default:
+            return nil
+        }
     }
 
     static func effectiveSelections(
@@ -183,18 +208,10 @@ enum ACPModelParameterResolver {
         selectedModelRaw: String,
         persistedSelections: [ACPModelParameterSelection]
     ) -> [ACPModelParameterSelection] {
-        resolve(
-            providerID: providerID,
-            selectedModelRaw: selectedModelRaw,
-            persistedSelections: persistedSelections
-        ).map { resolved in
-            ACPModelParameterSelection(
-                providerID: providerID,
-                baseModelRaw: resolved.baseModelRaw,
-                kind: resolved.definition.kind,
-                configID: resolved.definition.configID,
-                valueRaw: resolved.selectedChoice.rawValue
-            )
-        }
+        ACPModelParameterSelection.selections(
+            for: providerID,
+            activeBaseModelRaw: selectedModelRaw,
+            from: persistedSelections
+        )
     }
 }
