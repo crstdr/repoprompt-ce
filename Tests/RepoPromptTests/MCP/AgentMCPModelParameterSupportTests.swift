@@ -36,45 +36,59 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
         )
     }
 
-    func testOpenCodeDefinitionsAdvertiseEffortWhenMetadataExists() {
-        installOpenCodeEffortMetadata()
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
-
-        let definitions = AgentMCPModelParameterSupport.definitions(
-            agent: .openCode,
-            modelRaw: "ollama-cloud/kimi-k3"
-        )
-        XCTAssertEqual(definitions.map(\.configID), ["effort"])
-        XCTAssertEqual(definitions[0].choices.map(\.rawValue), ["low", "high"])
-
-        let values = AgentMCPModelParameterSupport.definitionValues(
-            agent: .openCode,
-            modelRaw: "ollama-cloud/kimi-k3"
-        )
-        XCTAssertEqual(values.count, 1)
-        XCTAssertEqual(values[0].objectValue?["config_id"]?.stringValue, "effort")
-        XCTAssertEqual(
-            values[0].objectValue?["choices"]?.arrayValue?.compactMap { $0.objectValue?["value"]?.stringValue },
-            ["low", "high"]
-        )
-    }
-
+    /// OpenCode definitions no longer read the provider-global registry synchronously: the
+    /// demand-scoped authority lives behind the async observation overload, so the sync surface
+    /// is Cursor-only and returns empty for OpenCode without acquired metadata.
     func testOpenCodeDefinitionsEmptyWithoutDiscoveryMetadata() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
-
         XCTAssertTrue(
             AgentMCPModelParameterSupport.definitions(
                 agent: .openCode,
-                modelRaw: "anthropic/claude-sonnet"
+                modelRaw: "ollama-cloud/kimi-k3"
             ).isEmpty
         )
         XCTAssertTrue(
             AgentMCPModelParameterSupport.definitionValues(
                 agent: .openCode,
-                modelRaw: "anthropic/claude-sonnet"
+                modelRaw: "ollama-cloud/kimi-k3"
             ).isEmpty
         )
+    }
+
+    /// Advertisement reduces a one-shot demand-scoped observation: a terminal `.available`
+    /// observation for the exact (workspace, model) yields definitions; `.noUsableParameters`
+    /// yields none. The per-call injected provider keeps this hermetic (no live ACP process,
+    /// no mutable global override).
+    func testOpenCodeAsyncDefinitionsComeFromOneShotObservation() async throws {
+        let availableProvider: AgentMCPModelParameterSupport.OneShotObservationProvider = { _, _, _ in
+            OpenCodeACPModelParameterSnapshot(
+                key: OpenCodeACPModelParameterKey(workspacePath: "/workspace-a", modelRaw: "ollama-cloud/kimi-k3"),
+                state: .available(self.openCodeEffortSet()),
+                updatedAt: Date()
+            )
+        }
+        let definitions = try await AgentMCPModelParameterSupport.definitions(
+            agent: .openCode,
+            modelRaw: "ollama-cloud/kimi-k3",
+            workspacePath: "/workspace-a",
+            oneShot: availableProvider
+        )
+        XCTAssertEqual(definitions.map(\.configID), ["effort"])
+        XCTAssertEqual(definitions.first?.choices.map(\.rawValue), ["low", "high"])
+
+        let noUsableProvider: AgentMCPModelParameterSupport.OneShotObservationProvider = { _, _, _ in
+            OpenCodeACPModelParameterSnapshot(
+                key: OpenCodeACPModelParameterKey(workspacePath: "/workspace-a", modelRaw: "ollama-cloud/kimi-k3"),
+                state: .noUsableParameters,
+                updatedAt: Date()
+            )
+        }
+        let emptyDefinitions = try await AgentMCPModelParameterSupport.definitions(
+            agent: .openCode,
+            modelRaw: "ollama-cloud/kimi-k3",
+            workspacePath: "/workspace-a",
+            oneShot: noUsableProvider
+        )
+        XCTAssertTrue(emptyDefinitions.isEmpty)
     }
 
     func testNonACPDefinitionsReturnEmpty() {
@@ -178,42 +192,119 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
         }
     }
 
-    func testOpenCodeResolveAcceptsSupportedEffort() throws {
-        installOpenCodeEffortMetadata()
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+    /// OpenCode explicit parameters are demand-scoped: the synchronous resolver cannot satisfy
+    /// them, so it rejects with the existing "metadata unavailable" argument error rather than
+    /// reading a provider-global snapshot.
+    func testOpenCodeSyncResolveRejectsAsDemandScoped() {
+        XCTAssertThrowsError(
+            try AgentMCPModelParameterSupport.resolve(
+                value: .array([
+                    .object(["config_id": .string("effort"), "value": .string("high")])
+                ]),
+                agent: .openCode,
+                modelRaw: "ollama-cloud/kimi-k3"
+            )
+        ) { error in
+            XCTAssertTrue(String(describing: error).contains("metadata is unavailable"))
+        }
+    }
 
-        let selections = try AgentMCPModelParameterSupport.resolve(
+    /// An explicit OpenCode request is validated by a fresh targeted observation. A throwing
+    /// injected provider produces the existing "metadata unavailable" argument error — never an
+    /// empty successful selection list.
+    func testOpenCodeAsyncResolveErrorsWhenMetadataUnavailable() async {
+        struct ScriptedTransportError: Error {}
+        let failingProvider: AgentMCPModelParameterSupport.OneShotObservationProvider = { _, _, _ in
+            throw ScriptedTransportError()
+        }
+        do {
+            _ = try await AgentMCPModelParameterSupport.resolve(
+                value: .array([
+                    .object(["config_id": .string("effort"), "value": .string("high")])
+                ]),
+                agent: .openCode,
+                modelRaw: "anthropic/claude-sonnet",
+                workspacePath: nil,
+                oneShot: failingProvider
+            )
+            XCTFail("Expected an argument error when OpenCode metadata is unavailable.")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("metadata is unavailable"))
+        }
+    }
+
+    /// The central regression: metadata reaches the resolver and validates an explicit request
+    /// *before any ACP session exists*, via the demand-scoped observation rather than a
+    /// provider-global snapshot.
+    func testOpenCodeAsyncResolveAcceptsInjectedObservationBeforeFirstPrompt() async throws {
+        let provider: AgentMCPModelParameterSupport.OneShotObservationProvider = { _, _, _ in
+            OpenCodeACPModelParameterSnapshot(
+                key: OpenCodeACPModelParameterKey(workspacePath: "/workspace-a", modelRaw: "ollama-cloud/kimi-k3"),
+                state: .available(self.openCodeEffortSet()),
+                updatedAt: Date()
+            )
+        }
+        let selections = try await AgentMCPModelParameterSupport.resolve(
             value: .array([
                 .object(["config_id": .string("effort"), "value": .string("high")])
             ]),
             agent: .openCode,
-            modelRaw: "ollama-cloud/kimi-k3"
+            modelRaw: "ollama-cloud/kimi-k3",
+            workspacePath: "/workspace-a",
+            oneShot: provider
         )
-
         XCTAssertEqual(selections.map(\.providerID), [.openCode])
         XCTAssertEqual(selections.map(\.valueRaw), ["high"])
         XCTAssertEqual(selections.map(\.baseModelRaw), ["ollama-cloud/kimi-k3"])
     }
 
-    func testOpenCodeResolveRejectsMissingMetadata() throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
-
-        XCTAssertThrowsError(try AgentMCPModelParameterSupport.resolve(
-            value: .array([
-                .object(["config_id": .string("effort"), "value": .string("high")])
-            ]),
-            agent: .openCode,
-            modelRaw: "anthropic/claude-sonnet"
-        )) { error in
-            XCTAssertTrue(String(describing: error).contains("metadata is unavailable"))
+    /// The explicit-request path preserves cancellation: when the acquisition itself throws
+    /// `CancellationError`, the explicit resolver surfaces it rather than converting it into
+    /// "metadata unavailable". Real in-flight cancellation belongs to the polling-service
+    /// lifecycle tests; here the injected provider proves the resolver's catch does not swallow
+    /// cancellation.
+    func testOpenCodeExplicitResolvePreservesCancellation() async throws {
+        let provider: AgentMCPModelParameterSupport.OneShotObservationProvider = { _, _, _ in
+            throw CancellationError()
+        }
+        do {
+            _ = try await AgentMCPModelParameterSupport.resolve(
+                value: .array([
+                    .object(["config_id": .string("effort"), "value": .string("high")])
+                ]),
+                agent: .openCode,
+                modelRaw: "ollama-cloud/kimi-k3",
+                workspacePath: "/workspace-a",
+                oneShot: provider
+            )
+            XCTFail("Expected cancellation to propagate from the explicit OpenCode resolver.")
+        } catch {
+            XCTAssertTrue(
+                error is CancellationError,
+                "Cancellation must propagate, not be converted into another error; got \(error)"
+            )
         }
     }
 
-    func testEffectiveSelectionsIncludeOpenCodeProvider() {
-        installOpenCodeEffortMetadata()
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+    private func openCodeEffortSet() -> ACPModelParameterSet {
+        ACPModelParameterSet(
+            baseModelRaw: "ollama-cloud/kimi-k3",
+            parameters: [
+                .init(
+                    kind: .thinking,
+                    configID: "effort",
+                    displayName: "Effort",
+                    choices: [
+                        .init(rawValue: "low", displayName: "Low"),
+                        .init(rawValue: "high", displayName: "High")
+                    ],
+                    currentValueRaw: "low"
+                )
+            ]
+        )
+    }
 
+    func testEffectiveSelectionsIncludeOpenCodeProvider() {
         let selections = [
             ACPModelParameterSelection(
                 providerID: .openCode,
@@ -307,40 +398,6 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
                     valueRaw: "high"
                 )
             ]
-        )
-    }
-
-    private func installOpenCodeEffortMetadata() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        let parameterSet = ACPModelParameterSet(
-            baseModelRaw: "ollama-cloud/kimi-k3",
-            parameters: [
-                .init(
-                    kind: .thinking,
-                    configID: "effort",
-                    displayName: "Effort",
-                    choices: [
-                        .init(rawValue: "low", displayName: "Low"),
-                        .init(rawValue: "high", displayName: "High")
-                    ],
-                    currentValueRaw: "low"
-                )
-            ]
-        )
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
-            .init(
-                options: [
-                    .init(
-                        rawValue: "ollama-cloud/kimi-k3",
-                        displayName: "Kimi K3",
-                        description: nil,
-                        isDefault: true
-                    )
-                ],
-                currentModelRaw: "ollama-cloud/kimi-k3",
-                modelParameterSets: [parameterSet]
-            ),
-            for: .openCode
         )
     }
 }

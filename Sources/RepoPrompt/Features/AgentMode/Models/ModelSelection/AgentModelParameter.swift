@@ -137,11 +137,15 @@ enum ACPModelParameterResolver {
     static func resolve(
         providerID: ACPProviderID,
         selectedModelRaw: String,
-        persistedSelections: [ACPModelParameterSelection]
+        persistedSelections: [ACPModelParameterSelection],
+        workspacePath: String? = nil,
+        openCodeParameters: OpenCodeACPModelParameterSnapshot? = nil
     ) -> [ACPResolvedModelParameter] {
         guard let parameterSet = parameterSet(
             providerID: providerID,
-            selectedModelRaw: selectedModelRaw
+            selectedModelRaw: selectedModelRaw,
+            workspacePath: workspacePath,
+            openCodeParameters: openCodeParameters
         ) else { return [] }
         return resolve(
             parameterSet: parameterSet,
@@ -177,30 +181,51 @@ enum ACPModelParameterResolver {
 
     static func parameterSet(
         providerID: ACPProviderID,
-        selectedModelRaw: String
+        selectedModelRaw: String,
+        workspacePath: String? = nil,
+        openCodeParameters: OpenCodeACPModelParameterSnapshot? = nil
     ) -> ACPModelParameterSet? {
         switch providerID {
         case .cursor:
-            return CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+            CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
         case .openCode:
-            guard let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode) else {
-                return nil
-            }
-            let targetIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(
-                selectedModelRaw,
-                providerID: .openCode
+            openCodeParameterSet(
+                selectedModelRaw: selectedModelRaw,
+                workspacePath: workspacePath,
+                observation: openCodeParameters
             )
-            let matches = snapshot.modelParameterSets.filter {
-                ACPModelParameterIdentity.canonicalBaseModelRaw(
-                    $0.baseModelRaw,
-                    providerID: .openCode
-                ) == targetIdentity
-            }
-            guard matches.count == 1 else { return nil }
-            return matches[0]
         default:
-            return nil
+            nil
         }
+    }
+
+    /// Accept OpenCode metadata only when the observation is `.available`, its key matches the
+    /// requested normalized workspace+model exactly, and the advertised set matches that model
+    /// unambiguously. Missing or mismatched context yields no parameter set — never a fall back
+    /// to the provider-global registry, whose per-provider snapshot cannot represent the
+    /// demand-scoped `(workspace, model)` authority.
+    private static func openCodeParameterSet(
+        selectedModelRaw: String,
+        workspacePath: String?,
+        observation: OpenCodeACPModelParameterSnapshot?
+    ) -> ACPModelParameterSet? {
+        guard let observation,
+              case let .available(parameterSet) = observation.state
+        else { return nil }
+        let targetIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(
+            selectedModelRaw,
+            providerID: .openCode
+        )
+        // Compare the constructed expected key directly; `observation.key`'s fields are already
+        // canonical at construction, so re-canonicalizing them would be a no-op. Key equality
+        // covers both the canonical model identity and the normalized workspace.
+        let expectedKey = OpenCodeACPModelParameterKey(workspacePath: workspacePath, modelRaw: selectedModelRaw)
+        guard observation.key == expectedKey else { return nil }
+        guard ACPModelParameterIdentity.canonicalBaseModelRaw(
+            parameterSet.baseModelRaw,
+            providerID: .openCode
+        ) == targetIdentity else { return nil }
+        return parameterSet
     }
 
     static func effectiveSelections(
