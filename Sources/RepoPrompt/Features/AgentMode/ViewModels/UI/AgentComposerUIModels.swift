@@ -222,6 +222,11 @@ struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
     let selectedValueRaw: String
     let selectedDisplayName: String
     let choices: [ACPModelParameterChoice]
+    /// OpenCode only: the demand-scoped discovery key this control's metadata came from. The
+    /// setter rejects a click whose key is missing or no longer matches the current target, so a
+    /// stale menu can never retarget a selection to a different workspace/model. Cursor leaves
+    /// this nil (its catalogue is static and needs no demand-scoped authority).
+    let openCodeDiscoveryKey: OpenCodeACPModelParameterKey?
 
     var id: String {
         "\(kind.rawValue):\(configID)"
