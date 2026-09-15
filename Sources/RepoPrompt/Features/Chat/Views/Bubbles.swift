@@ -409,7 +409,6 @@ struct MessageBubble: View {
 
                     CopyButtonOverlay(
                         message: message,
-                        viewModel: viewModel,
                         showCopyButton: true,
                         isHoveringCopy: $isHoveringCopy,
                         showingDeleteConfirmation: $showingDeleteConfirmation
@@ -476,7 +475,6 @@ struct MessageBubble: View {
                 HStack(spacing: 8) {
                     CopyButtonOverlay(
                         message: message,
-                        viewModel: viewModel,
                         showCopyButton: message.isFinalized,
                         isHoveringCopy: $isHoveringCopy,
                         showingDeleteConfirmation: $showingDeleteConfirmation
@@ -530,7 +528,7 @@ struct MessageBubble: View {
 /// Add the new ForkButtonOverlay struct
 private struct ForkButtonOverlay: View {
     let message: AIChatMessage
-    @ObservedObject var viewModel: OracleViewModel
+    let viewModel: OracleViewModel
     @Binding var isHoveringFork: Bool
 
     var body: some View {
@@ -596,7 +594,7 @@ private struct EditButtonOverlay: View {
 
 private struct DeleteButtonOverlay: View {
     let message: AIChatMessage
-    @ObservedObject var viewModel: OracleViewModel
+    let viewModel: OracleViewModel
     @Binding var isHoveringDelete: Bool
     @Binding var showingConfirmation: Bool
     @Environment(\.colorScheme) private var colorScheme
@@ -653,7 +651,6 @@ private struct DeleteButtonOverlay: View {
 
 private struct CopyButtonOverlay: View {
     let message: AIChatMessage
-    @ObservedObject var viewModel: OracleViewModel
     let showCopyButton: Bool
     @Binding var isHoveringCopy: Bool
     @Binding var showingDeleteConfirmation: Bool
