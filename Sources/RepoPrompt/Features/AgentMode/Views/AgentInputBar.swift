@@ -1027,8 +1027,10 @@ struct AgentComposerView: View, Equatable {
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 }
                 .foregroundColor(
-                    control.kind == .speed
-                        && control.selectedDisplayName.caseInsensitiveCompare("fast") == .orderedSame
+                    control.isSavedValueUnavailable || (
+                        control.kind == .speed
+                            && control.selectedDisplayName.caseInsensitiveCompare("fast") == .orderedSame
+                    )
                         ? .orange
                         : .secondary
                 )
@@ -1042,7 +1044,7 @@ struct AgentComposerView: View, Equatable {
             .accessibilityValue(Text(control.accessibilityValue))
             .disabled(modelControlsDisabled || control.choices.isEmpty)
             .opacity(modelControlsDisabled ? 0.55 : 1.0)
-            .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : control.displayName)
+            .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : control.tooltip)
             .fixedSize()
         }
     }

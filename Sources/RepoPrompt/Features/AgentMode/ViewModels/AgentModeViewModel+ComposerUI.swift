@@ -151,6 +151,7 @@ extension AgentModeViewModel {
         #if DEBUG
             test_syncComposerCallCount += 1
         #endif
+        reconcileOpenCodeModelParameterObservation()
         ui.composer.update(makeComposerProps(tabID: tabID))
     }
 

@@ -848,17 +848,11 @@ class PromptViewModel: ObservableObject {
                   providerID: providerID
               )
         else { return }
-        let profile = currentAgentModelsProfile()
-            .replacingContextBuilderModelParameter(
-                selections,
-                for: contextBuilderAgent.rawValue,
-                modelRaw: contextBuilderAgentModelRaw
-            )
-        // The existing CB setters deliberately mark the choice user-owned; pass `.userInitiated`
-        // rather than copying the role storage path, which preserves existing ownership.
-        persistCurrentAgentModelsProfile(
-            profile,
-            contextBuilderWriteIntent: .userInitiated
+        settingsManager.setAgentModelsContextBuilderModelParameter(
+            selections,
+            agentRaw: contextBuilderAgent.rawValue,
+            modelRaw: contextBuilderAgentModelRaw,
+            scope: currentAgentModelsEditingScope
         )
     }
 

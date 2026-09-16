@@ -1798,27 +1798,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                   providerID: providerID
               )
         else { return }
-        let profile = settingsManager.effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
-            .replacingContextBuilderModelParameter(
-                selections,
-                for: selectedAgent.rawValue,
-                modelRaw: selectedModelRaw
-            )
-        let wroteWorkspaceID: UUID? = if let workspaceID = currentWorkspaceID,
-                                         settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        let scope: AgentModelsEditingScope = if let workspaceID = currentWorkspaceID,
+                                                settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
         {
-            workspaceID
+            .workspace(workspaceID)
         } else {
-            nil
+            .global
         }
-        if let wroteWorkspaceID {
-            settingsManager.setWorkspaceAgentModelsProfile(workspaceID: wroteWorkspaceID, profile: profile)
-        } else {
-            settingsManager.setGlobalAgentModelsProfile(
-                profile,
-                contextBuilderWriteIntent: .userInitiated
-            )
-        }
+        settingsManager.setAgentModelsContextBuilderModelParameter(
+            selections,
+            agentRaw: selectedAgent.rawValue,
+            modelRaw: selectedModelRaw,
+            scope: scope
+        )
     }
 
     /// The saved `.thinking` pin value for the current Context Builder selection, if any. The

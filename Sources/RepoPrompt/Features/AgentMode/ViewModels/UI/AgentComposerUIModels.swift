@@ -236,8 +236,18 @@ struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
         displayName
     }
 
+    var isSavedValueUnavailable: Bool {
+        providerID == .openCode && !choices.contains { $0.rawValue == selectedValueRaw }
+    }
+
+    var tooltip: String {
+        isSavedValueUnavailable
+            ? "Saved \(displayName) value ‘\(selectedValueRaw)’ is not currently advertised. Choose a supported value before running."
+            : displayName
+    }
+
     var accessibilityValue: String {
-        selectedDisplayName
+        isSavedValueUnavailable ? "\(selectedDisplayName), unavailable" : selectedDisplayName
     }
 }
 
