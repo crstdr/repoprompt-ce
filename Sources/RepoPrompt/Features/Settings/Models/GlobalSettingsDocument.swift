@@ -421,9 +421,15 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         displayedSelectionID: AgentModelSelectionID
     ) -> AgentModelsSettingsProfile {
         var next = self
-        var overrides = next.mcpAgentRoleOverrides ?? [:]
-        overrides[roleRawValue] = displayedSelectionID.rawValue
-        next.mcpAgentRoleOverrides = overrides.isEmpty ? nil : overrides
+        // Only a real pin commits the displayed model choice. Clearing must not: the chip offers
+        // "Default" even for a role that is still tracking its recommendation, and writing the
+        // override there would silently stop that role tracking because the user opened a menu
+        // and re-picked the item already selected.
+        if let selections, !selections.isEmpty {
+            var overrides = next.mcpAgentRoleOverrides ?? [:]
+            overrides[roleRawValue] = displayedSelectionID.rawValue
+            next.mcpAgentRoleOverrides = overrides.isEmpty ? nil : overrides
+        }
         var pins = next.mcpAgentRoleModelParameters ?? [:]
         if let selections, !selections.isEmpty {
             pins[roleRawValue] = ACPModelParameterSelection.normalized(selections)
@@ -445,8 +451,13 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         let resolvedAgentRaw = Self.normalizedAgentRaw(agentRaw) ?? contextBuilderAgentRaw
         guard let resolvedAgentRaw else { return self }
 
-        var next = replacingContextBuilderModel(modelRaw, for: resolvedAgentRaw)
-        next.contextBuilderAgentRaw = resolvedAgentRaw
+        // Same rule as the role bucket: only a real pin commits the displayed agent+model choice,
+        // so clearing cannot quietly adopt a runtime fallback as the persisted selection.
+        var next = self
+        if let selections, !selections.isEmpty {
+            next = replacingContextBuilderModel(modelRaw, for: resolvedAgentRaw)
+            next.contextBuilderAgentRaw = resolvedAgentRaw
+        }
         var pins = next.contextBuilderModelParametersByAgent ?? [:]
         if let selections, !selections.isEmpty {
             pins[resolvedAgentRaw] = ACPModelParameterSelection.normalized(selections)
