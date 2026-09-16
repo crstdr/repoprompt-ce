@@ -330,7 +330,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             persistLastUsedModelIfNeeded(agent: selectedAgent, modelRaw: selectedModelRaw)
             refreshAutoEditPermissionGuidanceForActiveSession()
             updateDynamicModelPolling()
-            resyncOpenCodeModelParameterObservation()
             syncAllActiveUIState()
         }
     }
@@ -367,7 +366,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     reason: "selected_model_changed"
                 )
             }
-            resyncOpenCodeModelParameterObservation()
             syncComposerUIState()
             syncRuntimeMetricsUIState()
             syncRunInteractionUIState()
@@ -734,6 +732,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// can never overwrite a newer target's state.
     var openCodeModelParameterObservation: OpenCodeACPModelParameterSnapshot?
     private var openCodeModelParameterObservationTask: Task<Void, Never>?
+    private var openCodeModelParameterObservationTarget: (tabID: UUID, key: OpenCodeACPModelParameterKey)?
     private var openCodeModelParameterObservationGeneration: UInt64 = 0
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
@@ -1883,10 +1882,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     //
     // The view model (not the polling actor) owns interest in the composer's displayed target.
-    // Resync on provider/model/tab/workspace change: cancel + clear synchronously, capture tab /
-    // workspace / model / generation, then subscribe immediately (including before any ACP
-    // session exists). Deliveries are accepted only while the captured target and generation
-    // still match, so a stale stream can never overwrite a newer target's state.
+    // Reconcile before publishing committed composer state, including restored bindings and
+    // automatic model adoption. An unchanged tab + canonical discovery key keeps its subscription;
+    // a changed target cancels + clears synchronously before acquisition. Deliveries must still
+    // match the captured target and generation, so stale streams cannot overwrite newer state.
     //
     // The workspace key uses the same source that builds that tab's run request
     // (`effectiveWorkspacePath(for:)` — worktree bindings with the workspace fallback), not the
@@ -1918,24 +1917,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return OpenCodeACPModelParameterKey(workspacePath: workspacePath, modelRaw: modelRaw)
     }
 
-    private func resyncOpenCodeModelParameterObservation() {
-        openCodeModelParameterObservationTask?.cancel()
-        openCodeModelParameterObservationTask = nil
-        openCodeModelParameterObservation = nil
-        openCodeModelParameterObservationGeneration &+= 1
-        let generation = openCodeModelParameterObservationGeneration
-
-        guard usesProductionAgentDefaultsAndModelPolling,
+    func reconcileOpenCodeModelParameterObservation() {
+        guard usesProductionAgentDefaultsAndModelPolling, !isRestoringState else { return }
+        // The catalogue subscription owns the polling lifetime. Composer refreshes after a
+        // stop (mode exit, workspace switch, window close) must not restart discovery.
+        guard openCodeModelsSubscriptionTask != nil,
               selectedAgent == .openCode,
               let tabID = currentTabID,
-              !selectedModelRaw.isEmpty
+              !selectedModelRaw.isEmpty,
+              let key = openCodeParameterDiscoveryKey(session: sessions[tabID], modelRaw: selectedModelRaw)
+        else {
+            cancelOpenCodeModelParameterObservation()
+            return
+        }
+        guard openCodeModelParameterObservationTarget?.tabID != tabID
+            || openCodeModelParameterObservationTarget?.key != key
         else { return }
 
+        cancelOpenCodeModelParameterObservation()
+        openCodeModelParameterObservationTarget = (tabID, key)
+        let generation = openCodeModelParameterObservationGeneration
         let modelRaw = selectedModelRaw
-        let session = sessions[tabID]
-        // No key = the effective workspace failed to resolve: withhold authority (no
-        // subscription) rather than discover in a fallback directory.
-        guard let key = openCodeParameterDiscoveryKey(session: session, modelRaw: modelRaw) else { return }
         let workspacePath = key.workspacePath
         let streamProvider = openCodeModelParameterStreamProvider
         openCodeModelParameterObservationTask = Task { [weak self, workspacePath, modelRaw] in
@@ -1947,11 +1949,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                           openCodeModelParameterObservationGeneration == generation,
                           currentTabID == tabID,
                           selectedAgent == .openCode,
-                          selectedModelRaw == modelRaw
+                          openCodeModelParameterObservationTarget?.key == key
                     else { return false }
                     // Same construction as acquisition: a resolved key (possibly nil-workspace)
                     // matches; a resolution that would now fail yields no key and rejects.
-                    guard snapshot.key == openCodeParameterDiscoveryKey(session: sessions[tabID], modelRaw: modelRaw)
+                    guard snapshot.key == key,
+                          key == openCodeParameterDiscoveryKey(session: sessions[tabID], modelRaw: selectedModelRaw)
                     else { return false }
                     openCodeModelParameterObservation = snapshot
                     return true
@@ -1960,9 +1963,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // loop's exit conditions are cancellation and stream termination (checked
                 // above); a stale task exits via `guard !Task.isCancelled` on the next event, so
                 // `continue` leaks nothing. Using `return` here would let one stray or late
-                // foreign snapshot permanently kill a live subscription — and since resync only
-                // runs on agent/model/tab change, the effort control would then stay missing
-                // (silently) until the user happened to change one of those.
+                // foreign snapshot permanently kill an otherwise unchanged subscription.
                 guard matches else { continue }
                 await MainActor.run { [weak self] in
                     self?.syncComposerUIState()
@@ -1972,6 +1973,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func cancelOpenCodeModelParameterObservation() {
+        openCodeModelParameterObservationTarget = nil
         openCodeModelParameterObservationTask?.cancel()
         openCodeModelParameterObservationTask = nil
         openCodeModelParameterObservation = nil
@@ -1984,10 +1986,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// this to drive `acpModelParameterControls` and the setter without a live ACP process.
         /// `nil` clears any observation.
         func test_setOpenCodeModelParameterObservation(_ observation: OpenCodeACPModelParameterSnapshot?) {
-            openCodeModelParameterObservationTask?.cancel()
-            openCodeModelParameterObservationTask = nil
+            cancelOpenCodeModelParameterObservation()
             openCodeModelParameterObservation = observation
-            openCodeModelParameterObservationGeneration &+= 1
+            // Stamp the observation's identity so a later composer publish reconciles to a no-op
+            // instead of cancelling the injection. Without this the seam only survives while
+            // production polling happens to be disabled — an invariant every test using it would
+            // otherwise have to know and preserve.
+            if let observation, let tabID = currentTabID {
+                openCodeModelParameterObservationTarget = (tabID, observation.key)
+            }
         }
     #endif
 
@@ -4192,14 +4199,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             workspaceSwitchInFlight = false
             activeSessionLoadInProgressTabID = nil
             applySessionToBindings(session)
-            resyncOpenCodeModelParameterObservation()
             return
         }
 
         activeSessionLoadInProgressTabID = tabID
         publishLoadingTranscriptPresentation(tabID: tabID)
         applySessionToBindings(session)
-        resyncOpenCodeModelParameterObservation()
         Task { [weak self] in
             guard let self else { return }
             await loadSessionFromDisk(for: session)

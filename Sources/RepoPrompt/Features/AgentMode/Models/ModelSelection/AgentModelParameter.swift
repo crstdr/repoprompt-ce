@@ -190,8 +190,17 @@ enum ACPModelParameterResolver {
             let saved = persistedSelections.last { selection in
                 selection.identity == definitionIdentity
             }
-            guard let selectedChoice = saved.flatMap({ definition.choice(matching: $0.valueRaw) })
-                ?? definition.choice(matching: definition.currentValueRaw)
+            // OpenCode must show unsupported saved intent, not a default that the next run
+            // will never use. Cursor deliberately retains its existing display fallback.
+            let savedChoice = saved.flatMap { selection in
+                definition.choice(matching: selection.valueRaw)
+                    ?? (
+                        providerID == .openCode
+                            ? ACPModelParameterChoice(rawValue: selection.valueRaw, displayName: selection.valueRaw)
+                            : nil
+                    )
+            }
+            guard let selectedChoice = savedChoice ?? definition.choice(matching: definition.currentValueRaw)
             else { return nil }
             return .init(
                 baseModelRaw: parameterSet.baseModelRaw,
