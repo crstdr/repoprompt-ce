@@ -19,6 +19,7 @@
 
 import Combine
 import Foundation
+import OSLog
 import RepoPromptDomainRuntime
 import SwiftUI
 
@@ -75,6 +76,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     // MARK: - Bookkeeping
 
+    private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "AgentModelsSettings")
+
     private var cancellables = Set<AnyCancellable>()
     private var isReloadingScopedState = false
 
@@ -91,20 +94,16 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let settingsManager = settingsManager ?? settingsStore
-        let initialInheritanceMode = Self.inheritanceMode(
+        let initial = Self.liveScopedState(
             settingsManager: settingsManager,
             workspaceID: workspaceID
         )
-        let initialProfile = Self.profile(
-            settingsManager: settingsManager,
-            workspaceID: workspaceID,
-            inheritanceMode: initialInheritanceMode
-        )
+        let initialProfile = initial.profile
 
         self.apiSettingsVM = apiSettingsVM
         self.workspaceID = workspaceID
         self.workspaceName = workspaceName
-        inheritanceMode = initialInheritanceMode
+        inheritanceMode = initial.inheritanceMode
         profileSnapshot = initialProfile
         self.settingsManager = settingsManager
         _ = defaults // Retained for initializer compatibility while storage lives in GlobalSettingsStore.
@@ -341,14 +340,22 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     func additionalOracleModelDestination(at index: Int) -> ModelDestination {
-        ModelDestination(
+        // Capture the lane's displayed value alongside its index. This applier is handed to a
+        // model picker that can stay open across a refresh, and an index alone is not an
+        // identity: if the roster is reordered or shortened meanwhile, the index still validates
+        // but now names a different lane. The staleness guard in `updateSelectedProfile` cannot
+        // catch that on its own — by the time the menu item fires, cache and store agree again.
+        let expectedRaw = additionalOracleModelRaws.indices.contains(index)
+            ? additionalOracleModelRaws[index]
+            : nil
+        return ModelDestination(
             id: "agentModels.oracle.additional.\(index)",
             getter: { [weak self] in
                 guard let self, additionalOracleModelRaws.indices.contains(index) else { return "" }
                 return additionalOracleModelRaws[index]
             },
             applier: { [weak self] rawValue in
-                self?.setAdditionalOracleModel(raw: rawValue, at: index)
+                self?.setAdditionalOracleModel(raw: rawValue, at: index, expecting: expectedRaw)
             }
         )
     }
@@ -396,8 +403,11 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         }
     }
 
-    func setAdditionalOracleModel(raw: String, at index: Int) {
+    /// - Parameter expectedRaw: the value this lane displayed when the action was constructed.
+    ///   Supplied by deferred callers so a retained picker cannot retarget a reordered roster.
+    func setAdditionalOracleModel(raw: String, at index: Int, expecting expectedRaw: String? = nil) {
         guard additionalOracleModelRaws.indices.contains(index) else { return }
+        if let expectedRaw, additionalOracleModelRaws[index] != expectedRaw { return }
         updateSelectedProfile(reason: "agent_models.oracle_model") { profile in
             profile.additionalOracleModelRaws[index] = raw
         }
@@ -443,10 +453,11 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             return
         }
 
-        updateSelectedProfile(reason: "agent_models.apply_oracle_recommendation") { profile in
+        let committed = updateSelectedProfile(reason: "agent_models.apply_oracle_recommendation") { profile in
             profile.planningModelRaw = recommendedModelRaw
             profile.preferredComposeModelRaw = recommendedModelRaw
         }
+        guard committed else { return }
         postRecommendationsDidApply(reason: "agent_models.apply_oracle_recommendation")
     }
 
@@ -454,24 +465,27 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         guard let rec = recommendations.contextBuilder,
               workspaceID != nil else { return }
         let recommendedModelRaw = engine.recommendedContextBuilderModelRaw(rec)
-        updateSelectedProfile(
+        let committed = updateSelectedProfile(
             reason: "agent_models.apply_context_builder_recommendation",
             contextBuilderWriteIntent: .userInitiated
         ) { profile in
             profile.contextBuilderAgentRaw = rec.recommendedAgent.rawValue
             profile = profile.replacingContextBuilderModel(recommendedModelRaw, for: rec.recommendedAgent.rawValue)
         }
+        guard committed else { return }
         postRecommendationsDidApply(reason: "agent_models.apply_context_builder_recommendation")
     }
 
     func applyRoleDefault(_ resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution) {
-        var overrides = profileSnapshot.mcpAgentRoleOverrides ?? [:]
-        overrides.removeValue(forKey: resolution.role.rawValue)
-        persistRoleDefaultOverrides(overrides.isEmpty ? nil : overrides)
+        updateRoleDefaultOverrides { overrides in
+            overrides.removeValue(forKey: resolution.role.rawValue)
+        }
     }
 
     func resetAllRoleDefaults() {
-        persistRoleDefaultOverrides(nil)
+        updateRoleDefaultOverrides { overrides in
+            overrides.removeAll()
+        }
     }
 
     /// Set or clear one role's OpenCode effort pin, persisting the displayed role model choice
@@ -581,15 +595,15 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         _ selection: AgentModelCatalog.NormalizedAgentSelection,
         for role: AgentModelCatalog.TaskLabelKind
     ) {
-        var overrides = profileSnapshot.mcpAgentRoleOverrides ?? [:]
         let selectionID = AgentModelSelectionID(
             agentRaw: selection.agent.rawValue,
             modelRaw: selection.modelRaw
         )
         // Keep explicit role picks durable even when they currently match the recommendation;
         // `applyRoleDefault` / reset actions are the explicit path back to recommendation-tracking.
-        overrides[role.rawValue] = selectionID.rawValue
-        persistRoleDefaultOverrides(overrides)
+        updateRoleDefaultOverrides { overrides in
+            overrides[role.rawValue] = selectionID.rawValue
+        }
     }
 
     // MARK: - Bulk Apply
@@ -599,40 +613,54 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         guard workspaceID != nil else { return }
         isApplyingAll = true
 
-        var profile = profileSnapshot
-        var didMutateProfile = false
-        if let chat = recommendations.chatModel,
-           let recommendedModelRaw = engine.recommendedChatModelRaw(chat, backend: chat.defaultBackend)
-        {
-            profile.planningModelRaw = recommendedModelRaw
-            profile.preferredComposeModelRaw = recommendedModelRaw
-            didMutateProfile = true
+        // Resolve every recommendation up front, then apply them to the live base inside one
+        // guarded write. This used to build on `profileSnapshot` and persist directly, which kept
+        // the stale-whole-profile bug alive in the one action most likely to be clicked right
+        // after another surface wrote a pin.
+        let chatModelRaw = recommendations.chatModel.flatMap { chat in
+            engine.recommendedChatModelRaw(chat, backend: chat.defaultBackend)
         }
-        if let cb = recommendations.contextBuilder {
-            let recommendedModelRaw = engine.recommendedContextBuilderModelRaw(cb)
-            profile.contextBuilderAgentRaw = cb.recommendedAgent.rawValue
-            profile = profile.replacingContextBuilderModel(recommendedModelRaw, for: cb.recommendedAgent.rawValue)
-            didMutateProfile = true
-        }
-        if recommendations.mcpAgentDefaults != nil {
-            profile.mcpAgentRoleOverrides = nil
-            didMutateProfile = true
-        }
-        if didMutateProfile {
-            persistSelectedProfile(
-                profile,
+        let contextBuilder = recommendations.contextBuilder
+        let contextBuilderModelRaw = contextBuilder.map { engine.recommendedContextBuilderModelRaw($0) }
+        let clearsRoleOverrides = recommendations.mcpAgentDefaults != nil
+        let mutatesProfile = chatModelRaw != nil || contextBuilder != nil || clearsRoleOverrides
+
+        if mutatesProfile {
+            let committed = updateSelectedProfile(
                 reason: "agent_models.apply_all_recommendations",
-                contextBuilderWriteIntent: recommendations.contextBuilder == nil
+                contextBuilderWriteIntent: contextBuilder == nil
                     ? .preserveExistingOwnership
                     : .userInitiated
-            )
-        }
-        if includePresetExposure, let presetExposure = recommendations.mcpPresetExposure {
-            engine.applyMCPPresetExposure(presetExposure)
-        }
-        if !didMutateProfile {
+            ) { profile in
+                if let chatModelRaw {
+                    profile.planningModelRaw = chatModelRaw
+                    profile.preferredComposeModelRaw = chatModelRaw
+                }
+                if let contextBuilder, let contextBuilderModelRaw {
+                    profile.contextBuilderAgentRaw = contextBuilder.recommendedAgent.rawValue
+                    profile = profile.replacingContextBuilderModel(
+                        contextBuilderModelRaw,
+                        for: contextBuilder.recommendedAgent.rawValue
+                    )
+                }
+                if clearsRoleOverrides {
+                    profile.mcpAgentRoleOverrides = nil
+                }
+            }
+            // These recommendations were computed against state that has since moved, so applying
+            // part of them would be wrong. The reject path already reloaded and refreshed, which
+            // produces a fresh set for the next click.
+            guard committed else {
+                isApplyingAll = false
+                return
+            }
+        } else {
             reloadScopedState()
             refresh()
+        }
+
+        if includePresetExposure, let presetExposure = recommendations.mcpPresetExposure {
+            engine.applyMCPPresetExposure(presetExposure)
         }
         postRecommendationsDidApply(reason: "agent_models.apply_all_recommendations")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
@@ -706,6 +734,28 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             ?? settingsManager.effectiveAgentModelsProfile(workspaceID: workspaceID)
     }
 
+    /// The store's current scoped state, read as one pair.
+    ///
+    /// Single owner of the read rule. `init`, `reloadScopedState()` and `updateSelectedProfile`
+    /// all go through here, which is what makes the cache-vs-live comparison in
+    /// `updateSelectedProfile` meaningful: two different read paths could report a difference
+    /// that is not really there and reject every edit.
+    private static func liveScopedState(
+        settingsManager: any SettingsManaging,
+        workspaceID: UUID?
+    ) -> (inheritanceMode: AgentModelsInheritanceMode, profile: AgentModelsSettingsProfile) {
+        let inheritanceMode = Self.inheritanceMode(
+            settingsManager: settingsManager,
+            workspaceID: workspaceID
+        )
+        let profile = Self.profile(
+            settingsManager: settingsManager,
+            workspaceID: workspaceID,
+            inheritanceMode: inheritanceMode
+        )
+        return (inheritanceMode, profile)
+    }
+
     private func observeNotifications() {
         notificationCenter.publisher(for: .recommendationsShouldRefresh)
             .receive(on: DispatchQueue.main)
@@ -741,64 +791,89 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     private func reloadScopedState() {
-        let nextInheritanceMode = Self.inheritanceMode(
+        let next = Self.liveScopedState(
             settingsManager: settingsManager,
             workspaceID: workspaceID
         )
-        let nextProfile = Self.profile(
-            settingsManager: settingsManager,
-            workspaceID: workspaceID,
-            inheritanceMode: nextInheritanceMode
-        )
+        let nextProfile = next.profile
         isReloadingScopedState = true
-        inheritanceMode = nextInheritanceMode
+        inheritanceMode = next.inheritanceMode
         profileSnapshot = nextProfile
         syncChatWithOracle = nextProfile.syncChatModelWithOracle
         restrictMCPAgentDiscoveryToRoleLabels = nextProfile.restrictMCPAgentDiscoveryToRoleLabels
         isReloadingScopedState = false
     }
 
+    /// Read-modify-write the selected Agent Models profile — or refuse.
+    ///
+    /// **Observe live, assign nothing, verify against the cache, then act on one scope — or
+    /// reload and refuse.**
+    ///
+    /// This boundary produced one bug per fix, always the same way: two copies of the same truth
+    /// (the notification-fed cache and the store) disagreed, and a write happened anyway.
+    /// Mutating the cache lost effort pins written by other surfaces. Mutating the live profile
+    /// while writing to the cached `editingScope` copied whole profiles across scopes, because
+    /// both setters replace every field. Bounds-checking the cached array while indexing the live
+    /// one trapped. Reloading first — the other obvious fix — reassigns the published toggles,
+    /// whose `didSet` handlers read the very property they are mutating, so it silently reverts
+    /// every toggle edit.
+    ///
+    /// So divergence is terminal here, not an input to a write. The live scope and profile are
+    /// read into locals and compared against the cached pair; only when both agree does the
+    /// mutation run, and the write then targets the live-resolved scope. Because the base is
+    /// *verified* equal to `profileSnapshot`, every snapshot-derived index, key, count and value
+    /// a caller captured is sound by construction — including at call sites not yet written.
+    ///
+    /// Reading into locals is also what keeps the toggles working: nothing published is assigned
+    /// before the closure runs, so a `didSet`-driven mutation still sees the user's new value.
+    /// `reloadScopedState()` runs only after the decision — after a write, or instead of one.
+    ///
+    /// Three ways to restart the bug cycle, all forbidden by this contract:
+    /// - retrying a rejected mutation against the refreshed base. "Apply it to whatever is there
+    ///   now" is precisely the bug for index- and key-shaped edits;
+    /// - introducing an `await` between the live read and the write, reopening the
+    ///   time-of-check/time-of-use gap this guard closes;
+    /// - adding a whole-profile write path that bypasses this method — which is why the old
+    ///   `persistSelectedProfile` was deleted rather than given a scope parameter.
+    ///
+    /// - Returns: `true` when the profile was written. Callers with follow-up side effects
+    ///   (notifications, preset exposure) must gate them on this.
+    @discardableResult
     private func updateSelectedProfile(
         reason: String,
         contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership,
         _ mutation: (inout AgentModelsSettingsProfile) -> Void
-    ) {
-        // Base the mutation on the LIVE scoped profile, not the notification-fed cache.
-        //
-        // `persistSelectedProfile` replaces the whole profile, including the pin buckets. Those
-        // are also written by store-direct setters (the popover, MCP, recommendations) that post
-        // a change notification this view model only receives on a later runloop turn. Starting
-        // from the stale cache in that window would persist a profile that never contained a pin
-        // just written elsewhere — or restore one just cleared — with coherence then dropping the
-        // bucket. Any unrelated Settings edit would silently undo someone else's pin.
-        //
-        // This deliberately does NOT call `reloadScopedState()`: that also reassigns the
-        // published toggle properties from the store, and the toggles' `didSet` handlers read
-        // those same properties when building their mutation — so reloading here would overwrite
-        // the user's new value with the old one before the closure ran. Re-derive the profile
-        // only, through the same helpers the reload uses, so there is still one owner of the rule.
-        var profile = Self.profile(
+    ) -> Bool {
+        let live = Self.liveScopedState(
             settingsManager: settingsManager,
+            workspaceID: workspaceID
+        )
+        let liveScope = AgentModelsEditingScope.resolve(
             workspaceID: workspaceID,
-            inheritanceMode: Self.inheritanceMode(
-                settingsManager: settingsManager,
-                workspaceID: workspaceID
-            )
+            inheritanceMode: live.inheritanceMode
         )
-        mutation(&profile)
-        persistSelectedProfile(
-            profile,
-            reason: reason,
-            contextBuilderWriteIntent: contextBuilderWriteIntent
-        )
-    }
 
-    private func persistSelectedProfile(
-        _ profile: AgentModelsSettingsProfile,
-        reason: String,
-        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership
-    ) {
-        switch editingScope {
+        let scopeChanged = liveScope != editingScope
+        let profileChanged = live.profile != profileSnapshot
+        guard !scopeChanged, !profileChanged else {
+            // Rejection has to be observable, or "silent wrong write" simply becomes "silent
+            // dropped click" and the next person weakens a precondition to fix the symptom.
+            Self.logger.notice(
+                """
+                Rejected stale Agent Models edit \(reason, privacy: .public): \
+                scopeChanged=\(scopeChanged, privacy: .public) \
+                profileChanged=\(profileChanged, privacy: .public)
+                """
+            )
+            reloadScopedState()
+            refresh()
+            return false
+        }
+
+        var profile = live.profile
+        mutation(&profile)
+
+        switch liveScope {
         case .global:
             settingsManager.setGlobalAgentModelsProfile(
                 profile,
@@ -810,13 +885,26 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         reloadScopedState()
         refresh()
         postShouldRefresh(reason: reason)
+        return true
     }
 
-    private func persistRoleDefaultOverrides(_ overrides: [String: String]?) {
-        updateSelectedProfile(reason: "agent_models.role_defaults") { profile in
-            profile.mcpAgentRoleOverrides = overrides
+    /// Edit the selected profile's MCP agent role overrides in place.
+    ///
+    /// The closure receives the *live* dictionary rather than a replacement built from the cache.
+    /// A wholesale stale replacement did not merely drop a key: profile coherence discards any
+    /// effort pin whose role override disappears, so an unrelated role menu click could silently
+    /// erase a pin written by the role-defaults popover.
+    @discardableResult
+    private func updateRoleDefaultOverrides(_ edit: (inout [String: String]) -> Void) -> Bool {
+        let committed = updateSelectedProfile(reason: "agent_models.role_defaults") { profile in
+            var overrides = profile.mcpAgentRoleOverrides ?? [:]
+            edit(&overrides)
+            profile.mcpAgentRoleOverrides = overrides.isEmpty ? nil : overrides
         }
-        postAgentRoleDefaultsChanged()
+        if committed {
+            postAgentRoleDefaultsChanged()
+        }
+        return committed
     }
 
     private func setContextBuilderSelection(agent: AgentProviderKind, modelRaw: String) {
