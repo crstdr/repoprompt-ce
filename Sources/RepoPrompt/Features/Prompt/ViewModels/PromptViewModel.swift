@@ -780,6 +780,13 @@ class PromptViewModel: ObservableObject {
         fileManager.currentWorkspaceID
     }
 
+    /// The active workspace's execution root, used by demand-scoped OpenCode effort probes on
+    /// the Settings/popover surfaces (the composer's fallback tier). No worktree binding: these
+    /// surfaces edit future configuration and only preview metadata.
+    var activeWorkspaceRootPath: String? {
+        workspaceManager?.activeWorkspace?.repoPaths.first
+    }
+
     private var currentAgentModelsEditingScope: AgentModelsEditingScope {
         guard let workspaceID = currentWorkspaceID,
               settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
@@ -817,6 +824,58 @@ class PromptViewModel: ObservableObject {
             profile,
             contextBuilderWriteIntent: .userInitiated
         )
+    }
+
+    /// Set or clear the Context Builder agent's OpenCode effort pin, persisting the displayed
+    /// agent+model choice atomically so the pin stays eligible in the effective profile.
+    ///
+    /// Guarded write: the captured scope/provider/model must still match live host state, so a
+    /// stale menu cannot write to a scope or model that has since changed.
+    func setContextBuilderModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        expectedProviderID: ACPProviderID,
+        expectedModelRaw: String,
+        expectedScope: AgentModelsEditingScope
+    ) {
+        guard currentAgentModelsEditingScope == expectedScope,
+              let providerID = contextBuilderAgent.acpProviderID,
+              providerID == expectedProviderID,
+              ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  contextBuilderAgentModelRaw,
+                  providerID: providerID
+              ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  expectedModelRaw,
+                  providerID: providerID
+              )
+        else { return }
+        let profile = currentAgentModelsProfile()
+            .replacingContextBuilderModelParameter(
+                selections,
+                for: contextBuilderAgent.rawValue,
+                modelRaw: contextBuilderAgentModelRaw
+            )
+        // The existing CB setters deliberately mark the choice user-owned; pass `.userInitiated`
+        // rather than copying the role storage path, which preserves existing ownership.
+        persistCurrentAgentModelsProfile(
+            profile,
+            contextBuilderWriteIntent: .userInitiated
+        )
+    }
+
+    /// The saved `.thinking` pin value for the current Context Builder selection, if any. The
+    /// chip's saved-state input.
+    var contextBuilderThinkingParameterValueRaw: String? {
+        contextBuilderModelParameters.last { $0.kind == .thinking }?.valueRaw
+    }
+
+    /// The saved OpenCode effort pin for the current Context Builder agent+model selection,
+    /// filtered to the persisted explicit choice's provider + canonical model.
+    var contextBuilderModelParameters: [ACPModelParameterSelection] {
+        currentAgentModelsProfile()
+            .contextBuilderModelParameterSelections(
+                for: contextBuilderAgent,
+                modelRaw: contextBuilderAgentModelRaw
+            )
     }
 
     private var isSyncingSettings = false

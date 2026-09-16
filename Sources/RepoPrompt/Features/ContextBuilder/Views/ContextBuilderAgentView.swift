@@ -819,6 +819,9 @@ struct ContextBuilderAgentView: View {
         }
     }
 
+    // Translate a chip selection into a stored pin using the advertised `configID` — never an
+    // assumed `"effort"` key. nil value clears.
+
     private var headerSection: some View {
         Group {
             HStack(spacing: 8) {
@@ -842,6 +845,31 @@ struct ContextBuilderAgentView: View {
                 }
                 .disabled(isContextBuilderRunningForTab)
                 .hoverTooltip("Select agent and model for Context Builder")
+
+                if let providerID = viewModel.selectedAgent.acpProviderID {
+                    let expectedModelRaw = viewModel.selectedModelRaw
+                    ACPModelParameterProbeView(
+                        modelRaw: expectedModelRaw,
+                        providerID: providerID,
+                        probeContext: .resolved(viewModel.chooserProbeWorkspacePath),
+                        pinnedValueRaw: viewModel.contextBuilderThinkingParameterValueRaw,
+                        isEnabled: !isContextBuilderRunningForTab
+                    ) { configID, value in
+                        // Guarded write: re-check the live run permission, then re-check the
+                        // captured provider/model against live state inside the setter.
+                        guard !isContextBuilderRunningForTab else { return }
+                        viewModel.setContextBuilderModelParameter(
+                            ACPModelParameterSelection.thinkingPin(
+                                configID: configID,
+                                valueRaw: value,
+                                providerID: providerID,
+                                modelRaw: expectedModelRaw
+                            ),
+                            expectedProviderID: providerID,
+                            expectedModelRaw: expectedModelRaw
+                        )
+                    }
+                }
 
                 // Context Builder Prompts button
                 ContextBuilderPromptsButton(

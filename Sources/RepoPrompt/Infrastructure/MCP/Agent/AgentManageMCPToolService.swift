@@ -691,13 +691,22 @@ struct AgentManageMCPToolService {
                     "Failed to resolve the session workspace for model parameter validation: \(error.localizedDescription)"
                 )
             }
-            let modelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
+            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
                 value: args["model_parameters"],
                 agent: resolved.agent.flatMap { AgentProviderKind(rawValue: $0) },
                 modelRaw: resolved.model,
                 workspacePath: createParameterWorkspacePath,
                 oneShot: openCodeOneShotObservationProvider
             )
+            // A role-label create inherits the role's stored pin as a baseline, captured with
+            // the role resolution above. Explicit request parameters override matching
+            // identities; a compound model_id inherits nothing.
+            let modelParameterSelections = selection.taskLabelKind == nil
+                ? explicitModelParameterSelections
+                : AgentMCPModelParameterSupport.merged(
+                    inherited: selection.modelParameterSelections,
+                    explicit: explicitModelParameterSelections
+                )
             try agentModeVM.requireCurrentMCPWorkspaceTarget(
                 target,
                 expectedWorkspaceID: workspace.id
@@ -841,13 +850,21 @@ struct AgentManageMCPToolService {
                     "Failed to resolve the session workspace for model parameter validation: \(error.localizedDescription)"
                 )
             }
-            let modelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
+            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
                 value: args["model_parameters"],
                 agent: AgentProviderKind(rawValue: parameterAgentRaw),
                 modelRaw: parameterModelRaw,
                 workspacePath: parameterWorkspacePath,
                 oneShot: openCodeOneShotObservationProvider
             )
+            // A role-label resume inherits the role's stored pin as a baseline. Explicit request
+            // parameters override matching identities; a compound model_id inherits nothing.
+            let modelParameterSelections = selection.taskLabelKind == nil
+                ? explicitModelParameterSelections
+                : AgentMCPModelParameterSupport.merged(
+                    inherited: selection.modelParameterSelections,
+                    explicit: explicitModelParameterSelections
+                )
             // Resume adopts the live session's existing control registration. Re-registering the
             // same persistent session expires in-flight waiters and splits poll state from the UI.
             #if DEBUG

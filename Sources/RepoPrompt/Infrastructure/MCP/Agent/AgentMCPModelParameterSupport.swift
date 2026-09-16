@@ -269,6 +269,16 @@ enum AgentMCPModelParameterSupport {
         )
     }
 
+    /// Merge an inherited (role-pin) baseline with explicit request parameters. `normalized`
+    /// de-duplicates per identity with last-wins, so an explicit request parameter overrides an
+    /// inherited one for free.
+    static func merged(
+        inherited: [ACPModelParameterSelection],
+        explicit: [ACPModelParameterSelection]
+    ) -> [ACPModelParameterSelection] {
+        ACPModelParameterSelection.normalized(inherited + explicit)
+    }
+
     static func selectionValues(_ selections: [ACPModelParameterSelection]) -> [Value] {
         ACPModelParameterSelection.normalized(selections).map { selection in
             .object([

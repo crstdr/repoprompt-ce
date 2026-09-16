@@ -224,6 +224,57 @@ final class GlobalSettingsPersistenceSafetyTests: XCTestCase {
         )
     }
 
+    /// Round-trip + global decomposition for the new OpenCode parameter-pin buckets. This is
+    /// §2.6's silent-loss failure: a profile field without a backing `GlobalDefaults` field
+    /// mapped in **both** `globalAgentModelsProfile()` and `setGlobalAgentModelsProfile` is
+    /// dropped on the next read.
+    func testAgentModelParameterPinsSurviveCodecAndGlobalDecomposition() throws {
+        let pin = ACPModelParameterSelection(
+            providerID: .openCode,
+            baseModelRaw: "ollama-cloud/kimi-k3",
+            kind: .thinking,
+            configID: "effort",
+            valueRaw: "high"
+        )
+        let cbPin = ACPModelParameterSelection(
+            providerID: .openCode,
+            baseModelRaw: "ollama-cloud/kimi-k3",
+            kind: .thinking,
+            configID: "effort",
+            valueRaw: "low"
+        )
+        let profile = AgentModelsSettingsProfile(
+            contextBuilderAgentRaw: "openCode",
+            contextBuilderModelsByAgent: ["openCode": "ollama-cloud/kimi-k3"],
+            mcpAgentRoleOverrides: ["engineer": "openCode:ollama-cloud/kimi-k3"],
+            mcpAgentRoleModelParameters: ["engineer": [pin]],
+            contextBuilderModelParametersByAgent: ["openCode": [cbPin]]
+        )
+
+        // Codec round-trip.
+        let encoded = try JSONEncoder().encode(profile)
+        let decoded = try JSONDecoder().decode(AgentModelsSettingsProfile.self, from: encoded)
+        XCTAssertEqual(decoded.mcpAgentRoleModelParameters?["engineer"], [pin])
+        XCTAssertEqual(decoded.contextBuilderModelParametersByAgent?["openCode"], [cbPin])
+
+        // Global decomposition: set → read through the backing GlobalDefaults store.
+        let root = try makeTemporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("Settings/globalSettings.json")
+        let suiteName = "GlobalSettingsPersistenceSafetyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+
+        store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .userInitiated)
+        let readBack = store.globalAgentModelsProfile()
+        XCTAssertEqual(readBack.mcpAgentRoleModelParameters?["engineer"], [pin])
+        XCTAssertEqual(readBack.contextBuilderModelParametersByAgent?["openCode"], [cbPin])
+    }
+
     private func makeTemporaryRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("GlobalSettingsPersistenceSafetyTests-\(UUID().uuidString)", isDirectory: true)

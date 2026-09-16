@@ -71,6 +71,28 @@ struct ACPModelParameterSelection: Codable, Hashable {
         )
     }
 
+    /// Build the single `.thinking` pin for an OpenCode-style effort chip selection. `configID`
+    /// comes from the live advertised definition (never assumed to be `"effort"`); `valueRaw == nil`
+    /// clears. Returns nil when there is nothing to store.
+    static func thinkingPin(
+        configID: String,
+        valueRaw: String?,
+        providerID: ACPProviderID,
+        modelRaw: String
+    ) -> [Self]? {
+        let trimmedConfigID = configID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let valueRaw, !trimmedConfigID.isEmpty else { return nil }
+        return [
+            ACPModelParameterSelection(
+                providerID: providerID,
+                baseModelRaw: modelRaw,
+                kind: .thinking,
+                configID: trimmedConfigID,
+                valueRaw: valueRaw
+            )
+        ]
+    }
+
     static func normalized(_ selections: [Self]) -> [Self] {
         var valueByIdentity: [ACPModelParameterIdentity: Self] = [:]
         var orderedIdentities: [ACPModelParameterIdentity] = []

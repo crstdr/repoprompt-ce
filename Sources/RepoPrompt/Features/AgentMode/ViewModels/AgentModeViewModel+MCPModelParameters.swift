@@ -22,10 +22,17 @@ extension AgentModeViewModel {
         selections: [ACPModelParameterSelection]
     ) throws -> MCPModelParameterSelectionStagingRollback? {
         guard !selections.isEmpty else { return nil }
-        guard agentRaw == AgentProviderKind.cursor.rawValue,
+        // Any ACP provider derived from the resolved agent may carry model parameters (Cursor,
+        // OpenCode). Deriving the agent here, rather than hardcoding Cursor, keeps the same
+        // guard, revision capture, and rollback contract for every ACP provider.
+        guard let agentRaw,
+              let agent = AgentProviderKind(rawValue: agentRaw),
+              agent.acpProviderID != nil,
               let modelRaw
         else {
-            throw MCPError.invalidParams("Cursor model parameters require an explicit Cursor model selection.")
+            throw MCPError.invalidParams(
+                "Model parameters require an explicit ACP model selection."
+            )
         }
         guard let session = session(for: tabID, createIfNeeded: false) else {
             throw MCPError.internalError("Failed to resolve the Agent session for model parameter configuration.")
@@ -33,7 +40,7 @@ extension AgentModeViewModel {
         let previousSelections = session.acpModelParameterSelections
         try mcpStoreModelParameterSelections(
             tabID: tabID,
-            selectedAgent: .cursor,
+            selectedAgent: agent,
             selectedModelRaw: modelRaw,
             selections: selections,
             schedulePersistence: false

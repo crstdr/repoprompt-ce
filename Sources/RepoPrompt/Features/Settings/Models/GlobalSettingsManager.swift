@@ -280,6 +280,12 @@ struct GlobalDefaults: Codable, Equatable {
     /// Global MCP Agent Mode role-default overrides (shared across all workspaces).
     /// Keys are TaskLabelKind rawValues, values are AgentModelSelectionID rawValues.
     var mcpAgentRoleOverrides: [String: String]?
+    /// OpenCode-style ACP parameter pins for the global role defaults. Keys are
+    /// TaskLabelKind rawValues; values are model-scoped selections.
+    var mcpAgentRoleModelParameters: [String: [ACPModelParameterSelection]]?
+    /// OpenCode-style ACP parameter pins for the global Context Builder agents.
+    /// Keys are AgentProviderKind rawValues, mirroring `discoverModelsByAgent`.
+    var contextBuilderModelParametersByAgent: [String: [ACPModelParameterSelection]]?
     /// One-time migration version for legacy workspace-scoped MCP role overrides.
     var mcpAgentRoleOverridesMigrationVersion: Int?
     /// Global provider filter used by recommendation generation. nil means all providers.
@@ -508,7 +514,9 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
             contextBuilderModelsByAgent: globalDefaults.discoverModelsByAgent,
             mcpAgentRoleOverrides: globalDefaults.mcpAgentRoleOverrides,
-            restrictMCPAgentDiscoveryToRoleLabels: restrictMCPAgentDiscoveryToRoleLabels()
+            restrictMCPAgentDiscoveryToRoleLabels: restrictMCPAgentDiscoveryToRoleLabels(),
+            mcpAgentRoleModelParameters: globalDefaults.mcpAgentRoleModelParameters,
+            contextBuilderModelParametersByAgent: globalDefaults.contextBuilderModelParametersByAgent
         )
     }
 
@@ -534,6 +542,8 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         globalDefaults.discoverAgentRaw = normalized.contextBuilderAgentRaw
         globalDefaults.discoverModelsByAgent = normalized.contextBuilderModelsByAgent
         globalDefaults.mcpAgentRoleOverrides = normalized.mcpAgentRoleOverrides
+        globalDefaults.mcpAgentRoleModelParameters = normalized.mcpAgentRoleModelParameters
+        globalDefaults.contextBuilderModelParametersByAgent = normalized.contextBuilderModelParametersByAgent
         switch contextBuilderWriteIntent {
         case .preserveExistingOwnership:
             break
@@ -715,6 +725,45 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     ) {
         updateAgentModelsProfile(scope: scope) { profile in
             profile.mcpAgentRoleOverrides = overrides
+        }
+    }
+
+    /// Atomic Context Builder pin write: persist the displayed agent+model choice and
+    /// set/clear that agent's parameter bucket in one profile mutation.
+    func setAgentModelsContextBuilderModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        agentRaw: String?,
+        modelRaw: String,
+        scope: AgentModelsEditingScope
+    ) {
+        // The write durably commits the displayed Context Builder agent+model alongside the pin,
+        // so it must claim user ownership exactly as the existing Context Builder model setters
+        // do. With `.preserveExistingOwnership` the global ownership flag stays false, automatic
+        // recommendation application stays eligible, it moves the Context Builder model, and
+        // profile coherence then drops the bucket — silently erasing the pin the user just set.
+        updateAgentModelsProfile(scope: scope, contextBuilderWriteIntent: .userInitiated) { profile in
+            profile = profile.replacingContextBuilderModelParameter(
+                selections,
+                for: agentRaw,
+                modelRaw: modelRaw
+            )
+        }
+    }
+
+    /// Atomic role-pin write: persist the displayed model choice as the role override and
+    /// set/clear the role's parameter bucket in one profile mutation, so the two never diverge.
+    func setAgentModelsRoleModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        roleRawValue: String,
+        displayedSelectionID: AgentModelSelectionID,
+        scope: AgentModelsEditingScope
+    ) {
+        updateAgentModelsProfile(scope: scope) { profile in
+            profile = profile.replacingRoleModelParameter(
+                selections,
+                for: roleRawValue,
+                displayedSelectionID: displayedSelectionID
+            )
         }
     }
 
@@ -2270,13 +2319,14 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
 
     private func updateAgentModelsProfile(
         scope: AgentModelsEditingScope,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership,
         _ mutation: (inout AgentModelsSettingsProfile) -> Void
     ) {
         switch scope {
         case .global:
             var profile = globalAgentModelsProfile()
             mutation(&profile)
-            setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
+            setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: contextBuilderWriteIntent)
         case let .workspace(workspaceID):
             var settings = agentModelsSettingsByWorkspaceID[workspaceID] ?? WorkspaceAgentModelsSettings(
                 inheritanceMode: .useWorkspaceOverrides,
@@ -2310,7 +2360,9 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             contextBuilderAgentRaw: profile.contextBuilderAgentRaw,
             contextBuilderModelsByAgent: profile.contextBuilderModelsByAgent,
             mcpAgentRoleOverrides: profile.mcpAgentRoleOverrides,
-            restrictMCPAgentDiscoveryToRoleLabels: profile.restrictMCPAgentDiscoveryToRoleLabels
+            restrictMCPAgentDiscoveryToRoleLabels: profile.restrictMCPAgentDiscoveryToRoleLabels,
+            mcpAgentRoleModelParameters: profile.mcpAgentRoleModelParameters,
+            contextBuilderModelParametersByAgent: profile.contextBuilderModelParametersByAgent
         )
         if let invalidReason = invalidSynchronizedProfileReason(normalized) {
             invalidAgentModelsProfileAssertion(

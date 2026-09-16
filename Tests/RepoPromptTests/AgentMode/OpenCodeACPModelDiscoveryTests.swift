@@ -364,6 +364,78 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         XCTAssertTrue(recordedRequests(at: recordURL).isEmpty)
     }
 
+    /// The Consumer that must actually apply a saved OpenCode pin: the Context Builder headless
+    /// path. A saved `effort` selection must reach `session/set_config_option` **before**
+    /// `session/prompt`; asserting the request merely *contains* the selection would pass while
+    /// `beforePrompt` still ignored it — the exact failure this feature exists to prevent.
+    func testHeadlessProviderAppliesPinnedEffortBeforePrompt() async throws {
+        let workspace = try makeTestDirectory(name: "OpenCodeACPHeadlessPin")
+        let recordURL = workspace.appendingPathComponent("requests.jsonl")
+        let scriptURL = workspace.appendingPathComponent("opencode")
+        try Self.headlessPinServerScript.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let modelRaw = "ollama-cloud/kimi-k3"
+        let pin = ACPModelParameterSelection(
+            providerID: .openCode,
+            baseModelRaw: modelRaw,
+            kind: .thinking,
+            configID: "effort",
+            valueRaw: "high"
+        )
+        let provider = OpenCodeACPHeadlessAgentProvider(
+            config: OpenCodeAgentConfig(
+                modelString: modelRaw,
+                enableDebugLogging: false,
+                includeRepoPromptMCPServer: false,
+                includeManagedConfigOverlay: false,
+                cleanupLegacyPersistentConfig: false,
+                toolProfile: .headless,
+                modelParameterSelections: [pin]
+            ),
+            workspacePath: workspace.path,
+            providerFactory: { _ in
+                OpenCodeDiscoveryFakeProvider(
+                    commandPath: scriptURL.path,
+                    environment: ["ACP_RECORD_PATH": recordURL.path]
+                )
+            }
+        )
+        let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "hi"))
+        for try await _ in stream {}
+        await provider.dispose()
+
+        let sequence = recordedRequestSequence(at: recordURL)
+        let effortIndex = sequence.firstIndex {
+            $0.method == "session/set_config_option" && $0.params["configId"] as? String == "effort"
+        }
+        let promptIndex = sequence.firstIndex { $0.method == "session/prompt" }
+        guard let effortIndex, let promptIndex else {
+            return XCTFail("Expected both an effort mutation and a prompt, got \(sequence.map(\.method))")
+        }
+        XCTAssertLessThan(effortIndex, promptIndex, "effort must be applied before the prompt")
+        XCTAssertEqual(sequence[effortIndex].params["value"] as? String, "high")
+        XCTAssertEqual(sequence.count(where: { $0.method == "session/prompt" }), 1)
+    }
+
+    private struct RecordedRequest {
+        let method: String
+        let params: [String: Any]
+    }
+
+    private func recordedRequestSequence(at url: URL) -> [RecordedRequest] {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8)
+        else { return [] }
+        return text.split(whereSeparator: { $0.isNewline }).compactMap { line in
+            guard let lineData = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let method = object["method"] as? String
+            else { return nil }
+            return RecordedRequest(method: method, params: object["params"] as? [String: Any] ?? [:])
+        }
+    }
+
     private struct RecordedDiscoveryRequest {
         let method: String
         let params: [String: Any]
@@ -595,6 +667,69 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
                 result = {}
             else:
                 result = {"configOptions": post_mutation_options()}
+        else:
+            result = {}
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+    """#
+
+    /// Capture-faithful headless fixture: bootstrap advertises `model` + `mode` (including the
+    /// managed headless mode) but NO `effort`; effort appears only after a model set, and its
+    /// current value tracks the last applied effort so the mutation can be confirmed.
+    private static let headlessPinServerScript = #"""
+    #!/usr/bin/env python3
+    import json
+    import os
+    import sys
+
+    model = "ollama-cloud/kimi-k3"
+    mode = "repoprompt_headless"
+    effort = "max"
+
+    MODELS = [("ollama-cloud/kimi-k3", "Kimi K3"), ("anthropic/claude-sonnet", "Claude Sonnet")]
+    EFFORT_CHOICES = [("low", "Low"), ("medium", "Medium"), ("high", "High"), ("max", "Max")]
+
+    def selector(id, name, category, current, choices):
+        return {"id": id, "name": name, "category": category, "type": "select",
+                "currentValue": current, "options": [{"value": v, "name": n} for v, n in choices]}
+
+    def options():
+        return [
+            selector("model", "Model", "model", model, MODELS),
+            selector("mode", "Mode", "mode", mode, [("build", "Build"), ("repoprompt_headless", "Headless")]),
+            selector("effort", "Effort", "thought_level", effort, EFFORT_CHOICES),
+        ]
+
+    for line in sys.stdin:
+        request = json.loads(line)
+        record_path = os.environ.get("ACP_RECORD_PATH")
+        if record_path:
+            with open(record_path, "a") as record:
+                record.write(json.dumps(request) + "\n")
+        request_id = request.get("id")
+        if request_id is None:
+            continue
+        method = request.get("method")
+        params = request.get("params", {})
+        if method == "initialize":
+            result = {"agentCapabilities": {}}
+        elif method == "session/new":
+            result = {"sessionId": "opencode-headless-pin", "configOptions": [
+                selector("model", "Model", "model", model, MODELS),
+                selector("mode", "Mode", "mode", mode, [("build", "Build"), ("repoprompt_headless", "Headless")]),
+            ]}
+        elif method == "session/set_config_option":
+            config_id = params.get("configId")
+            if config_id == "model":
+                model = params.get("value", model)
+            elif config_id == "effort":
+                effort = params.get("value", effort)
+            result = {"configOptions": options()}
+        elif method == "session/prompt":
+            print(json.dumps({"jsonrpc": "2.0", "method": "session/update",
+                              "params": {"sessionId": "opencode-headless-pin", "update": {
+                                  "sessionUpdate": "agent_message_chunk",
+                                  "content": {"type": "text", "text": "pong"}}}}), flush=True)
+            result = {"stopReason": "end_turn"}
         else:
             result = {}
         print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
