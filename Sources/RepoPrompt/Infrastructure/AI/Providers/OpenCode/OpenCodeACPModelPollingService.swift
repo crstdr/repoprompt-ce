@@ -147,13 +147,31 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
 struct OpenCodeACPModelParameterKey: Hashable {
     let workspacePath: String?
     let canonicalBaseModelRaw: String
+    /// The model string as requested, preserved verbatim for protocol use. The canonical form is
+    /// lower-cased for comparison and must never reach the wire: the probe sets this model on the
+    /// session, and an installation whose model IDs are case-sensitive would be sent an alias that
+    /// does not exist — the parameter would never be advertised and the control would never
+    /// appear, for that install only. Identity deliberately excludes this field, so two spellings
+    /// of one model still share an observation.
+    let wireModelRaw: String
 
     init(workspacePath: String?, modelRaw: String) {
         self.workspacePath = Self.normalizedWorkspacePath(workspacePath)
+        wireModelRaw = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         canonicalBaseModelRaw = ACPModelParameterIdentity.canonicalBaseModelRaw(
             modelRaw,
             providerID: .openCode
         )
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.workspacePath == rhs.workspacePath
+            && lhs.canonicalBaseModelRaw == rhs.canonicalBaseModelRaw
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(workspacePath)
+        hasher.combine(canonicalBaseModelRaw)
     }
 
     /// The single workspace normalization every (service, resolver, composer) key comparison
@@ -536,8 +554,8 @@ actor OpenCodeACPModelPollingService {
         enqueueJob(jobKey)
     }
 
-    /// Probe parameter observations for a workspace (invoked by `refreshNow`, an explicit
-    /// one-shot user request). Owned keys re-probe; unowned keys are pruned instead.
+    /// Re-probe the owned parameter observations for a workspace, driven by `refreshNow`'s
+    /// explicit catalog refresh. Owned keys re-probe; unowned keys are pruned instead.
     private func refreshParameterObservations(for workspace: String?) {
         guard !isShutdown else { return }
         for (key, observation) in observations where key.workspacePath == workspace {
@@ -653,7 +671,7 @@ actor OpenCodeACPModelPollingService {
         }
 
         var wireModelRaw: String? {
-            parameterKey?.canonicalBaseModelRaw
+            parameterKey?.wireModelRaw
         }
 
         var workspacePath: String? {

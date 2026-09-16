@@ -1783,12 +1783,29 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     /// Set or clear the Context Builder agent's OpenCode effort pin, persisting the displayed
     /// agent+model choice atomically so the pin stays eligible. The displayed choice is
     /// re-derived from the live selection at write time.
+    /// The scope a Context Builder pin write lands in. Surfaces capture this at render time and
+    /// hand it back, so a menu opened against one scope cannot write into another after an
+    /// inheritance change — provider/model can stay identical across that switch, because a new
+    /// workspace override profile starts as a copy of the global one.
+    var contextBuilderEditingScope: AgentModelsEditingScope {
+        if let workspaceID = currentWorkspaceID,
+           settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        {
+            .workspace(workspaceID)
+        } else {
+            .global
+        }
+    }
+
     func setContextBuilderModelParameter(
         _ selections: [ACPModelParameterSelection]?,
         expectedProviderID: ACPProviderID,
-        expectedModelRaw: String
+        expectedModelRaw: String,
+        expectedScope: AgentModelsEditingScope
     ) {
-        guard let providerID = selectedAgent.acpProviderID,
+        let scope = contextBuilderEditingScope
+        guard scope == expectedScope,
+              let providerID = selectedAgent.acpProviderID,
               providerID == expectedProviderID,
               ACPModelParameterIdentity.canonicalBaseModelRaw(
                   selectedModelRaw,
@@ -1798,13 +1815,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                   providerID: providerID
               )
         else { return }
-        let scope: AgentModelsEditingScope = if let workspaceID = currentWorkspaceID,
-                                                settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
-        {
-            .workspace(workspaceID)
-        } else {
-            .global
-        }
         settingsManager.setAgentModelsContextBuilderModelParameter(
             selections,
             agentRaw: selectedAgent.rawValue,

@@ -296,8 +296,10 @@ enum MCPAgentRoleDefaultsService {
     /// `displayed` is the selection the surface is showing. Persisting it as the override
     /// together with the pin is what keeps the pin eligible: a pin written against a merely
     /// recommended (not overridden) model would be dropped by profile normalization the moment
-    /// it is saved. `selections == nil` clears the pin while still persisting the displayed
-    /// choice.
+    /// it is saved. `selections == nil` clears only the pin, and only when the stored bucket
+    /// belongs to `displayed` — it never writes the override, so re-picking the already-checked
+    /// "Default" cannot make a recommendation-tracking role durable, nor delete a pin retained
+    /// for a different model.
     static func setModelParameter(
         _ selections: [ACPModelParameterSelection]?,
         for role: AgentModelCatalog.TaskLabelKind,
