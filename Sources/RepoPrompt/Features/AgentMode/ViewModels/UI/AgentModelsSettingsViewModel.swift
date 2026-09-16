@@ -340,22 +340,14 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     func additionalOracleModelDestination(at index: Int) -> ModelDestination {
-        // Capture the lane's displayed value alongside its index. This applier is handed to a
-        // model picker that can stay open across a refresh, and an index alone is not an
-        // identity: if the roster is reordered or shortened meanwhile, the index still validates
-        // but now names a different lane. The staleness guard in `updateSelectedProfile` cannot
-        // catch that on its own — by the time the menu item fires, cache and store agree again.
-        let expectedRaw = additionalOracleModelRaws.indices.contains(index)
-            ? additionalOracleModelRaws[index]
-            : nil
-        return ModelDestination(
+        ModelDestination(
             id: "agentModels.oracle.additional.\(index)",
             getter: { [weak self] in
                 guard let self, additionalOracleModelRaws.indices.contains(index) else { return "" }
                 return additionalOracleModelRaws[index]
             },
             applier: { [weak self] rawValue in
-                self?.setAdditionalOracleModel(raw: rawValue, at: index, expecting: expectedRaw)
+                self?.setAdditionalOracleModel(raw: rawValue, at: index)
             }
         )
     }
@@ -403,11 +395,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         }
     }
 
-    /// - Parameter expectedRaw: the value this lane displayed when the action was constructed.
-    ///   Supplied by deferred callers so a retained picker cannot retarget a reordered roster.
-    func setAdditionalOracleModel(raw: String, at index: Int, expecting expectedRaw: String? = nil) {
+    func setAdditionalOracleModel(raw: String, at index: Int) {
         guard additionalOracleModelRaws.indices.contains(index) else { return }
-        if let expectedRaw, additionalOracleModelRaws[index] != expectedRaw { return }
         updateSelectedProfile(reason: "agent_models.oracle_model") { profile in
             profile.additionalOracleModelRaws[index] = raw
         }
