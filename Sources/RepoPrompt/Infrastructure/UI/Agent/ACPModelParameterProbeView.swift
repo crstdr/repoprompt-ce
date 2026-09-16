@@ -74,7 +74,36 @@ struct ACPModelParameterProbeView: View {
     }
 
     var body: some View {
-        Group {
+        HStack(spacing: 0) {
+            // Always-present zero-size host for the discovery task.
+            //
+            // The task CANNOT hang off the chip's own conditional. With no saved pin and no
+            // metadata yet, that conditional collapses to nil content, which SwiftUI gives no
+            // render node — `.task` is then never scheduled, so the chip can never acquire the
+            // metadata that would make it appear. Verified in isolation: `.task` on a `Group`
+            // wrapping nil content does not fire, while this zero-size host does.
+            Color.clear
+                .frame(width: 0, height: 0)
+                .task(id: probeKey) {
+                    snapshot = nil
+                    guard let probeKey, let probedModelRaw else { return }
+                    let stream = await OpenCodeACPModelPollingService.shared.subscribeModelParameters(
+                        workspacePath: probeKey.workspacePath,
+                        modelRaw: probedModelRaw
+                    )
+                    for await delivered in stream {
+                        // Cancellation is checked explicitly: a cancelled task's body still runs
+                        // to its next suspension, so an in-flight delivery could otherwise land
+                        // after the target changed and stick until the next remount.
+                        guard !Task.isCancelled else { return }
+                        // Canonical-key identity, not raw spellings: a foreign or stale delivery
+                        // is skipped, never allowed to overwrite this target's held observation.
+                        guard delivered.key == probeKey else { continue }
+                        guard !Task.isCancelled else { return }
+                        snapshot = delivered
+                    }
+                }
+
             if definition != nil || pinnedValueRaw != nil {
                 ACPModelParameterPinChip(
                     definition: definition,
@@ -82,25 +111,6 @@ struct ACPModelParameterProbeView: View {
                     isEnabled: isEnabled,
                     onSelect: onSelect
                 )
-            }
-        }
-        .task(id: probeKey) {
-            snapshot = nil
-            guard let probeKey, let probedModelRaw else { return }
-            let stream = await OpenCodeACPModelPollingService.shared.subscribeModelParameters(
-                workspacePath: probeKey.workspacePath,
-                modelRaw: probedModelRaw
-            )
-            for await delivered in stream {
-                // Cancellation is checked explicitly: a cancelled task's body still runs to its
-                // next suspension, so an in-flight delivery could otherwise land after the
-                // target changed and stick until the next remount.
-                guard !Task.isCancelled else { return }
-                // Canonical-key identity, not raw spellings: a foreign or stale delivery is
-                // skipped, never allowed to overwrite this target's held observation.
-                guard delivered.key == probeKey else { continue }
-                guard !Task.isCancelled else { return }
-                snapshot = delivered
             }
         }
     }
