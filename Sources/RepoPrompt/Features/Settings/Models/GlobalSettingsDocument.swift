@@ -337,7 +337,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         var coherent: [String: [ACPModelParameterSelection]] = [:]
         for rawKey in buckets.keys.sorted() {
             guard let key = trimmedNonEmpty(rawKey),
-                  let selectionID = roleOverrides?[rawKey].flatMap(AgentModelSelectionID.parse),
+                  let selectionID = roleOverrides?[key].flatMap(AgentModelSelectionID.parse),
                   let providerID = AgentProviderKind(rawValue: selectionID.agentRaw)?.acpProviderID,
                   let selections = buckets[rawKey]
             else { continue }
@@ -363,7 +363,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         for rawKey in buckets.keys.sorted() {
             guard let key = trimmedNonEmpty(rawKey),
                   let providerID = AgentProviderKind(rawValue: key)?.acpProviderID,
-                  let modelRaw = modelsByAgent?[rawKey],
+                  let modelRaw = modelsByAgent?[key],
                   let selections = buckets[rawKey]
             else { continue }
             let matching = ACPModelParameterSelection.selections(

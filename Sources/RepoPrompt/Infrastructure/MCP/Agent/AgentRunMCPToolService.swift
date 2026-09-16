@@ -564,13 +564,13 @@ struct AgentRunMCPToolService {
             )
             // A role-label start inherits the role's stored pin as a baseline, captured with the
             // role resolution above (never re-read after awaited setup). Explicit request
-            // parameters override matching identities; a compound model_id inherits nothing.
-            modelParameterSelections = selection.taskLabelKind == nil
-                ? explicitModelParameterSelections
-                : AgentMCPModelParameterSupport.merged(
-                    inherited: selection.modelParameterSelections,
-                    explicit: explicitModelParameterSelections
-                )
+            // parameters override matching identities; a compound
+            // model_id inherits nothing, because the resolver hands back no baseline for one — which
+            // is why the merge needs no role check here.
+            modelParameterSelections = AgentMCPModelParameterSupport.merged(
+                inherited: selection.modelParameterSelections,
+                explicit: explicitModelParameterSelections
+            )
         } catch {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error

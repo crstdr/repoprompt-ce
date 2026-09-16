@@ -885,11 +885,6 @@ struct AgentModelsSettingsView: View {
         .buttonStyle(.plain)
         .disabled(onNavigate == nil)
     }
-
-    // Translate a chip selection into a stored pin. The chip passes the chosen value, or nil to
-    // clear; `configID` comes from the live definition the chip rendered, falling back to the
-    // advertised `effort` key when metadata is unavailable (so an unadvertised saved value can
-    // still be cleared).
 }
 
 // Preview intentionally omitted: the view requires full PromptViewModel /

@@ -449,9 +449,6 @@ struct AgentModelsPopoverView: View {
         }
     }
 
-    // Translate a chip selection into a stored pin using the advertised `configID` — never an
-    // assumed `"effort"` key. nil value clears.
-
     @ViewBuilder
     private func roleDefaultPinState(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution

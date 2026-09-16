@@ -819,9 +819,6 @@ struct ContextBuilderAgentView: View {
         }
     }
 
-    // Translate a chip selection into a stored pin using the advertised `configID` — never an
-    // assumed `"effort"` key. nil value clears.
-
     private var headerSection: some View {
         Group {
             HStack(spacing: 8) {

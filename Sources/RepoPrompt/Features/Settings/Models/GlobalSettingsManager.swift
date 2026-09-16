@@ -2208,16 +2208,6 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
 
     /// Updates global MCP Agent Mode role-default overrides.
     /// Empty dictionaries are normalized to nil.
-    func updateGlobalMCPAgentRoleOverrides(_ overrides: [String: String]?, commit: Bool = true) {
-        let globalDefaultsBeforeMutation = globalDefaults
-        globalDefaults.mcpAgentRoleOverrides = Self.normalizedMCPAgentRoleOverrides(overrides)
-        let globalDefaultsChanged = globalDefaultsBeforeMutation != globalDefaults
-        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: commit)
-        if globalDefaultsChanged {
-            postAgentModelsSettingsDidChange(scope: .global)
-        }
-    }
-
     // MARK: - Recommendation Provider Filter (Global)
 
     /// Returns the global provider filter for recommendation generation. Absence means all providers.

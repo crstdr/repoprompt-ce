@@ -700,13 +700,13 @@ struct AgentManageMCPToolService {
             )
             // A role-label create inherits the role's stored pin as a baseline, captured with
             // the role resolution above. Explicit request parameters override matching
-            // identities; a compound model_id inherits nothing.
-            let modelParameterSelections = selection.taskLabelKind == nil
-                ? explicitModelParameterSelections
-                : AgentMCPModelParameterSupport.merged(
-                    inherited: selection.modelParameterSelections,
-                    explicit: explicitModelParameterSelections
-                )
+            // identities; a compound
+            // model_id inherits nothing, because the resolver hands back no baseline for one — which
+            // is why the merge needs no role check here.
+            let modelParameterSelections = AgentMCPModelParameterSupport.merged(
+                inherited: selection.modelParameterSelections,
+                explicit: explicitModelParameterSelections
+            )
             try agentModeVM.requireCurrentMCPWorkspaceTarget(
                 target,
                 expectedWorkspaceID: workspace.id
@@ -858,13 +858,13 @@ struct AgentManageMCPToolService {
                 oneShot: openCodeOneShotObservationProvider
             )
             // A role-label resume inherits the role's stored pin as a baseline. Explicit request
-            // parameters override matching identities; a compound model_id inherits nothing.
-            let modelParameterSelections = selection.taskLabelKind == nil
-                ? explicitModelParameterSelections
-                : AgentMCPModelParameterSupport.merged(
-                    inherited: selection.modelParameterSelections,
-                    explicit: explicitModelParameterSelections
-                )
+            // parameters override matching identities; a compound
+            // model_id inherits nothing, because the resolver hands back no baseline for one — which
+            // is why the merge needs no role check here.
+            let modelParameterSelections = AgentMCPModelParameterSupport.merged(
+                inherited: selection.modelParameterSelections,
+                explicit: explicitModelParameterSelections
+            )
             // Resume adopts the live session's existing control registration. Re-registering the
             // same persistent session expires in-flight waiters and splits poll state from the UI.
             #if DEBUG
