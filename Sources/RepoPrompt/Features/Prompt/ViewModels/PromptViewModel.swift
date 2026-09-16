@@ -831,6 +831,17 @@ class PromptViewModel: ObservableObject {
     ///
     /// Guarded write: the captured scope/provider/model must still match live host state, so a
     /// stale menu cannot write to a scope or model that has since changed.
+    /// **Known gap (accepted):** the scope is read live, but ``contextBuilderAgentModelRaw``
+    /// is a cached `@Published` refreshed from a notification delivered on a later runloop turn.
+    /// If another surface changes the Context Builder model between this menu being rendered and
+    /// clicked, the guard compares against the stale model, passes, and the write commits that
+    /// stale model alongside the pin — reverting the model choice made elsewhere.
+    ///
+    /// Not fixed here because the displayed selection may legitimately differ from the persisted
+    /// one (pinning an availability fallback is deliberate), so the correction is to re-run this
+    /// view model's own display resolution against current store state, not to compare against
+    /// the persisted model. Requires a cross-surface model change while a menu is open; the
+    /// damage is a reverted model choice, not a lost pin.
     func setContextBuilderModelParameter(
         _ selections: [ACPModelParameterSelection]?,
         expectedProviderID: ACPProviderID,
