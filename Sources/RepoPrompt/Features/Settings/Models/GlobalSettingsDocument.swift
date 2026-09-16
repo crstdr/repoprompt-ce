@@ -395,9 +395,10 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         )
     }
 
-    /// Whether a stored bucket belongs to the selection currently on screen. Clearing a pin uses
-    /// the same model-scoped rule as reading one, so a displayed availability fallback can never
-    /// delete intent retained for a different model.
+    /// Whether a stored **role** bucket belongs to the selection currently on screen. Clearing a
+    /// role pin uses the same model-scoped rule as reading one, so a displayed availability
+    /// fallback can never delete intent retained for a different model. Context Builder has a
+    /// stricter rule and clears through `contextBuilderModelParameterSelections` instead.
     private static func bucketBelongsToDisplayedSelection(
         _ bucket: [ACPModelParameterSelection]?,
         agentRaw: String,
@@ -486,12 +487,19 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         var pins = next.contextBuilderModelParametersByAgent ?? [:]
         if let selections, !selections.isEmpty {
             pins[resolvedAgentRaw] = ACPModelParameterSelection.normalized(selections)
-        } else if Self.bucketBelongsToDisplayedSelection(
-            pins[resolvedAgentRaw],
-            agentRaw: resolvedAgentRaw,
-            modelRaw: modelRaw
-        ) {
-            // Same displayed-model scoping as the role bucket above.
+        } else if let resolvedAgent = AgentProviderKind(rawValue: resolvedAgentRaw),
+                  !contextBuilderModelParameterSelections(
+                      for: resolvedAgent,
+                      modelRaw: modelRaw
+                  ).isEmpty
+        {
+            // Clear through the *read* predicate, not a parallel copy of it. Context Builder
+            // eligibility is stricter than the role rule: it also requires the bucket's agent to
+            // be the persisted Context Builder agent, because buckets for other agents are
+            // deliberately retained as per-agent memory. Re-deriving that here would be a second
+            // owner of the rule, and the first attempt at it missed exactly this condition — a
+            // Default click on a displayed availability fallback deleted a bucket invisible to
+            // every read and run.
             pins[resolvedAgentRaw] = nil
         }
         next.contextBuilderModelParametersByAgent = pins.isEmpty ? nil : pins
