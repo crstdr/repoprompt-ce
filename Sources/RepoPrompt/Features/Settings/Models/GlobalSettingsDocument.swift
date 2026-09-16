@@ -395,6 +395,23 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         )
     }
 
+    /// Whether a stored bucket belongs to the selection currently on screen. Clearing a pin uses
+    /// the same model-scoped rule as reading one, so a displayed availability fallback can never
+    /// delete intent retained for a different model.
+    private static func bucketBelongsToDisplayedSelection(
+        _ bucket: [ACPModelParameterSelection]?,
+        agentRaw: String,
+        modelRaw: String
+    ) -> Bool {
+        guard let bucket, !bucket.isEmpty else { return false }
+        guard let providerID = AgentProviderKind(rawValue: agentRaw)?.acpProviderID else { return false }
+        return !ACPModelParameterSelection.selections(
+            for: providerID,
+            activeBaseModelRaw: modelRaw,
+            from: bucket
+        ).isEmpty
+    }
+
     func replacingContextBuilderModel(_ modelRaw: String?, for agentRaw: String?) -> AgentModelsSettingsProfile {
         let resolvedAgentRaw = Self.normalizedAgentRaw(agentRaw) ?? contextBuilderAgentRaw
         guard let resolvedAgentRaw else { return self }
@@ -433,7 +450,15 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         var pins = next.mcpAgentRoleModelParameters ?? [:]
         if let selections, !selections.isEmpty {
             pins[roleRawValue] = ACPModelParameterSelection.normalized(selections)
-        } else {
+        } else if Self.bucketBelongsToDisplayedSelection(
+            pins[roleRawValue],
+            agentRaw: displayedSelectionID.agentRaw,
+            modelRaw: displayedSelectionID.modelRaw
+        ) {
+            // Clearing is scoped to the displayed model, exactly as reading is. A role whose
+            // stored model is currently unavailable displays a recommended fallback, so
+            // "Default" is already checked there — selecting it must not delete the pin that is
+            // still retained for the model the user actually chose.
             pins[roleRawValue] = nil
         }
         next.mcpAgentRoleModelParameters = pins.isEmpty ? nil : pins
@@ -461,7 +486,12 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         var pins = next.contextBuilderModelParametersByAgent ?? [:]
         if let selections, !selections.isEmpty {
             pins[resolvedAgentRaw] = ACPModelParameterSelection.normalized(selections)
-        } else {
+        } else if Self.bucketBelongsToDisplayedSelection(
+            pins[resolvedAgentRaw],
+            agentRaw: resolvedAgentRaw,
+            modelRaw: modelRaw
+        ) {
+            // Same displayed-model scoping as the role bucket above.
             pins[resolvedAgentRaw] = nil
         }
         next.contextBuilderModelParametersByAgent = pins.isEmpty ? nil : pins

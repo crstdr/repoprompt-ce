@@ -845,6 +845,7 @@ struct ContextBuilderAgentView: View {
 
                 if let providerID = viewModel.selectedAgent.acpProviderID {
                     let expectedModelRaw = viewModel.selectedModelRaw
+                    let expectedScope = viewModel.contextBuilderEditingScope
                     ACPModelParameterProbeView(
                         modelRaw: expectedModelRaw,
                         providerID: providerID,
@@ -863,7 +864,8 @@ struct ContextBuilderAgentView: View {
                                 modelRaw: expectedModelRaw
                             ),
                             expectedProviderID: providerID,
-                            expectedModelRaw: expectedModelRaw
+                            expectedModelRaw: expectedModelRaw,
+                            expectedScope: expectedScope
                         )
                     }
                 }
