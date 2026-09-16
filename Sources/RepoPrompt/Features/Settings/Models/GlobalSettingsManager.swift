@@ -740,12 +740,18 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         // do. With `.preserveExistingOwnership` the global ownership flag stays false, automatic
         // recommendation application stays eligible, it moves the Context Builder model, and
         // profile coherence then drops the bucket — silently erasing the pin the user just set.
+        // Skip a no-op. `.userInitiated` claims user ownership of the Context Builder defaults,
+        // so writing it for a click that changes nothing would silently revoke automatic
+        // recommendation eligibility.
+        let current = agentModelsProfile(for: scope)
+        let next = current.replacingContextBuilderModelParameter(
+            selections,
+            for: agentRaw,
+            modelRaw: modelRaw
+        )
+        guard next != current else { return }
         updateAgentModelsProfile(scope: scope, contextBuilderWriteIntent: .userInitiated) { profile in
-            profile = profile.replacingContextBuilderModelParameter(
-                selections,
-                for: agentRaw,
-                modelRaw: modelRaw
-            )
+            profile = next
         }
     }
 
@@ -2003,6 +2009,15 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     /// Builder agent, MCP role overrides, recommendation provider filter) so any change
     /// propagates to every observing window; route all `globalDefaults` mutations through here.
     private func persistGlobalDefaultsChange(before: GlobalDefaults, commit: Bool) {
+        // Direct `globalDefaults` writers (the legacy Context Builder selection setters, reached
+        // from `app_settings` and window settings) bypass profile normalization. Normalization
+        // only *masks* a pin whose model no longer matches, so the stale bucket would survive in
+        // backing state and resurrect if the user later switched back to that model. Re-derive
+        // the buckets through the profile, which is the single owner of the coherence rule —
+        // rather than restating that rule here.
+        let coherent = globalAgentModelsProfile()
+        globalDefaults.mcpAgentRoleModelParameters = coherent.mcpAgentRoleModelParameters
+        globalDefaults.contextBuilderModelParametersByAgent = coherent.contextBuilderModelParametersByAgent
         if before != globalDefaults {
             objectWillChange.send()
         }

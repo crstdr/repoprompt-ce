@@ -28,6 +28,13 @@ enum AgentMCPSelectionResolver {
         /// The role's stored OpenCode effort pin captured *with* the role resolution, so a
         /// caller inherits a baseline without re-reading the profile after awaited setup. Empty
         /// for compound IDs and non-role selections.
+        ///
+        /// ⚠️ Every launch path that consumes a `ResolvedSelection` must also deliver this to the
+        /// session before the run starts — via `mcpStageModelParameterSelections` (`agent_run`
+        /// start, `agent_explore` start) or `mcpConfigureSession`/`mcpApplyModelParameterSelections`
+        /// (`agent_manage` create/resume). Resolving it and forwarding only agent/model silently
+        /// drops the user's choice and runs at the provider default; `agent_explore` shipped that
+        /// bug. Capture it with the resolution — never re-read role settings after awaited setup.
         let modelParameterSelections: [ACPModelParameterSelection]
     }
 
