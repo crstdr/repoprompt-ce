@@ -763,12 +763,18 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         displayedSelectionID: AgentModelSelectionID,
         scope: AgentModelsEditingScope
     ) {
+        // Skip a no-op, matching the Context Builder setter. Now that clearing is scoped to the
+        // displayed model, re-picking an already-checked "Default" on a recommendation-tracking
+        // role produces an identical profile — writing and broadcasting it would be pure churn.
+        let current = agentModelsProfile(for: scope)
+        let next = current.replacingRoleModelParameter(
+            selections,
+            for: roleRawValue,
+            displayedSelectionID: displayedSelectionID
+        )
+        guard next != current else { return }
         updateAgentModelsProfile(scope: scope) { profile in
-            profile = profile.replacingRoleModelParameter(
-                selections,
-                for: roleRawValue,
-                displayedSelectionID: displayedSelectionID
-            )
+            profile = next
         }
     }
 
