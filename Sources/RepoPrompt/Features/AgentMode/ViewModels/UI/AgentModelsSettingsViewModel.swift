@@ -518,7 +518,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             scope: editingScope
         )
         reloadScopedState()
-        refresh()
+        // `postAgentRoleDefaultsChanged()` already refreshes; calling it here too is dead weight.
         postAgentRoleDefaultsChanged()
     }
 
@@ -763,7 +763,28 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership,
         _ mutation: (inout AgentModelsSettingsProfile) -> Void
     ) {
-        var profile = profileSnapshot
+        // Base the mutation on the LIVE scoped profile, not the notification-fed cache.
+        //
+        // `persistSelectedProfile` replaces the whole profile, including the pin buckets. Those
+        // are also written by store-direct setters (the popover, MCP, recommendations) that post
+        // a change notification this view model only receives on a later runloop turn. Starting
+        // from the stale cache in that window would persist a profile that never contained a pin
+        // just written elsewhere — or restore one just cleared — with coherence then dropping the
+        // bucket. Any unrelated Settings edit would silently undo someone else's pin.
+        //
+        // This deliberately does NOT call `reloadScopedState()`: that also reassigns the
+        // published toggle properties from the store, and the toggles' `didSet` handlers read
+        // those same properties when building their mutation — so reloading here would overwrite
+        // the user's new value with the old one before the closure ran. Re-derive the profile
+        // only, through the same helpers the reload uses, so there is still one owner of the rule.
+        var profile = Self.profile(
+            settingsManager: settingsManager,
+            workspaceID: workspaceID,
+            inheritanceMode: Self.inheritanceMode(
+                settingsManager: settingsManager,
+                workspaceID: workspaceID
+            )
+        )
         mutation(&profile)
         persistSelectedProfile(
             profile,
