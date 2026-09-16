@@ -707,14 +707,18 @@ actor ACPAgentSessionController {
         settlePromptTurn(promptTurnID, result: .success(()))
     }
 
-    func setSessionModel(_ rawModel: String) async throws {
+    /// Apply a selected model. `forceRPC` bypasses the same-model no-op skip for providers that
+    /// only advertise model-scoped parameter metadata (e.g. OpenCode `effort`) *after* a model
+    /// set; callers with pending parameter selections pass `true` so the metadata is advertised
+    /// before the selections are applied.
+    func setSessionModel(_ rawModel: String, forceRPC: Bool = false) async throws {
         try await configurationMutationMutex.withLock { [weak self] in
             guard let self else { throw CancellationError() }
-            try await setSessionModelSerialized(rawModel)
+            try await setSessionModelSerialized(rawModel, forceRPC: forceRPC)
         }
     }
 
-    private func setSessionModelSerialized(_ rawModel: String) async throws {
+    private func setSessionModelSerialized(_ rawModel: String, forceRPC: Bool = false) async throws {
         guard let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
@@ -867,7 +871,7 @@ actor ACPAgentSessionController {
             {
                 return
             }
-            try await setSessionModelViaConfigOptionsRPC(model, sessionID: sessionID, forceRPC: false)
+            try await setSessionModelViaConfigOptionsRPC(model, sessionID: sessionID, forceRPC: forceRPC)
         }
     }
 

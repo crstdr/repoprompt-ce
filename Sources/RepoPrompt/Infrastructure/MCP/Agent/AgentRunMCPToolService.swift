@@ -556,12 +556,21 @@ struct AgentRunMCPToolService {
             runParameterWorkspacePath = try agentModeVM.session(for: target.tabID, createIfNeeded: false)
                 .flatMap { try agentModeVM.effectiveWorkspacePath(for: $0) }
                 ?? workspace.repoPaths.first
-            modelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
+            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
                 value: args["model_parameters"],
                 agent: selection.agentRaw.flatMap { AgentProviderKind(rawValue: $0) },
                 modelRaw: selection.modelRaw,
                 workspacePath: runParameterWorkspacePath
             )
+            // A role-label start inherits the role's stored pin as a baseline, captured with the
+            // role resolution above (never re-read after awaited setup). Explicit request
+            // parameters override matching identities; a compound model_id inherits nothing.
+            modelParameterSelections = selection.taskLabelKind == nil
+                ? explicitModelParameterSelections
+                : AgentMCPModelParameterSupport.merged(
+                    inherited: selection.modelParameterSelections,
+                    explicit: explicitModelParameterSelections
+                )
         } catch {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error

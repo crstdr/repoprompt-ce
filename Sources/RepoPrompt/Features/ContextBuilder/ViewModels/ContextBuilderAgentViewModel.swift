@@ -121,7 +121,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     typealias ProviderFactory = (
         _ agent: AgentProviderKind,
         _ modelString: String?,
-        _ workspacePath: String?
+        _ workspacePath: String?,
+        _ modelParameterSelections: [ACPModelParameterSelection]
     ) -> HeadlessAgentProvider
 
     private func debugLog(_ message: @autoclosure () -> String) {
@@ -1034,6 +1035,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         workspaceManager?.activeWorkspace?.repoPaths.first
     }
 
+    /// Execution root for the Context Builder effort chooser's demand-scoped probe.
+    /// Worktree-aware only during a run; the chooser edits future configuration, so the active
+    /// workspace root is the honest preview context (the composer's fallback tier).
+    var chooserProbeWorkspacePath: String? {
+        currentWorkspacePath
+    }
+
     /// Track which agents are running (for cleanup)
     private var activeAgentRuns: Set<UUID> = []
 
@@ -1063,11 +1071,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         self.oracleViewModel = oracleViewModel
         self.settingsManager = settingsManager
         self.codexModelPollingService = codexModelPollingService
-        self.providerFactory = providerFactory ?? { agent, modelString, workspacePath in
+        self.providerFactory = providerFactory ?? { agent, modelString, workspacePath, modelParameterSelections in
             AgentRuntimeProviderService.shared.makeProvider(
                 for: agent,
                 modelString: modelString,
-                workspacePath: workspacePath
+                workspacePath: workspacePath,
+                modelParameterSelections: modelParameterSelections
             )
         }
         refreshAvailableAgents()
@@ -1771,6 +1780,62 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         updateDynamicModelPolling(startCursorPolling: false)
     }
 
+    /// Set or clear the Context Builder agent's OpenCode effort pin, persisting the displayed
+    /// agent+model choice atomically so the pin stays eligible. The displayed choice is
+    /// re-derived from the live selection at write time.
+    func setContextBuilderModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        expectedProviderID: ACPProviderID,
+        expectedModelRaw: String
+    ) {
+        guard let providerID = selectedAgent.acpProviderID,
+              providerID == expectedProviderID,
+              ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  selectedModelRaw,
+                  providerID: providerID
+              ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  expectedModelRaw,
+                  providerID: providerID
+              )
+        else { return }
+        let profile = settingsManager.effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
+            .replacingContextBuilderModelParameter(
+                selections,
+                for: selectedAgent.rawValue,
+                modelRaw: selectedModelRaw
+            )
+        let wroteWorkspaceID: UUID? = if let workspaceID = currentWorkspaceID,
+                                         settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        {
+            workspaceID
+        } else {
+            nil
+        }
+        if let wroteWorkspaceID {
+            settingsManager.setWorkspaceAgentModelsProfile(workspaceID: wroteWorkspaceID, profile: profile)
+        } else {
+            settingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: .userInitiated
+            )
+        }
+    }
+
+    /// The saved `.thinking` pin value for the current Context Builder selection, if any. The
+    /// chip's saved-state input.
+    var contextBuilderThinkingParameterValueRaw: String? {
+        contextBuilderModelParameters.last { $0.kind == .thinking }?.valueRaw
+    }
+
+    /// The saved OpenCode effort pin for the **displayed** Context Builder selection. Display
+    /// and probe must agree with the model the chip is mounted for (`selectedModelRaw`), which
+    /// availability fallback can make differ from the persisted choice without writing back.
+    var contextBuilderModelParameters: [ACPModelParameterSelection] {
+        settingsManager
+            .effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
+            .contextBuilderModelParameterSelections(for: selectedAgent, modelRaw: selectedModelRaw)
+    }
+
     /// Update the effective Agent Models profile's Context Builder selection.
     private func persistAgentModelToEffectiveProfile() {
         guard !isRestoringState else { return }
@@ -1922,7 +1987,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         return ContextBuilderResolvedRunAuthority(
             configuration: configuration,
             agentKind: selection.agent,
-            modelRaw: selection.modelRaw
+            modelRaw: selection.modelRaw,
+            modelParameterSelections: profile.contextBuilderModelParameterSelections(
+                for: selection.agent,
+                modelRaw: selection.modelRaw
+            )
         )
     }
 
@@ -2050,6 +2119,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     origin: .mcp(controlToken: mcpControlToken),
                     agentKind: runAgent,
                     modelRaw: runModelRaw,
+                    modelParameterSelections: authority.modelParameterSelections,
                     workspaceContext: workspaceContext,
                     mcpConfiguration: configuration,
                     continuation: continuation,
@@ -2162,11 +2232,22 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 generatedResponseAuthority: base.generatedResponseAuthority,
                 isSystemWorkspace: base.isSystemWorkspace
             )
+            let overrideAgentKind = agentOverride ?? resolved.agentKind
+            let overrideModelRaw = modelOverrideRaw ?? resolved.modelRaw
+            let overrideSelections = (agentOverride == nil && modelOverrideRaw == nil)
+                ? resolved.modelParameterSelections
+                : settingsManager
+                .effectiveAgentModelsProfile(workspaceID: identity.workspaceID)
+                .contextBuilderModelParameterSelections(
+                    for: overrideAgentKind,
+                    modelRaw: overrideModelRaw
+                )
             return try await runContextBuilderForMCP(
                 authority: ContextBuilderResolvedRunAuthority(
                     configuration: configuration,
-                    agentKind: agentOverride ?? resolved.agentKind,
-                    modelRaw: modelOverrideRaw ?? resolved.modelRaw
+                    agentKind: overrideAgentKind,
+                    modelRaw: overrideModelRaw,
+                    modelParameterSelections: overrideSelections
                 ),
                 instructionsOverride: instructionsOverride,
                 workspaceContext: workspaceContext,
@@ -2571,7 +2652,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             ownership: ownership,
             origin: .ui,
             agentKind: runAgent,
-            modelRaw: runModelRaw
+            modelRaw: runModelRaw,
+            modelParameterSelections: settingsManager
+                .effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
+                .contextBuilderModelParameterSelections(
+                    for: runAgent,
+                    modelRaw: runModelRaw
+                )
         )
 
         guard runRegistry.register(record) else {
@@ -2732,7 +2819,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let providerWorkspacePath = record.mcpConfiguration?.providerWorkspacePath
                 ?? record.workspaceContext?.providerWorkspacePath
                 ?? currentWorkspacePath
-            let provider = providerFactory(record.agentKind, modelString, providerWorkspacePath)
+            let provider = providerFactory(
+                record.agentKind,
+                modelString,
+                providerWorkspacePath,
+                record.modelParameterSelections
+            )
             guard record.installProvider(provider) else {
                 await provider.dispose()
                 await lease.failAndCleanup()

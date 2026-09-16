@@ -32,15 +32,6 @@ final class ACPIntegratedAgentModeRunner {
         let errorText: String?
     }
 
-    private struct StaleModelParameterSelectionError: LocalizedError {
-        let selections: [ACPModelParameterSelection]
-
-        var errorDescription: String? {
-            let values = selections.map { "\($0.configID)=\($0.valueRaw)" }.joined(separator: ", ")
-            return "The selected model settings are stale or unsupported for this ACP session: \(values). Refresh the model settings and try again."
-        }
-    }
-
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
@@ -630,7 +621,7 @@ final class ACPIntegratedAgentModeRunner {
 
                 try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
                 let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
-                try Self.validateModelParameterApplicationReport(parameterReport)
+                try parameterReport.validateNoSkippedSelections()
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
                 try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
                 setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
@@ -711,7 +702,7 @@ final class ACPIntegratedAgentModeRunner {
 
                 try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
                 let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
-                try Self.validateModelParameterApplicationReport(parameterReport)
+                try parameterReport.validateNoSkippedSelections()
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
                 try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
 
@@ -914,7 +905,15 @@ final class ACPIntegratedAgentModeRunner {
             return
         }
         log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
-        try await controller.setSessionModel(model)
+        // OpenCode advertises model-scoped parameter metadata (`effort`) only after a real model
+        // set. When a pin is inherited, the ordinary same-model no-op skip would leave `effort`
+        // unadvertised, the pin would land in `skipped`, and validation would throw before the
+        // prompt. Force the selector RPC for OpenCode whenever selections are pending; other ACP
+        // providers keep the skip. Covers fresh and continue runs (shared helper).
+        try await controller.setSessionModel(
+            model,
+            forceRPC: runRequest.agentKind == .openCode && !runRequest.modelParameterSelections.isEmpty
+        )
     }
 
     private static func explicitSelectedModel(
@@ -1803,7 +1802,7 @@ final class ACPIntegratedAgentModeRunner {
         static func testValidateModelParameterApplicationReport(
             _ report: ACPModelParameterApplicationReport
         ) throws {
-            try validateModelParameterApplicationReport(report)
+            try report.validateNoSkippedSelections()
         }
 
         static func testExplicitSelectedModel(
@@ -1813,14 +1812,6 @@ final class ACPIntegratedAgentModeRunner {
             try explicitSelectedModel(agentKind: agentKind, modelString: modelString)
         }
     #endif
-
-    private static func validateModelParameterApplicationReport(
-        _ report: ACPModelParameterApplicationReport
-    ) throws {
-        guard report.skipped.isEmpty else {
-            throw StaleModelParameterSelectionError(selections: report.skipped)
-        }
-    }
 
     // MARK: - Provider Stream Tool Event Handling
 
