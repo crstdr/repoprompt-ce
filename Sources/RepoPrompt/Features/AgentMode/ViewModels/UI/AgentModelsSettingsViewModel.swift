@@ -478,9 +478,17 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     /// atomically.
     ///
     /// Guarded write: the captured target (`expectedProviderID`/`expectedModelRaw`/`expectedScope`)
-    /// is re-checked against **live** host state before writing. The discovery key alone is
+    /// is re-checked against live host state before writing. The discovery key alone is
     /// insufficient — switching Settings global↔workspace leaves the key identical — so a stale
     /// menu click is dropped rather than written to the old scope or a changed model.
+    ///
+    /// The reload is what makes "live" true. `editingScope` and `profileSnapshot` are refreshed
+    /// from a notification delivered asynchronously, so between an external inheritance change
+    /// and its delivery this view model's cached view of the scope disagrees with the store that
+    /// other surfaces read directly. Writing on that stale scope does not merely land in the
+    /// wrong profile: the workspace branch of `updateAgentModelsProfile` sets
+    /// `inheritanceMode = .useWorkspaceOverrides`, so a stale click would silently re-enable
+    /// workspace overrides and undo the newer inheritance choice.
     func setRoleModelParameter(
         _ selections: [ACPModelParameterSelection]?,
         for role: AgentModelCatalog.TaskLabelKind,
@@ -488,6 +496,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         expectedModelRaw: String,
         expectedScope: AgentModelsEditingScope
     ) {
+        reloadScopedState()
         guard editingScope == expectedScope,
               let resolution = roleDefaultsResolutions.first(where: { $0.role == role }),
               resolution.effective.agent.acpProviderID == expectedProviderID,
@@ -525,6 +534,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         // Validate against — and write — the live DISPLAYED selection, which is what the chip is
         // mounted for. The write persists that displayed choice atomically with the pin, so
         // persisted and displayed agree after one click.
+        // Same reload-before-guard rule as `setRoleModelParameter`: both the scope and the
+        // displayed selection come from cached state that a pending notification has not yet
+        // refreshed.
+        reloadScopedState()
         let displayed = selectedContextBuilderSelection
         guard editingScope == expectedScope,
               let providerID = displayed.agent.acpProviderID,

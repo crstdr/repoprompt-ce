@@ -1924,7 +1924,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard openCodeModelsSubscriptionTask != nil,
               selectedAgent == .openCode,
               let tabID = currentTabID,
-              !selectedModelRaw.isEmpty,
+              // Trim to agree with the probe view, which trims before building its key. A
+              // whitespace-only model would otherwise pass here and fail inside discovery,
+              // leaving the control silently absent rather than unavailable.
+              !selectedModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let key = openCodeParameterDiscoveryKey(session: sessions[tabID], modelRaw: selectedModelRaw)
         else {
             cancelOpenCodeModelParameterObservation()
