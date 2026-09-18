@@ -368,6 +368,89 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertTrue(ContextBuilderAgentViewModel.test_shouldAdoptDiscoveredPreferredModel(for: .openCode))
     }
 
+    func testContextBuilderPinTargetRejectsStaleCrossSurfaceModelSelection() {
+        XCTAssertNil(ContextBuilderAgentViewModel.test_contextBuilderPinWriteSelection(
+            liveAgent: .cursor,
+            liveModelRaw: "composer-2.5",
+            expectedProviderID: .cursor,
+            expectedModelRaw: "grok-4.6"
+        ))
+
+        let current = ContextBuilderAgentViewModel.test_contextBuilderPinWriteSelection(
+            liveAgent: .cursor,
+            liveModelRaw: "grok-4.6",
+            expectedProviderID: .cursor,
+            expectedModelRaw: "Grok 4.6"
+        )
+        XCTAssertEqual(current?.agent, .cursor)
+        XCTAssertEqual(current?.modelRaw, "grok-4.6")
+    }
+
+    func testPromptViewModelContextBuilderPinRejectsStaleCrossSurfaceModelSelection() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PromptViewModelContextBuilderPinTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "PromptViewModelContextBuilderPinTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        )
+        let cursorAgentRaw = AgentProviderKind.cursor.rawValue
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                contextBuilderAgentRaw: cursorAgentRaw,
+                contextBuilderModelsByAgent: [cursorAgentRaw: "grok-4.6"]
+            ),
+            contextBuilderWriteIntent: .userInitiated
+        )
+
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let aiQueriesService = AIQueriesService(keyManager: keyManager)
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: aiQueriesService,
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        apiSettings.isCursorConnected = true
+        apiSettings.test_completeContextBuilderProviderValidation(verifiedProviders: [.cursor])
+
+        let prompt = PromptViewModel(
+            fileManager: WorkspaceFilesViewModel(),
+            aiQueriesService: aiQueriesService,
+            apiSettingsViewModel: apiSettings,
+            windowID: -1009,
+            settingsManager: store
+        )
+        XCTAssertEqual(prompt.contextBuilderAgent, .cursor)
+        XCTAssertEqual(prompt.contextBuilderAgentModelRaw, "grok-4.6")
+
+        var newerProfile = store.globalAgentModelsProfile()
+        newerProfile = newerProfile.replacingContextBuilderModel("composer-2.5", for: cursorAgentRaw)
+        store.setGlobalAgentModelsProfile(
+            newerProfile,
+            contextBuilderWriteIntent: .userInitiated
+        )
+        XCTAssertEqual(prompt.contextBuilderAgentModelRaw, "grok-4.6", "precondition: published cache remains stale")
+
+        prompt.setContextBuilderModelParameter(
+            [cursorEffortSelection(valueRaw: "high")],
+            expectedProviderID: .cursor,
+            expectedModelRaw: "grok-4.6",
+            expectedScope: .global
+        )
+
+        let finalProfile = store.globalAgentModelsProfile()
+        XCTAssertEqual(finalProfile.contextBuilderModelsByAgent?[cursorAgentRaw], "composer-2.5")
+        XCTAssertNil(finalProfile.contextBuilderModelParametersByAgent?[cursorAgentRaw])
+    }
+
     func testActiveCursorRunLocksParameterControlsAndRejectsDefensiveSelection() {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }

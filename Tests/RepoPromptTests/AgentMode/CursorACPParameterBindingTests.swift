@@ -163,6 +163,40 @@ final class CursorACPParameterBindingTests: XCTestCase {
         XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
     }
 
+    func testMixedValidAndUnsupportedParameterBatchDoesNotPartiallyApply() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: ["ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1"],
+            providerID: .cursor
+        )
+        _ = try await fixture.controller.bootstrap()
+        let valid = ACPModelParameterSelection(
+            providerID: .cursor,
+            baseModelRaw: "model-a",
+            kind: .thinking,
+            configID: "Cursor.Thought-Level",
+            valueRaw: "High"
+        )
+        let unsupported = ACPModelParameterSelection(
+            providerID: .cursor,
+            baseModelRaw: "model-a",
+            kind: .speed,
+            configID: "Cursor.Fast-Mode",
+            valueRaw: "retired-speed"
+        )
+
+        let report = try await fixture.controller.applySessionModelParameterSelections([
+            valid,
+            unsupported
+        ])
+        await fixture.controller.shutdown()
+
+        XCTAssertTrue(report.applied.isEmpty)
+        XCTAssertTrue(report.alreadyCurrent.isEmpty)
+        XCTAssertEqual(report.skipped, [unsupported])
+        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
+    }
+
     func testCursorAliasDuplicateParameterSelectionsApplyNewestValueExactlyOnce() async throws {
         let fixture = try makeFixture(
             shape: "modern",
