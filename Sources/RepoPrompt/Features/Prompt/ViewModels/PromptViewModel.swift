@@ -6534,6 +6534,8 @@ class PromptViewModel: ObservableObject {
             return api.isCursorConnected
         case .grokBuild:
             return api.isGrokBuildConnected
+        case .devin:
+            return DevinRuntimeLocator.isInstalledSync()
         }
     }
 
