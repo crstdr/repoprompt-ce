@@ -360,16 +360,9 @@ enum DevinIntegrationConfiguration {
             )
         }
 
-        do {
-            try FileManager.default.removeItem(at: replacement)
-        } catch {
-            try restoreSource(
-                replacement: replacement,
-                source: source,
-                publishedFingerprint: publishedFingerprint
-            )
-            throw error
-        }
+        // The live path already holds the overlay. Do not swap back on cleanup failure:
+        // a concurrent native write to `source` would land in `replacement` and then be deleted.
+        try FileManager.default.removeItem(at: replacement)
     }
 
     private static func restoreSource(

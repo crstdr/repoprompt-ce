@@ -132,7 +132,7 @@ public enum MCPTimeoutPolicy {
 
     /// Factory default for otherwise-quiet RP-managed subagent lifecycle waits
     /// (start post-launch, wait, steer-and-wait). Not a startup, execution, or notification interval.
-    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 300
+    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 120
 
     /// Session setup (worktree binding, provider startup, steer reactivation) runs before a
     /// lifecycle wait begins, and the server starts the caller's full wait only afterwards.
@@ -141,7 +141,7 @@ public enum MCPTimeoutPolicy {
 
     /// Discovery/help phrase for an omitted agent-control wait timeout.
     public static let configuredSubagentWaitDiscoveryPhrase =
-        "configured subagent wait (factory default: five minutes)"
+        "configured subagent wait (factory default: two minutes)"
 
     public static let agentControlTimeoutPropertyDescription =
         "[start, wait] Max wait seconds. 0 = poll. Omitted timeout uses the \(configuredSubagentWaitDiscoveryPhrase)."

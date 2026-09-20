@@ -1077,9 +1077,19 @@ actor ACPAgentSessionController {
             }
             return $0.configID < $1.configID
         }
-        var applied: [ACPModelParameterSelection] = []
+        typealias PendingSelection = (
+            selection: ACPModelParameterSelection,
+            currentModelRaw: String,
+            definition: ACPModelParameterDefinition,
+            choice: ACPModelParameterChoice
+        )
+        var pending: [PendingSelection] = []
         var alreadyCurrent: [ACPModelParameterSelection] = []
         var skipped: [ACPModelParameterSelection] = []
+
+        // Resolve the complete batch before sending any parameter mutation. A stale or
+        // unsupported selection makes the run fail closed; applying earlier valid entries first
+        // would leave the provider partially configured even though no prompt is submitted.
         for selection in normalized {
             guard selection.providerID == provider.providerID,
                   let models = discoveredSessionModels,
@@ -1106,31 +1116,40 @@ actor ACPAgentSessionController {
             }
             if definition.currentValueRaw == choice.rawValue {
                 alreadyCurrent.append(selection)
-                continue
+            } else {
+                pending.append((selection, currentModel, definition, choice))
             }
+        }
+
+        guard skipped.isEmpty else {
+            return .init(applied: [], alreadyCurrent: alreadyCurrent, skipped: skipped)
+        }
+
+        var applied: [ACPModelParameterSelection] = []
+        for resolved in pending {
             let response = try await sendRequestResponse(
                 method: "session/set_config_option",
                 params: [
                     "sessionId": sessionID,
-                    "configId": definition.configID,
-                    "value": choice.rawValue
+                    "configId": resolved.definition.configID,
+                    "value": resolved.choice.rawValue
                 ]
             )
             try await applyVerifiedConfigOptionsMutationResponse(
                 response,
                 requiredModeValue: nil,
                 requiredModelValue: nil,
-                requiredParameter: (definition.configID, choice.rawValue)
+                requiredParameter: (resolved.definition.configID, resolved.choice.rawValue)
             )
             applied.append(.init(
-                providerID: selection.providerID,
-                baseModelRaw: currentModel,
-                kind: selection.kind,
-                configID: definition.configID,
-                valueRaw: choice.rawValue
+                providerID: resolved.selection.providerID,
+                baseModelRaw: resolved.currentModelRaw,
+                kind: resolved.selection.kind,
+                configID: resolved.definition.configID,
+                valueRaw: resolved.choice.rawValue
             ))
         }
-        return .init(applied: applied, alreadyCurrent: alreadyCurrent, skipped: skipped)
+        return .init(applied: applied, alreadyCurrent: alreadyCurrent, skipped: [])
     }
 
     private func setSessionModeSerialized(_ modeID: String) async throws {

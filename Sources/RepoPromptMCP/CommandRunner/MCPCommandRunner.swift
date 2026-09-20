@@ -694,14 +694,14 @@ actor MCPCommandRunner {
             op=poll session_ids=["<uuid1>","<uuid2>"]
                                           Poll multiple snapshots immediately
             op=wait session_id="..." [timeout=N]
-                                          Block until input needed or terminal (omitted timeout uses configured subagent wait; factory default five minutes)
+                                          Block until input needed or terminal (omitted timeout uses configured subagent wait; factory default two minutes)
             op=wait session_ids=["<uuid1>","<uuid2>"] [timeout=N]
                                           Wait until first session needs input or terminates
             op=cancel session_id="..."    Request run cancellation
             op=steer session_id="..." message="..."
                                           Inject follow-up instruction mid-run
             op=steer session_id="..." message="..." wait=true [timeout_seconds=N]
-                                          Steer and wait for result (omitted timeout uses configured subagent wait; factory default five minutes)
+                                          Steer and wait for result (omitted timeout uses configured subagent wait; factory default two minutes)
             op=respond session_id="..." interaction_id="..." response="..."
                                           Resolve a pending interaction (approval, question, etc)
             session_id lifecycle: start returns it; all other ops require it.

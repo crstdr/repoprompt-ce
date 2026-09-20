@@ -131,7 +131,7 @@ If dispatching independent items as fresh agents concurrently, **each agent's br
 
 **Use `detach: true`** when dispatching concurrent items — otherwise the orchestrator blocks on the first agent and can't start the second.
 
-Then pass `session_ids` (array) to `agent_run op=wait` to block until the **first** session finishes or needs input. The response tells you which session won and which are still pending. Omit `timeout` for the configured subagent wait (factory default: five minutes); shorten it for closer supervision or lengthen it for well-scoped independent work. Completion, questions, and parent steering can end the wait early. Avoid repetitive status-only polling.
+Then pass `session_ids` (array) to `agent_run op=wait` to block until the **first** session finishes or needs input. The response tells you which session won and which are still pending. Omit `timeout` for the configured subagent wait (factory default: two minutes); shorten it for closer supervision or lengthen it for well-scoped independent work. Completion, questions, and parent steering can end the wait early. Avoid repetitive status-only polling.
 
 \(example(variant,
 	mcp: """

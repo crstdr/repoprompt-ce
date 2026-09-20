@@ -952,7 +952,9 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         let settings = scalarPreferences.contextBuilder
         return ContextBuilderBehaviorSettings(
             contextTokenBudget: settings?.contextTokenBudget ?? ContextBuilderDefaults.contextTokenBudget,
-            analysisTokenBudget: settings?.analysisTokenBudget ?? ContextBuilderDefaults.analysisTokenBudget,
+            analysisTokenBudget: ContextBuilderDefaults.normalizedAnalysisTokenBudget(
+                settings?.analysisTokenBudget ?? ContextBuilderDefaults.analysisTokenBudget
+            ),
             enhancementMode: settings?.enhancementMode.flatMap(PromptEnhancementMode.init(rawValue:))
                 ?? ContextBuilderDefaults.enhancementMode,
             questionTimeoutSeconds: settings?.questionTimeoutSeconds ?? ContextBuilderDefaults.questionTimeoutSeconds,
@@ -971,7 +973,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     ) {
         let persisted = GlobalScalarPreferences.ContextBuilderSettings(
             contextTokenBudget: settings.contextTokenBudget,
-            analysisTokenBudget: settings.analysisTokenBudget,
+            analysisTokenBudget: ContextBuilderDefaults.normalizedAnalysisTokenBudget(settings.analysisTokenBudget),
             enhancementMode: settings.enhancementMode.rawValue,
             questionTimeoutSeconds: settings.questionTimeoutSeconds,
             allowUIClarifyingQuestions: settings.allowUIClarifyingQuestions,
@@ -2712,13 +2714,17 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             let behavior = legacyContextBuilderBehaviorSettings(chatSettings: chatSettings)
             migratedScalarPreferences.contextBuilder = GlobalScalarPreferences.ContextBuilderSettings(
                 contextTokenBudget: behavior.contextTokenBudget,
-                analysisTokenBudget: behavior.analysisTokenBudget,
+                analysisTokenBudget: ContextBuilderDefaults.normalizedAnalysisTokenBudget(behavior.analysisTokenBudget),
                 enhancementMode: behavior.enhancementMode.rawValue,
                 questionTimeoutSeconds: behavior.questionTimeoutSeconds,
                 allowUIClarifyingQuestions: behavior.allowUIClarifyingQuestions,
                 allowMCPClarifyingQuestions: behavior.allowMCPClarifyingQuestions,
                 followUpAnalysisEnabled: behavior.followUpAnalysisEnabled
             )
+        }
+        if let analysisTokenBudget = migratedScalarPreferences.contextBuilder?.analysisTokenBudget {
+            migratedScalarPreferences.contextBuilder?.analysisTokenBudget =
+                ContextBuilderDefaults.normalizedAnalysisTokenBudget(analysisTokenBudget)
         }
 
         let migratedChatSettings = removingLegacyWorkspaceContextBuilderState(from: chatSettings)

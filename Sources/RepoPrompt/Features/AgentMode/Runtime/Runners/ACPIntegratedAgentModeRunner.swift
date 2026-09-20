@@ -619,11 +619,15 @@ final class ACPIntegratedAgentModeRunner {
                 hooks.persistence.scheduleSave(session)
                 hooks.bindingObservation.updateBindings(session)
 
-                try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
-                let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
-                try parameterReport.validateNoSkippedSelections()
-                await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-                try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+                guard try await configureControllerForRun(
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    controller: controller,
+                    runRequest: runRequest
+                ) else {
+                    return .superseded
+                }
                 setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
                 if runRequest.agentKind.requiresPrePromptAgentModeMCPRouting {
@@ -700,11 +704,15 @@ final class ACPIntegratedAgentModeRunner {
                     return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
                 }
 
-                try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
-                let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
-                try parameterReport.validateNoSkippedSelections()
-                await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-                try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+                guard try await configureControllerForRun(
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    controller: controller,
+                    runRequest: runRequest
+                ) else {
+                    return .superseded
+                }
 
                 if let deferredLease {
                     let acquired = await deferredLease.acquire()
@@ -883,10 +891,61 @@ final class ACPIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
     }
 
+    private func configureControllerForRun(
+        session: AgentTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        controller: ACPAgentSessionController,
+        runRequest: ACPRunRequest
+    ) async throws -> Bool {
+        let isCurrent = { [self] in
+            isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
+                && session.acpController === controller
+        }
+        return try await Self.performConfigurationSequenceIfCurrent(
+            isCurrent: isCurrent,
+            operations: [
+                { [self] in
+                    try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                },
+                {
+                    let report = try await controller.applySessionModelParameterSelections(
+                        runRequest.modelParameterSelections
+                    )
+                    try report.validateNoSkippedSelections()
+                },
+                {
+                    await controller.setAutoApproveAllToolPermissions(
+                        runRequest.autoApproveAllToolPermissions
+                    )
+                },
+                { [self] in
+                    try await applyRequestedSessionModeIfNeeded(
+                        runRequest.sessionModeID,
+                        controller: controller
+                    )
+                }
+            ]
+        )
+    }
+
+    /// Configuration calls can suspend on provider RPCs. Re-check ownership before and after
+    /// every step so an attempt superseded during one response cannot continue with later writes.
+    private static func performConfigurationSequenceIfCurrent(
+        isCurrent: () -> Bool,
+        operations: [() async throws -> Void]
+    ) async throws -> Bool {
+        for operation in operations {
+            guard isCurrent() else { return false }
+            try await operation()
+            guard isCurrent() else { return false }
+        }
+        return true
+    }
+
     private func applyRequestedSessionModeIfNeeded(
         _ requestedMode: String?,
-        controller: ACPAgentSessionController,
-        runID: UUID
+        controller: ACPAgentSessionController
     ) async throws {
         if let requestedMode = requestedMode?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedMode.isEmpty {
             try await controller.setSessionMode(requestedMode)
@@ -1803,6 +1862,16 @@ final class ACPIntegratedAgentModeRunner {
             _ report: ACPModelParameterApplicationReport
         ) throws {
             try report.validateNoSkippedSelections()
+        }
+
+        static func testPerformConfigurationSequenceIfCurrent(
+            isCurrent: () -> Bool,
+            operations: [() async throws -> Void]
+        ) async throws -> Bool {
+            try await performConfigurationSequenceIfCurrent(
+                isCurrent: isCurrent,
+                operations: operations
+            )
         }
 
         static func testExplicitSelectedModel(

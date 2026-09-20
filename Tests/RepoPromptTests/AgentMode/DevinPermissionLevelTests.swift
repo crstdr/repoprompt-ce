@@ -514,6 +514,57 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual(runs.value, 2)
     }
 
+    func testFailedDiscoveryDoesNotCacheFailure() async {
+        final class RunCounter: @unchecked Sendable {
+            var value = 0
+        }
+        let runs = RunCounter()
+        let service = DevinModelDiscoveryService(
+            isInstalled: { true },
+            runSession: { _ in
+                runs.value += 1
+                throw AIProviderError.invalidConfiguration(detail: "transient")
+            }
+        )
+
+        let first = await service.discoverIfNeeded()
+        let second = await service.discoverIfNeeded()
+
+        guard case .failed = first, case .failed = second else {
+            return XCTFail("expected uncached failures, got \(first) then \(second)")
+        }
+        XCTAssertEqual(runs.value, 2)
+    }
+
+    func testStaleDiscoveryCancelDoesNotCancelALaterAttempt() async {
+        final class RunCounter: @unchecked Sendable {
+            var value = 0
+        }
+        let runs = RunCounter()
+        let firstStarted = expectation(description: "first discovery started")
+        let service = DevinModelDiscoveryService(
+            isInstalled: { true },
+            runSession: { _ in
+                runs.value += 1
+                if runs.value == 1 {
+                    firstStarted.fulfill()
+                    try await Task.sleep(for: .seconds(30))
+                    return 1
+                }
+                return 2
+            }
+        )
+
+        let first = Task { await service.discoverIfNeeded() }
+        await fulfillment(of: [firstStarted], timeout: 2)
+        first.cancel()
+        _ = await first.value
+
+        let second = await service.discoverIfNeeded()
+        XCTAssertEqual(second, .discovered(modelCount: 2))
+        XCTAssertEqual(runs.value, 2)
+    }
+
     // MARK: - Helpers
 
     @MainActor

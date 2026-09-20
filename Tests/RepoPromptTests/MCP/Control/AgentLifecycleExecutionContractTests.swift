@@ -7,7 +7,7 @@ import XCTest
 @MainActor
 final class AgentLifecycleExecutionContractTests: XCTestCase {
     func testAgentRunLifecycleWaitDefaultsAndExplicitOverrides() throws {
-        let expected: TimeInterval = 300
+        let expected: TimeInterval = 120
         let captured = expected
         XCTAssertEqual(AgentRunMCPToolService.defaultWaitTimeoutSeconds, expected)
         XCTAssertEqual(try AgentRunMCPToolService.resolvedStartTimeoutSeconds(nil, capturedDefaultWaitSeconds: captured), expected)
@@ -50,7 +50,7 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
-        XCTAssertEqual(AgentRunMCPToolService.capturedDefaultWaitTimeoutSeconds(from: store), 300)
+        XCTAssertEqual(AgentRunMCPToolService.capturedDefaultWaitTimeoutSeconds(from: store), 120)
 
         XCTAssertTrue(store.setSubagentDefaultWaitSeconds(1200))
         // Freeze the value an in-flight wait would have captured, then change the preference:

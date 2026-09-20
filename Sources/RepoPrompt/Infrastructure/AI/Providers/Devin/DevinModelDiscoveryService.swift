@@ -8,6 +8,16 @@ actor DevinModelDiscoveryService {
         case discovered(modelCount: Int)
         case noModelsAdvertised
         case failed(message: String)
+
+        /// Transient failures and "not installed" stay uncached so Settings can retry.
+        fileprivate var isReusable: Bool {
+            switch self {
+            case .discovered, .noModelsAdvertised:
+                true
+            case .notInstalled, .failed:
+                false
+            }
+        }
     }
 
     typealias InstalledCheck = @Sendable () -> Bool
@@ -16,6 +26,7 @@ actor DevinModelDiscoveryService {
     private let isInstalled: InstalledCheck
     private let runSession: SessionRunner
     private var inFlight: Task<Outcome, Never>?
+    private var inFlightID = 0
     private var lastAttempt: Outcome?
     private var waiterCount = 0
 
@@ -30,14 +41,18 @@ actor DevinModelDiscoveryService {
     }
 
     func discoverIfNeeded(force: Bool = false) async -> Outcome {
-        if !force, inFlight == nil, let lastAttempt {
+        if !force, inFlight == nil, let lastAttempt, lastAttempt.isReusable {
             return lastAttempt
         }
         waiterCount += 1
         let task: Task<Outcome, Never>
-        if let inFlight {
+        let requestID: Int
+        if let inFlight, !inFlight.isCancelled {
             task = inFlight
+            requestID = inFlightID
         } else {
+            inFlightID += 1
+            requestID = inFlightID
             task = Task { [isInstalled, runSession] in
                 await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
                 if force {
@@ -68,25 +83,21 @@ actor DevinModelDiscoveryService {
         let outcome = await withTaskCancellationHandler {
             await task.value
         } onCancel: {
-            Task { await self.cancelSharedDiscoveryIfLastWaiter() }
+            Task { await self.cancelSharedDiscovery(id: requestID) }
         }
         waiterCount -= 1
         if waiterCount == 0 {
             inFlight = nil
         }
-        if !Task.isCancelled,
-           outcome != .notInstalled,
-           outcome != .failed(message: "cancelled")
-        {
+        if !Task.isCancelled, outcome.isReusable {
             lastAttempt = outcome
         }
         return outcome
     }
 
-    private func cancelSharedDiscoveryIfLastWaiter() {
-        if waiterCount <= 1 {
-            inFlight?.cancel()
-        }
+    private func cancelSharedDiscovery(id: Int) {
+        guard inFlightID == id, waiterCount <= 1 else { return }
+        inFlight?.cancel()
     }
 
     private static func runThrowawaySession(_ config: DevinAgentConfig) async throws -> Int? {

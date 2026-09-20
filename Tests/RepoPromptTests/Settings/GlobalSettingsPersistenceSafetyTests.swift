@@ -98,6 +98,120 @@ final class GlobalSettingsPersistenceSafetyTests: XCTestCase {
         )
     }
 
+    func testCurrentOutOfRangeAnalysisBudgetIsNormalizedWithUnknownFieldsPreserved() throws {
+        let root = try makeTemporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("Settings/globalSettings.json")
+        let initialStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try initialStore.save(makeDocument(
+            contextBuilder: makeContextBuilderSettings(analysisTokenBudget: 250_000),
+            fileSystemGlobalIgnoreDefaults: "already-seeded"
+        ))
+        var rawRoot = try readJSONObject(at: fileURL)
+        var rawScalar = try XCTUnwrap(rawRoot["scalarPreferences"] as? [String: Any])
+        var rawContextBuilder = try XCTUnwrap(rawScalar["contextBuilder"] as? [String: Any])
+        rawContextBuilder["futureContextBuilder"] = ["value": "preserved"]
+        rawScalar["contextBuilder"] = rawContextBuilder
+        rawRoot["scalarPreferences"] = rawScalar
+        try writeJSONObject(rawRoot, to: fileURL)
+
+        let suiteName = "GlobalSettingsPersistenceSafetyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+
+        XCTAssertEqual(
+            settings.contextBuilderBehaviorSettings().analysisTokenBudget,
+            ContextBuilderDefaults.analysisTokenBudgetRange.upperBound
+        )
+        let persisted = try GlobalSettingsFileStore(fileURL: fileURL).load()
+        XCTAssertEqual(
+            persisted.scalarPreferences?.contextBuilder?.analysisTokenBudget,
+            ContextBuilderDefaults.analysisTokenBudgetRange.upperBound
+        )
+        let normalizedRoot = try readJSONObject(at: fileURL)
+        let normalizedContextBuilder = try XCTUnwrap(
+            (normalizedRoot["scalarPreferences"] as? [String: Any])?["contextBuilder"] as? [String: Any]
+        )
+        XCTAssertEqual(
+            (normalizedContextBuilder["futureContextBuilder"] as? [String: Any])?["value"] as? String,
+            "preserved"
+        )
+    }
+
+    func testLegacyOutOfRangeAnalysisBudgetIsNormalizedDuringMigration() throws {
+        let root = try makeTemporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("Settings/globalSettings.json")
+        let workspaceID = UUID()
+        let initialStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try initialStore.save(makeDocument(
+            workspaceID: workspaceID,
+            includeLegacyChatSettings: true,
+            legacyAnalysisTokenBudget: 250_000,
+            fileSystemGlobalIgnoreDefaults: "already-seeded"
+        ))
+
+        let suiteName = "GlobalSettingsPersistenceSafetyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+
+        XCTAssertEqual(
+            settings.contextBuilderBehaviorSettings().analysisTokenBudget,
+            ContextBuilderDefaults.analysisTokenBudgetRange.upperBound
+        )
+        let persisted = try GlobalSettingsFileStore(fileURL: fileURL).load()
+        XCTAssertEqual(
+            persisted.scalarPreferences?.contextBuilder?.analysisTokenBudget,
+            ContextBuilderDefaults.analysisTokenBudgetRange.upperBound
+        )
+        XCTAssertNil(persisted.chatSettings[workspaceID]?.discoveryPlanTokenBudget)
+    }
+
+    func testAnalysisBudgetSetterNormalizesAndSurvivesRestart() throws {
+        let root = try makeTemporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("Settings/globalSettings.json")
+        let suiteName = "GlobalSettingsPersistenceSafetyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        var behavior = settings.contextBuilderBehaviorSettings()
+        behavior.analysisTokenBudget = ContextBuilderDefaults.analysisTokenBudgetRange.lowerBound - 1
+        settings.setContextBuilderBehaviorSettings(behavior)
+
+        let restarted = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertEqual(
+            restarted.contextBuilderBehaviorSettings().analysisTokenBudget,
+            ContextBuilderDefaults.analysisTokenBudgetRange.lowerBound
+        )
+
+        behavior = restarted.contextBuilderBehaviorSettings()
+        behavior.analysisTokenBudget = ContextBuilderDefaults.analysisTokenBudgetRange.upperBound
+        restarted.setContextBuilderBehaviorSettings(behavior)
+        let restartedAtUpperBound = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertEqual(
+            restartedAtUpperBound.contextBuilderBehaviorSettings().analysisTokenBudget,
+            ContextBuilderDefaults.analysisTokenBudgetRange.upperBound
+        )
+    }
+
     func testFailedMigrationRetryMergesKnownEditsAndPreservesUnknownFields() throws {
         let root = try makeTemporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -107,7 +221,7 @@ final class GlobalSettingsPersistenceSafetyTests: XCTestCase {
             workspaceID: workspaceID,
             includeLegacyChatSettings: true,
             includeAgentModelsProfile: true,
-            contextBuilder: makeContextBuilderSettings(),
+            contextBuilder: makeContextBuilderSettings(analysisTokenBudget: 250_000),
             fileSystemGlobalIgnoreDefaults: "keep"
         )
         let initialStore = GlobalSettingsFileStore(fileURL: fileURL)
@@ -139,12 +253,17 @@ final class GlobalSettingsPersistenceSafetyTests: XCTestCase {
         XCTAssertEqual(settings.persistenceBlockReason, .saveFailed)
         XCTAssertTrue(settings.isPendingPreservingMigrationRetry)
         XCTAssertEqual(try Data(contentsOf: fileURL), originalBytes)
+        XCTAssertEqual(
+            settings.contextBuilderBehaviorSettings().analysisTokenBudget,
+            ContextBuilderDefaults.analysisTokenBudgetRange.upperBound
+        )
 
         settings.setAppearanceModeRaw("Dark")
         settings.setPlanningModelRaw("retry-planning-model")
         var changedBehavior = settings.contextBuilderBehaviorSettings()
-        changedBehavior.analysisTokenBudget += 1
+        changedBehavior.analysisTokenBudget = ContextBuilderDefaults.analysisTokenBudgetRange.lowerBound - 1
         settings.setContextBuilderBehaviorSettings(changedBehavior)
+        changedBehavior.analysisTokenBudget = ContextBuilderDefaults.analysisTokenBudgetRange.lowerBound
         XCTAssertEqual(settings.appearanceModeRaw(), "Dark")
         XCTAssertEqual(settings.planningModelRaw(), "retry-planning-model")
         XCTAssertEqual(
@@ -287,6 +406,7 @@ final class GlobalSettingsPersistenceSafetyTests: XCTestCase {
         includeLegacyChatSettings: Bool = false,
         includeAgentModelsProfile: Bool = false,
         contextBuilder: GlobalScalarPreferences.ContextBuilderSettings? = nil,
+        legacyAnalysisTokenBudget: Int = 67890,
         fileSystemGlobalIgnoreDefaults: String? = nil
     ) -> GlobalSettingsDocument {
         var chatSettings: [UUID: ChatGlobalSettings] = [:]
@@ -300,7 +420,7 @@ final class GlobalSettingsPersistenceSafetyTests: XCTestCase {
             legacy.discoveryAllowClarifyingQuestions = true
             legacy.discoveryAllowClarifyingQuestionsForMCP = false
             legacy.discoveryQuestionTimeoutSeconds = 91
-            legacy.discoveryPlanTokenBudget = 6789
+            legacy.discoveryPlanTokenBudget = legacyAnalysisTokenBudget
             chatSettings[workspaceID] = legacy
         }
 
@@ -331,10 +451,12 @@ final class GlobalSettingsPersistenceSafetyTests: XCTestCase {
         )
     }
 
-    private func makeContextBuilderSettings() -> GlobalScalarPreferences.ContextBuilderSettings {
+    private func makeContextBuilderSettings(
+        analysisTokenBudget: Int = 56780
+    ) -> GlobalScalarPreferences.ContextBuilderSettings {
         GlobalScalarPreferences.ContextBuilderSettings(
             contextTokenBudget: 1234,
-            analysisTokenBudget: 5678,
+            analysisTokenBudget: analysisTokenBudget,
             enhancementMode: "balanced",
             questionTimeoutSeconds: 91,
             allowUIClarifyingQuestions: true,

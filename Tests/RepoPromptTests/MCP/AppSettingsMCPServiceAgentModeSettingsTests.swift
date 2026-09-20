@@ -446,7 +446,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         let service = AppSettingsMCPService(store: store)
         let key = "agent_mode.subagent_default_wait_seconds"
 
-        XCTAssertEqual(store.subagentDefaultWaitSeconds(), 300)
+        XCTAssertEqual(store.subagentDefaultWaitSeconds(), 120)
 
         let listed = try await service.handleForTesting([
             "op": .string("list"),
@@ -460,7 +460,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
             catalog.objectValue?["allowed_values"]?.arrayValue?.compactMap(\.stringValue),
             MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds.map(String.init)
         )
-        XCTAssertEqual(catalog.objectValue?["value"]?.intValue, 300)
+        XCTAssertEqual(catalog.objectValue?["value"]?.intValue, 120)
 
         for seconds in MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds {
             let set = try await service.handleForTesting([
@@ -499,7 +499,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
             defaults: defaults,
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
-        XCTAssertEqual(invalidReloaded.subagentDefaultWaitSeconds(), 300)
+        XCTAssertEqual(invalidReloaded.subagentDefaultWaitSeconds(), 120)
 
         let invalidService = AppSettingsMCPService(store: invalidReloaded)
         let previous = invalidReloaded.subagentDefaultWaitSeconds()
