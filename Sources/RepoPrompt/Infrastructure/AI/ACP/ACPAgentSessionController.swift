@@ -199,6 +199,10 @@ actor ACPAgentSessionController {
     private struct PermissionOption {
         let optionID: String
         let kind: String
+        /// The agent's own wording for this option. Agents that advertise several
+        /// distinctly-worded choices are unreadable without it, because the approval
+        /// card has no other source for what an option actually means.
+        let name: String?
     }
 
     private struct AutoApprovalSelection {
@@ -462,7 +466,7 @@ actor ACPAgentSessionController {
             throw ControllerError.invalidState(expected: "idle", actual: state)
         }
         state = .launching
-        log("Launching ACP transport")
+        log("Launching ACP transport (launchPermissionMode=\(launchedPermissionMode ?? "none"), autoApproveAll=\(autoApproveAllToolPermissions))")
         diagnose(.phaseStarted("launch"))
         let environment = await resolvedEnvironment()
         try Self.preflightInjectedMCPServers(in: sessionConfiguration, environment: environment)
@@ -1204,20 +1208,26 @@ actor ACPAgentSessionController {
                     "outcome": "cancelled"
                 ]
             ]
-        case .accept:
-            [
-                "outcome": [
-                    "outcome": "selected",
-                    "optionId": preferredAllowOptionID(for: pending.options, sessionScoped: false)
+        case .accept, .acceptForSession, .acceptWithExecpolicyAmendment:
+            if let optionID = preferredAllowOptionID(
+                for: pending.options,
+                sessionScoped: decision != .accept
+            ) {
+                [
+                    "outcome": [
+                        "outcome": "selected",
+                        "optionId": optionID
+                    ]
                 ]
-            ]
-        case .acceptForSession, .acceptWithExecpolicyAmendment:
-            [
-                "outcome": [
-                    "outcome": "selected",
-                    "optionId": preferredAllowOptionID(for: pending.options, sessionScoped: true)
+            } else {
+                // The agent offered no selectable allow option (e.g. only a denylisted
+                // mode switch): cancel rather than submit a wrong-direction or empty ID.
+                [
+                    "outcome": [
+                        "outcome": "cancelled"
+                    ]
                 ]
-            ]
+            }
         case .decline:
             if let optionID = preferredRejectOptionID(for: pending.options) {
                 [
@@ -1753,7 +1763,11 @@ actor ACPAgentSessionController {
                 let optionID = optionDictionary["optionId"] as? String,
                 let kind = optionDictionary["kind"] as? String
             else { return nil }
-            return PermissionOption(optionID: optionID, kind: kind)
+            return PermissionOption(
+                optionID: optionID,
+                kind: kind,
+                name: optionDictionary["name"] as? String
+            )
         }
 
         let rawInput = toolCall["rawInput"] as? [String: Any]
@@ -1778,7 +1792,7 @@ actor ACPAgentSessionController {
                 toolTitle: toolTitle,
                 toolKind: toolKind,
                 rawInputJSON: rawInputJSON,
-                options: optionDictionaries
+                options: options
             )
         )
 
@@ -3325,11 +3339,43 @@ actor ACPAgentSessionController {
         }
     }
 
+    private static let invisibleOptionLabelScalars = CharacterSet.whitespacesAndNewlines
+        .union(.controlCharacters)
+
+    /// The line shown for one advertised option: the agent's wording when it gives any,
+    /// otherwise its identifier. Both are agent-authored, so both go through the same
+    /// sanitiser -- routing only the name through it left the identifier able to
+    /// reintroduce the newline this is meant to prevent.
+    private static func optionLabel(name: String?, optionID: String) -> String {
+        displayableOptionLabel(name ?? "")
+            ?? displayableOptionLabel(optionID)
+            ?? ""
+    }
+
+    /// Collapse an agent-authored option string onto one display line, or `nil` when it
+    /// carries nothing visible.
+    ///
+    /// Both the name and the option ID come from the agent, and the caller joins labels
+    /// with a newline, so a value containing one would present a single option as two.
+    /// Emptiness is tested by looking for a visible scalar rather than by trimming the
+    /// invisible ones away: a trailing format character can be load-bearing, and trimming
+    /// them truncates emoji tag sequences such as the subdivision flags.
+    private static func displayableOptionLabel(_ raw: String) -> String? {
+        let collapsed = raw
+            .components(separatedBy: .newlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.unicodeScalars.contains(where: { !invisibleOptionLabelScalars.contains($0) })
+        else { return nil }
+        return collapsed
+    }
+
     private func approvalDetails(
         toolTitle: String?,
         toolKind: String?,
         rawInputJSON: String?,
-        options: [[String: Any]]
+        options: [PermissionOption]
     ) -> [AgentApprovalDetail] {
         var details: [AgentApprovalDetail] = []
         if let toolTitle, !toolTitle.isEmpty {
@@ -3341,10 +3387,17 @@ actor ACPAgentSessionController {
         if let rawInputJSON, !rawInputJSON.isEmpty {
             details.append(AgentApprovalDetail(label: "Input", value: rawInputJSON, isCode: true))
         }
-        if !options.isEmpty,
-           let optionsJSON = serializeJSON(options)
-        {
-            details.append(AgentApprovalDetail(label: "Options", value: optionsJSON, isCode: true))
+        let optionLabels = options.map {
+            Self.optionLabel(name: $0.name, optionID: $0.optionID)
+        }
+        if !optionLabels.isEmpty {
+            details.append(
+                AgentApprovalDetail(
+                    label: "Options",
+                    value: optionLabels.joined(separator: "\n"),
+                    isCode: false
+                )
+            )
         }
         return details
     }
@@ -3396,15 +3449,61 @@ actor ACPAgentSessionController {
         ])
     }
 
-    private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
+    /// The option an `.accept`-family decision submits, or nil when the agent offered no
+    /// selectable allow option. The denylist-filtered fallback must stay allow-kind:
+    /// without it, a Devin prompt whose only allow-typed entry is a denylisted
+    /// `switch_*`/`plan_*` would collapse to submitting its `reject_once` (or an empty ID)
+    /// for an accept decision — answering the opposite of what was decided.
+    private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String? {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity, .devin:
+        case .openCode, .cursor, .antigravity:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
+        case .devin:
+            devinAllowOptionPreferences(sessionScoped: sessionScoped)
         case .grokBuild:
             grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
         }
         let filteredOptions = safePermissionOptionsForAutoSelection(options)
-        return optionID(for: filteredOptions, preferences: preferences) ?? filteredOptions.first?.optionID ?? ""
+        if let matched = optionID(for: filteredOptions, preferences: preferences) {
+            return matched
+        }
+        return filteredOptions.first(where: {
+            guard normalizedPermissionOptionValue($0.kind)?.hasPrefix("allow") == true else {
+                return false
+            }
+            // A session-scoped decision must not silently widen into a persistent grant
+            // when no session/once option was offered.
+            return !(sessionScoped && ACPPermissionOptionPolicy.exceedsSessionScope(
+                optionID: $0.optionID,
+                for: provider.providerID
+            ))
+        })?.optionID
+    }
+
+    /// Devin's allow options are tiered (`allow_once` < `allow_session` < `allow_always` <
+    /// `allow_always_global`). `acceptForSession` therefore prefers the per-tool session
+    /// grant and otherwise falls back to the per-request grant — never `allow_always`,
+    /// which persists beyond the session the decision was scoped to. The mode-switching
+    /// options are unreachable — they are denylisted in `ACPPermissionOptionPolicy`
+    /// because re-flagging a running process would drift the launch-mode reuse key in
+    /// `isCompatibleWith`.
+    private func devinAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
+        if sessionScoped {
+            return [
+                .optionID("allow_session"),
+                .optionID("allow_once"),
+                .optionID("allow-once"),
+                .optionID("once"),
+                .kind("allow_once")
+            ]
+        }
+        return [
+            .optionID("allow_once"),
+            .optionID("allow-once"),
+            .optionID("once"),
+            .kind("allow_once"),
+            .optionID("allow_session")
+        ]
     }
 
     private func grokBuildAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
@@ -3451,8 +3550,9 @@ actor ACPAgentSessionController {
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
         case .openCode, .grokBuild, .antigravity, .devin:
             // Grok full access is provider-native (`grok agent --always-approve stdio`) and
-            // Devin's is a launch-time `--permission-mode`; the controller never
-            // auto-selects permission options for either.
+            // Devin's is a launch-time `--permission-mode`; neither gets a blank-check
+            // full-access selection. Devin still receives per-request RepoPrompt MCP
+            // auto-approval through `autoApprovalSelection`.
             return nil
         }
     }
@@ -3483,15 +3583,14 @@ actor ACPAgentSessionController {
         requestPayload: [String: Any],
         options: [PermissionOption]
     ) -> AutoApprovalSelection? {
-        guard provider.providerID != .devin,
-              let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
-                  requestToolName: requestToolName,
-                  requestPayload: requestPayload
-              ), isStrictACPRepoPromptPermissionMatch(
-                  match,
-                  requestToolName: requestToolName,
-                  requestPayload: requestPayload
-              )
+        guard let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+            requestToolName: requestToolName,
+            requestPayload: requestPayload
+        ), isStrictACPRepoPromptPermissionMatch(
+            match,
+            requestToolName: requestToolName,
+            requestPayload: requestPayload
+        )
         else {
             return nil
         }
@@ -3507,7 +3606,16 @@ actor ACPAgentSessionController {
                 .kind("allow_once")
             ]
         case .devin:
-            []
+            // Strict RepoPrompt MCP auto-approval is per-request: only Devin's
+            // allow-once options are eligible. `allow_session`/`allow_always`/`switch_*`
+            // broaden beyond the pending call (the mode switches would also drift the
+            // launch-mode reuse key), so they stay user-decided.
+            [
+                .optionID("allow_once"),
+                .optionID("allow-once"),
+                .optionID("once"),
+                .kind("allow_once")
+            ]
         case .grokBuild:
             // Strict RepoPrompt MCP auto-approval is per-request: never select Grok's
             // session-scoped `allow-edits-session` here.
@@ -4232,4 +4340,47 @@ actor ACPAgentSessionController {
     private func diagnose(_ event: DiagnosticEvent) {
         diagnosticSink?(event)
     }
+
+    #if DEBUG
+        /// Test seam for the strict RepoPrompt-MCP auto-approval path: returns the option
+        /// ID the controller would select for a permission request, or nil when it would
+        /// surface the prompt instead. `options` are `(optionID, kind)` pairs in the order
+        /// the agent advertised them.
+        func test_autoApprovalOptionID(
+            requestToolName: String?,
+            requestPayload: [String: Any],
+            options: [(optionID: String, kind: String)]
+        ) -> String? {
+            autoApprovalSelection(
+                requestToolName: requestToolName,
+                requestPayload: requestPayload,
+                options: options.map { PermissionOption(optionID: $0.optionID, kind: $0.kind, name: nil) }
+            )?.optionID
+        }
+
+        /// Test seam for the composed option line, covering the name-then-identifier
+        /// fallback rather than the sanitiser alone.
+        static func test_optionLabel(name: String?, optionID: String) -> String {
+            optionLabel(name: name, optionID: optionID)
+        }
+
+        /// Test seam for approval-card option labelling: collapses an agent-authored
+        /// option string onto one line, or returns nil when nothing visible remains.
+        static func test_displayableOptionLabel(_ raw: String) -> String? {
+            displayableOptionLabel(raw)
+        }
+
+        /// Test seam for the user-decision fallback ordering: returns the option ID a
+        /// `.accept`/`.acceptForSession` decision would submit, or nil when no
+        /// selectable allow option remains (the response is sent as `cancelled`).
+        func test_preferredAllowOptionID(
+            options: [(optionID: String, kind: String)],
+            sessionScoped: Bool
+        ) -> String? {
+            preferredAllowOptionID(
+                for: options.map { PermissionOption(optionID: $0.optionID, kind: $0.kind, name: nil) },
+                sessionScoped: sessionScoped
+            )
+        }
+    #endif
 }
