@@ -322,7 +322,13 @@ enum AgentModelCatalog {
             codexDynamicModels: codexDynamicModels
         )
         let resolvedModelRaw = canonicalModelRaw(candidateModelRaw ?? fallbackModelRaw, for: agent)
-        let finalModelRaw = isValid(
+        // Cursor membership comes from an asynchronously warmed discovery snapshot, so "not
+        // currently a member" cannot mean "never selected": restoration before discovery, a failed
+        // refresh, and a provider-removed model would all silently rewrite the user's saved model
+        // to Auto. Preserve the canonicalized non-empty candidate and let the explicit admission
+        // boundaries (MCP resolution, runner fence) reject it with an actionable error instead.
+        let preservesUnvalidatedModel = agent == .cursor && !resolvedModelRaw.isEmpty
+        let finalModelRaw = preservesUnvalidatedModel || isValid(
             rawModel: resolvedModelRaw,
             for: agent,
             availability: effectiveAvailability,
@@ -1625,7 +1631,10 @@ enum AgentModelCatalog {
 
     private static func canonicalModelRaw(_ rawModel: String, for agentKind: AgentProviderKind) -> String {
         guard agentKind == .cursor else { return rawModel }
-        return CursorAIModelCatalog.option(matching: rawModel)?.rawValue ?? rawModel
+        // Pure identity only: Cursor membership is discovery-backed and warms asynchronously, so a
+        // membership-dependent canonicalization would rewrite a saved selection differently before
+        // and after the cache warm and split its parameter pins.
+        return CursorAIModelCatalog.canonicalIdentity(rawModel)
     }
 
     private static func canonicalClaudeGLMModelRaw(_ rawModel: String?) -> String? {

@@ -232,6 +232,10 @@ struct AgentExploreMCPToolService {
         let caller = try await resolveExploreCaller(metadata: metadata, agentModeVM: agentModeVM)
         try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: caller.sourceTabID, isExploreOnly: true)
 
+        // Selection resolution validates membership synchronously against the shared ACP model
+        // registry, whose persisted snapshot warms asynchronously. Warm it first so a cached,
+        // still-advertised model is not rejected as unknown. No discovery or provider request.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: nil,
             defaultTaskLabel: .explore,

@@ -525,6 +525,10 @@ struct AgentRunMCPToolService {
         var selection: AgentMCPSelectionResolver.ResolvedSelection
         var routedReasoningEffortRaw: String?
         var routerSelectedTarget = false
+        // Selection validation below is synchronous over the shared ACP model registry, whose
+        // persisted snapshot warms asynchronously. Warm it first so a cached, still-advertised
+        // model is not rejected as unknown. No discovery or provider request.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         do {
             if let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
