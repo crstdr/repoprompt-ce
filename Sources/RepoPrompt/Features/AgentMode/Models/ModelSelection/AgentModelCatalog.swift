@@ -1841,7 +1841,10 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue),
+                // Auto is always valid even before discovery, so Cursor-only saved role choices
+                // still reach admission instead of disappearing with a cold catalogue.
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue)
             ]
         case .pair:
             [
@@ -1851,7 +1854,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue),
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue)
             ]
         case .design:
             [
@@ -1861,7 +1865,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
                 SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolMedium.rawValue),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue),
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue)
             ]
         }
     }
