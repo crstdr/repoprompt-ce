@@ -525,9 +525,9 @@ struct AgentRunMCPToolService {
         var selection: AgentMCPSelectionResolver.ResolvedSelection
         var routedReasoningEffortRaw: String?
         var routerSelectedTarget = false
-        // Selection validation below is synchronous over the shared ACP model registry, whose
-        // persisted snapshot warms asynchronously. Warm it first so a cached, still-advertised
-        // model is not rejected as unknown. No discovery or provider request.
+        // Warm the persisted ACP snapshot before selection validation so a cached model is not
+        // rejected as unknown. This step makes no provider request; the resolver may discover
+        // Cursor models on demand if no snapshot exists.
         await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         do {
             if let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
@@ -552,13 +552,16 @@ struct AgentRunMCPToolService {
                     ])
                 #endif
             } else {
-                selection = try AgentMCPSelectionResolver.resolve(
+                selection = try await AgentMCPSelectionResolver.resolve(
                     modelID: requestedModelID,
                     defaultTaskLabel: defaultTaskLabel,
                     availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-                    workspaceID: workspace.id
+                    workspaceID: workspace.id,
+                    workspacePath: workspace.repoPaths.first
                 )
             }
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw MCPError.invalidParams(error.localizedDescription)
         }

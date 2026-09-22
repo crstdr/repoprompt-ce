@@ -654,15 +654,16 @@ struct AgentManageMCPToolService {
         let spawnParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
         // create_session always creates a new session — default to the effective engineer role when model_id is omitted.
         // Validate selection before creating a target to avoid phantom sessions on bad model_id.
-        // Selection validation is synchronous over the shared ACP model registry, whose persisted
-        // snapshot warms asynchronously; warm it first so a cached, still-advertised model is not
-        // rejected as unknown. No discovery or provider request.
+        // Warm the persisted ACP snapshot before selection validation so a cached model is not
+        // rejected as unknown. This step makes no provider request; the resolver may discover
+        // Cursor models on demand if no snapshot exists.
         await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
-        let selection = try AgentMCPSelectionResolver.resolve(
+        let selection = try await AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: .engineer,
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: workspace.id
+            workspaceID: workspace.id,
+            workspacePath: workspace.repoPaths.first
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
@@ -804,12 +805,13 @@ struct AgentManageMCPToolService {
             agentModeVM: agentModeVM,
             workspace: workspace
         )
-        // See create_session: warm the persisted ACP catalog before synchronous validation.
+        // See create_session: warm the persisted ACP catalog before model validation.
         await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
-        let selection = try AgentMCPSelectionResolver.resolve(
+        let selection = try await AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: workspace.id
+            workspaceID: workspace.id,
+            workspacePath: workspace.repoPaths.first
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(

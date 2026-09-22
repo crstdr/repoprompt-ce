@@ -9,6 +9,10 @@ import XCTest
 /// than re-pinning a per-release model table.
 final class CursorDynamicModelCatalogTests: XCTestCase {
     private let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true)
+    private let cursorOnlyAvailability = AgentModelCatalog.AvailabilityContext(
+        claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: false,
+        cursorAvailable: true, grokBuildAvailable: false
+    )
 
     override func setUp() {
         super.setUp()
@@ -305,7 +309,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
     }
 
     @MainActor
-    func testFutureModelIsAdmittedByRawIDOnlySoItsExplicitPinSurvivesDispatch() throws {
+    func testFutureModelIsAdmittedByRawIDOnlySoItsExplicitPinSurvivesDispatch() async throws {
         // A model CE never shipped, whose display name carries a dot where the wire ID carries a
         // dash — the shape that historically needed alias rows.
         seedCursorCatalog(
@@ -372,20 +376,23 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
             providerID: .cursor,
             selectedModelRaw: "Claude Opus 9.1"
         ))
-        XCTAssertThrowsError(try AgentMCPSelectionResolver.resolve(
-            modelID: "cursor:Claude Opus 9.1",
-            availability: availability
-        ))
+        do {
+            _ = try await AgentMCPSelectionResolver.resolve(
+                modelID: "cursor:Claude Opus 9.1",
+                availability: availability
+            )
+            XCTFail("Expected an unadvertised display spelling to be rejected")
+        } catch {
+            // Only advertised raw IDs and closed legacy aliases are admitted.
+        }
 
         // Legacy display spellings CE already accepted keep working through the closed alias map.
         XCTAssertTrue(CursorAIModelCatalog.contains(modelRaw: "Cursor Grok 4.6"))
-        XCTAssertEqual(
-            try AgentMCPSelectionResolver.resolve(
-                modelID: "cursor:Cursor Grok 4.6",
-                availability: availability
-            ).modelRaw,
-            "Cursor Grok 4.6"
+        let legacy = try await AgentMCPSelectionResolver.resolve(
+            modelID: "cursor:Cursor Grok 4.6",
+            availability: availability
         )
+        XCTAssertEqual(legacy.modelRaw, "Cursor Grok 4.6")
     }
 
     func testSavedParameterPinIdentityIsIdenticalAcrossSpellingsAndWarmStates() {
@@ -423,7 +430,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
     }
 
     @MainActor
-    func testMCPCompoundAdmissionFollowsTheDiscoveredCursorCatalog() throws {
+    func testMCPCompoundAdmissionFollowsTheDiscoveredCursorCatalog() async throws {
         seedCursorCatalog(
             options: [
                 discoveredOption("default", "Auto", isDefault: true),
@@ -432,23 +439,27 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
             currentModelRaw: "future-cursor-model"
         )
 
-        let resolved = try AgentMCPSelectionResolver.resolve(
+        let resolved = try await AgentMCPSelectionResolver.resolve(
             modelID: "cursor:future-cursor-model",
             availability: availability
         )
         XCTAssertEqual(resolved.agentRaw, AgentProviderKind.cursor.rawValue)
         XCTAssertEqual(resolved.modelRaw, "future-cursor-model")
 
-        let auto = try AgentMCPSelectionResolver.resolve(
+        let auto = try await AgentMCPSelectionResolver.resolve(
             modelID: "cursor:auto",
             availability: availability
         )
         XCTAssertEqual(auto.modelRaw, "auto")
 
-        XCTAssertThrowsError(try AgentMCPSelectionResolver.resolve(
-            modelID: "cursor:grok-4.7",
-            availability: availability
-        ))
+        do {
+            _ = try await AgentMCPSelectionResolver.resolve(
+                modelID: "cursor:grok-4.7", availability: availability
+            )
+            XCTFail("Expected an unadvertised Cursor model to be rejected")
+        } catch {
+            // A settled catalogue that lacks this model must not trigger a refresh.
+        }
     }
 
     @MainActor
@@ -521,7 +532,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
     }
 
     @MainActor
-    func testCursorRoleLaunchRejectsUnadvertisedModelButAcceptsTheAdvertisedOne() throws {
+    func testCursorRoleLaunchRejectsUnadvertisedModelButAcceptsTheAdvertisedOne() async throws {
         let settings = GlobalSettingsStore.shared
         let previousOverrides = settings.mcpAgentRoleOverrides(scope: .global)
         defer { settings.updateMCPAgentRoleOverrides(previousOverrides, scope: .global, commit: true) }
@@ -540,10 +551,12 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
             ],
             currentModelRaw: "grok-4.8"
         )
-        XCTAssertThrowsError(try AgentMCPSelectionResolver.resolve(
-            modelID: "engineer",
-            availability: availability
-        )) { error in
+        do {
+            _ = try await AgentMCPSelectionResolver.resolve(
+                modelID: "engineer", availability: availability
+            )
+            XCTFail("Expected an unadvertised saved Cursor role model to be rejected")
+        } catch {
             let text = String(describing: error)
             XCTAssertTrue(text.contains("grok-4.7"), text)
             XCTAssertTrue(text.contains("last known model catalog"), text)
@@ -557,7 +570,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
             ],
             currentModelRaw: "grok-4.7"
         )
-        let advertised = try AgentMCPSelectionResolver.resolve(
+        let advertised = try await AgentMCPSelectionResolver.resolve(
             modelID: "engineer",
             availability: availability
         )
@@ -571,10 +584,186 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
             scope: .global
         )
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-        XCTAssertEqual(
-            try AgentMCPSelectionResolver.resolve(modelID: "engineer", availability: availability).modelRaw,
-            AgentModel.cursorAuto.rawValue
+        let auto = try await AgentMCPSelectionResolver.resolve(modelID: "engineer", availability: availability)
+        XCTAssertEqual(auto.modelRaw, AgentModel.cursorAuto.rawValue)
+    }
+
+    @MainActor
+    func testColdMCPCompoundSelectionDiscoversBeforeAdmission() async throws {
+        var refreshedPaths: [String?] = []
+        let resolved = try await AgentMCPSelectionResolver.resolve(
+            modelID: "cursor:grok-4.7",
+            availability: availability,
+            workspacePath: "/tmp/cursor-model-discovery-test",
+            cursorCatalogRefresh: { path in
+                refreshedPaths.append(path)
+                self.seedCursorCatalog(
+                    options: [self.discoveredOption("grok-4.7", "Cursor Grok 4.7")],
+                    currentModelRaw: "grok-4.7"
+                )
+            }
         )
+        XCTAssertEqual(refreshedPaths.count, 1)
+        XCTAssertEqual(refreshedPaths.compactMap(\.self), ["/tmp/cursor-model-discovery-test"])
+        XCTAssertEqual(resolved.agentRaw, AgentProviderKind.cursor.rawValue)
+        XCTAssertEqual(resolved.modelRaw, "grok-4.7")
+    }
+
+    @MainActor
+    func testColdSavedCursorRoleDiscoversAndRetainsItsPin() async throws {
+        let settings = GlobalSettingsStore.shared
+        let previousProfile = settings.globalAgentModelsProfile()
+        defer {
+            settings.setGlobalAgentModelsProfile(previousProfile, contextBuilderWriteIntent: .userInitiated)
+        }
+        let selection = AgentModelCatalog.NormalizedAgentSelection(agent: .cursor, modelRaw: "grok-4.7")
+        let pin = ACPModelParameterSelection(
+            providerID: .cursor, baseModelRaw: "grok-4.7", kind: .thinking,
+            configID: "reasoning_effort", valueRaw: "xhigh"
+        )
+        MCPAgentRoleDefaultsService.setModelParameter([pin], for: .engineer, displayed: selection, scope: .global)
+
+        let coldRole = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .engineer, availability: cursorOnlyAvailability
+        ))
+        XCTAssertEqual(coldRole.recommended.modelRaw, AgentModel.cursorAuto.rawValue)
+        XCTAssertEqual(coldRole.effective.modelRaw, "grok-4.7")
+        XCTAssertEqual(coldRole.modelParameters, [pin])
+
+        var refreshCount = 0
+        let resolved = try await AgentMCPSelectionResolver.resolve(
+            modelID: "engineer",
+            availability: cursorOnlyAvailability,
+            cursorCatalogRefresh: { _ in
+                refreshCount += 1
+                self.seedCursorCatalog(
+                    options: [self.discoveredOption("grok-4.7", "Cursor Grok 4.7")],
+                    currentModelRaw: "grok-4.7"
+                )
+            }
+        )
+        XCTAssertEqual(refreshCount, 1)
+        XCTAssertEqual(resolved.agentRaw, AgentProviderKind.cursor.rawValue)
+        XCTAssertEqual(resolved.modelRaw, "grok-4.7")
+        XCTAssertEqual(resolved.modelParameterSelections, [pin])
+
+        let omittedModelID = try await AgentMCPSelectionResolver.resolve(
+            modelID: nil, defaultTaskLabel: .engineer,
+            availability: cursorOnlyAvailability,
+            cursorCatalogRefresh: { _ in XCTFail("A settled catalogue must not refresh again") }
+        )
+        XCTAssertEqual(omittedModelID.modelRaw, "grok-4.7")
+        XCTAssertEqual(omittedModelID.modelParameterSelections, [pin])
+
+        let warmRole = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .engineer, availability: cursorOnlyAvailability
+        ))
+        XCTAssertEqual(warmRole.recommended.modelRaw, AgentModel.cursorAuto.rawValue)
+        XCTAssertEqual(warmRole.effective.modelRaw, "grok-4.7")
+    }
+
+    @MainActor
+    func testCursorOnlyRolesHaveAnAutoFloorWithoutDiscovery() async throws {
+        var refreshCount = 0
+        let noModels: AgentMCPSelectionResolver.CursorCatalogRefresh = { _ in refreshCount += 1 }
+        for role: AgentModelCatalog.TaskLabelKind in [.engineer, .pair, .design] {
+            let cold = try XCTUnwrap(AgentModelCatalog.resolveTaskLabelKind(
+                role, availability: cursorOnlyAvailability
+            ))
+            XCTAssertEqual(cold.agent, .cursor)
+            XCTAssertEqual(cold.modelRaw, AgentModel.cursorAuto.rawValue)
+            let selected = try await AgentMCPSelectionResolver.resolve(
+                modelID: role.rawValue, availability: cursorOnlyAvailability,
+                cursorCatalogRefresh: noModels
+            )
+            XCTAssertEqual(selected.modelRaw, AgentModel.cursorAuto.rawValue)
+        }
+        XCTAssertEqual(refreshCount, 0)
+
+        let withGrok = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: false,
+            cursorAvailable: true, grokBuildAvailable: true
+        )
+        for role: AgentModelCatalog.TaskLabelKind in [.engineer, .pair, .design] {
+            XCTAssertEqual(AgentModelCatalog.resolveTaskLabelKind(role, availability: withGrok)?.agent, .grokBuild)
+        }
+
+        seedCursorCatalog(
+            options: [discoveredOption(AgentModel.cursorComposer2.rawValue, "Composer 2")],
+            currentModelRaw: AgentModel.cursorComposer2.rawValue
+        )
+        for role: AgentModelCatalog.TaskLabelKind in [.engineer, .pair, .design] {
+            let warm = try XCTUnwrap(AgentModelCatalog.resolveTaskLabelKind(
+                role, availability: cursorOnlyAvailability
+            ))
+            XCTAssertEqual(warm.modelRaw, AgentModel.cursorComposer2.rawValue)
+        }
+    }
+
+    @MainActor
+    func testColdCursorOnlySavedRoleRejectsWhenDiscoveryPublishesNoModels() async {
+        let settings = GlobalSettingsStore.shared
+        let previousProfile = settings.globalAgentModelsProfile()
+        defer { settings.setGlobalAgentModelsProfile(previousProfile, contextBuilderWriteIntent: .userInitiated) }
+        MCPAgentRoleDefaultsService.setSelection(
+            .init(agent: .cursor, modelRaw: "grok-4.7"), for: .pair, scope: .global
+        )
+        var refreshCount = 0
+        for modelID: String? in ["pair", nil] {
+            do {
+                _ = try await AgentMCPSelectionResolver.resolve(
+                    modelID: modelID, defaultTaskLabel: .pair,
+                    availability: cursorOnlyAvailability,
+                    cursorCatalogRefresh: { _ in refreshCount += 1 }
+                )
+                XCTFail("A missing catalogue must not silently fall back to Cursor Auto")
+            } catch {
+                let detail = String(describing: error)
+                XCTAssertTrue(detail.contains("grok-4.7"), detail)
+                XCTAssertTrue(detail.contains("last known model catalog"), detail)
+            }
+        }
+        XCTAssertEqual(refreshCount, 2)
+    }
+
+    @MainActor
+    func testMissingCursorDiscoveryFailsClosedButAutoAndWarmCatalogDoNotRefresh() async throws {
+        var refreshCount = 0
+        let noModels: AgentMCPSelectionResolver.CursorCatalogRefresh = { _ in refreshCount += 1 }
+
+        do {
+            _ = try await AgentMCPSelectionResolver.resolve(
+                modelID: "cursor:grok-4.7", availability: availability,
+                cursorCatalogRefresh: noModels
+            )
+            XCTFail("A refresh without a published snapshot must not admit the model")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("not valid"), "\(error)")
+        }
+        XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor))
+        XCTAssertEqual(refreshCount, 1)
+
+        let auto = try await AgentMCPSelectionResolver.resolve(
+            modelID: "cursor:auto", availability: availability,
+            cursorCatalogRefresh: noModels
+        )
+        XCTAssertEqual(auto.modelRaw, "auto")
+        XCTAssertEqual(refreshCount, 1)
+
+        seedCursorCatalog(
+            options: [discoveredOption("grok-4.8", "Cursor Grok 4.8")],
+            currentModelRaw: "grok-4.8"
+        )
+        do {
+            _ = try await AgentMCPSelectionResolver.resolve(
+                modelID: "cursor:grok-4.7", availability: availability,
+                cursorCatalogRefresh: noModels
+            )
+            XCTFail("An unadvertised model must remain rejected with a settled catalogue")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("not valid"), "\(error)")
+        }
+        XCTAssertEqual(refreshCount, 1)
     }
 
     func testNonCursorDiscoveredProviderKeepsInvalidToDefaultNormalization() {
