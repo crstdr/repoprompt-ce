@@ -5,6 +5,19 @@ import XCTest
 
 @MainActor
 final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
+    /// Cursor membership and selectors come from its discovery snapshot; publish one so MCP
+    /// admission and parameter staging have a catalogue to validate against.
+    override func setUp() {
+        super.setUp()
+        CursorDiscoveredCatalogTestSupport.reset()
+        CursorDiscoveredCatalogTestSupport.seedStandardCatalog()
+    }
+
+    override func tearDown() {
+        CursorDiscoveredCatalogTestSupport.reset()
+        super.tearDown()
+    }
+
     func testFixtureRootsUseUniqueUUIDPaths() throws {
         let first = try makeFixture()
         defer { first.cleanup() }
@@ -718,7 +731,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         XCTAssertNil(session.mcpControlContext)
     }
 
-    func testAgentManageListCreateAndResumeUseReleaseCatalogMetadata() async throws {
+    func testAgentManageListCreateAndResumeUseDiscoveredCatalogMetadata() async throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
         let window = try await makeWindow(name: "Cursor MCP", root: fixture.root)

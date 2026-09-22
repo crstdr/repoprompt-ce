@@ -224,6 +224,10 @@ struct AgentManageMCPToolService {
         // serialized disposable-controller probe. Restrict OpenCode enrichment to the
         // advertised current/default model and dedupe canonical models so one enumeration
         // performs at most one probe. Cursor is synchronous and cheap.
+        // Enumeration reads discovered catalogs synchronously; warm the persisted ACP snapshot so
+        // list_agents cannot depend on another provider's incidental warm to advertise a cached
+        // Cursor catalog. No discovery or provider request.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         var probedOpenCodeCanonicals = Set<String>()
         let openCodeCurrentModelRaw: String? = await OpenCodeACPModelPollingService.shared
             .latestSnapshot()?.models.currentModelRaw
@@ -650,6 +654,10 @@ struct AgentManageMCPToolService {
         let spawnParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
         // create_session always creates a new session — default to the effective engineer role when model_id is omitted.
         // Validate selection before creating a target to avoid phantom sessions on bad model_id.
+        // Selection validation is synchronous over the shared ACP model registry, whose persisted
+        // snapshot warms asynchronously; warm it first so a cached, still-advertised model is not
+        // rejected as unknown. No discovery or provider request.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: .engineer,
@@ -796,6 +804,8 @@ struct AgentManageMCPToolService {
             agentModeVM: agentModeVM,
             workspace: workspace
         )
+        // See create_session: warm the persisted ACP catalog before synchronous validation.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,

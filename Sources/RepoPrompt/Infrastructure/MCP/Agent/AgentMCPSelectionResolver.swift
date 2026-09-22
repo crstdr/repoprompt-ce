@@ -152,6 +152,7 @@ enum AgentMCPSelectionResolver {
                     "Agent '\(providerSelection.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
                 )
             }
+            try requireAdvertisedCursorRoleModel(providerSelection, role: role)
             return (providerSelection, [])
         }
         if let resolution = MCPAgentRoleDefaultsService.effectiveSelection(
@@ -164,6 +165,7 @@ enum AgentMCPSelectionResolver {
                     "Agent '\(resolution.effective.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
                 )
             }
+            try requireAdvertisedCursorRoleModel(resolution.effective, role: role)
             return (resolution.effective, resolution.modelParameters)
         }
         guard let fallback = AgentModelCatalog.resolveTaskLabelKind(role, availability: availability) else {
@@ -175,5 +177,29 @@ enum AgentMCPSelectionResolver {
             )
         }
         return (fallback, [])
+    }
+
+    /// A role's stored Cursor model is preserved through restoration and refresh rather than being
+    /// swapped for the recommendation (`MCPAgentRoleDefaultsService`), so admission is where an
+    /// unadvertised one must fail. Callers warm the persisted ACP catalogue before resolving, so
+    /// this reads a settled catalogue and errors before a session is created or a run starts —
+    /// never a silent substitution. Cursor Auto is exempt: it is CE's provider-chosen default and
+    /// carries no advertised identity.
+    @MainActor
+    private static func requireAdvertisedCursorRoleModel(
+        _ selection: AgentModelCatalog.NormalizedAgentSelection,
+        role: AgentModelCatalog.TaskLabelKind
+    ) throws {
+        guard selection.agent == .cursor else { return }
+        let modelRaw = selection.modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modelRaw.isEmpty,
+              modelRaw.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
+              !CursorAIModelCatalog.contains(modelRaw: modelRaw)
+        else {
+            return
+        }
+        throw MCPError.invalidParams(
+            "Role '\(role.rawValue)' is set to Cursor model '\(modelRaw)', which is not in Cursor's last known model catalog. Refresh Cursor models with Test Connection, or choose Cursor Auto or another model for this role in Agent Models settings."
+        )
     }
 }
