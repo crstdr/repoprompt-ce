@@ -652,6 +652,7 @@ actor ACPAgentSessionController {
                     )
                 }
             #endif
+            try validateResumedSessionPermissionPolicy(promptRequest)
             try validatePromptModelParameterSelections(promptRequest)
             response = try await sendRequest(
                 method: "session/prompt",
@@ -2151,6 +2152,40 @@ actor ACPAgentSessionController {
     }
 
     // MARK: - Helpers
+
+    /// Refuse to prompt on a resumed session whose requested permission level cannot be applied.
+    ///
+    /// The guard fires when the request carries no session mode at all. Interactively that means
+    /// Normal or Provider Default -- Accept Edits and Smart map to the advertised `accept-edits`
+    /// and `smart`, so they are applied and are unaffected. In unattended runs every level below
+    /// Full Approval sends nothing, which is not the same as holding a floor: nothing is sent,
+    /// so nothing is enforced.
+    ///
+    /// Sending nothing is not a downgrade. A session opened with `session/load` keeps the mode it
+    /// already had, which can be a `bypass` this app set on an earlier run, so prompting anyway
+    /// would run the turn at a higher policy than the one requested.
+    ///
+    /// Devin advertises no value meaning `normal`/`auto`, so there is nothing to send instead;
+    /// inventing one would change the level the user selected. A fresh session is unaffected,
+    /// because there is no inherited mode to disagree with.
+    ///
+    /// Scoped to Devin so that other ACP providers are unchanged by this guard.
+    private func validateResumedSessionPermissionPolicy(_ request: ACPRunRequest) throws {
+        guard provider.providerID == .devin,
+              case .load = sessionConfiguration.mode,
+              // A load that could not find its session falls back to `session/new`, which leaves
+              // `sessionConfiguration.mode` as `.load` while the session is genuinely fresh.
+              // There is no inherited mode to disagree with, so the refusal must not apply.
+              fallbackResumeSessionIDForPromptClearing == nil,
+              request.sessionModeID == nil
+        else { return }
+        throw ControllerError.requestFailed(
+            """
+            Devin cannot apply the selected permission level to this resumed conversation. \
+            Start a new conversation, or choose a permission level that can be applied on resume.
+            """
+        )
+    }
 
     /// A later parameter or mode mutation can invalidate an earlier successful
     /// selection. Admit the complete effective request using only live session
