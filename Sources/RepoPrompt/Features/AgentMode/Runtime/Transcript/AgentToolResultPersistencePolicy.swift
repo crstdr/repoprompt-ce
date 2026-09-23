@@ -565,7 +565,9 @@ enum AgentToolResultPersistencePolicy {
             previousSanitizedTranscript: nil,
             reusablePrefixTurnCount: nil,
             preservedVisibleToolResultRowIDs: [],
-            context: context,
+            // A fresh per-pass context memoizes repeated JSON parses and tool
+            // executions within this single snapshot walk.
+            context: context ?? AgentToolResultProcessingContext(),
             purpose: .persistentStorage
         )
     }
