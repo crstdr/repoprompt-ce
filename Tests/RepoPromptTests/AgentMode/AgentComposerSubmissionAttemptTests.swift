@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -209,13 +210,34 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(props.areModelControlsDisabled)
     }
 
-    func testDefinitiveMissingRouterCredentialDisablesPersistedEnablement() throws {
+    func testDefinitiveMissingRouterCredentialDisablesPersistedEnablement() async throws {
         let backend = ComposerRoutingBackend(
             outcome: .selectLast,
             readiness: .needsConfiguration(generation: 1, reason: "Validate a TypeSafe API key.")
         )
         let (viewModel, store) = try makeRoutingViewModel(backend: backend)
         XCTAssertTrue(store.modelRouterConfiguration().enabled)
+
+        // Runtime construction publishes the backend's initial readiness asynchronously. Wait
+        // for that existing notification before testing how reconciliation handles the value.
+        let runtime = try XCTUnwrap(viewModel.modelRouterRuntime)
+        let expected: AgentTaskRouterBackendReadiness = .needsConfiguration(
+            generation: 1, reason: "Validate a TypeSafe API key."
+        )
+        let readinessPublished = expectation(description: "Router published missing-credential readiness")
+        var didFulfill = false
+        func fulfillIfPublished() {
+            guard !didFulfill, runtime.backendReadiness(backend.id) == expected else { return }
+            didFulfill = true
+            readinessPublished.fulfill()
+        }
+        let observation = runtime.objectWillChange.sink { _ in
+            Task { @MainActor in fulfillIfPublished() }
+        }
+        fulfillIfPublished()
+        await fulfillment(of: [readinessPublished], timeout: 10)
+        observation.cancel()
+        XCTAssertEqual(runtime.backendReadiness(backend.id), expected)
 
         viewModel.handleModelRouterRuntimeChanged()
 
