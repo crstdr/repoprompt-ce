@@ -10,7 +10,11 @@ import XCTest
 final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
     // MARK: - Fixtures
 
-    private func makeFullTurn(index: Int, id: UUID = UUID()) -> AgentTranscriptTurn {
+    private func makeFullTurn(
+        index: Int,
+        id: UUID = UUID(),
+        retentionTier: AgentTranscriptRetentionTier = .full
+    ) -> AgentTranscriptTurn {
         let startedAt = Date(timeIntervalSince1970: TimeInterval(index * 10))
         let user = AgentChatItem.user("request \(index)", sequenceIndex: index * 3)
         let thinking = AgentChatItem.thinking("thinking \(index)", sequenceIndex: index * 3 + 1)
@@ -30,7 +34,7 @@ final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
                     ]
                 )
             ],
-            retentionTier: .full,
+            retentionTier: retentionTier,
             terminalState: .completed,
             startedAt: startedAt,
             lastActivityAt: startedAt.addingTimeInterval(1),
@@ -108,7 +112,8 @@ final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
     func testCachesSliceBlocksRowsAndAnchorsPerTurn() throws {
         let turn0 = makeFullTurn(index: 0)
         let turn1 = makeFullTurn(index: 1)
-        let transcript = AgentTranscript(turns: [turn0, turn1], nextSequenceIndex: 6)
+        let archivedTurn = makeFullTurn(index: 2, retentionTier: .archived)
+        let transcript = AgentTranscript(turns: [turn0, turn1, archivedTurn], nextSequenceIndex: 9)
         let projection = AgentTranscriptProjectionBuilder.build(from: transcript)
 
         let caches = AgentTranscriptProjectionBuilder.updatedTurnCaches(
@@ -116,8 +121,8 @@ final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
             projection: projection
         )
 
-        XCTAssertEqual(Set(caches.keys), [turn0.id, turn1.id])
-        for turn in [turn0, turn1] {
+        XCTAssertEqual(Set(caches.keys), [turn0.id, turn1.id, archivedTurn.id])
+        for turn in [turn0, turn1, archivedTurn] {
             let cache = try XCTUnwrap(caches[turn.id])
             XCTAssertEqual(
                 cache.workingBlocks,
@@ -133,15 +138,24 @@ final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
                 .filter { $0.kind != .groupedHistory && $0.kind != .collapsedHistoryRange }
                 .flatMap(\.rows)
             XCTAssertEqual(cache.workingRows, expectedRows)
-            // Anchor maps contain only entries owned by this turn.
-            XCTAssertTrue(cache.rowAnchorIndex.values.allSatisfy { anchorTurnID($0) == turn.id })
-            XCTAssertTrue(cache.anchorBlockIndex.keys.allSatisfy { anchorTurnID($0) == turn.id })
+            let expectedArchivedRows = cache.archivedBlocks
+                .filter { $0.kind != .groupedHistory && $0.kind != .collapsedHistoryRange }
+                .flatMap(\.rows)
+            XCTAssertEqual(cache.archivedRows, expectedArchivedRows)
+            // Anchor maps equal the projection maps filtered by owning turn, in full.
             XCTAssertEqual(
-                Set(cache.rowAnchorIndex.keys),
-                Set(projection.rowAnchorIndex.filter { anchorTurnID($0.value) == turn.id }.keys)
+                cache.rowAnchorIndex,
+                projection.rowAnchorIndex.filter { anchorTurnID($0.value) == turn.id }
+            )
+            XCTAssertEqual(
+                cache.anchorBlockIndex,
+                projection.anchorBlockIndex.filter { anchorTurnID($0.key) == turn.id }
             )
             XCTAssertEqual(cache.token.turnID, turn.id)
         }
+        // The archived-tier turn produced real archived blocks, so the archived slicing
+        // assertions above are not vacuous.
+        XCTAssertFalse(caches[archivedTurn.id]?.archivedBlocks.isEmpty ?? true)
     }
 
     func testCompletedTurnWithNoBlocksStillGetsAnEmptyCache() throws {
