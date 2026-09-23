@@ -687,7 +687,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
             )
             XCTFail("A missing catalogue must not substitute Cursor Auto")
         } catch let error as MCPError {
-            guard case let .invalidParams(detail) = error else {
+            guard case let .invalidParams(message) = error, let detail = message else {
                 return XCTFail("Expected a model-specific invalid-params error: \(error)")
             }
             XCTAssertTrue(detail.contains("engineer") && detail.contains("grok-4.7"), detail)
@@ -730,7 +730,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
             )
             XCTFail("Expected an unadvertised saved Cursor role model to be rejected")
         } catch let error as MCPError {
-            guard case let .invalidParams(detail) = error else {
+            guard case let .invalidParams(message) = error, let detail = message else {
                 return XCTFail("Expected a model-specific invalid-params error: \(error)")
             }
             XCTAssertTrue(detail.contains("engineer") && detail.contains("grok-4.7"), detail)
