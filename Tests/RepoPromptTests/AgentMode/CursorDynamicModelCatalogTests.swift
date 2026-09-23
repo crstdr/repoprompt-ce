@@ -99,8 +99,21 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
         let previousProfile = settings.globalAgentModelsProfile()
         defer { settings.setGlobalAgentModelsProfile(previousProfile, contextBuilderWriteIntent: .preserveExistingOwnership) }
         settings.setAgentModelsMCPAgentRoleOverrides(nil, scope: .global)
+        let roles: [AgentModelCatalog.TaskLabelKind] = [.engineer, .pair, .design]
+        for role in roles {
+            MCPAgentRoleDefaultsService.setSelection(
+                .init(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue),
+                for: role,
+                scope: .global
+            )
+        }
+        let savedOverrides = settings.mcpAgentRoleOverrides(scope: .global)
         var refreshCount = 0
-        for role: AgentModelCatalog.TaskLabelKind in [.engineer, .pair, .design] {
+        for role in roles {
+            XCTAssertEqual(
+                savedOverrides?[role.rawValue],
+                AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: AgentModel.cursorAuto.rawValue).rawValue
+            )
             let recommended = try XCTUnwrap(AgentModelCatalog.resolveTaskLabelKind(role, availability: cursorOnly))
             XCTAssertEqual(recommended.agent, .cursor)
             XCTAssertEqual(recommended.modelRaw, AgentModel.cursorAuto.rawValue)
@@ -110,6 +123,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
                 cursorCatalogRefresh: { _ in refreshCount += 1 }
             )
             XCTAssertEqual(selected.modelRaw, AgentModel.cursorAuto.rawValue)
+            XCTAssertEqual(settings.mcpAgentRoleOverrides(scope: .global), savedOverrides)
         }
         XCTAssertEqual(refreshCount, 0)
 
