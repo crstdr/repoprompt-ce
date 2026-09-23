@@ -1302,9 +1302,18 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     private var toolExecutionByItemID: [UUID: AgentTranscriptToolExecution] = [:]
     private var missingToolExecutionItemIDs: Set<UUID> = []
     private var bashMetadataByRaw: [String: BashToolResultParser.Metadata] = [:]
+    /// When false, item-ID-keyed execution lookups always miss and stores are dropped.
+    /// Content-addressed caches (JSON parses, bash metadata) are unaffected. Used by
+    /// passes that must not let one activity's execution be reused for another activity
+    /// that happens to share its item ID.
+    private let cachesToolExecutions: Bool
     #if DEBUG || EDIT_FLOW_PERF
         private var metrics: AgentToolResultProcessingMetrics = .zero
     #endif
+
+    init(cachesToolExecutions: Bool = true) {
+        self.cachesToolExecutions = cachesToolExecutions
+    }
 
     func jsonObject(from raw: String?) -> [String: Any]? {
         guard let normalizedRaw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1363,6 +1372,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     }
 
     func lookupToolExecution(for itemID: UUID) -> ToolExecutionLookup {
+        guard cachesToolExecutions else { return .miss }
         lock.lock()
         if let cached = toolExecutionByItemID[itemID] {
             #if DEBUG || EDIT_FLOW_PERF
@@ -1386,6 +1396,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     }
 
     func storeToolExecution(_ execution: AgentTranscriptToolExecution, for itemID: UUID) {
+        guard cachesToolExecutions else { return }
         lock.lock()
         toolExecutionByItemID[itemID] = execution
         missingToolExecutionItemIDs.remove(itemID)
@@ -1393,6 +1404,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     }
 
     func markMissingToolExecution(for itemID: UUID) {
+        guard cachesToolExecutions else { return }
         lock.lock()
         missingToolExecutionItemIDs.insert(itemID)
         toolExecutionByItemID.removeValue(forKey: itemID)

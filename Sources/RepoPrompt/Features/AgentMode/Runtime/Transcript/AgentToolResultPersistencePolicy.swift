@@ -565,9 +565,10 @@ enum AgentToolResultPersistencePolicy {
             previousSanitizedTranscript: nil,
             reusablePrefixTurnCount: nil,
             preservedVisibleToolResultRowIDs: [],
-            // A fresh per-pass context memoizes repeated JSON parses and tool
-            // executions within this single snapshot walk.
-            context: context ?? AgentToolResultProcessingContext(),
+            // A fresh per-pass context memoizes repeated JSON parses within this single
+            // snapshot walk. Item-ID execution caching stays disabled so a repeated ID
+            // cannot hand one activity a cached execution derived from another.
+            context: context ?? AgentToolResultProcessingContext(cachesToolExecutions: false),
             purpose: .persistentStorage
         )
     }
