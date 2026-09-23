@@ -556,6 +556,9 @@ enum AgentToolResultPersistencePolicy {
         sanitizeTranscriptForPersistenceWithMetrics(transcript).transcript
     }
 
+    /// - Parameter context: Leave `nil` or supply a context created with
+    ///   `cachesToolExecutions: false`. A context with execution caching enabled can
+    ///   hand a repeated activity ID a cached execution derived from another activity.
     static func sanitizeTranscriptForPersistenceWithMetrics(
         _ transcript: AgentTranscript,
         context: AgentToolResultProcessingContext? = nil
