@@ -11,12 +11,16 @@ import XCTest
 final class JujutsuSnapshotPolicyTests: XCTestCase {
     private static let ignoreWorkingCopy = "--ignore-working-copy"
 
+    /// A path that never exists, so no stray `.git` there can make it look colocated.
+    private let probeRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("jj-policy-probe-\(UUID().uuidString)", isDirectory: true)
+
     // MARK: - Runner
 
     func testRecordedPolicyPlacesFlagBeforeSubcommandSoTrailingPathsCannotSwallowIt() async throws {
         let log = JJInvocationLog()
         let runner = makeRunner(log: log)
-        let repo = URL(fileURLWithPath: "/tmp/jj-policy-probe")
+        let repo = probeRoot
 
         _ = try await runner.run(["diff", "--stat", "--", "a.swift"], at: repo, workingCopy: .recorded)
         _ = try await runner.run(["diff", "--stat", "--", "a.swift"], at: repo, workingCopy: .snapshot)
@@ -37,7 +41,7 @@ final class JujutsuSnapshotPolicyTests: XCTestCase {
             bookmarksAtWorkingCopy: "zeta\nalpha"
         ))
 
-        let branch = try await backend.getCurrentBranch(at: URL(fileURLWithPath: "/tmp/jj-policy-probe"))
+        let branch = try await backend.getCurrentBranch(at: probeRoot)
 
         XCTAssertEqual(branch, "alpha", "The first local bookmark at @ in sorted order.")
         let invocations = await log.invocations
@@ -50,7 +54,7 @@ final class JujutsuSnapshotPolicyTests: XCTestCase {
         let log = JJInvocationLog()
         let backend = JujutsuBackend(runner: makeRunner(log: log, currentReadExitCode: 1))
 
-        let branch = try await backend.getCurrentBranch(at: URL(fileURLWithPath: "/tmp/jj-policy-probe"))
+        let branch = try await backend.getCurrentBranch(at: probeRoot)
 
         XCTAssertNil(branch)
         let invocations = await log.invocations
@@ -62,7 +66,7 @@ final class JujutsuSnapshotPolicyTests: XCTestCase {
         let log = JJInvocationLog()
         let backend = JujutsuBackend(runner: makeRunner(log: log, allBookmarks: ""))
 
-        let branch = try await backend.getCurrentBranch(at: URL(fileURLWithPath: "/tmp/jj-policy-probe"))
+        let branch = try await backend.getCurrentBranch(at: probeRoot)
 
         XCTAssertNil(branch)
         let invocations = await log.invocations
@@ -118,10 +122,10 @@ final class JujutsuSnapshotPolicyTests: XCTestCase {
 
     // MARK: - Reads that stay snapshotting
 
-    func testReadsThatMustSeeLiveEditsStillSnapshot() async throws {
+    func testLiveReadsAndFetchStillSnapshot() async throws {
         let log = JJInvocationLog()
         let backend = JujutsuBackend(runner: makeRunner(log: log))
-        let repo = URL(fileURLWithPath: "/tmp/jj-policy-probe")
+        let repo = probeRoot
 
         _ = try await backend.getDiffText(
             compare: .uncommitted(base: "HEAD"),
@@ -132,12 +136,13 @@ final class JujutsuSnapshotPolicyTests: XCTestCase {
         )
         _ = try await backend.getWorkingStatus(at: repo)
         _ = try await backend.getStatusFingerprint(at: repo, baseRef: "HEAD")
+        try await backend.fetch(at: repo)
 
         let invocations = await log.invocations
-        XCTAssertEqual(invocations.count, 4, "diff text, working status, fingerprint head + summary: \(invocations)")
+        XCTAssertEqual(invocations.count, 5, "diff text, working status, fingerprint head + summary, fetch: \(invocations)")
         XCTAssertTrue(
             invocations.allSatisfy { $0.first != Self.ignoreWorkingCopy },
-            "Diff text, working status and fingerprints must observe live edits: \(invocations)"
+            "Live reads and the one write command (fetch) must not skip the snapshot: \(invocations)"
         )
     }
 
@@ -150,7 +155,7 @@ final class JujutsuSnapshotPolicyTests: XCTestCase {
             includeUntrackedWhenApplicable: true,
             detectRenames: false,
             paths: nil,
-            at: URL(fileURLWithPath: "/tmp/jj-policy-probe")
+            at: probeRoot
         )
 
         let invocations = await log.invocations
@@ -367,6 +372,8 @@ final class JujutsuSnapshotPolicyTests: XCTestCase {
             case ("diff"?, "--stat"?):
                 return (statOutput, "", 0)
             case ("diff"?, _):
+                return ("", "", 0)
+            case ("git"?, "fetch"?):
                 return ("", "", 0)
             case ("bookmark"?, "list"?):
                 return command.contains("--all") ? (allBookmarks, "", 0) : ("core: vwzyxozr 38f2602e docs\n", "", 0)

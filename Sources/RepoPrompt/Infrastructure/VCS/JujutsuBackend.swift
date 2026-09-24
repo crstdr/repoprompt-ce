@@ -9,7 +9,8 @@ import Foundation
 /// - Unified diffs use `jj diff --git`.
 /// - Fingerprint statusHash is prefixed with "jj:" to prevent collisions with git fingerprints.
 /// - Every command states a `JJWorkingCopyPolicy`. Status polling snapshots the working copy
-///   once per refresh (`jj diff --summary`); reads a snapshot cannot change use `.recorded`.
+///   once per refresh (`jj diff --summary`), or three times in a workspace colocated with git,
+///   where the bookmark lists snapshot too; reads a snapshot cannot change use `.recorded`.
 /// - Bookmark reads need jj 0.22 or later, which introduced `jj bookmark`; on older jj they
 ///   return nothing.
 public actor JujutsuBackend: VCSBackendWithWarnings {
@@ -313,9 +314,9 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         let normalized = normalizeCompareSpecWithWarning(compare).spec
         let refs = try resolveDiffRefs(for: normalized, repoURL: repoURL)
 
-        // 1) Summary for statuses (M/A/D/R/C etc). This is the one call on the status-poll
-        //    path that snapshots the working copy; the reads below rely on it having run
-        //    first, so they reuse its snapshot instead of scanning again. Keep this order.
+        // 1) Summary for statuses (M/A/D/R/C etc). This call snapshots the working copy; the
+        //    reads below rely on it having run first, so they reuse its snapshot instead of
+        //    scanning again. Keep this order.
         let summaryText = try await jjDiffSummary(
             from: refs.from,
             to: refs.to,
