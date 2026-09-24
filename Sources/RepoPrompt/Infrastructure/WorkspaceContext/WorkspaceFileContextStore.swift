@@ -13580,11 +13580,11 @@ actor WorkspaceFileContextStore {
         }
 
         let resolved = await flight.task.value
-        let result: CodemapEligibilityResolution
-        if !nonGitCodeMapsEnabled, resolved.evidence?.filesystemProof != nil {
-            result = .terminal(.nonGit)
+        let filesystemOptOut = !nonGitCodeMapsEnabled && resolved.evidence?.filesystemProof != nil
+        let result: CodemapEligibilityResolution = if filesystemOptOut {
+            .terminal(.nonGit)
         } else {
-            result = resolved
+            resolved
         }
         if codemapEligibilityFlightsByRootEpoch[authority.rootEpoch]?.id == flight.id {
             codemapEligibilityFlightsByRootEpoch.removeValue(forKey: authority.rootEpoch)
