@@ -1,6 +1,10 @@
 import Foundation
 
 struct JevTaskRouterBackend: AgentTaskRouterBackend {
+    /// The shipped routing policy submits exactly one choice question per decision. The judgment
+    /// batch seam below generalizes structural validation only; it does not change what is sent.
+    static let routeQuestionID = "route"
+
     let id = AgentTaskRouterBackendID.jev
     let displayName = "Jev"
     let credentialService: JevRouterCredentialService
@@ -11,7 +15,7 @@ struct JevTaskRouterBackend: AgentTaskRouterBackend {
         AgentTaskRouterBackendSettingsRegistration(
             presentation: .init(
                 title: "Jev by TypeSafe",
-                configurationDetail: "Verify a TypeSafe API key, then enable Model Router above. Key verification checks your account without sending a task. Routing chooses a model and then its effort in separate Jev decisions, each with a five-second deadline and no automatic retry.",
+                configurationDetail: "Verify a TypeSafe API key, then enable Model Router or Auto effort. Key verification checks your account without sending a task. Model Router chooses a model and then its effort; Auto effort chooses only effort for an eligible user turn. Jev decisions have a five-second deadline and no automatic retry.",
                 secretFieldLabel: "TypeSafe API key",
                 links: [
                     .init(title: "TypeSafe API documentation", url: URL(string: "https://docs.typesafe.ai/api")!),
@@ -22,50 +26,61 @@ struct JevTaskRouterBackend: AgentTaskRouterBackend {
         )
     }
 
+    func chooseAutoEffort(
+        maskedTaskExcerpt: String,
+        selectedModelID: String,
+        builtInWorkflow: AgentWorkflow?,
+        efforts: [String]
+    ) async -> String? {
+        await JevAutoEffortJudge(credentials: credentialService).chooseEffort(
+            maskedTaskExcerpt: maskedTaskExcerpt,
+            selectedModelID: selectedModelID,
+            builtInWorkflow: builtInWorkflow,
+            efforts: efforts
+        )
+    }
+
     func readinessSnapshot() async -> AgentTaskRouterBackendReadiness {
         await credentialService.readinessSnapshot()
     }
 
     func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
-        guard request.contractVersion == AgentTaskRoutingRequest.currentContractVersion,
-              (2 ... AgentTaskRoutingEnvelopeBuilder.maximumCandidates).contains(request.candidates.count)
-        else {
+        guard request.contractVersion == AgentTaskRoutingRequest.currentContractVersion else {
             return .failed(category: .invalidRequest, retryable: false, evidence: nil)
         }
-        var criteria: [String: String] = [:]
-        for candidate in request.candidates {
-            guard !candidate.opaqueKey.isEmpty,
-                  criteria.updateValue(
-                      "\(candidate.targetDescription) Suitable work: \(candidate.rubric)",
-                      forKey: candidate.opaqueKey
-                  ) == nil
-            else {
-                return .failed(category: .invalidRequest, retryable: false, evidence: nil)
-            }
+        // Candidate count, empty keys, and duplicate opaque keys are all structural build errors,
+        // so an invalid request is still rejected before the service is contacted.
+        guard let batch = try? JevJudgmentBatch(questions: [
+            JevJudgmentQuestion(
+                id: Self.routeQuestionID,
+                instructions: routingInstructions(for: request),
+                criteria: request.candidates.map {
+                    JevJudgmentCriterion(
+                        opaqueKey: $0.opaqueKey,
+                        description: "\($0.targetDescription) Suitable work: \($0.rubric)"
+                    )
+                }
+            )
+        ]) else {
+            return .failed(category: .invalidRequest, retryable: false, evidence: nil)
         }
         let wireRequest = JevRoutingWireRequest(
             model: JevRouterCredentialService.pinnedModel,
             state: routingState(for: request),
-            questions: [
-                "route": .init(
-                    type: "choice",
-                    instructions: routingInstructions(for: request),
-                    criteria: criteria
-                )
-            ]
+            questions: batch.wireQuestions()
         )
         do {
             let response = try await credentialService.judgeForRouting(wireRequest)
-            let validated = try JevRoutingResponseInterpreter().validate(
-                response,
-                submittedOpaqueKeys: Set(criteria.keys)
-            )
+            let validated = try JevRoutingResponseInterpreter().validate(response, batch: batch)
+            guard let answer = validated.answer(forQuestionID: Self.routeQuestionID) else {
+                return .failed(category: .invalidResponse, retryable: false, evidence: nil)
+            }
             return .selected(
-                opaqueKey: validated.selectedOpaqueKey,
+                opaqueKey: answer.selectedOpaqueKey,
                 evidence: .init(
                     policyVersion: JevRouterCredentialService.routingPolicyVersion,
-                    confidence: validated.confidence,
-                    scores: validated.probabilities,
+                    confidence: answer.confidence,
+                    scores: answer.probabilities,
                     inputTokens: validated.inputTokens,
                     outputTokens: validated.outputTokens,
                     reasonCode: "unique_argmax"

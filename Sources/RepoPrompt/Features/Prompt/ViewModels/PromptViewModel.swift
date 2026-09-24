@@ -2286,7 +2286,8 @@ class PromptViewModel: ObservableObject {
         windowID: Int,
         settingsManager: SettingsManaging,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
-        promptClipboardPasteboard: NSPasteboard = .general
+        promptClipboardPasteboard: NSPasteboard = .general,
+        refreshAvailableModelsOnInit: Bool = true
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2308,8 +2309,10 @@ class PromptViewModel: ObservableObject {
         loadStoredPrompts()
         updateFileTree()
 
-        Task {
-            await self.refreshAvailableModels()
+        if refreshAvailableModelsOnInit {
+            Task {
+                await self.refreshAvailableModels()
+            }
         }
 
         syncSettingsFromSettingsManager()
@@ -4669,6 +4672,9 @@ class PromptViewModel: ObservableObject {
             let tabID = manager.workspaces[index].composeTabs[tabIndex].id
             guard tabIDs.contains(tabID), manager.workspaces[index].composeTabs[tabIndex].isPinned != pinned else { continue }
             manager.workspaces[index].composeTabs[tabIndex].isPinned = pinned
+            if !pinned {
+                manager.workspaces[index].composeTabs[tabIndex].pinnedOrder = nil
+            }
             updatedTabIDs.insert(tabID)
         }
         guard !updatedTabIDs.isEmpty else {
@@ -4678,6 +4684,41 @@ class PromptViewModel: ObservableObject {
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         return ComposeTabPinMutationReport(updatedTabIDs: updatedTabIDs, contextRejected: false)
+    }
+
+    /// Assigns an explicit order to the supplied pinned tabs in one workspace mutation.
+    /// The caller validates the complete Agent-session pin set before invoking this method.
+    @discardableResult
+    @MainActor
+    func setPinnedComposeTabOrder(
+        _ orderedTabIDs: [UUID],
+        workspaceID: UUID
+    ) -> Bool {
+        guard let manager = workspaceManager,
+              let workspace = manager.activeWorkspace,
+              workspace.id == workspaceID,
+              let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+              Set(orderedTabIDs).count == orderedTabIDs.count
+        else { return false }
+
+        let rankByTabID = Dictionary(uniqueKeysWithValues: orderedTabIDs.enumerated().map { ($0.element, $0.offset) })
+        let pinnedIDs = Set(manager.workspaces[index].composeTabs.filter(\.isPinned).map(\.id))
+        guard Set(orderedTabIDs).isSubset(of: pinnedIDs) else { return false }
+
+        var changed = false
+        for tabIndex in manager.workspaces[index].composeTabs.indices {
+            let tabID = manager.workspaces[index].composeTabs[tabIndex].id
+            guard let rank = rankByTabID[tabID] else { continue }
+            if manager.workspaces[index].composeTabs[tabIndex].pinnedOrder != rank {
+                manager.workspaces[index].composeTabs[tabIndex].pinnedOrder = rank
+                changed = true
+            }
+        }
+        guard changed else { return true }
+        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        manager.markWorkspaceDirty()
+        manager.pollAndSaveState()
+        return true
     }
 
     @MainActor
