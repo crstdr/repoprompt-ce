@@ -14,7 +14,8 @@ public enum JJWorkingCopyPolicy: Sendable, Equatable {
     case snapshot
     /// Read the last recorded snapshot via `--ignore-working-copy`, without scanning or
     /// writing. Only valid for output a snapshot cannot change, or for a read that follows
-    /// a snapshot taken earlier in the same operation.
+    /// a snapshot taken earlier in the same operation. Never use it for a command that writes:
+    /// jj then neither updates the working copy nor follows a moved git HEAD.
     case recorded
 }
 

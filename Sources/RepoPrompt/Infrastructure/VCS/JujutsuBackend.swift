@@ -10,6 +10,8 @@ import Foundation
 /// - Fingerprint statusHash is prefixed with "jj:" to prevent collisions with git fingerprints.
 /// - Every command states a `JJWorkingCopyPolicy`. Status polling snapshots the working copy
 ///   once per refresh (`jj diff --summary`); reads a snapshot cannot change use `.recorded`.
+/// - Bookmark reads need jj 0.22 or later, which introduced `jj bookmark`; on older jj they
+///   return nothing.
 public actor JujutsuBackend: VCSBackendWithWarnings {
     // MARK: - Configuration
 
@@ -764,6 +766,12 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
             return try await task.value.names
         }
 
+        // Bookmark names are snapshot-invariant: a snapshot rewrites @ and moves the bookmarks
+        // on it along. A colocated workspace is the exception: there a snapshotting command also
+        // imports refs and HEAD moved by plain `git`, and moves @ onto a new git HEAD. Only a
+        // snapshot does that safely (`jj git import` under --ignore-working-copy resets git HEAD
+        // instead), so colocated workspaces keep snapshotting here, as before.
+        let workingCopy: JJWorkingCopyPolicy = Self.isColocatedWorkspace(repoURL) ? .snapshot : .recorded
         let task = Task { [runner] in
             var args = ["bookmark", "list", "--color=never"]
             switch mode {
@@ -772,9 +780,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
             case .tracked:
                 args.append("--tracked")
             }
-            // Recorded state is sufficient: a snapshot rewrites @ and moves the bookmarks on
-            // it along, so it never changes which bookmarks exist or where they point.
-            let (stdout, _, exit) = try await runner.run(args, at: repoURL, workingCopy: .recorded)
+            let (stdout, _, exit) = try await runner.run(args, at: repoURL, workingCopy: workingCopy)
             guard exit == 0 else {
                 // Treat as non-fatal: older jj may not support some flags.
                 return BookmarkListResult(names: [], isCacheable: false)
@@ -814,6 +820,12 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         return Array(Set(results)).sorted()
     }
 
+    /// Whether the workspace is colocated with git (`.git` beside `.jj`). jj imports changes made
+    /// with plain `git` only in such a workspace, and only while snapshotting.
+    private nonisolated static func isColocatedWorkspace(_ repoURL: URL) -> Bool {
+        FileManager.default.fileExists(atPath: repoURL.appendingPathComponent(".git").path)
+    }
+
     private func bookmarkSnapshot(repoURL: URL) async throws -> BookmarkSnapshot {
         let key = standardizedRepoPath(repoURL)
         let cacheGeneration = bookmarkCacheGenerations[key] ?? 0
@@ -850,8 +862,8 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
     private func localBookmarksAtWorkingCopy(repoURL: URL, bookmarks: [String]) async throws -> [String] {
         // No bookmarks at all means none can point at @.
         guard !bookmarks.isEmpty else { return [] }
-        // Recorded state is sufficient for the same reason as `listBookmarks`: a snapshot
-        // moves the bookmarks on @ along with it, so the set of names does not change.
+        // Recorded state is sufficient: `listBookmarks` has just run, and in a colocated
+        // workspace it snapshotted, which imported any refs and HEAD moved by plain `git`.
         let (stdout, _, exit) = try await runner.run(
             ["log", "-r", "@", "--no-graph", "--color=never", "-T", Self.localBookmarkNamesTemplate],
             at: repoURL,
@@ -862,9 +874,12 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         return Self.parseLocalBookmarkNames(stdout)
     }
 
-    private static let localBookmarkNamesTemplate = #"local_bookmarks.map(|b| b.name()).join("\n")"#
+    /// Conflicted bookmarks print as empty lines: they have no single target, so jj cannot
+    /// resolve them as a revision, and they were never reported as current before.
+    private static let localBookmarkNamesTemplate =
+        #"local_bookmarks.map(|b| if(b.conflict(), "", b.name())).join("\n")"#
 
-    nonisolated static func parseLocalBookmarkNames(_ output: String) -> [String] {
+    private nonisolated static func parseLocalBookmarkNames(_ output: String) -> [String] {
         let names = output
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map { $0.trimmingCharacters(in: .whitespaces) }
