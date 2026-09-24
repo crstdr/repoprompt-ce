@@ -44,6 +44,9 @@ import XCTest
             XCTAssertNil(Diagnostics.context, "Throwing must restore the task-local scope")
             try Diagnostics.$context.withValue(context) {
                 for _ in 0 ..< Diagnostics.Recorder.maximumSamples + 1 {
+                    // The digest cache must not turn repeat decodes into hits:
+                    // this test measures per-decode work, so decode fresh.
+                    WorkspaceFileDecodeCache.shared.removeAllForTesting()
                     _ = try fixture.decode(bytes)
                 }
             }
