@@ -120,6 +120,14 @@ final class WorkspaceCodemapRootCapabilityServiceTests: XCTestCase {
         )
         let bareClassification = await probe.resolve(rootURL)
         XCTAssertEqual(bareClassification, .requiresGitPreflight)
+
+        try Data([0xFF, 0xFE, 0x00]).write(to: rootURL.appendingPathComponent("HEAD"))
+        let undecodableClassification = await probe.resolve(rootURL)
+        XCTAssertEqual(
+            undecodableClassification,
+            .requiresGitPreflight,
+            "An undecodable HEAD beside objects/ must defer to Git preflight"
+        )
     }
 
     private func makeService(

@@ -350,7 +350,7 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
         var bytes = [UInt8](repeating: 0, count: 256)
         let count = read(fd, &bytes, bytes.count)
         guard count >= 0 else { return true }
-        guard let text = String(bytes: bytes.prefix(count), encoding: .utf8) else { return false }
+        guard let text = String(bytes: bytes.prefix(count), encoding: .utf8) else { return true }
         let headLine = text.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
         if headLine.hasPrefix("ref: refs/") {
             return true
