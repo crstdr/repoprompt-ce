@@ -97,6 +97,31 @@ final class WorkspaceCodemapRootCapabilityServiceTests: XCTestCase {
         XCTAssertEqual(restoredState, .eligible(capability))
     }
 
+    func testOrdinaryHEADAndObjectsNamesDoNotMasqueradeAsBareGit() async throws {
+        let rootURL = try makeTemporaryRoot()
+        try "ordinary project notes\n".write(
+            to: rootURL.appendingPathComponent("HEAD"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.createDirectory(
+            at: rootURL.appendingPathComponent("objects"),
+            withIntermediateDirectories: false
+        )
+        let probe = WorkspaceCodemapLocalGitClassificationProbe.production
+        guard case .definitelyNonGit = await probe.resolve(rootURL) else {
+            return XCTFail("Ordinary HEAD and objects names must not require Git preflight")
+        }
+
+        try "ref: refs/heads/main\n".write(
+            to: rootURL.appendingPathComponent("HEAD"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let bareClassification = await probe.resolve(rootURL)
+        XCTAssertEqual(bareClassification, .requiresGitPreflight)
+    }
+
     private func makeService(
         probe: WorkspaceCodemapLocalGitClassificationProbe
     ) -> WorkspaceCodemapRootCapabilityService {

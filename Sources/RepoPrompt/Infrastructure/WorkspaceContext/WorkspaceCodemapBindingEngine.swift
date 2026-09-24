@@ -4827,8 +4827,10 @@ actor WorkspaceCodemapBindingEngine {
               session.pipelines[pipelineIdentity] != nil,
               candidate.identity.rootID == rootEpoch.rootID,
               candidate.identity.rootLifetimeID == rootEpoch.rootLifetimeID,
-              candidate.identity.standardizedRootPath ==
-              session.registration.capabilityRequest.loadedRootURL.path,
+              WorkspaceCodemapRootPathBinding.matches(
+                  candidate.identity.standardizedRootPath,
+                  authorizedRootURL: session.registration.capabilityRequest.loadedRootURL
+              ),
               candidate.requestGeneration > 0,
               candidate.requestGeneration == candidate.pathGeneration,
               (
@@ -5722,8 +5724,10 @@ actor WorkspaceCodemapBindingEngine {
                 guard let candidate,
                       candidate.identity.rootID == rootEpoch.rootID,
                       candidate.identity.rootLifetimeID == rootEpoch.rootLifetimeID,
-                      candidate.identity.standardizedRootPath ==
-                      initial.registration.capabilityRequest.loadedRootURL.path,
+                      WorkspaceCodemapRootPathBinding.matches(
+                          candidate.identity.standardizedRootPath,
+                          authorizedRootURL: initial.registration.capabilityRequest.loadedRootURL
+                      ),
                       candidate.identity.standardizedRelativePath == loadedPath,
                       candidate.ingressGeneration == initial.registration.ingressGeneration,
                       candidate.requestGeneration == candidate.pathGeneration,
@@ -6569,8 +6573,10 @@ actor WorkspaceCodemapBindingEngine {
         guard demand.identity.rootID == session.capability.rootEpoch.rootID,
               demand.identity.rootLifetimeID == session.capability.rootEpoch.rootLifetimeID
         else { return .result(.rejected(.rootEpochMismatch)) }
-        guard demand.identity.standardizedRootPath ==
-            session.registration.capabilityRequest.loadedRootURL.path
+        guard WorkspaceCodemapRootPathBinding.matches(
+            demand.identity.standardizedRootPath,
+            authorizedRootURL: session.registration.capabilityRequest.loadedRootURL
+        )
         else { return .result(.rejected(.rootPathMismatch)) }
         guard WorkspaceCodemapArtifactBindingIdentity(
             rootID: demand.identity.rootID,
@@ -6629,8 +6635,10 @@ actor WorkspaceCodemapBindingEngine {
         guard case let .eligible(session)? = roots[rootEpoch] else {
             return .failure(.rootUnavailable)
         }
-        guard request.identity.standardizedRootPath ==
-            session.registration.capabilityRequest.loadedRootURL.path,
+        guard WorkspaceCodemapRootPathBinding.matches(
+            request.identity.standardizedRootPath,
+            authorizedRootURL: session.registration.capabilityRequest.loadedRootURL
+        ),
             request.catalogGeneration == session.registration.catalogGeneration,
             request.ingressGeneration == session.registration.ingressGeneration,
             request.requestGeneration == request.pathGeneration,

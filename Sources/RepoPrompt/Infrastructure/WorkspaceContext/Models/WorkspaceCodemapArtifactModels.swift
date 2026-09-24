@@ -1,6 +1,19 @@
 import Foundation
 import RepoPromptCodeMapCore
 
+/// Catalog paths retain the user's loaded spelling; capabilities use physical root paths.
+/// Equality is evaluated at use time so a retargeted symlink cannot keep serving old evidence.
+enum WorkspaceCodemapRootPathBinding {
+    static func matches(_ candidateRootPath: String, authorizedRootURL: URL) -> Bool {
+        if candidateRootPath == authorizedRootURL.path {
+            return true
+        }
+        return URL(fileURLWithPath: candidateRootPath, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL.path ==
+            authorizedRootURL.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+}
+
 struct WorkspaceCodemapArtifactBindingIdentity: Hashable {
     let rootID: UUID
     let rootLifetimeID: UUID
@@ -473,7 +486,10 @@ private extension WorkspaceCodemapSourceAuthorityToken {
         isFactoryValidated &&
             rootEpoch.rootID == identity.rootID &&
             rootEpoch.rootLifetimeID == identity.rootLifetimeID &&
-            standardizedLoadedRootPath == identity.standardizedRootPath &&
+            WorkspaceCodemapRootPathBinding.matches(
+                identity.standardizedRootPath,
+                authorizedRootURL: URL(fileURLWithPath: standardizedLoadedRootPath, isDirectory: true)
+            ) &&
             candidateRootRelativePath == identity.standardizedRelativePath
     }
 }

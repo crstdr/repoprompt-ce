@@ -3,6 +3,57 @@ import Foundation
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
+    func testPlainRootRequiresExplicitOptInAndRevokesOnDisable() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        try workspace.write("export interface OptedInType { id: string }\n", to: "src/OptedIn.ts")
+        let fixture = try CodemapStoreFixture(name: #function, forbidCodeMapGitProcesses: true)
+        let store = fixture.makeProductionStore(nonGitCodeMapsEnabled: false)
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        let epochs = await store.codemapRootEpochs()
+        let rootEpoch = try XCTUnwrap(epochs[loaded.id])
+        let disabledPhase = await store.codemapGraphIndexBuildLaunchPhaseForTesting(rootEpoch: rootEpoch)
+        XCTAssertNil(disabledPhase)
+        XCTAssertTrue(fixture.builtSourceTexts.values.isEmpty)
+        XCTAssertTrue(fixture.codeMapGitProcessAttempts.values.isEmpty)
+
+        await store.setNonGitCodeMapsEnabled(true)
+        let engine = try fixture.runtime().bindingEngine()
+        let accounting = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        XCTAssertEqual(accounting.progress.counts.processedCandidateCount, 1)
+        XCTAssertFalse(fixture.builtSourceTexts.values.isEmpty)
+
+        await store.setNonGitCodeMapsEnabled(false)
+        let revoked = await engine.selectionGraph(rootEpoch: rootEpoch)
+        XCTAssertNil(revoked)
+    }
+
+    func testSymlinkLoadedRootKeepsFilesystemSourceAuthorityBound() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        try workspace.write("export interface AliasedType { id: string }\n", to: "src/Aliased.ts")
+        let alias = workspace.sandbox.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: workspace.rootURL)
+        let fixture = try CodemapStoreFixture(name: #function, forbidCodeMapGitProcesses: true)
+        let store = fixture.makeProductionStore()
+        let loaded = try await store.loadRoot(path: alias.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        let accounting = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let pinned = try await requireReadySnapshot(engine: engine, rootEpoch: accounting.rootEpoch)
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first { $0.standardizedRelativePath == "src/Aliased.ts" })
+        XCTAssertEqual(definitions(in: pinned, fileID: file.id), ["AliasedType"])
+        XCTAssertTrue(fixture.codeMapGitProcessAttempts.values.isEmpty)
+    }
+
     func testFilesystemTSAndTSXCodeMapsUseCurrentBytesWithoutGitOrManifestAccess() async throws {
         let workspace = try PlainWorkspaceFixture(name: #function)
         try workspace.write(

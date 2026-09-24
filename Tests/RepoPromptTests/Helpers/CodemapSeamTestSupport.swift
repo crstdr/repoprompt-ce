@@ -166,12 +166,13 @@ final class CodemapStoreFixture: @unchecked Sendable {
 
     /// Store that admits roots through the production local proof and Git preflight, sharing the
     /// fixture's instrumented Git service with the engine's Code Map collaborators.
-    func makeProductionStore() -> WorkspaceFileContextStore {
+    func makeProductionStore(nonGitCodeMapsEnabled: Bool = true) -> WorkspaceFileContextStore {
         let runtimeProvider = runtimeProvider
         return WorkspaceFileContextStore(
             codemapRuntimeProvider: { try runtimeProvider.runtime() },
             codemapLocalGitClassificationProbe: .production,
-            codemapGitEligibilityProbe: .production(gitService: codeMapGitService)
+            codemapGitEligibilityProbe: .production(gitService: codeMapGitService),
+            nonGitCodeMapsEnabled: nonGitCodeMapsEnabled
         )
     }
 

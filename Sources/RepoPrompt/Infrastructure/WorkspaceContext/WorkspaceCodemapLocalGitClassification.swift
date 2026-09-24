@@ -229,7 +229,7 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
             }
 
             guard dotGit == .absent,
-                  !resemblesBareRepository(head: head, objects: objects, refs: refs)
+                  !resemblesBareRepository(at: candidatePath, head: head, objects: objects, refs: refs)
             else {
                 return .gitEvidence
             }
@@ -328,13 +328,36 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
     }
 
     private static func resemblesBareRepository(
+        at directoryPath: String,
         head: WorkspaceCodemapNonGitFilesystemProof.EntryWitness,
         objects: WorkspaceCodemapNonGitFilesystemProof.EntryWitness,
         refs: WorkspaceCodemapNonGitFilesystemProof.EntryWitness
     ) -> Bool {
-        guard case .present = head else { return false }
-        if case .present = objects { return true }
-        if case .present = refs { return true }
-        return false
+        guard case let .present(headIdentity) = head else { return false }
+        let hasGitDirectory = [objects, refs].contains { witness in
+            guard case let .present(identity) = witness else { return false }
+            return (identity.mode & UInt32(S_IFMT)) == UInt32(S_IFDIR)
+        }
+        guard hasGitDirectory else { return false }
+        // Ordinary projects often have a HEAD file and an objects/refs directory. A bare
+        // repository also needs a plausible Git HEAD. Failed reads stay conservative: Git
+        // preflight decides rather than admitting an unreadable repository as filesystem.
+        guard (headIdentity.mode & UInt32(S_IFMT)) == UInt32(S_IFREG) else { return true }
+        let path = (directoryPath as NSString).appendingPathComponent("HEAD")
+        let fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else { return true }
+        defer { close(fd) }
+        var bytes = [UInt8](repeating: 0, count: 256)
+        let count = read(fd, &bytes, bytes.count)
+        guard count >= 0 else { return true }
+        guard let text = String(bytes: bytes.prefix(count), encoding: .utf8) else { return false }
+        let headLine = text.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
+        if headLine.hasPrefix("ref: refs/") {
+            return true
+        }
+        return (headLine.count == 40 || headLine.count == 64) &&
+            headLine.utf8.allSatisfy { byte in
+                (48 ... 57).contains(byte) || (65 ... 70).contains(byte) || (97 ... 102).contains(byte)
+            }
     }
 }

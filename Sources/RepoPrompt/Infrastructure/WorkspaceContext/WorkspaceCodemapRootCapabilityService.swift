@@ -167,7 +167,7 @@ struct WorkspaceCodemapSourceAuthorityToken: Hashable {
               observedPathGeneration == currentPathGeneration,
               observedIngressGeneration == currentIngressGeneration,
               let rootPath = standardizedAbsoluteRootPath(standardizedLoadedRootPath),
-              rootPath == capability.loadedRootURL.path,
+              WorkspaceCodemapRootPathBinding.matches(rootPath, authorizedRootURL: capability.loadedRootURL),
               let rootRelativePath = standardizedSafeRelativePath(candidateRootRelativePath)
         else { return nil }
 
