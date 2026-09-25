@@ -2,7 +2,10 @@ import Foundation
 
 extension AgentModeViewModel {
     func makeStatusPillsSnapshot() -> AgentStatusPillsSnapshot {
-        AgentStatusPillsSnapshot(
+        #if DEBUG
+            test_statusPillsSnapshotBuildCount += 1
+        #endif
+        return AgentStatusPillsSnapshot(
             currentTabID: currentTabID,
             selectedWorkflow: selectedWorkflow,
             stagedSlashCommand: stagedSlashCommandProps(tabID: currentTabID),
