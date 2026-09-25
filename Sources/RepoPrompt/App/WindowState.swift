@@ -793,7 +793,9 @@ class WindowState: ObservableObject {
             schedulePresentationVisibilityUpdate(from: nil)
             return
         }
-        guard let window else { return }
+        // A deferred WindowAccessor callback can deliver the first attach after `beginClose()`;
+        // reinstalling observers then would leak them, since `beginClose` is idempotent.
+        guard let window, !isClosing else { return }
 
         if nsWindow === window {
             configureWindowChrome(for: window)
