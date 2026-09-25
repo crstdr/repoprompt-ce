@@ -7370,6 +7370,11 @@ actor GitService {
             return preparedBaseProcessEnvironment
         }
         let shellEnvironment = await CLIEnvironmentCache.shared.environment(enableLogging: false)
+        // Another first-use caller may have prepared the environment while this one was suspended;
+        // the first prepared environment wins so every caller observes the same snapshot.
+        if let preparedBaseProcessEnvironment {
+            return preparedBaseProcessEnvironment
+        }
         let environment = Self.mergedProcessEnvironment(
             baseEnvironment: inheritedProcessEnvironment,
             shellEnvironment: shellEnvironment

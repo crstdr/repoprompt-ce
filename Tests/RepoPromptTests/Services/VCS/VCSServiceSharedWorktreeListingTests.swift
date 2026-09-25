@@ -411,6 +411,60 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         XCTAssertFalse(listing.contains { $0.path == mainRoot.path })
     }
 
+    func testReplacedNestedCheckoutIsNotMaskedByItsAncestorWorktree() async throws {
+        let clock = ManualClock()
+        let spy = ListingSpy()
+        let service = makeService(spy: spy, clock: clock, timeToLive: 2.5)
+        let nestedRoot = mainRoot.appendingPathComponent("nested", isDirectory: true)
+        try fixture.runGit(["worktree", "add", "-b", "nested", nestedRoot.path], at: mainRoot)
+        let nested = resolvedGit(nestedRoot)
+
+        // The window learns the nested linked root's repository.
+        _ = try await service.sharedGitWorktreeListing(for: nested)
+        // The nested checkout is removed and pruned, and a different repository is created there.
+        try fixture.runGit(["worktree", "remove", "--force", nestedRoot.path], at: mainRoot)
+        try fixture.initializeRepository(at: nestedRoot)
+        try fixture.write("other\n", to: "README.md", at: nestedRoot)
+        try fixture.stage("README.md", at: nestedRoot)
+        try fixture.commit("Other", at: nestedRoot)
+        clock.advance(by: 3.0)
+
+        let listing = try await service.sharedGitWorktreeListing(for: nested)
+        let root = try XCTUnwrap(listing.first { $0.path == nestedRoot.path })
+        XCTAssertTrue(root.isMain)
+        XCTAssertEqual(
+            StandardizedPath.absolute(root.repository.commonGitDir),
+            StandardizedPath.absolute(nestedRoot.appendingPathComponent(".git").path),
+            "The ancestor main worktree must not stand in for the replaced nested checkout"
+        )
+    }
+
+    func testFailedSharedEnumerationFallsBackToTheCallersOwnRoot() async throws {
+        let spy = ListingSpy()
+        let backend = GitBackend()
+        let mainRootPath = mainRoot.path
+        let service = VCSService(
+            jjRunner: JJCommandRunner(),
+            sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration(
+                timeToLive: 3600,
+                now: { 1000 },
+                lister: { url in
+                    await spy.recordCall(url)
+                    // The main checkout moved away: enumerating from its old root fails.
+                    if url.path == mainRootPath { throw VCSError.notARepository(path: url.path) }
+                    return try await backend.listWorktrees(at: url)
+                },
+                gitProcessEnvironment: { [:] }
+            )
+        )
+
+        let result = try await service.sharedGitWorktreeListing(for: resolvedGit(linkedRoot))
+
+        let calls = await spy.calledURLs
+        XCTAssertEqual(calls.map(\.path), [mainRoot.path, linkedRoot.path])
+        XCTAssertTrue(result.contains { $0.path == linkedRoot.path })
+    }
+
     func testProjectionChangesOnlyIsCurrent() {
         let original = GitWorktreeDescriptor(
             worktreeID: "wt",

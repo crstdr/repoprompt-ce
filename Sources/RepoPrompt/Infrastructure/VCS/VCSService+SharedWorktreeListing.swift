@@ -91,23 +91,32 @@ extension VCSService {
             return try await lister(rootURL)
         }
         var descriptors: [GitWorktreeDescriptor] = []
-        // One retry: a result is never older than an uncached enumeration started at the same time.
-        for _ in 0 ..< 2 {
-            try Task.checkCancellation()
-            guard let key = sharedWorktreeListingKey(forRepoRoot: rootURL) else {
-                return try await lister(rootURL)
+        do {
+            // One retry: a result never predates an uncached enumeration started when the caller retried.
+            for _ in 0 ..< 2 {
+                try Task.checkCancellation()
+                guard let key = sharedWorktreeListingKey(forRepoRoot: rootURL) else {
+                    return try await lister(rootURL)
+                }
+                let generation = sharedWorktreeListing.generation
+                descriptors = try await sharedWorktreeListing(forKey: key, lister: lister)
+                guard Self.listing(descriptors, belongsTo: key) else {
+                    // Not recognisably this repository's listing (an inherited GIT_DIR, or a main-root
+                    // spelling that differs from Git's): bypass sharing for this root, as before the cache.
+                    sharedWorktreeListing.keyByRootPath[rootURL.standardizedFileURL.path] = .some(nil)
+                    return try await lister(rootURL)
+                }
+                if sharedWorktreeListing.generation == generation { break }
             }
-            let generation = sharedWorktreeListing.generation
-            descriptors = try await sharedWorktreeListing(forKey: key, lister: lister)
-            guard Self.listing(descriptors, belongsTo: key) else {
-                // Not recognisably this repository's listing (an inherited GIT_DIR, or a main-root
-                // spelling that differs from Git's): bypass sharing for this root, as before the cache.
-                sharedWorktreeListing.keyByRootPath[rootURL.standardizedFileURL.path] = .some(nil)
-                return try await lister(rootURL)
-            }
-            if sharedWorktreeListing.generation == generation { break }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // The shared enumeration from the key's main root failed (e.g. the main checkout moved):
+            // re-resolve this root and enumerate from it, as before sharing.
+            dropCachedResolution(forRepoRoot: rootURL)
+            return try await lister(rootURL)
         }
-        guard let match = Self.descriptor(matching: rootURL, in: descriptors) else {
+        guard let match = Self.descriptor(exactlyAt: rootURL, in: descriptors) else {
             // The caller's root is not in its repository's listing (removed, pruned, or spelled
             // differently from Git): bypass sharing for this root until the next invalidation and
             // enumerate from the caller's own root, as before sharing.
@@ -219,14 +228,14 @@ extension VCSService {
         return { url in try await backend.listWorktrees(at: url) }
     }
 
-    /// Mirrors `gitWorktreeContextFromList`: the listed worktree equal to, else containing, the root.
+    /// The listed worktree at exactly the caller's repository root. A caller's resolved root is a
+    /// worktree top level, so an ancestor match would mean the root is not a worktree of this listing.
     nonisolated static func descriptor(
-        matching rootURL: URL,
+        exactlyAt rootURL: URL,
         in descriptors: [GitWorktreeDescriptor]
     ) -> GitWorktreeDescriptor? {
         let rootPath = StandardizedPath.absolute(rootURL.path)
         return descriptors.first { StandardizedPath.absolute($0.path) == rootPath }
-            ?? descriptors.first { StandardizedPath.isDescendant(rootPath, of: StandardizedPath.absolute($0.path)) }
     }
 
     /// A worktree's resolved Git directory must agree with its repository: the main worktree's Git
