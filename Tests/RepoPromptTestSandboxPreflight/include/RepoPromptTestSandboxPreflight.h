@@ -27,15 +27,16 @@ bool rp_test_sandbox_validate(
 );
 
 /// True when absolute `path` (which need not exist) is `root` or lies beneath it after resolving
-/// symlinks of their existing prefixes (for example `/var` -> `/private/var`).
+/// symlinks of their existing prefixes (for example `/var` -> `/private/var`). False when a
+/// component exists but cannot be resolved (for example a dangling symlink).
 bool rp_test_sandbox_path_is_within(const char *path, const char *root);
 
 /// Decides whether an inherited `GlobalCustomStorageURL` must be cleared at bundle load.
 /// Returns false (leave it alone) only when `value`, after resolving symlinks in its existing
-/// prefix, lies outside `passwd_home` and inside a live runner sandbox: an existing ancestor that
-/// holds the runner's marker file and does not contain `passwd_home`. That is evidence the value
-/// belongs to a concurrently running test. Everything else (real-home paths, paths outside every
-/// sandbox, dead sandboxes whose marker is gone, non-paths) is cleared.
+/// prefix, lies outside `passwd_home` and inside an existing marked runner sandbox: an ancestor
+/// that holds the runner's marker file and does not contain `passwd_home` (normally a concurrently
+/// running test). Everything else (real-home paths, paths outside every sandbox, sandboxes whose
+/// marker is gone, dangling or unresolvable components, non-paths) is cleared.
 bool rp_test_sandbox_should_clear_storage_override(const char *value, const char *passwd_home);
 
 /// True once the bundle-load preflight accepted this process.

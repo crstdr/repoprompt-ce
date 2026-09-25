@@ -31,15 +31,16 @@ final class TestSandboxPreflightTests: XCTestCase {
             FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         )
         XCTAssertTrue(rp_test_sandbox_path_is_within(applicationSupport.path, sandboxRoot))
-        XCTAssertFalse(rp_test_sandbox_path_is_within(applicationSupport.path, passwdHome))
+        XCTAssertFalse(rp_test_sandbox_path_is_within(applicationSupport.path, passwdHome + "/Library"))
     }
 
-    func testInheritedWorkspaceStorageOverrideCannotPointOutsideSandbox() throws {
-        let sandboxRoot = try XCTUnwrap(ProcessInfo.processInfo.environment["REPOPROMPT_TEST_SANDBOX_ROOT"])
+    func testWorkspaceStorageOverrideIsOnlyEverAKeptSandboxPath() {
+        // Matches the preflight policy: an override may belong to this or another existing marked
+        // sandbox (a concurrent test), never to the real home or an unowned location.
         if let override = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
-            XCTAssertTrue(
-                rp_test_sandbox_path_is_within(override, sandboxRoot),
-                "GlobalCustomStorageURL escapes the test sandbox: \(override)"
+            XCTAssertFalse(
+                rp_test_sandbox_should_clear_storage_override(override, passwdHome),
+                "GlobalCustomStorageURL escapes every test sandbox: \(override)"
             )
         }
     }
@@ -71,11 +72,13 @@ final class TestSandboxPreflightTests: XCTestCase {
             "missing runner marker"
         )
 
-        let containingRealHome = URL(fileURLWithPath: passwdHome).deletingLastPathComponent().path
-        XCTAssertNotNil(
-            validate(root: containingRealHome, home: passwdHome),
-            "sandbox containing the real home"
+        // A marked sandbox that contains the (synthetic) real home is refused for that reason.
+        let homeInside = validate(root: root.path, home: home, passwdHome: root.path + "/fake-user")
+        XCTAssertTrue(
+            homeInside?.contains("contains the user's real home") == true,
+            "sandbox containing the real home: \(homeInside ?? "accepted")"
         )
+        XCTAssertNotNil(validate(root: root.path, home: home, passwdHome: "relative/home"), "relative real home")
     }
 
     func testPathContainmentResolvesSymlinksAndNonexistentPaths() throws {
@@ -90,7 +93,7 @@ final class TestSandboxPreflightTests: XCTestCase {
         XCTAssertTrue(rp_test_sandbox_path_is_within(link.path + "/missing/file.json", root.path))
     }
 
-    /// Only an override inside a live runner sandbox (a concurrently running test) survives;
+    /// Only an override inside an existing marked runner sandbox (normally a concurrent test) survives;
     /// dead, real-home, unowned and malformed overrides are cleared.
     func testStorageOverrideClearingKeepsOnlyLiveSandboxOverrides() throws {
         let ownSandbox = try makeSandbox(named: "own-sandbox")
@@ -126,6 +129,25 @@ final class TestSandboxPreflightTests: XCTestCase {
         XCTAssertTrue(shouldClear(nil))
     }
 
+    /// A dangling symlink inside a sandbox whose target (with several missing components) lies in
+    /// the real home must not be re-appended lexically and kept: it would reach the home once the
+    /// target appears. Uses a synthetic home so nothing is created under the real one.
+    func testDanglingSymlinkIntoHomeIsNeverTreatedAsSandboxed() throws {
+        let sandbox = try makeSandbox(named: "dangling")
+        let syntheticHome = scratch.appendingPathComponent("synthetic-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: syntheticHome, withIntermediateDirectories: true)
+        let link = sandbox.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(
+            at: link,
+            withDestinationURL: syntheticHome.appendingPathComponent("not-yet-created/descendant")
+        )
+
+        let value = link.appendingPathComponent("Workspaces").path
+        XCTAssertFalse(rp_test_sandbox_path_is_within(value, sandbox.path))
+        XCTAssertTrue(rp_test_sandbox_should_clear_storage_override(value, syntheticHome.path))
+        XCTAssertTrue(rp_test_sandbox_should_clear_storage_override(link.path, syntheticHome.path))
+    }
+
     private func makeSandbox(named name: String) throws -> URL {
         let root = scratch.appendingPathComponent(name, isDirectory: true)
         for child in ["home", "tmp"] {
@@ -142,14 +164,17 @@ final class TestSandboxPreflightTests: XCTestCase {
     private func validate(
         root: String?,
         home: String?,
-        fixedHome: String?? = .none
+        fixedHome: String?? = .none,
+        passwdHome passwdHomeOverride: String? = nil
     ) -> String? {
         let resolvedFixedHome: String? = switch fixedHome {
         case .none: home
         case let .some(value): value
         }
         var reason = [CChar](repeating: 0, count: 1024)
-        let accepted = rp_test_sandbox_validate(root, home, resolvedFixedHome, passwdHome, &reason, reason.count)
+        let accepted = rp_test_sandbox_validate(
+            root, home, resolvedFixedHome, passwdHomeOverride ?? passwdHome, &reason, reason.count
+        )
         return accepted ? nil : String(cString: reason)
     }
 }

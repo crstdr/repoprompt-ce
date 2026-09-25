@@ -1,6 +1,7 @@
 #include "RepoPromptTestSandboxPreflight.h"
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <errno.h>
 #include <limits.h>
 #include <pwd.h>
 #include <stdio.h>
@@ -21,8 +22,10 @@ static void set_reason(char *reason, size_t capacity, const char *message, const
 }
 
 /// Resolves the longest existing prefix of `path` with realpath(3) and re-appends the rest, so
-/// paths that do not exist yet (or any more) still compare correctly. Rejects relative paths and
-/// `.`/`..` components in the unresolved remainder.
+/// paths that do not exist yet (or any more) still compare correctly. Rejects relative paths,
+/// `.`/`..` components in the unresolved remainder, and any component that exists but cannot be
+/// resolved (a dangling symlink, EACCES, ELOOP, ENOTDIR): only genuinely missing components are
+/// re-appended lexically, so a dangling link can never hide where the path will later point.
 static bool canonicalize(const char *path, char out[PATH_MAX]) {
     if (path == NULL || path[0] != '/') {
         return false;
@@ -62,6 +65,10 @@ static bool canonicalize(const char *path, char out[PATH_MAX]) {
                 strlcpy(out, "/", PATH_MAX);
             }
             return true;
+        }
+        struct stat link_status;
+        if (lstat(probe, &link_status) == 0 || errno != ENOENT) {
+            return false;
         }
         char *slash = strrchr(probe, '/');
         if (slash == NULL) {
@@ -122,7 +129,8 @@ bool rp_test_sandbox_validate(
         set_reason(reason, reason_capacity, "sandbox marker file is missing", marker);
         return false;
     }
-    if (passwd_home == NULL || passwd_home[0] == '\0') {
+    char canonical_passwd_home[PATH_MAX];
+    if (passwd_home == NULL || !canonicalize(passwd_home, canonical_passwd_home)) {
         set_reason(reason, reason_capacity, "cannot determine the user's real home directory", NULL);
         return false;
     }
@@ -151,8 +159,9 @@ bool rp_test_sandbox_validate(
 
 /// True when an existing ancestor of `canonical_path` is a runner sandbox (holds the runner's
 /// marker file) that does not contain the user's real home. Only the runner creates the marker,
-/// so this is evidence the path belongs to a live test sandbox.
-static bool has_live_sandbox_ancestor(const char *canonical_path, const char *passwd_home) {
+/// so this is evidence the path belongs to a test sandbox that still exists (not proof that its
+/// process is still running: a killed runner can leave one behind).
+static bool has_marked_sandbox_ancestor(const char *canonical_path, const char *passwd_home) {
     char probe[PATH_MAX];
     if (strlcpy(probe, canonical_path, sizeof probe) >= sizeof probe) {
         return false;
@@ -174,14 +183,16 @@ static bool has_live_sandbox_ancestor(const char *canonical_path, const char *pa
 
 bool rp_test_sandbox_should_clear_storage_override(const char *value, const char *passwd_home) {
     char canonical_value[PATH_MAX];
-    if (passwd_home == NULL || passwd_home[0] == '\0' || !canonicalize(value, canonical_value)) {
+    char canonical_passwd_home[PATH_MAX];
+    if (passwd_home == NULL || !canonicalize(passwd_home, canonical_passwd_home)
+        || !canonicalize(value, canonical_value)) {
         return true;
     }
     // Symlinks in the existing prefix are resolved, so a sandbox path that links out lands here.
     if (rp_test_sandbox_path_is_within(canonical_value, passwd_home)) {
         return true;
     }
-    return !has_live_sandbox_ancestor(canonical_value, passwd_home);
+    return !has_marked_sandbox_ancestor(canonical_value, passwd_home);
 }
 
 bool rp_test_sandbox_preflight_passed(void) {
@@ -191,8 +202,10 @@ bool rp_test_sandbox_preflight_passed(void) {
 /// Preferences are not redirected by HOME/CFFIXED_USER_HOME: every test process shares the real
 /// `~/Library/Preferences` domain of its host tool. A fixture that crashed before restoring the
 /// workspace storage override would otherwise hand the next process a dead root, which the
-/// app-global default runtime captures once. Keep only an override inside a live runner sandbox
-/// (a concurrently running test); clear everything else. The read/classify/clear sequence is not
+/// app-global default runtime captures once. Keep only an override inside an existing marked
+/// runner sandbox (normally a concurrently running test); clear everything else. This acts on the
+/// preferences domain of the process hosting the bundle; under SwiftPM/xctest that is the test
+/// tool's own domain, never the app's. The read/classify/clear sequence is not
 /// atomic, and a live override a fixture placed outside any sandbox (Foundation's temp directory
 /// ignores TMPDIR) can still be cleared by an overlapping run: at worst a flaky test, never a
 /// path into real data.
