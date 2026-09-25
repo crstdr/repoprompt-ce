@@ -95,7 +95,7 @@ final class TestSandboxPreflightTests: XCTestCase {
 
     /// Only an override inside an existing marked runner sandbox (normally a concurrent test) survives;
     /// dead, real-home, unowned and malformed overrides are cleared.
-    func testStorageOverrideClearingKeepsOnlyLiveSandboxOverrides() throws {
+    func testStorageOverrideClearingKeepsOnlyMarkedSandboxOverrides() throws {
         let ownSandbox = try makeSandbox(named: "own-sandbox")
         let otherSandbox = try makeSandbox(named: "other-sandbox")
         let unowned = scratch.appendingPathComponent("Suite-Durable-1/state", isDirectory: true)
@@ -109,24 +109,33 @@ final class TestSandboxPreflightTests: XCTestCase {
         func shouldClear(_ value: String?) -> Bool {
             rp_test_sandbox_should_clear_storage_override(value, passwdHome)
         }
-        // The unowned cases below need a scratch area outside every runner sandbox (true while
-        // Foundation's temporary directory ignores TMPDIR).
-        try XCTSkipUnless(
-            shouldClear(scratch.appendingPathComponent("probe").path),
-            "Scratch directory lives inside a runner sandbox"
-        )
 
-        // Kept: live sandboxes, including children that do not exist yet.
+        // Kept: existing marked sandboxes, including children that do not exist yet.
         XCTAssertFalse(shouldClear(ownSandbox.appendingPathComponent("Workspaces").path))
         XCTAssertFalse(shouldClear(otherSandbox.appendingPathComponent("root-fixture/Workspaces").path))
 
-        // Cleared: no sandbox ownership, dead sandbox, real home, symlink out of a sandbox, non-paths.
-        XCTAssertTrue(shouldClear(unowned.appendingPathComponent("Workspaces").path))
-        XCTAssertTrue(shouldClear(scratch.appendingPathComponent("gone-sandbox/root/Workspaces").path))
+        // Cleared regardless of where scratch lives: real home, symlink out of a sandbox, non-paths.
         XCTAssertTrue(shouldClear(passwdHome + "/Library/Application Support/RepoPrompt CE/Workspaces"))
-        XCTAssertTrue(shouldClear(linkOut.appendingPathComponent("Workspaces").path))
         XCTAssertTrue(shouldClear("relative/Workspaces"))
         XCTAssertTrue(shouldClear(nil))
+
+        // The remaining cases need a scratch area outside every runner sandbox (true while
+        // Foundation's temporary directory ignores TMPDIR). Checked independently of the
+        // classifier under test by looking for the runner marker on scratch's ancestors.
+        var ancestor = scratch.resolvingSymlinksInPath()
+        var scratchInsideSandbox = false
+        while ancestor.path != "/" {
+            if FileManager.default.fileExists(atPath: ancestor.appendingPathComponent(".issue944-test-sandbox").path) {
+                scratchInsideSandbox = true
+                break
+            }
+            ancestor.deleteLastPathComponent()
+        }
+        try XCTSkipIf(scratchInsideSandbox, "Scratch directory lives inside a runner sandbox")
+
+        XCTAssertTrue(shouldClear(unowned.appendingPathComponent("Workspaces").path))
+        XCTAssertTrue(shouldClear(scratch.appendingPathComponent("gone-sandbox/root/Workspaces").path))
+        XCTAssertTrue(shouldClear(linkOut.appendingPathComponent("Workspaces").path))
     }
 
     /// A dangling symlink inside a sandbox whose target (with several missing components) lies in
