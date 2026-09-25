@@ -138,6 +138,7 @@ conductor-selftest:
 	python3 Scripts/test_debug_app_process.py
 	python3 Scripts/test_ci_app_test_runner.py
 	python3 Scripts/test_conductor_diagnostics.py
+	python3 Scripts/test_conductor_wrapper.py
 	python3 Scripts/test_local_production_installer.py
 	python3 Scripts/test_security_inventory.py
 

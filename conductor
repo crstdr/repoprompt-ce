@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# /usr/bin/python3 is an xcrun shim that injects SDKROOT=<default SDK> into python3 when SDKROOT
+# is unset, and conductor forwards SDKROOT to every job. When the Command Line Tools ship a newer
+# SDK than the selected Xcode's compiler (for example CLT 27 next to Xcode 26.5), that default SDK
+# cannot be used by the compiler. Pin the selected Xcode's (or DEVELOPER_DIR's) macOS SDK first;
+# never override a value the user set.
+if [[ -z "${SDKROOT:-}" ]] && command -v xcrun >/dev/null 2>&1; then
+    if resolved_sdkroot="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)" \
+        && [[ -n "$resolved_sdkroot" && -d "$resolved_sdkroot" ]]; then
+        export SDKROOT="$resolved_sdkroot"
+    fi
+fi
 exec python3 "$SCRIPT_DIR/Scripts/conductor.py" "$@"
