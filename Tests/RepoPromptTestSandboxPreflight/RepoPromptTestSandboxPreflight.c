@@ -157,6 +157,9 @@ bool rp_test_sandbox_preflight_passed(void) {
 /// `~/Library/Preferences` domain of its host tool. A fixture that crashed before restoring the
 /// workspace storage override would otherwise hand the next process a dead root outside its
 /// sandbox, which the app-global default runtime captures once. Drop only that stale override.
+/// Because the domain is shared, an overlapping *uncoordinated* test process could lose a live
+/// override; coordinated runs are serialized by conductor's global heavy slot, and either way the
+/// affected process stays inside its own sandbox for Application Support.
 static void clear_inherited_workspace_storage_override(const char *sandbox_root) {
     CFStringRef key = CFSTR("GlobalCustomStorageURL");
     CFPropertyListRef value = CFPreferencesCopyAppValue(key, kCFPreferencesCurrentApplication);
