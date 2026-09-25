@@ -149,37 +149,98 @@ bool rp_test_sandbox_validate(
     return true;
 }
 
+static bool path_exists(const char *path) {
+    struct stat status;
+    return path != NULL && stat(path, &status) == 0;
+}
+
+bool rp_test_sandbox_should_clear_storage_override(
+    const char *value,
+    const char *sandbox_root,
+    const char *user_temp_root,
+    const char *passwd_home
+) {
+    char canonical_value[PATH_MAX];
+    if (!canonicalize(value, canonical_value)) {
+        return true;
+    }
+    // Anything under the user's real home could be real data: never adopt it.
+    if (passwd_home == NULL || rp_test_sandbox_path_is_within(canonical_value, passwd_home)) {
+        return true;
+    }
+
+    // Test roots: the runner's sandbox parent (sandbox roots are `<parent>/<prefix-XXXX>/<digest>`)
+    // and the per-user temporary directory where fixtures place their temp trees.
+    bool under_test_root = false;
+    char runner_parent[PATH_MAX];
+    if (canonicalize(sandbox_root, runner_parent)) {
+        for (int level = 0; level < 2; level++) {
+            char *slash = strrchr(runner_parent, '/');
+            if (slash == NULL || slash == runner_parent) {
+                runner_parent[0] = '\0';
+                break;
+            }
+            *slash = '\0';
+        }
+        if (runner_parent[0] != '\0' && !rp_test_sandbox_path_is_within(passwd_home, runner_parent)) {
+            under_test_root = rp_test_sandbox_path_is_within(canonical_value, runner_parent);
+        }
+    }
+    if (!under_test_root && user_temp_root != NULL && user_temp_root[0] != '\0'
+        && !rp_test_sandbox_path_is_within(passwd_home, user_temp_root)) {
+        under_test_root = rp_test_sandbox_path_is_within(canonical_value, user_temp_root);
+    }
+    if (!under_test_root) {
+        return true;
+    }
+
+    // Live if the override directory or its parent exists (fixtures point the override at a
+    // not-yet-created `Workspaces` child of a root they already created).
+    char parent[PATH_MAX];
+    strlcpy(parent, canonical_value, sizeof parent);
+    char *slash = strrchr(parent, '/');
+    if (slash != NULL && slash != parent) {
+        *slash = '\0';
+    }
+    return !(path_exists(canonical_value) || path_exists(parent));
+}
+
 bool rp_test_sandbox_preflight_passed(void) {
     return gPreflightPassed;
 }
 
 /// Preferences are not redirected by HOME/CFFIXED_USER_HOME: every test process shares the real
 /// `~/Library/Preferences` domain of its host tool. A fixture that crashed before restoring the
-/// workspace storage override would otherwise hand the next process a dead root outside its
-/// sandbox, which the app-global default runtime captures once. Drop only that stale override.
-/// Because the domain is shared, an overlapping *uncoordinated* test process could lose a live
-/// override; coordinated runs are serialized by conductor's global heavy slot, and either way the
-/// affected process stays inside its own sandbox for Application Support.
-static void clear_inherited_workspace_storage_override(const char *sandbox_root) {
+/// workspace storage override would otherwise hand the next process a dead root, which the
+/// app-global default runtime captures once. Clear only overrides that could reach real data or
+/// are dead; leave a live override that belongs to a concurrently running test alone.
+static void clear_inherited_workspace_storage_override(const char *sandbox_root, const char *passwd_home) {
     CFStringRef key = CFSTR("GlobalCustomStorageURL");
     CFPropertyListRef value = CFPreferencesCopyAppValue(key, kCFPreferencesCurrentApplication);
     if (value == NULL) {
         return;
     }
-    bool inside_sandbox = false;
+    bool should_clear = true;
     if (CFGetTypeID(value) == CFStringGetTypeID()) {
         char path[PATH_MAX];
+        char user_temp_root[PATH_MAX];
+        size_t temp_length = confstr(_CS_DARWIN_USER_TEMP_DIR, user_temp_root, sizeof user_temp_root);
         if (CFStringGetFileSystemRepresentation((CFStringRef)value, path, sizeof path)) {
-            inside_sandbox = rp_test_sandbox_path_is_within(path, sandbox_root);
+            should_clear = rp_test_sandbox_should_clear_storage_override(
+                path,
+                sandbox_root,
+                temp_length > 0 && temp_length <= sizeof user_temp_root ? user_temp_root : NULL,
+                passwd_home
+            );
         }
     }
     CFRelease(value);
-    if (inside_sandbox) {
+    if (!should_clear) {
         return;
     }
     CFPreferencesSetAppValue(key, NULL, kCFPreferencesCurrentApplication);
     CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-    fprintf(stderr, "RepoPromptTests: cleared an inherited GlobalCustomStorageURL outside this test sandbox.\n");
+    fprintf(stderr, "RepoPromptTests: cleared a stale or unsafe inherited GlobalCustomStorageURL.\n");
 }
 
 __attribute__((constructor))
@@ -204,6 +265,6 @@ static void rp_test_sandbox_preflight(void) {
         fflush(stderr);
         _exit(78);
     }
-    clear_inherited_workspace_storage_override(sandbox_root);
+    clear_inherited_workspace_storage_override(sandbox_root, account->pw_dir);
     gPreflightPassed = true;
 }

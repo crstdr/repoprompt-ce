@@ -30,6 +30,20 @@ bool rp_test_sandbox_validate(
 /// symlinks of their existing prefixes (for example `/var` -> `/private/var`).
 bool rp_test_sandbox_path_is_within(const char *path, const char *root);
 
+/// Decides whether an inherited `GlobalCustomStorageURL` must be cleared at bundle load.
+/// Returns false (leave it alone) only when `value` is an absolute path outside `passwd_home`,
+/// under a test root — the current sandbox's runner parent (`sandbox_root/../..`) or
+/// `user_temp_root` — and still live (the path or its parent exists). Such an override can only
+/// belong to a concurrently running test and cannot reach the user's real data; clearing it would
+/// break that run. Everything else (real-home paths, paths outside every test root, dead trees,
+/// non-paths) is cleared.
+bool rp_test_sandbox_should_clear_storage_override(
+    const char *value,
+    const char *sandbox_root,
+    const char *user_temp_root,
+    const char *passwd_home
+);
+
 /// True once the bundle-load preflight accepted this process.
 bool rp_test_sandbox_preflight_passed(void);
 

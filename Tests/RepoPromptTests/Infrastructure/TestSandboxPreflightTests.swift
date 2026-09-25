@@ -90,6 +90,37 @@ final class TestSandboxPreflightTests: XCTestCase {
         XCTAssertTrue(rp_test_sandbox_path_is_within(link.path + "/missing/file.json", root.path))
     }
 
+    /// A live override from a concurrently running test cannot reach real data and must survive;
+    /// dead, real-home, out-of-root and malformed overrides are cleared.
+    func testStorageOverrideClearingKeepsLiveConcurrentTestOverrides() throws {
+        let runnerParent = scratch.appendingPathComponent("runner-parent", isDirectory: true)
+        let userTemp = scratch.appendingPathComponent("user-temp", isDirectory: true)
+        let ownSandbox = runnerParent.appendingPathComponent("rpce-local-tests-own/digest", isDirectory: true)
+        let otherSandbox = runnerParent.appendingPathComponent("rpce-local-tests-other/digest", isDirectory: true)
+        let durableState = userTemp.appendingPathComponent("SomeSuite-Durable-1/state", isDirectory: true)
+        for directory in [ownSandbox, otherSandbox.appendingPathComponent("root-fixture"), durableState] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        func shouldClear(_ value: String?) -> Bool {
+            rp_test_sandbox_should_clear_storage_override(value, ownSandbox.path, userTemp.path, passwdHome)
+        }
+
+        // Kept: live overrides under a test root (own sandbox, another live sandbox, a live temp
+        // fixture whose `Workspaces` child is not created yet).
+        XCTAssertFalse(shouldClear(ownSandbox.appendingPathComponent("Workspaces").path))
+        XCTAssertFalse(shouldClear(otherSandbox.appendingPathComponent("root-fixture/Workspaces").path))
+        XCTAssertFalse(shouldClear(durableState.appendingPathComponent("Workspaces").path))
+
+        // Cleared: dead trees, real-home paths, paths outside every test root, non-paths.
+        XCTAssertTrue(shouldClear(runnerParent.appendingPathComponent("rpce-local-tests-gone/digest/root/Workspaces").path))
+        XCTAssertTrue(shouldClear(userTemp.appendingPathComponent("Gone-Durable-2/state/Workspaces").path))
+        XCTAssertTrue(shouldClear(passwdHome + "/Library/Application Support/RepoPrompt CE/Workspaces"))
+        XCTAssertTrue(shouldClear(scratch.appendingPathComponent("elsewhere/Workspaces").path))
+        XCTAssertTrue(shouldClear("relative/Workspaces"))
+        XCTAssertTrue(shouldClear(nil))
+    }
+
     private func makeSandbox(named name: String) throws -> URL {
         let root = scratch.appendingPathComponent(name, isDirectory: true)
         for child in ["home", "tmp"] {
