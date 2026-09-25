@@ -444,11 +444,11 @@ struct AgentMCPStartWorktreeCoordinator {
                 timeout: 30
             )
         } catch {
-            await vcsService.invalidateSharedWorktreeListings()
+            await vcsService.invalidateCache(for: URL(fileURLWithPath: worktree.path))
             throw error
         }
-        // The removal bypasses VCSService, so drop shared listings explicitly.
-        await vcsService.invalidateSharedWorktreeListings()
+        // The removal bypasses VCSService; drop the removed path's caches and all shared listings.
+        await vcsService.invalidateCache(for: URL(fileURLWithPath: worktree.path))
         guard result.status == 0 else {
             let stderr = String(data: result.stderr, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)

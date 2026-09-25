@@ -429,7 +429,14 @@ extension VCSService {
 
     func switchGitBranch(_ request: GitBranchSwitchRequest, at repoURL: URL) async throws -> GitBranchSwitchResult {
         let resolved = try await requireGitBranchSwitchRepo(repoURL, operation: "branch_switch")
-        let result = try await gitBackend().switchGitBranch(request, at: resolved.rootURL)
+        let result: GitBranchSwitchResult
+        do {
+            result = try await gitBackend().switchGitBranch(request, at: resolved.rootURL)
+        } catch {
+            // The checkout may have happened before a later read threw.
+            invalidateCache(for: resolved.rootURL)
+            throw error
+        }
         invalidateCache(for: resolved.rootURL)
         return result
     }
@@ -630,11 +637,19 @@ public extension VCSService {
             throw VCSError.unsupportedOperation(operation: "create_worktree", backend: resolved.backendKind)
         }
 
-        let result = try await gitBackend().createWorktreeWithResult(
-            request: request,
-            at: resolved.rootURL,
-            initializationContext: initializationContext
-        )
+        let result: GitWorktreeCreateResult
+        do {
+            result = try await gitBackend().createWorktreeWithResult(
+                request: request,
+                at: resolved.rootURL,
+                initializationContext: initializationContext
+            )
+        } catch {
+            // `git worktree add` may have succeeded before a later step threw.
+            invalidateCache(for: resolved.rootURL)
+            invalidateCache(for: request.path)
+            throw error
+        }
         invalidateCache(for: resolved.rootURL)
         invalidateCache(for: request.path)
         return result

@@ -4,8 +4,9 @@ import Foundation
 
 /// Configuration for the process-wide worktree listing shared by periodic Git context refreshes.
 struct SharedWorktreeListingConfiguration {
-    /// Must not exceed one `GitViewModel` context-refresh interval (2.5 s), so a single window
-    /// never observes a listing older than its previous refresh.
+    /// Matches one `GitViewModel` context-refresh interval (2.5 s). A window's own previous
+    /// enumeration is always expired by its next refresh; a listing shared from another window can
+    /// be up to one interval older than an uncached enumeration would have been.
     static let defaultTimeToLive: TimeInterval = 2.5
 
     var timeToLive: TimeInterval = Self.defaultTimeToLive
@@ -33,7 +34,19 @@ struct SharedWorktreeListingState {
     var generation: UInt64 = 0
     var nextFlightID: UInt64 = 0
     /// Standardized repo-root path -> cache key; a `nil` value marks a root that must bypass the cache.
-    var keyByRootPath: [String: String?] = [:]
+    var keyByRootPath: [String: SharedWorktreeListingKey?] = [:]
+}
+
+/// Identifies one repository's listing. Enumeration always runs from `mainRoot`, so neither the
+/// working directory nor the Git environment depends on which caller started it (a caller whose
+/// own worktree was removed cannot fail the shared enumeration for healthy callers).
+struct SharedWorktreeListingKey: Hashable {
+    let commonDirPath: String
+    let mainRoot: URL
+
+    var cacheKey: String {
+        commonDirPath + "\n" + mainRoot.path
+    }
 }
 
 extension VCSService {
@@ -51,21 +64,28 @@ extension VCSService {
     ///   on the next refresh;
     /// - failures are never cached, and there is no modification-time validation.
     ///
-    /// The key is the standardized common Git directory plus the known main-worktree root, so
-    /// callers sharing an entry give descriptor construction identical inputs. Only `isCurrent`
-    /// depends on the caller, and it is re-projected per request. Roots whose main worktree
-    /// cannot be derived from the common directory bypass the cache. Explicit tool listings keep
-    /// using the uncached `listGitWorktrees`.
+    /// The key is the standardized common Git directory plus the known main-worktree root, and the
+    /// enumeration always runs from that main root, so every sharer receives the same descriptors.
+    /// Only `isCurrent` depends on the caller, and it is re-projected per request. Roots whose main
+    /// worktree cannot be derived from the common directory bypass the cache. A request whose
+    /// enumeration was invalidated while it waited retries once, so it never returns a listing
+    /// that predates a RepoPrompt mutation it overlapped. Explicit tool listings keep using the
+    /// uncached `listGitWorktrees`.
     func sharedGitWorktreeListing(for resolved: VCSResolvedRepo) async throws -> [GitWorktreeDescriptor] {
         guard resolved.backendKind == .git else {
             throw VCSError.unsupportedOperation(operation: "list_worktrees", backend: resolved.backendKind)
         }
         let rootURL = resolved.rootURL
         let lister = gitWorktreeLister()
-        guard let key = sharedWorktreeListingKey(forRepoRoot: rootURL) else {
-            return try await lister(rootURL)
+        var descriptors: [GitWorktreeDescriptor] = []
+        for _ in 0 ..< 2 {
+            guard let key = sharedWorktreeListingKey(forRepoRoot: rootURL) else {
+                return try await lister(rootURL)
+            }
+            let generation = sharedWorktreeListing.generation
+            descriptors = try await sharedWorktreeListing(forKey: key, lister: lister)
+            if sharedWorktreeListing.generation == generation { break }
         }
-        let descriptors = try await sharedWorktreeListing(forKey: key, rootURL: rootURL, lister: lister)
         return Self.projectingCurrentWorktree(descriptors, currentRepoURL: rootURL)
     }
 
@@ -78,10 +98,10 @@ extension VCSService {
     }
 
     private func sharedWorktreeListing(
-        forKey key: String,
-        rootURL: URL,
+        forKey listingKey: SharedWorktreeListingKey,
         lister: @escaping @Sendable (URL) async throws -> [GitWorktreeDescriptor]
     ) async throws -> [GitWorktreeDescriptor] {
+        let key = listingKey.cacheKey
         let startedAt = sharedWorktreeListingConfiguration.now()
         if let entry = sharedWorktreeListing.entries[key] {
             if startedAt - entry.fetchStartedAt < sharedWorktreeListingConfiguration.timeToLive {
@@ -97,7 +117,8 @@ extension VCSService {
         sharedWorktreeListing.nextFlightID &+= 1
         let flightID = sharedWorktreeListing.nextFlightID
         // Unstructured so one waiter's cancellation cannot fail the other joined waiters.
-        let task = Task { try await lister(rootURL) }
+        let mainRoot = listingKey.mainRoot
+        let task = Task { try await lister(mainRoot) }
         sharedWorktreeListing.flights[key] = SharedWorktreeListingState.Flight(id: flightID, task: task)
         let result = await task.result
         if sharedWorktreeListing.flights[key]?.id == flightID {
@@ -112,15 +133,18 @@ extension VCSService {
         return try result.get()
     }
 
-    private func sharedWorktreeListingKey(forRepoRoot rootURL: URL) -> String? {
+    private func sharedWorktreeListingKey(forRepoRoot rootURL: URL) -> SharedWorktreeListingKey? {
         let rootPath = rootURL.standardizedFileURL.path
         if let memoized = sharedWorktreeListing.keyByRootPath[rootPath] {
             return memoized
         }
-        let key: String? = if let layout = gitRepositoryLayout(forRepoRoot: rootURL),
-                              let mainRoot = layout.knownMainWorktreeRoot
+        let key: SharedWorktreeListingKey? = if let layout = gitRepositoryLayout(forRepoRoot: rootURL),
+                                                let mainRoot = layout.knownMainWorktreeRoot
         {
-            layout.commonDir.standardizedFileURL.path + "\n" + mainRoot.standardizedFileURL.path
+            SharedWorktreeListingKey(
+                commonDirPath: layout.commonDir.standardizedFileURL.path,
+                mainRoot: mainRoot.standardizedFileURL
+            )
         } else {
             nil
         }
