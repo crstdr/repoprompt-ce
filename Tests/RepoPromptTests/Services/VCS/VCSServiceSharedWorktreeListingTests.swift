@@ -221,14 +221,19 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         try FileManager.default.removeItem(at: linkedRoot)
         clock.advance(by: 3.0)
 
-        let fromRemovedRoot = try await service.sharedGitWorktreeListing(for: linked)
+        // The removed root starts the shared enumeration, which runs from the main root and succeeds.
+        // The removed root itself is no longer listed, so only its own call falls back to its dead
+        // directory and fails, exactly as before sharing.
+        do {
+            _ = try await service.sharedGitWorktreeListing(for: linked)
+            XCTFail("The removed root's own fallback enumeration should fail as before sharing")
+        } catch {}
+        // A healthy window on the same repository receives the shared, successful listing.
         let fromMain = try await service.sharedGitWorktreeListing(for: resolvedGit(mainRoot))
 
         let calls = await spy.calledURLs
-        XCTAssertEqual(calls.map(\.path), [mainRoot.path, mainRoot.path], "Enumeration must run from the main root")
+        XCTAssertEqual(calls.map(\.path), [mainRoot.path, mainRoot.path, linkedRoot.path])
         XCTAssertEqual(currentPaths(fromMain), [mainRoot.path])
-        // The removed root's own refresh still succeeds: it receives its repository's listing.
-        XCTAssertTrue(fromRemovedRoot.contains { $0.path == mainRoot.path && $0.isMain })
     }
 
     func testWaiterOfInvalidatedEnumerationRetriesInsteadOfReturningPreMutationListing() async throws {
@@ -303,7 +308,8 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
                     await spy.recordCall(url)
                     let target = url.path == mainRootPath ? otherRoot : url
                     return try await backend.listWorktrees(at: target)
-                }
+                },
+                gitProcessEnvironment: { [:] }
             )
         )
         let linked = resolvedGit(linkedRoot)
@@ -320,6 +326,57 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
             [mainRoot.path, linkedRoot.path, linkedRoot.path],
             "A foreign listing must not be cached; the root then bypasses sharing"
         )
+    }
+
+    func testInheritedGitLocationEnvironmentDisablesSharing() async throws {
+        let spy = ListingSpy()
+        let backend = GitBackend()
+        let service = VCSService(
+            jjRunner: JJCommandRunner(),
+            sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration(
+                timeToLive: 3600,
+                now: { 1000 },
+                lister: { url in
+                    await spy.recordCall(url)
+                    return try await backend.listWorktrees(at: url)
+                },
+                gitProcessEnvironment: { ["GIT_DIR": "/elsewhere/.git"] }
+            )
+        )
+        let linked = resolvedGit(linkedRoot)
+
+        _ = try await service.sharedGitWorktreeListing(for: linked)
+        _ = try await service.sharedGitWorktreeListing(for: linked)
+
+        let calls = await spy.calledURLs
+        XCTAssertEqual(calls.map(\.path), [linkedRoot.path, linkedRoot.path], "No sharing, no main-root enumeration")
+    }
+
+    func testCallerRootMissingFromItsRepositoryListingFallsBackToCallerRoot() async throws {
+        let spy = ListingSpy()
+        let backend = GitBackend()
+        let mainRootPath = mainRoot.path
+        let linkedRootPath = linkedRoot.path
+        let service = VCSService(
+            jjRunner: JJCommandRunner(),
+            sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration(
+                timeToLive: 3600,
+                now: { 1000 },
+                lister: { url in
+                    await spy.recordCall(url)
+                    let descriptors = try await backend.listWorktrees(at: url)
+                    // The repository's listing no longer names the linked root (e.g. it was reused).
+                    return url.path == mainRootPath ? descriptors.filter { $0.path != linkedRootPath } : descriptors
+                },
+                gitProcessEnvironment: { [:] }
+            )
+        )
+
+        let result = try await service.sharedGitWorktreeListing(for: resolvedGit(linkedRoot))
+
+        let calls = await spy.calledURLs
+        XCTAssertEqual(calls.map(\.path), [mainRoot.path, linkedRoot.path])
+        XCTAssertTrue(result.contains { $0.path == linkedRoot.path })
     }
 
     func testProjectionChangesOnlyIsCurrent() {
@@ -377,7 +434,8 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
                     let descriptors = try await backend.listWorktrees(at: url)
                     await spy.waitAtGate()
                     return descriptors
-                }
+                },
+                gitProcessEnvironment: { [:] }
             )
         )
     }

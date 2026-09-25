@@ -14,6 +14,13 @@ struct SharedWorktreeListingConfiguration {
     var now: @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     /// Test seam replacing `git worktree list` plus per-worktree layout resolution.
     var lister: (@Sendable (URL) async throws -> [GitWorktreeDescriptor])?
+    /// The environment Git subprocesses inherit (process plus login shell), as `GitService` builds it.
+    var gitProcessEnvironment: @Sendable () async -> [String: String] = {
+        await GitService.mergedProcessEnvironment(
+            baseEnvironment: ProcessInfo.processInfo.environment,
+            shellEnvironment: CLIEnvironmentCache.shared.environment(enableLogging: false)
+        )
+    }
 }
 
 /// Cache entries, in-flight enumerations, and the invalidation generation.
@@ -38,6 +45,8 @@ struct SharedWorktreeListingState {
     var joinedFlightCount: UInt64 = 0
     /// Standardized repo-root path -> cache key; a `nil` value marks a root that must bypass the cache.
     var keyByRootPath: [String: SharedWorktreeListingKey?] = [:]
+    /// Memoized: sharing is disabled when Git subprocesses inherit a repository location.
+    var environmentAllowsSharing: Bool?
 }
 
 /// Identifies one repository's listing. Enumeration always runs from `mainRoot`, so neither the
@@ -80,6 +89,11 @@ extension VCSService {
         }
         let rootURL = resolved.rootURL
         let lister = gitWorktreeLister()
+        // An inherited GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR can redirect an enumeration run from a
+        // main checkout, so sharing is only used when Git's environment names no repository.
+        guard await sharedWorktreeListingEnvironmentAllowsSharing() else {
+            return try await lister(rootURL)
+        }
         var descriptors: [GitWorktreeDescriptor] = []
         // One retry: a result is never older than an uncached enumeration started at the same time.
         for _ in 0 ..< 2 {
@@ -96,6 +110,11 @@ extension VCSService {
                 return try await lister(rootURL)
             }
             if sharedWorktreeListing.generation == generation { break }
+        }
+        guard Self.listing(descriptors, contains: rootURL) else {
+            // The caller's root is not in its repository's listing (removed, pruned, or reused by
+            // another repository): enumerate from the caller's own root, as before sharing.
+            return try await lister(rootURL)
         }
         return Self.projectingCurrentWorktree(descriptors, currentRepoURL: rootURL)
     }
@@ -174,12 +193,31 @@ extension VCSService {
         return key
     }
 
+    private func sharedWorktreeListingEnvironmentAllowsSharing() async -> Bool {
+        if let allowed = sharedWorktreeListing.environmentAllowsSharing {
+            return allowed
+        }
+        let environment = await sharedWorktreeListingConfiguration.gitProcessEnvironment()
+        let allowed = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"].allSatisfy { environment[$0] == nil }
+        sharedWorktreeListing.environmentAllowsSharing = allowed
+        return allowed
+    }
+
     private func gitWorktreeLister() -> @Sendable (URL) async throws -> [GitWorktreeDescriptor] {
         if let lister = sharedWorktreeListingConfiguration.lister {
             return lister
         }
         let backend = gitBackend()
         return { url in try await backend.listWorktrees(at: url) }
+    }
+
+    /// Mirrors `gitWorktreeContextFromList`: the root is a listed worktree or lies inside one.
+    nonisolated static func listing(_ descriptors: [GitWorktreeDescriptor], contains rootURL: URL) -> Bool {
+        let rootPath = StandardizedPath.absolute(rootURL.path)
+        return descriptors.contains { descriptor in
+            let worktreePath = StandardizedPath.absolute(descriptor.path)
+            return worktreePath == rootPath || StandardizedPath.isDescendant(rootPath, of: worktreePath)
+        }
     }
 
     /// A listing belongs to a key only if it reports the key's main root as the main worktree.
