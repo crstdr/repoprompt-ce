@@ -161,6 +161,95 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
     }
 
+    /// One queued status edge for the observer's first outbound row, as the passive reducer would
+    /// publish it after a target transition.
+    private func passiveSnapshot(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        row: AgentMonitorPillProps.Outbound
+    ) -> AgentSessionLinkPassiveStatusNotices.Snapshot {
+        let reference = DomainAgentSessionLinkReference(linkID: row.linkID, generation: row.generation)
+        return AgentSessionLinkPassiveStatusNotices.Snapshot(
+            observerEndpoint: observer,
+            queueEpoch: UUID(),
+            queueRevision: 1,
+            linkSetRevision: 1,
+            isEnabled: true,
+            isDeliverable: true,
+            entries: [
+                AgentSessionLinkPassiveStatusNotices.PendingEntry(
+                    reference: reference,
+                    targetEndpoint: row.targetEndpoint,
+                    targetSessionID: row.targetSessionID,
+                    displayName: row.displayName,
+                    fromStatus: .running,
+                    toStatus: .idle,
+                    observedAt: Date(timeIntervalSince1970: 0),
+                    idleForSend: true,
+                    latestVisibleAssistantPreview: "Done.",
+                    changeSequence: 1,
+                    edgeSequence: 1
+                )
+            ],
+            attentionRequests: [],
+            unacknowledgedOverflowCount: 0,
+            overflowProduced: 0,
+            autoWakeLanes: [
+                AgentSessionLinkPassiveStatusNotices.AutoWakeLane(
+                    reference: reference,
+                    targetEndpoint: row.targetEndpoint,
+                    targetSessionID: row.targetSessionID,
+                    isEffectivelySelected: false
+                )
+            ]
+        )
+    }
+
+    /// The pending-updates section is derived from the passive queue, which changes without any link
+    /// projection change. Its own publication must refresh the on-screen observer's pill.
+    func testPassiveNoticePublishForCurrentObserverRefreshesStatusPills() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        let row = try XCTUnwrap(published.outbound.first)
+        viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        viewModel.test_flushPendingUIRefresh()
+        let pendingBefore = viewModel.ui.statusPills.snapshot.monitor.pendingUpdates
+
+        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+            passiveSnapshot(observer: fixture.endpoint, row: row),
+            to: fixture.endpoint
+        )
+        viewModel.test_flushPendingUIRefresh()
+
+        let fresh = viewModel.makeStatusPillsSnapshot()
+        XCTAssertEqual(fresh.monitor.pendingUpdates?.updateCount, 1)
+        XCTAssertNotEqual(fresh.monitor.pendingUpdates, pendingBefore)
+        XCTAssertEqual(viewModel.ui.statusPills.snapshot, fresh)
+    }
+
+    /// Before projection-scoped syncing, an unrelated endpoint's projection change incidentally
+    /// repaired a stale pending-updates section. The on-screen pill must not depend on that.
+    func testPassiveNoticeFreshnessDoesNotDependOnUnrelatedProjectionChanges() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        let row = try XCTUnwrap(published.outbound.first)
+        viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+
+        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+            passiveSnapshot(observer: fixture.endpoint, row: row),
+            to: fixture.endpoint
+        )
+        let other = nonCurrentEndpoint(fixture)
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: other), to: other)
+        viewModel.test_flushPendingUIRefresh()
+
+        XCTAssertEqual(viewModel.ui.statusPills.snapshot.monitor.pendingUpdates?.updateCount, 1)
+        XCTAssertEqual(viewModel.ui.statusPills.snapshot, viewModel.makeStatusPillsSnapshot())
+    }
+
     func testStatusPillSnapshotStaysCurrentAcrossProjectionAndPolicyMutations() throws {
         let fixture = try makeFixture()
         let viewModel = fixture.viewModel
