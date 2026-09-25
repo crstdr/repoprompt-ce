@@ -92,7 +92,7 @@ final class AgentTaskRoutingCandidateBuilderAvailabilityTests: XCTestCase {
         )
     }
 
-    func testHasAvailableTargetMatchesNonEmptyBuildForEveryInput() {
+    func testHasAvailableTargetMatchesNonEmptyBuildAcrossFixtureMatrix() {
         var outcomes: Set<Bool> = []
         for fixture in Self.optionFixtures {
             let builder = builder(fixture)
@@ -139,8 +139,9 @@ final class AgentTaskRoutingCandidateBuilderAvailabilityTests: XCTestCase {
             availability: availability
         ))
         // An opaque key is minted immediately before each candidate's display name and description
-        // are rendered, so zero keys means no candidate was constructed. One catalog read means the
-        // probe stopped at the first eligible definition that resolved.
+        // are rendered, so zero keys means no candidate was constructed. One catalog read means model
+        // resolution stopped at the first eligible definition that resolved (eligibility filtering
+        // itself is a cheap eager pass over the static definition table).
         XCTAssertEqual(opaqueKeys.value, 0)
         XCTAssertEqual(optionReads.value, 1)
 

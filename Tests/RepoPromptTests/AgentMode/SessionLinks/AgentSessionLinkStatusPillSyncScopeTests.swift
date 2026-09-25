@@ -250,6 +250,61 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         XCTAssertEqual(viewModel.ui.statusPills.snapshot, viewModel.makeStatusPillsSnapshot())
     }
 
+    /// The notification contract: whenever projection storage changes, the published monitor is
+    /// already current for anyone reading it from the notification — even when an independent
+    /// current-tab presentation change (here a queued passive update) is still waiting on its own
+    /// coalesced UI refresh.
+    func testUnrelatedProjectionNotificationSeesQueuedCurrentObserverUpdate() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        let row = try XCTUnwrap(published.outbound.first)
+        viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        viewModel.test_flushPendingUIRefresh()
+        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+            passiveSnapshot(observer: fixture.endpoint, row: row),
+            to: fixture.endpoint
+        )
+        var observed: (published: AgentMonitorPillProps, live: AgentMonitorPillProps)?
+        let (cancellable, notificationCount) = observeNotifications(viewModel) {
+            observed = (viewModel.ui.statusPills.snapshot.monitor, viewModel.currentMonitorPillProps())
+        }
+
+        let other = nonCurrentEndpoint(fixture)
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: other), to: other)
+
+        XCTAssertEqual(notificationCount(), 1)
+        let atNotification = try XCTUnwrap(observed)
+        XCTAssertEqual(atNotification.live.pendingUpdates?.updateCount, 1)
+        XCTAssertEqual(atNotification.published, atNotification.live)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    /// A rebind makes the tab's current incarnation one with no stored projection yet. A notification
+    /// for an unrelated endpoint must not let the pill keep presenting the retired incarnation's rows.
+    func testUnrelatedProjectionNotificationAfterRebindDoesNotExposeRetiredIncarnation() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: fixture.endpoint), to: fixture.endpoint)
+        viewModel.test_flushPendingUIRefresh()
+        fixture.session.beginPersistentBindingTransition()
+        let replacement = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: fixture.tabID)
+        XCTAssertNotEqual(replacement, fixture.endpoint)
+        var observed: (published: AgentMonitorPillProps, live: AgentMonitorPillProps)?
+        let (cancellable, _) = observeNotifications(viewModel) {
+            observed = (viewModel.ui.statusPills.snapshot.monitor, viewModel.currentMonitorPillProps())
+        }
+
+        let other = nonCurrentEndpoint(fixture)
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: other), to: other)
+
+        let atNotification = try XCTUnwrap(observed)
+        XCTAssertTrue(atNotification.live.outbound.isEmpty)
+        XCTAssertEqual(atNotification.published, atNotification.live)
+        withExtendedLifetime(cancellable) {}
+    }
+
     func testStatusPillSnapshotStaysCurrentAcrossProjectionAndPolicyMutations() throws {
         let fixture = try makeFixture()
         let viewModel = fixture.viewModel

@@ -609,23 +609,22 @@ extension AgentModeViewModel {
     /// is synchronized before the notification so every consumer can immediately re-read the same
     /// completed state. Equal replacements are true no-ops and publish nothing.
     ///
-    /// The snapshot's only storage-derived field is `monitor`, which `currentMonitorPillProps()` reads
-    /// from the current tab's exact endpoint entry alone. A transaction that leaves that entry
-    /// unchanged therefore cannot change the snapshot, and rebuilding it (Model Router availability,
-    /// execution location, ...) for every other endpoint's refresh is skipped. The notification is
-    /// posted for every changed transaction exactly as before.
+    /// The snapshot's only storage-derived field is `monitor`. The full snapshot (Model Router
+    /// availability, execution location, ...) is rebuilt only when the published `monitor` differs
+    /// from its live derivation or belongs to another tab — which covers a change to the current
+    /// tab's entry, a rebind whose new incarnation has no entry yet, and any current-tab presentation
+    /// change still waiting on its own coalesced UI refresh. Otherwise the published snapshot is
+    /// already the completed state, and the rebuild is skipped for every other endpoint's refresh.
+    /// The notification is posted for every changed transaction exactly as before.
     private func agentSessionLinkMutateProjectionStorage(
         _ mutation: (inout [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps]) -> Void
     ) {
         var updated = monitorPillPropsByEndpoint
         mutation(&updated)
         guard updated != monitorPillPropsByEndpoint else { return }
-        let currentEndpoint = currentTabID.flatMap { agentSessionLinkObserverEndpoint(tabID: $0) }
-        let currentEntryChanged = currentEndpoint.map {
-            updated[$0] != monitorPillPropsByEndpoint[$0]
-        } ?? false
         monitorPillPropsByEndpoint = updated
-        if currentEntryChanged {
+        let published = ui.statusPills.snapshot
+        if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
             syncStatusPillsUIState()
         }
         NotificationCenter.default.post(
