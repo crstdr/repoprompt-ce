@@ -111,8 +111,10 @@ struct RepoPromptSwiftUIApp: App {
     /// Global version manager for the entire app
     @StateObject private var versionManager = VersionManager()
 
-    /// Tracks all WindowState objects across multiple windows (singleton)
-    @StateObject private var windowStatesManager = WindowStatesManager.shared
+    /// Tracks all WindowState objects across multiple windows (singleton).
+    /// Deliberately not observed: the scene and commands only read it inside actions, and observing
+    /// it here re-evaluated the whole App scene body on every window open/close.
+    private let windowStatesManager = WindowStatesManager.shared
 
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
     @StateObject private var fontScale = FontScaleManager.shared
