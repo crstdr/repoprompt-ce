@@ -7360,6 +7360,11 @@ actor GitService {
         return "\(action) couldn’t launch git-lfs from RepoPrompt’s subprocess environment. If git-lfs is installed, restart RepoPrompt and make sure it’s available from your login shell PATH.\n\nRaw error: \(rawMessage)"
     }
 
+    /// The exact environment this instance's Git subprocesses inherit (memoized on first use).
+    func preparedProcessEnvironment() async -> [String: String] {
+        await processEnvironment()
+    }
+
     private func processEnvironment() async -> [String: String] {
         if let preparedBaseProcessEnvironment {
             return preparedBaseProcessEnvironment

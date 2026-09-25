@@ -14,13 +14,9 @@ struct SharedWorktreeListingConfiguration {
     var now: @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     /// Test seam replacing `git worktree list` plus per-worktree layout resolution.
     var lister: (@Sendable (URL) async throws -> [GitWorktreeDescriptor])?
-    /// The environment Git subprocesses inherit (process plus login shell), as `GitService` builds it.
-    var gitProcessEnvironment: @Sendable () async -> [String: String] = {
-        await GitService.mergedProcessEnvironment(
-            baseEnvironment: ProcessInfo.processInfo.environment,
-            shellEnvironment: CLIEnvironmentCache.shared.environment(enableLogging: false)
-        )
-    }
+    /// Test seam for the Git subprocess environment. By default the sharing decision reads the
+    /// exact environment prepared by the same `GitService` that runs the enumeration.
+    var gitProcessEnvironment: (@Sendable () async -> [String: String])?
 }
 
 /// Cache entries, in-flight enumerations, and the invalidation generation.
@@ -205,7 +201,11 @@ extension VCSService {
         if let allowed = sharedWorktreeListing.environmentAllowsSharing {
             return allowed
         }
-        let environment = await sharedWorktreeListingConfiguration.gitProcessEnvironment()
+        let environment: [String: String] = if let override = sharedWorktreeListingConfiguration.gitProcessEnvironment {
+            await override()
+        } else {
+            await gitBackend().gitProcessEnvironment()
+        }
         let allowed = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"].allSatisfy { environment[$0] == nil }
         sharedWorktreeListing.environmentAllowsSharing = allowed
         return allowed

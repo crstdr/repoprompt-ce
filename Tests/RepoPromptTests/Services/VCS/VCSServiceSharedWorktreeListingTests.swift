@@ -352,6 +352,12 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         XCTAssertEqual(calls.map(\.path), [linkedRoot.path, linkedRoot.path], "No sharing, no main-root enumeration")
     }
 
+    func testSharingDecisionReadsTheBackendsPreparedGitEnvironment() async {
+        let backend = GitBackend(gitService: GitService(inheritedProcessEnvironment: ["GIT_DIR": "/elsewhere/.git"]))
+        let environment = await backend.gitProcessEnvironment()
+        XCTAssertEqual(environment["GIT_DIR"], "/elsewhere/.git")
+    }
+
     func testCallerRootMissingFromItsRepositoryListingFallsBackToCallerRoot() async throws {
         let spy = ListingSpy()
         let backend = GitBackend()
