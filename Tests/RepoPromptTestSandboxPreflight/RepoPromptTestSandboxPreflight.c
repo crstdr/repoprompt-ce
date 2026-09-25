@@ -209,26 +209,35 @@ bool rp_test_sandbox_preflight_passed(void) {
 /// atomic, and a live override a fixture placed outside any sandbox (Foundation's temp directory
 /// ignores TMPDIR) can still be cleared by an overlapping run: at worst a flaky test, never a
 /// path into real data.
-static void clear_inherited_workspace_storage_override(const char *passwd_home) {
-    CFStringRef key = CFSTR("GlobalCustomStorageURL");
+/// True when the effective (searched) value is absent or one the policy keeps.
+static bool effective_workspace_storage_override_is_safe(CFStringRef key, const char *passwd_home) {
     CFPropertyListRef value = CFPreferencesCopyAppValue(key, kCFPreferencesCurrentApplication);
     if (value == NULL) {
-        return;
+        return true;
     }
-    bool should_clear = true;
+    bool safe = false;
     if (CFGetTypeID(value) == CFStringGetTypeID()) {
         char path[PATH_MAX];
         if (CFStringGetFileSystemRepresentation((CFStringRef)value, path, sizeof path)) {
-            should_clear = rp_test_sandbox_should_clear_storage_override(path, passwd_home);
+            safe = !rp_test_sandbox_should_clear_storage_override(path, passwd_home);
         }
     }
     CFRelease(value);
-    if (!should_clear) {
-        return;
+    return safe;
+}
+
+/// Returns false when an unsafe value remains effective after clearing the host's own key (for
+/// example one set in the global preferences domain), so the caller can refuse to start.
+static bool clear_inherited_workspace_storage_override(const char *passwd_home) {
+    CFStringRef key = CFSTR("GlobalCustomStorageURL");
+    if (effective_workspace_storage_override_is_safe(key, passwd_home)) {
+        return true;
     }
     CFPreferencesSetAppValue(key, NULL, kCFPreferencesCurrentApplication);
     CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
     fprintf(stderr, "RepoPromptTests: cleared a stale or unsafe inherited GlobalCustomStorageURL.\n");
+    // The runtime consumes the searched value, which also falls back to other domains.
+    return effective_workspace_storage_override_is_safe(key, passwd_home);
 }
 
 __attribute__((constructor))
@@ -261,6 +270,13 @@ static void rp_test_sandbox_preflight(void) {
         fflush(stderr);
         _exit(78);
     }
-    clear_inherited_workspace_storage_override(passwd_home_or_null);
+    if (!clear_inherited_workspace_storage_override(passwd_home_or_null)) {
+        fprintf(stderr,
+                "\nRepoPromptTests refused to start: an unsafe GlobalCustomStorageURL is still visible after\n"
+                "clearing the test host's own preference (it is set in another preferences domain, such as\n"
+                "the global domain). Remove it there before running tests.\n\n");
+        fflush(stderr);
+        _exit(78);
+    }
     gPreflightPassed = true;
 }
