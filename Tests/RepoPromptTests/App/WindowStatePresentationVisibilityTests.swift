@@ -140,10 +140,11 @@ final class WindowStatePresentationVisibilityTests: XCTestCase {
         )
     }
 
-    /// Both modes render the one shared `AgentRowActivityArcShape`, which is also where the
-    /// "Running" label is attached, so the swap cannot change layout or what VoiceOver announces.
-    /// SwiftUI does not materialize its accessibility tree for an off-screen test host, so the label
-    /// is pinned through the shared constant; the layout is measured in a real hosting view.
+    /// The still mode renders `AgentRowActivityArcShape` and the animated mode its layer-backed twin;
+    /// both take the same 15 pt frame and the same shared "Running" label, so the swap cannot change
+    /// layout or what VoiceOver announces. SwiftUI does not materialize its accessibility tree for an
+    /// off-screen test host, so the label is pinned through the shared constant; the layout is
+    /// measured in a real hosting view.
     func testStillAndAnimatedRunningIndicatorsShareFrameAndAccessibilityLabel() {
         let visible = hostIndicator(isWindowPresentationVisible: true)
         let hidden = hostIndicator(isWindowPresentationVisible: false)

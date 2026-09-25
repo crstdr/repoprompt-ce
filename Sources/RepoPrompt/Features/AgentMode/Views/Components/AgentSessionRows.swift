@@ -1520,16 +1520,13 @@ struct AgentStashedSessionRow: View {
 ///   should not out-shout it.
 private struct AgentRowActivityArc: View {
     var tint: Color = .accentColor
-    @State private var rotation: Double = 0
 
     var body: some View {
-        AgentRowActivityArcShape(tint: tint)
-            .rotationEffect(.degrees(rotation))
-            .onAppear {
-                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
-                    rotation = 360
-                }
-            }
+        // Render-server rotation: no per-frame SwiftUI render, window layout, or commit on main.
+        AgentRowAnimatedActivityArc(tint: tint)
+            .frame(width: AgentRowActivityArcLayerView.diameter, height: AgentRowActivityArcLayerView.diameter)
+            .accessibilityElement()
+            .accessibilityLabel(AgentRowRunningIndicator.accessibilityLabelText)
     }
 }
 
@@ -1552,10 +1549,10 @@ private struct AgentRowActivityArcShape: View {
 
 /// Whether a running row's arc may animate.
 ///
-/// A SwiftUI `repeatForever` rotation keeps the app committing Core Animation frames even when
-/// its window is miniaturized, occluded, or on another Space, so the arc animates only while its
-/// window is presented on screen and Reduce Motion is off. Otherwise the row shows the same arc
-/// standing still: running stays visible and labelled, it just stops spinning.
+/// The arc animates only while its window is presented on screen and Reduce Motion is off. A hidden
+/// window keeps no animation at all (so other commits never have to walk one), and Reduce Motion asks
+/// for none. Otherwise the row shows the same arc standing still: running stays visible and
+/// labelled, it just stops spinning.
 enum AgentRowActivityIndicatorMode: Equatable {
     case animated
     case still
@@ -1565,8 +1562,8 @@ enum AgentRowActivityIndicatorMode: Equatable {
     }
 }
 
-/// The running row's status glyph. Switching modes swaps the view, so the animated arc's
-/// `onAppear` starts the rotation again whenever the window becomes visible.
+/// The running row's status glyph. Switching modes swaps the view, so the animated arc's layer
+/// animation is installed again whenever the window becomes visible.
 struct AgentRowRunningIndicator: View {
     static let accessibilityLabelText = "Running"
 
