@@ -92,17 +92,17 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
     func testConcurrentRequestsJoinOneInFlightEnumeration() async throws {
         let gate = Gate()
         let spy = ListingSpy(gate: gate)
-        // TTL 0: only in-flight coalescing, not caching, can keep the count at one.
-        let service = makeService(spy: spy, clock: ManualClock(), timeToLive: 0)
+        let service = makeService(spy: spy, clock: ManualClock(), timeToLive: 60)
         let main = resolvedGit(mainRoot)
         let linked = resolvedGit(linkedRoot)
 
         let first = Task { try await service.sharedGitWorktreeListing(for: main) }
-        await spy.waitForCallCount(1)
+        await waitUntil { await spy.callCount >= 1 }
         let joiners = [main, linked, main].map { resolved in
             Task { try await service.sharedGitWorktreeListing(for: resolved) }
         }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // No entry exists while the flight is blocked, so all three must join it (not hit a cache).
+        await waitUntil { await service.sharedWorktreeListing.joinedFlightCount >= 3 }
         await gate.open()
 
         let firstResult = try await first.value
@@ -123,7 +123,7 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         let resolved = resolvedGit(mainRoot)
 
         let inFlight = Task { try await service.sharedGitWorktreeListing(for: resolved) }
-        await spy.waitForCallCount(1)
+        await waitUntil { await spy.callCount >= 1 }
         await service.invalidateSharedWorktreeListings()
         await gate.open()
         _ = try await inFlight.value
@@ -239,9 +239,10 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
 
         // The first enumeration snapshots the worktree list, then blocks.
         let initiator = Task { try await service.sharedGitWorktreeListing(for: resolved) }
-        await spy.waitForCallCount(1)
+        await waitUntil { await spy.callCount >= 1 }
         let joiner = Task { try await service.sharedGitWorktreeListing(for: resolvedGit(linkedRoot)) }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // Rendezvous: the joiner must be attached to the pre-mutation flight before the mutation.
+        await waitUntil { await service.sharedWorktreeListing.joinedFlightCount >= 1 }
 
         // A RepoPrompt mutation lands while both requests wait on the pre-mutation snapshot.
         let created = fixture.sandbox.appendingPathComponent("repo-created", isDirectory: true)
@@ -263,6 +264,62 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         XCTAssertTrue(joinerResult.contains { $0.path == created.path })
         let enumerations = await spy.callCount
         XCTAssertEqual(enumerations, 2, "Invalidated waiters retry once on a fresh enumeration")
+    }
+
+    func testRequestAfterTimeToLiveDoesNotJoinAStaleInFlightEnumeration() async throws {
+        let clock = ManualClock()
+        let gate = Gate()
+        let spy = ListingSpy(gate: gate)
+        let service = makeService(spy: spy, clock: clock, timeToLive: 2.5)
+        let resolved = resolvedGit(mainRoot)
+
+        let slow = Task { try await service.sharedGitWorktreeListing(for: resolved) }
+        await waitUntil { await spy.callCount >= 1 }
+        clock.advance(by: 3.0)
+        let late = Task { try await service.sharedGitWorktreeListing(for: resolved) }
+        await waitUntil { await spy.callCount >= 2 }
+        await gate.open()
+        _ = try await slow.value
+        _ = try await late.value
+
+        let joined = await service.sharedWorktreeListing.joinedFlightCount
+        XCTAssertEqual(joined, 0, "A flight older than the TTL must not be joined")
+        let enumerations = await spy.callCount
+        XCTAssertEqual(enumerations, 2)
+    }
+
+    func testListingWithoutTheKeysMainRootIsNotCachedAndFallsBackToCallerRoot() async throws {
+        // Simulates an inherited GIT_DIR: enumerating from the main root reports another repository.
+        let otherRoot = try fixture.makeRepository(named: "other", files: ["README.md": "other\n"])
+        let spy = ListingSpy()
+        let backend = GitBackend()
+        let mainRootPath = mainRoot.path
+        let service = VCSService(
+            jjRunner: JJCommandRunner(),
+            sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration(
+                timeToLive: 3600,
+                now: { 1000 },
+                lister: { url in
+                    await spy.recordCall(url)
+                    let target = url.path == mainRootPath ? otherRoot : url
+                    return try await backend.listWorktrees(at: target)
+                }
+            )
+        )
+        let linked = resolvedGit(linkedRoot)
+
+        let first = try await service.sharedGitWorktreeListing(for: linked)
+        let second = try await service.sharedGitWorktreeListing(for: linked)
+
+        XCTAssertTrue(first.contains { $0.path == linkedRoot.path })
+        XCTAssertFalse(first.contains { $0.path == otherRoot.path })
+        XCTAssertEqual(first.map(\.path), second.map(\.path))
+        let calls = await spy.calledURLs
+        XCTAssertEqual(
+            calls.map(\.path),
+            [mainRoot.path, linkedRoot.path, linkedRoot.path],
+            "A foreign listing must not be cached; the root then bypasses sharing"
+        )
     }
 
     func testProjectionChangesOnlyIsCurrent() {
@@ -325,6 +382,23 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         )
     }
 
+    /// Bounded rendezvous: fails (instead of hanging) if the condition never holds.
+    private func waitUntil(
+        timeout: TimeInterval = 5,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: () async -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while await !condition() {
+            guard Date() < deadline else {
+                XCTFail("Timed out waiting for condition", file: file, line: line)
+                return
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
     private func resolvedGit(_ root: URL) -> VCSResolvedRepo {
         VCSResolvedRepo(rootURL: root, backendKind: .git)
     }
@@ -367,7 +441,6 @@ private actor Gate {
 private actor ListingSpy {
     private let gate: Gate?
     private(set) var calledURLs: [URL] = []
-    private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     var callCount: Int {
         calledURLs.count
@@ -379,17 +452,9 @@ private actor ListingSpy {
 
     func recordCall(_ url: URL) {
         calledURLs.append(url)
-        let ready = countWaiters.filter { $0.0 <= callCount }
-        countWaiters.removeAll { $0.0 <= callCount }
-        ready.forEach { $0.1.resume() }
     }
 
     func waitAtGate() async {
         await gate?.wait()
-    }
-
-    func waitForCallCount(_ count: Int) async {
-        guard callCount < count else { return }
-        await withCheckedContinuation { countWaiters.append((count, $0)) }
     }
 }

@@ -26,6 +26,7 @@ struct SharedWorktreeListingState {
 
     struct Flight {
         let id: UInt64
+        let startedAt: TimeInterval
         let task: Task<[GitWorktreeDescriptor], Error>
     }
 
@@ -33,6 +34,8 @@ struct SharedWorktreeListingState {
     var flights: [String: Flight] = [:]
     var generation: UInt64 = 0
     var nextFlightID: UInt64 = 0
+    /// Number of requests that joined an in-flight enumeration (diagnostics and tests).
+    var joinedFlightCount: UInt64 = 0
     /// Standardized repo-root path -> cache key; a `nil` value marks a root that must bypass the cache.
     var keyByRootPath: [String: SharedWorktreeListingKey?] = [:]
 }
@@ -78,12 +81,20 @@ extension VCSService {
         let rootURL = resolved.rootURL
         let lister = gitWorktreeLister()
         var descriptors: [GitWorktreeDescriptor] = []
+        // One retry: a result is never older than an uncached enumeration started at the same time.
         for _ in 0 ..< 2 {
+            try Task.checkCancellation()
             guard let key = sharedWorktreeListingKey(forRepoRoot: rootURL) else {
                 return try await lister(rootURL)
             }
             let generation = sharedWorktreeListing.generation
             descriptors = try await sharedWorktreeListing(forKey: key, lister: lister)
+            guard Self.listing(descriptors, belongsTo: key) else {
+                // Not recognisably this repository's listing (an inherited GIT_DIR, or a main-root
+                // spelling that differs from Git's): bypass sharing for this root, as before the cache.
+                sharedWorktreeListing.keyByRootPath[rootURL.standardizedFileURL.path] = .some(nil)
+                return try await lister(rootURL)
+            }
             if sharedWorktreeListing.generation == generation { break }
         }
         return Self.projectingCurrentWorktree(descriptors, currentRepoURL: rootURL)
@@ -109,7 +120,10 @@ extension VCSService {
             }
             sharedWorktreeListing.entries.removeValue(forKey: key)
         }
-        if let flight = sharedWorktreeListing.flights[key] {
+        if let flight = sharedWorktreeListing.flights[key],
+           startedAt - flight.startedAt < sharedWorktreeListingConfiguration.timeToLive
+        {
+            sharedWorktreeListing.joinedFlightCount &+= 1
             return try await flight.task.value
         }
 
@@ -119,12 +133,20 @@ extension VCSService {
         // Unstructured so one waiter's cancellation cannot fail the other joined waiters.
         let mainRoot = listingKey.mainRoot
         let task = Task { try await lister(mainRoot) }
-        sharedWorktreeListing.flights[key] = SharedWorktreeListingState.Flight(id: flightID, task: task)
+        sharedWorktreeListing.flights[key] = SharedWorktreeListingState.Flight(
+            id: flightID,
+            startedAt: startedAt,
+            task: task
+        )
         let result = await task.result
         if sharedWorktreeListing.flights[key]?.id == flightID {
             sharedWorktreeListing.flights.removeValue(forKey: key)
         }
-        if case let .success(descriptors) = result, sharedWorktreeListing.generation == generation {
+        if case let .success(descriptors) = result,
+           sharedWorktreeListing.generation == generation,
+           Self.listing(descriptors, belongsTo: listingKey),
+           (sharedWorktreeListing.entries[key]?.fetchStartedAt ?? -.infinity) < startedAt
+        {
             sharedWorktreeListing.entries[key] = SharedWorktreeListingState.Entry(
                 descriptors: descriptors,
                 fetchStartedAt: startedAt
@@ -158,6 +180,11 @@ extension VCSService {
         }
         let backend = gitBackend()
         return { url in try await backend.listWorktrees(at: url) }
+    }
+
+    /// A listing belongs to a key only if it reports the key's main root as the main worktree.
+    nonisolated static func listing(_ descriptors: [GitWorktreeDescriptor], belongsTo key: SharedWorktreeListingKey) -> Bool {
+        descriptors.contains { $0.isMain && $0.path == key.mainRoot.path }
     }
 
     /// Mirrors `GitService.makeWorktreeDescriptors`, where `isCurrent` is `path == currentPath`.
