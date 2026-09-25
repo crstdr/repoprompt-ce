@@ -34,6 +34,40 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         XCTAssertTrue(arcViews(in: hidden.host).isEmpty, "a hidden window keeps no animation at all")
     }
 
+    /// SwiftUI draws in y-down space, so `rotationEffect(.degrees(+360))` spins clockwise and
+    /// `Circle().trim(0, 0.7)` runs clockwise from 3 o'clock, leaving its gap at the top right. The
+    /// layer arc must match: AppKit flips the flipped host view's backing layer, so the arc layer is
+    /// effectively y-down on screen, its identical path runs clockwise, and a positive
+    /// `transform.rotation.z` turns it clockwise.
+    func testHostedArcRunsAndSpinsClockwiseLikeTheSwiftUIArc() throws {
+        let hosted = hostIndicator(isWindowPresentationVisible: true)
+        defer { hosted.window.close() }
+        let arc = try XCTUnwrap(arcViews(in: hosted.host).first)
+        arc.layoutSubtreeIfNeeded()
+        let viewLayer = try XCTUnwrap(arc.layer)
+        XCTAssertTrue(arc.arcLayer.contentsAreFlipped(), "the arc layer renders y-down, like SwiftUI")
+
+        let bounds = arc.arcLayer.bounds
+        let swiftUIPath = Circle().path(in: bounds).cgPath
+        XCTAssertEqual(try pathPoints(XCTUnwrap(arc.arcLayer.path)), pathPoints(swiftUIPath))
+
+        func inWindow(_ point: CGPoint) -> CGPoint {
+            arc.convert(arc.arcLayer.convert(point, to: viewLayer), to: nil)
+        }
+        let center = inWindow(CGPoint(x: bounds.midX, y: bounds.midY))
+        let start = inWindow(CGPoint(x: bounds.maxX, y: bounds.midY))
+        let quarter = inWindow(CGPoint(x: bounds.midX, y: bounds.maxY))
+        // Window coordinates are y-up: 3 o'clock, then 6 o'clock below the center, is clockwise.
+        XCTAssertGreaterThan(start.x, center.x)
+        XCTAssertEqual(start.y, center.y, accuracy: 0.001)
+        XCTAssertLessThan(quarter.y, center.y, "the path runs clockwise, so the trimmed gap is at the top right")
+
+        arc.arcLayer.transform = CATransform3DMakeRotation(0.2, 0, 0, 1)
+        let rotatedStart = inWindow(CGPoint(x: bounds.maxX, y: bounds.midY))
+        arc.arcLayer.transform = CATransform3DIdentity
+        XCTAssertLessThan(rotatedStart.y, start.y, "a positive rotation turns 3 o'clock downward: clockwise")
+    }
+
     func testArcGeometryMatchesTheStillArc() {
         let arc = AgentRowActivityArcLayerView(frame: NSRect(x: 0, y: 0, width: 15, height: 15))
         arc.layout()
@@ -108,6 +142,25 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         )
         window.isReleasedWhenClosed = false
         return window
+    }
+
+    private func pathPoints(_ path: CGPath) -> [CGPoint] {
+        var points: [CGPoint] = []
+        path.applyWithBlock { element in
+            let count = switch element.pointee.type {
+            case .moveToPoint, .addLineToPoint: 1
+            case .addQuadCurveToPoint: 2
+            case .addCurveToPoint: 3
+            case .closeSubpath: 0
+            @unknown default: 0
+            }
+            for index in 0 ..< count {
+                let point = element.pointee.points[index]
+                // Rounded so equal geometry built by different APIs compares equal.
+                points.append(CGPoint(x: (point.x * 1000).rounded() / 1000, y: (point.y * 1000).rounded() / 1000))
+            }
+        }
+        return points
     }
 
     private func arcViews(in view: NSView) -> [AgentRowActivityArcLayerView] {
