@@ -467,10 +467,22 @@ def run_focused_build(repo_root: Path, args: Dict[str, Any]) -> int:
     run_tests = bool(args.get("runTests") or test_filter)
     build_dir = repo_root / ".build"
 
+    environment: Optional[Dict[str, str]] = None
     if run_tests:
         invocation = ["swift", "test", "--no-color-diagnostics"]
         if test_filter:
             invocation.extend(["--filter", test_filter])
+        # RepoPromptTests refuses to load outside the runner's isolated sandbox, which keeps
+        # tests out of the user's real app storage. Reuse the same HOME/TMPDIR contract.
+        import atexit
+        import shutil
+        import tempfile
+
+        import ci_app_test_runner
+
+        sandbox_directory = tempfile.mkdtemp(prefix="rpce-diagnostic-tests-")
+        atexit.register(shutil.rmtree, sandbox_directory, True)
+        environment = ci_app_test_runner.isolated_suite_environment(Path(sandbox_directory), "diagnostic")
     else:
         invocation = ["swift", "build", "--product", product, "--no-color-diagnostics"]
 
@@ -485,6 +497,7 @@ def run_focused_build(repo_root: Path, args: Dict[str, Any]) -> int:
         process = subprocess.Popen(
             invocation,
             cwd=str(repo_root),
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

@@ -10,7 +10,7 @@ help:
 	@printf '  %-30s %s\n' 'setup' 'Install format tools, run doctor, and resolve packages'
 	@printf '  %-30s %s\n' 'build' 'Build and package the debug app'
 	@printf '  %-30s %s\n' 'run' 'Build, package, and launch the debug app'
-	@printf '  %-30s %s\n' 'test' 'Run the Swift test suite'
+	@printf '  %-30s %s\n' 'test' 'Run the Swift test suite in the isolated test sandbox (uncoordinated)'
 	@printf '  %-30s %s\n' 'guardrails' 'Run source layout and repository guardrails'
 	@printf '  %-30s %s\n' 'codex-schema-check' 'Validate bounded app-server assumptions against generated Codex schemas'
 	@printf '  %-30s %s\n' 'clean' 'Remove .build'
@@ -125,7 +125,7 @@ run:
 	./Scripts/run.sh
 
 test:
-	swift test
+	python3 Scripts/ci_app_test_runner.py --local
 
 guardrails:
 	./Scripts/guardrails.sh

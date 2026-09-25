@@ -290,7 +290,7 @@ make dev-build
 
 Run the smallest relevant daemon build/test command above to validate a change. If the change affects packaging, the MCP server, the MCP CLI, Agent Mode, or any feature that depends on the running app, follow it with the live CE MCP smoke flow above.
 
-Direct `swift test --filter <name>` and `swift build --product <name>` still work and produce the same result, but they are uncoordinated — use them only when the daemon is unavailable (for example, no `python3`), and avoid them when other agents may be building.
+Direct `swift build --product <name>` still works and produces the same result, but it is uncoordinated — use it only when the daemon is unavailable, and avoid it when other agents may be building. `RepoPromptTests` refuses to load outside the isolated test sandbox (so tests can never touch the real app storage); the uncoordinated test fallback is `python3 Scripts/ci_app_test_runner.py --local [--filter <name>]` (`make test`), not bare `swift test`.
 
 Use `make dev-run` (or `make run`) only when it is safe to stop any existing RepoPrompt instance and launch the local debug app.
 

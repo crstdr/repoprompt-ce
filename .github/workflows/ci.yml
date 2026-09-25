@@ -117,7 +117,7 @@ jobs:
       - name: Test serialized Sentry privacy boundary
         env:
           REPOPROMPT_ENABLE_SENTRY: "1"
-        run: swift test --filter SentryTelemetryPrivacyTests
+        run: python3 Scripts/ci_app_test_runner.py --local --filter SentryTelemetryPrivacyTests
 
   provider-tests:
     name: Provider Tests

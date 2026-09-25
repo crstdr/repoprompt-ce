@@ -51,13 +51,25 @@ def list_suite_methods(
     swift_binary: str,
     cwd: Path | None,
 ) -> dict[str, tuple[str, ...]]:
-    result = subprocess.run(
-        [swift_binary, "test", "list"],
+    # Listing loads the test bundle, whose preflight refuses to run outside a test sandbox.
+    # Build first with the developer environment (compilation caches stay outside the
+    # disposable home), then list from a throwaway sandbox.
+    subprocess.run(
+        [swift_binary, "build", "--build-tests"],
         check=True,
         capture_output=True,
         cwd=cwd,
         text=True,
     )
+    with tempfile.TemporaryDirectory(prefix="rpce-test-list-") as directory:
+        result = subprocess.run(
+            [swift_binary, "test", "list", "--skip-build"],
+            check=True,
+            capture_output=True,
+            cwd=cwd,
+            text=True,
+            env=isolated_suite_environment(Path(directory), "list"),
+        )
     return parse_suite_methods(result.stdout)
 
 
@@ -381,7 +393,7 @@ def main(argv: Sequence[str]) -> int:
         print(f"::error::{error}")
         return 2
     except subprocess.CalledProcessError as error:
-        print(f"::error::swift test list failed with status {error.returncode}")
+        print(f"::error::test discovery failed with status {error.returncode}")
         if error.stdout:
             print(error.stdout, end="")
         if error.stderr:
