@@ -59,10 +59,25 @@ public actor VCSService {
     /// Whether jj is available on this system (cached after first check).
     private var _jjAvailable: Bool?
 
+    /// Configuration for the process-wide shared worktree listing used by periodic
+    /// Git context refreshes. See `VCSService+SharedWorktreeListing.swift`.
+    let sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration
+
+    /// Entries, in-flight enumerations, and invalidation generation for the shared listing.
+    var sharedWorktreeListing = SharedWorktreeListingState()
+
     // MARK: - Initialization
 
     public init(jjRunner: JJCommandRunner = JJCommandRunner()) {
+        self.init(jjRunner: jjRunner, sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration())
+    }
+
+    init(
+        jjRunner: JJCommandRunner,
+        sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration
+    ) {
         self.jjRunner = jjRunner
+        self.sharedWorktreeListingConfiguration = sharedWorktreeListingConfiguration
     }
 
     // MARK: - Backend Access
@@ -170,11 +185,16 @@ public actor VCSService {
         resolvedRepoCache.removeAll()
         backendKindCache.removeAll()
         gitLayoutCache.removeAll()
+        invalidateSharedWorktreeListings()
     }
 
     /// Remove a specific path from the cache.
     /// Also invalidates the resolved root if different from the input path.
+    ///
+    /// Every RepoPrompt operation that changes worktree-list data (worktree create, branch
+    /// switch, worktree merge) calls this, so it also drops every shared worktree listing.
     public func invalidateCache(for url: URL) {
+        invalidateSharedWorktreeListings()
         let path = url.standardizedFileURL.path
 
         // Get the resolved root path before removing (if cached)
@@ -499,7 +519,7 @@ public extension VCSService {
     func gitWorktreeContext(for url: URL, resolved: VCSResolvedRepo) async -> GitWorktreeContextSummary? {
         guard resolved.backendKind == .git else { return nil }
         do {
-            let worktrees = try await listGitWorktrees(for: resolved)
+            let worktrees = try await sharedGitWorktreeListing(for: resolved)
             return await gitWorktreeContext(for: url, resolved: resolved, worktrees: worktrees)
         } catch {
             return await gitWorktreeContext(for: url, resolved: resolved, worktrees: nil)

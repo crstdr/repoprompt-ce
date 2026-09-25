@@ -1,0 +1,287 @@
+import Foundation
+@testable import RepoPromptApp
+import XCTest
+
+/// Pins the process-wide worktree listing shared by periodic Git context refreshes: windows
+/// on one repository share one `git worktree list` + per-worktree metadata pass per time-to-live,
+/// concurrent requests coalesce, RepoPrompt's own worktree mutations invalidate immediately, and
+/// repositories never share entries. The spy counts real enumerations (one per process launch and
+/// metadata pass); each test has a control that fails if sharing or invalidation is removed.
+final class VCSServiceSharedWorktreeListingTests: XCTestCase {
+    private var fixture: ReviewGitRepositoryFixture!
+    private var mainRoot: URL!
+    private var linkedRoot: URL!
+
+    override func setUpWithError() throws {
+        // Resolve /var -> /private/var so paths match `git worktree list` output exactly.
+        let parent = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        fixture = try ReviewGitRepositoryFixture(name: "SharedWorktreeListing", parentDirectory: parent)
+        mainRoot = try fixture.makeRepository(named: "repo", files: ["README.md": "main\n"])
+        linkedRoot = fixture.sandbox.appendingPathComponent("repo-feature", isDirectory: true)
+        try fixture.runGit(["worktree", "add", "-b", "feature", linkedRoot.path], at: mainRoot)
+    }
+
+    override func tearDown() {
+        fixture?.cleanup()
+        fixture = nil
+    }
+
+    // MARK: - Two windows share one enumeration
+
+    func testTwoWindowRefreshesOfOneRepositoryShareOneEnumerationWithinTimeToLive() async {
+        let clock = ManualClock()
+        let spy = ListingSpy()
+        let service = makeService(spy: spy, clock: clock, timeToLive: 2.5)
+        let mainWindow = GitStatusActor(vcsService: service)
+        let linkedWindow = GitStatusActor(vcsService: service)
+
+        let mainDetections = await mainWindow.updateRoots([mainRoot.path])
+        clock.advance(by: 1.0)
+        let linkedDetections = await linkedWindow.updateRoots([linkedRoot.path])
+
+        let enumerations = await spy.callCount
+        XCTAssertEqual(enumerations, 1, "Two windows on one repository within the TTL must share one enumeration")
+        XCTAssertEqual(mainDetections.first?.gitWorktreeContext?.worktreePath, mainRoot.path)
+        XCTAssertEqual(linkedDetections.first?.gitWorktreeContext?.worktreePath, linkedRoot.path)
+
+        // Control: with sharing disabled (TTL 0), the same two refreshes enumerate twice.
+        let controlSpy = ListingSpy()
+        let control = makeService(spy: controlSpy, clock: ManualClock(), timeToLive: 0)
+        _ = await GitStatusActor(vcsService: control).updateRoots([mainRoot.path])
+        _ = await GitStatusActor(vcsService: control).updateRoots([linkedRoot.path])
+        let controlEnumerations = await controlSpy.callCount
+        XCTAssertEqual(controlEnumerations, 2)
+    }
+
+    func testSharedEntryReprojectsIsCurrentForEachCaller() async throws {
+        let spy = ListingSpy()
+        let service = makeService(spy: spy, clock: ManualClock(), timeToLive: 60)
+
+        let fromMain = try await service.sharedGitWorktreeListing(for: resolvedGit(mainRoot))
+        let fromLinked = try await service.sharedGitWorktreeListing(for: resolvedGit(linkedRoot))
+
+        let enumerations = await spy.callCount
+        XCTAssertEqual(enumerations, 1)
+        XCTAssertEqual(currentPaths(fromMain), [mainRoot.path])
+        XCTAssertEqual(currentPaths(fromLinked), [linkedRoot.path])
+        XCTAssertEqual(Set(fromMain.map(\.path)), Set(fromLinked.map(\.path)))
+    }
+
+    // MARK: - Time-to-live
+
+    func testRefreshAfterTimeToLiveReenumerates() async throws {
+        let clock = ManualClock()
+        let spy = ListingSpy()
+        let service = makeService(spy: spy, clock: clock, timeToLive: 2.5)
+        let resolved = resolvedGit(mainRoot)
+
+        _ = try await service.sharedGitWorktreeListing(for: resolved)
+        clock.advance(by: 2.4)
+        _ = try await service.sharedGitWorktreeListing(for: resolved)
+        let withinTimeToLive = await spy.callCount
+        XCTAssertEqual(withinTimeToLive, 1)
+
+        clock.advance(by: 0.1)
+        _ = try await service.sharedGitWorktreeListing(for: resolved)
+        let afterTimeToLive = await spy.callCount
+        XCTAssertEqual(afterTimeToLive, 2, "An entry must not be served once the TTL has elapsed")
+    }
+
+    // MARK: - Single flight
+
+    func testConcurrentRequestsJoinOneInFlightEnumeration() async throws {
+        let gate = Gate()
+        let spy = ListingSpy(gate: gate)
+        // TTL 0: only in-flight coalescing, not caching, can keep the count at one.
+        let service = makeService(spy: spy, clock: ManualClock(), timeToLive: 0)
+        let main = resolvedGit(mainRoot)
+        let linked = resolvedGit(linkedRoot)
+
+        let first = Task { try await service.sharedGitWorktreeListing(for: main) }
+        await spy.waitForCallCount(1)
+        let joiners = [main, linked, main].map { resolved in
+            Task { try await service.sharedGitWorktreeListing(for: resolved) }
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        await gate.open()
+
+        let firstResult = try await first.value
+        var joinerResults: [[GitWorktreeDescriptor]] = []
+        for joiner in joiners {
+            try await joinerResults.append(joiner.value)
+        }
+        let enumerations = await spy.callCount
+        XCTAssertEqual(enumerations, 1, "Concurrent requests for one repository must share one enumeration")
+        XCTAssertEqual(firstResult.count, 2)
+        XCTAssertEqual(currentPaths(joinerResults[1]), [linkedRoot.path])
+    }
+
+    func testInvalidationDuringInFlightEnumerationIsNotStored() async throws {
+        let gate = Gate()
+        let spy = ListingSpy(gate: gate)
+        let service = makeService(spy: spy, clock: ManualClock(), timeToLive: 60)
+        let resolved = resolvedGit(mainRoot)
+
+        let inFlight = Task { try await service.sharedGitWorktreeListing(for: resolved) }
+        await spy.waitForCallCount(1)
+        await service.invalidateSharedWorktreeListings()
+        await gate.open()
+        _ = try await inFlight.value
+
+        _ = try await service.sharedGitWorktreeListing(for: resolved)
+        let enumerations = await spy.callCount
+        XCTAssertEqual(enumerations, 2, "An enumeration that started before invalidation must not be cached")
+    }
+
+    // MARK: - RepoPrompt's own mutations are visible immediately
+
+    func testRepoPromptWorktreeCreateAndRemoveAreVisibleBeforeTimeToLive() async throws {
+        let spy = ListingSpy()
+        // A long TTL proves visibility comes from invalidation, not expiry.
+        let service = makeService(spy: spy, clock: ManualClock(), timeToLive: 3600)
+        let resolved = resolvedGit(mainRoot)
+        let initial = try await service.sharedGitWorktreeListing(for: resolved)
+        XCTAssertEqual(initial.count, 2)
+
+        // Control: a worktree added outside RepoPrompt stays hidden until the TTL expires.
+        let external = fixture.sandbox.appendingPathComponent("repo-external", isDirectory: true)
+        try fixture.runGit(["worktree", "add", "-b", "external", external.path], at: mainRoot)
+        let beforeInvalidation = try await service.sharedGitWorktreeListing(for: resolved)
+        XCTAssertFalse(beforeInvalidation.contains { $0.path == external.path })
+
+        // RepoPrompt creation (VCSService.createGitWorktree) invalidates immediately.
+        let created = fixture.sandbox.appendingPathComponent("repo-created", isDirectory: true)
+        _ = try await service.createGitWorktree(
+            request: GitWorktreeCreateRequest(
+                path: created,
+                branch: "created",
+                allowExternalPath: true,
+                mainWorktreeRoot: mainRoot,
+                knownWorktreeRoots: [mainRoot, linkedRoot, external]
+            ),
+            at: mainRoot
+        )
+        let afterCreate = try await service.sharedGitWorktreeListing(for: resolved)
+        XCTAssertTrue(afterCreate.contains { $0.path == created.path })
+        XCTAssertTrue(afterCreate.contains { $0.path == external.path })
+
+        // RepoPrompt removal (the start coordinator's `git worktree remove`) invalidates explicitly.
+        try fixture.runGit(["worktree", "remove", "--force", created.path], at: mainRoot)
+        await service.invalidateSharedWorktreeListings()
+        let afterRemove = try await service.sharedGitWorktreeListing(for: resolved)
+        XCTAssertFalse(afterRemove.contains { $0.path == created.path })
+
+        let enumerations = await spy.callCount
+        XCTAssertEqual(enumerations, 3)
+    }
+
+    func testInvalidateCacheForMutatedPathDropsSharedListings() async throws {
+        let spy = ListingSpy()
+        let service = makeService(spy: spy, clock: ManualClock(), timeToLive: 3600)
+        let resolved = resolvedGit(mainRoot)
+
+        _ = try await service.sharedGitWorktreeListing(for: resolved)
+        // Branch switch and worktree merge call `invalidateCache(for:)` after mutating.
+        await service.invalidateCache(for: linkedRoot)
+        _ = try await service.sharedGitWorktreeListing(for: resolved)
+
+        let enumerations = await spy.callCount
+        XCTAssertEqual(enumerations, 2)
+    }
+
+    // MARK: - Repository isolation
+
+    func testDifferentRepositoriesDoNotShareEntries() async throws {
+        let otherRoot = try fixture.makeRepository(named: "other", files: ["README.md": "other\n"])
+        let spy = ListingSpy()
+        let service = makeService(spy: spy, clock: ManualClock(), timeToLive: 3600)
+
+        let first = try await service.sharedGitWorktreeListing(for: resolvedGit(mainRoot))
+        let other = try await service.sharedGitWorktreeListing(for: resolvedGit(otherRoot))
+        let firstAgain = try await service.sharedGitWorktreeListing(for: resolvedGit(mainRoot))
+
+        let enumerations = await spy.callCount
+        XCTAssertEqual(enumerations, 2)
+        XCTAssertEqual(other.map(\.path), [otherRoot.path])
+        XCTAssertEqual(Set(first.map(\.path)), [mainRoot.path, linkedRoot.path])
+        XCTAssertEqual(firstAgain.map(\.path), first.map(\.path))
+    }
+
+    // MARK: - Helpers
+
+    private func makeService(spy: ListingSpy, clock: ManualClock, timeToLive: TimeInterval) -> VCSService {
+        let backend = GitBackend()
+        return VCSService(
+            jjRunner: JJCommandRunner(),
+            sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration(
+                timeToLive: timeToLive,
+                now: { clock.now },
+                lister: { url in
+                    await spy.recordCall(url)
+                    return try await backend.listWorktrees(at: url)
+                }
+            )
+        )
+    }
+
+    private func resolvedGit(_ root: URL) -> VCSResolvedRepo {
+        VCSResolvedRepo(rootURL: root, backendKind: .git)
+    }
+
+    private func currentPaths(_ descriptors: [GitWorktreeDescriptor]) -> [String] {
+        descriptors.filter(\.isCurrent).map(\.path)
+    }
+}
+
+private final class ManualClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 1000
+
+    var now: TimeInterval {
+        lock.withLock { value }
+    }
+
+    func advance(by seconds: TimeInterval) {
+        lock.withLock { value += seconds }
+    }
+}
+
+private actor Gate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+private actor ListingSpy {
+    private let gate: Gate?
+    private(set) var callCount = 0
+    private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    init(gate: Gate? = nil) {
+        self.gate = gate
+    }
+
+    func recordCall(_: URL) async {
+        callCount += 1
+        let ready = countWaiters.filter { $0.0 <= callCount }
+        countWaiters.removeAll { $0.0 <= callCount }
+        ready.forEach { $0.1.resume() }
+        await gate?.wait()
+    }
+
+    func waitForCallCount(_ count: Int) async {
+        guard callCount < count else { return }
+        await withCheckedContinuation { countWaiters.append((count, $0)) }
+    }
+}
