@@ -379,6 +379,32 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         XCTAssertTrue(result.contains { $0.path == linkedRoot.path })
     }
 
+    func testReusedWorktreePathReResolvesInsteadOfServingTheOldRepository() async throws {
+        let clock = ManualClock()
+        let spy = ListingSpy()
+        let service = makeService(spy: spy, clock: clock, timeToLive: 2.5)
+        let linked = resolvedGit(linkedRoot)
+
+        // The window learns the linked root's repository.
+        _ = try await service.sharedGitWorktreeListing(for: linked)
+        // The checkout is deleted and a different repository is cloned at the same path, without
+        // `git worktree remove`; the old repository keeps listing the (non-prunable) record.
+        try FileManager.default.removeItem(at: linkedRoot)
+        let reusedRoot = try fixture.makeRepository(named: "repo-feature", files: ["README.md": "other\n"])
+        XCTAssertEqual(reusedRoot.path, linkedRoot.path)
+        clock.advance(by: 3.0)
+
+        let listing = try await service.sharedGitWorktreeListing(for: linked)
+        let root = try XCTUnwrap(listing.first { $0.path == linkedRoot.path })
+        XCTAssertTrue(root.isMain)
+        XCTAssertEqual(
+            StandardizedPath.absolute(root.repository.commonGitDir),
+            StandardizedPath.absolute(linkedRoot.appendingPathComponent(".git").path),
+            "The reused path must be reported as its new repository, not the old one"
+        )
+        XCTAssertFalse(listing.contains { $0.path == mainRoot.path })
+    }
+
     func testProjectionChangesOnlyIsCurrent() {
         let original = GitWorktreeDescriptor(
             worktreeID: "wt",

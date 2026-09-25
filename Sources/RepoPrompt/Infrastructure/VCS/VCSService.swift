@@ -188,6 +188,16 @@ public actor VCSService {
         invalidateSharedWorktreeListings()
     }
 
+    /// Drop the cached resolution of one repository root only (no shared-listing invalidation),
+    /// e.g. when its worktree listing shows the root now belongs to a different repository.
+    func dropCachedResolution(forRepoRoot url: URL) {
+        let path = url.standardizedFileURL.path
+        resolvedRepoCache.removeValue(forKey: path)
+        backendKindCache.removeValue(forKey: path)
+        gitLayoutCache.removeValue(forKey: path)
+        sharedWorktreeListing.keyByRootPath.removeValue(forKey: path)
+    }
+
     /// Remove a specific path from the cache.
     /// Also invalidates the resolved root if different from the input path.
     ///

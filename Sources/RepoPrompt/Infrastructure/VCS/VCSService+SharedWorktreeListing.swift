@@ -111,9 +111,17 @@ extension VCSService {
             }
             if sharedWorktreeListing.generation == generation { break }
         }
-        guard Self.listing(descriptors, contains: rootURL) else {
-            // The caller's root is not in its repository's listing (removed, pruned, or reused by
-            // another repository): enumerate from the caller's own root, as before sharing.
+        guard let match = Self.descriptor(matching: rootURL, in: descriptors) else {
+            // The caller's root is not in its repository's listing (removed, pruned, or spelled
+            // differently from Git): bypass sharing for this root until the next invalidation and
+            // enumerate from the caller's own root, as before sharing.
+            sharedWorktreeListing.keyByRootPath[rootURL.standardizedFileURL.path] = .some(nil)
+            return try await lister(rootURL)
+        }
+        guard Self.isInternallyConsistent(match) else {
+            // The listed root now belongs to another repository (e.g. a removed worktree path reused
+            // by a new clone). Re-resolve this root only and enumerate from it, as before sharing.
+            dropCachedResolution(forRepoRoot: rootURL)
             return try await lister(rootURL)
         }
         return Self.projectingCurrentWorktree(descriptors, currentRepoURL: rootURL)
@@ -211,18 +219,30 @@ extension VCSService {
         return { url in try await backend.listWorktrees(at: url) }
     }
 
-    /// Mirrors `gitWorktreeContextFromList`: the root is a listed worktree or lies inside one.
-    nonisolated static func listing(_ descriptors: [GitWorktreeDescriptor], contains rootURL: URL) -> Bool {
+    /// Mirrors `gitWorktreeContextFromList`: the listed worktree equal to, else containing, the root.
+    nonisolated static func descriptor(
+        matching rootURL: URL,
+        in descriptors: [GitWorktreeDescriptor]
+    ) -> GitWorktreeDescriptor? {
         let rootPath = StandardizedPath.absolute(rootURL.path)
-        return descriptors.contains { descriptor in
-            let worktreePath = StandardizedPath.absolute(descriptor.path)
-            return worktreePath == rootPath || StandardizedPath.isDescendant(rootPath, of: worktreePath)
-        }
+        return descriptors.first { StandardizedPath.absolute($0.path) == rootPath }
+            ?? descriptors.first { StandardizedPath.isDescendant(rootPath, of: StandardizedPath.absolute($0.path)) }
     }
 
-    /// A listing belongs to a key only if it reports the key's main root as the main worktree.
+    /// A worktree's resolved Git directory must agree with its repository: the main worktree's Git
+    /// directory is the common directory, and a linked worktree's lives under `<common>/worktrees`.
+    nonisolated static func isInternallyConsistent(_ descriptor: GitWorktreeDescriptor) -> Bool {
+        guard let gitDir = descriptor.gitDir else { return false }
+        let gitDirPath = StandardizedPath.absolute(gitDir)
+        let commonPath = StandardizedPath.absolute(descriptor.repository.commonGitDir)
+        return descriptor.isMain
+            ? gitDirPath == commonPath
+            : StandardizedPath.isDescendant(gitDirPath, of: commonPath + "/worktrees")
+    }
+
+    /// A listing belongs to a key only if it reports the key's main root as a consistent main worktree.
     nonisolated static func listing(_ descriptors: [GitWorktreeDescriptor], belongsTo key: SharedWorktreeListingKey) -> Bool {
-        descriptors.contains { $0.isMain && $0.path == key.mainRoot.path }
+        descriptors.contains { $0.isMain && $0.path == key.mainRoot.path && isInternallyConsistent($0) }
     }
 
     /// Mirrors `GitService.makeWorktreeDescriptors`, where `isCurrent` is `path == currentPath`.
