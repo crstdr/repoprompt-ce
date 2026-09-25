@@ -23,13 +23,14 @@ WRAPPER = REPO_ROOT / "conductor"
 
 FAKE_PYTHON3 = """#!/bin/sh
 printf 'SDKROOT=%s\\n' "${SDKROOT-__UNSET__}"
+for argument in "$@"; do printf 'ARG=%s\\n' "$argument"; done
 """
 
 FAKE_XCRUN = """#!/bin/sh
 printf '%s|DEVELOPER_DIR=%s\\n' "$*" "${DEVELOPER_DIR-}" >> "$FAKE_XCRUN_LOG"
 case "${FAKE_XCRUN_MODE:-ok}" in
-    fail) exit 1 ;;
-    empty) exit 0 ;;
+    fail) echo "xcrun: error: simulated lookup failure" >&2; exit 1 ;;
+    empty) echo "xcrun: warning: simulated empty lookup" >&2; exit 0 ;;
     *) printf '%s\\n' "$FAKE_XCRUN_SDK" ;;
 esac
 """
@@ -63,8 +64,11 @@ class ConductorWrapperSDKRootTests(unittest.TestCase):
         }
         env.update(extra_env)
         result = subprocess.run(
-            [str(WRAPPER), "status"], env=env, capture_output=True, text=True, check=True, timeout=30
+            [str(WRAPPER), "status", "--label", "a b"], env=env, capture_output=True, text=True, timeout=30
         )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = [line.removeprefix("ARG=") for line in result.stdout.splitlines() if line.startswith("ARG=")]
+        self.assertEqual(arguments[1:], ["status", "--label", "a b"], "wrapper must forward its arguments")
         lines = [line for line in result.stdout.splitlines() if line.startswith("SDKROOT=")]
         self.assertEqual(len(lines), 1, result.stdout)
         value = lines[0].removeprefix("SDKROOT=")
@@ -106,8 +110,9 @@ class ConductorWrapperSDKRootTests(unittest.TestCase):
         no_xcrun_bin = self.scratch / "no-xcrun-bin"
         no_xcrun_bin.mkdir()
         write_executable(no_xcrun_bin / "python3", FAKE_PYTHON3)
-        for tool in ("dirname",):
-            os.symlink(shutil.which(tool), no_xcrun_bin / tool)
+        dirname = shutil.which("dirname")
+        self.assertIsNotNone(dirname)
+        os.symlink(dirname, no_xcrun_bin / "dirname")
         sdkroot, stderr = self.run_wrapper({}, path=f"{no_xcrun_bin}:/bin")
         self.assertIsNone(sdkroot)
         self.assertEqual(stderr, "")
