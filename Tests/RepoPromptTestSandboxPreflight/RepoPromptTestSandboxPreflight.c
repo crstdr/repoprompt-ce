@@ -96,7 +96,6 @@ bool rp_test_sandbox_validate(
     const char *sandbox_root,
     const char *home,
     const char *fixed_user_home,
-    const char *tmpdir,
     const char *passwd_home,
     char *reason,
     size_t reason_capacity
@@ -137,7 +136,6 @@ bool rp_test_sandbox_validate(
     } required[] = {
         {"HOME", home},
         {"CFFIXED_USER_HOME", fixed_user_home},
-        {"TMPDIR", tmpdir},
     };
     for (size_t index = 0; index < sizeof required / sizeof required[0]; index++) {
         if (required[index].value == NULL || !rp_test_sandbox_path_is_within(required[index].value, canonical_root)) {
@@ -190,7 +188,6 @@ static void rp_test_sandbox_preflight(void) {
             sandbox_root,
             getenv("HOME"),
             getenv("CFFIXED_USER_HOME"),
-            getenv("TMPDIR"),
             account ? account->pw_dir : NULL,
             reason,
             sizeof reason)) {

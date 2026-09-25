@@ -11,14 +11,16 @@
 /// `Scripts/ci_app_test_runner.py` (`./conductor test`), because an unsandboxed test process
 /// resolves the user's real `~/Library/Application Support/RepoPrompt CE` storage.
 
-/// Returns true when `sandbox_root` (containing the runner's marker file) holds `home`,
-/// `fixed_user_home` and `tmpdir`, and does not contain `passwd_home`. On failure, writes a
-/// human-readable reason into `reason`.
+/// Returns true when `sandbox_root` (containing the runner's marker file) holds `home` and
+/// `fixed_user_home`, and does not contain `passwd_home`. On failure, writes a human-readable
+/// reason into `reason`. On macOS, CoreFoundation/Foundation resolve the home directory (and
+/// therefore Application Support) from `CFFIXED_USER_HOME`. TMPDIR is deliberately not required:
+/// Foundation's temporary directory ignores it on macOS, and helper processes legitimately
+/// override it; it never locates app storage.
 bool rp_test_sandbox_validate(
     const char *sandbox_root,
     const char *home,
     const char *fixed_user_home,
-    const char *tmpdir,
     const char *passwd_home,
     char *reason,
     size_t reason_capacity

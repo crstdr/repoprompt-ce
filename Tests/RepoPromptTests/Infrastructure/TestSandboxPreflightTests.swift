@@ -46,35 +46,34 @@ final class TestSandboxPreflightTests: XCTestCase {
 
     func testAcceptsWellFormedSandbox() throws {
         let root = try makeSandbox(named: "valid")
-        XCTAssertNil(validate(root: root.path, home: root.path + "/home", tmpdir: root.path + "/tmp"))
+        XCTAssertNil(validate(root: root.path, home: root.path + "/home"))
     }
 
     /// Deliberately misconfigured environments: every one must be refused.
     func testRejectsEnvironmentsThatCouldReachRealStorage() throws {
         let root = try makeSandbox(named: "rejections")
         let home = root.path + "/home"
-        let tmp = root.path + "/tmp"
 
-        XCTAssertNotNil(validate(root: nil, home: home, tmpdir: tmp), "missing sandbox root")
-        XCTAssertNotNil(validate(root: "relative/root", home: home, tmpdir: tmp), "relative sandbox root")
-        let realHomeReason = validate(root: root.path, home: passwdHome, tmpdir: tmp)
+        XCTAssertNotNil(validate(root: nil, home: home), "missing sandbox root")
+        XCTAssertNotNil(validate(root: "relative/root", home: home), "relative sandbox root")
+        let realHomeReason = validate(root: root.path, home: passwdHome)
         XCTAssertTrue(realHomeReason?.contains("HOME=") == true, "real HOME: \(realHomeReason ?? "accepted")")
-        XCTAssertNotNil(validate(root: root.path, home: home, fixedHome: passwdHome, tmpdir: tmp), "real CFFIXED_USER_HOME")
-        XCTAssertNotNil(validate(root: root.path, home: home, fixedHome: .some(nil), tmpdir: tmp), "unset CFFIXED_USER_HOME")
-        XCTAssertNotNil(validate(root: root.path, home: home, tmpdir: "/tmp"), "TMPDIR outside sandbox")
-        XCTAssertNotNil(validate(root: root.path, home: root.path + "/../escaped", tmpdir: tmp), "dot-dot escape")
-        XCTAssertNotNil(validate(root: "/", home: home, tmpdir: tmp), "filesystem root as sandbox")
+        XCTAssertNotNil(validate(root: root.path, home: home, fixedHome: passwdHome), "real CFFIXED_USER_HOME")
+        XCTAssertNotNil(validate(root: root.path, home: home, fixedHome: .some(nil)), "unset CFFIXED_USER_HOME")
+        XCTAssertNotNil(validate(root: root.path, home: nil), "unset HOME")
+        XCTAssertNotNil(validate(root: root.path, home: root.path + "/../escaped"), "dot-dot escape")
+        XCTAssertNotNil(validate(root: "/", home: home), "filesystem root as sandbox")
 
         let unmarked = scratch.appendingPathComponent("unmarked", isDirectory: true)
         try FileManager.default.createDirectory(at: unmarked, withIntermediateDirectories: true)
         XCTAssertNotNil(
-            validate(root: unmarked.path, home: unmarked.path + "/home", tmpdir: unmarked.path + "/tmp"),
+            validate(root: unmarked.path, home: unmarked.path + "/home"),
             "missing runner marker"
         )
 
         let containingRealHome = URL(fileURLWithPath: passwdHome).deletingLastPathComponent().path
         XCTAssertNotNil(
-            validate(root: containingRealHome, home: passwdHome, tmpdir: passwdHome),
+            validate(root: containingRealHome, home: passwdHome),
             "sandbox containing the real home"
         )
     }
@@ -107,15 +106,14 @@ final class TestSandboxPreflightTests: XCTestCase {
     private func validate(
         root: String?,
         home: String?,
-        fixedHome: String?? = .none,
-        tmpdir: String?
+        fixedHome: String?? = .none
     ) -> String? {
         let resolvedFixedHome: String? = switch fixedHome {
         case .none: home
         case let .some(value): value
         }
         var reason = [CChar](repeating: 0, count: 1024)
-        let accepted = rp_test_sandbox_validate(root, home, resolvedFixedHome, tmpdir, passwdHome, &reason, reason.count)
+        let accepted = rp_test_sandbox_validate(root, home, resolvedFixedHome, passwdHome, &reason, reason.count)
         return accepted ? nil : String(cString: reason)
     }
 }
