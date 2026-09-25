@@ -4,8 +4,10 @@ import Foundation
 import RepoPromptDomainRuntime
 import XCTest
 
-/// Projection storage rebuilds the status-pill snapshot only when the current tab's exact endpoint
-/// entry changes; every changed transaction still posts its single owner-scoped notification.
+/// Projection storage rebuilds the status-pill snapshot only when the published `monitor` is stale
+/// (differs from its live derivation or belongs to another tab) — e.g. the current tab's exact entry
+/// changed, a rebind left the new incarnation without an entry, or a current-tab update is still
+/// queued — and every changed transaction still posts its single owner-scoped notification.
 @MainActor
 final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
     private var retainedViewModels: [AgentModeViewModel] = []
