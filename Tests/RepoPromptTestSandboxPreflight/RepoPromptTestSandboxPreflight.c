@@ -1,6 +1,7 @@
 #include "RepoPromptTestSandboxPreflight.h"
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <crt_externs.h>
 #include <errno.h>
 #include <limits.h>
 #include <pwd.h>
@@ -195,6 +196,21 @@ bool rp_test_sandbox_should_clear_storage_override(const char *value, const char
     return !has_marked_sandbox_ancestor(canonical_value, passwd_home);
 }
 
+bool rp_test_sandbox_argument_override_is_safe(int argc, const char *const argv[], const char *passwd_home) {
+    for (int index = 0; argv != NULL && index < argc; index++) {
+        if (argv[index] == NULL || strcmp(argv[index], "-GlobalCustomStorageURL") != 0) {
+            continue;
+        }
+        // NSArgumentDomain pairs `-key value`; a missing value is malformed and treated as unsafe.
+        if (index + 1 >= argc || argv[index + 1] == NULL
+            || rp_test_sandbox_should_clear_storage_override(argv[index + 1], passwd_home)) {
+            return false;
+        }
+        index++;
+    }
+    return true;
+}
+
 bool rp_test_sandbox_preflight_passed(void) {
     return gPreflightPassed;
 }
@@ -233,9 +249,16 @@ static bool clear_inherited_workspace_storage_override(const char *passwd_home) 
     if (effective_workspace_storage_override_is_safe(key, passwd_home)) {
         return true;
     }
-    CFPreferencesSetAppValue(key, NULL, kCFPreferencesCurrentApplication);
-    CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-    fprintf(stderr, "RepoPromptTests: cleared a stale or unsafe inherited GlobalCustomStorageURL.\n");
+    // Only the host's own (current-user, any-host) value can be removed here.
+    CFPropertyListRef own_value = CFPreferencesCopyValue(
+        key, kCFPreferencesCurrentApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost
+    );
+    if (own_value != NULL) {
+        CFRelease(own_value);
+        CFPreferencesSetAppValue(key, NULL, kCFPreferencesCurrentApplication);
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+        fprintf(stderr, "RepoPromptTests: removed this test host's stale or unsafe GlobalCustomStorageURL.\n");
+    }
     // The runtime consumes the searched value, which also falls back to other domains.
     return effective_workspace_storage_override_is_safe(key, passwd_home);
 }
@@ -272,9 +295,19 @@ static void rp_test_sandbox_preflight(void) {
     }
     if (!clear_inherited_workspace_storage_override(passwd_home_or_null)) {
         fprintf(stderr,
-                "\nRepoPromptTests refused to start: an unsafe GlobalCustomStorageURL is still visible after\n"
-                "clearing the test host's own preference (it is set in another preferences domain, such as\n"
-                "the global domain). Remove it there before running tests.\n\n");
+                "\nRepoPromptTests refused to start: an unsafe GlobalCustomStorageURL is still effective after\n"
+                "removing this test host's own value. It may be set in another preferences domain, for\n"
+                "example the global one (`defaults read -g GlobalCustomStorageURL`); remove it there.\n\n");
+        fflush(stderr);
+        _exit(78);
+    }
+    // UserDefaults.standard also reads the command-line argument domain (`-GlobalCustomStorageURL
+    // <path>`), which CFPreferences does not search; classify it the same way.
+    if (!rp_test_sandbox_argument_override_is_safe(
+            *_NSGetArgc(), (const char *const *)*_NSGetArgv(), passwd_home_or_null)) {
+        fprintf(stderr,
+                "\nRepoPromptTests refused to start: a -GlobalCustomStorageURL launch argument points outside\n"
+                "every test sandbox (or is malformed).\n\n");
         fflush(stderr);
         _exit(78);
     }

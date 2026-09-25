@@ -157,6 +157,27 @@ final class TestSandboxPreflightTests: XCTestCase {
         XCTAssertTrue(rp_test_sandbox_should_clear_storage_override(link.path, syntheticHome.path))
     }
 
+    /// UserDefaults' argument domain (`-GlobalCustomStorageURL <path>`) is classified like a
+    /// preference: only a path inside an existing marked sandbox is accepted.
+    func testLaunchArgumentOverrideIsClassified() throws {
+        let sandbox = try makeSandbox(named: "argument-sandbox")
+        func isSafe(_ arguments: [String]) -> Bool {
+            var cStrings = arguments.map { strdup($0) }
+            defer { cStrings.forEach { free($0) } }
+            return cStrings.withUnsafeMutableBufferPointer { buffer in
+                buffer.withMemoryRebound(to: UnsafePointer<CChar>?.self) { rebound in
+                    rp_test_sandbox_argument_override_is_safe(Int32(rebound.count), rebound.baseAddress, passwdHome)
+                }
+            }
+        }
+
+        XCTAssertTrue(isSafe(["xctest", "-XCTest", "Suite", "bundle.xctest"]))
+        XCTAssertTrue(isSafe(["xctest", "-GlobalCustomStorageURL", sandbox.appendingPathComponent("Workspaces").path]))
+        XCTAssertFalse(isSafe(["xctest", "-GlobalCustomStorageURL", passwdHome + "/Library/Application Support/RepoPrompt CE/Workspaces"]))
+        XCTAssertFalse(isSafe(["xctest", "-GlobalCustomStorageURL", "relative/Workspaces"]))
+        XCTAssertFalse(isSafe(["xctest", "-GlobalCustomStorageURL"]))
+    }
+
     private func makeSandbox(named name: String) throws -> URL {
         let root = scratch.appendingPathComponent(name, isDirectory: true)
         for child in ["home", "tmp"] {

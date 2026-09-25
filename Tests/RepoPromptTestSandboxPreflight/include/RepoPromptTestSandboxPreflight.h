@@ -39,6 +39,11 @@ bool rp_test_sandbox_path_is_within(const char *path, const char *root);
 /// marker is gone, dangling or unresolvable components, non-paths) is cleared.
 bool rp_test_sandbox_should_clear_storage_override(const char *value, const char *passwd_home);
 
+/// False when `argv` carries a `-GlobalCustomStorageURL <value>` launch argument (read by
+/// UserDefaults' argument domain, which CFPreferences does not search) whose value would be
+/// cleared by `rp_test_sandbox_should_clear_storage_override`, or has no value.
+bool rp_test_sandbox_argument_override_is_safe(int argc, const char *const argv[], const char *passwd_home);
+
 /// True once the bundle-load preflight accepted this process.
 bool rp_test_sandbox_preflight_passed(void);
 
