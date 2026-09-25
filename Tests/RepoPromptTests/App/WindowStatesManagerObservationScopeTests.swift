@@ -25,9 +25,23 @@ final class WindowStatesManagerObservationScopeTests: XCTestCase {
         XCTAssertEqual(observingManagerWrapperLabels(in: commands), [])
     }
 
-    func testRegisteringWindowPublishesManagerChangeOnce() async {
+    func testRegisteringWindowPublishesManagerChangeOnce() async throws {
+        // Registration and unregistration persist the window session to Application Support. Only run
+        // where the coordinated test runner has redirected HOME to a disposable sandbox, so a direct
+        // `swift test` or Xcode run can never overwrite the user's real windowSessions.json.
+        guard let sandboxRoot = ProcessInfo.processInfo.environment["REPOPROMPT_TEST_SANDBOX_ROOT"] else {
+            throw XCTSkip("Requires the isolated test sandbox (run via ./conductor test)")
+        }
+        try XCTSkipUnless(
+            WindowSessionStore.sessionFileURL().resolvingSymlinksInPath().path
+                .hasPrefix(URL(fileURLWithPath: sandboxRoot).resolvingSymlinksInPath().path + "/"),
+            "Window session storage is not redirected into the test sandbox"
+        )
+
         let manager = WindowStatesManager.shared
-        XCTAssertTrue(manager.pendingURLs.isEmpty, "Precondition: no queued deep links to drain")
+        guard manager.pendingURLs.isEmpty else {
+            return XCTFail("Precondition: no queued deep links to drain before registering")
+        }
 
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
