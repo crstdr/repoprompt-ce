@@ -1032,7 +1032,7 @@ struct AgentSessionRow: View {
             // plate fill and the identity glyph so the chevron/arrow/dot
             // remains visually centered while the ring conveys motion.
             if runState == .running {
-                AgentRowActivityArc(tint: runningAccentColor)
+                AgentRowRunningIndicator(tint: runningAccentColor)
                     .allowsHitTesting(false)
             }
 
@@ -1523,6 +1523,22 @@ private struct AgentRowActivityArc: View {
     @State private var rotation: Double = 0
 
     var body: some View {
+        AgentRowActivityArcShape(tint: tint)
+            .rotationEffect(.degrees(rotation))
+            .onAppear {
+                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
+                    rotation = 360
+                }
+            }
+    }
+}
+
+/// The arc's geometry and accessibility, shared by the animated and still presentations so
+/// swapping between them never changes the row's layout or what VoiceOver announces.
+private struct AgentRowActivityArcShape: View {
+    var tint: Color
+
+    var body: some View {
         Circle()
             .trim(from: 0.0, to: 0.7)
             .stroke(
@@ -1530,13 +1546,44 @@ private struct AgentRowActivityArc: View {
                 style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
             )
             .frame(width: 15, height: 15)
-            .rotationEffect(.degrees(rotation))
-            .onAppear {
-                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
-                    rotation = 360
-                }
-            }
-            .accessibilityLabel("Running")
+            .accessibilityLabel(AgentRowRunningIndicator.accessibilityLabelText)
+    }
+}
+
+/// Whether a running row's arc may animate.
+///
+/// A SwiftUI `repeatForever` rotation keeps the app committing Core Animation frames even when
+/// its window is miniaturized, occluded, or on another Space, so the arc animates only while its
+/// window is presented on screen and Reduce Motion is off. Otherwise the row shows the same arc
+/// standing still: running stays visible and labelled, it just stops spinning.
+enum AgentRowActivityIndicatorMode: Equatable {
+    case animated
+    case still
+
+    static func resolve(isWindowPresentationVisible: Bool, reduceMotion: Bool) -> Self {
+        isWindowPresentationVisible && !reduceMotion ? .animated : .still
+    }
+}
+
+/// The running row's status glyph. Switching modes swaps the view, so the animated arc's
+/// `onAppear` starts the rotation again whenever the window becomes visible.
+struct AgentRowRunningIndicator: View {
+    static let accessibilityLabelText = "Running"
+
+    var tint: Color = .accentColor
+    @Environment(\.windowIsPresentationVisible) private var isWindowPresentationVisible
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        switch AgentRowActivityIndicatorMode.resolve(
+            isWindowPresentationVisible: isWindowPresentationVisible,
+            reduceMotion: reduceMotion
+        ) {
+        case .animated:
+            AgentRowActivityArc(tint: tint)
+        case .still:
+            AgentRowActivityArcShape(tint: tint)
+        }
     }
 }
 
