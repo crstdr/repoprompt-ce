@@ -6,8 +6,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # SDK than the selected Xcode's compiler (for example CLT 27 next to Xcode 26.5), that default SDK
 # cannot be used by the compiler. Pin the selected Xcode's (or DEVELOPER_DIR's) macOS SDK first
 # (the same SDK SwiftPM resolves itself when SDKROOT is unset); never override a value the user set.
+# Only pin when a full Xcode is selected: with the Command Line Tools selected, leave SDKROOT
+# alone so a later full-Xcode resolution (release installs) is not handed a pinned CLT SDK.
 if [[ -z "${SDKROOT:-}" ]] && command -v xcrun >/dev/null 2>&1; then
-    if resolved_sdkroot="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)" \
+    selected_developer_dir="${DEVELOPER_DIR:-$(xcode-select --print-path 2>/dev/null || true)}"
+    if [[ -n "$selected_developer_dir" && -x "$selected_developer_dir/usr/bin/xcodebuild" ]] \
+        && resolved_sdkroot="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)" \
         && [[ -n "$resolved_sdkroot" && -d "$resolved_sdkroot" ]]; then
         export SDKROOT="$resolved_sdkroot"
     fi

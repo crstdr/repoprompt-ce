@@ -26,6 +26,10 @@ printf 'SDKROOT=%s\\n' "${SDKROOT-__UNSET__}"
 for argument in "$@"; do printf 'ARG=%s\\n' "$argument"; done
 """
 
+FAKE_XCODE_SELECT = """#!/bin/sh
+printf '%s\\n' "$FAKE_XCODE_SELECT_PATH"
+"""
+
 FAKE_XCRUN = """#!/bin/sh
 printf '%s|DEVELOPER_DIR=%s\\n' "$*" "${DEVELOPER_DIR-}" >> "$FAKE_XCRUN_LOG"
 case "${FAKE_XCRUN_MODE:-ok}" in
@@ -48,7 +52,13 @@ class ConductorWrapperSDKRootTests(unittest.TestCase):
         self.bin.mkdir()
         write_executable(self.bin / "python3", FAKE_PYTHON3)
         write_executable(self.bin / "xcrun", FAKE_XCRUN)
-        self.sdk = self.scratch / "Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk"
+        write_executable(self.bin / "xcode-select", FAKE_XCODE_SELECT)
+        self.xcode_developer_dir = self.scratch / "Xcode.app/Contents/Developer"
+        (self.xcode_developer_dir / "usr/bin").mkdir(parents=True)
+        write_executable(self.xcode_developer_dir / "usr/bin/xcodebuild", "#!/bin/sh\n")
+        self.clt_developer_dir = self.scratch / "CommandLineTools"
+        (self.clt_developer_dir / "usr/bin").mkdir(parents=True)
+        self.sdk = self.xcode_developer_dir / "Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk"
         self.sdk.mkdir(parents=True)
         self.xcrun_log = self.scratch / "xcrun.log"
 
@@ -61,6 +71,7 @@ class ConductorWrapperSDKRootTests(unittest.TestCase):
             "HOME": str(self.scratch),
             "FAKE_XCRUN_LOG": str(self.xcrun_log),
             "FAKE_XCRUN_SDK": str(self.sdk),
+            "FAKE_XCODE_SELECT_PATH": str(self.xcode_developer_dir),
         }
         env.update(extra_env)
         result = subprocess.run(
@@ -95,9 +106,20 @@ class ConductorWrapperSDKRootTests(unittest.TestCase):
         self.assertEqual(self.xcrun_calls(), [], "xcrun must not run when SDKROOT is already set")
 
     def test_developer_dir_drives_the_lookup(self) -> None:
-        developer_dir = str(self.scratch / "Xcode.app/Contents/Developer")
-        self.run_wrapper({"DEVELOPER_DIR": developer_dir})
+        developer_dir = str(self.xcode_developer_dir)
+        sdkroot, _ = self.run_wrapper({"DEVELOPER_DIR": developer_dir, "FAKE_XCODE_SELECT_PATH": str(self.clt_developer_dir)})
+        self.assertEqual(sdkroot, str(self.sdk))
         self.assertEqual(self.xcrun_calls(), [f"--sdk macosx --show-sdk-path|DEVELOPER_DIR={developer_dir}"])
+
+    def test_command_line_tools_selection_leaves_sdkroot_unset(self) -> None:
+        # With only the Command Line Tools selected, a later full-Xcode resolution (for example
+        # install_local_production.sh) must not inherit a pinned CLT SDK: keep the old behaviour.
+        for extra in ({"FAKE_XCODE_SELECT_PATH": str(self.clt_developer_dir)}, {"DEVELOPER_DIR": str(self.clt_developer_dir)}):
+            with self.subTest(extra=extra):
+                sdkroot, stderr = self.run_wrapper(extra)
+                self.assertIsNone(sdkroot)
+                self.assertEqual(stderr, "")
+        self.assertEqual(self.xcrun_calls(), [], "xcrun must not run without a full Xcode selected")
 
     def test_failed_empty_or_missing_lookup_leaves_sdkroot_unset_silently(self) -> None:
         for mode, sdk in (("fail", str(self.sdk)), ("empty", str(self.sdk)), ("ok", str(self.scratch / "missing.sdk"))):
