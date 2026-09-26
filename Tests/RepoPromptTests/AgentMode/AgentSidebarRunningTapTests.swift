@@ -310,6 +310,127 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         }
     }
 
+    func testFlattenedActiveAndArchivedRowIDsAreUnique() throws {
+        let now = Date()
+        let yesterday = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: now))
+        let pinned = Self.session(index: 0, activity: yesterday, isPinned: true)
+        let parent = Self.session(index: 1, activity: now, hasThreadChildren: true)
+        let child = Self.session(
+            index: 2,
+            activity: now.addingTimeInterval(-20),
+            parentSessionID: parent.tabID,
+            depth: 1
+        )
+        let older = Self.session(index: 3, activity: yesterday.addingTimeInterval(-60))
+        let active = AgentSidebarDateSectionBuilder.renderedActiveRows(
+            for: AgentSidebarDateSectionBuilder.activeSections(
+                for: [pinned, parent, child, older],
+                now: now
+            )
+        )
+        let activeIDs = active.map(\.id)
+
+        XCTAssertEqual(Set(activeIDs).count, activeIDs.count)
+        XCTAssertEqual(activeIDs, [pinned.id, parent.id, child.id, older.id])
+        XCTAssertTrue(AgentSidebarDateSectionBuilder.activeSections(for: [], now: now).isEmpty)
+
+        let today = try Self.stashedTab(index: 1, at: now)
+        let previous = try Self.stashedTab(index: 2, at: yesterday)
+        let archived = AgentSidebarDateSectionBuilder.renderedArchivedRows(
+            for: AgentSidebarDateSectionBuilder.archivedSections(
+                for: [today, previous],
+                now: now,
+                dateInfo: { tab in
+                    AgentModeViewModel.SidebarSessionDateInfo(
+                        lastEngagementAt: tab.stashedAt,
+                        activityDate: tab.stashedAt
+                    )
+                }
+            )
+        )
+        let archivedIDs = archived.map(\.id)
+
+        XCTAssertEqual(Set(archivedIDs).count, archivedIDs.count)
+        XCTAssertEqual(archivedIDs, [today.id, previous.id])
+        XCTAssertTrue(
+            AgentSidebarDateSectionBuilder.archivedSections(
+                for: [],
+                now: now,
+                dateInfo: { _ in
+                    AgentModeViewModel.SidebarSessionDateInfo(lastEngagementAt: nil, activityDate: nil)
+                }
+            ).isEmpty
+        )
+    }
+
+    func testSidebarSessionIDSurvivesAThreadMetadataRebuild() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let parentTabID = try XCTUnwrap(UUID(uuidString: "20000000-0000-4000-8000-000000000001"))
+        let childTabID = try XCTUnwrap(UUID(uuidString: "20000000-0000-4000-8000-000000000002"))
+        let pinnedTabID = try XCTUnwrap(UUID(uuidString: "20000000-0000-4000-8000-000000000003"))
+        let parentSessionID = try XCTUnwrap(UUID(uuidString: "20000000-0000-4000-8000-000000000011"))
+        let childSessionID = try XCTUnwrap(UUID(uuidString: "20000000-0000-4000-8000-000000000012"))
+        let pinnedSessionID = try XCTUnwrap(UUID(uuidString: "20000000-0000-4000-8000-000000000013"))
+        let parent = Self.composeTab(id: parentTabID, name: "Parent", sessionID: parentSessionID, modified: now)
+        let child = Self.composeTab(
+            id: childTabID,
+            name: "Child",
+            sessionID: childSessionID,
+            modified: now.addingTimeInterval(-30)
+        )
+        let pinned = Self.composeTab(
+            id: pinnedTabID,
+            name: "Pinned",
+            sessionID: pinnedSessionID,
+            modified: now.addingTimeInterval(-120),
+            isPinned: true
+        )
+        let tabs = [parent, child, pinned]
+
+        let threaded = Self.sidebarRows(
+            tabs: tabs,
+            entries: [
+                Self.indexEntry(id: parentSessionID, tabID: parentTabID, savedAt: now, parentSessionID: nil),
+                Self.indexEntry(
+                    id: childSessionID,
+                    tabID: childTabID,
+                    savedAt: now.addingTimeInterval(-30),
+                    parentSessionID: parentSessionID
+                ),
+                Self.indexEntry(
+                    id: pinnedSessionID,
+                    tabID: pinnedTabID,
+                    savedAt: now.addingTimeInterval(-120),
+                    parentSessionID: nil
+                )
+            ]
+        )
+        let detached = Self.sidebarRows(
+            tabs: tabs,
+            entries: [
+                Self.indexEntry(id: parentSessionID, tabID: parentTabID, savedAt: now, parentSessionID: nil),
+                Self.indexEntry(
+                    id: childSessionID,
+                    tabID: childTabID,
+                    savedAt: now.addingTimeInterval(-30),
+                    parentSessionID: nil
+                ),
+                Self.indexEntry(
+                    id: pinnedSessionID,
+                    tabID: pinnedTabID,
+                    savedAt: now.addingTimeInterval(-120),
+                    parentSessionID: nil
+                )
+            ]
+        )
+
+        XCTAssertEqual(threaded.map(\.id), [pinnedTabID, parentTabID, childTabID])
+        XCTAssertEqual(threaded.map(\.depth), [0, 0, 1])
+        XCTAssertEqual(detached.map(\.id), threaded.map(\.id))
+        XCTAssertEqual(detached.map(\.depth), [0, 0, 0])
+        XCTAssertEqual(Set(threaded.map(\.id)).count, threaded.count)
+    }
+
     private static let rowHeight: CGFloat = 36
 
     private static func measureFrames(
@@ -360,6 +481,77 @@ final class AgentSidebarRunningTapTests: XCTestCase {
             return Self.session(index: index, activity: activity)
         }
         return rows.sorted { $0.activityDate > $1.activityDate }
+    }
+
+    private static func stashedTab(index: Int, at date: Date) throws -> StashedTab {
+        try StashedTab(
+            id: XCTUnwrap(UUID(uuidString: "10000000-0000-4000-8000-00000000002\(index)")),
+            tab: ComposeTabState(),
+            stashedAt: date
+        )
+    }
+
+    private static func composeTab(
+        id: UUID,
+        name: String,
+        sessionID: UUID,
+        modified: Date,
+        isPinned: Bool = false
+    ) -> ComposeTabState {
+        ComposeTabState(
+            id: id,
+            name: name,
+            lastModified: modified,
+            isPinned: isPinned,
+            activeAgentSessionID: sessionID
+        )
+    }
+
+    private static func indexEntry(
+        id: UUID,
+        tabID: UUID,
+        savedAt: Date,
+        parentSessionID: UUID?
+    ) -> AgentSessionIndexEntry {
+        AgentSessionIndexEntry(
+            id: id,
+            tabID: tabID,
+            name: "Indexed",
+            lastUserMessageAt: nil,
+            savedAt: savedAt,
+            lastRunStateRaw: nil,
+            itemCount: 1,
+            agentKindRaw: nil,
+            agentModelRaw: nil,
+            agentReasoningEffortRaw: nil,
+            autoEditEnabled: false,
+            parentSessionID: parentSessionID,
+            hasUnknownConversationContent: false,
+            isMCPOriginated: false,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
+        )
+    }
+
+    private static func sidebarRows(
+        tabs: [ComposeTabState],
+        entries: [AgentSessionIndexEntry]
+    ) -> [AgentModeViewModel.SidebarSession] {
+        AgentModeSidebarSessionBuilder(
+            allTabs: tabs,
+            rowTabs: tabs,
+            sessions: [:],
+            authoritativeSessionIDByTabID: Dictionary(
+                uniqueKeysWithValues: tabs.compactMap { tab in
+                    tab.activeAgentSessionID.map { (tab.id, $0) }
+                }
+            ),
+            sessionIndex: Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),
+            sessionListSortDates: [:],
+            sessionListCacheReady: true,
+            sidebarRestoreFrozenOrderByTabID: [:],
+            mcpControlledTabIDs: []
+        ).build()
     }
 
     private static func session(

@@ -1149,7 +1149,10 @@ enum AgentSidebarDateSectionBucket: CaseIterable, Hashable, Identifiable {
     /// The sidebar list does not use this as a `ForEach` key. Each row is keyed
     /// by its own id. `ordinal` keeps a second run of the same day (a pinned
     /// group separated from later unpinned rows) distinct from the first.
+    /// An ordinal of 256 or more aliases the last byte. The paged sidebar stays
+    /// far below that.
     func sectionID(ordinal: Int) -> UUID {
+        assert(ordinal < 256, "A day with 256 runs would alias section ids")
         let bucketByte: UInt8 = switch self {
         case .today:
             1
@@ -1268,6 +1271,9 @@ enum AgentSidebarDateSectionBuilder {
                 ]
             )
         #endif
+        assert(sections.allSatisfy { section in
+            !section.groups.isEmpty && section.groups.allSatisfy { !$0.rows.isEmpty }
+        })
         return sections
     }
 
@@ -1354,6 +1360,7 @@ enum AgentSidebarDateSectionBuilder {
                 ]
             )
         #endif
+        assert(sections.allSatisfy { !$0.rows.isEmpty })
         return sections
     }
 
@@ -1362,6 +1369,11 @@ enum AgentSidebarDateSectionBuilder {
     /// running session sorts to the top, an earlier run of the same day
     /// disappears, or a root becomes a child when parent metadata arrives.
     /// Any of those destroyed the view under the pointer and cancelled the tap.
+    ///
+    /// A section is built only when it has a row, so an empty day does not emit
+    /// a header. A press is still lost if that row leaves the list, or moves far
+    /// enough that mouse-up misses it. Gaining a day header mid-press can shift
+    /// the row the same way. The next click hits.
     static func renderedActiveRows(
         for sections: [AgentSidebarActiveDateSection]
     ) -> [AgentSidebarRenderedActiveRow] {
@@ -1385,6 +1397,7 @@ enum AgentSidebarDateSectionBuilder {
                 }
             }
         }
+        assertUniqueIDs(rendered.map(\.id))
         return rendered
     }
 
@@ -1407,7 +1420,12 @@ enum AgentSidebarDateSectionBuilder {
                 }
             }
         }
+        assertUniqueIDs(rendered.map(\.id))
         return rendered
+    }
+
+    private static func assertUniqueIDs(_ ids: [UUID]) {
+        assert(Set(ids).count == ids.count, "Sidebar list row ids must be unique")
     }
 }
 
