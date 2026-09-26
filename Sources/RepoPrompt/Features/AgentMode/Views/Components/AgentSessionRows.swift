@@ -1,6 +1,107 @@
 import AppKit
+import OSLog
 import RepoPromptDomainRuntime
 import SwiftUI
+
+// MARK: - Sidebar tap diagnostics
+
+@MainActor
+enum AgentSidebarTapModifierReader {
+    /// Flags from `NSApp.currentEvent` when the tap handler runs.
+    ///
+    /// This is not captured from the mouse-down that started the click. A later
+    /// flags-changed or key event can be current, and a command or shift bit on
+    /// that event reinterprets the click. A nil current event is a plain click.
+    static func currentFlags() -> NSEvent.ModifierFlags {
+        NSApp.currentEvent?.modifierFlags ?? []
+    }
+
+    static func gesture(for flags: NSEvent.ModifierFlags) -> AgentSidebarSelectionGesture {
+        var modifiers: AgentSidebarSelectionModifiers = []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        return AgentSidebarSelectionGesture(modifiers: modifiers)
+    }
+}
+
+@MainActor
+enum AgentSidebarTapDiagnostics {
+    static let logger = Logger(subsystem: "com.repoprompt.agents", category: "sidebar-tap")
+
+    #if DEBUG
+        static var recordForTests = false
+        static var testLines: [String] = []
+    #endif
+
+    static func log(
+        disposition: AgentSidebarSelectionGestureDisposition,
+        reason: String,
+        modifierFlags: NSEvent.ModifierFlags,
+        selectionCount: Int,
+        workspaceMatched: Bool,
+        rowID: UUID?
+    ) {
+        let outcome = switch disposition {
+        case .activate:
+            "activate"
+        case .selectionChanged:
+            "selectionChanged"
+        case .ignored:
+            "ignored"
+        }
+        let line = [
+            "outcome=\(outcome)",
+            "reason=\(reason)",
+            "flags=\(modifierFlags.rawValue)",
+            "selection=\(selectionCount)",
+            "workspaceMatched=\(workspaceMatched)",
+            "row=\(rowID?.uuidString ?? "none")"
+        ].joined(separator: " ")
+        logger.log("\(line, privacy: .public)")
+        #if DEBUG
+            if recordForTests {
+                testLines.append(line)
+            }
+        #endif
+    }
+}
+
+@MainActor
+enum AgentSidebarRowTap {
+    static func handle(
+        isInteractionEnabled: Bool,
+        tapRowID: UUID?,
+        tapSelectionCount: Int,
+        tapWorkspaceMatched: Bool,
+        onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureResult,
+        onActivate: () -> Void
+    ) {
+        let flags = AgentSidebarTapModifierReader.currentFlags()
+        guard isInteractionEnabled else {
+            AgentSidebarTapDiagnostics.log(
+                disposition: .ignored,
+                reason: "interaction-disabled",
+                modifierFlags: flags,
+                selectionCount: tapSelectionCount,
+                workspaceMatched: tapWorkspaceMatched,
+                rowID: tapRowID
+            )
+            return
+        }
+        let result = onSelectionGesture(AgentSidebarTapModifierReader.gesture(for: flags))
+        AgentSidebarTapDiagnostics.log(
+            disposition: result.disposition,
+            reason: result.reason,
+            modifierFlags: flags,
+            selectionCount: result.selectionCount,
+            workspaceMatched: result.workspaceMatched,
+            rowID: result.rowID
+        )
+        if result.disposition == .activate {
+            onActivate()
+        }
+    }
+}
 
 // MARK: - Agent Session Row
 
@@ -37,8 +138,11 @@ struct AgentSessionRow: View {
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
+    var tapRowID: UUID?
+    var tapSelectionCount = 0
+    var tapWorkspaceMatched = false
     var commandProgressKind: AgentSidebarBulkActionKind?
-    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
+    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureResult
     let onSelect: () -> Void
     let onTogglePin: () -> Void
     var onStash: (() -> Void)?
@@ -532,19 +636,15 @@ struct AgentSessionRow: View {
         showDeleteConfirmation = true
     }
 
-    private var currentSelectionGesture: AgentSidebarSelectionGesture {
-        var modifiers: AgentSidebarSelectionModifiers = []
-        let flags = NSApp.currentEvent?.modifierFlags ?? []
-        if flags.contains(.command) { modifiers.insert(.command) }
-        if flags.contains(.shift) { modifiers.insert(.shift) }
-        return AgentSidebarSelectionGesture(modifiers: modifiers)
-    }
-
     private func handleRowTap() {
-        guard isInteractionEnabled else { return }
-        if onSelectionGesture(currentSelectionGesture) == .activate {
-            onSelect()
-        }
+        AgentSidebarRowTap.handle(
+            isInteractionEnabled: isInteractionEnabled,
+            tapRowID: tapRowID,
+            tapSelectionCount: tapSelectionCount,
+            tapWorkspaceMatched: tapWorkspaceMatched,
+            onSelectionGesture: onSelectionGesture,
+            onActivate: onSelect
+        )
     }
 
     private func toggleSelection() {
@@ -1293,8 +1393,11 @@ struct AgentStashedSessionRow: View {
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
+    var tapRowID: UUID?
+    var tapSelectionCount = 0
+    var tapWorkspaceMatched = false
     var commandProgressKind: AgentSidebarBulkActionKind?
-    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
+    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureResult
     let onRestore: () -> Void
     let onDelete: () -> Void
     let sessionIDCopyAction: AgentSidebarSessionIDCopyAction
@@ -1370,19 +1473,15 @@ struct AgentStashedSessionRow: View {
         "Delete stashed tab"
     }
 
-    private var currentSelectionGesture: AgentSidebarSelectionGesture {
-        var modifiers: AgentSidebarSelectionModifiers = []
-        let flags = NSApp.currentEvent?.modifierFlags ?? []
-        if flags.contains(.command) { modifiers.insert(.command) }
-        if flags.contains(.shift) { modifiers.insert(.shift) }
-        return AgentSidebarSelectionGesture(modifiers: modifiers)
-    }
-
     private func handleRowTap() {
-        guard isInteractionEnabled else { return }
-        if onSelectionGesture(currentSelectionGesture) == .activate {
-            onRestore()
-        }
+        AgentSidebarRowTap.handle(
+            isInteractionEnabled: isInteractionEnabled,
+            tapRowID: tapRowID,
+            tapSelectionCount: tapSelectionCount,
+            tapWorkspaceMatched: tapWorkspaceMatched,
+            onSelectionGesture: onSelectionGesture,
+            onActivate: onRestore
+        )
     }
 
     private func toggleSelection() {
