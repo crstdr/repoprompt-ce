@@ -32,6 +32,10 @@ printf '%s\\n' "$FAKE_XCODE_SELECT_PATH"
 
 FAKE_XCRUN = """#!/bin/sh
 printf '%s|DEVELOPER_DIR=%s\\n' "$*" "${DEVELOPER_DIR-}" >> "$FAKE_XCRUN_LOG"
+if [ "$*" = "--sdk macosx --show-sdk-version" ]; then
+    printf '%s\\n' "${FAKE_XCRUN_SDK_VERSION:-26.5}"
+    exit 0
+fi
 case "${FAKE_XCRUN_MODE:-ok}" in
     fail) echo "xcrun: error: simulated lookup failure" >&2; exit 1 ;;
     empty) echo "xcrun: warning: simulated empty lookup" >&2; exit 0 ;;
@@ -86,7 +90,9 @@ class ConductorWrapperSDKRootTests(unittest.TestCase):
         return (None if value == "__UNSET__" else value), result.stderr
 
     def xcrun_calls(self) -> list[str]:
-        return self.xcrun_log.read_text().splitlines() if self.xcrun_log.exists() else []
+        """SDK-path lookups made by the wrapper (the resolver's version probes are excluded)."""
+        calls = self.xcrun_log.read_text().splitlines() if self.xcrun_log.exists() else []
+        return [call for call in calls if call.split("|")[0] == "--sdk macosx --show-sdk-path"]
 
     def test_unset_sdkroot_is_pinned_to_the_selected_xcode_sdk(self) -> None:
         sdkroot, stderr = self.run_wrapper({})
@@ -120,6 +126,15 @@ class ConductorWrapperSDKRootTests(unittest.TestCase):
                 self.assertIsNone(sdkroot)
                 self.assertEqual(stderr, "")
         self.assertEqual(self.xcrun_calls(), [], "xcrun must not run without a full Xcode selected")
+
+    def test_xcode_the_installer_would_reject_is_not_pinned(self) -> None:
+        # resolve_full_xcode_developer_dir.sh rejects a selected Xcode whose macOS SDK is older than
+        # its minimum and falls back to another Xcode; pinning the selected Xcode's SDK would then
+        # hand install_local_production.sh a mismatched SDKROOT.
+        sdkroot, stderr = self.run_wrapper({"FAKE_XCRUN_SDK_VERSION": "15.4"})
+        self.assertIsNone(sdkroot)
+        self.assertEqual(stderr, "")
+        self.assertEqual(self.xcrun_calls(), [], "no SDK pin when the installer would choose another Xcode")
 
     def test_failed_empty_or_missing_lookup_leaves_sdkroot_unset_silently(self) -> None:
         for mode, sdk in (("fail", str(self.sdk)), ("empty", str(self.sdk)), ("ok", str(self.scratch / "missing.sdk"))):
