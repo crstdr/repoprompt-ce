@@ -344,6 +344,24 @@ pipeline with every decoration (handoff, oversight supplement, instruction packa
 skipped and no interrupt of an in-flight turn. No caller text ever reaches the provider. Every other
 runtime returns `not_supported` rather than a message asking the model to compact itself.
 
+ACP is advertisement-driven and live-unverified. `ACPAgentSessionController` records each
+`available_commands_update` for the session that sent it, before load-replay suppression and
+normalization (which drop it), and forgets it when a session starts opening, the process exits or
+fails, a prompt fails, or the controller shuts down. A Devin, Grok Build, or Antigravity target is
+supported only while its live controller advertises `compact` for the target's own provider
+session; otherwise, including after a relaunch before the next turn, it is `not_supported`. OpenCode
+advertises the user's own commands and skills, so an advertised `compact` there may not be native
+compaction; it and Cursor are never supported. The command reuses the live controller only (never a
+fresh or replacement one) and skips model/mode configuration. `promptAdvertisedCommand` checks that
+the session is open and idle, is the admitted one, and still advertises the command, in the same
+synchronous actor step as the write, then sends exactly one `/compact` text block without the
+provider's prompt builder. A refusal before the write fails the run but keeps the controller: nothing
+about that session changed. At dispatch the context count vouch is dropped, and for the rest of that
+turn only an occupancy report (`usage_update`) may vouch for a count again, never the turn's billed
+prompt count. That assumes an in-turn `usage_update` describes the context after compaction; a
+provider that reports occupancy before compacting and not after would leave the old count vouched
+until its next report. Only live traffic can settle this.
+
 A failed last run is not a readiness blocker, so a target that died on context length is admissible;
 any interaction or `awaiting_user` is `target_not_idle`. `accepted` means requested: completion is
 observed through `poll`/`wait`, where the `context` count reads unknown after the compaction signal

@@ -37,6 +37,34 @@ struct AgentProviderControlCommand: Equatable {
     var providerText: String {
         "/\(kind.rawValue)"
     }
+
+    /// ACP runtimes whose advertised slash commands are the agent's own commands.
+    ///
+    /// OpenCode advertises the user's own commands and skills, so an advertised `compact` there may
+    /// be a user command rather than native compaction; Cursor has no verified native command. Both
+    /// stay unsupported whatever they advertise.
+    static func acpRuntimeAdvertisesNativeCommands(_ agent: AgentProviderKind) -> Bool {
+        switch agent {
+        case .devin, .grokBuild, .antigravity:
+            true
+        case .openCode, .cursor, .codexExec, .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            false
+        }
+    }
+
+    /// Whether `session`'s live ACP controller currently advertises `kind` in the provider session
+    /// `providerConversation`. Live-unverified: no provider-recorded advertisement has been observed.
+    @MainActor
+    static func acpSession(
+        _ session: AgentTabSession,
+        advertises kind: Kind,
+        inProviderConversation providerConversation: String
+    ) -> Bool {
+        guard acpRuntimeAdvertisesNativeCommands(session.selectedAgent),
+              let controller = session.acpController
+        else { return false }
+        return controller.advertisesCommand(kind.rawValue, inProviderSession: providerConversation)
+    }
 }
 
 // MARK: - Direct-start options

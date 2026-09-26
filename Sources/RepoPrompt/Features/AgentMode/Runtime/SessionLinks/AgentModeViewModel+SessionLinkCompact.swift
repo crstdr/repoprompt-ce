@@ -17,6 +17,9 @@ enum AgentSessionLinkCompactSupport: Equatable {
     case codex
     /// Claude Code: the bare native `/compact` command in the existing provider conversation.
     case claudeCode
+    /// An ACP session whose live controller currently advertises `compact` in the existing provider
+    /// session: the bare `/compact` as the whole `session/prompt`. Live-unverified.
+    case acpAdvertisedCommand
     /// No verified native compaction path for this runtime. Never downgraded to a message.
     case notSupported
     /// The runtime supports compaction but this target has no provider conversation yet.
@@ -27,8 +30,11 @@ extension AgentModeViewModel {
     /// Pure support decision for one target, taken before anything is recorded.
     ///
     /// Claude-compatible variants share the Claude CLI but their backends are not verified to honor
-    /// the native command, and ACP/headless runtimes have no undecorated command path, so they are
-    /// `notSupported` rather than guessed at.
+    /// the native command, so they are `notSupported` rather than guessed at. An ACP session is
+    /// supported only while its live controller advertises `compact` for the target's own provider
+    /// session; without a live advertisement (including after a relaunch, before the next turn) it is
+    /// `notSupported`. OpenCode and Cursor are never supported (see
+    /// `AgentProviderControlCommand.acpRuntimeAdvertisesNativeCommands`).
     func agentSessionLinkCompactSupport(for session: TabSession) -> AgentSessionLinkCompactSupport {
         switch session.selectedAgent {
         case .codexExec:
@@ -39,8 +45,19 @@ extension AgentModeViewModel {
         case .claudeCode:
             let conversation = session.providerSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
             return conversation?.isEmpty == false ? .claudeCode : .noProviderSession
-        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible,
-             .openCode, .cursor, .grokBuild, .antigravity, .devin:
+        case .devin, .grokBuild, .antigravity:
+            guard let conversation = session.providerSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !conversation.isEmpty
+            else {
+                return .noProviderSession
+            }
+            // The exact stored conversation, not the trimmed one: it is what the controller compares.
+            return AgentProviderControlCommand.acpSession(
+                session,
+                advertises: .compact,
+                inProviderConversation: session.providerSessionID ?? ""
+            ) ? .acpAdvertisedCommand : .notSupported
+        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
             return .notSupported
         }
     }
@@ -93,7 +110,7 @@ extension AgentModeViewModel {
             return .blocked(.notSupported)
         case .noProviderSession:
             return .blocked(.noProviderSession)
-        case .codex, .claudeCode:
+        case .codex, .claudeCode, .acpAdvertisedCommand:
             break
         }
 
@@ -227,8 +244,9 @@ extension AgentModeViewModel {
         }
 
         // 8. The native command. Codex compacts its thread through the app-server control plane and
-        //    never sends a message; Claude Code receives exactly `/compact` through its ordinary run
-        //    pipeline, so status, events, and the compaction boundary flow as for any turn.
+        //    never sends a message; Claude Code and an advertising ACP session receive exactly
+        //    `/compact` through their ordinary run pipelines, so status, events, and (for Claude) the
+        //    compaction boundary flow as for any turn.
         let didStart: Bool
         switch support {
         case .codex:
@@ -261,7 +279,7 @@ extension AgentModeViewModel {
                 releaseComposerSubmitClaim(claim)
                 return .delivered(persistedOnly)
             }
-        case .claudeCode:
+        case .claudeCode, .acpAdvertisedCommand:
             guard let conversation = liveSession.providerSessionID,
                   let binding = liveSession.persistentSessionBindingIdentity
             else {

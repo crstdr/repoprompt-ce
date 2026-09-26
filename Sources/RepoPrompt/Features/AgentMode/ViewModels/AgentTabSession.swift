@@ -822,6 +822,7 @@ final class AgentTabSession: ObservableObject {
     /// persisted, so restored figures are never reported as current load.
     private(set) var vouchedContextCount: ContextUsageVouch? {
         didSet {
+            contextCountVouchRevision &+= 1
             if vouchedContextCount == nil { vouchedContextCountConfidence = nil }
             noteContextVouchTransition(from: oldValue, to: vouchedContextCount)
         }
@@ -889,6 +890,56 @@ final class AgentTabSession: ObservableObject {
     }
 
     var acpOccupancyReportThisTurn: ContextOccupancyEpoch?
+
+    /// Bumped by every write to `vouchedContextCount`, including a withdrawal that leaves it `nil`, so
+    /// a restore can prove no report touched the count since it was withdrawn.
+    private var contextCountVouchRevision: UInt64 = 0
+
+    /// A count vouch withdrawn at a compaction dispatch, with the revision the withdrawal produced.
+    struct WithdrawnContextCountVouch {
+        let vouch: ContextUsageVouch?
+        fileprivate let confidence: ContextUsageSnapshotConfidence?
+        fileprivate let revision: UInt64
+    }
+
+    /// True while an overseer-requested compaction turn runs on a runtime without a verified
+    /// compaction signal (ACP). Its billed prompt count describes the pre-compaction context, so
+    /// only an occupancy report may vouch for a count until the turn ends.
+    private(set) var contextCountVouchAwaitsOccupancyReport = false
+
+    /// Dispatching a compaction invalidates the count (the window is unchanged) and holds off
+    /// billed-count vouching for the rest of that turn. Returns the withdrawn vouch so a dispatch
+    /// that is refused before anything is sent can put it back.
+    @discardableResult
+    func beginCompactionContextCountSuspension() -> WithdrawnContextCountVouch {
+        let withdrawn = vouchedContextCount
+        let withdrawnConfidence = vouchedContextCountConfidence
+        vouchedContextCount = nil
+        contextCountVouchAwaitsOccupancyReport = true
+        return WithdrawnContextCountVouch(
+            vouch: withdrawn,
+            confidence: withdrawnConfidence,
+            revision: contextCountVouchRevision
+        )
+    }
+
+    func endCompactionContextCountSuspension() {
+        contextCountVouchAwaitsOccupancyReport = false
+    }
+
+    /// Restores a vouch withdrawn by a compaction that never reached the provider, but only if no
+    /// usage report has vouched for or withdrawn the count since, and it still describes the stored
+    /// count for the same provider.
+    func restoreContextCountVouchAfterUnsentCompaction(_ withdrawn: WithdrawnContextCountVouch) {
+        guard let vouch = withdrawn.vouch,
+              contextCountVouchRevision == withdrawn.revision,
+              vouchedContextCount == nil,
+              vouch.agent == selectedAgent,
+              contextUsageSnapshot?.used == vouch.tokens
+        else { return }
+        vouchedContextCount = vouch
+        vouchedContextCountConfidence = withdrawn.confidence
+    }
 
     /// Records which figures a live usage report from the selected provider vouches for. The report's
     /// context count (or, only when it carried none, its prompt count) vouches for the stored count

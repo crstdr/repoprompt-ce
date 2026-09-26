@@ -100,12 +100,22 @@ final class AgentModeRunService {
         )
     }
 
-    /// Runtimes whose run pipeline sends a `AgentProviderControlCommand` as its exact native text.
+    /// Whether this session's run pipeline sends `command` as its exact native text.
     ///
-    /// Claude Code only: the Claude-compatible variants share the CLI but their backends are not
-    /// verified to honor the native command, and ACP/headless runtimes have no undecorated path yet.
-    static func dispatchesProviderControlCommands(_ agent: AgentProviderKind) -> Bool {
-        agent == .claudeCode
+    /// Claude Code always does. An ACP session does only while its live controller advertises the
+    /// command in the admitted provider session (see `AgentProviderControlCommand.acpSession`). The
+    /// Claude-compatible variants share the CLI but their backends are not verified to honor the
+    /// native command, and headless runtimes have no undecorated path.
+    static func dispatchesProviderControlCommand(
+        _ command: AgentProviderControlCommand,
+        for session: AgentTabSession
+    ) -> Bool {
+        if session.selectedAgent == .claudeCode { return true }
+        return AgentProviderControlCommand.acpSession(
+            session,
+            advertises: command.kind,
+            inProviderConversation: command.expectedProviderConversation
+        )
     }
 
     @discardableResult
@@ -124,7 +134,9 @@ final class AgentModeRunService {
         let selectedAgent = session.selectedAgent
         // A control command is only ever routed to a runtime that dispatches it natively and
         // undecorated. Any other runtime would send it as ordinary prose, so it never starts at all.
-        if providerControlCommand != nil, !Self.dispatchesProviderControlCommands(selectedAgent) {
+        if let providerControlCommand,
+           !Self.dispatchesProviderControlCommand(providerControlCommand, for: session)
+        {
             let message = "\(selectedAgent.displayName) does not support this provider command."
             startOutcome?.recordStartFailure(message: message)
             return nil
@@ -208,6 +220,7 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 runRequest: acpRunRequest,
+                providerControlCommand: providerControlCommand,
                 makeLease: makeLease
             )
             recordNonCodexStartOutcome(startOutcome, session: session)

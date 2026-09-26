@@ -222,10 +222,12 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertFalse(options.isLaneUpdate)
         XCTAssertEqual(command.providerText, "/compact", "Fixed text: the conversation binding never reaches the provider")
         for agent in AgentProviderKind.allCases {
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = agent
             XCTAssertEqual(
-                AgentModeRunService.dispatchesProviderControlCommands(agent),
+                AgentModeRunService.dispatchesProviderControlCommand(command, for: session),
                 agent == .claudeCode,
-                "\(agent)"
+                "\(agent) without a live advertising ACP session"
             )
         }
     }
