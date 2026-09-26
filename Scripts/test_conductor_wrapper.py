@@ -32,8 +32,14 @@ printf '%s\\n' "$FAKE_XCODE_SELECT_PATH"
 
 FAKE_XCRUN = """#!/bin/sh
 printf '%s|DEVELOPER_DIR=%s\\n' "$*" "${DEVELOPER_DIR-}" >> "$FAKE_XCRUN_LOG"
+# The resolver's version probe is answered before FAKE_XCRUN_MODE so that mode only affects the
+# wrapper's SDK-path lookup. FAKE_XCRUN_OLD_SDK_DIR reports an old SDK for one developer dir only.
 if [ "$*" = "--sdk macosx --show-sdk-version" ]; then
-    printf '%s\\n' "${FAKE_XCRUN_SDK_VERSION:-26.5}"
+    if [ -n "${FAKE_XCRUN_OLD_SDK_DIR:-}" ] && [ "${DEVELOPER_DIR-}" = "$FAKE_XCRUN_OLD_SDK_DIR" ]; then
+        printf '15.4\\n'
+    else
+        printf '%s\\n' "${FAKE_XCRUN_SDK_VERSION:-26.5}"
+    fi
     exit 0
 fi
 case "${FAKE_XCRUN_MODE:-ok}" in
@@ -120,9 +126,11 @@ class ConductorWrapperSDKRootTests(unittest.TestCase):
     def test_command_line_tools_selection_leaves_sdkroot_unset(self) -> None:
         # With only the Command Line Tools selected, a later full-Xcode resolution (for example
         # install_local_production.sh) must not inherit a pinned CLT SDK: keep the old behaviour.
+        # SDK version "0" makes every candidate (including any real /Applications Xcode) unusable, so
+        # the resolver fails deterministically on every host and the wrapper's `|| true` is exercised.
         for extra in ({"FAKE_XCODE_SELECT_PATH": str(self.clt_developer_dir)}, {"DEVELOPER_DIR": str(self.clt_developer_dir)}):
             with self.subTest(extra=extra):
-                sdkroot, stderr = self.run_wrapper(extra)
+                sdkroot, stderr = self.run_wrapper({**extra, "FAKE_XCRUN_SDK_VERSION": "0"})
                 self.assertIsNone(sdkroot)
                 self.assertEqual(stderr, "")
         self.assertEqual(self.xcrun_calls(), [], "xcrun must not run without a full Xcode selected")
@@ -131,7 +139,27 @@ class ConductorWrapperSDKRootTests(unittest.TestCase):
         # resolve_full_xcode_developer_dir.sh rejects a selected Xcode whose macOS SDK is older than
         # its minimum and falls back to another Xcode; pinning the selected Xcode's SDK would then
         # hand install_local_production.sh a mismatched SDKROOT.
-        sdkroot, stderr = self.run_wrapper({"FAKE_XCRUN_SDK_VERSION": "15.4"})
+        # Selected Xcode A reports an old SDK; a usable Xcode B exists in ~/Applications (HOME is the
+        # scratch dir), so the resolver successfully falls back to a different Xcode.
+        xcode_b = self.scratch / "Applications/Xcode-B.app/Contents/Developer"
+        (xcode_b / "usr/bin").mkdir(parents=True)
+        (xcode_b / "Platforms/MacOSX.platform").mkdir(parents=True)
+        write_executable(xcode_b / "usr/bin/xcodebuild", "#!/bin/sh\n")
+        resolver = subprocess.run(
+            [str(REPO_ROOT / "Scripts/resolve_full_xcode_developer_dir.sh")],
+            env={
+                "PATH": f"{self.bin}:/usr/bin:/bin",
+                "HOME": str(self.scratch),
+                "FAKE_XCRUN_LOG": str(self.xcrun_log),
+                "FAKE_XCODE_SELECT_PATH": str(self.xcode_developer_dir),
+                "FAKE_XCRUN_OLD_SDK_DIR": str(self.xcode_developer_dir),
+            },
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(resolver.returncode, 0, resolver.stderr)
+        self.assertNotEqual(resolver.stdout.strip(), str(self.xcode_developer_dir), "resolver must fall back")
+
+        sdkroot, stderr = self.run_wrapper({"FAKE_XCRUN_OLD_SDK_DIR": str(self.xcode_developer_dir)})
         self.assertIsNone(sdkroot)
         self.assertEqual(stderr, "")
         self.assertEqual(self.xcrun_calls(), [], "no SDK pin when the installer would choose another Xcode")
