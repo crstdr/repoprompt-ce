@@ -64,6 +64,34 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         window.orderOut(nil)
     }
 
+    func testTapActivatesThePressedRowWhenThatRowMovesDuringThePress() {
+        let now = Date()
+        let harness = SidebarRunningTapHarness(now: now)
+        harness.rows = Self.sessions(now: now)
+        let pressedIndex = 3
+        let pressedID = harness.rows[pressedIndex].tabID
+
+        let (window, host) = Self.makeWindow(harness)
+        window.setFrameOrigin(NSPoint(x: 80, y: 80))
+        window.makeKeyAndOrderFront(nil)
+        _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
+
+        let point = Self.point(in: host, rowIndex: pressedIndex)
+        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
+
+        harness.rows = Self.sessions(now: now, promotedTabID: pressedID)
+        let moved = Self.render(until: Date().addingTimeInterval(0.4)) {
+            harness.renderedFirstRowID == pressedID
+        }
+        XCTAssertTrue(moved, "The press must overlap the pressed row moving to the top")
+
+        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
+        _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
+
+        XCTAssertEqual(harness.activated, [pressedID])
+        window.orderOut(nil)
+    }
+
     func testTapSurvivesWhenAnEarlierRunOfTheSameDayJoinsToday() throws {
         let now = Date()
         let yesterday = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: now))

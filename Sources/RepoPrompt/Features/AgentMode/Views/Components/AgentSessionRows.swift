@@ -35,7 +35,7 @@ enum AgentSidebarTapDiagnostics {
 
     static func log(
         disposition: AgentSidebarSelectionGestureDisposition,
-        reason: String,
+        reason: String?,
         modifierFlags: NSEvent.ModifierFlags,
         selectionCount: Int,
         workspaceMatched: Bool,
@@ -49,14 +49,17 @@ enum AgentSidebarTapDiagnostics {
         case .ignored:
             "ignored"
         }
-        let line = [
-            "outcome=\(outcome)",
-            "reason=\(reason)",
+        var fields = ["outcome=\(outcome)"]
+        if let reason, reason != outcome {
+            fields.append("reason=\(reason)")
+        }
+        fields.append(contentsOf: [
             "flags=\(modifierFlags.rawValue)",
             "selection=\(selectionCount)",
             "workspaceMatched=\(workspaceMatched)",
             "row=\(rowID?.uuidString ?? "none")"
-        ].joined(separator: " ")
+        ])
+        let line = fields.joined(separator: " ")
         logger.log("\(line, privacy: .public)")
         #if DEBUG
             if recordForTests {

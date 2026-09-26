@@ -25,7 +25,7 @@ final class AgentSidebarTapDiagnosticsTests: XCTestCase {
                 seenGesture = gesture
                 return AgentSidebarSelectionGestureResult(
                     disposition: .activate,
-                    reason: "activate",
+                    reason: nil,
                     selectionCount: 0,
                     workspaceMatched: true,
                     rowID: rowID
@@ -40,7 +40,7 @@ final class AgentSidebarTapDiagnosticsTests: XCTestCase {
         XCTAssertEqual(
             AgentSidebarTapDiagnostics.testLines,
             [
-                "outcome=activate reason=activate flags=\(flags.rawValue) selection=0 workspaceMatched=true row=\(rowID.uuidString)"
+                "outcome=activate flags=\(flags.rawValue) selection=0 workspaceMatched=true row=\(rowID.uuidString)"
             ]
         )
     }

@@ -1144,12 +1144,11 @@ enum AgentSidebarDateSectionBucket: CaseIterable, Hashable, Identifiable {
         return .previous
     }
 
-    /// Stable `ForEach` identity for one contiguous run of this bucket.
+    /// Model identity for one contiguous run of this bucket.
     ///
-    /// The section id used to be the first row's id. A running session sorting to
-    /// the top changed that id, SwiftUI destroyed the section, and an in-flight
-    /// tap never reached mouse-up. `ordinal` keeps a second run of the same day
-    /// (a pinned group separated from later unpinned rows) distinct.
+    /// The sidebar list does not use this as a `ForEach` key. Each row is keyed
+    /// by its own id. `ordinal` keeps a second run of the same day (a pinned
+    /// group separated from later unpinned rows) distinct from the first.
     func sectionID(ordinal: Int) -> UUID {
         let bucketByte: UInt8 = switch self {
         case .today:
@@ -1190,6 +1189,12 @@ struct AgentSidebarArchivedDateRow: Identifiable {
     }
 }
 
+/// One visible active row.
+///
+/// `id` is `SidebarSession.id`. The builder sets that to `ComposeTabState.id`
+/// and copies it when a snapshot rebuilds depth or thread metadata. It has to
+/// stay the same across those rebuilds, re-parenting, and metadata refreshes.
+/// A new id destroys the SwiftUI row and cancels an in-flight tap.
 struct AgentSidebarRenderedActiveRow: Identifiable {
     let session: AgentModeViewModel.SidebarSession
     let showsHeader: Bool
@@ -1201,6 +1206,11 @@ struct AgentSidebarRenderedActiveRow: Identifiable {
     }
 }
 
+/// One visible archived row.
+///
+/// `id` is `StashedTab.id`, assigned once when the tab is stashed and kept on
+/// the persisted stash record. A new id destroys the SwiftUI row and cancels
+/// an in-flight tap.
 struct AgentSidebarRenderedArchivedRow: Identifiable {
     let row: AgentSidebarArchivedDateRow
     let showsHeader: Bool

@@ -42,7 +42,8 @@ enum AgentSidebarSelectionGestureDisposition: Equatable {
 
 struct AgentSidebarSelectionGestureResult: Equatable {
     var disposition: AgentSidebarSelectionGestureDisposition
-    var reason: String
+    /// Early-exit cause. Nil when `disposition` already names the outcome.
+    var reason: String?
     var selectionCount: Int
     var workspaceMatched: Bool
     var rowID: UUID
@@ -50,7 +51,7 @@ struct AgentSidebarSelectionGestureResult: Equatable {
     /// Stub for tests that construct a row and never inspect the gesture result.
     static let ignored = Self(
         disposition: .ignored,
-        reason: "ignored",
+        reason: nil,
         selectionCount: 0,
         workspaceMatched: false,
         rowID: UUID()
@@ -199,6 +200,8 @@ struct AgentSidebarSelectionState: Equatable {
         return operation
     }
 
+    /// The same in-flight and rendered-order guards run first in
+    /// `handleSidebarSelectionGesture` so a tap log can name the reason. Keep them in sync.
     mutating func handle(
         _ gesture: AgentSidebarSelectionGesture,
         identity: AgentSidebarSelectionIdentity,

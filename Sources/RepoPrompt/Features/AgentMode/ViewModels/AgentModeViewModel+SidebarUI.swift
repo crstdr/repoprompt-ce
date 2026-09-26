@@ -127,9 +127,9 @@ extension AgentModeViewModel {
         identity: AgentSidebarSelectionIdentity,
         renderedOrder: [AgentSidebarSelectionIdentity],
         workspaceID: UUID?,
-        rowID: UUID? = nil
+        rowID: UUID
     ) -> AgentSidebarSelectionGestureResult {
-        let row = rowID ?? identity.tabID
+        // Mirrors guards in `AgentSidebarSelectionState.handle` for diagnostics; keep in sync.
         let selectionCount = ui.sessionSidebar.selectionState.selectedIdentities.count
         let match = AgentSidebarTapWorkspaceGate.evaluate(
             sidebarWorkspaceID: workspaceID,
@@ -141,7 +141,7 @@ extension AgentModeViewModel {
                 reason: match.ignoredReason,
                 selectionCount: selectionCount,
                 workspaceMatched: false,
-                rowID: row
+                rowID: rowID
             )
         }
         let state = ui.sessionSidebar.selectionState
@@ -151,7 +151,7 @@ extension AgentModeViewModel {
                 reason: "mutation-in-flight",
                 selectionCount: selectionCount,
                 workspaceMatched: true,
-                rowID: row
+                rowID: rowID
             )
         }
         guard renderedOrder.contains(identity) else {
@@ -160,7 +160,7 @@ extension AgentModeViewModel {
                 reason: "identity-not-rendered",
                 selectionCount: selectionCount,
                 workspaceMatched: true,
-                rowID: row
+                rowID: rowID
             )
         }
         let disposition = ui.sessionSidebar.handleSelectionGesture(
@@ -169,20 +169,12 @@ extension AgentModeViewModel {
             renderedOrder: renderedOrder,
             workspaceID: workspaceID
         )
-        let reason = switch disposition {
-        case .activate:
-            "activate"
-        case .selectionChanged:
-            "selection-changed"
-        case .ignored:
-            "ignored"
-        }
         return AgentSidebarSelectionGestureResult(
             disposition: disposition,
-            reason: reason,
+            reason: nil,
             selectionCount: ui.sessionSidebar.selectionState.selectedIdentities.count,
             workspaceMatched: true,
-            rowID: row
+            rowID: rowID
         )
     }
 
