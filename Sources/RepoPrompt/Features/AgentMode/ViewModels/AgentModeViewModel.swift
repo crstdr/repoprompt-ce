@@ -2740,6 +2740,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     lazy var codexContextUsageEstimator = CodexContextUsageEstimator()
 
+    lazy var acpContextUsageEstimator = ACPContextUsageEstimator()
+
     func slashSkillSuggestions(for query: String) async -> [MentionSuggestion] {
         let slashSession: TabSession? = {
             if let activeSession {
