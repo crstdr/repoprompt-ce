@@ -228,7 +228,6 @@ actor ACPAgentSessionController {
     private let provider: any ACPAgentProvider
     private let runRequest: ACPRunRequest
     private let launchConfiguration: ACPLaunchConfiguration
-    private let launchedPermissionMode: String?
     private let sessionConfiguration: ACPSessionConfiguration
     private let mcpClientNameHint: String?
     private let logPrefix: String
@@ -265,6 +264,8 @@ actor ACPAgentSessionController {
     private var inboundMessageSequence: UInt64 = 0
     private var pendingRequests: [String: PendingRequest] = [:]
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
+    private var recentDevinToolCalls: [String: [String: Any]] = [:]
+    private var recentDevinToolCallIDs: [String] = []
     private var activePromptTurnID: UUID?
     private var activePromptOpenCodeStderrError: String?
     #if DEBUG
@@ -291,6 +292,7 @@ actor ACPAgentSessionController {
     private var sessionModelSnapshotHasLiveAuthority = false
     private var sessionModelFailureReason: String?
     private var sessionModeSnapshot: SessionModeSnapshot?
+    private var openedSessionModeID: String?
     private var sessionModeFailureReason: String?
     private var lastAppliedConfigurationSequence: UInt64 = 0
     private var bufferedConfigOptionUpdates: [BufferedConfigOptionUpdate] = []
@@ -361,10 +363,6 @@ actor ACPAgentSessionController {
         try Self.preflightInjectedMCPServers(in: sessionConfiguration)
         self.sessionConfiguration = sessionConfiguration
         launchConfiguration = try provider.makeLaunchConfiguration(for: runRequest)
-        launchedPermissionMode = Self.normalizedLaunchPermissionMode(
-            runRequest.launchPermissionMode,
-            providerID: provider.providerID
-        )
         autoApproveAllToolPermissions = runRequest.autoApproveAllToolPermissions
         mcpClientNameHint = runRequest.agentKind.mcpClientNameHint
         logPrefix = "[ACP][\(provider.providerID.rawValue)]"
@@ -397,22 +395,6 @@ actor ACPAgentSessionController {
         else {
             return false
         }
-        // A provider-native launch-time permission flag (Devin `--permission-mode`) is baked
-        // into the running process's argv; compare its normalized launched value so later
-        // request-carrier changes cannot drift the reuse key from the process.
-        if provider.providerID == .devin {
-            guard DevinAgentToolPreferences.PermissionLevel.isRecognizedCLIPermissionMode(
-                request.launchPermissionMode
-            ) else {
-                return false
-            }
-        }
-        guard launchedPermissionMode == Self.normalizedLaunchPermissionMode(
-            request.launchPermissionMode,
-            providerID: provider.providerID
-        ) else {
-            return false
-        }
         if provider.providerID == .grokBuild {
             // Grok full access is a launch flag and "default" sends no model RPC, so a live
             // process can never move between permission profiles or back to the provider
@@ -430,14 +412,6 @@ actor ACPAgentSessionController {
         // workspace are the safety boundary; model aliases/defaults/discovered
         // current-model values should not prevent session/cancel from being sent.
         return true
-    }
-
-    private static func normalizedLaunchPermissionMode(
-        _ mode: String?,
-        providerID: ACPProviderID
-    ) -> String? {
-        guard providerID == .devin else { return mode }
-        return DevinAgentToolPreferences.PermissionLevel.from(cliPermissionMode: mode).cliPermissionMode
     }
 
     func normalizeError(_ error: Error) -> Error {
@@ -466,7 +440,7 @@ actor ACPAgentSessionController {
             throw ControllerError.invalidState(expected: "idle", actual: state)
         }
         state = .launching
-        log("Launching ACP transport (launchPermissionMode=\(launchedPermissionMode ?? "none"), autoApproveAll=\(autoApproveAllToolPermissions))")
+        log("Launching ACP transport")
         diagnose(.phaseStarted("launch"))
         let environment = await resolvedEnvironment()
         try Self.preflightInjectedMCPServers(in: sessionConfiguration, environment: environment)
@@ -627,6 +601,8 @@ actor ACPAgentSessionController {
             throw ControllerError.invalidState(expected: "no active prompt turn", actual: state)
         }
         suppressSessionLoadReplayUpdates = false
+        recentDevinToolCalls.removeAll()
+        recentDevinToolCallIDs.removeAll()
         let promptTurnID = UUID()
         activePromptTurnID = promptTurnID
         resetActivePromptTrace()
@@ -1047,11 +1023,23 @@ actor ACPAgentSessionController {
         )
     }
 
-    func setSessionMode(_ modeID: String) async throws {
-        try await configurationMutationMutex.withLock { [weak self] in
-            guard let self else { throw CancellationError() }
-            try await setSessionModeSerialized(modeID)
+    func setSessionMode(_ modeID: String, reportFailure: Bool = false) async throws {
+        do {
+            try await configurationMutationMutex.withLock { [weak self] in
+                guard let self else { throw CancellationError() }
+                try await setSessionModeSerialized(modeID)
+            }
+        } catch {
+            if reportFailure, !(error is CancellationError) {
+                emit(.stream(AIStreamResult(type: "error", text: displayText(for: provider.normalizeError(error)))))
+            }
+            throw error
         }
+    }
+
+    func restoreOpenedSessionMode(reportFailure: Bool = false) async throws {
+        guard let openedSessionModeID else { return }
+        try await setSessionMode(openedSessionModeID, reportFailure: reportFailure)
     }
 
     func applySessionModelParameterSelections(
@@ -1214,20 +1202,9 @@ actor ACPAgentSessionController {
                 for: pending.options,
                 sessionScoped: decision != .accept
             ) {
-                [
-                    "outcome": [
-                        "outcome": "selected",
-                        "optionId": optionID
-                    ]
-                ]
+                ["outcome": ["outcome": "selected", "optionId": optionID]]
             } else {
-                // The agent offered no selectable allow option (e.g. only a denylisted
-                // mode switch): cancel rather than submit a wrong-direction or empty ID.
-                [
-                    "outcome": [
-                        "outcome": "cancelled"
-                    ]
-                ]
+                ["outcome": ["outcome": "cancelled"]]
             }
         case .decline:
             if let optionID = preferredRejectOptionID(for: pending.options) {
@@ -1443,6 +1420,8 @@ actor ACPAgentSessionController {
         #endif
         guard state != .closed, state != .closing else { return }
         state = .closing
+        recentDevinToolCalls.removeAll()
+        recentDevinToolCallIDs.removeAll()
         log("Shutting down ACP controller")
 
         await cancelPrompt()
@@ -1477,6 +1456,7 @@ actor ACPAgentSessionController {
         sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
+        openedSessionModeID = nil
         sessionModeFailureReason = nil
         lastAppliedConfigurationSequence = 0
         bufferedConfigOptionUpdates.removeAll()
@@ -1715,6 +1695,35 @@ actor ACPAgentSessionController {
             return
         }
 
+        if provider.providerID == .devin, let toolCallID = update["toolCallId"] as? String {
+            switch update["sessionUpdate"] as? String {
+            case "tool_call":
+                if recentDevinToolCalls[toolCallID] == nil {
+                    recentDevinToolCallIDs.append(toolCallID)
+                }
+                recentDevinToolCalls[toolCallID] = update
+                if recentDevinToolCallIDs.count > 64 {
+                    recentDevinToolCalls.removeValue(forKey: recentDevinToolCallIDs.removeFirst())
+                }
+            case "tool_call_update":
+                if let status = update["status"] as? String,
+                   ["completed", "failed", "cancelled"].contains(status)
+                {
+                    recentDevinToolCalls.removeValue(forKey: toolCallID)
+                    recentDevinToolCallIDs.removeAll { $0 == toolCallID }
+                } else if update["title"] != nil || update["kind"] != nil
+                    || update["rawInput"] != nil || update["_meta"] != nil
+                {
+                    // Replace authorization context rather than merging stale tool identity.
+                    if recentDevinToolCalls[toolCallID] != nil {
+                        recentDevinToolCalls[toolCallID] = update
+                    }
+                }
+            default:
+                break
+            }
+        }
+
         let normalizedEvents = provider.normalizeSessionUpdate(update, sessionID: sessionID)
         #if DEBUG
             captureNormalizedACPEvents(normalizedEvents, sessionID: sessionID, sourceUpdate: update)
@@ -1755,9 +1764,28 @@ actor ACPAgentSessionController {
         }
 
         let toolCallID = (toolCall["toolCallId"] as? String) ?? UUID().uuidString
-        let toolTitle = (toolCall["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let toolKind = (toolCall["kind"] as? String)?.lowercased()
-        let rawInputJSON = serializeJSON(toolCall["rawInput"])
+        let cachedToolCall = recentDevinToolCalls[toolCallID] ?? [:]
+        var resolvedToolCall = cachedToolCall
+        resolvedToolCall.merge(toolCall) { _, requestValue in requestValue }
+        // The cached tool call is the authorization context auto-approval matches on
+        // (`_meta` RepoPrompt identity, `rawInput` server identifier). Trust it only
+        // when the request does not contradict it: a same-ID request that supplies its
+        // own identity fields must not inherit ANY of the earlier call's authorization
+        // evidence unless every supplied field is corroborated by the cache, so the
+        // whole cached entry is discarded on divergence or partial corroboration.
+        let identityKeys = ["title", "kind", "rawInput", "_meta"]
+        let requestSuppliesIdentity = identityKeys.contains { toolCall[$0] != nil }
+        let identityDiverges = identityKeys.contains { key in
+            guard let requestValue = toolCall[key] else { return false }
+            guard let cachedValue = cachedToolCall[key] else { return true }
+            return serializeJSON(requestValue) != serializeJSON(cachedValue)
+        }
+        if requestSuppliesIdentity, identityDiverges {
+            resolvedToolCall = toolCall
+        }
+        let toolTitle = (resolvedToolCall["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let toolKind = (resolvedToolCall["kind"] as? String)?.lowercased()
+        let rawInputJSON = serializeJSON(resolvedToolCall["rawInput"])
         let optionDictionaries = params["options"] as? [[String: Any]] ?? []
         let options = optionDictionaries.compactMap { optionDictionary -> PermissionOption? in
             guard
@@ -1771,11 +1799,11 @@ actor ACPAgentSessionController {
             )
         }
 
-        let rawInput = toolCall["rawInput"] as? [String: Any]
+        let rawInput = resolvedToolCall["rawInput"] as? [String: Any]
         let autoApprovalPayload = repoPromptPermissionAutoApprovalPayload(
             toolTitle: toolTitle,
             toolKind: toolKind,
-            toolCall: toolCall,
+            toolCall: resolvedToolCall,
             rawInput: rawInput,
             options: optionDictionaries
         )
@@ -1798,7 +1826,9 @@ actor ACPAgentSessionController {
         )
 
         if let autoApproval = autoApprovalSelection(
-            requestToolName: toolTitle,
+            requestToolName: provider.providerID == .devin
+                ? ((resolvedToolCall["_meta"] as? [String: Any])?["cognition.ai/toolName"] as? String ?? toolTitle)
+                : toolTitle,
             requestPayload: autoApprovalPayload,
             options: options
         ) {
@@ -2155,11 +2185,11 @@ actor ACPAgentSessionController {
 
     /// Refuse to prompt on a resumed session whose requested permission level cannot be applied.
     ///
-    /// The guard fires when the request carries no session mode at all. Interactively that means
-    /// Normal or Provider Default -- Accept Edits and Smart map to the advertised `accept-edits`
-    /// and `smart`, so they are applied and are unaffected. In unattended runs every level below
-    /// Full Approval sends nothing, which is not the same as holding a floor: nothing is sent,
-    /// so nothing is enforced.
+    /// The guard fires when the request carries no session mode at all. That means Provider
+    /// Default -- Normal, Accept Edits, and Smart map to the advertised `accept-edits`/`smart`
+    /// modes and Full Approval to `bypass`, so they are applied and are unaffected. Devin
+    /// advertises no value meaning `normal`/`auto`, so Provider Default has nothing to send;
+    /// inventing one would change the level the user selected.
     ///
     /// Sending nothing is not a downgrade. A session opened with `session/load` keeps the mode it
     /// already had, which can be a `bypass` this app set on an earlier run, so prompting anyway
@@ -2255,7 +2285,6 @@ actor ACPAgentSessionController {
             taskLabelKind: request.taskLabelKind,
             sessionModeID: request.sessionModeID,
             autoApproveAllToolPermissions: request.autoApproveAllToolPermissions,
-            launchPermissionMode: request.launchPermissionMode,
             modelParameterSelections: request.modelParameterSelections
         )
     }
@@ -2547,17 +2576,20 @@ actor ACPAgentSessionController {
         case let .valid(snapshot):
             sessionModeFailureReason = nil
             sessionModeSnapshot = snapshot
+            openedSessionModeID = snapshot.currentValue
             if response["modes"] != nil {
                 diagnose(.info("ACP session also advertised legacy modes; ignoring them because configOptions is the only supported mode authority."))
             }
         case .absent:
             sessionModeSnapshot = nil
+            openedSessionModeID = nil
             sessionModeFailureReason = nil
             if response["modes"] != nil {
                 diagnose(.info("Ignoring legacy ACP modes metadata because mode selection requires a modern configOptions selector."))
             }
         case let .malformed(reason):
             sessionModeSnapshot = nil
+            openedSessionModeID = nil
             sessionModeFailureReason = reason
             diagnose(.info("ACP session advertised a malformed modern mode config option: \(reason)"))
         }
@@ -3490,55 +3522,32 @@ actor ACPAgentSessionController {
     /// `switch_*`/`plan_*` would collapse to submitting its `reject_once` (or an empty ID)
     /// for an accept decision — answering the opposite of what was decided.
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String? {
+        let filteredOptions = safePermissionOptionsForAutoSelection(options)
+        // Devin is exact-ID only: broadening options (mode switches, persistent/global or
+        // server-wide grants) are unreachable here, which is why the denylist needs no
+        // `switch_*`/`plan_*`/`_always` pattern rules. Routing Devin through the
+        // kind-preference fallback below would silently loosen this — don't.
+        if provider.providerID == .devin {
+            if sessionScoped, let option = filteredOptions.first(where: { $0.optionID == "allow_session" }) {
+                return option.optionID
+            }
+            return filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
+        }
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
         case .openCode, .cursor, .antigravity:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
-        case .devin:
-            devinAllowOptionPreferences(sessionScoped: sessionScoped)
         case .grokBuild:
             grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
+        case .devin:
+            []
         }
-        let filteredOptions = safePermissionOptionsForAutoSelection(options)
-        if let matched = optionID(for: filteredOptions, preferences: preferences) {
-            return matched
+        if let preferred = optionID(for: filteredOptions, preferences: preferences) {
+            return preferred
         }
-        return filteredOptions.first(where: {
-            guard normalizedPermissionOptionValue($0.kind)?.hasPrefix("allow") == true else {
-                return false
-            }
-            // A session-scoped decision must not silently widen into a persistent grant
-            // when no session/once option was offered.
-            return !(sessionScoped && ACPPermissionOptionPolicy.exceedsSessionScope(
-                optionID: $0.optionID,
-                for: provider.providerID
-            ))
-        })?.optionID
-    }
-
-    /// Devin's allow options are tiered (`allow_once` < `allow_session` < `allow_always` <
-    /// `allow_always_global`). `acceptForSession` therefore prefers the per-tool session
-    /// grant and otherwise falls back to the per-request grant — never `allow_always`,
-    /// which persists beyond the session the decision was scoped to. The mode-switching
-    /// options are unreachable — they are denylisted in `ACPPermissionOptionPolicy`
-    /// because re-flagging a running process would drift the launch-mode reuse key in
-    /// `isCompatibleWith`.
-    private func devinAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
-        if sessionScoped {
-            return [
-                .optionID("allow_session"),
-                .optionID("allow_once"),
-                .optionID("allow-once"),
-                .optionID("once"),
-                .kind("allow_once")
-            ]
-        }
-        return [
-            .optionID("allow_once"),
-            .optionID("allow-once"),
-            .optionID("once"),
-            .kind("allow_once"),
-            .optionID("allow_session")
-        ]
+        return optionID(
+            for: filteredOptions,
+            preferences: sessionScoped ? [.kind("allow_always"), .kind("allow_once")] : [.kind("allow_once")]
+        )
     }
 
     private func grokBuildAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
@@ -3584,10 +3593,8 @@ actor ACPAgentSessionController {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
         case .openCode, .grokBuild, .antigravity, .devin:
-            // Grok full access is provider-native (`grok agent --always-approve stdio`) and
-            // Devin's is a launch-time `--permission-mode`; neither gets a blank-check
-            // full-access selection. Devin still receives per-request RepoPrompt MCP
-            // auto-approval through `autoApprovalSelection`.
+            // Grok full access is provider-native; Devin uses an ACP session mode.
+            // Neither broadly auto-selects native permission options here.
             return nil
         }
     }
@@ -3641,16 +3648,7 @@ actor ACPAgentSessionController {
                 .kind("allow_once")
             ]
         case .devin:
-            // Strict RepoPrompt MCP auto-approval is per-request: only Devin's
-            // allow-once options are eligible. `allow_session`/`allow_always`/`switch_*`
-            // broaden beyond the pending call (the mode switches would also drift the
-            // launch-mode reuse key), so they stay user-decided.
-            [
-                .optionID("allow_once"),
-                .optionID("allow-once"),
-                .optionID("once"),
-                .kind("allow_once")
-            ]
+            [.optionID("allow_once")]
         case .grokBuild:
             // Strict RepoPrompt MCP auto-approval is per-request: never select Grok's
             // session-scoped `allow-edits-session` here.
@@ -3662,8 +3660,14 @@ actor ACPAgentSessionController {
             ]
         }
 
-        guard let optionID = optionID(for: safePermissionOptionsForAutoSelection(options), preferences: preferences) else { return nil }
-        return AutoApprovalSelection(optionID: optionID, match: match)
+        let filteredOptions = safePermissionOptionsForAutoSelection(options)
+        let selectedOptionID: String? = if provider.providerID == .devin {
+            filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
+        } else {
+            optionID(for: filteredOptions, preferences: preferences)
+        }
+        guard let selectedOptionID else { return nil }
+        return AutoApprovalSelection(optionID: selectedOptionID, match: match)
     }
 
     /// Options that must never be picked by an automatic or fallback selection path.
@@ -3806,6 +3810,8 @@ actor ACPAgentSessionController {
     private func emitTerminal(state: AgentSessionRunState, errorText: String?) {
         guard !didEmitTerminal else { return }
         didEmitTerminal = true
+        recentDevinToolCalls.removeAll()
+        recentDevinToolCallIDs.removeAll()
         emit(.terminal(state: state, errorText: errorText))
     }
 

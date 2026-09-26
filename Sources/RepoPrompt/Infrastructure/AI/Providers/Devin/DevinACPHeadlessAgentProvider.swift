@@ -44,17 +44,17 @@ final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
             beforePrompt: { controller, request in
                 // The bridge has no session-mode step of its own, so apply it here.
                 //
-                // Model first, mode last -- the same order the interactive runner uses. The
-                // model mutation validates with `requiredModeValue: nil`, so it does not
-                // re-check the mode; setting the mode last means no later configuration call
-                // can accept a response that carries a different one. This ordering is what
-                // the boundary suite pins.
+                // Model and parameter selections first, mode last -- the same order the
+                // interactive runner uses. Setting the mode last means no later
+                // configuration call can accept a response that carries a different one.
                 if let model = request.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !model.isEmpty,
                    model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
                 {
-                    try await controller.setSessionModel(model)
+                    try await controller.setSessionModel(model, forceRPC: !request.modelParameterSelections.isEmpty)
                 }
+                let report = try await controller.applySessionModelParameterSelections(request.modelParameterSelections)
+                try report.validateNoSkippedSelections()
                 guard let mode = request.sessionModeID?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !mode.isEmpty
                 else { return }
@@ -65,16 +65,12 @@ final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
     }
 
     /// Headless runs are unattended: the bridge declines any permission request the
-    /// controller does not auto-approve, so a mid-run prompt fails the whole run. The level
-    /// comes from `unattendedCLIPermissionMode`/`unattendedSessionModeID` — an explicitly
-    /// configured Full Approval escalates to `bypass`, and every other level sends no mode
-    /// at all. Sending nothing is NOT a floor: on a fresh session it leaves Devin's own
-    /// default, and on a resumed session it leaves whatever mode that session already had,
-    /// which can be a `bypass` set by an earlier run. Both carriers are sent only when the
-    /// RepoPrompt MCP server is injected; model discovery keeps the provider default.
-    ///
-    /// The launch flag alone is not enough: `devin acp` does not consume `--permission-mode`,
-    /// so the mode is also applied over ACP before the prompt.
+    /// controller does not auto-approve, so a mid-run prompt fails the whole run. The
+    /// configured level is applied as the ACP session mode (`sessionModeID`), sent only
+    /// when the RepoPrompt MCP server is injected; model discovery keeps the provider
+    /// default. A level that maps to no mode sends nothing: on a fresh session that
+    /// leaves Devin's own default, and on a resumed session the controller's
+    /// resume-permission guard refuses the prompt rather than run at an inherited mode.
     static func makeRunRequest(
         config: DevinAgentConfig,
         workspacePath: String?,
@@ -90,11 +86,9 @@ final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
             attachments: [],
             taskLabelKind: nil,
             sessionModeID: config.includeRepoPromptMCPServer
-                ? configuredPermissionLevel.unattendedSessionModeID
+                ? configuredPermissionLevel.sessionModeID
                 : nil,
-            launchPermissionMode: config.includeRepoPromptMCPServer
-                ? configuredPermissionLevel.unattendedCLIPermissionMode
-                : nil
+            modelParameterSelections: config.modelParameterSelections
         )
     }
 

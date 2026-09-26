@@ -27,16 +27,27 @@ final class DevinHeadlessSessionModeBoundaryTests: XCTestCase {
         XCTAssertEqual(modeSets.first?["value"] as? String, "bypass")
     }
 
-    func testLevelsBelowFullApprovalSendNoModeAtAll() async throws {
-        for level: DevinAgentToolPreferences.PermissionLevel in [.normal, .acceptEdits, .smart, .providerDefault] {
-            let h = try makeHarness()
+    func testEachLevelSendsItsMappedSessionMode() async throws {
+        for (level, expectedMode): (DevinAgentToolPreferences.PermissionLevel, String?) in [
+            (.normal, "accept-edits"), (.acceptEdits, "accept-edits"), (.smart, "smart"), (.providerDefault, nil)
+        ] {
+            // Start below the mapped mode so the application is observable: a session
+            // already at the target correctly sends no set call.
+            let h = try makeHarness(startingMode: "ask")
             try await drain(h.makeProvider(level: level))
             let modeSets = h.recordedParams("session/set_config_option")
                 .filter { $0["configId"] as? String == "mode" }
-            XCTAssertTrue(
-                modeSets.isEmpty,
-                "\(level) must not set a session mode on an unattended run; sent \(modeSets)"
-            )
+            if let expectedMode {
+                XCTAssertEqual(
+                    modeSets.first?["value"] as? String, expectedMode,
+                    "\(level) must apply its mapped mode; sent \(modeSets)"
+                )
+            } else {
+                XCTAssertTrue(
+                    modeSets.isEmpty,
+                    "providerDefault must not set a session mode; sent \(modeSets)"
+                )
+            }
             XCTAssertTrue(h.recordedMethodOrder().contains("session/prompt"))
         }
     }
@@ -125,25 +136,44 @@ final class DevinHeadlessSessionModeBoundaryTests: XCTestCase {
         )
     }
 
-    /// The decisive case: a session that was escalated to `bypass` is then resumed by a request
-    /// at a lower level, which maps to nil and so sends no mode. Prompting would silently run at
-    /// the inherited `bypass`, so the request must be refused before `session/prompt`.
-    func testLowerLevelResumeOfAnEscalatedSessionRefusesToPrompt() async throws {
+    /// A session escalated to `bypass` that is resumed by a request at a lower level must not
+    /// run at the inherited mode: the mapped level is applied explicitly (`accept-edits`),
+    /// which downgrades the stale `bypass` before `session/prompt`.
+    func testLowerLevelResumeOfAnEscalatedSessionAppliesTheChosenMode() async throws {
         let h = try makeHarness(startingMode: "bypass")
         let provider = h.makeProvider(level: .normal)
+        let stream = try await provider.streamAgentMessage(
+            AgentMessage(userMessage: "hi", resumeSessionID: "devin-headless-session")
+        )
+        for try await _ in stream {}
+        await provider.dispose()
+        let modeSets = h.recordedParams("session/set_config_option")
+            .filter { $0["configId"] as? String == "mode" }
+        XCTAssertEqual(
+            modeSets.first?["value"] as? String, "accept-edits",
+            "A resumed lower-level run must downgrade the inherited mode explicitly; got \(modeSets)"
+        )
+        XCTAssertTrue(h.recordedMethodOrder().contains("session/prompt"))
+    }
+
+    /// A providerDefault resume maps to no mode, so nothing can be applied — the resume
+    /// permission guard refuses the prompt rather than run at the inherited `bypass`.
+    func testProviderDefaultResumeOfAnEscalatedSessionRefusesToPrompt() async throws {
+        let h = try makeHarness(startingMode: "bypass")
+        let provider = h.makeProvider(level: .providerDefault)
         do {
             let stream = try await provider.streamAgentMessage(
                 AgentMessage(userMessage: "hi", resumeSessionID: "devin-headless-session")
             )
             for try await _ in stream {}
-            XCTFail("expected the resumed lower-level request to be refused")
+            XCTFail("expected the resumed providerDefault request to be refused")
         } catch {
             // expected
         }
         await provider.dispose()
         XCTAssertFalse(
             h.recordedMethodOrder().contains("session/prompt"),
-            "A resumed session whose policy cannot be established must not be prompted."
+            "A resumed session whose level cannot be established must not be prompted."
         )
     }
 
@@ -159,10 +189,13 @@ final class DevinHeadlessSessionModeBoundaryTests: XCTestCase {
         XCTAssertTrue(h.recordedMethodOrder().contains("session/prompt"))
     }
 
-    /// A FRESH run at a lower level is unaffected -- there is no inherited mode to disagree with.
-    func testFreshLowerLevelRunIsUnaffectedByTheResumeGuard() async throws {
-        let h = try makeHarness()
+    /// A FRESH run at a lower level prompts normally and applies its mapped mode.
+    func testFreshLowerLevelRunAppliesItsMappedMode() async throws {
+        let h = try makeHarness(startingMode: "ask")
         try await drain(h.makeProvider(level: .normal))
+        let modeSets = h.recordedParams("session/set_config_option")
+            .filter { $0["configId"] as? String == "mode" }
+        XCTAssertEqual(modeSets.first?["value"] as? String, "accept-edits")
         XCTAssertTrue(
             h.recordedMethodOrder().contains("session/prompt"),
             "Fresh-session behaviour must be unchanged."
@@ -186,7 +219,13 @@ final class DevinHeadlessSessionModeBoundaryTests: XCTestCase {
         XCTAssertTrue(order.contains("session/new"), "expected the fresh-session fallback; got \(order)")
         XCTAssertTrue(
             order.contains("session/prompt"),
-            "A session that fell back to `session/new` is fresh and must not be refused."
+            "A session that fell back to `session/new` is fresh and must prompt."
+        )
+        let modeSets = h.recordedParams("session/set_config_option")
+            .filter { $0["configId"] as? String == "mode" }
+        XCTAssertEqual(
+            modeSets.first?["value"] as? String, "accept-edits",
+            "The mapped level still applies to the fallback session; got \(modeSets)"
         )
     }
 
