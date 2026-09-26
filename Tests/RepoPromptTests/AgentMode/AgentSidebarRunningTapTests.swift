@@ -198,7 +198,110 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         XCTAssertEqual(forward.map(\.bucket), [.today])
     }
 
+    func testRenderedRowsKeepSectionHeadersThreadOrderAndDepth() throws {
+        let now = Date()
+        let yesterday = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: now))
+        let previous = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -3, to: now))
+        let pinned = Self.session(index: 0, activity: yesterday, isPinned: true)
+        let parent = Self.session(index: 1, activity: now, hasThreadChildren: true)
+        let child = Self.session(
+            index: 2,
+            activity: now.addingTimeInterval(-20),
+            parentSessionID: parent.tabID,
+            depth: 1
+        )
+        let older = Self.session(index: 3, activity: previous)
+        let rendered = AgentSidebarDateSectionBuilder.renderedActiveRows(
+            for: AgentSidebarDateSectionBuilder.activeSections(
+                for: [pinned, parent, child, older],
+                now: now
+            )
+        )
+
+        XCTAssertEqual(
+            rendered.map(\.session.tabID),
+            [pinned.tabID, parent.tabID, child.tabID, older.tabID]
+        )
+        XCTAssertEqual(rendered.map(\.showsHeader), [true, true, false, true])
+        XCTAssertEqual(rendered.map(\.isFirstHeader), [true, false, false, false])
+        XCTAssertEqual(rendered.map(\.headerTitle), ["Yesterday", "Today", "Today", "Previous"])
+        XCTAssertEqual(rendered.map(\.session.depth), [0, 0, 1, 0])
+        XCTAssertEqual(rendered.map(\.session.isPinned), [true, false, false, false])
+    }
+
+    func testArchivedRenderedRowsKeepOneHeaderPerDay() throws {
+        let now = Date()
+        let yesterday = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: now))
+        let today = try StashedTab(
+            id: XCTUnwrap(UUID(uuidString: "10000000-0000-4000-8000-000000000011")),
+            tab: ComposeTabState(),
+            stashedAt: now
+        )
+        let older = try StashedTab(
+            id: XCTUnwrap(UUID(uuidString: "10000000-0000-4000-8000-000000000012")),
+            tab: ComposeTabState(),
+            stashedAt: yesterday
+        )
+        let rendered = AgentSidebarDateSectionBuilder.renderedArchivedRows(
+            for: AgentSidebarDateSectionBuilder.archivedSections(
+                for: [today, older],
+                now: now,
+                dateInfo: { tab in
+                    AgentModeViewModel.SidebarSessionDateInfo(
+                        lastEngagementAt: tab.stashedAt,
+                        activityDate: tab.stashedAt
+                    )
+                }
+            )
+        )
+
+        XCTAssertEqual(rendered.map(\.row.id), [today.id, older.id])
+        XCTAssertEqual(rendered.map(\.showsHeader), [true, true])
+        XCTAssertEqual(rendered.map(\.isFirstHeader), [true, false])
+        XCTAssertEqual(rendered.map(\.headerTitle), ["Today", "Yesterday"])
+    }
+
+    func testFlatRowListMatchesSectionListFrames() {
+        let sectionFrames = Self.measureFrames(.sectionForEach)
+        let flatFrames = Self.measureFrames(.flatRows)
+
+        XCTAssertEqual(sectionFrames.keys.sorted(), flatFrames.keys.sorted())
+        for name in sectionFrames.keys.sorted() {
+            XCTAssertEqual(
+                flatFrames[name]?.minY ?? -1,
+                sectionFrames[name]?.minY ?? -2,
+                accuracy: 0.5,
+                "\(name) vertical position"
+            )
+            XCTAssertEqual(
+                flatFrames[name]?.height ?? -1,
+                sectionFrames[name]?.height ?? -2,
+                accuracy: 0.5,
+                "\(name) height"
+            )
+        }
+    }
+
     private static let rowHeight: CGFloat = 36
+
+    private static func measureFrames(
+        _ style: SidebarLayoutProbe.Style
+    ) -> [String: CGRect] {
+        let sink = SidebarLayoutFrameSink()
+        let host = NSHostingView(rootView: SidebarLayoutProbe(style: style, sink: sink))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 280, height: 420),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        window.setFrameOrigin(NSPoint(x: 140, y: 140))
+        window.makeKeyAndOrderFront(nil)
+        _ = render(until: Date().addingTimeInterval(0.4)) { sink.frames.count >= 7 }
+        window.orderOut(nil)
+        return sink.frames
+    }
 
     private static func makeWindow(
         _ harness: SidebarRunningTapHarness
@@ -346,4 +449,96 @@ private struct SidebarRunningTapList: View {
         .frame(width: 280, height: 180, alignment: .top)
         .onAppear { harness.appeared = true }
     }
+}
+
+private struct SidebarLayoutFrameKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
+    }
+}
+
+@MainActor
+private final class SidebarLayoutFrameSink {
+    var frames: [String: CGRect] = [:]
+}
+
+private struct SidebarLayoutProbe: View {
+    enum Style {
+        case sectionForEach
+        case flatRows
+    }
+
+    let style: Style
+    let sink: SidebarLayoutFrameSink
+
+    var body: some View {
+        stack
+            .coordinateSpace(name: "probe")
+            .frame(width: 280, alignment: .top)
+            .onPreferenceChange(SidebarLayoutFrameKey.self) { sink.frames = $0 }
+    }
+
+    @ViewBuilder
+    private var stack: some View {
+        switch style {
+        case .sectionForEach:
+            VStack(spacing: 2) {
+                ForEach(Self.sections, id: \.title) { section in
+                    marker(section.title, minHeight: nil, top: section.isFirst ? 2 : 14, bottom: 4)
+                    ForEach(section.rows, id: \.self) { name in
+                        marker(name, minHeight: 36, top: 0, bottom: 0)
+                    }
+                }
+            }
+        case .flatRows:
+            VStack(spacing: 2) {
+                ForEach(Array(Self.flatItems.enumerated()), id: \.offset) { _, item in
+                    if let header = item.header {
+                        marker(header, minHeight: nil, top: item.isFirst ? 2 : 14, bottom: 4)
+                    }
+                    marker(item.row, minHeight: 36, top: 0, bottom: 0)
+                }
+            }
+        }
+    }
+
+    private func marker(
+        _ name: String,
+        minHeight: CGFloat?,
+        top: CGFloat,
+        bottom: CGFloat
+    ) -> some View {
+        Text(verbatim: name)
+            .frame(
+                maxWidth: .infinity,
+                minHeight: minHeight,
+                maxHeight: minHeight,
+                alignment: .leading
+            )
+            .padding(.top, top)
+            .padding(.bottom, bottom)
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: SidebarLayoutFrameKey.self,
+                        value: [name: proxy.frame(in: .named("probe"))]
+                    )
+                }
+            }
+    }
+
+    private static let sections: [(title: String, isFirst: Bool, rows: [String])] = [
+        ("H-Yesterday", true, ["R0"]),
+        ("H-Today", false, ["R1", "R2"]),
+        ("H-Previous", false, ["R3"])
+    ]
+
+    private static let flatItems: [(header: String?, isFirst: Bool, row: String)] = [
+        ("H-Yesterday", true, "R0"),
+        ("H-Today", false, "R1"),
+        (nil, false, "R2"),
+        ("H-Previous", false, "R3")
+    ]
 }
