@@ -313,6 +313,18 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome
 
+    /// Runs the whole overseer compaction transaction on the target's MainActor.
+    ///
+    /// Same ownership split and fence ordering as `agentSessionLinkPerformSend`; the only differences
+    /// are the attributed `.system` request row and the RepoPrompt-constructed native command in
+    /// place of a message.
+    func agentSessionLinkPerformCompact(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkCompactRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome
+
     // MARK: Launch restoration inputs
 
     /// Identity-only descriptors for every compose-tab binding in every active workspace.
@@ -5255,6 +5267,100 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
+    // MARK: - Overseer compaction
+
+    /// Orchestrates one overseer compaction across the authority ledger and the target's MainActor.
+    ///
+    /// The send ledger is reused as-is: the lease carries the same `send_when_idle` capability, and
+    /// the domain-separated compact digest makes a key already spent on a send an
+    /// `idempotency_conflict` rather than a replay. A duplicate retry replays the stored receipt
+    /// without reaching the target, and every settlement re-drives parked queued sends, because a
+    /// compaction occupies the same authority-wide in-flight slots.
+    func compact(target: AuthorizedTarget, idempotencyKey: String) async -> SendOutcome {
+        guard let host else { return .rejected(.denied) }
+        guard let observer = host.agentSessionLinkCandidates()
+            .first(where: { $0.domainEndpoint == target.lease.observer })
+        else {
+            await invalidate(endpoint: target.lease.observer, reason: .observerIdentityDrift)
+            return .rejected(.denied)
+        }
+
+        let reservation: DomainAgentSessionLinkSendReservation
+        switch await authority.beginSend(
+            lease: target.lease,
+            idempotencyKey: idempotencyKey,
+            messageDigest: AgentSessionLinkMessageDigest.compactDigest()
+        ) {
+        case let .reserved(value):
+            reservation = value
+        case let .duplicate(receipt):
+            return .receipt(receipt)
+        case .inProgress:
+            return .rejected(.sendAlreadyInProgress)
+        case .indeterminate:
+            return .blocked(.persistenceIndeterminate)
+        case .conflict:
+            return .rejected(.idempotencyConflict)
+        case .inFlightLimitReached:
+            return .rejected(.deliveryLedgerFull)
+        case .retainedOutcomeLimitReached:
+            return .rejected(.deliveryLedgerExhausted)
+        case let .rejected(error):
+            return .rejected(error == .runtimeShuttingDown ? .shuttingDown : .denied)
+        }
+
+        let request = AgentSessionLinkCompactRequest(
+            linkID: target.lease.linkID,
+            linkGeneration: target.lease.linkGeneration,
+            observerEndpoint: target.lease.observer,
+            observerDisplayName: observer.resolvedDisplayName
+        )
+        let liveness: AgentSessionLinkSendLivenessProbe = { [weak self] in
+            guard let self, let host = self.host else { return .unavailable }
+            return host.agentSessionLinkSendLiveness(
+                observer: request.observerEndpoint,
+                target: target.lease.target
+            )
+        }
+        let authority = authority
+        let outcome = await host.agentSessionLinkPerformCompact(
+            to: target.candidate,
+            request: request,
+            liveness: liveness,
+            commitAuthorization: {
+                await AgentSessionLinkSendCommitOutcome(
+                    authority.commitSendAuthorization(
+                        reservation: reservation,
+                        linkGeneration: reservation.linkGeneration
+                    )
+                )
+            }
+        )
+
+        switch outcome {
+        case let .delivered(delivery):
+            let receipt = DomainAgentSessionLinkSendReceipt(
+                targetSessionID: target.lease.target.sessionID,
+                targetItemID: delivery.targetItemID.uuidString,
+                acceptedAt: delivery.acceptedAt,
+                deliveryState: delivery.deliveryState,
+                resultingRunState: delivery.resultingRunState
+            )
+            await authority.completeSend(reservation: reservation, receipt: receipt)
+            publishTargetSnapshot(forTargetSession: target.lease.target.sessionID)
+            notePendingSendLedgerSettled(on: target.lease.reference)
+            return .receipt(receipt)
+        case let .blocked(failure):
+            if failure.isDeliveryIndeterminate {
+                await authority.settleIndeterminateSend(reservation: reservation)
+            } else {
+                await authority.abandonSend(reservation: reservation)
+            }
+            notePendingSendLedgerSettled(on: target.lease.reference)
+            return .blocked(failure)
+        }
+    }
+
     // MARK: - One pending send per link generation
 
     /// What a queue admission or cancellation produced.
@@ -5651,6 +5757,11 @@ final class AgentSessionLinkRuntimeBridge {
             case .persistenceFailed, .persistenceIndeterminate:
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
+                clear(.failed(failure))
+            case .notSupported, .noProviderSession:
+                // Compaction-only outcomes; a queued send never produces them. Loud in debug, and
+                // terminal in release so no background loop can form around one.
+                assertionFailure("A queued send cannot produce the compaction-only outcome \(failure).")
                 clear(.failed(failure))
             case .endpointInvalidated, .linkRevoked, .shuttingDown:
                 // The link, an endpoint, or the process is gone, so there is no surviving `poll` a

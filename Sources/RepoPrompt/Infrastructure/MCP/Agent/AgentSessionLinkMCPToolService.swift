@@ -134,6 +134,9 @@ struct AgentSessionLinkMCPToolService {
         case "cancel_pending_send":
             try validateAllowedKeys(args, op: op, allowed: Self.cancelPendingSendKeys)
             return try await executeCancelPendingSend(args: args)
+        case "compact":
+            try validateAllowedKeys(args, op: op, allowed: Self.compactKeys)
+            return try await executeCompact(args: args)
         case "set_waiting_on":
             try validateAllowedKeys(args, op: op, allowed: Self.setWaitingOnKeys)
             return try await executeSetWaitingOn(args: args)
@@ -153,8 +156,8 @@ struct AgentSessionLinkMCPToolService {
     /// Single-sourced so the missing-op and unsupported-op errors can never drift apart, or from the
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
-        "Use list, poll, wait, read, send, cancel_pending_send, set_waiting_on, snooze_auto_wake, "
-            + "or request_attention."
+        "Use list, poll, wait, read, send, cancel_pending_send, compact, set_waiting_on, "
+            + "snooze_auto_wake, or request_attention."
 
     private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
         let endpoint = try await resolveCallerEndpointIdentity()
@@ -768,6 +771,71 @@ struct AgentSessionLinkMCPToolService {
         }
     }
 
+    // MARK: - compact
+
+    /// Requests provider-native context compaction of one exact, fully idle overseen session.
+    ///
+    /// Authorized exactly like `send` (the `send_when_idle` grant) under its own operation identity,
+    /// and admitted by the same readiness contract, so a target whose last turn failed on context
+    /// length is admissible while one holding any interaction is `target_not_idle`. The provider
+    /// command is RepoPrompt's own; nothing the caller writes reaches the provider. The result is
+    /// `accepted` when the request was recorded — never proof that compaction finished.
+    private func executeCompact(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        guard let rawSessionID = AgentMCPToolHelpers.normalizedString(args["session_id"]),
+              let targetSessionID = UUID(uuidString: rawSessionID)
+        else {
+            throw MCPError.invalidParams("agent_session_link compact requires a canonical session_id.")
+        }
+        guard let rawKey = AgentMCPToolHelpers.normalizedString(args["idempotency_key"]) else {
+            throw MCPError.invalidParams(
+                "agent_session_link compact requires idempotency_key. Use a new key for a new "
+                    + "compaction request and reuse a key only to retry the same request."
+            )
+        }
+        let idempotencyKey = try Self.boundedIdempotencyKey(rawKey)
+        let target = try await authorize(
+            operation: .monitorCompact,
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        )
+        return try await Self.compactOutcomeValue(
+            bridge.compact(target: target, idempotencyKey: idempotencyKey),
+            targetSessionID: targetSessionID
+        )
+    }
+
+    private static func compactOutcomeValue(
+        _ outcome: AgentSessionLinkRuntimeBridge.SendOutcome,
+        targetSessionID: UUID
+    ) throws -> Value {
+        switch outcome {
+        case let .receipt(receipt):
+            return AgentSessionLinkResponseRenderer.compactReceiptValue(receipt)
+        case let .blocked(failure):
+            return AgentSessionLinkResponseRenderer.compactBlockedValue(
+                failure,
+                targetSessionID: targetSessionID
+            )
+        case .workflowUnavailable:
+            // A compaction names no workflow, so the bridge can never produce this.
+            throw MCPError.internalError("agent_session_link compact produced an unexpected workflow outcome.")
+        case let .rejected(rejection):
+            switch rejection {
+            case .denied:
+                throw Self.denialError(targetSessionID: targetSessionID)
+            case .shuttingDown:
+                throw MCPError.internalError("RepoPrompt is shutting down.")
+            case .idempotencyConflict, .sendAlreadyInProgress, .deliveryLedgerFull,
+                 .deliveryLedgerExhausted:
+                return AgentSessionLinkResponseRenderer.compactRejectedValue(
+                    rejection,
+                    targetSessionID: targetSessionID
+                )
+            }
+        }
+    }
+
     // MARK: - cancel_pending_send
 
     /// Removes this observer's own queued message for one target, if it is still cancellable.
@@ -1141,6 +1209,9 @@ struct AgentSessionLinkMCPToolService {
         "delivery", "replace_pending"
     ]
     static let cancelPendingSendKeys: Set<String> = ["op", "session_id", "idempotency_key"]
+    /// Deliberately no text field: the provider command is fixed by RepoPrompt, so there is nothing
+    /// a caller could phrase, and no `session_ids`, queue, or workflow form either.
+    static let compactKeys: Set<String> = ["op", "session_id", "idempotency_key"]
     static let setWaitingOnKeys: Set<String> = ["op", "summary", "clear"]
     /// `clear` is shared with `set_waiting_on` and `duration_seconds` belongs to nothing else: the two
     /// are mutually exclusive, which this schema shape cannot express and the service enforces.
@@ -1456,6 +1527,98 @@ enum AgentSessionLinkResponseRenderer {
             "delivery_state": .string(receipt.deliveryState.rawValue),
             "resulting_run_state": .string(receipt.resultingRunState),
             "duplicate": .bool(receipt.duplicate)
+        ])
+    }
+
+    /// Stable compaction receipt, identical for a duplicate retry except for `duplicate: true`.
+    ///
+    /// `accepted` only when the compaction run started (`delivery_state: run_started`); even then it
+    /// means started, never finished, and a provider refusal after that point surfaces as the run
+    /// failing. A request row recorded in the target whose
+    /// command was then withheld or failed to start reports `not_started`: nothing reached the
+    /// provider, and because the receipt is retained under the key, requesting again needs a new key.
+    static func compactReceiptValue(_ receipt: DomainAgentSessionLinkSendReceipt) -> Value {
+        let started = receipt.deliveryState == .runStarted
+        return .object([
+            "result": .string(started ? "accepted" : "not_started"),
+            "accepted": .bool(started),
+            "session_id": .string(receipt.targetSessionID.uuidString),
+            "target_item_id": .string(receipt.targetItemID),
+            "accepted_at": .string(AgentMCPToolHelpers.timestamp(receipt.acceptedAt)),
+            "delivery_state": .string(receipt.deliveryState.rawValue),
+            "resulting_run_state": .string(receipt.resultingRunState),
+            "duplicate": .bool(receipt.duplicate),
+            // A same-key retry can only replay this retained receipt, so it is never a retry signal.
+            "retryable": .bool(false),
+            "detail": .string(
+                started
+                    ? "The compaction run was started, not confirmed. Observe the session with poll and wait: "
+                    + "a finished compaction leaves it idle, and its context count is unreliable until "
+                    + "its next ordinary turn reports usage."
+                    : "The request was recorded in the overseen session, but RepoPrompt did not confirm that "
+                    + "a compaction started. Read the session before requesting again; a new request "
+                    + "needs a new idempotency_key."
+            )
+        ])
+    }
+
+    /// The compaction transaction ran and refused before recording anything, or could not prove
+    /// what it recorded.
+    static func compactBlockedValue(
+        _ failure: AgentSessionLinkSendFailure,
+        targetSessionID: UUID
+    ) -> Value {
+        var payload: [String: Value] = [
+            "result": .string(failure.rawValue),
+            "session_id": .string(targetSessionID.uuidString),
+            "accepted": .bool(false),
+            "retryable": .bool(failure.isRetryable),
+            "detail": .string(compactFailureDetail(failure))
+        ]
+        if failure.isDeliveryIndeterminate {
+            payload["accepted_unknown"] = .bool(true)
+        }
+        return .object(payload)
+    }
+
+    private static func compactFailureDetail(_ failure: AgentSessionLinkSendFailure) -> String {
+        switch failure {
+        case .linkRevoked:
+            "Oversight of this session ended before the compaction was authorized. Nothing was requested."
+        case .persistenceFailed:
+            "The compaction request could not be durably recorded in the overseen session, so nothing "
+                + "was started."
+        case .persistenceIndeterminate:
+            "The overseen session could not be saved and the rollback could not be confirmed, so it is "
+                + "unknown whether the request was recorded. No compaction was started and this "
+                + "idempotency_key is spent. Read the session before requesting again."
+        case .endpointInvalidated, .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
+             .noProviderSession:
+            failure.message
+        }
+    }
+
+    /// The ledger refused a compaction before the target was touched.
+    static func compactRejectedValue(
+        _ rejection: AgentSessionLinkRuntimeBridge.SendRejection,
+        targetSessionID: UUID
+    ) -> Value {
+        let result = rejection == .sendAlreadyInProgress ? "compaction_in_progress" : rejection.rawValue
+        let detail = switch rejection {
+        case .idempotencyConflict:
+            "That idempotency_key was already used for a different request. Nothing was requested. "
+                + "Use a new key for a new compaction."
+        case .sendAlreadyInProgress:
+            "A compaction with that idempotency_key is still settling. Poll the target before retrying."
+        case .deliveryLedgerFull, .deliveryLedgerExhausted, .shuttingDown, .denied:
+            sendRejectionDetail(rejection)
+        }
+        return .object([
+            "result": .string(result),
+            "session_id": .string(targetSessionID.uuidString),
+            "accepted": .bool(false),
+            "retryable": .bool(isSendRejectionRetryable(rejection)),
+            "detail": .string(detail)
         ])
     }
 

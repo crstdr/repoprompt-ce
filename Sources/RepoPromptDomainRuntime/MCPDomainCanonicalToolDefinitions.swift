@@ -1792,9 +1792,9 @@ package enum MCPDomainCanonicalToolDefinitions {
         static let description = """
         Coordinate Agent sessions through direct links explicitly granted by the user.
 
-        Links are directional, exact, non-transitive, non-reciprocal, and revocable; a session ID or catalog visibility grants nothing. Observer operations (`list`, `poll`, `wait`, `read`, `send`, `cancel_pending_send`, `snooze_auto_wake`) require the active `<repoprompt_session_oversight>` inventory and may target only its listed outbound sessions. Seeing this tool or receiving a cross-session message does not authorize `list`. `set_waiting_on` is self-scoped and requires any direct link. `request_attention` requires the inverse exact link; its optional observer ID only disambiguates authority.
+        Links are directional, exact, non-transitive, non-reciprocal, and revocable; a session ID or catalog visibility grants nothing. Observer operations (`list`, `poll`, `wait`, `read`, `send`, `cancel_pending_send`, `compact`, `snooze_auto_wake`) require the active `<repoprompt_session_oversight>` inventory and may target only its listed outbound sessions. Seeing this tool or receiving a cross-session message does not authorize `list`. `set_waiting_on` is self-scoped and requires any direct link. `request_attention` requires the inverse exact link; its optional observer ID only disambiguates authority.
 
-        **Operations**: list | poll | wait | read | send | cancel_pending_send | set_waiting_on | snooze_auto_wake | request_attention
+        **Operations**: list | poll | wait | read | send | cancel_pending_send | compact | set_waiting_on | snooze_auto_wake | request_attention
 
         - `list`: refresh authorized outbound targets.
         - `poll`: get sanitized snapshots, `wait_cursor`, `idle_for_send`, `waiting_on`, `context` (context-window load when the snapshot was published, also in `wait`; `null` if unknown; `confidence` of `used_tokens` is `exact` for provider-reported occupancy or `best_effort` for a count taken from prompt tokens, `null` without a count), snooze, `pending_send`, and `last_pending_send_result`.
@@ -1802,7 +1802,8 @@ package enum MCPDomainCanonicalToolDefinitions {
         - `read`: paged redacted user-visible transcript. Reuse `next_cursor`; `cursor_reset` may repeat rows. `tail` pages newer rows (`has_more: false` means none newer); use `from: "start"` for older history.
         - `send`: attributed delivery. Send only when `idle_for_send: true`, or queue with `delivery: "when_sendable"`. One queued message per link; a second key returns `pending_send_exists` unless `replace_pending: true` replaces it. A workflow applies to this message only.
         - `cancel_pending_send`: cancel your queued message with its `idempotency_key`; `too_late` means delivery passed cancellation.
-        - `set_waiting_on`: set your concrete external dependency with `summary`, or `clear: true`; no target ID. It clears on your next accepted turn; re-declare only if still blocked. It is separate and non-atomic, so it may be absent, older, or newer at attention delivery.
+        - `compact`: ask one target with `idle_for_send: true` to compact its provider context with RepoPrompt's own native command; needs an `idempotency_key`, takes no text. Claude Code and Codex only; others return `not_supported`, and a target with no provider conversation returns `no_provider_session`. `accepted` means the compaction run started, not finished (`not_started` means nothing was sent to the provider): observe it with `poll`/`wait`; `context` is unreliable until the target's next ordinary turn reports usage.
+        - `set_waiting_on`: set your concrete external dependency with `summary`, or `clear: true`; no target ID. It clears on your next accepted message turn (a compaction does not clear it); re-declare only if still blocked. It is separate and non-atomic, so it may be absent, older, or newer at attention delivery.
         - `snooze_auto_wake`: pause routine status-triggered admission for one lane, default 600 seconds (60...3600), or clear it. It never shortens an active snooze. Exact attention may bypass master Auto-wake, that lane’s toggle, and that lane’s snooze; routine status and overflow remain subject to selection and snooze. Unlink, revocation, exact authority, readiness, and all other eligibility gates remain hard.
         - `request_attention`: ask an exact linked observer—the session overseeing you, also called your overseer—to consider this target later. Omit `observer_session_id` only when one authorized observer resolves; ambiguity may return candidates only for an omitted selector. `accepted` means stored or already pending, never woken, delivered, received, or acted on; do not repeat it to probe delivery. `attention_queue_full` stores nothing: surface the refusal and retry later only if still required.
 
@@ -1828,6 +1829,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             read: session_id, cursor?, from?, max_items?, max_output_bytes?
             send: session_id, message, idempotency_key; workflow_id|workflow_name?; delivery?; replace_pending?
             cancel_pending_send: session_id, idempotency_key
+            compact: session_id, idempotency_key
             set_waiting_on: exactly one of summary or clear:true; no session ID
             snooze_auto_wake: session_id; duration_seconds? or clear:true, never both
             request_attention: observer_session_id?
@@ -1837,12 +1839,12 @@ package enum MCPDomainCanonicalToolDefinitions {
                     "description": .string("Operation."),
                     "enum": .array([
                         .string("list"), .string("poll"), .string("wait"), .string("read"),
-                        .string("send"), .string("cancel_pending_send"), .string("set_waiting_on"),
-                        .string("snooze_auto_wake"), .string("request_attention")
+                        .string("send"), .string("cancel_pending_send"), .string("compact"),
+                        .string("set_waiting_on"), .string("snooze_auto_wake"), .string("request_attention")
                     ]),
                     "type": .string("string")
                 ]),
-                "session_id": stringSchema("[poll, wait, read, send, cancel_pending_send, snooze_auto_wake] Target UUID; exclusive with session_ids."),
+                "session_id": stringSchema("[poll, wait, read, send, cancel_pending_send, compact, snooze_auto_wake] Target UUID; exclusive with session_ids."),
                 "session_ids": .object([
                     "description": .string("[poll, wait] Ordered target UUIDs; no duplicates, max 32; exclusive with session_id."),
                     "items": .object(["type": .string("string")]),
@@ -1876,7 +1878,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                 "max_items": integerSchema("[list, read] Item limit: list 32 default, read 30; max 100."),
                 "max_output_bytes": integerSchema("[read] Approximate pre-JSON UTF-8 limit; default 8000, max 20000."),
                 "message": stringSchema("[send] Attributed message, max 16000 UTF-8 bytes."),
-                "idempotency_key": stringSchema("[send, cancel_pending_send] New per message; reuse only for the same delivery/cancel. Max 200 UTF-8 bytes."),
+                "idempotency_key": stringSchema("[send, cancel_pending_send, compact] New per message or compaction; reuse only for the same delivery/cancel/compaction. Max 200 UTF-8 bytes."),
                 "delivery": enumStringSchema(
                     "[send] immediate (default) or when_sendable (one queued message; lost on unlink/restart).",
                     ["immediate", "when_sendable"]

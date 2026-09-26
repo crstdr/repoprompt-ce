@@ -176,8 +176,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     // MARK: - Guidance revision
 
-    /// A provider context that physically accepted revision 4 is re-owed revision 5 in full. Merely
-    /// rendering or abandoning revision 5 does not advance the acknowledgement; only physical
+    /// A provider context that physically accepted revision 4 is re-owed the current revision in full.
+    /// Merely rendering or abandoning it does not advance the acknowledgement; only physical
     /// acceptance earns the reminder, and a rebuilt context owes the full block again.
     func testRevisionFiveReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
         let observerSessionID = UUID()
@@ -228,7 +228,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 5 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains(
+            "Guidance revision \(AgentSessionLinkPrompts.currentLaneGuidanceRevision) supersedes"
+        ))
         XCTAssertTrue(reOwed.fragment.contains("attributed attention request"))
         XCTAssertTrue(reOwed.fragment.contains("master Auto-wake"))
         XCTAssertTrue(reOwed.fragment.contains("lane&apos;s own toggle"))

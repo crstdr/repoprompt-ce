@@ -57,6 +57,31 @@ struct AgentSessionLinkSendRequest: Equatable {
     }
 }
 
+/// Everything the target's MainActor needs to run one overseer-requested compaction, as a value.
+///
+/// Identity and attribution only: unlike a send it carries no caller text at all, because the
+/// provider command is fixed by RepoPrompt (`AgentProviderControlCommand.compact`).
+struct AgentSessionLinkCompactRequest: Equatable {
+    let linkID: UUID
+    let linkGeneration: UInt64
+    /// The exact granted observer incarnation; see `AgentSessionLinkSendRequest.observerEndpoint`.
+    let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    /// Observer name captured at request time, persisted with the attribution row.
+    let observerDisplayName: String?
+
+    var observerSessionID: UUID {
+        observerEndpoint.sessionID
+    }
+
+    var attribution: AgentCrossSessionAttribution {
+        AgentCrossSessionAttribution(
+            sourceSessionID: observerSessionID,
+            sourceName: observerDisplayName,
+            linkID: linkID
+        )
+    }
+}
+
 // MARK: - Liveness probe
 
 /// Host-answered liveness facts for one send, valid only at the instant they were read.
@@ -124,6 +149,11 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     /// row may or may not be on disk. The idempotency key is permanently spent.
     case persistenceIndeterminate = "persistence_indeterminate"
     case shuttingDown = "shutting_down"
+    /// Compaction only: the target's provider runtime has no verified native compaction path.
+    case notSupported = "not_supported"
+    /// Compaction only: the provider supports compaction, but this target has no provider
+    /// conversation yet, so there is nothing to compact.
+    case noProviderSession = "no_provider_session"
 
     init(_ reason: AgentSessionLinkDeliveryReadiness.BlockReason) {
         switch reason {
@@ -143,7 +173,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         switch self {
         case .targetLoading, .targetNotIdle, .persistenceFailed:
             true
-        case .endpointInvalidated, .linkRevoked, .persistenceIndeterminate, .shuttingDown:
+        case .endpointInvalidated, .linkRevoked, .persistenceIndeterminate, .shuttingDown,
+             .notSupported, .noProviderSession:
             false
         }
     }
@@ -171,6 +202,10 @@ enum AgentSessionLinkSendFailure: String, Equatable {
                 + "idempotency_key is spent. Read the session before sending anything again."
         case .shuttingDown:
             "RepoPrompt is shutting down."
+        case .notSupported:
+            "The overseen session's provider has no supported context compaction. Nothing was requested."
+        case .noProviderSession:
+            "The overseen session has no provider conversation to compact yet. Nothing was requested."
         }
     }
 }
@@ -414,6 +449,18 @@ enum AgentSessionLinkMessageDigest {
     static func digest(message: String, workflowSelector: String) -> String {
         let canonical = "\(workflowSelector.utf8.count):\(workflowSelector)\(message)"
         return SHA256.hash(data: Data(canonical.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    /// Request identity of an overseer compaction.
+    ///
+    /// A fixed pre-image that no send can produce (a send's pre-image always begins with a decimal
+    /// length prefix), so the two digests coincide only on a SHA-256 collision. A key reused across
+    /// `send` and `compact` is therefore an `idempotency_conflict`, never a replay of the other
+    /// operation's receipt.
+    static func compactDigest() -> String {
+        SHA256.hash(data: Data("agent_session_link.compact/v1".utf8))
             .map { String(format: "%02x", $0) }
             .joined()
     }

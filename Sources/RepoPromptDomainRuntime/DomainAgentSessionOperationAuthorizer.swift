@@ -31,6 +31,13 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     /// about the overseen session is read, written, resumed, or notified. The authority it needs is
     /// therefore the plain read grant the observer already holds over that lane.
     case monitorSnoozeAutoWake = "agent_session_link.snooze_auto_wake"
+    /// Overseer-requested provider context compaction of one exact, fully idle target.
+    ///
+    /// It needs the same grant as `send`: a RepoPrompt-constructed native compaction command starts
+    /// a provider turn on an idle target exactly as an attributed message does, and it is gated by the
+    /// same readiness contract. It is a distinct identity so policy, dispatch, and diagnostics never
+    /// mistake a compaction for a message.
+    case monitorCompact = "agent_session_link.compact"
 
     package enum Family: String, Hashable, Sendable {
         /// Existing spawn-provenance control and read operations.
@@ -46,7 +53,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
              .manageResume, .manageStop, .manageCleanup:
             .sessionControl
         case .monitorList, .monitorPoll, .monitorWait, .monitorRead, .monitorSend,
-             .monitorSnoozeAutoWake:
+             .monitorSnoozeAutoWake, .monitorCompact:
             .monitor
         }
     }
@@ -58,7 +65,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
         case .monitorList:
             true
         case .monitorPoll, .monitorWait, .monitorRead, .monitorSend,
-             .monitorSnoozeAutoWake,
+             .monitorSnoozeAutoWake, .monitorCompact,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
              .manageList, .manageGetLog, .manageExtractHandoff,
              .manageResume, .manageStop, .manageCleanup:
@@ -78,7 +85,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
             .wait
         case .monitorRead:
             .read
-        case .monitorSend:
+        case .monitorSend, .monitorCompact:
             .sendWhenIdle
         case .monitorList,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
@@ -91,7 +98,8 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     /// True when the operation mutates or resumes target state rather than only reading it.
     package var mutatesTarget: Bool {
         switch self {
-        case .runCancel, .runSteer, .runRespond, .manageResume, .manageStop, .manageCleanup, .monitorSend:
+        case .runCancel, .runSteer, .runRespond, .manageResume, .manageStop, .manageCleanup, .monitorSend,
+             .monitorCompact:
             true
         case .runPoll, .runWait, .manageList, .manageGetLog, .manageExtractHandoff,
              .monitorList, .monitorPoll, .monitorWait, .monitorRead,

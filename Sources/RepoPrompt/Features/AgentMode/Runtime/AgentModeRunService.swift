@@ -100,6 +100,14 @@ final class AgentModeRunService {
         )
     }
 
+    /// Runtimes whose run pipeline sends a `AgentProviderControlCommand` as its exact native text.
+    ///
+    /// Claude Code only: the Claude-compatible variants share the CLI but their backends are not
+    /// verified to honor the native command, and ACP/headless runtimes have no undecorated path yet.
+    static func dispatchesProviderControlCommands(_ agent: AgentProviderKind) -> Bool {
+        agent == .claudeCode
+    }
+
     @discardableResult
     func startRun(
         tabID: UUID,
@@ -109,10 +117,18 @@ final class AgentModeRunService {
         attachments: [AgentImageAttachment],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
+        providerControlCommand: AgentProviderControlCommand? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
         let selectedAgent = session.selectedAgent
+        // A control command is only ever routed to a runtime that dispatches it natively and
+        // undecorated. Any other runtime would send it as ordinary prose, so it never starts at all.
+        if providerControlCommand != nil, !Self.dispatchesProviderControlCommands(selectedAgent) {
+            let message = "\(selectedAgent.displayName) does not support this provider command."
+            startOutcome?.recordStartFailure(message: message)
+            return nil
+        }
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let workspacePath: String?
         do {
@@ -178,7 +194,8 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 makeLease: makeLease,
-                autoEffortSelection: autoEffortSelection
+                autoEffortSelection: autoEffortSelection,
+                providerControlCommand: providerControlCommand
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil

@@ -149,6 +149,9 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             // Observer-local admission policy, so it needs the read grant it already holds over the
             // lane and nothing stronger.
             .monitorSnoozeAutoWake: .poll,
+            // A compaction starts a provider turn on an idle target exactly as a send does, so it
+            // needs the send grant and nothing new.
+            .monitorCompact: .sendWhenIdle,
         ]
         for operation in targetBearingMonitorOperations {
             guard let capability = expected[operation] else {
@@ -328,7 +331,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             [
                 "agent_session_link.list", "agent_session_link.poll", "agent_session_link.wait",
                 "agent_session_link.read", "agent_session_link.send",
-                "agent_session_link.snooze_auto_wake",
+                "agent_session_link.snooze_auto_wake", "agent_session_link.compact",
             ]
         )
         for operation in sessionControlOperations where operation.requiredMonitorCapability != nil {
@@ -350,5 +353,11 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .poll
         )
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorSnoozeAutoWake.family, .monitor)
+        // Compaction mutates the target's provider context, is target-scoped, and borrows the send
+        // grant rather than introducing a new capability.
+        XCTAssertTrue(DomainAgentSessionTargetOperation.monitorCompact.mutatesTarget)
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorCompact.isObserverScoped)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorCompact.requiredMonitorCapability, .sendWhenIdle)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorCompact.family, .monitor)
     }
 }

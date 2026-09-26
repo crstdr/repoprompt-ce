@@ -818,6 +818,11 @@ struct AgentMessageBubble: View {
                 )
             } else {
                 HStack(spacing: 6) {
+                    // An overseer compaction request carries its observer's attribution; the same
+                    // badge a delivered cross-session message shows says who asked for it.
+                    if let attribution = item.crossSessionAttribution {
+                        crossSessionAttributionBadge(attribution)
+                    }
                     Text(verbatim: laneUpdateDisplayText ?? item.text)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                         .foregroundColor(.secondary)

@@ -253,6 +253,26 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             return sendOutcome
         }
 
+        var compactRequests: [(AgentSessionLinkEndpointCandidate, AgentSessionLinkCompactRequest)] = []
+        var compactOutcome: AgentSessionLinkSendTransactionOutcome = .blocked(.targetNotIdle)
+
+        func agentSessionLinkPerformCompact(
+            to candidate: AgentSessionLinkEndpointCandidate,
+            request: AgentSessionLinkCompactRequest,
+            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+            commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkSendTransactionOutcome {
+            compactRequests.append((candidate, request))
+            if invokesSendCommit {
+                let commit = await commitAuthorization()
+                sendCommitOutcomes.append(commit)
+                guard commit == .committed else {
+                    return .blocked(commit == .shuttingDown ? .shuttingDown : .linkRevoked)
+                }
+            }
+            return compactOutcome
+        }
+
         /// Every snooze call the bridge actually admitted, so a test can prove a denial never reached
         /// the owning session at all rather than being refused once it got there.
         var snoozeProjectionCalls: [(
@@ -3181,6 +3201,64 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             1,
             "A duplicate retry must never reach the target transaction again"
         )
+    }
+
+    // MARK: - Compaction
+
+    private func authorizedCompactTarget(
+        _ fixture: Fixture
+    ) async -> AgentSessionLinkRuntimeBridge.AuthorizedTarget? {
+        await fixture.bridge.authorizeTarget(
+            operation: .monitorCompact,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        ).success
+    }
+
+    func testCompactionIsAuthorizedByTheSendGrantAndCarriesExactObserverAttribution() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        fixture.host.compactOutcome = delivered()
+
+        let resolved = await authorizedCompactTarget(fixture)
+        let target = try XCTUnwrap(resolved, "the send_when_idle grant authorizes compact")
+        XCTAssertEqual(target.lease.capability, .sendWhenIdle)
+        guard case .receipt = await fixture.bridge.compact(target: target, idempotencyKey: "compact-1") else {
+            return XCTFail("Expected an accepted compaction receipt")
+        }
+        let request = try XCTUnwrap(fixture.host.compactRequests.first?.1)
+        XCTAssertEqual(request.observerSessionID, fixture.observer.sessionID)
+        XCTAssertEqual(request.observerDisplayName, "Planning")
+        XCTAssertEqual(request.attribution.linkID, target.lease.linkID)
+        XCTAssertTrue(fixture.host.sendRequests.isEmpty, "A compaction is never routed as a message")
+    }
+
+    func testCompactionRetriesReplayTheReceiptAndSendKeysNeverDoubleAsCompactKeys() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        fixture.host.compactOutcome = delivered()
+        fixture.host.sendOutcome = delivered()
+
+        let first = await authorizedCompactTarget(fixture)
+        guard case let .receipt(receipt) = try await fixture.bridge.compact(
+            target: XCTUnwrap(first),
+            idempotencyKey: "compact-1"
+        ) else { return XCTFail("Expected a receipt") }
+        let retry = await authorizedCompactTarget(fixture)
+        guard case let .receipt(replay) = try await fixture.bridge.compact(
+            target: XCTUnwrap(retry),
+            idempotencyKey: "compact-1"
+        ) else { return XCTFail("Expected the stored receipt to replay") }
+        XCTAssertTrue(replay.duplicate)
+        XCTAssertEqual(replay.targetItemID, receipt.targetItemID)
+        XCTAssertEqual(fixture.host.compactRequests.count, 1, "A duplicate retry never reaches the target again")
+
+        let sendTarget = await authorizedSendTarget(fixture)
+        _ = try await fixture.bridge.send(target: XCTUnwrap(sendTarget), message: "hello", idempotencyKey: "shared-key")
+        let compactTarget = await authorizedCompactTarget(fixture)
+        let conflict = try await fixture.bridge.compact(target: XCTUnwrap(compactTarget), idempotencyKey: "shared-key")
+        XCTAssertEqual(conflict, .rejected(.idempotencyConflict))
+        XCTAssertEqual(fixture.host.compactRequests.count, 1)
     }
 
     func testSameKeyWithDifferentTextConflictsAndDeliversNothing() async throws {
