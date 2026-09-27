@@ -3079,6 +3079,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         text: String,
         images: [AgentImageAttachment],
         selection: (model: String?, reasoningEffort: String?, serviceTier: String?),
+        autoEffortApplied: Bool,
         attachmentReservationID: UUID?,
         reason: CodexTurnFallbackDecision,
         controller: any CodexSessionControlling
@@ -3111,6 +3112,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             model: selection.model,
             reasoningEffort: selection.reasoningEffort,
             serviceTier: selection.serviceTier,
+            autoEffortApplied: autoEffortApplied,
             attachmentReservationID: attachmentReservationID,
             optimisticUserItemID: submission.optimisticUserItemID,
             draftText: submission.draftText,
@@ -3127,6 +3129,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         detachCodexFallbackAttachmentReservation(attachmentReservationID, session: session)
         session.codexFallbackQueue.append(entry)
+        if let auditTurnID = submission.optimisticUserItemID {
+            session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexQueuedFallback() }
+        }
         if case let .mcp(attemptID) = submission.origin {
             session.codexSteerAckTracker.resolve(
                 attemptID: attemptID,
@@ -3388,6 +3393,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         do {
             updateCodexStallWatchdogState(for: session)
+            if let auditTurnID = head.optimisticUserItemID {
+                session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.fallbackStart) }
+                viewModel?.scheduleSave(for: session.tabID)
+            }
             _ = try await controller.startUserTurn(
                 text: monitoring?.text ?? head.providerText,
                 images: head.images,
@@ -3397,6 +3406,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             // Acceptance is the non-throwing `startUserTurn` return that produces the enclosing `.sent`
             // path; the in-flight bookkeeping below is local state, not provider acceptance.
+            if let auditTurnID = head.optimisticUserItemID {
+                session.updateAutomationAudit(turnID: auditTurnID) {
+                    $0.recordCodexStartAccepted(
+                        effortRaw: head.reasoningEffort,
+                        autoEffortApplied: head.autoEffortApplied
+                    )
+                }
+                viewModel?.scheduleSave(for: session.tabID)
+            }
             viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
             guard var inFlight = session.codexFallbackDispatchInFlight,
                   inFlight.id == head.id,
@@ -5618,13 +5636,29 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 controller: controller,
                 session: session
             ) {
-                try await controller.startUserTurn(
+                if let auditTurnID = replayTurn.auditTurnID {
+                    session.updateAutomationAudit(turnID: auditTurnID) {
+                        $0.recordCodexDispatch(.managedAuthReplay)
+                    }
+                    viewModel?.scheduleSave(for: session.tabID)
+                }
+                let receipt = try await controller.startUserTurn(
                     text: replayText,
                     images: replayTurn.images,
                     model: replayTurn.model,
                     reasoningEffort: replayTurn.reasoningEffort,
                     serviceTier: replayTurn.serviceTier
                 )
+                if let auditTurnID = replayTurn.auditTurnID {
+                    session.updateAutomationAudit(turnID: auditTurnID) {
+                        $0.recordCodexStartAccepted(
+                            effortRaw: replayTurn.reasoningEffort,
+                            autoEffortApplied: replayTurn.autoEffortApplied
+                        )
+                    }
+                    viewModel?.scheduleSave(for: session.tabID)
+                }
+                return receipt
             }
             dispatched = true
             viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
@@ -6829,6 +6863,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         autoEffortSelection: AutoEffortTurnSelection? = nil
     ) async -> NativeSendOutcome {
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
+        let auditTurnID = fallbackContext?.optimisticUserItemID
+            ?? session.pendingTurnRuntimeAnchors.first?.userItemID
         let wasRunAlreadyActive = session.runState.isActive
         let activeSendRunID = wasRunAlreadyActive ? session.runID : nil
         let activeSendRunAttemptID = wasRunAlreadyActive ? session.activeRunAttemptID : nil
@@ -6888,7 +6924,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         cancelCodexIdleShutdown(for: session.tabID)
 
-        func turnSelection() -> (model: String?, reasoningEffort: String?, serviceTier: String?) {
+        func turnSelection() -> (model: String?, reasoningEffort: String?, serviceTier: String?, isAuto: Bool) {
             var manual = effectiveCodexSelection(for: session)
             guard !wasRunAlreadyActive,
                   let autoEffortSelection,
@@ -6907,11 +6943,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                       modelRaw: session.selectedModelRaw,
                       advertised: advertisedModel.supportedReasoningEfforts
                   ).contains(autoEffortSelection.effortRaw)
-            else { return manual }
+            else { return (manual.model, manual.reasoningEffort, manual.serviceTier, false) }
             manual.reasoningEffort = autoEffortSelection.effortRaw
-            return manual
+            return (manual.model, manual.reasoningEffort, manual.serviceTier, true)
         }
-        let selection = turnSelection()
+        let initialSelection = turnSelection()
+        let selection = (
+            model: initialSelection.model,
+            reasoningEffort: initialSelection.reasoningEffort,
+            serviceTier: initialSelection.serviceTier
+        )
         session.codexPendingAuthRetryTurn = .init(
             text: text,
             images: attachments,
@@ -6921,7 +6962,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             attachmentReservationID: attachmentReservationID,
             expectedTurnID: wasRunAlreadyActive
                 ? session.codexAuthoritativeActiveTurn?.turnID
-                : nil
+                : nil,
+            auditTurnID: auditTurnID,
+            autoEffortApplied: initialSelection.isAuto
         )
 
         await ensureCodexNativeSession(
@@ -7020,6 +7063,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 text: text,
                 images: attachments,
                 selection: selection,
+                autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
                 controller: controller
@@ -7256,20 +7300,39 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         controller: controller,
                         session: session
                     ) {
-                        let physicalSelection = autoEffortSelection == nil ? selection : turnSelection()
+                        let physicalSelection = autoEffortSelection == nil
+                            ? (model: selection.model, reasoningEffort: selection.reasoningEffort, serviceTier: selection.serviceTier, isAuto: false)
+                            : turnSelection()
                         if var pendingTurn = session.codexPendingAuthRetryTurn {
                             pendingTurn.model = physicalSelection.model
                             pendingTurn.reasoningEffort = physicalSelection.reasoningEffort
                             pendingTurn.serviceTier = physicalSelection.serviceTier
+                            pendingTurn.autoEffortApplied = physicalSelection.isAuto
                             session.codexPendingAuthRetryTurn = pendingTurn
                         }
-                        return try await controller.startUserTurn(
+                        if let auditTurnID {
+                            session.updateAutomationAudit(turnID: auditTurnID) {
+                                $0.recordCodexDispatch(.start)
+                            }
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
+                        let receipt = try await controller.startUserTurn(
                             text: dispatchText,
                             images: attachments,
                             model: physicalSelection.model,
                             reasoningEffort: physicalSelection.reasoningEffort,
                             serviceTier: physicalSelection.serviceTier
                         )
+                        if let auditTurnID {
+                            session.updateAutomationAudit(turnID: auditTurnID) {
+                                $0.recordCodexStartAccepted(
+                                    effortRaw: physicalSelection.reasoningEffort,
+                                    autoEffortApplied: physicalSelection.isAuto
+                                )
+                            }
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
+                        return receipt
                     }
                     dispatched = true
                 }
@@ -7279,12 +7342,22 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 let dispatchText = monitoring?.text ?? text
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
+                if let auditTurnID {
+                    session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.steer) }
+                    viewModel?.scheduleSave(for: session.tabID)
+                }
+                func recordAcceptedSteer() {
+                    guard let auditTurnID else { return }
+                    session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexSteerAccepted() }
+                    viewModel?.scheduleSave(for: session.tabID)
+                }
                 do {
                     let receipt = try await controller.steerUserTurn(
                         text: dispatchText,
                         images: attachments,
                         expectedTurnID: identity.turnID
                     )
+                    recordAcceptedSteer()
                     if receipt.acceptedTurnID != identity.turnID {
                         await reconcileAcceptedCodexSteerMismatch(
                             from: identity,
@@ -7317,6 +7390,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             images: attachments,
                             expectedTurnID: actualTurnID
                         )
+                        recordAcceptedSteer()
                         guard receipt.acceptedTurnID == actualTurnID else {
                             throw CodexTurnSteerError.expectedTurnMismatch(
                                 expectedTurnID: expectedTurnID,
@@ -7449,6 +7523,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 text: text,
                 images: attachments,
                 selection: selection,
+                autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
                 controller: controller
