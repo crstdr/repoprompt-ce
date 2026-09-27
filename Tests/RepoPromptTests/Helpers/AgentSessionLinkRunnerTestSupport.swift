@@ -401,7 +401,7 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
         ACPSessionConfiguration(
-            mode: environment["ACP_FAIL_LOAD"] == "1"
+            mode: environment["ACP_FAIL_LOAD"] == "1" || environment["ACP_LOAD"] == "1"
                 ? request.resumeSessionID.map { .load(existingSessionID: $0) } ?? .new : .new,
             workingDirectory: request.workspacePath ?? FileManager.default.temporaryDirectory.path,
             mcpServers: []
@@ -482,6 +482,8 @@ enum AgentSessionLinkACPServerScript {
     /// - `ACP_UNMATCHED_RESPONSE_ON_PROMPT`: a response with an unknown id during each prompt (a protocol
     ///   violation that fails the controller).
     /// - `ACP_ADVERTISE_ON_CANCEL` (comma list): a list for the cancelled session on each `session/cancel`.
+    /// - `ACP_LOAD` (`1`): open the request's `resumeSessionID` with a successful `session/load`, which
+    ///   also advertises `ACP_ADVERTISE_COMMANDS`.
     static func write(to directory: URL) throws -> URL {
         let scriptURL = directory.appendingPathComponent("monitor_acp_server.py")
         let script = #"""
@@ -569,6 +571,10 @@ enum AgentSessionLinkACPServerScript {
                 respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
             elif method == "session/load" and os.environ.get("ACP_FAIL_LOAD"):
                 respond_error(request.get("id"), "session not found: invalid params")
+            elif method == "session/load":
+                respond(request.get("id"), {"configOptions": config_options()})
+                if os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
+                    advertise(params.get("sessionId"), os.environ["ACP_ADVERTISE_COMMANDS"])
             elif method == "session/new":
                 respond(request.get("id"), {
                     "sessionId": "monitor-acp-session",

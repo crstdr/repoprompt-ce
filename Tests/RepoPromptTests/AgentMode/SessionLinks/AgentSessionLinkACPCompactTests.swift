@@ -242,6 +242,61 @@ final class ACPAdvertisedCommandControllerTests: XCTestCase {
         XCTAssertFalse(fixture.controller.advertisesCommand("compact", inProviderSession: ACPCompactFixtures.sessionID))
     }
 
+    /// A resumed Devin session refuses any prompt whose request cannot apply its permission level
+    /// (#1029). The command is checked against the run's current request, like an ordinary prompt,
+    /// not the one the session was opened with.
+    func testAResumedDevinCommandIsCheckedAgainstTheCurrentRequest() async throws {
+        let directory = try ACPCompactFixtures.makeTemporaryDirectory(tracking: &temporaryURLs)
+        let scriptURL = try AgentSessionLinkACPServerScript.write(to: directory)
+        let promptLog = directory.appendingPathComponent("prompts.jsonl")
+        let provider = AgentSessionLinkCapturingACPProvider(
+            providerID: .devin,
+            commandPath: scriptURL.path,
+            environment: [
+                "ACP_LOAD": "1",
+                "ACP_ADVERTISE_COMMANDS": "compact",
+                "ACP_PROMPT_LOG": promptLog.path
+            ]
+        )
+        func request(sessionModeID: String?) -> ACPRunRequest {
+            ACPRunRequest(
+                agentKind: .devin,
+                modelString: nil,
+                workspacePath: directory.path,
+                resumeSessionID: "resumed-devin",
+                attachments: [],
+                taskLabelKind: nil,
+                sessionModeID: sessionModeID
+            )
+        }
+        // Opened while an applicable permission level was selected.
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request(sessionModeID: "ask"))
+        controllers.append(controller)
+        _ = try await controller.bootstrap()
+        try await AsyncTestWait.waitUntil("the load advertisement to be captured") {
+            controller.advertisesCommand("compact", inProviderSession: "resumed-devin")
+        }
+
+        do {
+            try await controller.promptAdvertisedCommand(
+                "compact",
+                expectedSessionID: "resumed-devin",
+                request: request(sessionModeID: nil)
+            )
+            XCTFail("The current selection cannot be applied to the resumed session, so the command must be refused")
+        } catch let refusal as ACPAgentSessionController.ProviderCommandRefusal {
+            XCTAssertTrue(refusal.sessionIsUsable)
+        }
+        XCTAssertEqual(try ACPCompactFixtures.loggedPrompts(at: promptLog), [], "Nothing was written")
+
+        try await controller.promptAdvertisedCommand(
+            "compact",
+            expectedSessionID: "resumed-devin",
+            request: request(sessionModeID: "ask")
+        )
+        XCTAssertEqual(try ACPCompactFixtures.loggedPrompts(at: promptLog), [ACPCompactFixtures.bareCompactPrompt])
+    }
+
     func testShutdownDropsTheAdvertisement() async throws {
         let fixture = try await makeBootstrappedController(environment: ["ACP_ADVERTISE_COMMANDS": "compact"])
         try await waitForAdvertisement(fixture.controller)
