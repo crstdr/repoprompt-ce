@@ -4,13 +4,14 @@ import SwiftUI
 /// The running row's spinning arc, animated by the render server instead of SwiftUI.
 ///
 /// A SwiftUI `repeatForever` rotation is interpolated on the main thread: every frame re-renders the
-/// row's whole window hosting view, lays the window out, and commits its layer tree, so each visible
-/// window with a running row paid a per-frame main-thread cost that scaled with its sidebar and
-/// transcript rather than with the 15 pt arc. A `CABasicAnimation` on the arc's own shape layer is
-/// run by the render server, so the main thread does no per-frame work while it spins.
+/// row's whole window hosting view, lays the window out, and commits its layer tree, so every window
+/// with a running row paid a per-frame main-thread cost that scaled with its sidebar and transcript
+/// rather than with the 15 pt arc. A `CABasicAnimation` on the arc's own shape layer is run by the
+/// render server, so the main thread does no per-frame work while it spins.
 ///
-/// Geometry matches the still `Circle().trim(from: 0, to: 0.7).stroke(lineWidth: 1.5, lineCap: .round)`
-/// in a 15 pt frame, so swapping between the two presentations never moves the row.
+/// It keeps the SwiftUI arc's geometry, colour and motion: `Circle().trim(from: 0, to: 0.7)` stroked
+/// 1.5 pt wide with round caps, at 0.75 of the tint's opacity, in a 15 pt frame, turning clockwise
+/// once a second.
 struct AgentRowAnimatedActivityArc: NSViewRepresentable {
     var tint: Color
 
@@ -71,6 +72,12 @@ final class AgentRowActivityArcLayerView: NSView {
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: Self.diameter, height: Self.diameter)
+    }
+
+    /// Decorative, like the SwiftUI shape it replaces: clicks go through to the plate's chevron and the
+    /// row, independently of the call site's `.allowsHitTesting(false)`.
+    override func hitTest(_: NSPoint) -> NSView? {
+        nil
     }
 
     override func layout() {
@@ -151,14 +158,17 @@ final class AgentRowActivityArcLayerView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         arcLayer.frame = bounds
-        // Stroked on the bounds' inscribed circle, like SwiftUI's `Circle().stroke` in its frame.
-        arcLayer.path = CGPath(ellipseIn: bounds, transform: nil)
+        // Stroked on the inscribed circle, like SwiftUI's `Circle().stroke` in its frame.
+        arcLayer.path = CGPath(ellipseIn: arcLayer.bounds, transform: nil)
         CATransaction.commit()
     }
 
-    /// Resolves the (possibly dynamic) tint against this view's appearance, at the still arc's opacity.
+    /// Resolves the (possibly dynamic) tint against this view's appearance, at the SwiftUI arc's
+    /// opacity. AppKit reports accent-colour changes, as well as light and dark ones, through
+    /// `viewDidChangeEffectiveAppearance`, which calls this again, so the arc follows them the way
+    /// SwiftUI's `Color.accentColor` does.
     private func updateStrokeColor() {
-        var resolved = tint.withAlphaComponent(tint.alphaComponent * Self.strokeOpacity).cgColor
+        var resolved: CGColor?
         effectiveAppearance.performAsCurrentDrawingAppearance {
             resolved = self.tint.withAlphaComponent(self.tint.alphaComponent * Self.strokeOpacity).cgColor
         }

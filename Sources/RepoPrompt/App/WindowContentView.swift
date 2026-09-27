@@ -28,6 +28,7 @@ struct WindowContentView: View {
     var body: some View {
         ContentView(windowState: windowState)
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
+            .debugBuildWindowEdge()
             .environmentObject(windowState) // If your subviews need it
             // Presentation-only visibility for decorative animations, above the sidebar and detail.
             .environment(\.windowIsPresentationVisible, windowState.isPresentationVisible)

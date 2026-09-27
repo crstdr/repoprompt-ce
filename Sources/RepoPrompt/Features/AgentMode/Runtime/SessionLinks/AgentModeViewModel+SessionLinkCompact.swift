@@ -260,9 +260,11 @@ extension AgentModeViewModel {
                 isStillAdmissible: { [weak self] in
                     guard let self else { return false }
                     let current = liveness()
-                    guard agentSessionLinkLiveSession(matching: candidate) === liveSession,
+                    guard !Task.isCancelled,
+                          agentSessionLinkLiveSession(matching: candidate) === liveSession,
                           current.permitsDelivery,
-                          composerSubmitClaimIsCurrent(claim)
+                          composerSubmitClaimIsCurrent(claim),
+                          workspaceManager?.activeWorkspace?.id == candidate.workspaceID
                     else { return false }
                     return AgentSessionLinkDeliveryReadiness.evaluate(
                         snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(

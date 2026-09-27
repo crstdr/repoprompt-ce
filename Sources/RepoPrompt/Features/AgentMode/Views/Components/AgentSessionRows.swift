@@ -1620,7 +1620,7 @@ struct AgentStashedSessionRow: View {
 /// - Read as "actively processing" without competing with the green waiting
 ///   dot — running is informational, waiting is actionable, so running
 ///   should not out-shout it.
-private struct AgentRowActivityArc: View {
+struct AgentRowActivityArc: View {
     var tint: Color = .accentColor
 
     var body: some View {

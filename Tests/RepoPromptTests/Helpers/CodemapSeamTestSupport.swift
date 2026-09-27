@@ -58,6 +58,8 @@ final class CodemapStoreFixture: @unchecked Sendable {
     init(
         name: String,
         capabilityHooks: WorkspaceCodemapRootCapabilityServiceHooks = .none,
+        enginePolicy: WorkspaceCodemapBindingEnginePolicy = .default,
+        graphPullPause: WorkspaceCodemapGraphPullPause = .production,
         forbidCodeMapGitProcesses: Bool = false,
         beforeArtifactBuild: @escaping @Sendable (String) async -> Void = { _ in }
     ) throws {
@@ -134,7 +136,9 @@ final class CodemapStoreFixture: @unchecked Sendable {
                             gitService: codeMapGitService
                         ),
                         sourceReader: registry.makeValidatedSourceReaderClient(),
-                        catalogClient: registry.makeBindingCatalogClient()
+                        catalogClient: registry.makeBindingCatalogClient(),
+                        policy: enginePolicy,
+                        graphPullPause: graphPullPause
                     )
                 }
             ))

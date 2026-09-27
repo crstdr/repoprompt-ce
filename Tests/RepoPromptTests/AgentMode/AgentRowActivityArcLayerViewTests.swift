@@ -8,17 +8,14 @@ import XCTest
 /// layer, not a SwiftUI `repeatForever` that re-renders the whole window every frame on main.
 @MainActor
 final class AgentRowActivityArcLayerViewTests: XCTestCase {
-    func testVisibleRunningIndicatorSpinsWithARenderServerRotation() throws {
-        let visible = hostIndicator(isWindowPresentationVisible: true)
-        let hidden = hostIndicator(isWindowPresentationVisible: false)
-        defer {
-            visible.window.close()
-            hidden.window.close()
-        }
+    func testRunningArcSpinsWithARenderServerRotation() throws {
+        let hosted = hostRunningArc()
+        defer { hosted.window.close() }
 
-        let arcs = arcViews(in: visible.host)
-        XCTAssertEqual(arcs.count, 1, "the visible running row renders the layer-backed arc")
+        let arcs = arcViews(in: hosted.host)
+        XCTAssertEqual(arcs.count, 1, "the running row's arc is the layer-backed arc")
         let arc = try XCTUnwrap(arcs.first)
+        XCTAssertEqual(arc.bounds.size, CGSize(width: 15, height: 15), "the arc keeps its 15 pt frame")
         let rotation = try XCTUnwrap(
             arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey) as? CABasicAnimation,
             "the rotation is a Core Animation layer animation"
@@ -30,7 +27,19 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(rotation.toValue as? CGFloat), 2 * .pi, accuracy: 1e-9)
         XCTAssertEqual(rotation.timingFunction, CAMediaTimingFunction(name: .linear))
         XCTAssertFalse(rotation.isRemovedOnCompletion)
+    }
 
+    /// A hidden window keeps no layer arc at all: `AgentRowRunningIndicator` swaps to the still
+    /// shape so no window commit ever has to walk a live animation.
+    func testHiddenWindowKeepsNoAnimation() {
+        let visible = hostIndicator(isWindowPresentationVisible: true)
+        let hidden = hostIndicator(isWindowPresentationVisible: false)
+        defer {
+            visible.window.close()
+            hidden.window.close()
+        }
+
+        XCTAssertEqual(arcViews(in: visible.host).count, 1, "the visible running row renders the layer-backed arc")
         XCTAssertTrue(arcViews(in: hidden.host).isEmpty, "a hidden window keeps no animation at all")
     }
 
@@ -40,7 +49,7 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
     /// effectively y-down on screen, its identical path runs clockwise, and a positive
     /// `transform.rotation.z` turns it clockwise.
     func testHostedArcRunsAndSpinsClockwiseLikeTheSwiftUIArc() throws {
-        let hosted = hostIndicator(isWindowPresentationVisible: true)
+        let hosted = hostRunningArc()
         defer { hosted.window.close() }
         let arc = try XCTUnwrap(arcViews(in: hosted.host).first)
         arc.layoutSubtreeIfNeeded()
@@ -68,7 +77,7 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         XCTAssertLessThan(rotatedStart.y, start.y, "a positive rotation turns 3 o'clock downward: clockwise")
     }
 
-    func testArcGeometryMatchesTheStillArc() {
+    func testArcGeometryMatchesTheSwiftUIArc() {
         let arc = AgentRowActivityArcLayerView(frame: NSRect(x: 0, y: 0, width: 15, height: 15))
         arc.layout()
 
@@ -102,24 +111,44 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         XCTAssertNil(arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey))
     }
 
-    func testTintIsStrokedAtTheStillArcOpacity() throws {
+    func testTintIsStrokedAtTheSwiftUIArcOpacity() throws {
         let arc = AgentRowActivityArcLayerView(frame: NSRect(x: 0, y: 0, width: 15, height: 15))
         arc.tint = NSColor(srgbRed: 1, green: 0.5, blue: 0, alpha: 1)
 
-        let stroke = try XCTUnwrap(arc.arcLayer.strokeColor)
-        XCTAssertEqual(stroke.alpha, 0.75, accuracy: 0.001)
-        let components = try XCTUnwrap(try stroke.converted(
-            to: XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB)),
-            intent: .defaultIntent,
-            options: nil
-        )?.components)
-        XCTAssertEqual(components[0], 1, accuracy: 0.01)
-        XCTAssertEqual(components[1], 0.5, accuracy: 0.01)
-        XCTAssertEqual(components[2], 0, accuracy: 0.01)
+        XCTAssertEqual(try strokeComponents(of: arc), [1, 0.5, 0, 0.75])
+    }
+
+    /// AppKit reports accent-colour as well as light and dark changes through
+    /// `viewDidChangeEffectiveAppearance`; the stroke re-resolves the dynamic tint there, the way
+    /// SwiftUI re-resolves `Color.accentColor`.
+    func testAppearanceChangeReResolvesTheDynamicTint() throws {
+        let arc = AgentRowActivityArcLayerView(frame: NSRect(x: 0, y: 0, width: 15, height: 15))
+        arc.appearance = NSAppearance(named: .aqua)
+        arc.tint = NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)
+                : NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1)
+        }
+        XCTAssertEqual(try strokeComponents(of: arc), [1, 0, 0, 0.75])
+
+        arc.appearance = NSAppearance(named: .darkAqua)
+        XCTAssertEqual(try strokeComponents(of: arc), [0, 0, 1, 0.75])
+    }
+
+    /// Decorative, like the SwiftUI shape it replaces: clicks on the arc reach the plate and the row.
+    func testArcIsTransparentToClicks() throws {
+        let hosted = hostRunningArc()
+        defer { hosted.window.close() }
+        let arc = try XCTUnwrap(arcViews(in: hosted.host).first)
+        let center = NSPoint(x: arc.bounds.midX, y: arc.bounds.midY)
+
+        XCTAssertNil(arc.hitTest(arc.convert(center, to: arc.superview)))
+        XCTAssertFalse(hosted.host.hitTest(arc.convert(center, to: hosted.host.superview)) is AgentRowActivityArcLayerView)
     }
 
     // MARK: - Helpers
 
+    /// The row's mode-resolving indicator, hosted with an explicit window-visibility override.
     private func hostIndicator(
         isWindowPresentationVisible: Bool
     ) -> (host: NSHostingView<AnyView>, window: NSWindow) {
@@ -127,6 +156,15 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
             AgentRowRunningIndicator()
                 .environment(\.windowIsPresentationVisible, isWindowPresentationVisible)
         ))
+        let window = makeWindow()
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        return (host, window)
+    }
+
+    /// The sidebar row's own running arc, hosted in a window the way the row hosts it.
+    private func hostRunningArc() -> (host: NSHostingView<AgentRowActivityArc>, window: NSWindow) {
+        let host = NSHostingView(rootView: AgentRowActivityArc())
         let window = makeWindow()
         window.contentView = host
         host.layoutSubtreeIfNeeded()
@@ -142,6 +180,14 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         )
         window.isReleasedWhenClosed = false
         return window
+    }
+
+    /// The stroke's sRGB components, alpha last, rounded so equal colours compare equal.
+    private func strokeComponents(of arc: AgentRowActivityArcLayerView) throws -> [CGFloat] {
+        let stroke = try XCTUnwrap(arc.arcLayer.strokeColor)
+        let sRGB = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        let components = try XCTUnwrap(stroke.converted(to: sRGB, intent: .defaultIntent, options: nil)?.components)
+        return components.map { ($0 * 100).rounded() / 100 }
     }
 
     private func pathPoints(_ path: CGPath) -> [CGPoint] {

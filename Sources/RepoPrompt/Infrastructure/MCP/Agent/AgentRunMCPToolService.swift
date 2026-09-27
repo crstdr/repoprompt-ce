@@ -1525,7 +1525,7 @@ struct AgentRunMCPToolService {
         )
         let interactionID = try requireUUID(args["interaction_id"], name: "interaction_id")
         let workflow = try resolveWorkflow(args: args)
-        let payload = try parseResponsePayload(args: args)
+        let payload = try Self.parseResponsePayload(args: args)
         let dispatch = try await agentModeVM.mcpResolvePendingInteraction(
             sessionID: sessionID,
             interactionID: interactionID,
@@ -2947,7 +2947,8 @@ struct AgentRunMCPToolService {
         let hasNormalizedFieldNames: Bool
     }
 
-    private func parseResponsePayload(args: [String: Value]) throws -> AgentModeViewModel.MCPInteractionResponsePayload {
+    /// Shared with `agent_session_link respond`, so both surfaces accept exactly the same answers.
+    static func parseResponsePayload(args: [String: Value]) throws -> AgentModeViewModel.MCPInteractionResponsePayload {
         let parsedAnswers: ParsedAnswers = if let rawAnswers = args["answers"] {
             try parseAnswers(rawAnswers)
         } else {
@@ -2968,7 +2969,7 @@ struct AgentRunMCPToolService {
         case .some:
             .nonScalar
         }
-        let responseRaw = normalizedString(args["response"])
+        let responseRaw = payloadNormalizedString(args["response"])
         let explicitSkip: Bool
         if let skipValue = args["skip"] {
             guard let skipBool = skipValue.boolValue else {
@@ -2996,7 +2997,7 @@ struct AgentRunMCPToolService {
             skip: isSkip,
             explicitSkip: explicitSkip,
             responseArgument: responseArgument,
-            amendment: normalizedString(args["amendment"]),
+            amendment: payloadNormalizedString(args["amendment"]),
             answerValueShapesByQuestionID: parsedAnswers.valueShapes,
             hasNormalizedAnswerFieldNames: parsedAnswers.hasNormalizedFieldNames,
             answersByQuestionID: parsedAnswers.flat,
@@ -3008,7 +3009,7 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func parseAgentJSONObject(_ value: Value?, name: String) throws -> [String: AgentJSONValue] {
+    private static func parseAgentJSONObject(_ value: Value?, name: String) throws -> [String: AgentJSONValue] {
         guard let value else { return [:] }
         guard let object = value.objectValue else {
             throw MCPError.invalidParams("\(name) must be an object.")
@@ -3018,7 +3019,7 @@ struct AgentRunMCPToolService {
         }
     }
 
-    private func agentJSONValue(from value: Value) throws -> AgentJSONValue {
+    private static func agentJSONValue(from value: Value) throws -> AgentJSONValue {
         switch value {
         case .null:
             return .null
@@ -3041,7 +3042,7 @@ struct AgentRunMCPToolService {
         }
     }
 
-    private func parseAnswers(_ value: Value) throws -> ParsedAnswers {
+    private static func parseAnswers(_ value: Value) throws -> ParsedAnswers {
         guard let object = value.objectValue else {
             throw MCPError.invalidParams("answers must be an object keyed by question ID.")
         }
@@ -3082,7 +3083,7 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func parseAnswerValue(_ value: Value, questionID: String) throws -> AgentAskUserAnswer {
+    private static func parseAnswerValue(_ value: Value, questionID: String) throws -> AgentAskUserAnswer {
         if let answer = value.stringValue {
             return AgentAskUserAnswer(
                 answers: [answer],
@@ -3109,7 +3110,7 @@ struct AgentRunMCPToolService {
             answerObject["selected_options"] ?? answerObject["selectedOptions"],
             name: "answers['\(questionID)'].selected_options"
         ) ?? []
-        let customResponse = normalizedString(answerObject["custom_response"] ?? answerObject["customResponse"])
+        let customResponse = payloadNormalizedString(answerObject["custom_response"] ?? answerObject["customResponse"])
         let explicitAnswers = try parseOptionalAnswerStrings(
             answerObject["answers"],
             name: "answers['\(questionID)'].answers"
@@ -3137,7 +3138,7 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func parseOptionalAnswerStrings(_ value: Value?, name: String) throws -> [String]? {
+    private static func parseOptionalAnswerStrings(_ value: Value?, name: String) throws -> [String]? {
         guard let value else { return nil }
         if let answer = value.stringValue {
             return [answer]
@@ -3148,13 +3149,18 @@ struct AgentRunMCPToolService {
         return try parseAnswerStringArray(answerArray, name: name)
     }
 
-    private func parseAnswerStringArray(_ values: [Value], name: String) throws -> [String] {
+    private static func parseAnswerStringArray(_ values: [Value], name: String) throws -> [String] {
         try values.map { element -> String in
             guard let text = element.stringValue else {
                 throw MCPError.invalidParams("\(name) must contain only strings.")
             }
             return text
         }
+    }
+
+    private static func payloadNormalizedString(_ value: Value?) -> String? {
+        let trimmed = value?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Resolves session_id for control operations (poll/wait/cancel/steer/respond).

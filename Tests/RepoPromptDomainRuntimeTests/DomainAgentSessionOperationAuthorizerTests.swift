@@ -149,6 +149,10 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             // Observer-local admission policy, so it needs the read grant it already holds over the
             // lane and nothing stronger.
             .monitorSnoozeAutoWake: .poll,
+            // Acting for the user in the target needs the user's explicit management delegation.
+            .monitorGetInteraction: .manage,
+            .monitorRespond: .manage,
+            .monitorSteer: .manage,
             // A compaction starts a provider turn on an idle target exactly as a send does, so it
             // needs the send grant and nothing new.
             .monitorCompact: .sendWhenIdle,
@@ -331,7 +335,9 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             [
                 "agent_session_link.list", "agent_session_link.poll", "agent_session_link.wait",
                 "agent_session_link.read", "agent_session_link.send",
-                "agent_session_link.snooze_auto_wake", "agent_session_link.compact",
+                "agent_session_link.snooze_auto_wake",
+                "agent_session_link.get_interaction", "agent_session_link.respond",
+                "agent_session_link.steer", "agent_session_link.compact",
             ]
         )
         for operation in sessionControlOperations where operation.requiredMonitorCapability != nil {
@@ -353,6 +359,22 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .poll
         )
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorSnoozeAutoWake.family, .monitor)
+        // Management: inspection reads, answering and steering mutate, and none is observer-scoped.
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorGetInteraction.mutatesTarget)
+        XCTAssertTrue(DomainAgentSessionTargetOperation.monitorRespond.mutatesTarget)
+        XCTAssertTrue(DomainAgentSessionTargetOperation.monitorSteer.mutatesTarget)
+        for operation in [
+            DomainAgentSessionTargetOperation.monitorGetInteraction, .monitorRespond, .monitorSteer
+        ] {
+            XCTAssertFalse(operation.isObserverScoped, operation.rawValue)
+            XCTAssertEqual(operation.requiredMonitorCapability, .manage, operation.rawValue)
+        }
+        // A watch grant never implies management, and management is never part of version 1.
+        XCTAssertFalse(DomainAgentSessionLinkCapability.version1.contains(.manage))
+        XCTAssertEqual(
+            DomainAgentSessionLinkCapability.managed,
+            DomainAgentSessionLinkCapability.version1.union([.manage])
+        )
         // Compaction mutates the target's provider context, is target-scoped, and borrows the send
         // grant rather than introducing a new capability.
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorCompact.mutatesTarget)
