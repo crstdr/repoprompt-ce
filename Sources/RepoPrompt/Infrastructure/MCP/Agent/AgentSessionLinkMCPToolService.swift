@@ -111,33 +111,7 @@ struct AgentSessionLinkMCPToolService {
     // MARK: - Entry point
 
     func execute(args: [String: Value]) async throws -> Value {
-        let value = try await executeOperation(args: args)
-        return await attachingCapabilityNotices(to: value)
-    }
-
-    /// Adds every capability-change notice still owed to the calling observer endpoint.
-    ///
-    /// Every structured result is a delivery channel, including refusals such as
-    /// `management_not_granted`: that is exactly where a model that is still reasoning from older
-    /// capabilities needs the correction. Claimed after the operation settled, so the notice describes
-    /// authority no older than the result beside it. A thrown MCP error carries nothing and leaves the
-    /// notice owed; a caller that cannot be resolved as an exact endpoint is never handed one.
-    private func attachingCapabilityNotices(to value: Value) async -> Value {
-        guard case var .object(payload) = value,
-              !Task.isCancelled,
-              let observerEndpoint = try? await resolveCallerEndpointIdentity()
-        else {
-            return value
-        }
-        let notices = await bridge.takeCapabilityNotices(forObserverEndpoint: observerEndpoint)
-        guard !notices.isEmpty else { return value }
-        // A parked wait may already have claimed and rendered the notice that woke it. A later
-        // change can arrive while this result is being wrapped; combine rather than replace it.
-        payload["capability_notice"] = AgentSessionLinkResponseRenderer.capabilityNoticeValue(
-            notices,
-            merging: payload["capability_notice"]
-        )
-        return .object(payload)
+        try await executeOperation(args: args)
     }
 
     private func executeOperation(args: [String: Value]) async throws -> Value {
@@ -685,15 +659,10 @@ struct AgentSessionLinkMCPToolService {
             // Read after the wait resumes, so a queued send that drained while this call was parked
             // reports its terminal outcome rather than the pending entry it had on entry.
             let pendingSends = await bridge.pendingSendProjections(for: leases)
-            // The authority claimed the notices a capability wake was for in the same actor turn that
-            // woke it; anything recorded since rides the same result rather than a later one.
-            let capabilityNotices = await waitResult.capabilityNotices
-                + bridge.takeCapabilityNotices(forObserverEndpoint: observerEndpoint)
             return AgentSessionLinkResponseRenderer.waitValue(
                 waitResult,
                 pendingSends: pendingSends,
-                isSingle: isSingle,
-                capabilityNotices: capabilityNotices
+                isSingle: isSingle
             )
         }
     }
@@ -2018,42 +1987,10 @@ enum AgentSessionLinkResponseRenderer {
         }
     }
 
-    /// The `capability_notice` field: the shared RepoPrompt-authored correction plus one row per
-    /// changed link. Names only sessions the exact caller endpoint holds a grant for.
-    static func capabilityNoticeValue(
-        _ notices: [DomainAgentSessionLinkCapabilityNotice],
-        merging existing: Value? = nil
-    ) -> Value {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        // The wait's already-claimed notices precede any notices claimed while wrapping its result.
-        // A later toggle of the same link supersedes the earlier state; changes on other links must
-        // all survive. These rows are rendered by RepoPrompt, never parsed from a provider response.
-        let changes = (existing?.objectValue?["changes"]?.arrayValue ?? []) + notices.map { notice in
-            Value.object([
-                "session_id": .string(notice.targetSessionID.uuidString),
-                "managed": .bool(notice.managed),
-                "management_operations": .string(notice.managed ? "available" : "withdrawn"),
-                "changed_at": .string(formatter.string(from: notice.changedAt))
-            ])
-        }
-        var seenSessionIDs = Set<String>()
-        let latestChanges = Array(changes.reversed().filter { change in
-            guard let sessionID = change.objectValue?["session_id"]?.stringValue else { return false }
-            return seenSessionIDs.insert(sessionID).inserted
-        }.reversed())
-        return .object([
-            "notice": .string(AgentSessionLinkPrompts.capabilityChangeNoticeText),
-            "changes": .array(latestChanges)
-        ])
-    }
-
     static func waitValue(
         _ result: DomainAgentSessionLinkWaitResult,
         pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:],
-        isSingle: Bool,
-        capabilityNotices: [DomainAgentSessionLinkCapabilityNotice] = []
+        isSingle: Bool
     ) -> Value {
         var payload: [String: Value] = [
             "notice": .string(AgentSessionLinkMCPToolService.untrustedContentNotice),
@@ -2064,9 +2001,6 @@ enum AgentSessionLinkResponseRenderer {
         ]
         if let detail = waitDetail(result.outcome) {
             payload["detail"] = .string(detail)
-        }
-        if !capabilityNotices.isEmpty {
-            payload["capability_notice"] = capabilityNoticeValue(capabilityNotices)
         }
         if isSingle {
             if let state = result.targets.first {
@@ -2107,8 +2041,6 @@ enum AgentSessionLinkResponseRenderer {
             "cursor_expired"
         case .invalidRequest:
             "invalid_request"
-        case .capabilitiesChanged:
-            "capabilities_changed"
         }
     }
 
@@ -2137,11 +2069,6 @@ enum AgentSessionLinkResponseRenderer {
             "Oversight of \(sessionID.uuidString) is no longer available."
         case let .cursorExpired(sessionID):
             "The wait cursor for \(sessionID.uuidString) expired. Poll that session again."
-        case let .capabilitiesChanged(sessionID):
-            "Your user changed what you may do with \(sessionID.uuidString) while you waited. "
-                + "`capability_notice` (here, or already delivered in this turn) states what you may "
-                + "do now and replaces anything said earlier, including your own earlier refusals. "
-                + "No target change was consumed, so you may wait again with the returned cursors."
         case .changed, .idle, .timedOut, .cancelled, .shuttingDown, .invalidRequest:
             nil
         }

@@ -142,10 +142,13 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let operations = try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue)
             .compactMap(\.stringValue)
         XCTAssertTrue(operations.contains("steer"))
+        XCTAssertFalse(definition.description.contains("capability_notice"))
+        XCTAssertFalse(definition.description.contains("capabilities_changed"))
         for invariant in [
             "`get_interaction`, `respond`, and `steer` require the `manage` capability",
-            "the newest inventory and each result’s `managed` field are current and replace anything said earlier",
-            "arrives as `capability_notice` on your next result or as a `wait` that returns `capabilities_changed`",
+            "New oversight links include it by default",
+            "an existing live link keeps the capabilities its current grant actually has",
+            "each result’s `managed` field report that grant",
             "Without `manage` it returns `management_not_granted` and no payload",
             "exactly the current `interaction_id`",
             "`accept` (this request only)",

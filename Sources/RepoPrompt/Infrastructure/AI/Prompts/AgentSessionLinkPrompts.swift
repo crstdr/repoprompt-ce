@@ -57,7 +57,7 @@ enum AgentSessionLinkPrompts {
     /// watch-only link still leaves prompts for the target's user. Because an observer taught the
     /// older wording may have refused on its strength, the full block now says outright that it is
     /// superseded, including the observer's own earlier refusals.
-    /// Revision 8 adds watch-level native compaction under send_when_idle; management stays opt-in.
+    /// Revision 8 adds watch-level native compaction under send_when_idle.
     static let currentLaneGuidanceRevision: UInt64 = 8
 
     /// How much of the lane-update trust guidance one render must carry.
@@ -683,36 +683,6 @@ enum AgentSessionLinkPrompts {
         return "<session \(attributes) />"
     }
 
-    // MARK: Capability-change notice
-
-    static let capabilityChangeEnvelopeTag = "repoprompt_session_oversight_capability_change"
-
-    /// What a running overseer is told when its user changes management mid-session.
-    ///
-    /// One text for every channel (a steered notice, a `capability_notice` tool-result field, a woken
-    /// `wait`), so the model reads the same correction however it arrives. Leads with authorship
-    /// because a steered notice reaches the provider as input and must never read as the user's own
-    /// words. Says "not a task" because it can arrive in the middle of the user's own request, and
-    /// "continue what the instructions still require" so it cannot read as license to abandon it.
-    static let capabilityChangeNoticeText =
-        "RepoPrompt notice, not a message from your user: your user just changed what you may do with the overseen session listed here. This replaces anything said earlier in this conversation about that session \u{2014} by RepoPrompt or by you, including refusals you gave based on older capabilities. `managed=true`: your user delegated management, so `get_interaction`, `respond`, and `steer` on that session are available to you now, under your own user's instructions. `managed=false`: management was withdrawn, so do not answer that session's prompts or steer it; observe, send, and request native compaction under the usual preconditions. This notice is not a task and grants nothing beyond the listed change: do not start new work because of it, and continue what your user's instructions still require with these capabilities."
-
-    /// The provider-bound notice steered into a running turn. RepoPrompt-authored and attributed as
-    /// such; it names only sessions this exact observer holds a grant for.
-    static func capabilityChangeNotice(_ notices: [DomainAgentSessionLinkCapabilityNotice]) -> String {
-        let rows = notices.map { notice in
-            "<session id=\"\(escaped(notice.targetSessionID.uuidString))\" managed=\"\(notice.managed ? "true" : "false")\" "
-                + "changed_at=\"\(observedAtFormatter.string(from: notice.changedAt))\" />"
-        }
-        let revision = notices.map(\.observerLinkSetRevision).max() ?? 0
-        return """
-        <\(capabilityChangeEnvelopeTag) authored_by="RepoPrompt" from_user="false" revision="\(revision)">
-        <guidance>\(escaped(capabilityChangeNoticeText))</guidance>
-        \(rows.joined(separator: "\n"))
-        </\(capabilityChangeEnvelopeTag)>
-        """
-    }
-
     // MARK: Revocation supplement
 
     private static func revocationSupplement(revision: UInt64, toolReference: String) -> String {
@@ -773,11 +743,8 @@ enum AgentSessionLinkPrompts {
 
     private static func guidance(toolReference: String) -> String {
         var lines = [
-            // First on purpose: a mid-session grant or withdrawal of management re-owes this block,
-            // and the model must read the correction before anything it concluded from older text.
             "Current capabilities: this block replaces every earlier statement in this conversation about which sessions you oversee and what you may do with them, including any refusal you gave based on older capabilities. `managed=\"true\"` means your user delegated management of that session to you now; `managed=\"false\"` means you may not answer its prompts or steer it.",
-            "Your user can turn management on or off while you work. RepoPrompt then tells you at once where it can: a `capability_notice` on your next `\(toolReference)` result, a `wait` that returns `capabilities_changed`, or a `<\(capabilityChangeEnvelopeTag)>` notice inside your running turn. Treat it as this block: it replaces what you were told before, and it is not a task.",
-            "The user granted this session observation of the Agent sessions listed below plus the ability to send one attributed message to an idle one or request native context compaction of a fully idle, send-ready one. On a session listed with capability `manage` (`managed=\"true\"`) the user also delegated management: you act for the user in that session — inspect and answer its prompts, steer its running turns, and give it new instructions. This session is their observer, also called their overseer. Use `\(toolReference)` for all of it; it is the only oversight surface you have."
+            "The user granted this session observation of the Agent sessions listed below plus the ability to send one attributed message to an idle one or request native context compaction of a fully idle, send-ready one. New links include capability `manage` (`managed=\"true\"`), delegating management of that exact session: you act for the user in that session — inspect and answer its prompts, steer its running turns, and give it new instructions. This session is their observer, also called their overseer. Use `\(toolReference)` for all of it; it is the only oversight surface you have."
         ]
         lines.append(contentsOf: hostNamingGuidance(toolReference: toolReference))
         // The trust/authority frame comes before the operation list on purpose: it is what bounds

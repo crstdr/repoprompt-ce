@@ -378,6 +378,14 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
         restored = await isRestored(fixture)
         XCTAssertTrue(restored)
+        let restoredInventory = await fixture.authority.links(forObserverEndpoint: observer.domainEndpoint)
+        XCTAssertEqual(restoredInventory.items.first?.capabilities, DomainAgentSessionLinkCapability.managed)
+        let managedLease = try await fixture.authority.authorize(
+            operation: .monitorRespond,
+            observerEndpoint: observer.domainEndpoint,
+            targetSessionID: target.sessionID
+        ).get()
+        XCTAssertEqual(managedLease.capability, .manage, "restoration follows the same managed Add path")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
         XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
     }
