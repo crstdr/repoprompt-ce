@@ -888,11 +888,12 @@ final class ACPIntegratedAgentModeRunner {
                 // A controller that can no longer run turns is retired as after any failed turn, even
                 // when the turn was a control command that never got as far as sending.
                 guard await controller.hasReusableSession else {
-                    return .failed(
-                        errorText: providerControlCommand == nil
-                            ? "\(runRequest.agentKind.displayName) ACP session is no longer reusable."
-                            : "\(runRequest.agentKind.displayName) ACP session is no longer reusable, so the requested command was not run."
-                    )
+                    guard providerControlCommand != nil else {
+                        return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
+                    }
+                    // A control command retires a controller that can never run another turn, as after
+                    // any failed turn, but leaves one that is merely busy alone.
+                    return await Self.controlCommandUnreusableOutcome(controller: controller, runRequest: runRequest)
                 }
 
                 // A control command runs in the session exactly as it is: applying the run's model or
@@ -1075,6 +1076,18 @@ final class ACPIntegratedAgentModeRunner {
     /// identity facts are re-proven here, and the controller re-proves its own (open, idle, same
     /// provider session, still advertised) in the same synchronous step as the write. A refusal from
     /// either sent nothing and leaves the controller in place.
+    /// A control command's controller that cannot take a turn now: retired as after any failed turn
+    /// when it can never run another, left in place (nothing was sent) when it is merely busy.
+    private static func controlCommandUnreusableOutcome(
+        controller: ACPAgentSessionController,
+        runRequest: ACPRunRequest
+    ) async -> TransientOperationResult {
+        let displayName = runRequest.agentKind.displayName
+        return await controller.isRetired
+            ? .failed(errorText: "\(displayName) ACP session is no longer reusable, so the requested command was not run.")
+            : .refusedBeforeSend(errorText: "\(displayName) ACP session was busy, so the requested command was not run.")
+    }
+
     private func runProviderControlCommandTurn(
         session: AgentTabSession,
         runID: UUID,
@@ -1091,9 +1104,7 @@ final class ACPIntegratedAgentModeRunner {
         setRunningStatus(statusText, source: .transport, session: session, urgent: true)
 
         guard await controller.prepareForNextTurn() else {
-            return .failed(
-                errorText: "\(displayName) ACP session is no longer reusable, so the requested command was not run."
-            )
+            return await Self.controlCommandUnreusableOutcome(controller: controller, runRequest: runRequest)
         }
         let events = await controller.events
         let consumeTask = Task { @MainActor [weak self, weak session] in
@@ -1150,7 +1161,8 @@ final class ACPIntegratedAgentModeRunner {
             log("controller.promptAdvertisedCommand begin", runID: runID)
             try await controller.promptAdvertisedCommand(
                 command.kind.rawValue,
-                expectedSessionID: command.expectedProviderConversation
+                expectedSessionID: command.expectedProviderConversation,
+                request: runRequest
             )
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)

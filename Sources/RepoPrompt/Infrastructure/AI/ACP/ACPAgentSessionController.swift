@@ -678,8 +678,14 @@ actor ACPAgentSessionController {
     /// attachment, or provider framing can wrap it, and no model-parameter admission applies. Every
     /// check runs synchronously on the actor immediately before the write — there is no suspension
     /// between them and `session/prompt` leaving the process — so a refusal guarantees nothing was
-    /// sent. Turn completion, terminal events, and failure handling are `prompt`'s.
-    func promptAdvertisedCommand(_ name: String, expectedSessionID: String) async throws {
+    /// sent. Turn completion, terminal events, and failure handling are `prompt`'s. `request` is the
+    /// run's current request, exactly as an ordinary prompt passes it, so request-level admission sees
+    /// the same current selections the target's next ordinary turn would.
+    func promptAdvertisedCommand(
+        _ name: String,
+        expectedSessionID: String,
+        request overrideRunRequest: ACPRunRequest? = nil
+    ) async throws {
         // The caller's run may have been cancelled during the hop onto this actor.
         guard !Task.isCancelled else { throw ProviderCommandCancelledBeforeSend() }
         // `.promptRunning` passes this first guard on purpose: busy is not dead, and the second guard
@@ -700,13 +706,18 @@ actor ACPAgentSessionController {
             )
         }
         // A resumed Devin session whose permission level cannot be applied refuses every prompt; the
-        // command is refused the same way, before anything is written.
+        // command is refused the same way, against the same current request, before anything is
+        // written.
         do {
-            try validateResumedSessionPermissionPolicy(effectivePromptRunRequest(override: nil))
+            try validateResumedSessionPermissionPolicy(effectivePromptRunRequest(override: overrideRunRequest))
         } catch {
             throw ProviderCommandRefusal(reason: displayText(for: error), sessionIsUsable: true)
         }
-        try await submitPromptTurn(.providerCommand("/\(name)"), sessionID: sessionID, overrideRunRequest: nil)
+        try await submitPromptTurn(
+            .providerCommand("/\(name)"),
+            sessionID: sessionID,
+            overrideRunRequest: overrideRunRequest
+        )
     }
 
     private enum PromptPayload {
