@@ -5608,7 +5608,8 @@ final class AgentSessionLinkRuntimeBridge {
                 targetItemID: delivery.targetItemID.uuidString,
                 acceptedAt: delivery.acceptedAt,
                 deliveryState: delivery.deliveryState,
-                resultingRunState: delivery.resultingRunState
+                resultingRunState: delivery.resultingRunState,
+                compactionRunsInBackground: delivery.compactionRunsInBackground
             )
             await authority.completeSend(reservation: reservation, receipt: receipt)
             publishTargetSnapshot(forTargetSession: target.lease.target.sessionID)
