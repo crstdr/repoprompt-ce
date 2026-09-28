@@ -1215,11 +1215,14 @@ final class AgentModeRunService {
         restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID)
         if let scheduled = session.scheduledACPFollowUp {
             session.scheduledACPFollowUp = nil
-            if scheduled.binding == session.persistentSessionBindingIdentity,
-               let draft = scheduled.instruction.localDraftText
-            {
+            let drafts = ([AgentTabSession.ScheduledACPFollowUp.QueuedInstruction(
+                instruction: scheduled.instruction, stopFence: scheduled.stopFence
+            )] + scheduled.queuedInstructions)
+                .filter { $0.stopFence.binding == session.persistentSessionBindingIdentity }
+                .compactMap(\.instruction.localDraftText)
+            if !drafts.isEmpty {
                 hooks.queuedWorkRecovery.restoreDraftText(
-                    tabID, draft, "Restored local ACP follow-up after Stop", .prependAlways
+                    tabID, drafts.joined(separator: "\n"), "Restored local ACP follow-up after Stop", .prependAlways
                 )
             }
         }

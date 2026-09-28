@@ -336,11 +336,17 @@ final class AgentTabSession: ObservableObject {
     typealias PendingInstruction = AgentRunPendingInstruction
 
     /// An ACP fallback handed to the scheduled-start task but not yet accepted by a provider.
-    /// Stop owns its local recovery payload until that start is accepted or withdrawn.
+    /// Stop owns every queued local recovery payload until that start is accepted or withdrawn.
     struct ScheduledACPFollowUp {
+        struct QueuedInstruction {
+            let instruction: PendingInstruction
+            let stopFence: AgentRunStartStopFence
+        }
+
         let id: UUID
         let instruction: PendingInstruction
-        let binding: AgentPersistentSessionBindingIdentity?
+        let stopFence: AgentRunStartStopFence
+        var queuedInstructions: [QueuedInstruction] = []
     }
 
     var scheduledACPFollowUp: ScheduledACPFollowUp?

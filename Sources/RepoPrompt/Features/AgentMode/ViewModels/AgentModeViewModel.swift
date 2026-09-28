@@ -3297,19 +3297,36 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func scheduleTypedACPFollowUpRun(
         session: TabSession,
-        instruction: TabSession.PendingInstruction
+        instruction: TabSession.PendingInstruction,
+        capturedStopFence: AgentRunStartStopFence? = nil
     ) {
+        let stopFence = capturedStopFence ?? AgentRunStartStopFence(session: session)
+        guard stopFence.permitsStart(of: session) else {
+            if sessions[session.tabID] === session,
+               stopFence.binding == session.persistentSessionBindingIdentity,
+               let draft = instruction.localDraftText
+            {
+                restoreComposerDraft(
+                    tabID: session.tabID, text: draft,
+                    message: "Restored local ACP follow-up after cancelled start",
+                    strategy: .prependAlways
+                )
+            }
+            return
+        }
         session.mcpFollowUpRunPending = true
-        if session.scheduledACPFollowUp != nil {
-            session.pendingInstructions.append(instruction)
+        if var scheduled = session.scheduledACPFollowUp {
+            // Keep later fallbacks under the same Stop-owned producer until its start settles.
+            // A failed first start must not leave them in the general queue without an owner.
+            scheduled.queuedInstructions.append(.init(instruction: instruction, stopFence: stopFence))
+            session.scheduledACPFollowUp = scheduled
             session.isDirty = true
             updateBindingsFromSession(session)
             scheduleSave(for: session.tabID)
             return
         }
-        let stopFence = AgentRunStartStopFence(session: session)
         let scheduled = TabSession.ScheduledACPFollowUp(
-            id: UUID(), instruction: instruction, binding: stopFence.binding
+            id: UUID(), instruction: instruction, stopFence: stopFence
         )
         session.scheduledACPFollowUp = scheduled
         Task { @MainActor [weak self, weak session] in
@@ -3325,18 +3342,51 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 directStartOptions: AgentDirectRunStartOptions(stopFence: stopFence),
                 startOutcome: startOutcome
             )
-            guard session.scheduledACPFollowUp?.id == scheduled.id else { return }
+            guard let settled = session.scheduledACPFollowUp, settled.id == scheduled.id else { return }
             session.scheduledACPFollowUp = nil
-            if !startOutcome.outcome.didStart,
-               sessions[session.tabID] === session,
-               session.persistentSessionBindingIdentity == scheduled.binding,
-               let draft = instruction.localDraftText
-            {
-                restoreComposerDraft(
-                    tabID: session.tabID, text: draft,
-                    message: "Restored local ACP follow-up after failed start",
-                    strategy: .prependAlways
-                )
+            if startOutcome.outcome.didStart {
+                // Only an accepted run can transfer still-fenced successors. A very short run
+                // may have committed its terminal handoff before this task regained the actor;
+                // start its successor directly with the original fence instead of stranding it.
+                let eligible = settled.queuedInstructions.filter { $0.stopFence.permitsStart(of: session) }
+                let cancelledDrafts = settled.queuedInstructions
+                    .filter { !$0.stopFence.permitsStart(of: session) }
+                    .filter { $0.stopFence.binding == session.persistentSessionBindingIdentity }
+                    .compactMap(\.instruction.localDraftText)
+                if sessions[session.tabID] === session, !cancelledDrafts.isEmpty {
+                    restoreComposerDraft(
+                        tabID: session.tabID, text: cancelledDrafts.joined(separator: "\n"),
+                        message: "Restored local ACP follow-up after cancelled start",
+                        strategy: .prependAlways
+                    )
+                }
+                if session.runState.isActive {
+                    session.pendingInstructions.append(contentsOf: eligible.map(\.instruction))
+                } else {
+                    for next in eligible {
+                        scheduleTypedACPFollowUpRun(
+                            session: session, instruction: next.instruction,
+                            capturedStopFence: next.stopFence
+                        )
+                    }
+                }
+            } else if sessions[session.tabID] === session {
+                let drafts = ([TabSession.ScheduledACPFollowUp.QueuedInstruction(
+                    instruction: settled.instruction, stopFence: settled.stopFence
+                )] + settled.queuedInstructions)
+                    .filter { $0.stopFence.binding == session.persistentSessionBindingIdentity }
+                    .compactMap(\.instruction.localDraftText)
+                if !drafts.isEmpty {
+                    restoreComposerDraft(
+                        tabID: session.tabID, text: drafts.joined(separator: "\n"),
+                        message: "Restored local ACP follow-up after failed start",
+                        strategy: .prependAlways
+                    )
+                }
+            }
+            if session.scheduledACPFollowUp == nil {
+                session.mcpFollowUpRunPending = false
+                handleObservedMCPStateChange(for: session)
             }
         }
     }
@@ -18893,7 +18943,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard periodicStartIsCurrent() else { return nil }
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
-            if session.mcpFollowUpRunPending {
+            if session.mcpFollowUpRunPending, session.scheduledACPFollowUp == nil {
                 session.mcpFollowUpRunPending = false
                 handleObservedMCPStateChange(for: session)
             }
@@ -18902,7 +18952,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .failed(message: message)
         }
         defer {
-            if session.mcpFollowUpRunPending {
+            if session.mcpFollowUpRunPending, session.scheduledACPFollowUp == nil {
                 session.mcpFollowUpRunPending = false
                 handleObservedMCPStateChange(for: session)
             }
