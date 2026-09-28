@@ -13,6 +13,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
     func testEachOperationDeclaresExactlyItsDocumentedFields() {
         XCTAssertEqual(AgentSessionLinkMCPToolService.listKeys, ["op", "cursor", "max_items"])
+        XCTAssertEqual(AgentSessionLinkMCPToolService.createLaneKeys, [
+            "op", "idempotency_key", "role", "session_name", "workspace", "message",
+            "workflow_id", "workflow_name"
+        ])
+        XCTAssertEqual(AgentSessionLinkMCPToolService.retireLaneKeys, ["op", "session_id"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.pollKeys, ["op", "session_id", "session_ids"])
         XCTAssertEqual(
             AgentSessionLinkMCPToolService.waitKeys,
@@ -593,6 +598,94 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         )
         XCTAssertTrue("\(a)".contains("No active session link"))
         XCTAssertTrue("\(AgentSessionLinkMCPToolService.unavailableError)".contains("not available for this session"))
+    }
+
+    func testLaneOperationsRejectUnknownKeysAndWorkflowWithoutMessage() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-1"),
+                "session_id": .string(fixture.target.sessionID.uuidString)
+            ])
+            XCTFail("Expected create_lane to reject a target override")
+        } catch {
+            XCTAssertTrue("\(error)".contains("does not support 'session_id'"))
+        }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("retire_lane"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "message": .string("override")
+            ])
+            XCTFail("Expected retire_lane to reject a message")
+        } catch {
+            XCTAssertTrue("\(error)".contains("does not support 'message'"))
+        }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-2"),
+                "workflow_name": .string("Review")
+            ])
+            XCTFail("Expected workflow without message to fail")
+        } catch {
+            XCTAssertTrue("\(error)".contains("workflow requires message"))
+        }
+        let list = try await Self.executeObject(fixture.service, args: ["op": .string("list")])
+        XCTAssertEqual(list["items"]?.arrayValue?.first?.objectValue?["created_by_you"], .bool(false))
+        fixture.host.laneCreatorByEndpoint[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        let creatorList = try await Self.executeObject(fixture.service, args: ["op": .string("list")])
+        XCTAssertEqual(creatorList["items"]?.arrayValue?.first?.objectValue?["created_by_you"], .bool(true))
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-3"),
+                "workspace": .string("not-a-workspace")
+            ])
+            XCTFail("Expected an unlinked caller to be denied before workspace resolution")
+        } catch {
+            XCTAssertTrue("\(error)".contains("not available for this session"))
+        }
+    }
+
+    func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let byName = AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: workspace.name.uppercased(), callerWindow: fixture.window
+        )
+        let byID = AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: workspace.id.uuidString, callerWindow: fixture.window
+        )
+        XCTAssertEqual(byName?.windowID, fixture.window.windowID)
+        XCTAssertEqual(byName?.workspaceID, workspace.id)
+        XCTAssertEqual(byID?.windowID, fixture.window.windowID)
+        XCTAssertNil(AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: UUID().uuidString, callerWindow: fixture.window
+        ))
+        let candidates = [
+            AgentSessionLaneMCPToolService.Destination(
+                windowID: 4, workspaceID: workspace.id, workspaceName: workspace.name
+            ),
+            AgentSessionLaneMCPToolService.Destination(
+                windowID: 2, workspaceID: workspace.id, workspaceName: workspace.name
+            ),
+            AgentSessionLaneMCPToolService.Destination(
+                windowID: 8, workspaceID: UUID(), workspaceName: "Other"
+            )
+        ]
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: workspace.id.uuidString, callerWindowID: 4
+        )?.windowID, 4)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: workspace.name, callerWindowID: 8
+        )?.windowID, 2)
     }
 
     /// The missing-op and unsupported-op errors teach the same operation list the schema advertises.
@@ -1955,7 +2048,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         defer { fixture.tearDown() }
         for op in [
             "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact", "set_waiting_on",
-            "snooze_auto_wake", "request_attention", "respond"
+            "snooze_auto_wake", "request_attention", "respond", "steer", "create_lane", "retire_lane"
         ] {
             XCTAssertTrue(
                 AgentSessionLinkMCPToolService.supportedOperationsSentence.contains(op),
@@ -2437,6 +2530,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     /// and bridge, not to re-test the bridge.
     private final class ReadReleaseHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
+        var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
         var waitingOn: DomainAgentSessionWaitingOn?
         var publishedPromptInventories:
@@ -2451,6 +2545,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
             candidates
+        }
+
+        func agentSessionLinkLaneProvenance(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity
+        ) -> UUID? {
+            laneCreatorByEndpoint[endpoint]
         }
 
         func agentSessionLinkObservationSnapshot(

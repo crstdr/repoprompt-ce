@@ -3,6 +3,51 @@ import MCP
 
 /// Flat, bounded lane receipts. Allocation refusals never disclose a session ID.
 enum AgentSessionLaneMCPToolService {
+    struct Destination: Equatable {
+        let windowID: Int
+        let workspaceID: UUID
+        let workspaceName: String
+    }
+
+    @MainActor
+    static func resolveDestination(
+        workspaceSelector: String?,
+        callerWindow: WindowState
+    ) -> Destination? {
+        let candidates = WindowStatesManager.shared.allWindows.compactMap { window -> Destination? in
+            guard !window.isClosing, let workspace = window.workspaceManager.activeWorkspace else {
+                return nil
+            }
+            return Destination(
+                windowID: window.windowID,
+                workspaceID: workspace.id,
+                workspaceName: workspace.name
+            )
+        }
+        return selectDestination(
+            candidates: candidates,
+            workspaceSelector: workspaceSelector,
+            callerWindowID: callerWindow.windowID
+        )
+    }
+
+    static func selectDestination(
+        candidates: [Destination],
+        workspaceSelector: String?,
+        callerWindowID: Int
+    ) -> Destination? {
+        candidates.filter { candidate in
+            guard let workspaceSelector else { return candidate.windowID == callerWindowID }
+            return candidate.workspaceID == UUID(uuidString: workspaceSelector)
+                || candidate.workspaceName.localizedCaseInsensitiveCompare(workspaceSelector) == .orderedSame
+        }.min { lhs, rhs in
+            let lhsIsCaller = lhs.windowID == callerWindowID
+            let rhsIsCaller = rhs.windowID == callerWindowID
+            if lhsIsCaller != rhsIsCaller { return lhsIsCaller }
+            return lhs.windowID < rhs.windowID
+        }
+    }
+
     static func refusal(_ reason: String) -> Value {
         .object(["result": .string(reason)])
     }

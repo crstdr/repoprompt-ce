@@ -6330,19 +6330,19 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Early service gate so workspace resolution cannot disclose destinations to an unlinked caller.
-    func laneCreationCallerEligible(
+    func laneCreationCallerPreflight(
         _ endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) async -> Bool {
-        guard !isFrozenForTermination,
-              let candidate = host?.agentSessionLinkCandidates().first(where: {
+    ) async -> AgentSessionLaneCreateReceipt.Reason? {
+        guard !isFrozenForTermination else { return .shuttingDown }
+        guard let candidate = host?.agentSessionLinkCandidates().first(where: {
                   $0.domainEndpoint == endpoint
               }),
               AgentSessionLinkEndpointEligibility.addDisabledReason(
                   candidate.eligibilityInput,
                   roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
               ) == nil
-        else { return false }
-        return await authority.hasActiveLink(endpoint: endpoint)
+        else { return .denied }
+        return await authority.hasActiveLink(endpoint: endpoint) ? nil : .denied
     }
 
     func createLane(

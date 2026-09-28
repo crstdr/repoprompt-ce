@@ -157,6 +157,12 @@ struct AgentSessionLinkMCPToolService {
         case "steer":
             try validateAllowedKeys(args, op: op, allowed: Self.steerKeys)
             return try await executeSteer(args: args)
+        case "create_lane":
+            try validateAllowedKeys(args, op: op, allowed: Self.createLaneKeys)
+            return try await executeCreateLane(args: args)
+        case "retire_lane":
+            try validateAllowedKeys(args, op: op, allowed: Self.retireLaneKeys)
+            return try await executeRetireLane(args: args)
         default:
             let retiredInteractionHint = op == "get_interaction"
                 ? " For a pending prompt, use poll or wait on the exact target, then respond with its interaction_id."
@@ -172,7 +178,7 @@ struct AgentSessionLinkMCPToolService {
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
         "Use list, poll, wait, read, send, cancel_pending_send, compact, set_waiting_on, snooze_auto_wake, "
-            + "request_attention, respond, or steer."
+            + "request_attention, respond, steer, create_lane, or retire_lane."
 
     private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
         let endpoint = try await resolveCallerEndpointIdentity()
@@ -443,11 +449,12 @@ struct AgentSessionLinkMCPToolService {
 
     // MARK: - list
 
-    // These executors are exposed only with the atomic lane contract migration.
+    // The bridge owns authority and sequencing; this surface owns only parsing and receipts.
     private func executeCreateLane(args: [String: Value]) async throws -> Value {
         let observerEndpoint = try await resolveCallerEndpointIdentity()
-        guard await bridge.laneCreationCallerEligible(observerEndpoint) else {
-            throw Self.unavailableError
+        if let refusal = await bridge.laneCreationCallerPreflight(observerEndpoint) {
+            if refusal == .denied { throw Self.unavailableError }
+            return AgentSessionLaneMCPToolService.refusal(refusal.rawValue)
         }
         let key = try Self.parseIdempotencyKey(args["idempotency_key"], op: "create_lane")
         let role: String?
@@ -494,19 +501,10 @@ struct AgentSessionLinkMCPToolService {
             workspaceSelector = nil
         }
         let callerWindow = try requireTargetWindow()
-        let matchingWindows = WindowStatesManager.shared.allWindows.filter { window in
-            guard !window.isClosing, let workspace = window.workspaceManager.activeWorkspace else {
-                return false
-            }
-            guard let workspaceSelector else { return window.windowID == callerWindow.windowID }
-            return workspace.id == UUID(uuidString: workspaceSelector)
-                || workspace.name.localizedCaseInsensitiveCompare(workspaceSelector) == .orderedSame
-        }
-        guard let destination = matchingWindows.sorted(by: { lhs, rhs in
-            if lhs.windowID == callerWindow.windowID { return true }
-            if rhs.windowID == callerWindow.windowID { return false }
-            return lhs.windowID < rhs.windowID
-        }).first, let workspaceID = destination.workspaceManager.activeWorkspace?.id else {
+        guard let destination = AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: workspaceSelector,
+            callerWindow: callerWindow
+        ) else {
             return AgentSessionLaneMCPToolService.refusal("destination_unavailable")
         }
         let receipt = await bridge.createLane(
@@ -516,7 +514,7 @@ struct AgentSessionLinkMCPToolService {
                 role: role,
                 sessionName: sessionName,
                 destinationWindowID: destination.windowID,
-                workspaceID: workspaceID,
+                workspaceID: destination.workspaceID,
                 message: message,
                 workflowReference: workflowReference
             )
@@ -1528,6 +1526,11 @@ struct AgentSessionLinkMCPToolService {
     /// Deliberately no workflow, delivery mode, or queue flag: a steer is one instruction delivered
     /// now, into whatever the target is doing, under its own current settings.
     static let steerKeys: Set<String> = ["op", "session_id", "message", "idempotency_key"]
+    static let createLaneKeys: Set<String> = [
+        "op", "idempotency_key", "role", "session_name", "workspace", "message",
+        "workflow_id", "workflow_name"
+    ]
+    static let retireLaneKeys: Set<String> = ["op", "session_id"]
     // The caller still comes only from server-owned run routing. `observer_session_id` is a selector
     // over that caller's exact inbound grants, never a caller identity or an authority claim.
 

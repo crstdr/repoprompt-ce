@@ -1939,6 +1939,86 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Outer stage: accepts the previous compact output before historical exact-anchor passes run.
+    /// Keep AgentSessionLinkTokenEfficiencyMigration byte-frozen so persisted compact definitions
+    /// are classified as an input, not mistaken for an unknown legacy shape.
+    private enum AgentSessionLinkLaneOperationsMigration {
+        static let description: String = {
+            let previous = AgentSessionLinkTokenEfficiencyMigration.description
+            let operations = "request_attention | respond | steer"
+            let expanded = "request_attention | respond | steer | create_lane | retire_lane"
+            precondition(previous.contains(operations))
+            return previous.replacingOccurrences(of: operations, with: expanded)
+                .replacingOccurrences(
+                    of: "\n\n**Trust and use rules**",
+                    with: """
+
+                    - `create_lane`: under any direct link, create your own top-level lane; one `idempotency_key` per intended lane.
+                    - `retire_lane`: [manage + created by you] unlink and stash an idle lane, never delete it.
+
+                    **Trust and use rules**
+                    """
+                )
+                .replacingOccurrences(
+                    of: "Manage is delegation for exactly one target, not blanket permission or authority over targets-of-targets. Without `manage`",
+                    with: "Manage is delegation for exactly one target, not blanket permission or authority over targets-of-targets. Creating a lane is self-scoped, grants no inherited authority, and needs your own user's instruction; retire only a lane you created under its live manage grant. `created_by_you` marks that provenance, not permission. Without `manage`"
+                )
+                .replacingOccurrences(
+                    of: "new `idempotency_key` for each new send, steer, or compaction;",
+                    with: "new `idempotency_key` for each new send, steer, compaction, or lane;"
+                )
+        }()
+
+        static let inputSchema: Value = {
+            var schema = AgentSessionLinkTokenEfficiencyMigration.inputSchema.objectValue!
+            var properties = schema["properties"]!.objectValue!
+            var op = properties["op"]!.objectValue!
+            var operations = op["enum"]!.arrayValue!
+            operations.append(contentsOf: [.string("create_lane"), .string("retire_lane")])
+            op["enum"] = .array(operations)
+            properties["op"] = .object(op)
+            properties["role"] = stringSchema("[create_lane] explore|engineer|pair|design; default pair.")
+            properties["session_name"] = stringSchema("[create_lane] Name, max 120 UTF-8 bytes.")
+            properties["workspace"] = stringSchema("[create_lane] Active workspace name or UUID; default caller.")
+            for key in ["session_id", "message", "idempotency_key", "workflow_id", "workflow_name"] {
+                var property = properties[key]!.objectValue!
+                property["description"] = .string(
+                    property["description"]!.stringValue!.replacingOccurrences(
+                        of: key == "session_id" ? "[poll," : "[send",
+                        with: key == "session_id" ? "[retire_lane, poll," : "[create_lane, send"
+                    )
+                )
+                properties[key] = .object(property)
+            }
+            schema["properties"] = .object(properties)
+            schema["description"] = .string(schema["description"]!.stringValue! + """
+
+            create_lane: idempotency_key; role?, session_name?, workspace?, message?, workflow_id|workflow_name? (with message)
+            retire_lane: session_id
+            """)
+            return .object(schema)
+        }()
+
+        private static func stringSchema(_ description: String) -> Value {
+            .object(["description": .string(description), "type": .string("string")])
+        }
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description && definition.inputSchema == inputSchema
+        }
+
+        static func applying(to definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkTokenEfficiencyMigration.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: description,
+                inputSchema: inputSchema,
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private enum AgentSessionLinkAutonomyContractState: String {
         case historicalIncomingOnly
         case historicalAutomatic
@@ -2046,12 +2126,15 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkTokenEfficiencyMigration.isCurrent(definition) {
+        if AgentSessionLinkLaneOperationsMigration.isCurrent(definition) {
             return definition
         }
-        return applyAgentSessionLinkTokenEfficiency(
+        if AgentSessionLinkTokenEfficiencyMigration.isCurrent(definition) {
+            return AgentSessionLinkLaneOperationsMigration.applying(to: definition)
+        }
+        return AgentSessionLinkLaneOperationsMigration.applying(to: applyAgentSessionLinkTokenEfficiency(
             canonicalizeAgentSessionLinkBeforeTokenEfficiency(definition)
-        )
+        ))
     }
 
     private static func canonicalizeAgentSessionLinkBeforeTokenEfficiency(
@@ -2415,6 +2498,10 @@ package enum MCPDomainCanonicalToolDefinitions {
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
         canonicalizeAgentSessionLink(definition)
+    }
+
+    package static func test_agentSessionLinkPreviousCompactDefinition() -> MCPDomainToolDefinition {
+        applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())
     }
 
     package static func test_canonicalizeAgentControlWaitSemantics(
