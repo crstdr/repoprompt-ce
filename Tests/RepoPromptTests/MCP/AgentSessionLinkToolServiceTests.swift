@@ -2772,6 +2772,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             laneCreatorByEndpoint[lane.domainEndpoint] = creatorSessionID
             return .created(sessionID: lane.sessionID, tabID: lane.tabID, bindingToken: token)
         }
+
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
         var waitingOn: DomainAgentSessionWaitingOn?
         var publishedPromptInventories:

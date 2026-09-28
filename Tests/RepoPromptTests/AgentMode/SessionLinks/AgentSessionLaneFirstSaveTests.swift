@@ -101,8 +101,10 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertEqual(saved.agentReasoningEffort, fixture.selection.reasoningEffortRaw)
             XCTAssertGreaterThanOrEqual(saveCount, 2)
             let lane = try XCTUnwrap(viewModel.sessions[tabID])
-            XCTAssertEqual(lane.restorationReadiness,
-                           .authoritative(bindingToken, .freshBindingDurablyCreated))
+            XCTAssertEqual(
+                lane.restorationReadiness,
+                .authoritative(bindingToken, .freshBindingDurablyCreated)
+            )
             XCTAssertFalse(lane.runState.isActive)
             XCTAssertFalse(lane.isMCPOriginated)
         }

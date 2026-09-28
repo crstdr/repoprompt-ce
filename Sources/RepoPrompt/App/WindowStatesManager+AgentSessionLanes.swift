@@ -43,9 +43,9 @@ extension WindowStatesManager {
         guard !isTerminating else { return 0 }
         return allWindows.filter { !$0.isClosing }.reduce(0) { count, window in
             count + window.workspaceManager.workspaces.reduce(0) { workspaceCount, workspace in
-                workspaceCount + workspace.composeTabs.filter {
+                workspaceCount + workspace.composeTabs.count(where: {
                     $0.activeAgentSessionID == sessionID
-                }.count
+                })
             }
         }
     }

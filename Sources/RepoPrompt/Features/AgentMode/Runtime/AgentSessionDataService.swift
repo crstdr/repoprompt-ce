@@ -873,8 +873,10 @@ actor AgentSessionDataService {
 
     private static func isMissingDirectoryError(_ error: Error) -> Bool {
         let error = error as NSError
-        return (error.domain == NSCocoaErrorDomain
-                    && (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError))
+        return (
+            error.domain == NSCocoaErrorDomain
+                && (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError)
+        )
             || (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
     }
 

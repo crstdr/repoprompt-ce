@@ -449,7 +449,7 @@ struct AgentSessionLinkMCPToolService {
 
     // MARK: - list
 
-    // The bridge owns authority and sequencing; this surface owns only parsing and receipts.
+    /// The bridge owns authority and sequencing; this surface owns only parsing and receipts.
     private func executeCreateLane(args: [String: Value]) async throws -> Value {
         let observerEndpoint = try await resolveCallerEndpointIdentity()
         if let refusal = await bridge.laneCreationCallerPreflight(observerEndpoint) {
@@ -571,8 +571,10 @@ struct AgentSessionLinkMCPToolService {
         }
 
         let page = inventory.items.dropFirst(offset).prefix(maxItems)
-        let createdByYou = Set(bridge.laneAnnotatedPromptInventory(inventory).items
-            .filter(\.createdByYou).map(\.targetSessionID))
+        let createdByYou = Set(
+            bridge.laneAnnotatedPromptInventory(inventory).items
+                .filter(\.createdByYou).map(\.targetSessionID)
+        )
         let nextOffset = offset + page.count
         let hasMore = nextOffset < inventory.items.count
 

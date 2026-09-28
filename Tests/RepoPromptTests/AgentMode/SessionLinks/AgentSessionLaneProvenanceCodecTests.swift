@@ -41,7 +41,7 @@ final class AgentSessionLaneProvenanceCodecTests: XCTestCase {
             observedFileSize: nil,
             observedFileModificationDate: nil
         )
-        for encoded in [try JSONEncoder().encode(session), try JSONEncoder().encode(record)] {
+        for encoded in try [JSONEncoder().encode(session), JSONEncoder().encode(record)] {
             var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
             object.removeValue(forKey: "createdByOverseerSessionID")
             object["futureField"] = ["unknown": true]

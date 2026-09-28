@@ -8265,7 +8265,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if case .oversightLane = creationKind,
                let publishedLaneTarget,
                let sessionID = publishedLaneTarget.sessionID
-                   ?? publishedLaneTarget.recoveryClaim?.identity.sessionID {
+               ?? publishedLaneTarget.recoveryClaim?.identity.sessionID
+            {
                 mcpAcceptSessionTarget(publishedLaneTarget)
                 propagatedError = AgentSessionLanePublishedFailure(
                     sessionID: sessionID, tabID: publishedLaneTarget.tabID

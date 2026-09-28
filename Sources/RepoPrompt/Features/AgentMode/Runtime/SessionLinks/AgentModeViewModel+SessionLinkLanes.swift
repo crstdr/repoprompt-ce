@@ -178,8 +178,10 @@ extension AgentModeViewModel {
     func agentSessionLinkLaneCreatorLabel(for sessionID: UUID) -> String? {
         let live = sessions.values.first { $0.activeAgentSessionID == sessionID }
         let creatorID = live?.createdByOverseerSessionID
-            ?? (live?.hasLoadedPersistedState == true
-                ? nil : ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID)
+            ?? (
+                live?.hasLoadedPersistedState == true
+                    ? nil : ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID
+            )
         guard let creatorID else { return nil }
         return agentSessionLinkLaneCreatorLabel(creatorID: creatorID)
     }
@@ -200,8 +202,8 @@ extension AgentModeViewModel {
         let canRetire: @MainActor () -> Bool = { [weak self] in
             guard let self,
                   isStillRetirable(),
-                  self.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-                  let session = self.session(for: endpoint.tabID, createIfNeeded: false),
+                  agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+                  let session = session(for: endpoint.tabID, createIfNeeded: false),
                   session.activeAgentSessionID == endpoint.sessionID,
                   !session.runState.isActive,
                   session.waitingPrompt == nil,

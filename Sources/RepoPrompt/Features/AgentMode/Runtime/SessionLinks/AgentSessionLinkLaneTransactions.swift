@@ -7,14 +7,14 @@ struct AgentSessionLaneCreateRequest {
     let role: String?
     let sessionName: String?
     /// The caller's selector, not a window/workspace binding that can move after the request.
-    var workspaceSelector: String? = nil
+    var workspaceSelector: String?
     let message: String?
     let workflowReference: AgentWorkflowReference?
 
     var digest: String {
         let fields = [
             role ?? "pair", sessionName ?? "", Self.canonicalSelector(workspaceSelector),
-            message ?? "", AgentWorkflowReference.canonicalSelector(for: workflowReference),
+            message ?? "", AgentWorkflowReference.canonicalSelector(for: workflowReference)
         ]
         let canonical = fields.map { "\($0.utf8.count):\($0)" }.joined()
         return AgentSessionLinkMessageDigest.digest(message: canonical, workflowSelector: "create_lane/v1")
@@ -51,6 +51,7 @@ struct AgentSessionLaneCreateReceipt: Equatable {
         case saveFailed = "save_failed"
         case addFailed = "add_failed"
     }
+
     enum FirstTask: Equatable { case none, delivered, queued, failed }
 
     let result: Result
@@ -63,8 +64,15 @@ struct AgentSessionLaneCreateReceipt: Equatable {
     var duplicate = false
 
     static func refused(_ reason: Reason, laneCount: Int = 0) -> Self {
-        Self(result: .refused, sessionID: nil, sessionName: nil, linked: false,
-             reason: reason, firstTask: .none, laneCount: laneCount)
+        Self(
+            result: .refused,
+            sessionID: nil,
+            sessionName: nil,
+            linked: false,
+            reason: reason,
+            firstTask: .none,
+            laneCount: laneCount
+        )
     }
 }
 
@@ -79,6 +87,7 @@ enum AgentSessionLaneRetireOutcome: Equatable {
         case stopFailed = "stop_failed"
         case alreadyStopped = "already_stopped"
     }
+
     case retired(sessionID: UUID)
     case notRetired(sessionID: UUID, reason: Reason)
     case unlinkedNotStashed(sessionID: UUID)

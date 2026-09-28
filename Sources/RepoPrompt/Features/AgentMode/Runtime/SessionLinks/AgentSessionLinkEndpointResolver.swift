@@ -96,7 +96,7 @@ struct AgentSessionOversightRestorationProof: Equatable {
         target: AgentSessionLinkEndpointCandidate,
         requireObserverAuthoritative: Bool = true
     ) {
-        guard (!requireObserverAuthoritative || observer.restorationReadiness.isAuthoritative),
+        guard !requireObserverAuthoritative || observer.restorationReadiness.isAuthoritative,
               target.restorationReadiness.isAuthoritative
         else {
             return nil
@@ -116,9 +116,13 @@ struct AgentSessionOversightRestorationProof: Equatable {
     ) -> Bool {
         observer.domainEndpoint == observerEndpoint
             && target.domainEndpoint == targetEndpoint
-            && (observer.restorationReadiness == observerReadiness
-                || (!requireObserverAuthoritative
-                    && isObserverHydrationAdvance(observer.restorationReadiness)))
+            && (
+                observer.restorationReadiness == observerReadiness
+                    || (
+                        !requireObserverAuthoritative
+                            && isObserverHydrationAdvance(observer.restorationReadiness)
+                    )
+            )
             && target.restorationReadiness == targetReadiness
     }
 

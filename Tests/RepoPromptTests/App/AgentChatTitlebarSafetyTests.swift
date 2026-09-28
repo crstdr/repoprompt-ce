@@ -589,8 +589,10 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             XCTAssertNotNil(fixture.tab(fixture.tabAID))
             XCTAssertEqual(fixture.sessionA.items.map(\.id), originalRows)
             XCTAssertEqual(fixture.sessionA.items.count, 2)
-            XCTAssertFalse(fixture.window.workspaceManager.activeWorkspace?.stashedTabs
-                .contains(where: { $0.tab.id == fixture.tabAID }) == true)
+            XCTAssertFalse(
+                fixture.window.workspaceManager.activeWorkspace?.stashedTabs
+                    .contains(where: { $0.tab.id == fixture.tabAID }) == true
+            )
         }
     }
 

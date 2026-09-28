@@ -88,15 +88,15 @@ enum AgentSessionLaneMCPToolService {
     static func render(_ outcome: AgentSessionLaneRetireOutcome) -> Value {
         switch outcome {
         case let .retired(sessionID):
-            return .object(["result": .string("retired"), "session_id": .string(sessionID.uuidString)])
+            .object(["result": .string("retired"), "session_id": .string(sessionID.uuidString)])
         case let .notRetired(sessionID, reason):
-            return .object([
+            .object([
                 "result": .string("not_retired"),
                 "session_id": .string(sessionID.uuidString),
                 "reason": .string(reason.rawValue)
             ])
         case let .unlinkedNotStashed(sessionID):
-            return .object([
+            .object([
                 "result": .string("unlinked_not_stashed"),
                 "session_id": .string(sessionID.uuidString)
             ])

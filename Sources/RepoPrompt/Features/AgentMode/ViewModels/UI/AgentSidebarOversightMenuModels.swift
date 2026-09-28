@@ -32,7 +32,7 @@ struct AgentSidebarOversightMenuProps: Equatable {
     let targetSessionID: UUID
     let targetDisplayName: String
     let observerOptions: [ObserverOption]
-    var createdByLabel: String? = nil
+    var createdByLabel: String?
 
     var linkedObservers: [ObserverOption] {
         observerOptions.filter {

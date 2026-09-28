@@ -112,7 +112,7 @@ struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
     var isOverseer = false
-    var createdByLabel: String? = nil
+    var createdByLabel: String?
     let isPinned: Bool
     let isMCPControlled: Bool
     let runState: AgentSessionRunState
@@ -1402,7 +1402,7 @@ struct AgentSessionRow: View {
 
 struct AgentStashedSessionRow: View {
     let stashed: StashedTab
-    var createdByLabel: String? = nil
+    var createdByLabel: String?
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
