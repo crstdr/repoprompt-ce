@@ -304,7 +304,11 @@ extension AgentModeViewModel {
                 lastActivityAt: Date()
             )
         }
-        return Self.observationSnapshot(for: session, candidate: candidate)
+        return Self.observationSnapshot(
+            for: session,
+            candidate: candidate,
+            subagentCounts: (running: 0, finished: 0)
+        )
     }
 
     /// Status/activity-only projection: run state, pending interaction, and canonical activity.
@@ -513,7 +517,8 @@ extension AgentModeViewModel {
     /// Reserved for target publication and `poll`; UI rendering must use `statusProjection` instead.
     static func observationSnapshot(
         for session: TabSession,
-        candidate: AgentSessionLinkEndpointCandidate
+        candidate: AgentSessionLinkEndpointCandidate,
+        subagentCounts: (running: Int, finished: Int)
     ) -> DomainAgentSessionObservationSnapshot {
         let projection = statusProjection(for: session)
         return DomainAgentSessionObservationSnapshot(
@@ -521,7 +526,12 @@ extension AgentModeViewModel {
             displayName: candidate.displayName,
             providerDisplayName: candidate.providerDisplayName,
             status: projection.status,
-            board: .empty,
+            board: laneBoard(
+                for: session,
+                candidate: candidate,
+                status: projection.status,
+                subagentCounts: subagentCounts
+            ),
             idleForSend: isIdleForSend(
                 session: session,
                 candidate: candidate,
@@ -534,6 +544,56 @@ extension AgentModeViewModel {
             lastActivityAt: session.lastActivityAt,
             context: observationContextLoad(for: session)
         )
+    }
+
+    /// Passive board state from the target's own run, before `linkStatus` flattens terminal runs.
+    /// Subagent counts are supplied by the caller so this projection remains independent of the
+    /// view model's session collection; the census is wired separately.
+    static func laneBoard(
+        for session: TabSession,
+        candidate: AgentSessionLinkEndpointCandidate,
+        status: DomainAgentSessionLinkStatus,
+        subagentCounts: (running: Int, finished: Int)
+    ) -> DomainAgentSessionLaneBoard {
+        let runOutcome: DomainAgentSessionLaneBoard.RunOutcome = switch session.runState {
+        case .idle: .none
+        case .running: .running
+        case .waitingForUser, .waitingForQuestion, .waitingForApproval: .awaitingUser
+        case .completed: .completed
+        case .cancelled: .cancelled
+        case .failed: .failed
+        }
+        let revision = session.lastTerminalCommitRevision
+        let stampedReason = revision.flatMap { revision -> DomainAgentRunSnapshot.FailureReason? in
+            guard revision.terminalState == session.runState,
+                  revision.expectedRunID == session.runID
+            else { return nil }
+            return revision.failureReason
+        }
+        let failureReason = laneFailureReason(for: session.runState, stamped: stampedReason)
+        return DomainAgentSessionLaneBoard(
+            runOutcome: runOutcome,
+            failureReason: failureReason,
+            sendBlockers: sendBlockers(
+                sendReadinessInputs(session: session, candidate: candidate, status: status)
+            ).map(\.rawValue),
+            subagentRunning: subagentCounts.running,
+            subagentFinished: subagentCounts.finished
+        )
+    }
+
+    static func laneFailureReason(
+        for runState: AgentSessionRunState,
+        stamped: DomainAgentRunSnapshot.FailureReason?
+    ) -> DomainAgentSessionLaneBoard.FailureReason? {
+        switch runState {
+        case .cancelled:
+            .cancelled
+        case .failed:
+            stamped.flatMap { DomainAgentSessionLaneBoard.FailureReason(rawValue: $0.rawValue) }
+        case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval, .completed:
+            nil
+        }
     }
 
     /// The context load the target's context ring already shows, as recorded by its provider's usage
@@ -1132,25 +1192,90 @@ extension AgentModeViewModel {
     /// `idle_for_send: true` for a target that `send` will still refuse, and `until: "sendable"` waits
     /// on exactly this field — so an omission turns the documented wait-then-send recipe back into
     /// the retry loop it exists to prevent.
+    enum SendBlocker: String {
+        case statusNotIdle = "status_not_idle"
+        case runStateActive = "run_state_active"
+        case persistedStateNotLoaded = "persisted_state_not_loaded"
+        case bindingTransitionInProgress = "binding_transition_in_progress"
+        case terminalCommitInProgress = "terminal_commit_in_progress"
+        case mcpFollowUpRunPending = "mcp_follow_up_run_pending"
+        case composerSubmissionInFlight = "composer_submission_in_flight"
+        case preparingInitialWorktree = "preparing_initial_worktree"
+        case changingExecutionLocation = "changing_execution_location"
+        case pendingInstructions = "pending_instructions"
+        case pendingACPSteeringInstructions = "pending_acp_steering_instructions"
+        case pendingClaudeSteeringInstructions = "pending_claude_steering_instructions"
+        case pendingAutoWake = "pending_auto_wake"
+        case candidateClosing = "candidate_closing"
+    }
+
+    /// One sample of every send-readiness condition. The board and `idleForSend` consume the same
+    /// evaluator below; tests can exercise conditions that are otherwise private lifecycle state.
+    struct SendReadinessInputs {
+        var status: DomainAgentSessionLinkStatus
+        var runStateIsActive: Bool
+        var hasLoadedPersistedState: Bool
+        var bindingTransitionInProgress: Bool
+        var terminalCommitInProgress: Bool
+        var mcpFollowUpRunPending: Bool
+        var isComposerSubmissionInFlight: Bool
+        var isPreparingInitialWorktree: Bool
+        var isChangingExecutionLocation: Bool
+        var hasPendingInstructions: Bool
+        var hasPendingACPSteeringInstructions: Bool
+        var hasPendingClaudeSteeringInstructions: Bool
+        var hasPendingAutoWake: Bool
+        var isCandidateClosing: Bool
+    }
+
+    static func sendReadinessInputs(
+        session: TabSession,
+        candidate: AgentSessionLinkEndpointCandidate,
+        status: DomainAgentSessionLinkStatus
+    ) -> SendReadinessInputs {
+        SendReadinessInputs(
+            status: status,
+            runStateIsActive: session.runState.isActive,
+            hasLoadedPersistedState: session.hasLoadedPersistedState,
+            bindingTransitionInProgress: session.bindingTransitionInProgress,
+            terminalCommitInProgress: session.terminalCommitInProgress,
+            mcpFollowUpRunPending: session.mcpFollowUpRunPending,
+            isComposerSubmissionInFlight: session.isComposerSubmissionInFlight,
+            isPreparingInitialWorktree: session.isPreparingInitialWorktree,
+            isChangingExecutionLocation: session.isChangingExecutionLocation,
+            hasPendingInstructions: !session.pendingInstructions.isEmpty,
+            hasPendingACPSteeringInstructions: !session.pendingACPSteeringInstructions.isEmpty,
+            hasPendingClaudeSteeringInstructions: !session.pendingClaudeSteeringInstructions.isEmpty,
+            hasPendingAutoWake: session.oversight.pendingAutoWake != nil,
+            isCandidateClosing: candidate.isClosing
+        )
+    }
+
+    static func sendBlockers(_ input: SendReadinessInputs) -> [SendBlocker] {
+        var blockers: [SendBlocker] = []
+        if input.status != .idle { blockers.append(.statusNotIdle) }
+        if input.runStateIsActive { blockers.append(.runStateActive) }
+        if !input.hasLoadedPersistedState { blockers.append(.persistedStateNotLoaded) }
+        if input.bindingTransitionInProgress { blockers.append(.bindingTransitionInProgress) }
+        if input.terminalCommitInProgress { blockers.append(.terminalCommitInProgress) }
+        if input.mcpFollowUpRunPending { blockers.append(.mcpFollowUpRunPending) }
+        if input.isComposerSubmissionInFlight { blockers.append(.composerSubmissionInFlight) }
+        if input.isPreparingInitialWorktree { blockers.append(.preparingInitialWorktree) }
+        if input.isChangingExecutionLocation { blockers.append(.changingExecutionLocation) }
+        if input.hasPendingInstructions { blockers.append(.pendingInstructions) }
+        if input.hasPendingACPSteeringInstructions { blockers.append(.pendingACPSteeringInstructions) }
+        if input.hasPendingClaudeSteeringInstructions { blockers.append(.pendingClaudeSteeringInstructions) }
+        if input.hasPendingAutoWake { blockers.append(.pendingAutoWake) }
+        if input.isCandidateClosing { blockers.append(.candidateClosing) }
+        return blockers.sorted { $0.rawValue < $1.rawValue }
+    }
+
     static func isIdleForSend(
         session: TabSession,
         candidate: AgentSessionLinkEndpointCandidate,
         status: DomainAgentSessionLinkStatus
     ) -> Bool {
-        status == .idle
-            && !session.runState.isActive
-            && session.hasLoadedPersistedState
-            && !session.bindingTransitionInProgress
-            && !session.terminalCommitInProgress
-            && !session.mcpFollowUpRunPending
-            && !session.isComposerSubmissionInFlight
-            && !session.isPreparingInitialWorktree
-            && !session.isChangingExecutionLocation
-            && session.pendingInstructions.isEmpty
-            && session.pendingACPSteeringInstructions.isEmpty
-            && session.pendingClaudeSteeringInstructions.isEmpty
-            && session.oversight.pendingAutoWake == nil
-            && !candidate.isClosing
+        sendBlockers(sendReadinessInputs(session: session, candidate: candidate, status: status)).isEmpty
     }
 
     static func latestVisibleAssistantPreview(for session: TabSession) -> String? {
