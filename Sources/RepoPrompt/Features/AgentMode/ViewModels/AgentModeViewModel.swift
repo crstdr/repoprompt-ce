@@ -5699,6 +5699,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             defersProviderLockUntilSend: agentSession.pendingHandoffDefersProviderLockUntilSend,
             isStagedForSend: false
         )
+        session.selfCompactState = agentSession.selfCompactState ?? .init()
 
         codexCoordinator.restoreCodexMetadata(from: agentSession, session: session)
         switch session.selectedAgent {
@@ -15321,6 +15322,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
             pendingHandoffSourceItemID: session.pendingHandoff.sourceItemID,
             pendingHandoffDefersProviderLockUntilSend: session.pendingHandoff.defersProviderLockUntilSend,
+            selfCompactState: session.selfCompactState.active == nil && session.selfCompactState.latest == nil
+                ? nil : session.selfCompactState,
             isMCPOriginated: session.isMCPOriginated,
             worktreeBindings: session.worktreeBindings,
             worktreeMergeOperations: session.worktreeMergeOperations

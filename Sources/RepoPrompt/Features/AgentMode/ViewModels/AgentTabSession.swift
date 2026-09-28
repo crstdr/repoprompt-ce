@@ -1101,6 +1101,11 @@ final class AgentTabSession: ObservableObject {
     /// Cleared only after the provider accepts the turn.
     var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init()
 
+    /// Session-owned self-compaction state. No restored attempt is executable.
+    var selfCompactState = AgentSelfCompactState() {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
     var isProviderSelectionLocked: Bool {
         hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
     }

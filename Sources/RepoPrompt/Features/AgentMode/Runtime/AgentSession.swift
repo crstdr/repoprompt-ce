@@ -244,6 +244,13 @@ struct AgentSession: Codable, Identifiable {
     var pendingHandoffSourceItemID: UUID?
     var pendingHandoffDefersProviderLockUntilSend: Bool
 
+    /// Optional recovery data. A decoded attempt is never authority to resume provider work.
+    var selfCompactState: AgentSelfCompactState?
+    /// Runtime-only: the decoded record was invalid and its original file needs preservation.
+    var selfCompactPersistenceWarning = false
+    /// Runtime-only: cold reconciliation should be persisted after the source is safe to rewrite.
+    var selfCompactNeedsRecoveryRewrite = false
+
     init(
         id: UUID = UUID(),
         serializationVersion: Int = AgentSession.currentSerializationVersion,
@@ -286,6 +293,7 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffCreatedAt: Date? = nil,
         pendingHandoffSourceItemID: UUID? = nil,
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
+        selfCompactState: AgentSelfCompactState? = nil,
         isMCPOriginated: Bool = false,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
         worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
@@ -331,6 +339,7 @@ struct AgentSession: Codable, Identifiable {
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
         self.pendingHandoffDefersProviderLockUntilSend = pendingHandoffDefersProviderLockUntilSend
+        self.selfCompactState = selfCompactState
         self.isMCPOriginated = isMCPOriginated
         self.worktreeBindings = worktreeBindings
         self.worktreeMergeOperations = worktreeMergeOperations
@@ -378,6 +387,7 @@ struct AgentSession: Codable, Identifiable {
         case pendingHandoffCreatedAt
         case pendingHandoffSourceItemID
         case pendingHandoffDefersProviderLockUntilSend
+        case selfCompactState
         case isMCPOriginated
         case worktreeBindings
         case worktreeMergeOperations
@@ -446,6 +456,20 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
         pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffDefersProviderLockUntilSend) ?? false
+        if container.contains(.selfCompactState), try !(container.decodeNil(forKey: .selfCompactState)) {
+            do {
+                var restored = try container.decode(AgentSelfCompactState.self, forKey: .selfCompactState)
+                selfCompactNeedsRecoveryRewrite = restored.reconcileColdLaunch()
+                selfCompactState = restored
+            } catch {
+                // An optional maintenance record must not make the whole session unreadable.
+                selfCompactPersistenceWarning = true
+                selfCompactNeedsRecoveryRewrite = true
+                selfCompactState = AgentSelfCompactState(latest: .malformedRecovery())
+            }
+        } else {
+            selfCompactState = nil
+        }
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
         worktreeBindings = try container.decodeIfPresent([AgentSessionWorktreeBinding].self, forKey: .worktreeBindings) ?? []
         worktreeMergeOperations = try container.decodeIfPresent([AgentSessionWorktreeMergeOperation].self, forKey: .worktreeMergeOperations) ?? []
