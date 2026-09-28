@@ -662,6 +662,9 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         var pending = AgentSessionLinkDeliveryReadiness.Snapshot.ready
         pending.mcpFollowUpRunPending = true
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(pending), .pendingStart)
+        pending.mcpFollowUpRunPending = false
+        pending.pendingInstructionCount = 1
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(pending), .pendingStart)
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(.ready), .notRunning)
     }
 

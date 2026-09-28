@@ -12,15 +12,35 @@ extension AgentModeViewModel {
         strategy: AgentModeRunService.DraftRestorationStrategy,
         operation: AgentComposerDraftRestorationOperation? = nil
     ) {
-        // Also update session draft so it persists across tab switches
-        storeDraftText(for: tabID, text)
+        // A later queued recovery can arrive before SwiftUI applies the previous event.
+        // Compose against the session-owned draft now, then publish the complete value so
+        // successive restorations cannot overwrite one another or prepend twice in the UI.
+        let restoredText: String
+        let restoredStrategy: AgentModeRunService.DraftRestorationStrategy
+        let restoredOperation: AgentComposerDraftRestorationOperation?
+        if case .prependAlways = strategy, operation == nil {
+            let existingDraft = retrieveDraftText(for: tabID)
+            restoredText = AgentComposerDraftRestorationReducer.compose(restoredText: text, above: existingDraft)
+            restoredStrategy = .replaceAlways
+            restoredOperation = AgentComposerDraftRestorationOperation(
+                rejectedDraftText: text,
+                draftTextBeforeRestoration: existingDraft,
+                composedDraftText: restoredText,
+                previousRestorationEventID: draftRestorationEvent.flatMap { $0.tabID == tabID ? $0.id : nil }
+            )
+        } else {
+            restoredText = text
+            restoredStrategy = strategy
+            restoredOperation = operation
+        }
+        storeDraftText(for: tabID, restoredText)
         draftRestorationEvent = DraftRestorationEvent(
             id: UUID(),
             tabID: tabID,
-            text: text,
+            text: restoredText,
             message: message,
-            strategy: strategy,
-            operation: operation
+            strategy: restoredStrategy,
+            operation: restoredOperation
         )
         syncComposerUIState()
     }

@@ -44,7 +44,9 @@ enum AgentSessionLinkStopAdmission: Equatable {
             return .blocked(.targetBusy)
         }
         if snapshot.runStateIsActive { return .activeRun }
-        if snapshot.mcpFollowUpRunPending { return .pendingStart }
+        // Queued instructions are cancellable work even if a failed scheduled start has
+        // already cleared its own pending flag. Stop must own their withdrawal.
+        if snapshot.mcpFollowUpRunPending || snapshot.pendingInstructionCount > 0 { return .pendingStart }
         return .notRunning
     }
 }

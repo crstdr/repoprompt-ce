@@ -5,10 +5,17 @@ import Foundation
 struct AgentRunPendingInstruction: Equatable, ExpressibleByStringLiteral {
     let providerText: String
     let localDraftText: String?
+    /// Retains the producer's original Stop generation across terminal follow-up handoffs.
+    let stopFence: AgentRunStartStopFence?
 
-    init(providerText: String, localDraftText: String?) {
+    init(providerText: String, localDraftText: String?, stopFence: AgentRunStartStopFence? = nil) {
         self.providerText = providerText
         self.localDraftText = localDraftText
+        self.stopFence = stopFence
+    }
+
+    func retainingStopFence(_ fence: AgentRunStartStopFence) -> Self {
+        Self(providerText: providerText, localDraftText: localDraftText, stopFence: fence)
     }
 
     init(stringLiteral value: String) {

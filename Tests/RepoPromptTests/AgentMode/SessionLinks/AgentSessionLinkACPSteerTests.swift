@@ -474,6 +474,89 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertFalse(draft.contains("managed scheduled direction"))
     }
 
+    func testFailedSuccessorStartLeavesRemainingSiblingWithdrawableByStop() async throws {
+        let fixture = try await makeFixture()
+        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        let originalFence = AgentRunStartStopFence(session: fixture.session)
+        let batch = (1...3).map { index in
+            AgentModeViewModel.TabSession.ACPSteeringInstruction(
+                id: UUID(), targetRunID: fixture.session.runID,
+                targetRunAttemptID: fixture.session.activeRunAttemptID,
+                providerText: "pre-Stop payload \(index)", interruptedPromptProviderText: nil,
+                attachments: [], taggedFileAttachments: [], draftText: "typed draft \(index)",
+                optimisticUserItemID: nil, createdAt: Date()
+            )
+        }
+        fixture.session.pendingACPSteeringInstructions.append(contentsOf: batch)
+        let firstFinished = AgentSessionLinkStopSignal<Void>()
+        let secondFinished = AgentSessionLinkStopSignal<Void>()
+        var starts = 0
+        var finishes = 0
+        fixture.viewModel.test_beforeScheduledACPFollowUpStart = {
+            starts += 1
+            if starts == 2 {
+                // B reaches the real provider-availability check and fails before a prompt.
+                fixture.session.selectedAgent = .cursor
+            }
+        }
+        fixture.viewModel.test_didFinishScheduledACPFollowUpStart = {
+            finishes += 1
+            if finishes == 1 { firstFinished.finish(()) }
+            if finishes == 2 { secondFinished.finish(()) }
+        }
+        defer {
+            fixture.viewModel.test_beforeScheduledACPFollowUpStart = nil
+            fixture.viewModel.test_didFinishScheduledACPFollowUpStart = nil
+        }
+        for instruction in batch {
+            fixture.viewModel.test_settleRejectedACPSteeringSubmission(
+                id: instruction.id, session: fixture.session, stopFence: originalFence
+            )
+        }
+        XCTAssertEqual(fixture.session.scheduledACPFollowUp?.queuedInstructions.count, 2)
+        await firstFinished.value()
+        XCTAssertTrue(fixture.session.runState.isActive, "A must own a running turn before handoff")
+        XCTAssertEqual(fixture.session.pendingInstructions.map(\.providerText), [
+            "pre-Stop payload 2", "pre-Stop payload 3"
+        ])
+        XCTAssertTrue(fixture.session.pendingInstructions.allSatisfy { $0.stopFence == originalFence })
+
+        await fixture.viewModel.test_publishNaturalCompletion(fixture.session, supportsFollowUp: true)
+        await secondFinished.value()
+        XCTAssertNil(fixture.session.scheduledACPFollowUp)
+        XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
+        XCTAssertEqual(fixture.session.pendingInstructions.map(\.providerText), ["pre-Stop payload 3"])
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "typed draft 2")
+        let snapshot = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            session: fixture.session, endpointMatchesGrant: true, isClosing: false
+        )
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .pendingStart)
+
+        let stopRequest = AgentSessionLinkStopRequest(
+            requestID: UUID(), linkID: UUID(), linkGeneration: 1,
+            observerEndpoint: Self.observer, observerDisplayName: "Overseer"
+        )
+        let stop = await fixture.viewModel.agentSessionLinkPerformStop(
+            to: fixture.candidate, request: stopRequest,
+            liveness: { Self.liveness }, queueHasCommittedDrain: { false },
+            withdrawInbound: { true }, commitAuthorization: { .committed }
+        )
+        guard case let .settled(receipt) = stop else { return XCTFail("Expected Stop receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        let recovered = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        XCTAssertEqual(recovered.components(separatedBy: "\n"), ["typed draft 3", "typed draft 2"])
+
+        fixture.session.selectedAgent = .openCode
+        await fixture.viewModel.startAgentRun(tabID: fixture.session.tabID, initialMessage: "fresh run after Stop")
+        await fixture.session.agentTask?.value
+        let prompted = try XCTUnwrap(fixture.provider.promptedMessages.last?.userMessage)
+        XCTAssertTrue(prompted.contains("fresh run after Stop"))
+        XCTAssertFalse(prompted.contains("pre-Stop payload 2"))
+        XCTAssertFalse(prompted.contains("pre-Stop payload 3"))
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), recovered)
+    }
+
     func testFailedScheduledACPStartWithdrawsAllFallbacksBeforeStop() async throws {
         let fixture = try await makeFixture()
         await fixture.viewModel.test_publishNaturalCompletion(fixture.session)

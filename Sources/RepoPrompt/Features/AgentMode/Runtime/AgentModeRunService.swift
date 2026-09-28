@@ -837,7 +837,8 @@ final class AgentModeRunService {
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         let followUp = AgentTabSession.PendingInstruction(
             providerText: providerText,
-            localDraftText: localDrafts.isEmpty ? nil : localDrafts.joined(separator: "\n")
+            localDraftText: localDrafts.isEmpty ? nil : localDrafts.joined(separator: "\n"),
+            stopFence: stopFence
         )
         current.forEach { $0.managed?.sink.resolve(.delivered(.queuedFollowUp)) }
         if session.runState == .completed, session.acpController != nil {
@@ -1226,7 +1227,9 @@ final class AgentModeRunService {
                 )
             }
         }
-        let localPending = session.pendingInstructions.compactMap(\.localDraftText)
+        let localPending = session.pendingInstructions
+            .filter { $0.stopFence?.binding == session.persistentSessionBindingIdentity || $0.stopFence == nil }
+            .compactMap(\.localDraftText)
         if !localPending.isEmpty {
             hooks.queuedWorkRecovery.restoreDraftText(
                 tabID, localPending.joined(separator: "\n"),

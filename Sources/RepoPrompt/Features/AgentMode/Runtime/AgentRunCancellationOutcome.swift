@@ -140,7 +140,7 @@ struct AgentRunCancellationAdmission {
             else { return false }
         case .pendingStart:
             guard candidate.activeRunOwnership == nil,
-                  candidate.mcpFollowUpRunPending,
+                  (candidate.mcpFollowUpRunPending || !candidate.pendingInstructions.isEmpty),
                   pendingStartFence?.permitsStart(of: candidate) ?? true
             else { return false }
         }

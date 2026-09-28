@@ -3261,10 +3261,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             continuation: .init(
                 startFollowUpRun: { [weak self] session, instruction in
                     if session.selectedAgent.acpProviderID != nil {
-                        self?.scheduleTypedACPFollowUpRun(session: session, instruction: instruction)
+                        self?.scheduleTypedACPFollowUpRun(
+                            session: session, instruction: instruction,
+                            capturedStopFence: instruction.stopFence
+                        )
                         return
                     }
-                    let stopFence = AgentRunStartStopFence(session: session)
+                    let stopFence = instruction.stopFence ?? AgentRunStartStopFence(session: session)
                     Task { @MainActor [weak self, weak session] in
                         guard let self, let session else { return }
                         await startFollowUpRun(
@@ -3275,7 +3278,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     }
                 },
                 startTypedACPFollowUpRun: { [weak self] session, instruction in
-                    self?.scheduleTypedACPFollowUpRun(session: session, instruction: instruction)
+                    self?.scheduleTypedACPFollowUpRun(
+                        session: session, instruction: instruction,
+                        capturedStopFence: instruction.stopFence
+                    )
                 },
                 signalMCPInstructionDelivered: { [weak self] session in
                     await self?.signalMCPInstructionDelivered(for: session)
@@ -3345,9 +3351,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard let settled = session.scheduledACPFollowUp, settled.id == scheduled.id else { return }
             session.scheduledACPFollowUp = nil
             if startOutcome.outcome.didStart {
-                // Only an accepted run can transfer still-fenced successors. A very short run
-                // may have committed its terminal handoff before this task regained the actor;
-                // start its successor directly with the original fence instead of stranding it.
+                // Only an accepted run can transfer still-fenced successors. Keep each fence
+                // on the queued instruction through every later terminal handoff; otherwise a
+                // failed successor start could leave its siblings with a fresh post-Stop fence.
                 let eligible = settled.queuedInstructions.filter { $0.stopFence.permitsStart(of: session) }
                 let cancelledDrafts = settled.queuedInstructions
                     .filter { !$0.stopFence.permitsStart(of: session) }
@@ -3361,7 +3367,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 }
                 if session.runState.isActive {
-                    session.pendingInstructions.append(contentsOf: eligible.map(\.instruction))
+                    session.pendingInstructions.append(contentsOf: eligible.map {
+                        $0.instruction.retainingStopFence($0.stopFence)
+                    })
                 } else {
                     for next in eligible {
                         scheduleTypedACPFollowUpRun(
@@ -17706,14 +17714,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
         let instruction = TabSession.PendingInstruction(
             providerText: queued.providerText,
-            localDraftText: queued.managed == nil ? queued.draftText : nil
+            localDraftText: queued.managed == nil ? queued.draftText : nil,
+            stopFence: stopFence
         )
         if session.runState.isActive {
             session.pendingInstructions.insert(instruction, at: 0)
             queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
         } else if session.runState == .completed, session.acpController != nil {
             queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
-            scheduleTypedACPFollowUpRun(session: session, instruction: instruction)
+            scheduleTypedACPFollowUpRun(
+                session: session, instruction: instruction, capturedStopFence: instruction.stopFence
+            )
         } else {
             // A rejected ACP steer remains a provider follow-up, never a composer draft.
             session.pendingInstructions.insert(instruction, at: 0)
