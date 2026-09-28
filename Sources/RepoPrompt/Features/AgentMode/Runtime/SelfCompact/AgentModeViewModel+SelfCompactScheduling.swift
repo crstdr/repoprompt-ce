@@ -1,8 +1,7 @@
 import Foundation
 import RepoPromptDomainRuntime
 
-/// The self-compaction request is never exposed until the service is wired in a later item. These
-/// routines are the app-side owner of its terminal boundary, not a second overseer transaction.
+/// App-side owner of the self-only MCP admission and terminal boundary, not a second overseer transaction.
 extension AgentModeViewModel {
     /// Synchronous admission captures the authoritative run attempt before a future MCP await.
     func agentSelfCompactSchedule(
@@ -82,6 +81,9 @@ extension AgentModeViewModel {
         let reservation = candidate.reserve(note: note, idempotencyKey: idempotencyKey)
         switch reservation {
         case let .duplicate(requestID):
+            guard session.selfCompactAdmissionPendingID != requestID else {
+                return .blocked(reason: "persistence_pending")
+            }
             return .duplicate(requestID: requestID, status: session.selfCompactState.status)
         case .conflict:
             return .blocked(reason: "idempotency_conflict")
@@ -137,6 +139,12 @@ extension AgentModeViewModel {
         ) else { return .blocked(reason: "busy") }
         guard case let .scheduled(attempt) = accepted else {
             return .blocked(reason: "busy")
+        }
+        session.selfCompactAdmissionPendingID = attempt.id
+        defer {
+            if session.selfCompactAdmissionPendingID == attempt.id {
+                session.selfCompactAdmissionPendingID = nil
+            }
         }
         guard case .success = await flushSaveRequired(for: endpoint.tabID, workspaceID: endpoint.workspaceID) else {
             var state = session.selfCompactState

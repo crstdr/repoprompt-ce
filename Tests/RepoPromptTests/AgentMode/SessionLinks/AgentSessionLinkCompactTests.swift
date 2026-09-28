@@ -23,6 +23,30 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         let driftHook: AgentSessionLinkSendTransactionLiveTests.LiveSendDriftHook
     }
 
+    @MainActor
+    private final class FirstSaveGate {
+        private var entered = false
+        private var enteredWaiter: CheckedContinuation<Void, Never>?
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+        func pause() async {
+            entered = true
+            enteredWaiter?.resume()
+            enteredWaiter = nil
+            await withCheckedContinuation { releaseWaiter = $0 }
+        }
+
+        func waitUntilEntered() async {
+            if entered { return }
+            await withCheckedContinuation { enteredWaiter = $0 }
+        }
+
+        func release() {
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
+
     private var retainedViewModels: [AgentModeViewModel] = []
 
     override func tearDown() {
@@ -33,7 +57,8 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
     private func makeFixture(
         agent: AgentProviderKind = .claudeCode,
         providerConversation: Bool = true,
-        saverBehavior: LiveSendEventLog.SaverBehavior = .succeed
+        saverBehavior: LiveSendEventLog.SaverBehavior = .succeed,
+        firstSaveGate: FirstSaveGate? = nil
     ) throws -> Fixture {
         let events = LiveSendEventLog()
         let driftHook = AgentSessionLinkSendTransactionLiveTests.LiveSendDriftHook()
@@ -87,7 +112,10 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         viewModel.test_setCurrentTabIDOverride(tabID)
         viewModel.test_setAgentSessionSaver { agentSession, _, _ in
             let saveIndex = events.recordSave(items: agentSession.toLiveItems())
-            if saveIndex == 0 { driftHook.duringDeliveryFlush?() }
+            if saveIndex == 0 {
+                driftHook.duringDeliveryFlush?()
+                await firstSaveGate?.pause()
+            }
             switch saverBehavior {
             case .succeed:
                 break
@@ -328,8 +356,51 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.session.selfCompactState.active?.id, attempt.id)
     }
 
+    func testSameKeyRetryCannotClaimScheduledWhileFirstReservationSaveIsPending() async throws {
+        let gate = FirstSaveGate()
+        let fixture = try makeFixture(firstSaveGate: gate)
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.pendingSave")
+        fixture.session.isDirty = false
+        let endpoint = fixture.candidate.domainEndpoint
+        let origin = AgentSelfMCPCallOrigin(
+            endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID
+        )
+        let first = Task { @MainActor in
+            await fixture.viewModel.agentSelfCompactMCPAdmission(
+                endpoint: endpoint, origin: origin,
+                note: "pending note", idempotencyKey: "same-key-pending"
+            )
+        }
+        await gate.waitUntilEntered()
+        let retry = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            endpoint: endpoint, origin: origin,
+            note: "pending note", idempotencyKey: "same-key-pending"
+        )
+        guard case let .blocked(reason) = retry else {
+            gate.release()
+            return XCTFail("A retry must not claim scheduled before the first save commits")
+        }
+        XCTAssertEqual(reason, "persistence_pending")
+        gate.release()
+        guard case let .scheduled(attempt) = await first.value else {
+            return XCTFail("Expected the first admission after its save")
+        }
+        let committedRetry = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            endpoint: endpoint, origin: origin,
+            note: "pending note", idempotencyKey: "same-key-pending"
+        )
+        guard case let .duplicate(requestID, _) = committedRetry else {
+            return XCTFail("Expected idempotent replay after commit")
+        }
+        XCTAssertEqual(requestID, attempt.id)
+    }
+
     func testSelfMCPAdmissionPersistenceFailureNeverLeavesExecutableRequest() async throws {
-        let fixture = try makeFixture(saverBehavior: .fail)
+        let gate = FirstSaveGate()
+        let fixture = try makeFixture(saverBehavior: .fail, firstSaveGate: gate)
         let runID = UUID()
         fixture.session.installRunID(runID)
         fixture.session.runState = .running
@@ -340,10 +411,24 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID
         )
 
-        let result = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let first = Task { @MainActor in
+            await fixture.viewModel.agentSelfCompactMCPAdmission(
+                endpoint: endpoint, origin: origin,
+                note: "retain after failed save", idempotencyKey: "failed-save-key"
+            )
+        }
+        await gate.waitUntilEntered()
+        let retry = await fixture.viewModel.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin,
             note: "retain after failed save", idempotencyKey: "failed-save-key"
         )
+        guard case let .blocked(pendingReason) = retry else {
+            gate.release()
+            return XCTFail("A retry must not claim scheduled before a failing save")
+        }
+        XCTAssertEqual(pendingReason, "persistence_pending")
+        gate.release()
+        let result = await first.value
         guard case let .blocked(reason) = result else {
             return XCTFail("Expected an indeterminate persistence refusal")
         }

@@ -392,6 +392,47 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
     }
 
+    func testStaleDedicatedACPNoteCannotReparkAnOrdinarySendInFlight() throws {
+        let session = AgentTabSession(tabID: UUID())
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: note, idempotencyKey: "ordinary-in-flight")
+        state.active?.phase = .dispatchingNote
+        session.selfCompactState = state
+        let frame = AgentSelfCompactNoteEnvelope.frame(note)
+        let dedicatedID = try XCTUnwrap(AgentSelfCompactParkedPrefix.preparedDedicatedNoteID(frame, session: session))
+        XCTAssertTrue(AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
+            dedicatedID, session: session, scheduleSave: {}
+        ))
+        let ordinary = AgentSelfCompactParkedPrefix.prepare("next turn", session: session, scheduleSave: {})
+        XCTAssertEqual(ordinary.text, frame + "\n\nnext turn")
+        let ordinaryID = try XCTUnwrap(ordinary.dispatchID)
+        XCTAssertTrue(AgentSelfCompactParkedPrefix.markAttempted(ordinaryID, session: session))
+
+        // The dedicated sender resumed after the ordinary sender entered transport. Its stale
+        // pre-transport cleanup must not clear the ordinary sender's one-shot marker.
+        AgentSelfCompactParkedPrefix.markNotAttempted(dedicatedID, session: session)
+        XCTAssertEqual(session.selfCompactState.active?.phase, .dispatchingNote)
+        XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, true)
+        XCTAssertNil(session.selfCompactState.parkedNote)
+        XCTAssertTrue(AgentSelfCompactParkedPrefix.markAccepted(ordinaryID, session: session))
+        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+    }
+
+    func testUnverifiedACPNoteTransportFailureDoesNotClaimVerifiedCompaction() throws {
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: note, idempotencyKey: "unverified-failure")
+        let attempt = try XCTUnwrap(state.active)
+        state.active?.phase = .parked
+        state.active?.acpCompletionUnverified = true
+        let dispatchID = AgentSelfCompactionDispatchID(requestID: attempt.id, stage: .note)
+        XCTAssertTrue(state.noteWillAttempt(dispatchID))
+        XCTAssertTrue(state.noteTransportFailed(dispatchID))
+        XCTAssertEqual(state.latest?.outcome, .deliveryUnknown)
+        XCTAssertEqual(state.latest?.noteDelivery, .deliveryUnknown)
+        XCTAssertEqual(state.latest?.completionVerified, false)
+        XCTAssertEqual(state.latest?.recoveryNote, note)
+    }
+
     func testUnattemptedACPNoteStartupReparksAndSaves() throws {
         let session = AgentTabSession(tabID: UUID())
         var state = AgentSelfCompactState()

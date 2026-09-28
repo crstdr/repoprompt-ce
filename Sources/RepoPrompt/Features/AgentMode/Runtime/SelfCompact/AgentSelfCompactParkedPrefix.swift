@@ -60,7 +60,11 @@ enum AgentSelfCompactParkedPrefix {
     @MainActor
     static func markNotAttempted(_ dispatchID: AgentSelfCompactionDispatchID, session: AgentTabSession) {
         var state = session.selfCompactState
-        _ = state.noteDefinitivelyNotAttempted(dispatchID)
+        // ACP invokes this only before its own transport attempt. A suspended dedicated sender
+        // must not clear the marker after an ordinary sender has claimed the same note.
+        guard state.active?.noteDispatchStarted == false,
+              state.noteDefinitivelyNotAttempted(dispatchID)
+        else { return }
         session.selfCompactState = state
     }
 

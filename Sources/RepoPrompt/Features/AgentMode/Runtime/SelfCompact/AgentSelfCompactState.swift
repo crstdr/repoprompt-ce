@@ -110,7 +110,9 @@ struct AgentSelfCompactSettlement: Codable, Equatable {
     let recoveryNote: String?
 
     static func recoveryRequired(from attempt: AgentSelfCompactAttempt, at date: Date = Date()) -> Self {
-        let delivery: NoteDelivery = if attempt.noteDispatchStarted {
+        // The dispatching phase is durably saved before transport, but the later attempted
+        // marker is debounced. A crash after provider acceptance can restore that older record.
+        let delivery: NoteDelivery = if attempt.noteDispatchStarted || attempt.phase == .dispatchingNote {
             .deliveryUnknown
         } else if attempt.phase == .parked {
             .parked
@@ -291,7 +293,10 @@ struct AgentSelfCompactState: Codable, Equatable {
               active?.phase == .dispatchingNote
         else { return false }
         if active?.noteDispatchStarted == true {
-            settle(.deliveryUnknown, noteDelivery: .deliveryUnknown, completionVerified: true)
+            settle(
+                .deliveryUnknown, noteDelivery: .deliveryUnknown,
+                completionVerified: active?.acpCompletionUnverified != true && active?.compactTurnSucceeded == true
+            )
         } else {
             active?.phase = .parked
         }

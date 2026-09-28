@@ -63,7 +63,7 @@ final class AgentSelfCompactStateTests: XCTestCase {
         }
     }
 
-    func testColdRestoreDistinguishesPreparedNoteFromTransportAttempt() throws {
+    func testColdRestoreTreatsUnsavedDispatchMarkerAsDeliveryUnknown() throws {
         var session = AgentSession(name: "Prepared", autoEditEnabled: true)
         var state = AgentSelfCompactState()
         _ = state.reserve(note: "recover", idempotencyKey: "prepared")
@@ -71,7 +71,9 @@ final class AgentSelfCompactStateTests: XCTestCase {
         state.active?.noteDispatchStarted = false
         session.selfCompactState = state
         let restored = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(session))
-        XCTAssertEqual(restored.selfCompactState?.latest?.noteDelivery, .notSent)
+        // Claude can accept the note while its debounced noteDispatchStarted save still lags.
+        // A persisted dispatching phase cannot prove the transport was never attempted.
+        XCTAssertEqual(restored.selfCompactState?.latest?.noteDelivery, .deliveryUnknown)
         XCTAssertEqual(restored.selfCompactState?.latest?.recoveryNote, "recover")
     }
 

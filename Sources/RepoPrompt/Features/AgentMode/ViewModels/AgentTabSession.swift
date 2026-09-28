@@ -1112,6 +1112,10 @@ final class AgentTabSession: ObservableObject {
 
     var selfCompactPersistenceWarning = false
 
+    /// Runtime-only fence: a same-key MCP retry cannot claim a scheduled receipt until the
+    /// original reservation's required save has completed.
+    var selfCompactAdmissionPendingID: UUID?
+
     /// Runtime-only timer and note worker; persisted state is deliberately inert on restore.
     var selfCompactNativeCompletion: AgentSelfCompactNativeCompletionCoordinator?
 

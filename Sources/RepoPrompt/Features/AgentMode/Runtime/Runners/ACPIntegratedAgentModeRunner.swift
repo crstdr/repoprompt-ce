@@ -688,12 +688,10 @@ final class ACPIntegratedAgentModeRunner {
         }
         if let dispatchID = carry.dispatchID {
             guard AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session) else {
-                if carry.exactNote {
-                    AgentSelfCompactParkedPrefix.markNotAttempted(dispatchID, session: session)
-                } else {
+                // The failed claim does not own an attempt marker to clear.
+                if !carry.exactNote {
                     hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(session, oversightDispatch)
                 }
-                hooks.persistence.scheduleSave(session)
                 return false
             }
             hooks.persistence.scheduleSave(session)
@@ -1168,15 +1166,14 @@ final class ACPIntegratedAgentModeRunner {
         }
         if let dispatchID = carry.dispatchID {
             guard AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session) else {
-                if carry.exactNote {
-                    AgentSelfCompactParkedPrefix.markNotAttempted(dispatchID, session: session)
-                } else {
+                // Another sender may already own this note's one-shot attempt. A stale dedicated
+                // sender has no marker to clear and must not re-park an ordinary in-flight send.
+                if !carry.exactNote {
                     hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
                         session,
                         oversightDispatch
                     )
                 }
-                hooks.persistence.scheduleSave(session)
                 return .cancelled
             }
             hooks.persistence.scheduleSave(session)
