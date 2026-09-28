@@ -1590,6 +1590,42 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    func testSecondTargetDeletionAfterAuthorityHopWithholdsWholePromptBatch() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second target")
+        fixture.host.candidates.append(second)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            rawTargetSessionID: second.sessionID.uuidString
+        ) else { return XCTFail("Expected a second managed grant") }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let authorized = await fixture.bridge.authorizeTargets(
+            operation: .monitorPoll,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionIDs: [fixture.target.sessionID, second.sessionID]
+        )
+        guard case let .success(targets) = authorized else { return XCTFail("Expected an exact batch") }
+        let gate = ObservationReleaseGate()
+        fixture.bridge.test_afterManagedObservationAuthorityValidation = { await gate.pause() }
+        let observing = Task { @MainActor in
+            await fixture.bridge.pendingInteractionsForObservation(leases: targets.map(\.lease))
+        }
+        await gate.waitUntilPaused()
+        let registry = AgentSessionDeletionRegistry.shared
+        let attempt = registry.beginDurableDeletion(sessionID: second.sessionID)
+        XCTAssertTrue(registry.isDeletionInProgress(sessionID: second.sessionID))
+        gate.release()
+        let inspections = await observing.value
+        XCTAssertNil(inspections, "Deletion of one target must withhold the other target's prompt too")
+        XCTAssertEqual(fixture.host.pendingInteractionCallCount, 0, "Inspect no prompt in an invalid batch")
+        registry.didFailDurableDeletion(attempt)
+        for target in targets {
+            let failure = await fixture.authority.validate(lease: target.lease)
+            XCTAssertNil(failure, "Reversible deletion must not revoke either link")
+        }
+    }
+
     private func addRestrictedLink(
         to target: AgentSessionLinkEndpointCandidate,
         fixture: ReadReleaseFixture
@@ -1611,6 +1647,54 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         guard case .activated = activated else {
             return XCTFail("Expected a restricted grant, got \(activated)")
         }
+    }
+
+    func testRestrictedGrantCannotInspectOrMutateHostThroughManagementOperations() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let restricted = makeCandidate(windowID: 3, displayName: "Restricted target")
+        try await addRestrictedLink(to: restricted, fixture: fixture)
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let sessionID = Value.string(restricted.sessionID.uuidString)
+        let interactionReadsBefore = fixture.host.pendingInteractionCallCount
+
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertEqual(polled["managed"], .bool(false))
+        XCTAssertNil(polled["pending_interaction"])
+        XCTAssertNil(polled["respond_hint"])
+        let waited = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"), "session_id": sessionID, "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(waited["managed"], .bool(false))
+        XCTAssertNil(waited["pending_interaction"])
+        XCTAssertNil(waited["respond_hint"])
+        XCTAssertEqual(fixture.host.pendingInteractionCallCount, interactionReadsBefore)
+
+        let responded = try await Self.executeObject(fixture.service, args: [
+            "op": .string("respond"),
+            "session_id": sessionID,
+            "interaction_id": .string(UUID().uuidString),
+            "response": .string("accept")
+        ])
+        XCTAssertEqual(responded["result"], .string("management_not_granted"))
+        XCTAssertEqual(responded["managed"], .bool(false))
+        XCTAssertEqual(responded["applied"], .bool(false))
+        let steered = try await Self.executeObject(fixture.service, args: [
+            "op": .string("steer"),
+            "session_id": sessionID,
+            "message": .string("Continue"),
+            "idempotency_key": .string("restricted-steer")
+        ])
+        XCTAssertEqual(steered["result"], .string("management_not_granted"))
+        XCTAssertEqual(steered["managed"], .bool(false))
+        XCTAssertEqual(steered["applied"], .bool(false))
+        XCTAssertTrue(fixture.host.respondRequests.isEmpty)
+        XCTAssertTrue(fixture.host.respondAuthorizations.isEmpty)
+        XCTAssertTrue(fixture.host.steerRequests.isEmpty)
+        XCTAssertTrue(fixture.host.steerCommits.isEmpty)
+        XCTAssertEqual(fixture.host.pendingInteractionCallCount, interactionReadsBefore)
     }
 
     func testWaitReportsExactManagedMetadataForSingleAndMultiSnapshots() async throws {
@@ -2544,6 +2628,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         // MARK: Management
 
         var pendingInteractionInspection: AgentSessionLinkPendingInteractionInspection = .none
+        var pendingInteractionCallCount = 0
         var respondOutcome: AgentSessionLinkInteractionResponseOutcome = .noPendingInteraction
         var respondRequests: [AgentSessionLinkInteractionResponseRequest] = []
         var respondAuthorizations: [Bool] = []
@@ -2558,7 +2643,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         func agentSessionLinkPendingInteraction(
             for _: AgentSessionLinkEndpointCandidate
         ) -> AgentSessionLinkPendingInteractionInspection {
-            pendingInteractionInspection
+            pendingInteractionCallCount += 1
+            return pendingInteractionInspection
         }
 
         /// Mirrors the real host contract: the bridge's final fence runs before anything is applied.

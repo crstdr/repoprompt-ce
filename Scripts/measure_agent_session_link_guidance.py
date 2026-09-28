@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Replay the fixed one-link oversight inventory fixture at two Git refs.
 
-Usage: python3 Scripts/measure_agent_session_link_guidance.py 21e5c584 worktree
+Usage: python3 Scripts/measure_agent_session_link_guidance.py 3e5d805e worktree
+Both refs must contain the one-line `respondHint` literal; older refs need their
+inventory/tool counts measured separately rather than silently omitting the hint.
 This is a static literal estimate, not an automated Swift-renderer check. The fixture
 uses the bare, host-determined tool name and includes its naming guidance. Compare
 the resulting counts against a Swift-rendered one-link fixture when changing the renderer.
@@ -99,8 +101,16 @@ def tool_definition(ref):
 
 def respond_hint(ref):
     source = contents(ref, PROMPTS)
-    match = re.search(r'    static let respondHint =\s*"([^"\\]*(?:\\.[^"\\]*)*)"', source)
-    return swift_literal(match[1]) if match else None
+    assignment = re.search(r"(?m)^[ \t]*static let respondHint[ \t]*=[ \t]*(?:\r?\n[ \t]*)?", source)
+    if not assignment:
+        raise ValueError(f"{ref}: respondHint assignment is missing from {PROMPTS}")
+    match = re.match(r'"((?:[^"\\\r\n]|\\.)*)"[ \t]*(?:\r?\n|$)', source[assignment.end() :])
+    if not match or re.match(r"[ \t]*\+", source[assignment.end() + match.end() :]):
+        raise ValueError(f"{ref}: respondHint must be one complete Swift string literal on one line")
+    hint = swift_literal(match[1])
+    if "\n" in hint or "\r" in hint:
+        raise ValueError(f"{ref}: respondHint must not contain a newline")
+    return hint
 
 
 def report(ref):
@@ -110,8 +120,7 @@ def report(ref):
         chars = len(inventory(ref, managed))
         print(f"{ref} {'managed' if managed else 'watch'} inventory: {chars} chars, ~{chars / 4:.2f} tokens")
     hint = respond_hint(ref)
-    if hint is not None:
-        print(f"{ref} respond_hint: {len(hint)} chars, ~{len(hint) / 4:.2f} tokens")
+    print(f"{ref} respond_hint: {len(hint)} chars, ~{len(hint) / 4:.2f} tokens")
 
 
 if __name__ == "__main__":

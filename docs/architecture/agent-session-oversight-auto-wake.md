@@ -212,7 +212,11 @@ authority-owned fact. `compact` remains watch-level under `send_when_idle`, not 
 generation-qualified lease, both live endpoint checks, and final operation fence remain in force;
 revoke, rebind, or replacement defeats stale work. Manage never implies automatic permission
 acceptance or authority over a target's other links. Provider-wide permission preferences are
-separate from oversight.
+separate from oversight. Removing per-row Manage badges does not remove attribution: successful
+`respond` and `steer` results carry `answered_by_session_id` and `steered_by_session_id`,
+respectively. Delivered cross-session send, steer, and compact transcript rows retain typed
+source-session attribution and its visible badge. The badge identifies who acted; it is not a
+separate grant or proof of permission.
 
 ### Inspecting and answering prompts
 
@@ -277,9 +281,12 @@ The active inventory keeps only the operation names, one-line use, and the commo
 It does not carry an always-on answer walkthrough; the pending result supplies just-in-time
 `respond_hint`. `AgentSessionLinkPromptContext` records the accepted inventory-guidance revision
 (2 for the lean wording) separately from the link-set revision and passive lane-guidance revision.
-New wording re-owes an inventory at the next dispatch even when the exact grants are unchanged,
-and acceptance advances
-only the wording acknowledgement. It does not advance membership, fabricate a capability-change
+These are independent number spaces: inventory revision 2 does not precede or supersede lane
+revision 8, and neither number is a link-set generation. The inventory counter versions the
+operation/use wording owed with membership; the lane counter versions the full or reminder trust
+block owed with passive updates. New inventory wording re-owes an inventory at the next dispatch
+even when the exact grants are unchanged, and acceptance advances only the inventory-wording
+acknowledgement. It does not advance membership, fabricate a capability-change
 notice, or turn an empty inventory into a terminal/suspension notice. Failed, stale, or unaccepted
 claims do not acknowledge the new text. The supplement remains provider-only additive context,
 not a base-system-prompt or transcript mutation.

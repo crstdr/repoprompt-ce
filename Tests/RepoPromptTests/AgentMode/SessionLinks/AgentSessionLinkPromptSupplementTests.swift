@@ -1426,7 +1426,9 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
 final class AgentSessionLinkPromptDecisionTests: XCTestCase {
     /// `isEligibilitySuppressed` defaults to `false` here and *only* here: an eligible observer is
     /// the ordinary case these tests describe, while production deliberately has no default so the
-    /// fact cannot be dropped again on the way down.
+    /// fact cannot be dropped again on the way down. Membership-only cases explicitly assume the
+    /// current inventory wording was accepted; the omitted-argument regression calls production
+    /// `decide` directly.
     private func decide(
         currentRevision: UInt64,
         hasLinks: Bool,
@@ -1441,7 +1443,8 @@ final class AgentSessionLinkPromptDecisionTests: XCTestCase {
             isEligibilitySuppressed: isEligibilitySuppressed,
             lastAcceptedRevision: lastAcceptedRevision,
             lastAcceptedHadLinks: lastAcceptedHadLinks,
-            possiblyDeliveredLinkRevision: possiblyDeliveredLinkRevision
+            possiblyDeliveredLinkRevision: possiblyDeliveredLinkRevision,
+            acceptedInventoryGuidanceRevision: AgentSessionLinkPrompts.currentInventoryGuidanceRevision
         )
     }
 
@@ -1455,6 +1458,21 @@ final class AgentSessionLinkPromptDecisionTests: XCTestCase {
     func testAcknowledgedRevisionIsQuiet() {
         XCTAssertNil(
             decide(currentRevision: 3, hasLinks: true, lastAcceptedRevision: 3, lastAcceptedHadLinks: true)
+        )
+    }
+
+    func testOmittedAcceptedInventoryGuidanceRevisionFailsSafeForExistingLinks() {
+        XCTAssertEqual(
+            AgentSessionLinkPromptSupplementDecision.decide(
+                currentRevision: 3,
+                hasLinks: true,
+                isEligibilitySuppressed: false,
+                lastAcceptedRevision: 3,
+                lastAcceptedHadLinks: true,
+                currentInventoryGuidanceRevision: 2
+            ),
+            .inventory,
+            "Omitting acceptance must not silently claim the current inventory wording was delivered"
         )
     }
 
