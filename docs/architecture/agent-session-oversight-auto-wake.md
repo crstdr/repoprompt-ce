@@ -22,6 +22,8 @@ defect in this subsystem.
 | Claim / receipt | The immutable rendered batch a provider was actually sent, including exact attention occurrence identities, and what that provider's acceptance therefore acknowledges. | `AgentSessionLinkPromptContext` |
 | Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentModeViewModel+SessionLinkAutoWake` |
 
+The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
+
 ## Autonomy is grant-scoped and prompt-governed
 
 The user's exact direct grant is the whole structural delegation. Target-bearing observer operations
@@ -466,7 +468,9 @@ ACP is advertisement-driven and live-unverified. `ACPAgentSessionController` rec
 normalization (which drop it), and forgets it when a session starts opening, the process exits or
 fails, a prompt fails, or the controller shuts down. A Devin, Grok Build, or Antigravity target is
 supported only while its live controller advertises `compact` for the target's own provider
-session; otherwise, including after a relaunch before the next turn, it is `not_supported`. OpenCode
+session. With no live provider session — after a relaunch, before the next turn, or while the
+controller is still opening — the result is the retryable `no_provider_session`; `not_supported`
+is reserved for a live session whose observed command list provably lacks `compact`. OpenCode
 advertises the user's own commands and skills, so an advertised `compact` there may not be native
 compaction; it and Cursor are never supported. The command reuses the live controller only (never a
 fresh or replacement one) and skips model/mode configuration. `promptAdvertisedCommand` checks that

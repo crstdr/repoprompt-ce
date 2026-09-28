@@ -366,6 +366,14 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     public static let overseerCompactionRequestText =
         "Context compaction was requested by an overseeing session."
 
+    /// Fixed text of the note appended when an ACP provider accepts `/compact` and ends the command
+    /// turn instantly with no output — the signature of a fire-and-forget slash command whose
+    /// compaction keeps running in the provider's background, where the session's next prompt
+    /// cancels it.
+    public static let acpBackgroundCompactionNoteText =
+        "The provider accepted the compaction; it may still be running in the background — sending "
+            + "a message to this session in the next ~60–90 s can cancel it."
+
     /// The visible provenance row for one overseer-requested context compaction.
     ///
     /// `.system`, never `.user`: RepoPrompt issued the provider command, not the target's user, and no

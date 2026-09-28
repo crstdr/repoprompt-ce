@@ -606,6 +606,8 @@ struct AgentSessionLinkMCPToolService {
             targetSessionIDs: request.sessionIDs
         )
 
+        await bridge.refreshLaneBoardCensus(for: targets)
+
         var states: [DomainAgentSessionLinkTargetState] = []
         var pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:]
         var snoozes: [UUID: AgentSessionLinkAutoWakeSnoozeProjection] = [:]
@@ -697,6 +699,7 @@ struct AgentSessionLinkMCPToolService {
             observerEndpoint: observerEndpoint,
             targetSessionIDs: request.sessionIDs
         )
+        await bridge.refreshLaneBoardCensus(for: targets)
         let waitRequests = targets.map { target in
             DomainAgentSessionLinkWaitRequest(
                 lease: target.lease,
@@ -1735,6 +1738,7 @@ enum AgentSessionLinkResponseRenderer {
             "name": AgentMCPToolHelpers.stringOrNull(snapshot.displayName),
             "provider": AgentMCPToolHelpers.stringOrNull(snapshot.providerDisplayName),
             "status": .string(snapshot.status.rawValue),
+            "board": laneBoardValue(snapshot.board),
             "idle_for_send": .bool(snapshot.idleForSend),
             "idle_since": snapshot.idleSince.map { .string(AgentMCPToolHelpers.timestamp($0)) } ?? .null,
             "waiting_on": snapshot.waitingOn.map { waitingOn in
@@ -1755,6 +1759,23 @@ enum AgentSessionLinkResponseRenderer {
             "change_sequence": .int(Int(clamping: state.changeSequence)),
             "context": contextLoadValue(snapshot.context)
         ])
+    }
+
+    static func laneBoardValue(_ board: DomainAgentSessionLaneBoard) -> Value {
+        var payload: [String: Value] = ["run_outcome": .string(board.runOutcome.rawValue)]
+        if let failureReason = board.failureReason {
+            payload["failure_reason"] = .string(failureReason.rawValue)
+        }
+        if !board.sendBlockers.isEmpty {
+            payload["send_blockers"] = .array(board.sendBlockers.map(Value.string))
+        }
+        if board.subagentRunning > 0 || board.subagentFinished > 0 {
+            payload["subagents"] = .object([
+                "running": .int(board.subagentRunning),
+                "finished": .int(board.subagentFinished)
+            ])
+        }
+        return .object(payload)
     }
 
     /// Target-global context load, or `null` when unknown. Always present, so a caller can tell
@@ -1977,6 +1998,17 @@ enum AgentSessionLinkResponseRenderer {
     /// provider, and because the receipt is retained under the key, requesting again needs a new key.
     static func compactReceiptValue(_ receipt: DomainAgentSessionLinkSendReceipt) -> Value {
         let started = receipt.deliveryState == .runStarted
+        var detail = started
+            ? "The compaction run was started, not confirmed. Observe the session with poll and wait: "
+            + "a finished compaction leaves it idle, and its context count is unreliable until "
+            + "its next ordinary turn reports usage."
+            : "The request was recorded in the overseen session, but RepoPrompt did not confirm that "
+            + "a compaction started. Read the session before requesting again; a new request "
+            + "needs a new idempotency_key."
+        if started, receipt.compactionRunsInBackground {
+            detail += " This provider may run the compaction in the background: do not send to "
+                + "the session for ~60–90 s or the compaction can be cancelled."
+        }
         return .object([
             "result": .string(started ? "accepted" : "not_started"),
             "accepted": .bool(started),
@@ -1988,15 +2020,7 @@ enum AgentSessionLinkResponseRenderer {
             "duplicate": .bool(receipt.duplicate),
             // A same-key retry can only replay this retained receipt, so it is never a retry signal.
             "retryable": .bool(false),
-            "detail": .string(
-                started
-                    ? "The compaction run was started, not confirmed. Observe the session with poll and wait: "
-                    + "a finished compaction leaves it idle, and its context count is unreliable until "
-                    + "its next ordinary turn reports usage."
-                    : "The request was recorded in the overseen session, but RepoPrompt did not confirm that "
-                    + "a compaction started. Read the session before requesting again; a new request "
-                    + "needs a new idempotency_key."
-            )
+            "detail": .string(detail)
         ])
     }
 
