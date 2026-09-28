@@ -6148,7 +6148,7 @@ final class AgentSessionLinkRuntimeBridge {
             clear(.delivered(receipt))
         case let .blocked(failure):
             switch failure {
-            case .targetNotIdle, .targetLoading:
+            case .targetNotIdle, .targetLoading, .compactionSettling:
                 // The target became busy or is still hydrating. Nothing was mutated, so the entry
                 // waits for the next accepted readiness publication rather than retrying on a timer.
                 park(.targetReadiness, failure: failure)

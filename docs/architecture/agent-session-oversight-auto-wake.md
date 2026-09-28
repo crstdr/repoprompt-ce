@@ -254,22 +254,27 @@ operations and a retry replays the stored receipt.
 | Fully idle and send-ready | The attributed send transaction (durable row, then run start) | `run_started` / `run_start_failed` |
 | Running Codex turn | Native steer, or the durable fallback queue, reported by the steer acknowledgement tracker; the deferred dispatch re-proves the exact endpoint and the exact active run, and withdraws the row (`steer_not_accepted`) if either moved | `steered` / `queued_follow_up` |
 | Running Claude-native turn | The provider's interrupt-steering queue | `queued_interrupt` |
+| Running ACP turn | The target's serialized ACP steering queue; an interrupt refusal becomes a follow-up with the original provider envelope | `steered` / `queued_follow_up` |
 | Waiting for its next instruction | That instruction | `delivered_to_waiting_instruction` |
 | Any pending prompt | Refused before the fence | `target_awaiting_interaction` |
 | Between states, idle but not yet send-ready, or settled during the fence | Refused; nothing staged and the key is released | `target_busy` |
-| Running ACP turn, or a provider with no live steering | Refused; the follow-up queue is never used | `steer_unavailable` |
+| A provider or state with no live steering | Refused before staging | `steer_unavailable` |
+| ACP compact settling after compact dispatch | Managed delivery waits for a context-vouch drop or the approximately 90-second deadline; the target user's own sends and steers remain ungated | `compaction_settling` (retryable) |
 
 The running routes go through the target's own `submitPreparedUserTurn`, so a steer reaches the
 provider exactly as a local composer message would. What they never touch is composer state: no
 draft, attachment, tagged file, workflow, interview preference, or file-selection side effect is
 read, cleared, or restored, and every withdrawal path carries an empty restoration draft, so an
-overseer's words can never reappear in the target user's composer as the user's own. The shared
-follow-up queue is excluded for the same reason — it is restored into the composer on an
-execution-location change — and so is ACP live steering, whose refusal path requeues into that
-queue and whose interrupt replays the previous prompt from transcript text. (That replay now skips a
-cross-session row, whose framing was provider-only.) After the commit fence the transaction
-re-proves both endpoints, the workspace, and admission synchronously; a run that settled during the
-fence is refused as `target_busy` rather than started from a deferred path.
+overseer's words can never reappear in the target user's composer as the user's own. ACP uses a
+managed context on the target's serialized steering instruction rather than a managed instruction
+in the ordinary follow-up queue. Flush, requeue, stale-run withdrawal, and cancellation resolve
+only managed sinks in a mixed managed/local batch, exactly once. A refused interrupt keeps the
+original provider envelope in `pendingInstructions` for the follow-up, not in the user's composer.
+An interrupted attributed ACP row replays its exact dispatched envelope from
+`dispatchedProviderText`; older attributed rows lacking that field are still dropped rather than
+reconstructed from raw transcript words. After the commit fence the transaction re-proves both
+endpoints, the workspace, and admission synchronously; a run that settled during the fence is
+refused as `target_busy` rather than started from a deferred path.
 A provider path that withdraws the row reports `steer_not_accepted` (key released); one whose
 outcome cannot be observed reports `steer_unconfirmed` with `delivered_unknown: true` (key spent).
 

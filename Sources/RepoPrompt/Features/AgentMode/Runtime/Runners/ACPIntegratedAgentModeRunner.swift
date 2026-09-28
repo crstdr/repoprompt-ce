@@ -1043,6 +1043,15 @@ final class ACPIntegratedAgentModeRunner {
             return .cancelled
         }
 
+        // A locally typed advertised /compact is still an ordinary user turn, but providers such
+        // as Devin may continue compacting after that turn reports completion. Only managed
+        // deliveries consult this marker; local sends and steers remain free to proceed.
+        if initialMessageForRun.trimmingCharacters(in: .whitespacesAndNewlines) == "/compact",
+           let providerSessionID = session.providerSessionID,
+           controller.advertisesCommand("compact", inProviderSession: providerSessionID)
+        {
+            session.beginACPCompactSettling(providerSessionID: providerSessionID, controller: controller)
+        }
         do {
             log("controller.prompt begin", runID: runID)
             try await controller.prompt(monitoring.message, request: runRequest)
@@ -1159,6 +1168,10 @@ final class ACPIntegratedAgentModeRunner {
         // signal, so only a later occupancy report (`usage_update`) may vouch for a count again; this
         // turn's billed prompt count cannot. The suspension ends on every exit from here.
         let withdrawnVouch = session.beginCompactionContextCountSuspension()
+        session.beginACPCompactSettling(
+            providerSessionID: command.expectedProviderConversation,
+            controller: controller
+        )
         defer { session.endCompactionContextCountSuspension() }
         do {
             log("controller.promptAdvertisedCommand begin", runID: runID)
@@ -1173,12 +1186,14 @@ final class ACPIntegratedAgentModeRunner {
             // Nothing was sent, so the count still describes the context.
             await abandonConsumer()
             session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
+            session.clearACPCompactSettling()
             log("provider control command refused: \(refusal.reason)", runID: runID)
             let errorText = "\(displayName) did not run the requested command: \(refusal.reason)"
             return refusal.sessionIsUsable ? .refusedBeforeSend(errorText: errorText) : .failed(errorText: errorText)
         } catch is ACPAgentSessionController.ProviderCommandCancelledBeforeSend {
             await abandonConsumer()
             session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
+            session.clearACPCompactSettling()
             return .cancelled
         } catch is CancellationError {
             await abandonConsumer()

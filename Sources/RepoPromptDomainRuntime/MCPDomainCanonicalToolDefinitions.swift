@@ -1951,7 +1951,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                 .replacingOccurrences(of: " | respond | steer\n", with: " | respond | steer | stop\n")
                 .replacingOccurrences(
                     of: "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering.",
-                    with: "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering.\n        \(stopBullet)"
+                    with: "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering. ACP supported; may return `compaction_settling`.\n        \(stopBullet)"
                 )
                 .replacingOccurrences(of: "each new send, steer, or compaction", with: "each new send, steer, stop, or compaction")
         }()

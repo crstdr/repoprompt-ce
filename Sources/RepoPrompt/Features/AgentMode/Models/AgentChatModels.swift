@@ -192,6 +192,10 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// Set on attributed user deliveries and fixed-text system control rows.
     public var crossSessionAttribution: AgentCrossSessionAttribution?
 
+    /// Exact provider payload of an attributed user turn. It is never shown as the bubble text;
+    /// ACP interrupted-turn replay uses it instead of impersonating the lane user's own words.
+    public var dispatchedProviderText: String?
+
     /// Set only on the `.system` lane-update row of an accepted automatic wake.
     ///
     /// Local presentation only. `text` stays the generic canonical marker, which is what provider
@@ -218,6 +222,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
         isLocalControlPlaneEcho: Bool = false,
         crossSessionAttribution: AgentCrossSessionAttribution? = nil,
+        dispatchedProviderText: String? = nil,
         laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil
     ) {
         self.id = id
@@ -238,6 +243,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.codexGoalMode = codexGoalMode
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
         self.crossSessionAttribution = crossSessionAttribution
+        self.dispatchedProviderText = dispatchedProviderText
         self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
     }
 
@@ -253,6 +259,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
         case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, isLocalControlPlaneEcho
         case crossSessionAttribution
+        case dispatchedProviderText
         case laneUpdateDisplayAttribution
     }
 
@@ -279,6 +286,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             AgentCrossSessionAttribution.self,
             forKey: .crossSessionAttribution
         )
+        dispatchedProviderText = try c.decodeIfPresent(String.self, forKey: .dispatchedProviderText)
         // Lossy on purpose: a malformed local-display blob is dropped, never propagated as a decode
         // failure that would take the whole transcript row with it.
         laneUpdateDisplayAttribution = try c.decodeIfPresent(
@@ -289,8 +297,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
 
     // MARK: - Factory Methods
 
-    public static func user(_ text: String, attachments: [AgentImageAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false, crossSessionAttribution: AgentCrossSessionAttribution? = nil) -> AgentChatItem {
-        AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho, crossSessionAttribution: crossSessionAttribution)
+    public static func user(_ text: String, attachments: [AgentImageAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false, crossSessionAttribution: AgentCrossSessionAttribution? = nil, dispatchedProviderText: String? = nil) -> AgentChatItem {
+        AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho, crossSessionAttribution: crossSessionAttribution, dispatchedProviderText: dispatchedProviderText)
     }
 
     public static func assistant(_ text: String, reasoning: String? = nil, sequenceIndex: Int = 0, isStreaming: Bool = false) -> AgentChatItem {
@@ -426,6 +434,7 @@ extension AgentChatItem {
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
             crossSessionAttribution: crossSessionAttribution,
+            dispatchedProviderText: dispatchedProviderText,
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution
         )
     }
@@ -458,6 +467,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var isLocalControlPlaneEcho: Bool
     public var crossSessionAttribution: AgentCrossSessionAttribution?
+    public var dispatchedProviderText: String?
     /// Local-display lane labels for an accepted lane-update row. Persisted with the session file
     /// and nowhere else; see `AgentLaneUpdateDisplayAttribution`.
     public var laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution?
@@ -477,6 +487,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho
         crossSessionAttribution = item.crossSessionAttribution
+        dispatchedProviderText = item.dispatchedProviderText
         laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
         toolResultStatus = nil
 
@@ -552,6 +563,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
             crossSessionAttribution: crossSessionAttribution,
+            dispatchedProviderText: dispatchedProviderText,
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution
         )
     }
@@ -600,6 +612,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case codexGoalMode
         case isLocalControlPlaneEcho
         case crossSessionAttribution
+        case dispatchedProviderText
         case laneUpdateDisplayAttribution
     }
 
@@ -626,6 +639,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             AgentCrossSessionAttribution.self,
             forKey: .crossSessionAttribution
         )
+        dispatchedProviderText = try container.decodeIfPresent(String.self, forKey: .dispatchedProviderText)
         laneUpdateDisplayAttribution = try container.decodeIfPresent(
             AgentLaneUpdateDisplayAttribution.self,
             forKey: .laneUpdateDisplayAttribution

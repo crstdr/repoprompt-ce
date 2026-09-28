@@ -16730,16 +16730,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// The provider route a managed cross-session steer would take right now, following
     /// `submitPreparedUserTurn`'s own branch order, or `nil` when no managed route exists.
     ///
-    /// It lives beside the submission path because classification happens before the attributed row
-    /// exists, so the two have to agree branch for branch. The shared follow-up queue is deliberately
-    /// not a managed route: a queued instruction can later be restored into the target user's
-    /// composer (on an execution-location change, for example), and an overseer's words must never
-    /// reappear there as the user's own draft.
-    ///
-    /// An idle target has no route here either: it is delivered only through the durable,
-    /// exact-endpoint send transaction. ACP live steering is not a managed route because a refused
-    /// ACP steer is requeued into that same follow-up queue and an interrupted ACP prompt is replayed
-    /// from transcript text, neither of which is aware of managed framing yet.
+    /// It lives beside submission because classification happens before the attributed row exists.
+    /// An idle target uses the durable send transaction. ACP's serialized queue carries managed
+    /// context through flush and follow-up, and only local draft text can return to the composer.
     func agentSessionLinkManagedSteerRoute(for session: TabSession) -> AgentSessionLinkManagedSteerRoute? {
         if session.runState == .waitingForUser, session.instructionContinuation != nil {
             return .waitingInstruction
@@ -16751,7 +16744,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         switch activeProviderSteeringRoute(for: session) {
         case .claudeNativeInterrupt:
             return .claudeInterrupt
-        case .acpPrompt, nil:
+        case .acpPrompt:
+            return .acpQueued
+        case nil:
             return nil
         }
     }
@@ -16797,6 +16792,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Codex reports its terminal state through the acknowledgement tracker `agent_run` uses. The
         // `.mcp` fallback origin that an attempt ID selects is the programmatic-dispatch origin,
         // which never restores a composer draft on failure.
+        guard agentSessionLinkManagedSteerRoute(for: session) == route else { return false }
         let codexAttemptID = route == .codex ? session.codexSteerAckTracker.beginAttempt() : nil
         let submission = submitPreparedUserTurn(
             tabID: tabID,
@@ -16971,7 +16967,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             taggedFileAttachments: taggedFilesToSend,
             sequenceIndex: session.nextSequenceIndex,
             workflow: activeWorkflow,
-            crossSessionAttribution: managedTurn?.attribution
+            crossSessionAttribution: managedTurn?.attribution,
+            dispatchedProviderText: managedTurn?.providerText
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
@@ -17303,14 +17300,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
-        // A managed steer never starts a run, uses ACP live steering, or enters the shared follow-up
-        // queue from here (see `agentSessionLinkManagedSteerRoute`). Reaching any of them means the
-        // state drifted from its classification, so the turn is withdrawn instead.
+        // Managed steers use only the classified live route; a drift to idle or to the
+        // unqualified follow-up path withdraws the attributed row instead.
         if let managedTurn {
             let steeringRoute = session.runState.isActive
                 ? activeProviderSteeringRoute(for: session, attachments: attachmentsToSend)
                 : nil
-            guard steeringRoute == .claudeNativeInterrupt else {
+            guard steeringRoute == .claudeNativeInterrupt || steeringRoute == .acpPrompt else {
                 withdrawAgentSessionLinkManagedTurn(
                     managedTurn,
                     userItemID: userItem.id,
@@ -17354,15 +17350,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return UserTurnSubmissionResult.submitted
     }
 
-    private func interruptedACPProviderText(for session: TabSession, before steeringUserItem: AgentChatItem) -> String? {
+    func interruptedACPProviderText(for session: TabSession, before steeringUserItem: AgentChatItem) -> String? {
         guard let interruptedUserItem = session.items.last(where: {
             $0.kind == .user && $0.sequenceIndex < steeringUserItem.sequenceIndex
         }) else {
             return nil
         }
-        // A cross-session row stores only the sender's raw words; its RepoPrompt framing was
-        // provider-only. Replaying those words would present another session's text as this
-        // session's own user prompt, so an interrupted cross-session turn is not replayed.
+        // New attributed rows retain the exact payload passed to the provider. Legacy attributed
+        // rows lack a provable envelope and must still be omitted rather than impersonated.
+        if let dispatched = interruptedUserItem.dispatchedProviderText {
+            return dispatched
+        }
         guard interruptedUserItem.crossSessionAttribution == nil else { return nil }
         let rendered = renderProviderMessage(
             text: interruptedUserItem.text,
@@ -17444,7 +17442,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 taggedFileAttachments: taggedFilesToSend,
                 draftText: restorableDraftText,
                 optimisticUserItemID: userItem.id,
-                createdAt: Date()
+                createdAt: Date(),
+                managed: managedTurn.map {
+                    TabSession.ACPSteeringManagedContext(
+                        sink: $0.sink,
+                        attributedItemID: userItem.id,
+                        candidate: $0.candidate,
+                        attribution: $0.attribution
+                    )
+                }
             )
             session.pendingACPSteeringInstructions.append(steering)
             Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID)) queue=\(session.pendingACPSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
@@ -17465,7 +17471,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
                 if session.runState.isActive {
                     session.pendingInstructions.insert(queued.providerText, at: 0)
+                    queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
                 } else if session.runState == .completed, session.acpController != nil {
+                    queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
                     await startAgentRun(
                         tabID: session.tabID,
                         initialMessage: queued.providerText,
@@ -17476,6 +17484,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     // active-steering queue was rejected before the run service could take it,
                     // preserve it as a normal provider follow-up instead.
                     session.pendingInstructions.insert(queued.providerText, at: 0)
+                    queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
                     session.isDirty = true
                     updateBindingsFromSession(session)
                     scheduleSave(for: session.tabID)

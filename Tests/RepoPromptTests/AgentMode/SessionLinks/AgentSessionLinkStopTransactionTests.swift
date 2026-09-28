@@ -68,6 +68,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
 
     private func stop(
         _ fixture: Fixture,
+        auditDeadlineSeconds: TimeInterval = 1,
         beforeCleanupTask: @escaping @MainActor () -> Void = {}
     ) async -> AgentSessionLinkStopTransactionOutcome {
         let observer = DomainAgentSessionLinkEndpointIdentity(
@@ -88,7 +89,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             withdrawInbound: { true },
             commitAuthorization: { .committed },
             teardownDeadlineSeconds: 1,
-            auditDeadlineSeconds: 1,
+            auditDeadlineSeconds: auditDeadlineSeconds,
             beforeCleanupTask: beforeCleanupTask
         )
     }
@@ -151,6 +152,41 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.session.runState, .cancelled)
         XCTAssertTrue(receipt.teardownCompleted == true)
         XCTAssertEqual(fixture.session.items.count(where: { $0.text == AgentChatItem.overseerRunStoppedText }), 1)
+    }
+
+    func testSuccessfulStopRetainsResultWhenAuditSaveFails() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "stop-save-failure")
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+            throw NSError(domain: "StopAuditFailure", code: 1)
+        }
+        let outcome = await stop(fixture)
+        guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.auditStatus, .failed)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        XCTAssertEqual(fixture.session.items.count(where: { $0.text == AgentChatItem.overseerRunStoppedText }), 1)
+    }
+
+    func testAuditDeadlineRetainsUnknownWithoutRepeatingCancellation() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "stop-save-timeout")
+        let gate = AgentSessionLinkStopSignal<Void>()
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+            await gate.value()
+            return URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("\(UUID().uuidString).json")
+        }
+        let outcome = await stop(fixture, auditDeadlineSeconds: 0.05)
+        guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.auditStatus, .unknown)
+        XCTAssertEqual(fixture.session.items.count(where: { $0.text == AgentChatItem.overseerRunStoppedText }), 1)
+        gate.finish(())
     }
 
     func testSecondUserStopForceRetiresUnclaimedTerminalGate() async throws {

@@ -57,6 +57,8 @@ enum AgentSessionLinkDeliveryReadiness {
         var pendingOversightAutoWake: Bool = false
         /// A binding-qualified managed stop owns this target until cleanup releases its gate.
         var stopInProgress: Bool = false
+        /// A dispatched ACP compact command may still be settling inside the provider.
+        var compactionSettling: Bool = false
 
         // Target interactions. Waiting states are never ready: answering one would be a different
         // capability than sending a new instruction, and `send` never gains it.
@@ -85,6 +87,7 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingClaudeSteeringCount: Int,
             pendingOversightAutoWake: Bool = false,
             stopInProgress: Bool = false,
+            compactionSettling: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
             hasPendingUserInputRequest: Bool,
@@ -109,6 +112,7 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingClaudeSteeringCount = pendingClaudeSteeringCount
             self.pendingOversightAutoWake = pendingOversightAutoWake
             self.stopInProgress = stopInProgress
+            self.compactionSettling = compactionSettling
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser
             self.hasPendingUserInputRequest = hasPendingUserInputRequest
@@ -218,6 +222,7 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingClaudeSteeringCount > 0
             || snapshot.pendingOversightAutoWake
             || snapshot.stopInProgress
+            || snapshot.compactionSettling
             || snapshot.hasWaitingPrompt
             || snapshot.hasPendingAskUser
             || snapshot.hasPendingUserInputRequest

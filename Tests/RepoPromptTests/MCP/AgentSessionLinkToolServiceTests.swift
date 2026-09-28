@@ -2431,6 +2431,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(busy["delivered"], .bool(false))
         XCTAssertEqual(busy["retryable"], .bool(true))
 
+        guard case let .object(settling) = AgentSessionLinkResponseRenderer.sendBlockedValue(
+            .compactionSettling,
+            targetSessionID: sessionID
+        ) else { return XCTFail("Expected settle refusal") }
+        XCTAssertEqual(settling["result"], .string("compaction_settling"))
+        XCTAssertEqual(settling["delivered"], .bool(false))
+        XCTAssertEqual(settling["retryable"], .bool(true))
+
         guard case let .object(revoked) = AgentSessionLinkResponseRenderer.sendBlockedValue(
             .linkRevoked,
             targetSessionID: sessionID

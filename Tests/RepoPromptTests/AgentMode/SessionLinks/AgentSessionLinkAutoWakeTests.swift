@@ -1465,6 +1465,29 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
     }
 
+    func testObserverAdmitsOneWakeForCancelledTargetStatusEdge() throws {
+        // This fixture is the observer side of Stop: the target's accepted cancelled publication
+        // appears here as one running -> idle status edge, not as a target-side wake retraction.
+        let observer = try makeFixture()
+        try publishInventory(observer, revision: 1)
+        observer.session.oversight.autoWakeOnUpdates = true
+        observer.session.runState = .running
+        try publishLane(
+            observer, linkSetRevision: 1, queueRevision: 0,
+            targetIndices: [], laneIndices: [0]
+        )
+        XCTAssertNil(observer.session.oversight.pendingAutoWake)
+        try publishLane(observer, linkSetRevision: 1, queueRevision: 1)
+        let first = try XCTUnwrap(observer.session.oversight.pendingAutoWake)
+        first.task?.cancel()
+        try publishLane(observer, linkSetRevision: 1, queueRevision: 1)
+        XCTAssertEqual(observer.session.oversight.pendingAutoWake?.wakeID, first.wakeID)
+        XCTAssertEqual(observer.session.oversight.pendingAutoWake?.wakeFingerprint, first.wakeFingerprint)
+        observer.viewModel.cancelAgentSessionLinkAutoWake(
+            for: first.observerEndpoint, reason: .settingDisabled
+        )
+    }
+
     func testBusyWakeAwaitsOneCancellableObservationSubscription() async throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)

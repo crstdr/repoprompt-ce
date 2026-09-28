@@ -378,6 +378,13 @@ final class AgentTabSession: ObservableObject {
     var claudeSteeringFlushTask: Task<Void, Never>?
 
     /// ACP steering queue — carries text accepted for serialized live steering.
+    struct ACPSteeringManagedContext {
+        let sink: AgentSessionLinkManagedSteerSink
+        let attributedItemID: UUID
+        let candidate: AgentSessionLinkEndpointCandidate
+        let attribution: AgentCrossSessionAttribution
+    }
+
     struct ACPSteeringInstruction: Identifiable {
         let id: UUID
         /// The ACP process run this steering message was queued against.
@@ -397,6 +404,7 @@ final class AgentTabSession: ObservableObject {
         /// The optimistic user bubble we appended (for potential removal on failure).
         let optimisticUserItemID: UUID?
         let createdAt: Date
+        var managed: ACPSteeringManagedContext?
     }
 
     var pendingACPSteeringInstructions: [ACPSteeringInstruction] = [] {
@@ -704,6 +712,7 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
+                clearACPCompactSettling()
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
@@ -791,8 +800,13 @@ final class AgentTabSession: ObservableObject {
     var attachmentsPendingProviderConsumptionCleanup: [AgentImageAttachment] = []
     var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
 
-    // Provider session ID for resumption (e.g., Claude CLI session_id)
-    var providerSessionID: String?
+    /// Provider session ID for resumption (e.g., Claude CLI session_id)
+    var providerSessionID: String? {
+        didSet {
+            if providerSessionID != oldValue { clearACPCompactSettling() }
+        }
+    }
+
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
     var automationTurnAudit: [AgentAutomationTurnAudit] = []
@@ -924,6 +938,69 @@ final class AgentTabSession: ObservableObject {
 
     var acpOccupancyReportThisTurn: ContextOccupancyEpoch?
 
+    /// A compact command may finish its RepoPrompt turn before the provider finishes compacting.
+    /// Runtime-only and qualified by both controller and provider conversation.
+    struct ACPCompactSettlingMarker {
+        let providerSessionID: String
+        let controllerID: ObjectIdentifier
+        let dispatchedAt: Date
+        let deadline: Date
+        let priorUsedTokens: Int?
+    }
+
+    private(set) var acpCompactSettling: ACPCompactSettlingMarker?
+    private var acpCompactSettleDeadlineTask: Task<Void, Never>?
+    nonisolated static let acpCompactSettleSeconds: TimeInterval = 90
+
+    func beginACPCompactSettling(
+        providerSessionID: String,
+        controller: ACPAgentSessionController,
+        now: Date = Date(),
+        settleSeconds: TimeInterval = AgentTabSession.acpCompactSettleSeconds,
+        scheduleDeadline: Bool = true
+    ) {
+        guard selectedAgent.acpProviderID != nil,
+              acpController === controller,
+              self.providerSessionID == providerSessionID
+        else { return }
+        let marker = ACPCompactSettlingMarker(
+            providerSessionID: providerSessionID,
+            controllerID: ObjectIdentifier(controller),
+            dispatchedAt: now,
+            deadline: now.addingTimeInterval(settleSeconds),
+            priorUsedTokens: contextUsageSnapshot?.used
+        )
+        acpCompactSettleDeadlineTask?.cancel()
+        acpCompactSettling = marker
+        noteMonitorObservationInputsChanged()
+        guard scheduleDeadline else { return }
+        acpCompactSettleDeadlineTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, settleSeconds) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            _ = self?.isACPCompactSettling(now: Date())
+        }
+    }
+
+    func clearACPCompactSettling() {
+        guard acpCompactSettling != nil else { return }
+        acpCompactSettleDeadlineTask?.cancel()
+        acpCompactSettleDeadlineTask = nil
+        acpCompactSettling = nil
+        noteMonitorObservationInputsChanged()
+    }
+
+    func isACPCompactSettling(now: Date = Date()) -> Bool {
+        guard let marker = acpCompactSettling else { return false }
+        guard now < marker.deadline,
+              providerSessionID == marker.providerSessionID,
+              acpController.map(ObjectIdentifier.init) == marker.controllerID
+        else {
+            clearACPCompactSettling()
+            return false
+        }
+        return true
+    }
+
     /// Bumped by every write to `vouchedContextCount`, including a withdrawal that leaves it `nil`, so
     /// a restore can prove no report touched the count since it was withdrawn.
     private var contextCountVouchRevision: UInt64 = 0
@@ -1003,6 +1080,18 @@ final class AgentTabSession: ObservableObject {
                     : nil
             }
         }
+        // A post-dispatch ACP occupancy report clears the settling hold only when it vouches
+        // a drop below the count captured at dispatch. An unchanged/billed count is not proof.
+        if reportsOccupancy,
+           let contextUsedTokens,
+           let marker = acpCompactSettling,
+           let priorUsedTokens = marker.priorUsedTokens,
+           contextUsedTokens < priorUsedTokens,
+           vouchedContextCount?.tokens == contextUsedTokens,
+           isACPCompactSettling()
+        {
+            clearACPCompactSettling()
+        }
     }
 
     var codexNeedsReconnect: Bool = false
@@ -1069,7 +1158,12 @@ final class AgentTabSession: ObservableObject {
     }
 
     var claudeController: (any NativeAgentRuntimeControlling)?
-    var acpController: ACPAgentSessionController?
+    var acpController: ACPAgentSessionController? {
+        didSet {
+            if acpController !== oldValue { clearACPCompactSettling() }
+        }
+    }
+
     var codexEventTask: Task<Void, Never>?
     var codexEventTaskRunID: UUID?
     var codexLastEventAt: Date?

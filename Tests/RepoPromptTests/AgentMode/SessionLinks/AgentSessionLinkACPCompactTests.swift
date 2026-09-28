@@ -439,12 +439,21 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
         XCTAssertNil(fixture.session.vouchedContextCount, "The count vouch is invalidated at dispatch")
         XCTAssertEqual(fixture.session.vouchedContextWindow?.tokens, 1000)
         XCTAssertFalse(fixture.session.contextCountVouchAwaitsOccupancyReport, "The suspension ends with the turn")
+        XCTAssertTrue(fixture.session.isACPCompactSettling(), "Background compaction may outlive the command turn")
 
         // The revision the command skipped is still owed to the next ordinary turn.
         fixture.session.runState = .idle
         await run(fixture, message: "acp follow-up")
         XCTAssertEqual(fixture.harness.acceptedClaims.count, 2)
         XCTAssertTrue(fixture.session.acpController === liveController)
+    }
+
+    func testUserTypedAdvertisedCompactAlsoStartsManagedSettleWindow() async throws {
+        let fixture = try makeFixture()
+        await run(fixture, message: "initial turn")
+        fixture.session.runState = .idle
+        await run(fixture, message: "/compact")
+        XCTAssertTrue(fixture.session.isACPCompactSettling())
     }
 
     func testARefusalAfterARebindSendsNothingAndKeepsTheLiveSession() async throws {

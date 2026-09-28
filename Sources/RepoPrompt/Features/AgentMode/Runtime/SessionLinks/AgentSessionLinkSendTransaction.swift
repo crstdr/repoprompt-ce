@@ -177,6 +177,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     case targetBusy = "target_busy"
     /// A queued inbound send was withdrawn when its exact target endpoint was stopped.
     case targetStopped = "target_stopped"
+    /// A tracked ACP compact command may still be running in the background.
+    case compactionSettling = "compaction_settling"
     /// The target is running on a provider path that cannot take live steering. Nothing was
     /// delivered; the message can be queued with `send` and `delivery: "when_sendable"`.
     case steerUnavailable = "steer_unavailable"
@@ -208,7 +210,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     var isRetryable: Bool {
         switch self {
         case .targetLoading, .targetNotIdle, .persistenceFailed, .targetAwaitingInteraction,
-             .targetBusy, .steerUnavailable, .steerNotAccepted:
+             .targetBusy, .compactionSettling, .steerUnavailable, .steerNotAccepted:
             true
         case .endpointInvalidated, .linkRevoked, .persistenceIndeterminate, .shuttingDown,
              .managementRevoked, .steerUnconfirmed, .notSupported, .noProviderSession, .targetStopped:
@@ -251,6 +253,9 @@ enum AgentSessionLinkSendFailure: String, Equatable {
                 + "was delivered. Wait for a change and try again with the same idempotency_key."
         case .targetStopped:
             "The queued message was withdrawn because the target was stopped and was not delivered."
+        case .compactionSettling:
+            "The ACP provider may still be compacting in the background. Nothing was delivered. "
+                + "Wait for a context update or retry after the settle window with the same idempotency_key."
         case .steerUnavailable:
             "This session's provider cannot take live steering while it runs. Nothing was "
                 + "delivered. Steer again once it is idle, or queue a message with send and "

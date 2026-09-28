@@ -370,6 +370,7 @@ final class AgentModeRunService {
               let controller = session.acpController else { return false }
 
         let tabID = session.tabID
+        let flushStopFence = AgentRunStartStopFence(session: session)
         steeringDebugLog("[AgentRunSteeringWake] ACP flush start tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
         session.acpSteeringFlushTask = Task { [weak self, weak session, controller] in
             guard let self, let session else { return }
@@ -392,7 +393,8 @@ final class AgentModeRunService {
                         tabID: tabID,
                         session: session,
                         matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID },
-                        reason: "stale ACP steering attempt before MCP idle wait"
+                        reason: "stale ACP steering attempt before MCP idle wait",
+                        stopFence: flushStopFence
                     )
                     return
                 }
@@ -405,7 +407,8 @@ final class AgentModeRunService {
                         tabID: tabID,
                         session: session,
                         while: { $0.targetRunID != runID || $0.targetRunAttemptID != runAttemptID },
-                        reason: "queued ACP steering target no longer matches active run"
+                        reason: "queued ACP steering target no longer matches active run",
+                        stopFence: flushStopFence
                     )
                     continue
                 }
@@ -434,7 +437,8 @@ final class AgentModeRunService {
                     requeueAllQueuedACPSteeringAsFollowUp(
                         tabID: tabID,
                         session: session,
-                        reason: "ACP steering MCP idle wait was cancelled"
+                        reason: "ACP steering MCP idle wait was cancelled",
+                        stopFence: flushStopFence
                     )
                     return
                 }
@@ -447,16 +451,22 @@ final class AgentModeRunService {
                         tabID: tabID,
                         session: session,
                         matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID },
-                        reason: "stale ACP steering attempt after MCP idle wait"
+                        reason: "stale ACP steering attempt after MCP idle wait",
+                        stopFence: flushStopFence
                     )
                     return
                 }
 
-                let steeringBatch = Array(session.pendingACPSteeringInstructions.prefix(while: {
+                let queuedBatch = Array(session.pendingACPSteeringInstructions.prefix(while: {
                     $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID
                 }))
-                guard !steeringBatch.isEmpty else { continue }
-                session.pendingACPSteeringInstructions.removeFirst(steeringBatch.count)
+                guard !queuedBatch.isEmpty else { continue }
+                session.pendingACPSteeringInstructions.removeFirst(queuedBatch.count)
+                let steeringBatch = currentACPSteeringInstructions(queuedBatch, session: session)
+                guard !steeringBatch.isEmpty else {
+                    releaseSupersedingProtectionIfUnused()
+                    continue
+                }
 
                 let providerTextForSend = coalescedACPProviderText(for: steeringBatch)
                 var dequeuedUserInputTokens: [Int] = []
@@ -475,6 +485,21 @@ final class AgentModeRunService {
                     steeringBatch.flatMap(\.taggedFileAttachments),
                     session
                 )
+                // Augmentation suspended. Re-prove every attributed endpoint before the provider
+                // call; if one went stale, never send the already-coalesced batch containing it.
+                let stillCurrent = currentACPSteeringInstructions(steeringBatch, session: session)
+                if stillCurrent.count != steeringBatch.count || !flushStopFence.permitsStart(of: session) {
+                    releaseSupersedingProtectionIfUnused()
+                    if !dequeuedUserInputTokens.isEmpty {
+                        session.pendingNonCodexUserInputTokenQueue.insert(contentsOf: dequeuedUserInputTokens, at: 0)
+                    }
+                    requeueACPSteeringAsFollowUp(
+                        stillCurrent, tabID: tabID, session: session,
+                        reason: "ACP steering endpoint changed during preparation",
+                        stopFence: flushStopFence
+                    )
+                    return
+                }
                 let sent = await submitActiveACPPromptIfSupported(
                     session: session,
                     messageForRun: augmentedSteeringText,
@@ -485,10 +510,15 @@ final class AgentModeRunService {
                 )
                 hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
                 if sent {
+                    steeringBatch.forEach { $0.managed?.sink.resolve(.delivered(.steered)) }
                     await hooks.continuation.signalMCPInstructionDelivered(session)
                 }
                 if !sent {
                     releaseSupersedingProtectionIfUnused()
+                    guard flushStopFence.permitsStart(of: session) else {
+                        withdrawManagedACPSteering(steeringBatch, session: session)
+                        return
+                    }
                     session.pendingACPSteeringInstructions.insert(contentsOf: steeringBatch, at: 0)
                     if !dequeuedUserInputTokens.isEmpty {
                         session.pendingNonCodexUserInputTokenQueue.insert(contentsOf: dequeuedUserInputTokens, at: 0)
@@ -496,7 +526,8 @@ final class AgentModeRunService {
                     requeueAllQueuedACPSteeringAsFollowUp(
                         tabID: tabID,
                         session: session,
-                        reason: "ACP interrupt+prompt send returned false"
+                        reason: "ACP interrupt+prompt send returned false",
+                        stopFence: flushStopFence
                     )
                     return
                 }
@@ -555,50 +586,53 @@ final class AgentModeRunService {
         tabID: UUID,
         session: AgentTabSession,
         matching shouldRequeue: (AgentTabSession.ACPSteeringInstruction) -> Bool,
-        reason: String
+        reason: String,
+        stopFence: AgentRunStartStopFence
     ) {
         let instructions = session.pendingACPSteeringInstructions.filter(shouldRequeue)
         guard !instructions.isEmpty else { return }
         session.pendingACPSteeringInstructions.removeAll(where: shouldRequeue)
-        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason)
+        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason, stopFence: stopFence)
     }
 
     private func requeueLeadingACPSteeringAsFollowUp(
         tabID: UUID,
         session: AgentTabSession,
         while shouldRequeue: (AgentTabSession.ACPSteeringInstruction) -> Bool,
-        reason: String
+        reason: String,
+        stopFence: AgentRunStartStopFence
     ) {
         let instructions = Array(session.pendingACPSteeringInstructions.prefix(while: shouldRequeue))
         guard !instructions.isEmpty else { return }
         session.pendingACPSteeringInstructions.removeFirst(instructions.count)
-        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason)
+        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason, stopFence: stopFence)
     }
 
     private func requeueAllQueuedACPSteeringAsFollowUp(
         tabID: UUID,
         session: AgentTabSession,
-        reason: String
+        reason: String,
+        stopFence: AgentRunStartStopFence
     ) {
         let instructions = session.pendingACPSteeringInstructions
         guard !instructions.isEmpty else { return }
         session.pendingACPSteeringInstructions.removeAll()
-        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason)
+        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason, stopFence: stopFence)
     }
 
     private func coalescedACPProviderText(
         for instructions: [AgentTabSession.ACPSteeringInstruction]
     ) -> String {
         let steeringTexts = instructions
-            .map { $0.providerText.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .map(\.providerText)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !steeringTexts.isEmpty else { return "" }
 
         var seenInterruptedTexts = Set<String>()
         let steeringTextSet = Set(steeringTexts)
         let interruptedTexts = instructions.compactMap { instruction -> String? in
-            guard let text = instruction.interruptedPromptProviderText?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty,
+            guard let text = instruction.interruptedPromptProviderText,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !steeringTextSet.contains(text),
                   seenInterruptedTexts.insert(text).inserted
             else {
@@ -634,16 +668,77 @@ final class AgentModeRunService {
         """
     }
 
+    private func managedACPSteeringIsCurrent(
+        _ managed: AgentTabSession.ACPSteeringManagedContext,
+        session: AgentTabSession
+    ) -> Bool {
+        let candidate = managed.candidate
+        return session.tabID == candidate.tabID
+            && session.activeAgentSessionID == candidate.sessionID
+            && session.persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration
+            && session.bindingTransitionGeneration == candidate.bindingTransitionGeneration
+            && !session.bindingTransitionInProgress
+            && session.items.contains {
+                $0.id == managed.attributedItemID && $0.crossSessionAttribution == managed.attribution
+            }
+    }
+
+    private func withdrawManagedACPSteering(
+        _ instructions: [AgentTabSession.ACPSteeringInstruction],
+        session: AgentTabSession
+    ) {
+        var removedRow = false
+        for instruction in instructions {
+            guard let managed = instruction.managed else { continue }
+            if let index = session.items.firstIndex(where: { $0.id == managed.attributedItemID }) {
+                _ = session.removeItem(at: index)
+                removedRow = true
+            }
+            managed.sink.resolve(.notAccepted(
+                message: "The ACP steer was withdrawn before the provider accepted it."
+            ))
+        }
+        if removedRow {
+            session.isDirty = true
+            hooks.bindingObservation.updateBindings(session)
+            hooks.persistence.scheduleSave(session)
+        }
+    }
+
+    private func currentACPSteeringInstructions(
+        _ instructions: [AgentTabSession.ACPSteeringInstruction],
+        session: AgentTabSession
+    ) -> [AgentTabSession.ACPSteeringInstruction] {
+        instructions.filter { instruction in
+            guard let managed = instruction.managed else { return true }
+            guard managedACPSteeringIsCurrent(managed, session: session) else {
+                withdrawManagedACPSteering([instruction], session: session)
+                return false
+            }
+            return true
+        }
+    }
+
     private func requeueACPSteeringAsFollowUp(
         _ instructions: [AgentTabSession.ACPSteeringInstruction],
         tabID: UUID,
         session: AgentTabSession,
-        reason: String
+        reason: String,
+        stopFence: AgentRunStartStopFence
     ) {
-        var providerTexts = [coalescedACPProviderText(for: instructions)]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !providerTexts.isEmpty else { return }
+        guard stopFence.permitsStart(of: session) else {
+            withdrawManagedACPSteering(instructions, session: session)
+            return
+        }
+        let current = currentACPSteeringInstructions(instructions, session: session)
+        guard !current.isEmpty else { return }
+        var providerTexts = [coalescedACPProviderText(for: current)]
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !providerTexts.isEmpty else {
+            current.forEach { $0.managed?.sink.resolve(.notAccepted(message: "The ACP steer contained no provider text.")) }
+            return
+        }
+        current.forEach { $0.managed?.sink.resolve(.delivered(.queuedFollowUp)) }
         if session.runState == .completed, session.acpController != nil {
             let first = providerTexts.removeFirst()
             if !providerTexts.isEmpty {
@@ -970,7 +1065,14 @@ final class AgentModeRunService {
         let drafts = (
             session.pendingClaudeSteeringInstructions.map(\.draftText)
                 + session.pendingACPSteeringInstructions.map(\.draftText)
-                + session.pendingInstructions
+                + session.pendingInstructions.filter { text in
+                    // Managed ACP follow-ups retain their provider envelope in this shared queue.
+                    // Never restore that attributed provider text as the lane user's draft.
+                    !(
+                        text.contains("<cross_session_message ")
+                            && text.contains("delegation=\"user_delegated_management\"")
+                    )
+                }
         )
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
@@ -1009,6 +1111,7 @@ final class AgentModeRunService {
         restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
         session.pendingInstructions.removeAll()
         session.pendingClaudeSteeringInstructions.removeAll()
+        withdrawManagedACPSteering(session.pendingACPSteeringInstructions, session: session)
         session.pendingACPSteeringInstructions.removeAll()
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()
@@ -1034,6 +1137,10 @@ final class AgentModeRunService {
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
+            // Even a settled run may still have a deferred ACP queue. User Stop must not leave
+            // managed sinks parked behind the terminal shortcut.
+            withdrawManagedACPSteering(session.pendingACPSteeringInstructions, session: session)
+            session.pendingACPSteeringInstructions.removeAll()
             await terminalCommitBarrier.awaitTerminalPublication(
                 for: revision.ownership,
                 lifecycle: session.runLifecycle
@@ -1078,6 +1185,7 @@ final class AgentModeRunService {
         session.activeNonCodexTurnTokenAccumulator = nil
         session.pendingInstructions.removeAll()
         session.pendingClaudeSteeringInstructions.removeAll()
+        withdrawManagedACPSteering(session.pendingACPSteeringInstructions, session: session)
         session.pendingACPSteeringInstructions.removeAll()
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()

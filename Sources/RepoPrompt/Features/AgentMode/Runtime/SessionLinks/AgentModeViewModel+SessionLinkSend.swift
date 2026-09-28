@@ -47,6 +47,7 @@ extension AgentModeViewModel {
             pendingClaudeSteeringCount: session.pendingClaudeSteeringInstructions.count,
             pendingOversightAutoWake: session.oversight.pendingAutoWake != nil,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
+            compactionSettling: session.isACPCompactSettling(),
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,
             hasPendingUserInputRequest: session.pendingUserInputRequest != nil,
@@ -173,8 +174,23 @@ extension AgentModeViewModel {
             return .blocked(.endpointInvalidated)
         }
 
-        // 6. Durable acceptance. The row carries the observer's raw text plus attribution; the
-        //    envelope is built for the provider only, so the transcript is not a rendering of XML.
+        // Freeze the exact provider payload before the durable row so an interrupted ACP turn can
+        // replay its original management envelope rather than unframed attributed words.
+        let envelope = AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: request.observerSessionID,
+            sourceName: request.observerDisplayName,
+            linkID: request.linkID,
+            linkGeneration: request.linkGeneration,
+            message: request.message,
+            framing: request.framing
+        )
+        let providerMessage = AgentSessionLinkMessageEnvelope.providerPayload(
+            envelope: envelope,
+            workflow: request.workflow,
+            includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared
+                .showBuiltInWorkflowCleanupGuidance()
+        )
+        // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
         let userItem = AgentChatItem.user(
             request.message,
             sequenceIndex: liveSession.nextSequenceIndex,
@@ -271,23 +287,14 @@ extension AgentModeViewModel {
         //    additionally leaves any staged handoff untouched, so the target's next *local* send
         //    still receives the continuity it was staged for. Nothing focuses, activates, or
         //    switches the target window.
-        let envelope = AgentSessionLinkMessageEnvelope.render(
-            sourceSessionID: request.observerSessionID,
-            sourceName: request.observerDisplayName,
-            linkID: request.linkID,
-            linkGeneration: request.linkGeneration,
-            message: request.message,
-            framing: request.framing
-        )
-        // A per-message workflow is applied to the provider payload only. `session.selectedWorkflow`
-        // is never read, written, or restored here, which is what makes preserving the target's own
-        // selection structural rather than a cleanup step some failure path could skip.
-        let providerMessage = AgentSessionLinkMessageEnvelope.providerPayload(
-            envelope: envelope,
-            workflow: request.workflow,
-            includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared
-                .showBuiltInWorkflowCleanupGuidance()
-        )
+        // The row was durable before dispatch. Mark the exact provider text only after the final
+        // dispatch admission, so a persisted-only row cannot masquerade as an interrupted prompt.
+        if let index = liveSession.items.firstIndex(where: { $0.id == userItem.id }) {
+            var dispatchedRow = liveSession.items[index]
+            dispatchedRow.dispatchedProviderText = providerMessage
+            liveSession.replaceItem(at: index, with: dispatchedRow)
+            scheduleSave(for: candidate.tabID)
+        }
         // The run service's `nil` return is "not a Codex native send", not "started", so the
         // recorder is what distinguishes a Claude/ACP/headless pre-start failure from success.
         let startRecorder = AgentRunStartOutcomeRecorder()
@@ -300,6 +307,11 @@ extension AgentModeViewModel {
         releaseComposerSubmitClaim(claim)
         if startRecorder.outcome.didStart {
             agentSessionLinkClearWaitingOnAfterAcceptedTurn(liveSession)
+        } else if let index = liveSession.items.firstIndex(where: { $0.id == userItem.id }) {
+            var undispatchedRow = liveSession.items[index]
+            undispatchedRow.dispatchedProviderText = nil
+            liveSession.replaceItem(at: index, with: undispatchedRow)
+            scheduleSave(for: candidate.tabID)
         }
 
         let resultingRunState = sessions[candidate.tabID]?.runState ?? liveSession.runState
