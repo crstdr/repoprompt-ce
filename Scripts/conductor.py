@@ -66,6 +66,30 @@ BUILD_CACHE_CLONE_SECONDS_PER_ENTRY = 0.005
 BUILD_CACHE_CLONE_SECONDS_PER_GIB = 5.0
 BUILD_CACHE_RETRY_OVERHEAD_SECONDS = 30.0
 BUILD_CACHE_FORCE_STOP_WAIT_SECONDS = 4 * BUILD_CACHE_CLONE_MAX_SECONDS + BUILD_CACHE_RETRY_OVERHEAD_SECONDS
+CONDUCTOR_JOB_TICKET_ENV = "REPOPROMPT_CONDUCTOR_JOB_TICKET"
+OPERATION_RUNNER_ARG = "__operation_runner"
+# SwiftPM keys its manifest cache on the full process environment, so any per-job value
+# exported to a SwiftPM process forces every package manifest to be re-evaluated and the
+# build to be re-planned (~30 s per job on this package). The job ticket is therefore
+# delivered only to conductor's own operation runner, which consumes it before spawning
+# anything else.
+_CURRENT_JOB_TICKET: Optional[str] = None
+
+
+def argv_is_operation_runner(argv: Sequence[str]) -> bool:
+    return OPERATION_RUNNER_ARG in list(argv)[:4]
+
+
+def capture_job_ticket(environ: Dict[str, str]) -> Optional[str]:
+    global _CURRENT_JOB_TICKET
+    _CURRENT_JOB_TICKET = environ.pop(CONDUCTOR_JOB_TICKET_ENV, None)
+    return _CURRENT_JOB_TICKET
+
+
+def current_job_ticket() -> Optional[str]:
+    return _CURRENT_JOB_TICKET
+
+
 BUILD_CACHE_ELIGIBLE_OPERATIONS = {"swift-build", "build", "package", "test", "install-debug-cli"}
 BUILD_CACHE_ENV_KEYS = (
     "ARCHS",
@@ -4223,7 +4247,9 @@ class DaemonState:
                     self._append_system_line_locked(job, "job canceled before process start\n")
                     return
             argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
-            env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = job.ticket
+            env.pop(CONDUCTOR_JOB_TICKET_ENV, None)
+            if argv_is_operation_runner(argv):
+                env[CONDUCTOR_JOB_TICKET_ENV] = job.ticket
             if BuildCacheManager.eligible(job.operation, job.args) and (self.paths.repo_root / "Package.swift").is_file():
                 with self._cache_write_lock:
                     cache_manager = self._build_cache_manager(env)
@@ -7356,7 +7382,7 @@ def package_debug_app_under_heavy(repo_root: Path, operation_label: str) -> Tupl
     staged_bundle = staging_parent / live_bundle.name
     metadata = display_lock_metadata(
         lock_kind="global-heavy",
-        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        ticket=current_job_ticket(),
         operation=operation_label,
         operation_label=operation_label,
         repo_root=repo_root,
@@ -7448,7 +7474,7 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
         return 1
     metadata = display_lock_metadata(
         lock_kind="live-app",
-        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        ticket=current_job_ticket(),
         operation="app launch-existing" if staged_bundle is None else "app activate-staged-and-launch",
         operation_label="app launch-existing" if staged_bundle is None else "app activate staged and launch",
         repo_root=repo_root,
@@ -7543,7 +7569,7 @@ def operation_app_status(repo_root: Path) -> int:
 def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
     metadata = display_lock_metadata(
         lock_kind="live-app",
-        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        ticket=current_job_ticket(),
         operation="app stop",
         operation_label="app stop",
         repo_root=repo_root,
@@ -8339,9 +8365,10 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
 def main(argv: List[str]) -> int:
     repo_root = resolve_repo_root()
 
-    if argv and argv[0] == "__operation_runner":
+    if argv and argv[0] == OPERATION_RUNNER_ARG:
         if len(argv) != 2:
             raise ConductorError("__operation_runner requires one JSON payload argument")
+        capture_job_ticket(os.environ)
         return run_operation_runner(argv[1])
     if argv and argv[0] == "__cache_attempt_gate":
         if len(argv) != 3:

@@ -3107,6 +3107,7 @@ actor WorkspaceFileContextStore {
     private let codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe
     private let codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe
     private let codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy
+    private var nonGitCodeMapsEnabled: Bool
     private let selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory
     private let selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy
     private let automaticSelectionAccountingMaximum: Int
@@ -3298,6 +3299,7 @@ actor WorkspaceFileContextStore {
             codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
             codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
+            nonGitCodeMapsEnabled: Bool = true,
             codemapGraphIndexBuildLaunchPolicyForTesting: CodemapGraphIndexBuildLaunchPolicyForTesting = .enabled,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
@@ -3331,6 +3333,7 @@ actor WorkspaceFileContextStore {
             self.codemapLocalGitClassificationProbe = codemapLocalGitClassificationProbe
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
+            self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.codemapGraphIndexBuildLaunchPolicyForTesting = codemapGraphIndexBuildLaunchPolicyForTesting
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
@@ -3366,6 +3369,7 @@ actor WorkspaceFileContextStore {
             codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
             codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
+            nonGitCodeMapsEnabled: Bool = false,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
             automaticSelectionAccountingMaximum: Int = .max,
@@ -3397,6 +3401,7 @@ actor WorkspaceFileContextStore {
             self.codemapLocalGitClassificationProbe = codemapLocalGitClassificationProbe
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
+            self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
             precondition(automaticSelectionAccountingMaximum >= 0)
@@ -10207,22 +10212,42 @@ actor WorkspaceFileContextStore {
             return LoadedRootCatalogReconciliation(succeeded: true, deltas: [])
         }
 
-        let deltas: [FileSystemDelta]
+        var remaining = folderPaths.sorted()
+        var deltas: [FileSystemDelta] = []
         do {
-            deltas = try await state.service.scanFoldersInParallel(folderPaths.sorted()).deltas
+            while !remaining.isEmpty {
+                try Task.checkCancellation()
+                let result = try await state.service.scanFoldersInParallel(remaining)
+                guard !result.scannedFolders.isEmpty else {
+                    return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
+                }
+                guard let currentState = rootStatesByID[rootID],
+                      currentState.lifetimeID == state.lifetimeID,
+                      currentState.root.standardizedFullPath == root.standardizedFullPath
+                else {
+                    return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
+                }
+                // The service commits each batch to its visited inventory. Apply that batch to
+                // the store before scanning the next one so a later failure/retry cannot lose it.
+                if !result.deltas.isEmpty {
+                    await handleObservedFileSystemDeltas(result.deltas, root: root)
+                }
+                deltas.append(contentsOf: result.deltas)
+                remaining.removeAll { result.scannedFolders.contains($0) }
+                guard rootStatesByID[rootID]?.lifetimeID == state.lifetimeID else {
+                    return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
+                }
+            }
         } catch {
-            return LoadedRootCatalogReconciliation(succeeded: false, deltas: [])
+            return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
         }
-        guard let currentRoot = rootStatesByID[rootID]?.root,
-              currentRoot.standardizedFullPath == root.standardizedFullPath
+        guard !Task.isCancelled,
+              let currentState = rootStatesByID[rootID],
+              currentState.lifetimeID == state.lifetimeID,
+              currentState.root.standardizedFullPath == root.standardizedFullPath
         else {
             return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
         }
-        guard !deltas.isEmpty else {
-            return LoadedRootCatalogReconciliation(succeeded: true, deltas: [])
-        }
-
-        await handleObservedFileSystemDeltas(deltas, root: root)
         return LoadedRootCatalogReconciliation(succeeded: true, deltas: deltas)
     }
 
@@ -10878,6 +10903,35 @@ actor WorkspaceFileContextStore {
 
     private func removeCodemapRootStatusContinuation(_ id: UUID) {
         codemapRootStatusContinuations.removeValue(forKey: id)
+    }
+
+    /// Changing the opt-in revokes prior filesystem capabilities before admitting new work.
+    /// Git-root sessions are not affected by this compatibility setting.
+    func setNonGitCodeMapsEnabled(_ enabled: Bool) async {
+        guard nonGitCodeMapsEnabled != enabled else { return }
+        nonGitCodeMapsEnabled = enabled
+        var affectedRootIDs: [UUID] = []
+        for (rootID, state) in rootStatesByID {
+            guard case .nonGitRoot = state.service.ignoreRulePolicy,
+                  rootStatesByID[rootID]?.lifetimeID == state.lifetimeID,
+                  nonGitCodeMapsEnabled == enabled
+            else { continue }
+            let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
+            _ = detachCodemapSession(rootEpoch: rootEpoch)
+            filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: rootEpoch)
+            affectedRootIDs.append(rootID)
+        }
+        await awaitCodemapCleanupFlights(rootIDs: Set(affectedRootIDs))
+        guard nonGitCodeMapsEnabled == enabled else { return }
+        if enabled {
+            for rootID in affectedRootIDs {
+                guard let state = rootStatesByID[rootID] else { continue }
+                scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: WorkspaceCodemapRootEpoch(
+                    rootID: rootID,
+                    rootLifetimeID: state.lifetimeID
+                ))
+            }
+        }
     }
 
     private func codemapGenerationIsSuspended(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
@@ -13248,6 +13302,13 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             guard codemapGraphIndexBuildLaunchPolicyForTesting == .enabled else { return }
         #endif
+        // Legacy plain roots do no automatic Code Map work until the persisted opt-in is on.
+        if !nonGitCodeMapsEnabled,
+           let state = rootStatesByID[rootEpoch.rootID],
+           case .nonGitRoot = state.service.ignoreRulePolicy
+        {
+            return
+        }
         guard !codemapGenerationIsSuspended(rootEpoch: rootEpoch),
               !codemapRootWorkIsFenced(rootEpoch: rootEpoch),
               let authority = currentCodemapAuthority(rootEpoch: rootEpoch),
@@ -13531,7 +13592,13 @@ actor WorkspaceFileContextStore {
             codemapEligibilityFlightsByRootEpoch[authority.rootEpoch] = flight
         }
 
-        let result = await flight.task.value
+        let resolved = await flight.task.value
+        let filesystemOptOut = !nonGitCodeMapsEnabled && resolved.evidence?.filesystemProof != nil
+        let result: CodemapEligibilityResolution = if filesystemOptOut {
+            .terminal(.nonGit)
+        } else {
+            resolved
+        }
         if codemapEligibilityFlightsByRootEpoch[authority.rootEpoch]?.id == flight.id {
             codemapEligibilityFlightsByRootEpoch.removeValue(forKey: authority.rootEpoch)
         }
@@ -13589,14 +13656,17 @@ actor WorkspaceFileContextStore {
     private func performCodemapEligibility(
         authority: CodemapRootAuthority
     ) async -> CodemapEligibilityResolution {
+        // The local proof opens its root with O_NOFOLLOW. Classify the physical directory,
+        // while retaining the loaded alias in catalog identities for binding checks.
         let rootURL = URL(fileURLWithPath: authority.standardizedRootPath, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
         let local = await codemapLocalGitClassificationProbe.resolve(rootURL)
         guard !Task.isCancelled else { return .cancelled }
         guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
         if case let .definitelyNonGit(proof) = local,
            case let .current(currentProof) = codemapLocalGitClassificationProbe.refresh(proof)
         {
-            return .eligible(.filesystem(currentProof))
+            return nonGitCodeMapsEnabled ? .eligible(.filesystem(currentProof)) : .terminal(.nonGit)
         }
         guard !Task.isCancelled else { return .cancelled }
         guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
@@ -13616,7 +13686,7 @@ actor WorkspaceFileContextStore {
             guard case let .definitelyNonGit(proof) = retry,
                   case let .current(currentProof) = codemapLocalGitClassificationProbe.refresh(proof)
             else { return .transient(.repositoryChanging) }
-            return .eligible(.filesystem(currentProof))
+            return nonGitCodeMapsEnabled ? .eligible(.filesystem(currentProof)) : .terminal(.nonGit)
         case let .transientUnavailable(reason):
             return .transient(reason)
         }

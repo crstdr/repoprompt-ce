@@ -56,5 +56,10 @@ final class IgnoreRulesRecoveryTests: XCTestCase {
         )
         XCTAssertTrue(gitRoot.isIgnored(relativePath: ".git", isDirectory: true))
         XCTAssertFalse(gitRoot.isIgnored(relativePath: ".jj", isDirectory: true))
+
+        let unmodifiedGitRoot = try IgnoreRules(
+            policy: .gitRoot(repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix(""))
+        )
+        XCTAssertFalse(unmodifiedGitRoot.isIgnored(relativePath: ".jj", isDirectory: true))
     }
 }
