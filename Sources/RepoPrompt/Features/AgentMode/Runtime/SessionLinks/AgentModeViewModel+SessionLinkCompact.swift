@@ -297,7 +297,8 @@ extension AgentModeViewModel {
         session: TabSession,
         tabID: UUID,
         support: AgentSessionLinkCompactSupport,
-        isStillAdmissible: @escaping @MainActor () -> Bool
+        isStillAdmissible: @escaping @MainActor () -> Bool,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async -> AgentNativeCompactDispatchResult {
         guard isStillAdmissible(), agentSessionLinkCompactSupport(for: session) == support else {
             return .notStarted
@@ -308,6 +309,7 @@ extension AgentModeViewModel {
             let start = await codexCoordinator.startOversightCompaction(
                 session: session,
                 expectedThreadID: expectedThreadID,
+                selfCompactDispatchID: selfCompactDispatchID,
                 isStillAdmissible: { [weak self] in
                     guard let self else { return false }
                     return isStillAdmissible() && agentSessionLinkCompactSupport(for: session) == support
@@ -325,7 +327,8 @@ extension AgentModeViewModel {
             else { return .notStarted }
             let command = AgentProviderControlCommand.compact(
                 expectedBinding: binding,
-                expectedProviderConversation: conversation
+                expectedProviderConversation: conversation,
+                selfCompactDispatchID: selfCompactDispatchID
             )
             let recorder = AgentRunStartOutcomeRecorder()
             _ = await startAgentRun(

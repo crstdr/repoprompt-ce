@@ -1106,6 +1106,9 @@ final class AgentTabSession: ObservableObject {
         didSet { noteMonitorObservationInputsChanged() }
     }
 
+    /// Runtime-only timer and note worker; persisted state is deliberately inert on restore.
+    var selfCompactNativeCompletion: AgentSelfCompactNativeCompletionCoordinator?
+
     var isProviderSelectionLocked: Bool {
         hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
     }
@@ -1210,6 +1213,8 @@ final class AgentTabSession: ObservableObject {
     /// instruction, applyEditsReview, MCP control, run cancellation) remain
     /// on the VM and are called separately by each teardown path.
     func cancelEphemeralRuntimeState() {
+        selfCompactNativeCompletion?.cancelRuntimeWork()
+        selfCompactNativeCompletion = nil
         derivedTranscriptRefreshTask?.cancel()
         derivedTranscriptRefreshTask = nil
         pendingDerivedTranscriptRefreshReason = nil

@@ -12,6 +12,15 @@ struct AgentSelfCompactOwner: Codable, Equatable {
     let bindingTransitionGeneration: UInt64
     let runID: UUID
     let runAttemptID: UUID
+
+    @MainActor
+    func matchesLocalBinding(_ session: AgentTabSession) -> Bool {
+        session.tabID == tabID
+            && session.persistentSessionBindingIdentity?.sessionID == sessionID
+            && session.persistentSessionBindingIdentity?.generation == persistentBindingGeneration
+            && session.bindingTransitionGeneration == bindingTransitionGeneration
+            && !session.bindingTransitionInProgress
+    }
 }
 
 struct AgentSelfCompactAttempt: Codable, Equatable {
@@ -36,7 +45,12 @@ struct AgentSelfCompactAttempt: Codable, Equatable {
     var phase: Phase
     var compactDispatchStarted = false
     var admittedSupport: AgentSessionLinkCompactSupport?
+    var compactProviderConversation: String?
     var noteDispatchStarted = false
+    var noteWasPrepended: Bool?
+    var compactRunID: UUID?
+    var compactRunAttemptID: UUID?
+    var compactTurnSucceeded: Bool?
 
     init(
         id: UUID = UUID(),
@@ -91,7 +105,7 @@ struct AgentSelfCompactSettlement: Codable, Equatable {
     let recoveryNote: String?
 
     static func recoveryRequired(from attempt: AgentSelfCompactAttempt, at date: Date = Date()) -> Self {
-        let delivery: NoteDelivery = if attempt.noteDispatchStarted || attempt.phase == .dispatchingNote {
+        let delivery: NoteDelivery = if attempt.noteDispatchStarted {
             .deliveryUnknown
         } else if attempt.phase == .parked {
             .parked
@@ -216,6 +230,68 @@ struct AgentSelfCompactState: Codable, Equatable {
         return .scheduled(attempt)
     }
 
+    /// Binds the command before its provider RPC. A completion may arrive before the RPC returns.
+    mutating func bindCompactRun(_ dispatchID: AgentSelfCompactionDispatchID, runID: UUID?, attemptID: UUID?) -> Bool {
+        guard dispatchID.stage == .compact,
+              active?.id == dispatchID.requestID,
+              active?.phase == .dispatchingCompact,
+              let runID, let attemptID
+        else { return false }
+        active?.compactRunID = runID
+        active?.compactRunAttemptID = attemptID
+        return true
+    }
+
+    mutating func noteWillAttempt(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+        guard dispatchID.stage == .note,
+              active?.id == dispatchID.requestID,
+              active?.phase == .dispatchingNote || active?.phase == .parked,
+              active?.noteDispatchStarted == false
+        else { return false }
+        let wasParked = active?.phase == .parked
+        active?.phase = .dispatchingNote
+        active?.noteDispatchStarted = true
+        active?.noteWasPrepended = wasParked
+        return true
+    }
+
+    mutating func noteAccepted(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+        guard dispatchID.stage == .note,
+              active?.id == dispatchID.requestID,
+              active?.phase == .dispatchingNote,
+              active?.noteDispatchStarted == true
+        else { return false }
+        settle(
+            .noteAccepted,
+            noteDelivery: active?.noteWasPrepended == true ? .prepended : .accepted,
+            completionVerified: active?.compactTurnSucceeded == true
+        )
+        return true
+    }
+
+    mutating func noteDefinitivelyNotAttempted(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+        guard dispatchID.stage == .note,
+              active?.id == dispatchID.requestID,
+              active?.phase == .dispatchingNote
+        else { return false }
+        active?.phase = .parked
+        active?.noteDispatchStarted = false
+        return true
+    }
+
+    mutating func noteTransportFailed(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+        guard dispatchID.stage == .note,
+              active?.id == dispatchID.requestID,
+              active?.phase == .dispatchingNote
+        else { return false }
+        if active?.noteDispatchStarted == true {
+            settle(.deliveryUnknown, noteDelivery: .deliveryUnknown, completionVerified: true)
+        } else {
+            active?.phase = .parked
+        }
+        return true
+    }
+
     mutating func settle(
         _ outcome: AgentSelfCompactSettlement.Outcome,
         noteDelivery: AgentSelfCompactSettlement.NoteDelivery,
@@ -243,6 +319,22 @@ struct AgentSelfCompactState: Codable, Equatable {
         latest = .recoveryRequired(from: active, at: date)
         self.active = nil
         return true
+    }
+
+    /// A parked note belongs to its old incarnation, never to a rebound replacement tab.
+    @MainActor
+    mutating func cancelStaleParkedNote(for session: AgentTabSession) -> Bool {
+        guard let attempt = active, attempt.phase == .parked,
+              let owner = attempt.owner, !owner.matchesLocalBinding(session)
+        else { return false }
+        settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+        return true
+    }
+
+    /// Reading the frame does not consume it; only final provider acknowledgment can do that.
+    var parkedNote: (dispatchID: AgentSelfCompactionDispatchID, frame: String)? {
+        guard let attempt = active, attempt.phase == .parked, !attempt.noteDispatchStarted else { return nil }
+        return (.init(requestID: attempt.id, stage: .note), AgentSelfCompactNoteEnvelope.frame(attempt.note))
     }
 
     var status: AgentSelfCompactStatus? {

@@ -77,6 +77,9 @@ final class AgentSelfCompactTerminalScheduler {
             store(state)
             return
         }
+        // Item 2 deliberately narrowed the plan's failed-origin allowance. A generic .failed
+        // terminal does not prove context exhaustion or even a live provider conversation, so native
+        // self-compaction remains fail-closed until a typed context-limit failure is available.
         guard !successorClaimed, terminalState == .completed, isCurrentOwner(owner) else {
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             store(state)

@@ -18623,6 +18623,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // A provider control command is exactly its fixed native text: prepending initial-thread
         // context would make it ordinary prose the provider no longer recognizes as a command.
         let initialMessageForRun = directStartOptions.providerControlCommand != nil
+            || directStartOptions.selfCompactDispatchID?.stage == .note
             ? augmentedInitialMessage
             : await buildInitialThreadMessageIfNeeded(
                 tabID: tabID,
@@ -18652,6 +18653,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexFallbackContext: preparedCodexFallbackContext,
             autoEffortSelection: autoEffortSelection,
             providerControlCommand: directStartOptions.providerControlCommand,
+            selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome
         )
     }

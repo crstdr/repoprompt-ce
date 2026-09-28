@@ -2456,6 +2456,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     func startOversightCompaction(
         session: AgentTabSession,
         expectedThreadID: String,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         isStillAdmissible: () -> Bool
     ) async -> OversightCompactionStart {
         guard nativeSlashCommandAvailabilityMessage(.compact, session: session) == nil,
@@ -2482,6 +2483,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return .notStarted
         }
         beginCodexCompaction(session)
+        if let selfCompactDispatchID {
+            guard session.selfCompactNativeCompletion?.bindCompact(
+                selfCompactDispatchID,
+                runID: session.runID,
+                runAttemptID: session.activeRunAttemptID
+            ) == true else {
+                unwindFailedCodexCompactionStart(session)
+                return .notStarted
+            }
+        }
         do {
             try await controller.compactThread()
             return .started
@@ -6860,9 +6871,30 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         attachmentReservationID: UUID? = nil,
         policyAlreadyInstalled: Bool = false,
         terminalizeRejectedSend: Bool = true,
-        autoEffortSelection: AutoEffortTurnSelection? = nil
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async -> NativeSendOutcome {
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
+        let isSelfNote = selfCompactDispatchID?.stage == .note
+        if isSelfNote {
+            guard let active = session.selfCompactState.active,
+                  active.id == selfCompactDispatchID?.requestID,
+                  active.phase == .dispatchingNote,
+                  active.owner?.matchesLocalBinding(session) == true,
+                  active.compactProviderConversation == session.codexConversationID,
+                  text == AgentSelfCompactNoteEnvelope.frame(active.note),
+                  attachments.isEmpty,
+                  fallbackContext == nil
+            else { return .preDispatchRejected(message: "Continuation note admission changed before Codex dispatch.") }
+        }
+        func parkedNoteForCurrentBinding() -> (dispatchID: AgentSelfCompactionDispatchID, frame: String)? {
+            var state = session.selfCompactState
+            if state.cancelStaleParkedNote(for: session) {
+                session.selfCompactState = state
+                viewModel?.scheduleSave(for: session.tabID)
+            }
+            return session.selfCompactState.parkedNote
+        }
         let auditTurnID = fallbackContext?.optimisticUserItemID
             ?? session.pendingTurnRuntimeAnchors.first?.userItemID
         let wasRunAlreadyActive = session.runState.isActive
@@ -6953,7 +6985,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             reasoningEffort: initialSelection.reasoningEffort,
             serviceTier: initialSelection.serviceTier
         )
-        session.codexPendingAuthRetryTurn = .init(
+        if !isSelfNote { session.codexPendingAuthRetryTurn = .init(
             text: text,
             images: attachments,
             model: selection.model,
@@ -6965,13 +6997,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 : nil,
             auditTurnID: auditTurnID,
             autoEffortApplied: initialSelection.isAuto
-        )
+        ) }
 
         await ensureCodexNativeSession(
             session: session,
             policyAlreadyInstalled: policyAlreadyInstalled,
+            allowMissingRolloutFallback: !isSelfNote,
+            allowResumeTimeoutFallback: !isSelfNote,
             deferReconnectForCurrentActiveTurn: wasRunAlreadyActive,
-            skipResumeWhenNoPriorCodexHistory: !wasRunAlreadyActive && !hadResumeEligibleCodexHistoryBeforeSend
+            skipResumeWhenNoPriorCodexHistory: !isSelfNote && !wasRunAlreadyActive && !hadResumeEligibleCodexHistoryBeforeSend
         )
         if Task.isCancelled {
             // The run was cancelled during startup — e.g. while the MCP routing wait was suspended. The
@@ -7055,7 +7089,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             wasRunAlreadyActive: wasRunAlreadyActive,
             session: session
         )
+        if isSelfNote {
+            guard case .start = dispatchPlan,
+                  session.selfCompactState.active?.compactProviderConversation == session.codexConversationID
+            else {
+                return .preDispatchRejected(message: "Codex could not start the continuation note on its original thread.")
+            }
+        }
         if case let .fallback(decision) = dispatchPlan {
+            if isSelfNote {
+                return .preDispatchRejected(message: "Codex did not send the continuation note because a direct turn was unavailable.")
+            }
             clearCodexPendingAuthRetryTurn(session)
             return enqueueCodexFallback(
                 session: session,
@@ -7072,7 +7116,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
         let promptDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(sendRunID)
         let expectedControllerID = ObjectIdentifier(controller)
-        let catalogReadiness = await viewModel?.ensureProviderInputCatalogReady(for: session) ?? .unavailable
+        let catalogReadiness: AgentModeViewModel.ProviderInputCatalogReadiness = if isSelfNote {
+            .notRequired
+        } else {
+            await viewModel?.ensureProviderInputCatalogReady(for: session) ?? .unavailable
+        }
         guard catalogReadiness == .ready || catalogReadiness == .notRequired else {
             viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
@@ -7166,6 +7214,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         var monitoring: AgentSessionLinkDecoratedProviderText?
         var acquiredAgentSessionLinkPhysicalDispatch = false
         let prepareAgentSessionLinkPhysicalDispatch: () async -> NativeSendOutcome? = {
+            if isSelfNote {
+                guard let active = session.selfCompactState.active,
+                      active.id == selfCompactDispatchID?.requestID,
+                      active.phase == .dispatchingNote,
+                      active.owner?.matchesLocalBinding(session) == true,
+                      active.compactProviderConversation == session.codexConversationID,
+                      session.codexController.map(ObjectIdentifier.init) == expectedControllerID
+                else { return .preDispatchRejected(message: "Continuation note scope changed before Codex dispatch.") }
+                return nil
+            }
             let catalogRouteIsCurrent = catalogReadiness != .ready
                 || self.viewModel?.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) == true
             let providerRouteIsCurrent = session.runID == sendRunID
@@ -7270,11 +7328,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return nil
         }
 
+        var selfCompactSteerDefinitivelyRejected = false
         do {
             setRunningStatus("Sending message…", source: .transport, session: session, urgent: true)
             switch dispatchPlan {
             case .start:
-                let hookGateDispatchOwnerToken = try await gateFirstTurnForProjectHooks(
+                let hookGateDispatchOwnerToken = isSelfNote ? nil : try await gateFirstTurnForProjectHooks(
                     session: session,
                     controller: controller
                 )
@@ -7291,7 +7350,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     if let rejection = await prepareAgentSessionLinkPhysicalDispatch() {
                         return rejection
                     }
-                    let dispatchText = monitoring?.text ?? text
+                    let parkedNote = isSelfNote ? nil : parkedNoteForCurrentBinding()
+                    let noteDispatchID = selfCompactDispatchID ?? parkedNote?.dispatchID
+                    let baseText = monitoring?.text ?? text
+                    let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                     beginTrackedCodexUserTurn(session)
                     updateCodexStallWatchdogState(for: session)
                     logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.startUserTurn")
@@ -7316,13 +7378,41 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             }
                             viewModel?.scheduleSave(for: session.tabID)
                         }
-                        let receipt = try await controller.startUserTurn(
-                            text: dispatchText,
-                            images: attachments,
-                            model: physicalSelection.model,
-                            reasoningEffort: physicalSelection.reasoningEffort,
-                            serviceTier: physicalSelection.serviceTier
-                        )
+                        if let noteDispatchID {
+                            var state = session.selfCompactState
+                            guard state.noteWillAttempt(noteDispatchID) else {
+                                throw CancellationError()
+                            }
+                            session.selfCompactState = state
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
+                        let receipt: CodexTurnStartReceipt
+                        do {
+                            receipt = try await controller.startUserTurn(
+                                text: dispatchText,
+                                images: attachments,
+                                model: physicalSelection.model,
+                                reasoningEffort: physicalSelection.reasoningEffort,
+                                serviceTier: physicalSelection.serviceTier
+                            )
+                        } catch {
+                            if let noteDispatchID {
+                                var state = session.selfCompactState
+                                _ = state.noteTransportFailed(noteDispatchID)
+                                session.selfCompactState = state
+                                viewModel?.scheduleSave(for: session.tabID)
+                            }
+                            throw error
+                        }
+                        if let noteDispatchID {
+                            var state = session.selfCompactState
+                            if state.noteAccepted(noteDispatchID) {
+                                session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
+                                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                            }
+                            session.selfCompactState = state
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
                         if let auditTurnID {
                             session.updateAutomationAudit(turnID: auditTurnID) {
                                 $0.recordCodexStartAccepted(
@@ -7340,7 +7430,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 if let rejection = await prepareAgentSessionLinkPhysicalDispatch() {
                     return rejection
                 }
-                let dispatchText = monitoring?.text ?? text
+                let parkedNote = parkedNoteForCurrentBinding()
+                let baseText = monitoring?.text ?? text
+                let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 if let auditTurnID {
                     session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.steer) }
@@ -7352,11 +7444,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     viewModel?.scheduleSave(for: session.tabID)
                 }
                 do {
+                    if let parkedNote {
+                        var state = session.selfCompactState
+                        guard state.noteWillAttempt(parkedNote.dispatchID) else { return .cancelled }
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                    }
                     let receipt = try await controller.steerUserTurn(
                         text: dispatchText,
                         images: attachments,
                         expectedTurnID: identity.turnID
                     )
+                    if let parkedNote {
+                        var state = session.selfCompactState
+                        if state.noteAccepted(parkedNote.dispatchID) {
+                            session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
+                            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                        }
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                    }
                     recordAcceptedSteer()
                     if receipt.acceptedTurnID != identity.turnID {
                         await reconcileAcceptedCodexSteerMismatch(
@@ -7367,6 +7474,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         )
                     }
                 } catch let mismatch as CodexTurnSteerError {
+                    if let parkedNote {
+                        var state = session.selfCompactState
+                        if case .expectedTurnMismatch = mismatch {
+                            _ = state.noteDefinitivelyNotAttempted(parkedNote.dispatchID)
+                        } else {
+                            _ = state.noteTransportFailed(parkedNote.dispatchID)
+                        }
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                        selfCompactSteerDefinitivelyRejected = true
+                        throw mismatch
+                    }
                     guard case let .expectedTurnMismatch(expectedTurnID, actualTurnID, failure) = mismatch,
                           let actualTurnID = actualTurnID?.trimmingCharacters(in: .whitespacesAndNewlines),
                           !actualTurnID.isEmpty,
@@ -7423,6 +7542,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             failure: failure
                         )
                     }
+                } catch {
+                    if let parkedNote {
+                        var state = session.selfCompactState
+                        _ = state.noteTransportFailed(parkedNote.dispatchID)
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                    }
+                    throw error
                 }
             case .fallback:
                 preconditionFailure("Fallback dispatch plans return before provider dispatch")
@@ -7490,6 +7617,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return .sent
         } catch let steerError as CodexTurnSteerError {
+            if selfCompactSteerDefinitivelyRejected {
+                return .preDispatchRejected(message: "Codex rejected the steer before receiving the parked continuation note.")
+            }
             if acquiredAgentSessionLinkPhysicalDispatch {
                 viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,
@@ -7517,6 +7647,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 .activeTurnNotSteerable(turnKind: turnKind, failure: failure)
             }
             clearCodexPendingAuthRetryTurn(session)
+            if isSelfNote {
+                return .preDispatchRejected(message: "Codex did not queue the continuation note.")
+            }
             return enqueueCodexFallback(
                 session: session,
                 context: fallbackContext,
@@ -9046,6 +9179,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if turnKind == .compact {
                 if status == .completed {
                     markCodexContextCompacted(session)
+                    var state = session.selfCompactState
+                    if let active = state.active,
+                       active.compactRunID == session.runID,
+                       active.compactRunAttemptID == session.activeRunAttemptID,
+                       active.phase == .dispatchingCompact || active.phase == .awaitingCompactTurn
+                    {
+                        state.active?.compactTurnSucceeded = true
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                    }
                 }
                 await finalizeCodexRun(
                     session,

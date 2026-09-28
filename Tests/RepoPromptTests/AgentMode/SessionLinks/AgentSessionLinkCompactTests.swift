@@ -642,6 +642,115 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         XCTAssertTrue(sent.isEmpty)
     }
 
+    private func armSelfNote(
+        session: AgentModeViewModel.TabSession,
+        note: String
+    ) throws -> AgentSelfCompactionDispatchID {
+        let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        let owner = try AgentSelfCompactOwner(
+            windowID: 1,
+            workspaceID: UUID(),
+            tabID: session.tabID,
+            sessionID: binding.sessionID,
+            persistentBindingGeneration: binding.generation,
+            bindingTransitionGeneration: session.bindingTransitionGeneration,
+            runID: XCTUnwrap(session.runID),
+            runAttemptID: XCTUnwrap(session.activeRunAttemptID)
+        )
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: note, idempotencyKey: "native-note-test", owner: owner)
+        state.active?.phase = .dispatchingNote
+        state.active?.compactProviderConversation = "monitor-native-session"
+        let id = try XCTUnwrap(state.active?.id)
+        session.selfCompactState = state
+        return .init(requestID: id, stage: .note)
+    }
+
+    func testDedicatedClaudeNoteSendsExactFrameAndAcknowledgesAtProviderSeam() async throws {
+        let controller = MonitorFakeNativeController()
+        let (viewModel, session, _, _) = try makeViewModel(controller: controller)
+        session.providerSessionID = "monitor-native-session"
+        let declaration = try XCTUnwrap(
+            DomainAgentSessionWaitingOn(summary: "CI artifact", declaredAt: Date(timeIntervalSince1970: 50))
+        )
+        let handoff = AgentModeViewModel.PendingHandoffState(
+            payload: "keep staged handoff",
+            createdAt: Date(timeIntervalSince1970: 7),
+            sourceItemID: UUID()
+        )
+        let workflow = AgentWorkflowDefinition(
+            customID: UUID(), displayName: "Keep workflow", template: "keep"
+        )
+        let attachment = AgentImageAttachment(
+            source: .localFile(path: "/tmp/self-compact-keep.png"),
+            title: "self-compact-keep.png"
+        )
+        session.oversight.waitingOn = declaration
+        session.pendingHandoff = handoff
+        session.lastUserMessageAt = Date(timeIntervalSince1970: 9)
+        session.draftText = "unsent draft"
+        session.selectedWorkflow = workflow
+        session.pendingImageAttachments = [attachment]
+        let commandIntent = try intent(for: session)
+        let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        let command = AgentProviderControlCommand.compact(
+            expectedBinding: binding, expectedProviderConversation: "monitor-native-session"
+        )
+        let commandOutcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: session, text: command.providerText, attachments: [], intent: commandIntent,
+            allowsCatalogRouteControllerRecovery: false, providerControlCommand: command
+        )
+        XCTAssertEqual(commandOutcome, .sent)
+        let note = "line one\nβeta line two"
+        let noteIntent = try intent(for: session)
+        let dispatchID = try armSelfNote(session: session, note: note)
+        let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: session, text: AgentSelfCompactNoteEnvelope.frame(note), attachments: [],
+            intent: noteIntent, allowsCatalogRouteControllerRecovery: false,
+            selfCompactDispatchID: dispatchID
+        )
+        XCTAssertEqual(outcome, .sent)
+        let sent = await controller.sentMessages
+        XCTAssertEqual(sent, ["/compact", AgentSelfCompactNoteEnvelope.frame(note)])
+        XCTAssertEqual(session.selfCompactState.latest?.outcome, .noteAccepted)
+        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .accepted)
+        XCTAssertEqual(session.oversight.waitingOn, declaration)
+        XCTAssertEqual(session.pendingHandoff, handoff)
+        XCTAssertEqual(session.lastUserMessageAt, Date(timeIntervalSince1970: 9))
+        XCTAssertEqual(session.draftText, "unsent draft")
+        XCTAssertEqual(session.selectedWorkflow, workflow)
+        XCTAssertEqual(session.pendingImageAttachments, [attachment])
+    }
+
+    func testClaudeAmbiguousNoteTransportRetainsRecoveryWithoutRetry() async throws {
+        let controller = MonitorFakeNativeController()
+        let (viewModel, session, _, _) = try makeViewModel(controller: controller)
+        session.providerSessionID = "monitor-native-session"
+        let commandIntent = try intent(for: session)
+        let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        let command = AgentProviderControlCommand.compact(
+            expectedBinding: binding, expectedProviderConversation: "monitor-native-session"
+        )
+        _ = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: session, text: command.providerText, attachments: [], intent: commandIntent,
+            allowsCatalogRouteControllerRecovery: false, providerControlCommand: command
+        )
+        let noteIntent = try intent(for: session)
+        let dispatchID = try armSelfNote(session: session, note: "recover me")
+        await controller.setFailSendAfterRecord(true)
+        let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: session, text: AgentSelfCompactNoteEnvelope.frame("recover me"), attachments: [],
+            intent: noteIntent, allowsCatalogRouteControllerRecovery: false,
+            selfCompactDispatchID: dispatchID
+        )
+        guard case .failed = outcome else { return XCTFail("Expected transport error") }
+        XCTAssertEqual(session.selfCompactState.latest?.outcome, .deliveryUnknown)
+        XCTAssertEqual(session.selfCompactState.latest?.recoveryNote, "recover me")
+        XCTAssertNil(session.selfCompactState.parkedNote)
+        let sent = await controller.sentMessages
+        XCTAssertEqual(sent.count, 2)
+    }
+
     func testRawCommandFailsClosedInsteadOfInterruptingAnInFlightTurn() async throws {
         let controller = MonitorFakeNativeController()
         await controller.setTurnInFlight(true)

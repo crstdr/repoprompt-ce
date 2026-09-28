@@ -51,20 +51,28 @@ extension AgentModeViewModel {
         publication: AgentRunTerminalPublicationResult,
         teardownSettled: @escaping @MainActor () -> Bool
     ) {
-        guard session.selfCompactState.active?.phase == .scheduled else { return }
-        agentSelfCompactScheduler(for: session).terminalSettled(
-            runID: revision.expectedRunID,
-            runAttemptID: revision.ownership.attemptID,
-            terminalState: revision.terminalState,
-            publication: publication,
-            successorClaimed: revision.successorKind != nil,
-            teardownSettled: teardownSettled
-        )
+        if session.selfCompactState.active?.phase == .scheduled {
+            agentSelfCompactScheduler(for: session).terminalSettled(
+                runID: revision.expectedRunID,
+                runAttemptID: revision.ownership.attemptID,
+                terminalState: revision.terminalState,
+                publication: publication,
+                successorClaimed: revision.successorKind != nil,
+                teardownSettled: teardownSettled
+            )
+        } else {
+            session.selfCompactNativeCompletion?.compactTurnSettled(
+                revision: revision,
+                publication: publication,
+                teardownSettled: teardownSettled
+            )
+        }
     }
 
     func agentSelfCompactCancelForAcceptedLocalInput(_ session: TabSession) {
         guard session.selfCompactState.active != nil else { return }
         agentSelfCompactScheduler(for: session).cancelForAcceptedLocalInput()
+        session.selfCompactNativeCompletion?.supersedeForOrdinaryInput()
     }
 
     private func agentSelfCompactScheduler(for session: TabSession) -> AgentSelfCompactTerminalScheduler {
@@ -178,12 +186,103 @@ extension AgentModeViewModel {
             return false
         }
         guard ready() else { return false }
+        var state = session.selfCompactState
+        state.active?.compactProviderConversation = support == .codex
+            ? session.codexConversationID : session.providerSessionID
+        session.selfCompactState = state
+        session.selfCompactNativeCompletion = agentSelfCompactNativeCompletion(for: session)
         let result = await agentSessionLinkDispatchNativeCompact(
             session: session,
             tabID: owner.tabID,
             support: support,
-            isStillAdmissible: ready
+            isStillAdmissible: ready,
+            selfCompactDispatchID: .init(requestID: requestID, stage: .compact)
         )
         return result == .started
+    }
+
+    private func agentSelfCompactNativeCompletion(
+        for session: TabSession
+    ) -> AgentSelfCompactNativeCompletionCoordinator {
+        AgentSelfCompactNativeCompletionCoordinator(
+            load: { session.selfCompactState },
+            store: { [weak self] state in
+                let previous = session.selfCompactState
+                session.selfCompactState = state
+                if previous.active != nil, state.active == nil {
+                    let row: AgentChatItem? = switch state.latest?.outcome {
+                    case .failed:
+                        AgentChatItem.selfCompactionCouldNotStart(sequenceIndex: session.nextSequenceIndex)
+                    default:
+                        nil
+                    }
+                    if let row {
+                        session.appendItem(row)
+                        self?.updateBindingsFromSession(session)
+                    }
+                }
+                self?.scheduleSave(for: session)
+                self?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            },
+            isCurrentOwner: { [weak self] owner in
+                self?.agentSelfCompactOwnerIsCurrent(owner, session: session) ?? false
+            },
+            dispatchNote: { [weak self] requestID, stillAdmissible in
+                guard let self else { return false }
+                return await agentSelfCompactDispatchNote(
+                    requestID: requestID, session: session, stillAdmissible: stillAdmissible
+                )
+            }
+        )
+    }
+
+    private func agentSelfCompactDispatchNote(
+        requestID: UUID,
+        session: TabSession,
+        stillAdmissible: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        guard stillAdmissible(), let owner = session.selfCompactState.active?.owner,
+              let target = makeComposerSubmitTarget(tabID: owner.tabID, session: session),
+              target.route == .existingAgentSession,
+              target.expectedSourceAgentSessionID == owner.sessionID
+        else { return false }
+        let submit = AgentComposerSubmitAttempt(
+            id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
+        )
+        guard case let .claimed(claim) = claimComposerSubmitAttempt(
+            submit, requireActiveTabOwnership: false
+        ) else { return false }
+        defer { releaseComposerSubmitClaim(claim) }
+        let ready: @MainActor () -> Bool = { [weak self] in
+            guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
+                  !Self.agentSessionLinkCompactHasQueuedProviderWork(session),
+                  agentSelfCompactOwnerIsCurrent(owner, session: session),
+                  workspaceManager?.activeWorkspace?.id == owner.workspaceID
+            else { return false }
+            return AgentSessionLinkDeliveryReadiness.evaluate(
+                snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
+                    session: session,
+                    endpointMatchesGrant: true,
+                    isClosing: false,
+                    ignoresComposerSubmissionInFlight: true,
+                    ignoresSelfCompactRequestID: requestID
+                )
+            ) == .ready
+        }
+        guard ready(), let note = session.selfCompactState.active?.note else { return false }
+        var state = session.selfCompactState
+        state.active?.phase = .dispatchingNote
+        session.selfCompactState = state
+        guard case .success = await flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID),
+              ready()
+        else { return false }
+        let recorder = AgentRunStartOutcomeRecorder()
+        _ = await startAgentRun(
+            tabID: owner.tabID,
+            initialMessage: AgentSelfCompactNoteEnvelope.frame(note),
+            directStartOptions: .selfCompactNote(requestID: requestID),
+            startOutcome: recorder
+        )
+        return recorder.outcome.didStart
     }
 }

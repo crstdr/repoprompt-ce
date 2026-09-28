@@ -128,10 +128,20 @@ final class AgentModeRunService {
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
         let selectedAgent = session.selectedAgent
+        if let selfCompactDispatchID {
+            guard session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
+                  selectedAgent == .codexExec || selectedAgent == .claudeCode,
+                  (selfCompactDispatchID.stage == .compact) == (providerControlCommand != nil)
+            else {
+                startOutcome?.recordStartFailure(message: nil)
+                return nil
+            }
+        }
         // A control command is only ever routed to a runtime that dispatches it natively and
         // undecorated. Any other runtime would send it as ordinary prose, so it never starts at all.
         if let providerControlCommand,
@@ -161,7 +171,8 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 fallbackContext: codexFallbackContext,
-                autoEffortSelection: autoEffortSelection
+                autoEffortSelection: autoEffortSelection,
+                selfCompactDispatchID: selfCompactDispatchID
             )
             startOutcome?.record(codexOutcome: outcome)
             return outcome
@@ -207,7 +218,8 @@ final class AgentModeRunService {
                 attachments: attachments,
                 makeLease: makeLease,
                 autoEffortSelection: autoEffortSelection,
-                providerControlCommand: providerControlCommand
+                providerControlCommand: providerControlCommand,
+                selfCompactDispatchID: selfCompactDispatchID
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil

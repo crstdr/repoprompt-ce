@@ -46,6 +46,7 @@ final class AgentSelfCompactStateTests: XCTestCase {
             var state = AgentSelfCompactState()
             let attempt = try XCTUnwrap(state.reserve(note: "verbatim\n  note", idempotencyKey: "key").scheduledAttempt)
             state.active?.phase = phase
+            if phase == .dispatchingNote { state.active?.noteDispatchStarted = true }
             session.selfCompactState = state
             let restored = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(session))
             XCTAssertNil(restored.selfCompactState?.active, "\(phase)")
@@ -60,6 +61,18 @@ final class AgentSelfCompactStateTests: XCTestCase {
             XCTAssertEqual(restored.selfCompactState?.status?.noteDelivery, expectedDelivery, "\(phase)")
             XCTAssertTrue(restored.selfCompactNeedsRecoveryRewrite, "\(phase)")
         }
+    }
+
+    func testColdRestoreDistinguishesPreparedNoteFromTransportAttempt() throws {
+        var session = AgentSession(name: "Prepared", autoEditEnabled: true)
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: "recover", idempotencyKey: "prepared")
+        state.active?.phase = .dispatchingNote
+        state.active?.noteDispatchStarted = false
+        session.selfCompactState = state
+        let restored = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(session))
+        XCTAssertEqual(restored.selfCompactState?.latest?.noteDelivery, .notSent)
+        XCTAssertEqual(restored.selfCompactState?.latest?.recoveryNote, "recover")
     }
 
     func testMalformedOptionalRecordsDoNotDiscardSession() throws {

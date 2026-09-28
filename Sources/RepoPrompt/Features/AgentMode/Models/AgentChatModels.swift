@@ -404,6 +404,15 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         )
     }
 
+    /// Fixed replay-safe provenance; the provider input, not this row, contains the note.
+    public static func selfCompactionNoteRestored(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "A continuation note from before compaction was restored to this session.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
     public static func error(_ text: String, sequenceIndex: Int = 0) -> AgentChatItem {
         AgentChatItem(kind: .error, text: text, sequenceIndex: sequenceIndex)
     }
