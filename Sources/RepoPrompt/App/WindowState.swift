@@ -2547,6 +2547,9 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
+        // Finish this window's own saves (including the final `onDisappear` capture) before any
+        // teardown step can stop the presentation that owns them (#1089).
+        await workspaceManager.awaitOwnSavesForWindowClose()
         await workspaceManager.awaitRootReconciliationShutdown()
         await promptManager.gitViewModel.shutdownForWindowClose()
 

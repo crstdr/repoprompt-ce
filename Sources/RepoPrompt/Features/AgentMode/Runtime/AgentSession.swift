@@ -225,6 +225,9 @@ struct AgentSession: Codable, Identifiable {
     /// Parent session ID for thread nesting (child sessions spawned from another session)
     var parentSessionID: UUID?
 
+    /// Immutable creation provenance for an overseer-created top-level lane.
+    var createdByOverseerSessionID: UUID?
+
     /// Whether this session was originally created by an MCP client (vs the user in the UI).
     /// Used to scope cleanup operations to MCP-originated sessions only.
     var isMCPOriginated: Bool
@@ -289,6 +292,7 @@ struct AgentSession: Codable, Identifiable {
         codexTotalTotalTokens: Int? = nil,
         codexMcpSessionKey: String? = nil,
         parentSessionID: UUID? = nil,
+        createdByOverseerSessionID: UUID? = nil,
         pendingHandoffPayload: String? = nil,
         pendingHandoffCreatedAt: Date? = nil,
         pendingHandoffSourceItemID: UUID? = nil,
@@ -335,6 +339,7 @@ struct AgentSession: Codable, Identifiable {
         self.codexTotalTotalTokens = codexTotalTotalTokens
         self.codexMcpSessionKey = codexMcpSessionKey
         self.parentSessionID = parentSessionID
+        self.createdByOverseerSessionID = createdByOverseerSessionID
         self.pendingHandoffPayload = pendingHandoffPayload
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
@@ -383,6 +388,7 @@ struct AgentSession: Codable, Identifiable {
         case codexTotalTotalTokens
         case codexMcpSessionKey
         case parentSessionID
+        case createdByOverseerSessionID
         case pendingHandoffPayload
         case pendingHandoffCreatedAt
         case pendingHandoffSourceItemID
@@ -452,6 +458,7 @@ struct AgentSession: Codable, Identifiable {
         codexTotalTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexTotalTotalTokens)
         codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
+        createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)

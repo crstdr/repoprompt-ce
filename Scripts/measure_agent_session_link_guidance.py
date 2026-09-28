@@ -83,9 +83,10 @@ def inventory(ref, managed):
         raise ValueError(f"{ref}: currentInventoryGuidanceRevision is missing from {PROMPTS}")
     revision_attribute = f' guidance_revision="{guidance_revision[1]}"'
     capabilities = "manage,poll,read,send_when_idle,wait" if managed else "poll,read,send_when_idle,wait"
+    creator_attribute = ' created_by_you="false"' if 'created_by_you=' in source else ''
     row = (
         f'<session id="{TARGET}" name="{escaped(NAME)}" capabilities="{capabilities}" '
-        f'managed="{str(managed).lower()}" />'
+        f'managed="{str(managed).lower()}"{creator_attribute} />'
     )
     return (
         f'<repoprompt_session_oversight revision="7"{revision_attribute} status="active">\n'

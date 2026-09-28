@@ -11,9 +11,12 @@ enum AgentSidebarTapModifierReader {
     ///
     /// This is not captured from the mouse-down that started the click. A later
     /// flags-changed or key event can be current, and a command or shift bit on
-    /// that event reinterprets the click. A nil current event is a plain click.
+    /// that event reinterprets the click. A nil app or a nil current event is a
+    /// plain click. `NSApp` is an implicitly unwrapped optional, so a test
+    /// process that has not created the shared application must not touch it.
     static func currentFlags() -> NSEvent.ModifierFlags {
-        NSApp.currentEvent?.modifierFlags ?? []
+        guard NSApp != nil else { return [] }
+        return NSApp.currentEvent?.modifierFlags ?? []
     }
 
     static func gesture(for flags: NSEvent.ModifierFlags) -> AgentSidebarSelectionGesture {
@@ -112,6 +115,7 @@ struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
     var isOverseer = false
+    var createdByLabel: String?
     let isPinned: Bool
     let isMCPControlled: Bool
     let runState: AgentSessionRunState
@@ -762,6 +766,14 @@ struct AgentSessionRow: View {
                         overseerBadge
                     }
 
+                    if let creatorLabel = createdByLabel ?? sidebarOversightMenu?.createdByLabel {
+                        Text("Created by \(creatorLabel)")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .accessibilityLabel("Created by \(creatorLabel)")
+                    }
+
                     if isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinFontSize))
@@ -1393,6 +1405,7 @@ struct AgentSessionRow: View {
 
 struct AgentStashedSessionRow: View {
     let stashed: StashedTab
+    var createdByLabel: String?
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
@@ -1518,6 +1531,13 @@ struct AgentStashedSessionRow: View {
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                    if let createdByLabel {
+                        Text("Created by \(createdByLabel)")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .accessibilityLabel("Created by \(createdByLabel)")
+                    }
                     if stashed.tab.isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinIconSize))
@@ -1670,13 +1690,22 @@ struct AgentRowRunningIndicator: View {
     static let accessibilityLabelText = "Running"
 
     var tint: Color = .accentColor
+    /// Nil reads the process Reduce Motion setting. Tests pin it so the hosted
+    /// indicator does not depend on the runner's accessibility preferences.
+    var reduceMotionOverride: Bool?
+
+    init(tint: Color = .accentColor, reduceMotionOverride: Bool? = nil) {
+        self.tint = tint
+        self.reduceMotionOverride = reduceMotionOverride
+    }
+
     @Environment(\.windowIsPresentationVisible) private var isWindowPresentationVisible
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         switch AgentRowActivityIndicatorMode.resolve(
             isWindowPresentationVisible: isWindowPresentationVisible,
-            reduceMotion: reduceMotion
+            reduceMotion: reduceMotionOverride ?? reduceMotion
         ) {
         case .animated:
             AgentRowActivityArc(tint: tint)

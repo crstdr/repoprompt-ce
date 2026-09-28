@@ -1,4 +1,5 @@
 import AppKit
+import ObjectiveC
 @testable import RepoPromptApp
 import SwiftUI
 import XCTest
@@ -15,16 +16,15 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let pressedIndex = 3
         let pressedID = harness.rows[pressedIndex].tabID
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         let appeared = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
         XCTAssertTrue(appeared)
         let point = Self.point(in: host, rowIndex: pressedIndex)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
+        Self.send(.leftMouseDown, at: point, window: window)
+        Self.send(.leftMouseUp, at: point, window: window)
         _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
 
-        XCTAssertEqual(harness.activated, [pressedID])
+        Self.assertActivated(harness, equals: [pressedID], window: window)
         window.orderOut(nil)
     }
 
@@ -38,13 +38,12 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         XCTAssertNotEqual(promotedID, pressedID)
 
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
 
         let sectionIDAtPress = harness.seenSectionIDs.last
         let point = Self.point(in: host, rowIndex: pressedIndex)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
+        Self.send(.leftMouseDown, at: point, window: window)
 
         harness.rows = Self.sessions(now: now, promotedTabID: promotedID)
         let resorted = Self.render(until: Date().addingTimeInterval(0.4)) {
@@ -57,10 +56,10 @@ final class AgentSidebarRunningTapTests: XCTestCase {
             "Re-sorting running rows must not change the date section identity"
         )
 
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
+        Self.send(.leftMouseUp, at: point, window: window)
         _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
 
-        XCTAssertEqual(harness.activated, [pressedID])
+        Self.assertActivated(harness, equals: [pressedID], window: window)
         window.orderOut(nil)
     }
 
@@ -72,12 +71,11 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let pressedID = harness.rows[pressedIndex].tabID
 
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
 
         let point = Self.point(in: host, rowIndex: pressedIndex)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
+        Self.send(.leftMouseDown, at: point, window: window)
 
         harness.rows = Self.sessions(now: now, promotedTabID: pressedID)
         let moved = Self.render(until: Date().addingTimeInterval(0.4)) {
@@ -85,10 +83,10 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         }
         XCTAssertTrue(moved, "The press must overlap the pressed row moving to the top")
 
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
+        Self.send(.leftMouseUp, at: point, window: window)
         _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
 
-        XCTAssertEqual(harness.activated, [pressedID])
+        Self.assertActivated(harness, equals: [pressedID], window: window)
         window.orderOut(nil)
     }
 
@@ -101,13 +99,12 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let harness = SidebarRunningTapHarness(now: now)
         harness.rows = [pinned, today, pressed]
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
 
         let sectionIDAtPress = harness.sectionIDByRow[pressed.tabID]
         let point = Self.point(in: host, rowIndex: 2)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
+        Self.send(.leftMouseDown, at: point, window: window)
 
         harness.rows = [
             Self.session(index: 0, activity: now.addingTimeInterval(5), isPinned: true),
@@ -122,10 +119,10 @@ final class AgentSidebarRunningTapTests: XCTestCase {
             "The press must overlap the later Yesterday section changing ordinal"
         )
 
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
+        Self.send(.leftMouseUp, at: point, window: window)
         _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
 
-        XCTAssertEqual(harness.activated, [pressed.tabID])
+        Self.assertActivated(harness, equals: [pressed.tabID], window: window)
         window.orderOut(nil)
     }
 
@@ -136,14 +133,13 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let harness = SidebarRunningTapHarness(now: now)
         harness.rows = [parent, pressed]
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
 
         let groupIDAtPress = harness.groupIDByRow[pressed.tabID]
         XCTAssertEqual(groupIDAtPress, pressed.tabID)
         let point = Self.point(in: host, rowIndex: 1)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
+        Self.send(.leftMouseDown, at: point, window: window)
 
         harness.rows = [
             Self.session(index: 0, activity: now, hasThreadChildren: true),
@@ -162,10 +158,10 @@ final class AgentSidebarRunningTapTests: XCTestCase {
             "The press must overlap the row leaving its own group for its parent"
         )
 
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
+        Self.send(.leftMouseUp, at: point, window: window)
         _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
 
-        XCTAssertEqual(harness.activated, [pressed.tabID])
+        Self.assertActivated(harness, equals: [pressed.tabID], window: window)
         window.orderOut(nil)
     }
 
@@ -452,11 +448,41 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         return sink.frames
     }
 
+    /// The CI runner's XCTest process is inactive, and a borderless window cannot
+    /// become key, so SwiftUI drops `onTapGesture`. Finish launch, become a regular
+    /// app, and put a keyable window on a screen before sending events.
+    private static func showForClicks(_ window: NSWindow) {
+        SidebarTapFirstMouse.install()
+        let app = NSApplication.shared
+        if app.activationPolicy() != .regular {
+            _ = app.setActivationPolicy(.regular)
+        }
+        if !app.isRunning {
+            app.finishLaunching()
+        }
+        app.activate(ignoringOtherApps: true)
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            var frame = window.frame
+            frame.origin = NSPoint(
+                x: screen.visibleFrame.minX + 80,
+                y: screen.visibleFrame.minY + 80
+            )
+            window.setFrame(frame, display: true)
+        } else {
+            window.setFrameOrigin(NSPoint(x: 80, y: 80))
+        }
+        window.makeKeyAndOrderFront(nil)
+        if !window.isKeyWindow {
+            window.orderFrontRegardless()
+            window.makeKey()
+        }
+    }
+
     private static func makeWindow(
         _ harness: SidebarRunningTapHarness
-    ) -> (NSWindow, NSHostingView<SidebarRunningTapList>) {
-        let host = NSHostingView(rootView: SidebarRunningTapList(harness: harness))
-        let window = NSWindow(
+    ) -> (NSWindow, SidebarTapHostingView<SidebarRunningTapList>) {
+        let host = SidebarTapHostingView(rootView: SidebarRunningTapList(harness: harness))
+        let window = SidebarTapWindow(
             contentRect: NSRect(x: 0, y: 0, width: 280, height: rowHeight * 5),
             styleMask: [.borderless],
             backing: .buffered,
@@ -584,6 +610,35 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         return host.convert(NSPoint(x: 40, y: y), to: nil)
     }
 
+    private static func send(_ type: NSEvent.EventType, at point: NSPoint, window: NSWindow) {
+        if !window.isKeyWindow {
+            window.makeKey()
+        }
+        window.sendEvent(mouseEvent(type, at: point, window: window))
+    }
+
+    private static func assertActivated(
+        _ harness: SidebarRunningTapHarness,
+        equals expected: [UUID],
+        window: NSWindow,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let app = NSApplication.shared
+        XCTAssertEqual(
+            harness.activated,
+            expected,
+            """
+            tap missed key=\(window.isKeyWindow) active=\(app.isActive) \
+            policy=\(app.activationPolicy().rawValue) screens=\(NSScreen.screens.count) \
+            number=\(window.windowNumber) visible=\(window.isVisible) \
+            onScreen=\(window.screen != nil)
+            """,
+            file: file,
+            line: line
+        )
+    }
+
     private static func mouseEvent(
         _ type: NSEvent.EventType,
         at point: NSPoint,
@@ -604,7 +659,9 @@ final class AgentSidebarRunningTapTests: XCTestCase {
 
     private static func render(until deadline: Date, condition: () -> Bool) -> Bool {
         while Date() < deadline {
-            if condition() { return true }
+            if condition() {
+                return true
+            }
             RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
         }
         return condition()
@@ -761,4 +818,54 @@ private struct SidebarLayoutProbe: View {
         (nil, false, "R2"),
         ("H-Previous", false, "R3")
     ]
+}
+
+/// Borderless windows refuse `makeKey()` unless they opt in. The click tests
+/// need a key window so SwiftUI does not discard the gesture.
+private final class SidebarTapWindow: NSWindow {
+    override var canBecomeKey: Bool {
+        true
+    }
+
+    override var canBecomeMain: Bool {
+        true
+    }
+}
+
+/// The hosting view is the hit target when SwiftUI has not inserted a subview.
+/// Accepting the first mouse covers the runner case where the app never becomes active.
+private final class SidebarTapHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+}
+
+/// SwiftUI may hit-test an internal descendant. That descendant's default
+/// `acceptsFirstMouse` is false, and an inactive app then drops the click.
+/// The test process accepts the first mouse on every view so the real
+/// `onTapGesture` still runs.
+private enum SidebarTapFirstMouse {
+    private static var installed = false
+
+    static func install() {
+        guard !installed else { return }
+        guard
+            let original = class_getInstanceMethod(
+                NSView.self,
+                #selector(NSView.acceptsFirstMouse(for:))
+            ),
+            let replacement = class_getInstanceMethod(
+                NSView.self,
+                #selector(NSView.sidebarTapTests_acceptsFirstMouse(for:))
+            )
+        else { return }
+        method_exchangeImplementations(original, replacement)
+        installed = true
+    }
+}
+
+private extension NSView {
+    @objc func sidebarTapTests_acceptsFirstMouse(for _: NSEvent?) -> Bool {
+        true
+    }
 }
