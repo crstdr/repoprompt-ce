@@ -50,9 +50,10 @@ extension AgentModeViewModel {
         guard let binding = session.persistentSessionBindingIdentity else { return .blocked(.targetBusy) }
 
         if selection == .notRunning {
-            // A reserved wake has no run yet, but its captured start fence must not survive Stop.
+            // Even an unmodeled deferred producer may hold a start fence.
+            session.stopState.invalidateScheduledStarts()
             if session.oversight.pendingAutoWake != nil {
-                prepareAgentRunCancellation(session: session, intent: .userStop)
+                agentSessionLinkRetractAutoWakeForUserStop(session)
             }
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
@@ -180,11 +181,21 @@ extension AgentModeViewModel {
                     audit: .notRequired, runState: session.runState.rawValue
                 ))
             }
+            if recorder.initiatedCancellation, recorder.teardownCompleted,
+               recorder.publicationResult == nil
+            {
+                return .settled(Self.agentSessionLinkStopReceipt(
+                    request: request, targetSessionID: candidate.sessionID,
+                    result: .notRunning, stopRequested: true,
+                    teardownCompleted: true, audit: .notRequired,
+                    runState: session.runState.rawValue
+                ))
+            }
             let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
             case .accepted?: .teardownTimeout
             case .stale?: .terminalPublicationStale
             case .rejected?: .terminalPublicationRejected
-            case nil: .cancellationUnconfirmed
+            case nil: recorder.initiatedCancellation ? .cancellationUnconfirmed : .targetChanged
             }
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
@@ -200,11 +211,21 @@ extension AgentModeViewModel {
             audit.finish(.unknown)
         }
         let auditStatus = await audit.value()
+        if recorder.initiatedCancellation, recorder.teardownCompleted,
+           recorder.publicationResult == nil
+        {
+            return .settled(Self.agentSessionLinkStopReceipt(
+                request: request, targetSessionID: candidate.sessionID,
+                result: .notRunning, stopRequested: true,
+                teardownCompleted: true, audit: .notRequired,
+                runState: session.runState.rawValue
+            ))
+        }
         let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
         case .accepted?: nil
         case .stale?: .terminalPublicationStale
         case .rejected?: .terminalPublicationRejected
-        case nil: .cancellationUnconfirmed
+        case nil: recorder.initiatedCancellation ? .cancellationUnconfirmed : .targetChanged
         }
         return .settled(Self.agentSessionLinkStopReceipt(
             request: request, targetSessionID: candidate.sessionID,

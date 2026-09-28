@@ -91,15 +91,14 @@ extension AgentModeViewModel {
 
         // 2. Pure readiness admission, then provider support. Readiness first, so a busy or waiting
         //    target reads `target_not_idle` regardless of its provider.
-        let admission = AgentSessionLinkDeliveryReadiness.evaluate(
+        if let failure = AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: admissionLiveness.targetEndpointIsLive,
                 isClosing: admissionLiveness.targetWindowIsClosing
             )
-        )
-        if case let .blocked(reason) = admission {
-            return .blocked(AgentSessionLinkSendFailure(reason))
+        ) {
+            return .blocked(failure)
         }
         if Self.agentSessionLinkCompactHasQueuedProviderWork(session) {
             return .blocked(.targetNotIdle)
@@ -153,17 +152,16 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointInvalidated)
         }
-        let postCommitAdmission = AgentSessionLinkDeliveryReadiness.evaluate(
+        if let failure = AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: postCommitLiveness.targetEndpointIsLive,
                 isClosing: postCommitLiveness.targetWindowIsClosing,
                 ignoresComposerSubmissionInFlight: true
             )
-        )
-        if case let .blocked(reason) = postCommitAdmission {
+        ) {
             releaseComposerSubmitClaim(claim)
-            return .blocked(AgentSessionLinkSendFailure(reason))
+            return .blocked(failure)
         }
         if Self.agentSessionLinkCompactHasQueuedProviderWork(liveSession) {
             releaseComposerSubmitClaim(claim)
@@ -226,15 +224,14 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
-        let dispatchAdmission = AgentSessionLinkDeliveryReadiness.evaluate(
+        if AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,
                 isClosing: dispatchLiveness.targetWindowIsClosing,
                 ignoresComposerSubmissionInFlight: true
             )
-        )
-        if case .blocked = dispatchAdmission {
+        ) != nil {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }

@@ -756,6 +756,31 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         XCTAssertEqual(openCode.viewModel.agentSessionLinkCompactSupport(for: openCode.session), .notSupported)
     }
 
+    func testManagedSendAndCompactWaitForACPCompactionSettlement() async throws {
+        let fixture = try makeFixture()
+        let controller = try await installLiveController(fixture)
+        fixture.session.beginACPCompactSettling(
+            providerSessionID: fixture.session.providerSessionID ?? "", controller: controller,
+            settleSeconds: 90, scheduleDeadline: false
+        )
+        let candidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidate(
+            tabID: fixture.tabID, sessionID: fixture.sessionID,
+            tabName: "ACP lane", isWindowClosing: false
+        ))
+        let send = await fixture.viewModel.agentSessionLinkPerformSend(
+            to: candidate,
+            request: AgentSessionLinkSendRequest(
+                linkID: UUID(), linkGeneration: 1, observerEndpoint: request.observerEndpoint,
+                observerDisplayName: "Planning", message: "do not interrupt compact", workflow: nil
+            ),
+            liveness: { Self.liveLiveness }, commitAuthorization: { .committed }
+        )
+        XCTAssertEqual(send, .blocked(.compactionSettling))
+        let compactOutcome = try await compact(fixture)
+        XCTAssertEqual(compactOutcome, .blocked(.compactionSettling))
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
+    }
+
     func testAnAcceptedCompactionRecordsTheRequestAndRunsOnlyOnTheLiveSession() async throws {
         let fixture = try makeFixture()
         let controller = try await installLiveController(fixture)

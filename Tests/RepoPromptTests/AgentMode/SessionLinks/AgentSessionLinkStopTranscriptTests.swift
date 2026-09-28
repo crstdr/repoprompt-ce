@@ -33,20 +33,27 @@ final class AgentSessionLinkStopTranscriptTests: XCTestCase {
         let targetID = UUID()
         let timedOut = DomainAgentSessionLinkStopReceipt(
             requestID: UUID(), targetSessionID: targetID,
-            result: .stopped,
+            result: .stopFailed, failureReason: .teardownTimeout,
             stopRequested: true, teardownCompleted: false,
             targetItemID: UUID().uuidString, auditStatus: .unknown,
-            resultingRunState: "cancelled", settledAt: Date(), duplicate: true
+            resultingRunState: "cancelled", settledAt: Date()
         )
         let value = try AgentSessionLinkMCPToolService.stopOutcomeValue(
             .receipt(timedOut), targetSessionID: targetID
         )
         guard case let .object(payload) = value else { return XCTFail("expected object") }
-        XCTAssertEqual(Set(payload.keys), ["result", "session_id", "duplicate", "warning"])
-        XCTAssertEqual(payload["result"]?.stringValue, "stopped")
+        XCTAssertEqual(Set(payload.keys), ["result", "session_id", "reason", "warning"])
+        XCTAssertEqual(payload["result"]?.stringValue, "stop_failed")
+        XCTAssertEqual(payload["reason"]?.stringValue, "teardown_timeout")
         XCTAssertNotNil(payload["warning"]?.stringValue)
-        XCTAssertNil(payload["reason"])
-        XCTAssertEqual(payload["duplicate"], .bool(true))
+        let replay = try AgentSessionLinkMCPToolService.stopOutcomeValue(
+            .receipt(timedOut.markedDuplicate()), targetSessionID: targetID
+        )
+        let replayPayload = try XCTUnwrap(replay.objectValue)
+        XCTAssertEqual(replayPayload["result"], payload["result"])
+        XCTAssertEqual(replayPayload["reason"], payload["reason"])
+        XCTAssertEqual(replayPayload["warning"], payload["warning"])
+        XCTAssertEqual(replayPayload["duplicate"], .bool(true))
         let idle = DomainAgentSessionLinkStopReceipt(
             requestID: UUID(), targetSessionID: targetID,
             result: .notRunning, stopRequested: false,
@@ -68,6 +75,15 @@ final class AgentSessionLinkStopTranscriptTests: XCTestCase {
         let failedPayload = try XCTUnwrap(failedValue.objectValue)
         XCTAssertEqual(failedPayload["result"]?.stringValue, "stop_failed")
         XCTAssertEqual(failedPayload["reason"]?.stringValue, "terminal_publication_rejected")
+    }
+
+    func testManagedEnvelopeDetectionCoversIndentedAndCoalescedPayloads() {
+        let envelope = "  <cross_session_message origin=\"user_granted_session_link\" delegation=\"user_delegated_management\">"
+        XCTAssertTrue(AgentSessionLinkMessageEnvelope.containsManagedEnvelope(envelope))
+        XCTAssertTrue(AgentSessionLinkMessageEnvelope.containsManagedEnvelope(
+            "<steering_messages>\n<message>\n\(envelope)\n</message>\n</steering_messages>"
+        ))
+        XCTAssertFalse(AgentSessionLinkMessageEnvelope.containsManagedEnvelope("local queued instruction"))
     }
 
     func testFlatReceiptContainsNoAuditOrRequestIdentity() throws {

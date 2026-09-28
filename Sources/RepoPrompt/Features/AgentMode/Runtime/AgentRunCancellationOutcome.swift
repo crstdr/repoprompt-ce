@@ -8,6 +8,7 @@ struct AgentRunStopState {
     private(set) var activeManagedStopBinding: AgentPersistentSessionBindingIdentity?
     private(set) var managedStopCleanupClaimed = false
     private(set) var managedStopCleanupStarted = false
+    private(set) var managedStopClaimedAt: Date?
 
     mutating func invalidateScheduledStarts() {
         cancellationGeneration = UUID()
@@ -20,6 +21,7 @@ struct AgentRunStopState {
         activeManagedStopBinding = binding
         managedStopCleanupClaimed = true
         managedStopCleanupStarted = false
+        managedStopClaimedAt = Date()
         return true
     }
 
@@ -29,6 +31,7 @@ struct AgentRunStopState {
         activeManagedStopBinding = nil
         managedStopCleanupClaimed = false
         managedStopCleanupStarted = false
+        managedStopClaimedAt = nil
         return true
     }
 
@@ -44,19 +47,33 @@ struct AgentRunStopState {
         managedStopCleanupClaimed = false
     }
 
-    mutating func forceRetireUnclaimedStop(binding: AgentPersistentSessionBindingIdentity?) -> Bool {
-        guard activeManagedStopID != nil, activeManagedStopBinding == binding,
-              !managedStopCleanupClaimed
-        else { return false }
+    mutating func forceRetireUnclaimedStop(
+        binding: AgentPersistentSessionBindingIdentity?,
+        runIsTerminal: Bool = false,
+        now: Date = Date(),
+        deadlineSeconds: TimeInterval = 30
+    ) -> Bool {
+        guard activeManagedStopID != nil, activeManagedStopBinding == binding else { return false }
+        let startedTeardownTimedOut = runIsTerminal && managedStopCleanupStarted
+            && managedStopClaimedAt.map { now.timeIntervalSince($0) >= deadlineSeconds } == true
+        guard !managedStopCleanupClaimed || startedTeardownTimedOut else { return false }
         activeManagedStopID = nil
         activeManagedStopBinding = nil
+        managedStopCleanupClaimed = false
         managedStopCleanupStarted = false
+        managedStopClaimedAt = nil
         return true
     }
 
     func isStopping(binding: AgentPersistentSessionBindingIdentity?) -> Bool {
         activeManagedStopID != nil && activeManagedStopBinding == binding
     }
+
+    #if DEBUG
+        mutating func test_ageManagedStopClaim(by interval: TimeInterval) {
+            managedStopClaimedAt = managedStopClaimedAt?.addingTimeInterval(-interval)
+        }
+    #endif
 }
 
 /// Captured before a deferred producer creates a task; never refreshed by that producer.
@@ -169,12 +186,11 @@ final class AgentRunCancellationOutcomeRecorder {
               primaryRevision == nil,
               revision.ownership == expectedOwnership,
               revision.expectedRunID == expectedRunID,
-              revision.terminalState == .cancelled,
-              session.persistentSessionBindingIdentity == expectedBinding
+              revision.terminalState == .cancelled
         else { return }
         primaryRevision = revision
         publicationResult = result
-        if case .accepted = result {
+        if case .accepted = result, session.persistentSessionBindingIdentity == expectedBinding {
             onAcceptedPrimaryPublication?(revision)
         }
     }

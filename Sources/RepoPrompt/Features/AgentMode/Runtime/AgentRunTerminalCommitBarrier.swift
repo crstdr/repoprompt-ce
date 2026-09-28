@@ -453,7 +453,8 @@ final class AgentRunTerminalCommitBarrier {
         lifecycle: AgentRunAttemptLifecycle
     ) async {
         await awaitTerminalPublication(for: ownership, lifecycle: lifecycle)
-        guard lifecycle.lastTerminalCommitRevision?.ownership == ownership else { return }
+        // The task is keyed by the captured attempt, not by the mutable live binding revision.
+        // A rebind during publication must not erase the original cleanup evidence.
         await terminalTeardownTasks[ownership]?.value
     }
 

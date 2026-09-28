@@ -260,6 +260,38 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
     }
 
+    func testAugmentationSuspensionCannotMutateReboundACPQueueOrComposer() async throws {
+        let fixture = try await makeFixture()
+        let entered = AgentSessionLinkStopSignal<Void>()
+        let release = AgentSessionLinkStopSignal<Void>()
+        addTeardownBlock { release.finish(()) }
+        fixture.viewModel.test_afterProviderInputAugmentation = {
+            entered.finish(())
+            await release.value()
+        }
+        fixture.session.pendingNonCodexUserInputTokenQueue = [111]
+        let message = request("stale managed direction")
+        let steering = Task { await self.steer(fixture, request: message) }
+        await entered.value()
+        fixture.session.stopState.invalidateScheduledStarts()
+        fixture.session.installPersistentSessionBinding(
+            AgentPersistentSessionBindingIdentity(tabID: fixture.session.tabID, sessionID: UUID())
+        )
+        fixture.session.pendingNonCodexUserInputTokenQueue = [222]
+        fixture.viewModel.storeDraftText(for: fixture.session.tabID, "replacement draft")
+        release.finish(())
+        let outcome = await steering.value
+        guard case .blocked = outcome else { return XCTFail("stale steer must not be delivered") }
+        XCTAssertEqual(fixture.session.pendingNonCodexUserInputTokenQueue, [222])
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "replacement draft")
+        XCTAssertTrue(
+            fixture.session.items.contains(where: { $0.text == message.message }),
+            "a stale flush must not remove a row from the rebound session"
+        )
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
+        fixture.viewModel.test_afterProviderInputAugmentation = nil
+    }
+
     func testCancelWipesManagedQueueWithoutRestoringItsDraft() async throws {
         let fixture = try await makeFixture()
         let message = request("managed queue entry")
@@ -340,6 +372,19 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertEqual(
             fixture.viewModel.agentSessionLinkSteerAdmission(for: fixture.session, liveness: Self.liveness),
             .steer(.acpQueued)
+        )
+    }
+
+    func testEndpointInvalidationOutranksCompactSettlingForManagedSteer() {
+        var readiness = AgentSessionLinkDeliveryReadiness.Snapshot.ready
+        readiness.compactionSettling = true
+        readiness.endpointMatchesGrant = false
+        XCTAssertEqual(
+            AgentSessionLinkSteerAdmission.evaluate(
+                readiness: readiness, runStateIsActive: false,
+                pendingPromptExists: false, route: nil
+            ),
+            .blocked(.endpointInvalidated)
         )
     }
 

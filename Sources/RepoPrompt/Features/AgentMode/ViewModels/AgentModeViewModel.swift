@@ -616,6 +616,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] = [:]
 
     #if DEBUG
+        var test_afterClaudeAttachmentSelfCancel: (@MainActor () async -> Void)?
+        var test_claudeAttachmentRestartFinished: (@MainActor () -> Void)?
+        var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
+
         /// Test-only live-authority seam for prompt readiness orchestration.
         var test_agentSessionLinkHasActiveOutboundLink:
             ((DomainAgentSessionLinkEndpointIdentity) async -> Bool)?
@@ -3092,6 +3096,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             queuedWorkRecovery: .init(
                 restoreDraftText: { [weak self] tabID, text, message, strategy in
                     self?.restoreComposerDraft(tabID: tabID, text: text, message: message, strategy: strategy)
+                },
+                isCurrentSessionBinding: { [weak self] session, fence in
+                    self?.sessions[session.tabID] === session
+                        && session.persistentSessionBindingIdentity == fence.binding
                 }
             ),
             persistence: .init(
@@ -17259,7 +17267,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
                 Task { [weak self, weak session] in
                     guard let self, let session else { return }
+                    #if DEBUG
+                        defer { test_claudeAttachmentRestartFinished?() }
+                    #endif
                     @MainActor func restoreIfStopped() {
+                        guard sessions[tabID] === session,
+                              session.persistentSessionBindingIdentity == producerStopFence.binding
+                        else { return }
                         if let index = session.items.firstIndex(where: { $0.id == userItem.id }) {
                             _ = session.removeItem(at: index)
                         }
@@ -17279,8 +17293,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         return
                     }
                     await cancelAgentRun(tabID: tabID)
+                    #if DEBUG
+                        await test_afterClaudeAttachmentSelfCancel?()
+                    #endif
                     // This submission itself issued one Stop; any additional Stop invalidates it.
                     guard sessions[tabID] === session,
+                          session.persistentSessionBindingIdentity == producerStopFence.binding,
                           session.stopState.cancellationCount == producerStopFence.cancellationCount + 1
                     else {
                         restoreIfStopped()
@@ -18395,8 +18413,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             attachments: attachments,
             agent: effectiveAgent
         )
-        guard let session, !ignoresPendingHandoff else { return withAttachmentRendering }
-        return prependPendingHandoffIfNeeded(withAttachmentRendering, session: session)
+        let providerText: String = if let session, !ignoresPendingHandoff {
+            prependPendingHandoffIfNeeded(withAttachmentRendering, session: session)
+        } else {
+            withAttachmentRendering
+        }
+        #if DEBUG
+            if effectiveAgent.acpProviderID != nil {
+                await test_afterProviderInputAugmentation?()
+            }
+        #endif
+        return providerText
     }
 
     @MainActor
@@ -19610,7 +19637,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async {
         guard let session = sessions[tabID] else { return }
         if !session.runState.isActive,
-           session.stopState.forceRetireUnclaimedStop(binding: session.persistentSessionBindingIdentity)
+           session.stopState.forceRetireUnclaimedStop(
+               binding: session.persistentSessionBindingIdentity,
+               runIsTerminal: session.runState.isTerminalForCommit
+           )
         {
             session.noteMonitorObservationInputsChanged()
             requestUIRefresh(tabID: tabID, urgent: true)
@@ -20601,6 +20631,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     #if DEBUG
+        func test_setBeforeCancellationCommit(_ action: (@MainActor (TabSession) async -> Void)?) {
+            runService.testBeforeCancellationCommit = action
+        }
+
+        func test_publishNaturalCompletion(_ session: TabSession) async {
+            await runService.test_publishNaturalCompletion(session)
+        }
+
+        func test_submitWaitingClaudeAttachment(
+            session: TabSession,
+            text: String,
+            attachment: AgentImageAttachment
+        ) -> UserTurnSubmissionResult {
+            submitPreparedUserTurn(
+                tabID: session.tabID, session: session, trimmedText: text,
+                attachmentsToSend: [attachment], taggedFilesToSend: [], activeWorkflow: nil
+            )
+        }
+
         func test_resumeStaleACPFlush(
             session: TabSession, runID: UUID, runAttemptID: UUID, stopFence: AgentRunStartStopFence
         ) {

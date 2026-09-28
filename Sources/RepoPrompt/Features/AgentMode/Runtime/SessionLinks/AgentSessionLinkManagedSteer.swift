@@ -120,8 +120,14 @@ extension AgentSessionLinkSteerAdmission {
         pendingPromptExists: Bool,
         route: AgentSessionLinkManagedSteerRoute?
     ) -> AgentSessionLinkSteerAdmission {
+        let readinessDecision = AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness)
+        switch readinessDecision {
+        case .blocked(.endpointInvalidated): return .blocked(.endpointInvalidated)
+        case .blocked(.targetLoading): return .blocked(.targetLoading)
+        case .ready, .blocked(.targetNotIdle): break
+        }
         if readiness.compactionSettling { return .blocked(.compactionSettling) }
-        switch AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness) {
+        switch readinessDecision {
         case .ready:
             return .idleTurn
         case .blocked(.endpointInvalidated):

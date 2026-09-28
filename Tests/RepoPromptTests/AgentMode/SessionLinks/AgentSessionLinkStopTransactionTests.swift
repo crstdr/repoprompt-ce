@@ -132,17 +132,33 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         ), "the held wake must never reach a provider call")
     }
 
+    func testIdleStopInvalidatesUnmodeledDeferredStartFence() async throws {
+        let fixture = try makeFixture()
+        let deferredFence = AgentRunStartStopFence(session: fixture.session)
+        guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .notRunning)
+        XCTAssertFalse(deferredFence.permitsStart(of: fixture.session))
+    }
+
     func testPendingStartWithdrawsWithoutSyntheticTerminalRun() async throws {
         let fixture = try makeFixture()
         fixture.session.runState = .completed
         fixture.session.mcpFollowUpRunPending = true
         fixture.session.pendingInstructions = ["the user's queued instruction"]
+        fixture.session.pendingClaudeSteeringInstructions = [
+            .init(
+                id: UUID(), targetRunID: nil, targetRunAttemptID: nil,
+                providerText: "local queued steer", attachments: [], taggedFileAttachments: [],
+                draftText: "local queued steer", optimisticUserItemID: nil, createdAt: Date()
+            )
+        ]
         let beforeRevision = fixture.session.lastTerminalCommitRevision
         let outcome = await stop(fixture)
         guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
         XCTAssertEqual(receipt.result, .stopped)
         XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
         XCTAssertEqual(fixture.session.runState, .completed)
         XCTAssertEqual(fixture.session.lastTerminalCommitRevision, beforeRevision)
         XCTAssertEqual(fixture.session.items.count(where: { $0.text == AgentChatItem.overseerRunStoppedText }), 1)
@@ -168,6 +184,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(receipt.result, .stopped)
         XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "the user's own draft")
         XCTAssertFalse(fixture.viewModel.retrieveDraftText(for: fixture.tabID).contains("overseer-only"))
+        XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
     }
 
     func testActiveRunUsesCancellationSpineAndAttributedFactRow() async throws {
@@ -294,6 +311,42 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         }
     }
 
+    func testSecondUserStopRetiresStartedTimedOutTeardownGate() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        let ownership = fixture.session.beginRunAttempt(source: "started-wedged-stop")
+        let entered = AgentSessionLinkStopSignal<Void>()
+        let release = AgentSessionLinkStopSignal<Void>()
+        let deadline = AgentSessionLinkStopSignal<Void>()
+        fixture.session.installRunAttemptTerminalResources(ownership: ownership) { _ in
+            {
+                entered.finish(())
+                await release.value()
+            }
+        }
+        addTeardownBlock {
+            release.finish(())
+            deadline.finish(())
+        }
+        let stopping = Task {
+            await self.stop(fixture, teardownDeadlineSeconds: 30, deadlineSleep: { seconds in
+                if seconds == 30 { await deadline.value() }
+            })
+        }
+        await entered.value()
+        deadline.finish(())
+        guard case let .settled(receipt) = await stopping.value else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.failureReason, .teardownTimeout)
+        let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+        XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
+        fixture.session.stopState.test_ageManagedStopClaim(by: 31)
+        await fixture.viewModel.cancelAgentRun(tabID: fixture.tabID)
+        XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding))
+        release.finish(())
+        XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding), "late cleanup cannot reclaim the gate")
+    }
+
     func testAuditRebindDuringSaveCannotClaimOriginalRowPersisted() async throws {
         let fixture = try makeFixture()
         fixture.session.runState = .running
@@ -389,6 +442,61 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertTrue(fixture.session.stopState.releaseManagedStop(id: stopID, binding: binding))
     }
 
+    func testLocalStopWithdrawsQueuesAfterRealCompletedTerminalRevision() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "completed-before-local-stop")
+        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        let revision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
+        XCTAssertEqual(revision.terminalState, .completed)
+        fixture.session.pendingInstructions = ["queued local follow-up"]
+        fixture.session.pendingClaudeSteeringInstructions = [
+            .init(
+                id: UUID(), targetRunID: nil, targetRunAttemptID: nil,
+                providerText: "queued Claude steer", attachments: [], taggedFileAttachments: [],
+                draftText: "queued Claude steer", optimisticUserItemID: nil, createdAt: Date()
+            )
+        ]
+        fixture.session.pendingNonCodexUserInputTokenQueue = [111]
+        await fixture.viewModel.cancelAgentRun(tabID: fixture.tabID)
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
+        XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertTrue(fixture.session.pendingNonCodexUserInputTokenQueue.isEmpty)
+        XCTAssertEqual(fixture.session.lastTerminalCommitRevision, revision)
+    }
+
+    func testNaturalCompletionAfterCancellationAdmissionSettlesNotRunning() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "natural-completion-after-admission")
+        fixture.viewModel.test_setBeforeCancellationCommit { session in
+            await fixture.viewModel.test_publishNaturalCompletion(session)
+        }
+        defer { fixture.viewModel.test_setBeforeCancellationCommit(nil) }
+        guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .notRunning)
+        XCTAssertEqual(receipt.stopRequested, true)
+        XCTAssertEqual(fixture.session.lastTerminalCommitRevision?.terminalState, .completed)
+        XCTAssertFalse(fixture.session.items.contains(where: { $0.text == AgentChatItem.overseerRunStoppedText }))
+    }
+
+    func testClaimLostBeforeCancellationReportsTargetChanged() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "target-changed-before-task-entry")
+        let outcome = await stop(fixture, beforeCleanupTask: {
+            fixture.session.installRunID(UUID())
+        })
+        guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .stopFailed)
+        XCTAssertEqual(receipt.failureReason, .targetChanged)
+        XCTAssertEqual(receipt.stopRequested, false)
+    }
+
     func testNaturalCompletionBeforeTaskEntryIsNoopWithoutAttribution() async throws {
         let fixture = try makeFixture()
         fixture.session.runState = .running
@@ -408,6 +516,40 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
         XCTAssertTrue(fixture.session.items.allSatisfy { $0.text != AgentChatItem.overseerRunStoppedText })
+    }
+
+    func testClaudeAttachmentRestartRejectsInPlaceRebindDuringSuspension() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .waitingForUser
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "claude-attachment-restart")
+        let reachedRestart = AgentSessionLinkStopSignal<Void>()
+        let releaseRestart = AgentSessionLinkStopSignal<Void>()
+        let finishedRestart = AgentSessionLinkStopSignal<Void>()
+        addTeardownBlock { releaseRestart.finish(()) }
+        fixture.viewModel.test_afterClaudeAttachmentSelfCancel = {
+            reachedRestart.finish(())
+            await releaseRestart.value()
+        }
+        fixture.viewModel.test_claudeAttachmentRestartFinished = { finishedRestart.finish(()) }
+        defer {
+            fixture.viewModel.test_afterClaudeAttachmentSelfCancel = nil
+            fixture.viewModel.test_claudeAttachmentRestartFinished = nil
+        }
+        let attachment = AgentImageAttachment(source: .url("https://example.test/old-image.png"))
+        guard case .submitted = fixture.viewModel.test_submitWaitingClaudeAttachment(
+            session: fixture.session, text: "old binding text", attachment: attachment
+        ) else { return XCTFail("expected scheduled attachment restart") }
+        await reachedRestart.value()
+        let replacementBinding = AgentPersistentSessionBindingIdentity(
+            tabID: fixture.tabID, sessionID: fixture.candidate.sessionID
+        )
+        fixture.session.installPersistentSessionBinding(replacementBinding)
+        fixture.viewModel.storeDraftText(for: fixture.tabID, "replacement draft")
+        releaseRestart.finish(())
+        await finishedRestart.value()
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "replacement draft")
+        XCTAssertNotEqual(fixture.session.runState, .running)
     }
 
     func testHydrationDeferredSubmissionNeverRestoresIntoReplacementSession() async throws {

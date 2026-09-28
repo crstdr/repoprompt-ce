@@ -101,15 +101,14 @@ extension AgentModeViewModel {
         }
 
         // 2. Pure readiness admission.
-        let admission = AgentSessionLinkDeliveryReadiness.evaluate(
+        if let failure = AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: admissionLiveness.targetEndpointIsLive,
                 isClosing: admissionLiveness.targetWindowIsClosing
             )
-        )
-        if case let .blocked(reason) = admission {
-            return .blocked(AgentSessionLinkSendFailure(reason))
+        ) {
+            return .blocked(failure)
         }
 
         // 3. Local composer claim. Losing it means a local user Send won the race, which is exactly
@@ -157,17 +156,16 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointInvalidated)
         }
-        let postCommitAdmission = AgentSessionLinkDeliveryReadiness.evaluate(
+        if let failure = AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: postCommitLiveness.targetEndpointIsLive,
                 isClosing: postCommitLiveness.targetWindowIsClosing,
                 ignoresComposerSubmissionInFlight: true
             )
-        )
-        if case let .blocked(reason) = postCommitAdmission {
+        ) {
             releaseComposerSubmitClaim(claim)
-            return .blocked(AgentSessionLinkSendFailure(reason))
+            return .blocked(failure)
         }
         guard let workspaceID = workspaceManager?.activeWorkspace?.id,
               workspaceID == candidate.workspaceID
@@ -265,15 +263,14 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
-        let dispatchAdmission = AgentSessionLinkDeliveryReadiness.evaluate(
+        if AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,
                 isClosing: dispatchLiveness.targetWindowIsClosing,
                 ignoresComposerSubmissionInFlight: true
             )
-        )
-        if case .blocked = dispatchAdmission {
+        ) != nil {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }

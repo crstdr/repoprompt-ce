@@ -208,6 +208,15 @@ enum AgentSessionLinkDeliveryReadiness {
         return .ready
     }
 
+    /// Managed deliveries must also respect the ACP background-compaction settle window.
+    /// Local user submissions keep their existing admission behavior.
+    static func managedDeliveryFailure(snapshot: Snapshot) -> AgentSessionLinkSendFailure? {
+        switch evaluate(snapshot: snapshot) {
+        case let .blocked(reason): AgentSessionLinkSendFailure(reason)
+        case .ready: snapshot.compactionSettling ? .compactionSettling : nil
+        }
+    }
+
     /// Every non-lifecycle blocker. Completed, cancelled, and failed prior runs are *not* blockers:
     /// a terminal run in a still-live session is idle and remains sendable.
     private static func isTargetBusy(_ snapshot: Snapshot) -> Bool {

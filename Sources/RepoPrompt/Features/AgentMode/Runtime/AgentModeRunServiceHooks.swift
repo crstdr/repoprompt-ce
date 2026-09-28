@@ -70,6 +70,9 @@ extension AgentModeRunService {
     /// Authority: queued-work recovery projection.
     struct QueuedWorkRecoveryHooks {
         let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
+        var isCurrentSessionBinding: @MainActor (AgentTabSession, AgentRunStartStopFence) -> Bool = { session, fence in
+            fence.binding == session.persistentSessionBindingIdentity
+        }
     }
 
     /// Host persistence scheduling for session/tab state.

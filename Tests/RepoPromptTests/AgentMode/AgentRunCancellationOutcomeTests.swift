@@ -3,6 +3,14 @@ import Foundation
 import XCTest
 
 final class AgentRunCancellationOutcomeTests: XCTestCase {
+    func testStopBoundaryValuesRemainSendable() {
+        func requireSendable(_: (some Sendable).Type) {}
+        requireSendable(AgentRunStartStopFence.self)
+        requireSendable(AgentRunCancellationAdmission.self)
+        requireSendable(AgentRunOwnership.self)
+        requireSendable(AgentPersistentSessionBindingIdentity.self)
+    }
+
     @MainActor
     func testStartFenceRejectsOldGenerationAndOldBindingButAllowsNewWork() {
         let session = AgentTabSession(tabID: UUID())
@@ -37,6 +45,34 @@ final class AgentRunCancellationOutcomeTests: XCTestCase {
         XCTAssertTrue(state.isStopping(binding: binding))
         XCTAssertTrue(state.releaseManagedStop(id: stopID, binding: binding))
         XCTAssertFalse(state.isStopping(binding: binding))
+    }
+
+    @MainActor
+    func testPublicationTimeRebindRetainsCausalResultWithoutAttribution() {
+        let session = AgentTabSession(tabID: UUID())
+        let binding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID())
+        session.installPersistentSessionBinding(binding)
+        let ownership = session.beginRunAttempt(source: "publication-rebind")
+        let runID = UUID()
+        var attributed = false
+        let recorder = AgentRunCancellationOutcomeRecorder(
+            expectedOwnership: ownership, expectedRunID: runID, expectedBinding: binding,
+            onAcceptedPrimaryPublication: { _ in attributed = true }
+        )
+        recorder.recordCancellationInitiated()
+        let revision = AgentRunTerminalCommitRevision(
+            commitID: UUID(), ownership: ownership, terminalState: .cancelled,
+            failureReason: nil, expectedRunID: runID, sourceItemsRevision: 0,
+            assistantDeltaFlushGeneration: 0, providerDrainGeneration: 0,
+            mcpPublicationEnvelope: nil, successorKind: nil, providerSuccessorID: nil
+        )
+        session.installPersistentSessionBinding(
+            AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID())
+        )
+        recorder.recordPrimaryPublication(revision: revision, result: .accepted(successorEpoch: nil), session: session)
+        XCTAssertEqual(recorder.primaryRevision, revision)
+        XCTAssertEqual(recorder.publicationResult, .accepted(successorEpoch: nil))
+        XCTAssertFalse(attributed)
     }
 
     @MainActor

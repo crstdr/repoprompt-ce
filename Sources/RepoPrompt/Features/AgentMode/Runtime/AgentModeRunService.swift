@@ -54,6 +54,30 @@ final class AgentModeRunService {
     private let acpRunner: ACPIntegratedAgentModeRunner
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
 
+    #if DEBUG
+        var testBeforeCancellationCommit: (@MainActor (AgentTabSession) async -> Void)?
+
+        func test_publishNaturalCompletion(_ session: AgentTabSession) async {
+            guard let ownership = session.activeRunOwnership else { return }
+            _ = await terminalCommitBarrier.commit(.init(
+                binding: hooks.bindTerminalSession(session),
+                ownership: ownership,
+                expectedRunID: session.runID,
+                terminalState: .completed,
+                source: "test.naturalCompletion",
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: false,
+                supportsFollowUp: false,
+                notifyTurnComplete: false,
+                providerDrainGeneration: session.providerTerminalDrainGeneration,
+                prepareProviderState: {
+                    session.provider = nil
+                    return nil
+                }
+            ))
+        }
+    #endif
+
     private static let enableSteeringDebugLogging = false
 
     private func steeringDebugLog(_ message: @autoclosure () -> String) {
@@ -497,8 +521,16 @@ final class AgentModeRunService {
                 )
                 // Augmentation suspended. Re-prove every attributed endpoint before the provider
                 // call; if one went stale, never send the already-coalesced batch containing it.
+                guard flushStopFence.permitsStart(of: session),
+                      hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
+                else {
+                    releaseSupersedingProtectionIfUnused()
+                    withdrawManagedACPSteering(steeringBatch, session: session, stopFence: flushStopFence)
+                    restoreLocalACPSteeringDrafts(steeringBatch, tabID: tabID, session: session, stopFence: flushStopFence)
+                    return
+                }
                 let stillCurrent = currentACPSteeringInstructions(steeringBatch, session: session)
-                if stillCurrent.count != steeringBatch.count || !flushStopFence.permitsStart(of: session) {
+                if stillCurrent.count != steeringBatch.count {
                     releaseSupersedingProtectionIfUnused()
                     if !dequeuedUserInputTokens.isEmpty {
                         session.pendingNonCodexUserInputTokenQueue.insert(contentsOf: dequeuedUserInputTokens, at: 0)
@@ -525,9 +557,11 @@ final class AgentModeRunService {
                 }
                 if !sent {
                     releaseSupersedingProtectionIfUnused()
-                    guard flushStopFence.permitsStart(of: session) else {
-                        withdrawManagedACPSteering(steeringBatch, session: session)
-                        restoreLocalACPSteeringDrafts(steeringBatch, tabID: tabID)
+                    guard flushStopFence.permitsStart(of: session),
+                          hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
+                    else {
+                        withdrawManagedACPSteering(steeringBatch, session: session, stopFence: flushStopFence)
+                        restoreLocalACPSteeringDrafts(steeringBatch, tabID: tabID, session: session, stopFence: flushStopFence)
                         return
                     }
                     session.pendingACPSteeringInstructions.insert(contentsOf: steeringBatch, at: 0)
@@ -687,12 +721,18 @@ final class AgentModeRunService {
 
     private func withdrawManagedACPSteering(
         _ instructions: [AgentTabSession.ACPSteeringInstruction],
-        session: AgentTabSession
+        session: AgentTabSession,
+        stopFence: AgentRunStartStopFence? = nil
     ) {
+        let mayMutateOriginalBinding = stopFence.map {
+            hooks.queuedWorkRecovery.isCurrentSessionBinding(session, $0)
+        } ?? true
         var removedRow = false
         for instruction in instructions {
             guard let managed = instruction.managed else { continue }
-            if let index = session.items.firstIndex(where: { $0.id == managed.attributedItemID }) {
+            if mayMutateOriginalBinding,
+               let index = session.items.firstIndex(where: { $0.id == managed.attributedItemID })
+            {
                 _ = session.removeItem(at: index)
                 removedRow = true
             }
@@ -755,8 +795,8 @@ final class AgentModeRunService {
         stopFence: AgentRunStartStopFence
     ) {
         guard stopFence.permitsStart(of: session) else {
-            withdrawManagedACPSteering(instructions, session: session)
-            restoreLocalACPSteeringDrafts(instructions, tabID: tabID)
+            withdrawManagedACPSteering(instructions, session: session, stopFence: stopFence)
+            restoreLocalACPSteeringDrafts(instructions, tabID: tabID, session: session, stopFence: stopFence)
             return
         }
         let current = currentACPSteeringInstructions(instructions, session: session)
@@ -1097,10 +1137,7 @@ final class AgentModeRunService {
                 + session.pendingInstructions.filter { text in
                     // Managed ACP follow-ups retain their provider envelope in this shared queue.
                     // Never restore that attributed provider text as the lane user's draft.
-                    !(
-                        text.starts(with: "<cross_session_message ")
-                            && text.contains("delegation=\"user_delegated_management\"")
-                    )
+                    !AgentSessionLinkMessageEnvelope.containsManagedEnvelope(text)
                 }
         )
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1125,8 +1162,13 @@ final class AgentModeRunService {
 
     private func restoreLocalACPSteeringDrafts(
         _ instructions: [AgentTabSession.ACPSteeringInstruction],
-        tabID: UUID
+        tabID: UUID,
+        session: AgentTabSession? = nil,
+        stopFence: AgentRunStartStopFence? = nil
     ) {
+        if let stopFence, let session,
+           !hooks.queuedWorkRecovery.isCurrentSessionBinding(session, stopFence)
+        { return }
         let drafts = instructions.filter { $0.managed == nil }
             .map(\.draftText)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -1145,12 +1187,10 @@ final class AgentModeRunService {
         session.acpSteeringFlushTask = nil
         session.acpSteeringFlushID = nil
         restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+        session.pendingClaudeSteeringInstructions.removeAll()
         restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID)
         let localPending = session.pendingInstructions.filter { text in
-            !(
-                text.starts(with: "<cross_session_message ")
-                    && text.contains("delegation=\"user_delegated_management\"")
-            )
+            !AgentSessionLinkMessageEnvelope.containsManagedEnvelope(text)
         }
         if !localPending.isEmpty {
             hooks.queuedWorkRecovery.restoreDraftText(
@@ -1199,10 +1239,11 @@ final class AgentModeRunService {
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
-            // Even a settled run may still have a deferred ACP queue. User Stop must not leave
-            // managed sinks parked behind the terminal shortcut.
-            withdrawManagedACPSteering(session.pendingACPSteeringInstructions, session: session)
-            session.pendingACPSteeringInstructions.removeAll()
+            // A settled run can still carry deferred instructions. Local Stop must withdraw
+            // them without manufacturing another terminal attempt.
+            if intent == .userStop {
+                withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
+            }
             await terminalCommitBarrier.awaitTerminalPublication(
                 for: revision.ownership,
                 lifecycle: session.runLifecycle
@@ -1264,6 +1305,7 @@ final class AgentModeRunService {
         )
 
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.cancel")
+        let cancellationLifecycle = session.runLifecycle
         let expectedRunID = session.runID
         let provider = session.provider
         let acpController = session.acpController
@@ -1280,7 +1322,10 @@ final class AgentModeRunService {
             dependencies.codexCoordinator.drainCodexTerminalBuffersForCancellation(session)
         }
 
-        await terminalCommitBarrier.commit(.init(
+        #if DEBUG
+            await testBeforeCancellationCommit?(session)
+        #endif
+        let committedRevision = await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: expectedRunID,
@@ -1344,9 +1389,9 @@ final class AgentModeRunService {
         if completion == .terminalTeardownCompleted {
             await terminalCommitBarrier.awaitTerminalTeardown(
                 for: ownership,
-                lifecycle: session.runLifecycle
+                lifecycle: cancellationLifecycle
             )
-            if session.runLifecycle.lastTerminalCommitRevision?.ownership == ownership {
+            if committedRevision?.ownership == ownership {
                 outcomeRecorder?.recordTeardownCompleted()
             }
         }
