@@ -431,6 +431,13 @@ actor ACPAgentSessionController {
         state == .sessionOpen && process != nil && sessionID != nil
     }
 
+    /// Whether a provider session is live right now — open or running a turn — as opposed to
+    /// starting up, closed, or never begun. Busy still counts as live; turn admission is a
+    /// separate question from whether the session exists at all.
+    var hasLiveProviderSession: Bool {
+        (state == .sessionOpen || state == .promptRunning) && process != nil && sessionID != nil
+    }
+
     /// Whether this controller can never run another turn (failed, closing, closed, or without a
     /// process), as opposed to being merely busy with one.
     var isRetired: Bool {
