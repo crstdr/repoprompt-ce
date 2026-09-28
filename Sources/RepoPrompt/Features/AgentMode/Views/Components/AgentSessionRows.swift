@@ -11,12 +11,9 @@ enum AgentSidebarTapModifierReader {
     ///
     /// This is not captured from the mouse-down that started the click. A later
     /// flags-changed or key event can be current, and a command or shift bit on
-    /// that event reinterprets the click. A nil app or a nil current event is a
-    /// plain click. `NSApp` is an implicitly unwrapped optional, so a test
-    /// process that has not created the shared application must not touch it.
+    /// that event reinterprets the click. A nil current event is a plain click.
     static func currentFlags() -> NSEvent.ModifierFlags {
-        guard NSApp != nil else { return [] }
-        return NSApp.currentEvent?.modifierFlags ?? []
+        NSApp.currentEvent?.modifierFlags ?? []
     }
 
     static func gesture(for flags: NSEvent.ModifierFlags) -> AgentSidebarSelectionGesture {
@@ -1690,22 +1687,13 @@ struct AgentRowRunningIndicator: View {
     static let accessibilityLabelText = "Running"
 
     var tint: Color = .accentColor
-    /// Nil reads the process Reduce Motion setting. Tests pin it so the hosted
-    /// indicator does not depend on the runner's accessibility preferences.
-    var reduceMotionOverride: Bool?
-
-    init(tint: Color = .accentColor, reduceMotionOverride: Bool? = nil) {
-        self.tint = tint
-        self.reduceMotionOverride = reduceMotionOverride
-    }
-
     @Environment(\.windowIsPresentationVisible) private var isWindowPresentationVisible
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         switch AgentRowActivityIndicatorMode.resolve(
             isWindowPresentationVisible: isWindowPresentationVisible,
-            reduceMotion: reduceMotionOverride ?? reduceMotion
+            reduceMotion: reduceMotion
         ) {
         case .animated:
             AgentRowActivityArc(tint: tint)

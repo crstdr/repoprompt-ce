@@ -732,7 +732,6 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
     }
 
     func testAgentManageListCreateAndResumeUseDiscoveredCatalogMetadata() async throws {
-        try skipRemovedCursorAutoFallback()
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
         let window = try await makeWindow(name: "Cursor MCP", root: fixture.root)

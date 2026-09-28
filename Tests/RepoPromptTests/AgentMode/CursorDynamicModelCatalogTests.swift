@@ -2,10 +2,6 @@ import MCP
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
-func skipRemovedCursorAutoFallback() throws {
-    throw XCTSkip("Encodes the local Cursor Auto fallback removed in e823a016 (2026-09-24, Cristian deprioritised Cursor); revisit with #1050")
-}
-
 /// Contract for Cursor's discovery-backed catalogue projection.
 ///
 /// The compiled model inventory and its live-vs-release reconciliation are gone: membership and
@@ -95,7 +91,6 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
 
     @MainActor
     func testAutoStaysPinnedFirstDefaultAndParameterFreeEvenWhenCursorAdvertisesIt() async throws {
-        try skipRemovedCursorAutoFallback()
         // Before any discovery or cache warm the projection is Auto-only.
         XCTAssertEqual(CursorAIModelCatalog.options.map(\.rawValue), ["auto"])
         XCTAssertTrue(CursorAIModelCatalog.contains(modelRaw: "auto"))
@@ -185,8 +180,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
     }
 
     @MainActor
-    func testSavedCursorSelectionSurvivesColdStartAndProviderRemovalButFailsClosedAtAdmission() throws {
-        try skipRemovedCursorAutoFallback()
+    func testSavedCursorSelectionSurvivesColdStartAndProviderRemovalButFailsClosedAtAdmission() {
         // Cold: the persisted catalogue has not warmed yet, so membership is unknown — the saved
         // model must not be rewritten to Auto.
         let cold = AgentModelCatalog.normalizePersistedSelection(
@@ -556,7 +550,6 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
 
     @MainActor
     func testCursorRoleOverrideAndItsPinSurviveUnknownOrRemovedCatalogue() throws {
-        try skipRemovedCursorAutoFallback()
         let pin = ACPModelParameterSelection(
             providerID: .cursor,
             baseModelRaw: "grok-4.7",
@@ -661,7 +654,6 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
 
     @MainActor
     func testCursorRoleLaunchRejectsUnadvertisedModelButAcceptsTheAdvertisedOne() async throws {
-        try skipRemovedCursorAutoFallback()
         let settings = GlobalSettingsStore.shared
         let previousProfile = settings.globalAgentModelsProfile()
         defer { settings.setGlobalAgentModelsProfile(previousProfile, contextBuilderWriteIntent: .preserveExistingOwnership) }
@@ -809,7 +801,6 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
 
     @MainActor
     func testColdSavedCursorRoleDiscoversAndRetainsItsPin() async throws {
-        try skipRemovedCursorAutoFallback()
         let settings = GlobalSettingsStore.shared
         let previousProfile = settings.globalAgentModelsProfile()
         defer {
@@ -863,7 +854,6 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
 
     @MainActor
     func testCursorOnlyRolesHaveAnAutoFloorWithoutDiscovery() async throws {
-        try skipRemovedCursorAutoFallback()
         var refreshCount = 0
         let noModels: AgentMCPSelectionResolver.CursorCatalogRefresh = { _ in refreshCount += 1 }
         for role: AgentModelCatalog.TaskLabelKind in [.engineer, .pair, .design] {
@@ -901,8 +891,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
     }
 
     @MainActor
-    func testColdCursorOnlySavedRoleRejectsWhenDiscoveryPublishesNoModels() async throws {
-        try skipRemovedCursorAutoFallback()
+    func testColdCursorOnlySavedRoleRejectsWhenDiscoveryPublishesNoModels() async {
         let settings = GlobalSettingsStore.shared
         let previousProfile = settings.globalAgentModelsProfile()
         defer { settings.setGlobalAgentModelsProfile(previousProfile, contextBuilderWriteIntent: .userInitiated) }

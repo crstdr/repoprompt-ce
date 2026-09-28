@@ -398,7 +398,6 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     func testPromptViewModelContextBuilderPinRejectsStaleCrossSurfaceModelSelection() throws {
-        try skipRemovedCursorAutoFallback()
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("PromptViewModelContextBuilderPinTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
