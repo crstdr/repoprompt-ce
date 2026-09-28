@@ -2,16 +2,15 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
-// Value types for a managing observer inspecting and explicitly answering its target's current
-// pending interaction through managed `agent_session_link` `poll`/`wait` and `respond`.
-//
-// Authority is layered and every layer is required:
-// 1. the exact outbound grant carrying the user's `.manage` delegation (a management lease from
-//    `authorizeTarget` plus live endpoint revalidation),
-// 2. the same lease re-validated inside the authority as the final suspension point, so a
-//    withdrawn delegation or revoked link applies nothing,
-// 3. the target's exact current `interaction_id` (compare-and-set before and after that final
-//    authority hop, with the submission made synchronously after the last check).
+// Value types for observer-local pending-interaction inspection through `poll`/`wait` and explicit
+// answers through `respond`. These paths have distinct authority checks:
+// 1. `poll`/`wait` obtain exact observation leases via `authorizeTargets`; before inspecting any
+//    prompt, `managedObservationTargetsIfValid` proves current Manage for the whole batch, and the
+//    bridge rechecks live endpoints. Restricted grants receive no prompt body.
+// 2. `respond` obtains a Manage-authorized mutation lease via `authorizeTarget`, then revalidates
+//    that exact lease and both live endpoints at the final authority hop before submission.
+// 3. `respond` also compares the target's current `interaction_id` before and after that hop, and
+//    submits synchronously after the last check. Revocation or endpoint drift applies nothing.
 //
 // Nothing here answers anything automatically. Provider permission auto-approval is a separate,
 // independent opt-in that never reaches questions or elicitations.
