@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -287,6 +289,151 @@ def execute_command(
         return 127
 
 
+SWIFT_TESTING_IMPORT = re.compile(r"^\s*(?:@testable\s+)?import\s+Testing\b", re.MULTILINE)
+XCTEST_HELPER_RELATIVE_PATH = Path("libexec/swift/pm/swiftpm-xctest-helper")
+BundleTestLister = Callable[[Path, Mapping[str, str]], Optional[list[str]]]
+
+
+def package_uses_swift_testing(root: Path) -> bool:
+    """Direct XCTest execution would silently skip Swift Testing tests, so detect them."""
+    tests_root = root / "Tests"
+    if not tests_root.is_dir():
+        return False
+    for path in tests_root.rglob("*.swift"):
+        try:
+            if SWIFT_TESTING_IMPORT.search(path.read_text(encoding="utf-8", errors="ignore")):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def xctest_helper_path(swift_binary: str) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["xcrun", "--find", swift_binary],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    swift_path = Path(result.stdout.strip())
+    helper = swift_path.parent.parent / XCTEST_HELPER_RELATIVE_PATH
+    return helper if helper.is_file() else None
+
+
+def flatten_listed_tests(document: Mapping[str, object]) -> list[str]:
+    """Flatten swiftpm-xctest-helper JSON into SwiftPM `Module.Class/method` specifiers."""
+    specifiers: list[str] = []
+
+    def is_leaf(node: object) -> bool:
+        # Test methods carry no "tests" key; suites always do, even when empty ("tests": []).
+        return isinstance(node, Mapping) and "tests" not in node
+
+    def visit(node: Mapping[str, object]) -> None:
+        children = node.get("tests")
+        if not isinstance(children, list) or not children:
+            return
+        name = str(node.get("name", ""))
+        if all(is_leaf(child) for child in children):
+            specifiers.extend(f"{name}/{child.get('name')}" for child in children if child.get("name"))
+            return
+        for child in children:
+            if isinstance(child, Mapping):
+                visit(child)
+
+    visit(document)
+    return sorted(set(specifiers))
+
+
+def helper_bundle_lister(helper: Path) -> BundleTestLister:
+    def list_tests(bundle: Path, environment: Mapping[str, str]) -> Optional[list[str]]:
+        with tempfile.TemporaryDirectory(prefix="rpce-test-list-") as directory:
+            output = Path(directory) / "tests.json"
+            try:
+                subprocess.run(
+                    [str(helper), str(bundle), str(output)],
+                    check=True,
+                    capture_output=True,
+                    env=dict(environment),
+                )
+                return flatten_listed_tests(json.loads(output.read_text(encoding="utf-8")))
+            except (OSError, subprocess.CalledProcessError, ValueError):
+                return None
+
+    return list_tests
+
+
+def select_xctest_specifiers(specifiers: Sequence[str], test_filter: str | None) -> list[str] | None:
+    """Apply SwiftPM `--filter` regex semantics; collapse fully selected suites.
+
+    Returns None when the filter is not a valid Python regex so callers can fall back to SwiftPM.
+    """
+    if not test_filter:
+        return ["All"] if specifiers else []
+    try:
+        pattern = re.compile(test_filter)
+    except re.error:
+        return None
+    selected = [specifier for specifier in specifiers if pattern.search(specifier)]
+    by_suite: dict[str, list[str]] = {}
+    for specifier in specifiers:
+        by_suite.setdefault(specifier.split("/", 1)[0], []).append(specifier)
+    selected_set = set(selected)
+    selectors: list[str] = []
+    for suite in sorted(by_suite):
+        methods = by_suite[suite]
+        chosen = [method for method in methods if method in selected_set]
+        if not chosen:
+            continue
+        if len(chosen) == len(methods):
+            selectors.append(suite)
+        else:
+            selectors.extend(chosen)
+    return selectors
+
+
+def direct_xctest_command(
+    *,
+    swift_binary: str,
+    cwd: Path | None,
+    test_filter: str | None,
+    environment: Mapping[str, str],
+    lister: BundleTestLister | None = None,
+    bundle_discovery: Optional[Callable[[str, Path | None], Mapping[str, Path]]] = None,
+    xctest_binary: Optional[Callable[[], tuple[str, ...]]] = None,
+) -> tuple[str, ...] | None:
+    """Build the direct xctest invocation, or None when SwiftPM must run the tests.
+
+    Running the built bundle directly avoids re-evaluating every package manifest under the
+    sandboxed environment (the manifest cache is environment keyed) and the build re-plan that
+    alternating `swift build` / `swift test` otherwise forces on the next job.
+    """
+    root = cwd or Path.cwd()
+    if package_uses_swift_testing(root):
+        return None
+    discovered = (bundle_discovery or discover_test_bundles)(swift_binary, cwd)
+    bundle = package_test_bundle(discovered) if discovered else None
+    if bundle is None:
+        return None
+    if lister is None:
+        helper = xctest_helper_path(swift_binary)
+        if helper is None:
+            return None
+        lister = helper_bundle_lister(helper)
+    specifiers = lister(bundle, environment)
+    if specifiers is None:
+        return None
+    selectors = select_xctest_specifiers(specifiers, test_filter)
+    if selectors is None:
+        return None
+    if not selectors:
+        return ()
+    binary = (xctest_binary or xctest_binary_path)()
+    return (*binary, "-XCTest", ",".join(selectors), str(bundle))
+
+
 def run_local_tests(
     *,
     swift_binary: str,
@@ -294,19 +441,29 @@ def run_local_tests(
     test_filter: str | None = None,
     test_product: str | None = None,
     executor: CommandExecutor = execute_command,
+    direct_command: Callable[..., tuple[str, ...] | None] = direct_xctest_command,
 ) -> int:
     # Keep compilation and its caches outside the disposable runtime home.
     environment = dict(os.environ)
     status = executor((swift_binary, "build", "--build-tests"), cwd, environment)
     if status != 0:
         return status
-    command = [swift_binary, "test", "--skip-build"]
-    if test_product:
-        command.extend(["--test-product", test_product])
-    if test_filter:
-        command.extend(["--filter", test_filter])
     with tempfile.TemporaryDirectory(prefix="rpce-local-tests-") as directory:
         environment = isolated_suite_environment(Path(directory), "local", environment)
+        command: tuple[str, ...] | None = None
+        if test_product is None:
+            command = direct_command(
+                swift_binary=swift_binary, cwd=cwd, test_filter=test_filter, environment=environment,
+            )
+        if command == ():
+            print("No matching test cases were run")
+            return 0
+        if command is None:
+            command = (swift_binary, "test", "--skip-build")
+            if test_product:
+                command += ("--test-product", test_product)
+            if test_filter:
+                command += ("--filter", test_filter)
         return executor(command, cwd, environment)
 
 

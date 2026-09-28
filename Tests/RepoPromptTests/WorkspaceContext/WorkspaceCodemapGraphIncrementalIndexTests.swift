@@ -521,7 +521,7 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         guard case let .eligible(rootCapability) = await service.resolve(root: request),
               case let .git(capability) = rootCapability
         else {
-            return XCTFail("The fixture repository must be codemap eligible")
+            return XCTFail("The fixture repository must be Git codemap eligible")
         }
 
         var maximumVisits: [WorkspaceCodemapGraphReconcileMode: [Int: UInt64]] = [:]
@@ -536,9 +536,9 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
                 )
                 let livePaths = (0 ..< seededLiveCount).map { "Live/File\($0).swift" }
                 let authorities = await service.makeSourceAuthorities(
-                    capability: .git(capability),
+                    capability: rootCapability,
                     observedRootEpoch: capability.rootEpoch,
-                    observedRootAuthority: .git(capability.repositoryAuthority),
+                    observedRootAuthority: rootCapability.rootAuthority,
                     candidates: livePaths.map {
                         WorkspaceCodemapSourceAuthorityRequest(
                             candidateRootRelativePath: $0,

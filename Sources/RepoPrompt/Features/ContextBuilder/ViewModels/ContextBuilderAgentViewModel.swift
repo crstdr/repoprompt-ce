@@ -318,6 +318,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Generic N>1 post-discovery state and the task that must drain before replacement.
         var followUpOracleGroupState = ContextBuilderOracleGroupState()
         var followUpOracleGroupTask: Task<OracleGroupRuntime.Completion, Error>?
+        var followUpOracleGroupSupervision: ContextBuilderOracleGroupSupervision?
 
         /// Per-tab selected follow-up type for automatic analysis
         var selectedFollowUpType: ContextBuilderFollowUpType = .plan
@@ -397,6 +398,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mcpWorkspaceID = nil
             followUpOracleSessionID = nil
             followUpOracleGroupTask = nil
+            followUpOracleGroupSupervision = nil
             pendingAskUser = nil
             askUserContinuation = nil
             pendingAskUserRunID = nil
@@ -430,6 +432,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Owns active and terminal-cleanup Context Builder attempts.
     private let runRegistry = ContextBuilderRunRegistry()
+
+    #if DEBUG
+        // One clock domain for source observations, admissions and the grouped poller.
+        var oracleGroupClockForTesting: (@MainActor @Sendable () -> TimeInterval)?
+        var oracleGroupSleepForTesting: (@MainActor @Sendable (TimeInterval) async throws -> Void)?
+    #endif
 
     #if DEBUG
         /// Opt-in, invocation-scoped counters for isolated tests and separately approved live diagnostics.
@@ -4835,16 +4843,18 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             return false
         }
         let task = session.followUpOracleGroupTask
-        let members = session.followUpOracleGroupState.invalidateAndTakeMembers()
+        let supervision = session.followUpOracleGroupSupervision
+        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
         let cleanupGeneration = session.followUpOracleGroupState.generation
+        supervision?.cancel()
         task?.cancel()
-        for member in members {
-            await oracleViewModel.cancelStreaming(in: member.sessionID)
-        }
+        // Each captured lane releases its exact stream/waiter before its task joins. Never
+        // look up whatever query a member session happens to host after this await.
         if let task { _ = await task.result }
         let stillOwnsCleanup = session.followUpOracleGroupState.generation == cleanupGeneration
         if stillOwnsCleanup {
             session.followUpOracleGroupTask = nil
+            session.followUpOracleGroupSupervision = nil
         }
         return stillOwnsCleanup
     }
@@ -4875,6 +4885,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             throw CancellationError()
         }
         let generation = session.followUpOracleGroupState.beginRun()
+        let supervision: ContextBuilderOracleGroupSupervision
+        #if DEBUG
+            supervision = ContextBuilderOracleGroupSupervision(
+                clock: oracleGroupClockForTesting ?? { ProcessInfo.processInfo.systemUptime },
+                sleep: oracleGroupSleepForTesting ?? { try await Task.sleep(for: .seconds($0)) }
+            )
+        #else
+            supervision = ContextBuilderOracleGroupSupervision()
+        #endif
+        session.followUpOracleGroupSupervision = supervision
         let groupPrompt = ContextBuilderFrozenOraclePack.prompt(for: mode, prompt: prompt)
         let oracleStore = AppDomainRuntimeComposition.shared.oracleConversationStore
 
@@ -5011,7 +5031,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     tabContext: tabContext,
                     frozenInput: frozenPack.input,
                     callbacks: callbacks,
-                    resolvedStartExecution: execution
+                    resolvedStartExecution: execution,
+                    contextBuilderSupervision: supervision
                 )
             }
             session.followUpOracleGroupTask = task
@@ -5019,16 +5040,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let completion = try await withTaskCancellationHandler {
                 try await task.value
             } onCancel: {
+                supervision.cancel()
                 task.cancel()
-                Task { @MainActor [weak self] in
-                    guard let self, let session = sessions[tabID],
-                          session.followUpOracleGroupState.generation == generation
-                    else { return }
-                    let members = session.followUpOracleGroupState.members
-                    for member in members {
-                        await oracleViewModel.cancelStreaming(in: member.sessionID)
-                    }
-                }
             }
             try requireCurrentOracleRun(session: session, generation: generation)
             let groupReply = ContextBuilderOracleGroupReply(result: completion.result)
@@ -6130,6 +6143,7 @@ extension ContextBuilderAgentViewModel.TabSession {
         )
         followUpOracleGroupState.finish(generation: generation)
         followUpOracleGroupTask = nil
+        followUpOracleGroupSupervision = nil
         return reply
     }
 
