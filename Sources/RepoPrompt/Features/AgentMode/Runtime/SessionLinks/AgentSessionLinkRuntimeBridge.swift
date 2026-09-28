@@ -856,16 +856,6 @@ final class AgentSessionLinkRuntimeBridge {
     private var bookkeepingByReference: [DomainAgentSessionLinkReference: ReferenceBookkeeping] = [:]
     /// Process-memory, observer-local unread baselines. Never persisted and never agent-visible.
     private var monitorSeenByReference: [DomainAgentSessionLinkReference: MonitorSeenRecord] = [:]
-    /// Explicit, process-local permission delegation for one exact active oversight grant.
-    /// A new generation or endpoint cannot inherit it, even when the session UUID pair is reused.
-    private struct AutoApprovalLink: Hashable {
-        let observer: DomainAgentSessionLinkEndpointIdentity
-        let target: DomainAgentSessionLinkEndpointIdentity
-        let reference: DomainAgentSessionLinkReference
-    }
-
-    private var autoApprovalLinks: Set<AutoApprovalLink> = []
-
     // The user's *management* delegation is deliberately not bridge state. It is the `.manage`
     // capability on the exact grant in `DomainAgentSessionLinkAuthority`, so the advertised
     // capabilities, the prompt inventory, and every management fence read one authority.
@@ -3329,7 +3319,6 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
-            autoApprovalLinks = autoApprovalLinks.filter { $0.reference != reference }
             // Management needs no cleanup here: it lived on the grant the authority just removed.
         }
         // Generation-qualified for the same reason, and released before anything republishes: a
@@ -3697,12 +3686,7 @@ final class AgentSessionLinkRuntimeBridge {
                 status: presentation.status,
                 lastActivityAt: presentation.lastActivityAt,
                 hasUnreadActivity: hasUnreadActivity,
-                targetRoute: targetRoute,
-                autoApprovalEnabled: autoApprovalLinks.contains(AutoApprovalLink(
-                    observer: endpoint,
-                    target: targetEndpoint,
-                    reference: reference
-                ))
+                targetRoute: targetRoute
             ))
         }
 
@@ -4325,105 +4309,21 @@ final class AgentSessionLinkRuntimeBridge {
         )
     }
 
-    // MARK: Exact-link permission auto-approval
-
-    private func autoApprovalEndpointsAreEligible(
-        _ key: AutoApprovalLink,
+    /// Rechecks both exact live endpoint incarnations before a management action commits.
+    private func managementEndpointsAreEligible(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
         host: any AgentSessionLinkEndpointHost
     ) -> Bool {
         let candidates = host.agentSessionLinkCandidates()
-        guard let observer = candidates.first(where: { $0.domainEndpoint == key.observer }),
-              let target = candidates.first(where: { $0.domainEndpoint == key.target })
+        guard let observer = candidates.first(where: { $0.domainEndpoint == observerEndpoint }),
+              let target = candidates.first(where: { $0.domainEndpoint == targetEndpoint })
         else { return false }
         return AgentSessionLinkEndpointEligibility.observerOperationEligibility(
             observer.eligibilityInput,
             roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
         ) == .eligible
             && AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil
-    }
-
-    /// Changes only the captured active grant. This setting is deliberately not persisted: durable
-    /// Auto-wake selection is UUID-keyed and cannot safely carry permission authority across relink.
-    func setAutoApproval(
-        _ enabled: Bool,
-        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        expectedReference: DomainAgentSessionLinkReference
-    ) async -> Bool {
-        guard !isFrozenForTermination,
-              let grant = await authority.activeGrant(for: expectedReference),
-              grant.observer == observerEndpoint,
-              grant.target == targetEndpoint,
-              let host
-        else { return false }
-        let key = AutoApprovalLink(observer: observerEndpoint, target: targetEndpoint, reference: expectedReference)
-        guard autoApprovalEndpointsAreEligible(key, host: host) else { return false }
-        if enabled {
-            autoApprovalLinks.insert(key)
-        } else {
-            autoApprovalLinks.remove(key)
-        }
-        requestMonitorProjectionRefresh(forExactObserverEndpoints: [observerEndpoint])
-        return true
-    }
-
-    /// Bulk selection is a snapshot of current outbound grants, not a master preference for future
-    /// links. The exact references are sourced from authority, never from possibly stale UI rows.
-    func setAutoApprovalForCurrentLinks(
-        _ enabled: Bool,
-        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
-    ) async -> Bool {
-        guard !isFrozenForTermination,
-              let host,
-              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
-        else { return false }
-        let inputs = await authority.projectionInputs(forEndpoint: observerEndpoint)
-        guard !isFrozenForTermination,
-              let host = self.host,
-              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
-        else { return false }
-        for item in inputs.outbound.items {
-            guard let target = inputs.outboundTargetEndpoints[item.linkID] else { continue }
-            let key = AutoApprovalLink(
-                observer: observerEndpoint,
-                target: target,
-                reference: DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
-            )
-            guard autoApprovalEndpointsAreEligible(key, host: host) else { continue }
-            if enabled {
-                autoApprovalLinks.insert(key)
-            } else {
-                autoApprovalLinks.remove(key)
-            }
-        }
-        requestMonitorProjectionRefresh(forExactObserverEndpoints: [observerEndpoint])
-        return true
-    }
-
-    /// Observation-time filter only: a prompt seen while selection is off must not become
-    /// retroactively eligible if the user enables the link before its queued task runs.
-    /// This does not replace the authority-backed admission check at response time.
-    func hasAutoApprovalSelection(for targetEndpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
-        autoApprovalLinks.contains { $0.target == targetEndpoint }
-    }
-
-    /// Admission check for a provider permission request on one exact target incarnation. The
-    /// caller must re-check its pending request and endpoint after this suspension, then submit
-    /// synchronously. Questions and app-owned reviews never call this gate.
-    func autoApprovalIsAuthorized(for targetEndpoint: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
-        guard !isFrozenForTermination, host != nil else { return false }
-        let candidates = autoApprovalLinks.filter { $0.target == targetEndpoint }
-        for key in candidates {
-            guard let grant = await authority.activeGrant(for: key.reference),
-                  grant.observer == key.observer,
-                  grant.target == targetEndpoint,
-                  !isFrozenForTermination,
-                  autoApprovalLinks.contains(key),
-                  let host
-            else { continue }
-            if autoApprovalEndpointsAreEligible(key, host: host) { return true }
-        }
-        return false
     }
 
     /// Read-only inspection of the target's current pending interaction.
@@ -4475,8 +4375,11 @@ final class AgentSessionLinkRuntimeBridge {
               !isFrozenForTermination,
               let host
         else { return false }
-        let key = AutoApprovalLink(observer: lease.observer, target: lease.target, reference: lease.reference)
-        guard autoApprovalEndpointsAreEligible(key, host: host) else { return false }
+        guard managementEndpointsAreEligible(
+            observerEndpoint: lease.observer,
+            targetEndpoint: lease.target,
+            host: host
+        ) else { return false }
         let registry = AgentSessionDeletionRegistry.shared
         for sessionID in [lease.observer.sessionID, lease.target.sessionID] {
             if registry.isPermanentlyDeleted(sessionID: sessionID)

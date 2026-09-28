@@ -919,10 +919,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let notificationAttention = AgentModeNotificationAttentionTracker()
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
-        /// Holds provider-permission delivery after observation so tests can order a later opt-in.
-        var test_permissionAutoApprovalDeliveryQueue: DispatchQueue?
-        /// Observes sink delivery synchronously; callers must provide a thread-safe recorder.
-        var test_permissionAutoApprovalDidDeliver: (@Sendable (Set<UUID>) -> Void)?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
         private var test_persistentBindingResolutionSnapshotBuildCount = 0
@@ -4217,8 +4213,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func prepareSessionForWindowClose(_ session: TabSession) async {
-        session.permissionAutoApprovalCancellable?.cancel()
-        session.permissionAutoApprovalCancellable = nil
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
         // cancelEphemeralRuntimeState() cancels and nils agentTask before the
@@ -6053,46 +6047,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // - Shared helpers: Services/MCP/Agent/AgentMCPToolHelpers.swift
 
     private func configureMCPStateObservation(for session: TabSession) {
-        #if DEBUG
-            let permissionDeliveryQueue = test_permissionAutoApprovalDeliveryQueue ?? DispatchQueue.main
-            let permissionDeliveryObserver = test_permissionAutoApprovalDidDeliver
-        #else
-            let permissionDeliveryQueue = DispatchQueue.main
-        #endif
         session.mcpStateObservationCancellable?.cancel()
-        session.permissionAutoApprovalCancellable?.cancel()
-        session.permissionAutoApprovalCancellable = Publishers.CombineLatest(
-            session.$pendingApproval.map { $0?.id },
-            session.$pendingPermissionsRequest.map { $0?.id }
-        )
-        .map { Set([$0, $1].compactMap(\.self)) }
-        .removeDuplicates()
-        // The first observation is a baseline; later changes emit only newly presented IDs.
-        .scan(OverseerPermissionRequestDelta()) { previous, requestIDs in
-            var next = previous
-            next.observe(requestIDs)
-            return next
-        }
-        .map(\.newRequestIDs)
-        .filter { [weak self, weak session] requestIDs in
-            guard !requestIDs.isEmpty,
-                  let self, let session,
-                  let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID)
-            else { return false }
-            return AgentSessionLinkRuntimeBridge.shared.hasAutoApprovalSelection(for: endpoint)
-        }
-        // @Published sends before storage changes; evaluate only after the settled value is visible.
-        .receive(on: permissionDeliveryQueue)
-        .sink { [weak self, weak session] requestIDs in
-            #if DEBUG
-                permissionDeliveryObserver?(requestIDs)
-            #endif
-            guard let self, let session else { return }
-            Task { @MainActor [weak self, weak session] in
-                guard let self, let session else { return }
-                await autoApproveOverseenProviderPermissions(for: session, requestIDs: requestIDs)
-            }
-        }
         let publishers: [AnyPublisher<Void, Never>] = [
             session.$runState.map { _ in () }.eraseToAnyPublisher(),
             session.$runningStatusText.map { _ in () }.eraseToAnyPublisher(),

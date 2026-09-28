@@ -192,38 +192,23 @@ eligible observer to add nor an existing relationship to unlink. A row may legit
 sidebar eyes at once; their fill, color, placement, interaction, tooltip, and directional
 accessibility wording must remain distinct.
 
-## Auto-approval is an exact, process-local link choice
+## Permission prompts require an explicit response
 
-The observer dashboard can opt an individual outbound link into automatic acceptance of the target's
-**provider permission prompts**, or select/deselect all links that are active at the instant of the
-bulk action. Every link starts off. The selection is keyed by the exact observer endpoint, target
-endpoint, and generation-qualified link reference. It is not an Auto-wake preference, a provider-wide
-permission mode, or a durable session-UUID selection. Unlink, relink, endpoint replacement, and app
-restart return to manual approval; bulk selection never opts in a future link.
-
-At a newly observed provider prompt, the target checks the selected link against the current authority
-grant and both live endpoint candidates, then checks its own exact session incarnation and pending
-request again after the authority hop. The listener tracks only newly presented request IDs, not the
-whole pending inventory, and survives MCP-control teardown such as managed Codex logout while the
-target session remains live. The response accepts only that one provider request. ACP additionally
-requires a genuine one-time allow option; if none exists, its prompt stays manual without changing
-the ordinary manual option-selection path. The ordinary manual path remains in place when no exact
-link is selected. User questions, MCP elicitation, Codex
-hook reviews, app-owned apply-edits and worktree-merge reviews, GitHub/destructive approvals, and
-unrelated app permission controls never call this gate. A permission request already pending when the
-choice is enabled remains manual; the setting applies to new prompts. This deliberately narrow
-process-local policy avoids promoting UUID-keyed saved Auto-wake state into permission authority.
+An oversight link never auto-accepts the target's provider permission prompts. The observer may
+answer an eligible one-time prompt only through an explicit, interaction-ID-qualified `respond`
+operation under its exact current Manage grant. Persistent or session-wide approvals, hook trust,
+worktree-merge reviews, and secret input stay with the target's user. Auto-wake selection and snooze
+are admission policy for observer turns, not permission authority. Provider-wide Claude and ACP
+permission preferences and MCP client permissions are separate controls, not oversight link choices.
 
 ## Management is an authority-owned grant capability
 
-Auto-approval never lets the observer *agent* choose anything; it blindly accepts new provider
-permission prompts. **Management** is the user's delegation of one exact target session to the
-observer: the overseer may then act for the user in that session — inspect and answer its pending
-prompts and direct its runs — through `agent_session_link` `get_interaction`, `respond`, and
-`steer`. It is not a second authority. It is the `.manage` capability on the exact grant in
-`DomainAgentSessionLinkAuthority`, so `list` capabilities, `poll`'s `managed` field, the
-prompt inventory's `managed="true"` rows, the dashboard's **Manage** checkbox, and every management
-fence all read the same record.
+**Management** is the user's delegation of one exact target session to the observer: the overseer
+may inspect and answer eligible pending prompts and direct its runs through `agent_session_link`
+`get_interaction`, `respond`, and `steer`. It is not a second authority. It is the `.manage`
+capability on the exact grant in `DomainAgentSessionLinkAuthority`, so `list` capabilities, `poll`'s
+`managed` field, prompt inventory rows, and every management fence read the same record. No
+oversight-specific automatic permission response exists.
 
 | Property | Rule |
 | --- | --- |
@@ -232,7 +217,7 @@ fence all read the same record.
 | Lifetime | Process-local. Unlink, relink, endpoint replacement, and restart return the link to watch-only; a Handoff/Fork's fresh grants never inherit it |
 | Granting | Requires both exact endpoints live and eligible now |
 | Withdrawing | Allowed whenever the grant exists, and effective at the next fence of any operation already in flight |
-| Independence | Neither management nor auto-approval implies the other |
+| Permission decisions | Manage never implies an automatic answer; `respond` is an explicit one-time operation |
 
 Every management operation authorizes `.monitorGetInteraction`, `.monitorRespond`, or `.monitorSteer`,
 each requiring `.manage`. A watch-only link receives a structured `management_not_granted` result
