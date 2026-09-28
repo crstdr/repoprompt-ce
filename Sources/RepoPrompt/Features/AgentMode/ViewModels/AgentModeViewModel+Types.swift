@@ -492,6 +492,11 @@ extension AgentModeViewModel {
         }
     }
 
+    enum MCPSessionCreationKind {
+        case mcpControlled
+        case oversightLane(creatorSessionID: UUID)
+    }
+
     struct MCPSessionTarget: Equatable {
         /// How this session target was obtained.
         enum Origin: Equatable {

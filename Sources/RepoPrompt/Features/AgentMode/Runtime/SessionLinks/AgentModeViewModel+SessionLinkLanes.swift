@@ -1,0 +1,116 @@
+import Foundation
+import MCP
+import RepoPromptDomainRuntime
+
+extension AgentModeViewModel {
+    enum MCPOversightLaneCreationOutcome: Equatable {
+        case created(sessionID: UUID, tabID: UUID)
+        case creationIncomplete(sessionID: UUID, tabID: UUID)
+    }
+
+    /// Creates a user-visible, top-level session without MCP ownership or a provider turn. The
+    /// caller may establish an oversight link only after `.created` proves the first payload save.
+    func mcpCreateOversightLane(
+        creatorSessionID: UUID,
+        sessionName: String?,
+        selection: AgentSessionLanePolicy.RoleSelection,
+        expectedWorkspaceID: UUID
+    ) async throws -> MCPOversightLaneCreationOutcome {
+        guard workspaceManager?.activeWorkspaceID == expectedWorkspaceID,
+              workspaceManager?.activeWorkspace?.id == expectedWorkspaceID
+        else {
+            throw MCPError.invalidParams("The destination workspace is not active.")
+        }
+        let target = try await mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: sessionName,
+            parentSessionID: nil,
+            inheritWorktreeBindings: false,
+            expectedWorkspaceID: expectedWorkspaceID,
+            creationKind: .oversightLane(creatorSessionID: creatorSessionID)
+        )
+        // A published lane is an ordinary session even if later configuration or persistence fails.
+        // Accept the provisional admission rather than invoking MCP's discard/delete recovery path.
+        mcpAcceptSessionTarget(target)
+        guard let sessionID = target.sessionID else {
+            throw MCPError.internalError("The new lane has no session ID.")
+        }
+        let incomplete: MCPOversightLaneCreationOutcome = .creationIncomplete(
+            sessionID: sessionID,
+            tabID: target.tabID
+        )
+        guard let session = session(for: target.tabID, createIfNeeded: false),
+              session.activeAgentSessionID == sessionID,
+              session.createdByOverseerSessionID == creatorSessionID,
+              session.parentSessionID == nil,
+              !session.isMCPOriginated,
+              session.mcpControlContext == nil
+        else { return incomplete }
+
+        // Provenance was installed by the fresh-session seam before this first dirty marking.
+        session.isDirty = true
+        do {
+            try requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
+            try await mcpConfigureSession(
+                tabID: target.tabID,
+                agentRaw: selection.agentRaw,
+                modelRaw: selection.modelRaw,
+                reasoningEffortRaw: selection.reasoningEffortRaw,
+                requireInactiveRunState: true,
+                workspaceAuthority: .init(
+                    target: target,
+                    expectedWorkspaceID: expectedWorkspaceID,
+                    allowMatchingControlledSession: false
+                )
+            )
+            try requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
+            try mcpApplyModelParameterSelections(
+                tabID: target.tabID,
+                selections: selection.modelParameterSelections
+            )
+            guard session.selectedAgent.rawValue == selection.agentRaw,
+                  session.selectedModelRaw == selection.modelRaw,
+                  selection.reasoningEffortRaw.map({ session.selectedReasoningEffortRaw == $0 }) ?? true
+            else {
+                scheduleSave(for: session)
+                return incomplete
+            }
+        } catch {
+            scheduleSave(for: session)
+            return incomplete
+        }
+
+        guard await mcpCommitOversightLaneFirstSave(
+            session: session,
+            sessionID: sessionID,
+            workspaceID: expectedWorkspaceID
+        ) else {
+            scheduleSave(for: session)
+            return incomplete
+        }
+        guard session.activeAgentSessionID == sessionID,
+              session.createdByOverseerSessionID == creatorSessionID,
+              session.parentSessionID == nil,
+              session.mcpControlContext == nil,
+              !session.isMCPOriginated
+        else { return incomplete }
+        return .created(sessionID: sessionID, tabID: target.tabID)
+    }
+
+    /// Exact-incarnation read for cap and retirement checks; a stale endpoint never inherits a
+    /// replacement's provenance merely because the session UUID is the same.
+    func agentSessionLinkLaneProvenance(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> UUID? {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = session(for: endpoint.tabID, createIfNeeded: false),
+              session.activeAgentSessionID == endpoint.sessionID
+        else { return nil }
+        if session.hasLoadedPersistedState {
+            return session.createdByOverseerSessionID
+        }
+        return ownerValidatedSessionIndex[endpoint.sessionID]?.createdByOverseerSessionID
+    }
+}

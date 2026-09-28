@@ -4713,6 +4713,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.selectedModelRaw = normalizedSelection.modelRaw
         session.selectedReasoningEffortRaw = indexEntry.agentReasoningEffortRaw
         session.acpModelParameterSelections = indexEntry.acpModelParameterSelections
+        session.createdByOverseerSessionID = indexEntry.createdByOverseerSessionID
         session.autoEditEnabled = indexEntry.autoEditEnabled
         session.oversight.autoWakeOnUpdates = indexEntry.autoWakeOnOversightUpdates
         session.oversight.autoWakeTargetSessionIDs = indexEntry.agentSessionLinkAutoWakeTargetSessionIDs
@@ -8172,7 +8173,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionName: String?,
         parentSessionID: UUID? = nil,
         inheritWorktreeBindings: Bool = false,
-        expectedWorkspaceID: UUID? = nil
+        expectedWorkspaceID: UUID? = nil,
+        creationKind: MCPSessionCreationKind = .mcpControlled
     ) async throws -> MCPSessionTarget {
         let selector = try normalizeMCPSessionSelector(
             tabID: tabID,
@@ -8180,6 +8182,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             createIfNeeded: createIfNeeded,
             expectedWorkspaceID: expectedWorkspaceID
         )
+        if case .oversightLane = creationKind {
+            guard parentSessionID == nil, !inheritWorktreeBindings, case .fresh = selector else {
+                throw MCPError.invalidParams("An oversight lane must be a new top-level session.")
+            }
+        }
         let discardAuthorityID = UUID()
         var reservedSessionID: UUID?
         do {
@@ -8206,7 +8213,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionName: sessionName,
                 parentSessionID: parentSessionID,
                 inheritWorktreeBindings: inheritWorktreeBindings,
-                expectedWorkspaceID: expectedWorkspaceID
+                expectedWorkspaceID: expectedWorkspaceID,
+                creationKind: creationKind
             )
             guard let resolvedSessionID = target.sessionID else { return target }
             guard target.recoveryClaim != nil else {
@@ -8393,7 +8401,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionName: String?,
         parentSessionID: UUID?,
         inheritWorktreeBindings: Bool,
-        expectedWorkspaceID: UUID?
+        expectedWorkspaceID: UUID?,
+        creationKind: MCPSessionCreationKind
     ) async throws -> MCPSessionTarget {
         if let expectedWorkspaceID,
            workspaceManager?.activeWorkspaceID != expectedWorkspaceID
@@ -8623,6 +8632,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     await test_afterDurableChildTabCreation?()
                 #endif
                 let hydrated = await ensureSessionReady(tabID: createdTabID)
+                if case let .oversightLane(creatorSessionID) = creationKind {
+                    // Set provenance before configuration can dirty or save this fresh session.
+                    hydrated.createdByOverseerSessionID = creatorSessionID
+                }
                 provisionalTarget = MCPSessionTarget(
                     tabID: hydrated.tabID,
                     sessionID: intendedSessionID,
@@ -8848,6 +8861,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.internalError(
                 "The Agent session could not be started because its workspace binding was not durably accepted. No provider was started; resolve workspace persistence and retry."
             )
+        }
+    }
+
+    func mcpCommitOversightLaneFirstSave(
+        session: TabSession,
+        sessionID: UUID,
+        workspaceID: UUID
+    ) async -> Bool {
+        // Configuration may have armed the ordinary debounce; this transaction owns first save.
+        session.saveDebounceTask?.cancel()
+        session.saveDebounceTask = nil
+        do {
+            guard try await durablyEnsureSessionBoundToTab(
+                session,
+                intendedSessionID: sessionID,
+                expectedWorkspaceID: workspaceID
+            ) == sessionID,
+                let expectedToken = session.currentRestorationBindingToken,
+                !Task.isCancelled
+            else { return false }
+
+            let firstSave = await saveSessionCore(for: session.tabID)
+            guard case let .durablySaved(bindingToken) = firstSave,
+                  bindingToken == expectedToken,
+                  session.currentRestorationBindingToken == expectedToken,
+                  session.restorationReadiness == .authoritative(expectedToken, .freshBindingDurablyCreated),
+                  !Task.isCancelled
+            else { return false }
+            return true
+        } catch {
+            return false
         }
     }
 
