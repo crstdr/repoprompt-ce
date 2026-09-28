@@ -10,7 +10,8 @@ extension AgentModeViewModel {
         runID: UUID,
         runAttemptID: UUID,
         note: String,
-        idempotencyKey: String
+        idempotencyKey: String,
+        support: AgentSessionLinkCompactSupport
     ) -> AgentSelfCompactState.Reservation? {
         guard let session = sessions[endpoint.tabID],
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
@@ -33,7 +34,6 @@ extension AgentModeViewModel {
         var state = session.selfCompactState
         let reservation = state.reserve(note: note, idempotencyKey: idempotencyKey, owner: owner)
         if case .scheduled = reservation {
-            let support = agentSessionLinkCompactSupport(for: session)
             guard support == .codex || support == .claudeCode || support == .acpAdvertisedCommand else {
                 return nil
             }
@@ -106,7 +106,13 @@ extension AgentModeViewModel {
               endpoint.persistentBindingGeneration != nil
         else { return .blocked(reason: "session_not_exclusive") }
 
-        switch agentSessionLinkCompactSupport(for: session) {
+        let support = await agentSessionLinkCompactSupport(for: session)
+        guard sessions[endpoint.tabID] === session,
+              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              session.runID == origin.runID,
+              session.activeRunOwnership?.attemptID == origin.runAttemptID
+        else { return .unavailable }
+        switch support {
         case .notSupported: return .blocked(reason: "not_supported")
         case .noProviderSession: return .blocked(reason: "no_provider_session")
         case .codex, .claudeCode, .acpAdvertisedCommand: break
@@ -127,7 +133,7 @@ extension AgentModeViewModel {
 
         guard let accepted = agentSelfCompactSchedule(
             endpoint: endpoint, runID: origin.runID, runAttemptID: origin.runAttemptID,
-            note: note, idempotencyKey: idempotencyKey
+            note: note, idempotencyKey: idempotencyKey, support: support
         ) else { return .blocked(reason: "busy") }
         guard case let .scheduled(attempt) = accepted else {
             return .blocked(reason: "busy")
@@ -213,7 +219,7 @@ extension AgentModeViewModel {
                 self?.agentSelfCompactHasActiveMCPTools(runID: runID) ?? false
             },
             support: { [weak self] in
-                self?.agentSessionLinkCompactSupport(for: session) ?? .notSupported
+                await self?.agentSessionLinkCompactSupport(for: session) ?? .notSupported
             },
             dispatch: { [weak self] requestID, support, stillAdmissible in
                 guard let self else { return false }
@@ -265,7 +271,6 @@ extension AgentModeViewModel {
         let ready: @MainActor () -> Bool = { [weak self] in
             guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
                   !Self.agentSessionLinkCompactHasQueuedProviderWork(session),
-                  agentSessionLinkCompactSupport(for: session) == support,
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }
             return AgentSessionLinkDeliveryReadiness.evaluate(

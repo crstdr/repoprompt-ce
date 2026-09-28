@@ -14,7 +14,7 @@ final class AgentSelfCompactTerminalScheduler {
     private let store: @MainActor (AgentSelfCompactState) -> Void
     private let isCurrentOwner: @MainActor (AgentSelfCompactOwner) -> Bool
     private let hasActiveTools: @MainActor (UUID) -> Bool
-    private let support: @MainActor () -> AgentSessionLinkCompactSupport
+    private let support: @MainActor () async -> AgentSessionLinkCompactSupport
     private let dispatch: Dispatch
     private let sleep: @MainActor (Duration) async -> Void
     private let maximumDrainPolls: Int
@@ -24,7 +24,7 @@ final class AgentSelfCompactTerminalScheduler {
         store: @escaping @MainActor (AgentSelfCompactState) -> Void,
         isCurrentOwner: @escaping @MainActor (AgentSelfCompactOwner) -> Bool,
         hasActiveTools: @escaping @MainActor (UUID) -> Bool,
-        support: @escaping @MainActor () -> AgentSessionLinkCompactSupport,
+        support: @escaping @MainActor () async -> AgentSessionLinkCompactSupport,
         dispatch: @escaping Dispatch,
         maximumDrainPolls: Int = 600,
         sleep: @escaping @MainActor (Duration) async -> Void = { duration in
@@ -128,8 +128,9 @@ final class AgentSelfCompactTerminalScheduler {
             settleCancellation(requestID)
             return
         }
-        let admittedSupport = support()
-        guard load().active?.admittedSupport == admittedSupport,
+        let admittedSupport = await support()
+        guard isPending(requestID, owner: owner), isCurrentOwner(owner),
+              load().active?.admittedSupport == admittedSupport,
               admittedSupport == .codex || admittedSupport == .claudeCode
               || admittedSupport == .acpAdvertisedCommand
         else {
@@ -143,7 +144,7 @@ final class AgentSelfCompactTerminalScheduler {
         let didStart = await dispatch(requestID, admittedSupport) { [self] in
             isDispatching(requestID, owner: owner)
                 && isCurrentOwner(owner)
-                && support() == admittedSupport
+                && load().active?.admittedSupport == admittedSupport
         }
         guard isDispatching(requestID, owner: owner) else { return }
         guard isCurrentOwner(owner) else {

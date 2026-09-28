@@ -46,6 +46,13 @@ final class ACPIntegratedAgentModeRunner {
         let errorText: String?
     }
 
+    /// A provider control command that completes in under this span with no transcript output is
+    /// treated as fire-and-forget: the provider may still be working in the background. The bound
+    /// exists to exclude a hypothetical in-turn compaction (real model work, many seconds), and is
+    /// deliberately forgiving of main-actor stalls — a missed note only loses the hint, never
+    /// misreports the outcome.
+    private static let acpFireAndForgetCommandWindow: TimeInterval = 5
+
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
@@ -1309,6 +1316,13 @@ final class ACPIntegratedAgentModeRunner {
         // turn's billed prompt count cannot. The suspension ends on every exit from here.
         let withdrawnVouch = session.beginCompactionContextCountSuspension()
         defer { session.endCompactionContextCountSuspension() }
+        // An ACP slash command can be fire-and-forget (Devin `/compact`): the provider ends the
+        // turn instantly with no output while it keeps compacting in the background, where the
+        // session's next prompt cancels the work. `dispatchedAt`/`transcriptItemsAtDispatch` detect
+        // that signature so the transcript can name the invisible work rather than show a silent
+        // empty turn.
+        let dispatchedAt = Date()
+        let transcriptItemsAtDispatch = session.items.count
         do {
             log("controller.promptAdvertisedCommand begin", runID: runID)
             if let dispatchID = command.selfCompactDispatchID, dispatchID.stage == .compact {
@@ -1361,6 +1375,22 @@ final class ACPIntegratedAgentModeRunner {
         }
 
         let outcome = await consumeTask.value
+        if case .completed = outcome,
+           command.kind == .compact,
+           session.items.count == transcriptItemsAtDispatch,
+           // Buffered assistant chunks land as an item only after a debounce flush; a pending
+           // buffer means the turn did emit output, so it was not silent.
+           session.pendingAssistantDelta.isEmpty,
+           Date().timeIntervalSince(dispatchedAt) < Self.acpFireAndForgetCommandWindow
+        {
+            session.appendItem(AgentChatItem(
+                kind: .system,
+                text: AgentChatItem.acpBackgroundCompactionNoteText,
+                sequenceIndex: session.nextSequenceIndex
+            ))
+            toolTrackingHooks.requestUIRefresh(session.tabID, false)
+            toolTrackingHooks.scheduleSave(session.tabID)
+        }
         log("provider control command turn completed \(outcome.debugDescription)", runID: runID)
         return outcome
     }
