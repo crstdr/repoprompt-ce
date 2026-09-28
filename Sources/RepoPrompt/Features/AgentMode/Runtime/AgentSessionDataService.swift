@@ -30,6 +30,7 @@ struct AgentSessionMeta {
     let lastRunState: String?
     let acpModelParameterSelections: [ACPModelParameterSelection]
     let parentSessionID: UUID?
+    let createdByOverseerSessionID: UUID?
     let isMCPOriginated: Bool
     let worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     let activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
@@ -250,6 +251,7 @@ actor AgentSessionDataService {
         let codexTotalTotalTokens: Int?
         let codexMcpSessionKey: String?
         let parentSessionID: UUID?
+        let createdByOverseerSessionID: UUID?
         let worktreeBindings: [AgentSessionWorktreeBinding]?
         let worktreeMergeOperations: [AgentSessionWorktreeMergeOperation]?
         let pendingHandoffPayload: String?
@@ -1408,6 +1410,7 @@ actor AgentSessionDataService {
                 codexTotalTotalTokens: header.codexTotalTotalTokens,
                 codexMcpSessionKey: header.codexMcpSessionKey,
                 parentSessionID: header.parentSessionID,
+                createdByOverseerSessionID: header.createdByOverseerSessionID,
                 pendingHandoffPayload: header.pendingHandoffPayload,
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
@@ -1470,6 +1473,7 @@ actor AgentSessionDataService {
                         lastRunState: session.lastRunState,
                         acpModelParameterSelections: session.acpModelParameterSelections,
                         parentSessionID: session.parentSessionID,
+                        createdByOverseerSessionID: session.createdByOverseerSessionID,
                         isMCPOriginated: session.isMCPOriginated,
                         worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
                         activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
@@ -1525,6 +1529,7 @@ actor AgentSessionDataService {
                             lastRunState: session.lastRunState,
                             acpModelParameterSelections: session.acpModelParameterSelections,
                             parentSessionID: session.parentSessionID,
+                            createdByOverseerSessionID: session.createdByOverseerSessionID,
                             isMCPOriginated: session.isMCPOriginated,
                             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
                             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
