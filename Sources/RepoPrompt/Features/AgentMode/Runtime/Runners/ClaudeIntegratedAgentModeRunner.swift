@@ -76,7 +76,8 @@ final class ClaudeIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         makeLease: (_ runID: UUID) -> MCPBootstrapLease,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
-        providerControlCommand: AgentProviderControlCommand? = nil
+        providerControlCommand: AgentProviderControlCommand? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async {
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
@@ -108,6 +109,13 @@ final class ClaudeIntegratedAgentModeRunner {
             }
         }
         let runAttemptID = ownership.attemptID
+        if let dispatchID = providerControlCommand?.selfCompactDispatchID,
+           dispatchID.stage == .compact
+        {
+            _ = session.selfCompactNativeCompletion?.bindCompact(
+                dispatchID, runID: runID, runAttemptID: runAttemptID
+            )
+        }
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus("Thinking…", source: .transport)
@@ -155,8 +163,20 @@ final class ClaudeIntegratedAgentModeRunner {
                         // below, so replacing a route-stale controller is safe at this boundary.
                         allowsCatalogRouteControllerRecovery: true,
                         autoEffortSelection: autoEffortSelection,
-                        providerControlCommand: providerControlCommand
+                        providerControlCommand: providerControlCommand,
+                        selfCompactDispatchID: selfCompactDispatchID
                     )
+                    if let selfCompactDispatchID,
+                       selfCompactDispatchID.stage == .note,
+                       sendOutcome != .sent,
+                       session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
+                       session.selfCompactState.active?.noteDispatchStarted == false
+                    {
+                        var state = session.selfCompactState
+                        _ = state.noteDefinitivelyNotAttempted(selfCompactDispatchID)
+                        session.selfCompactState = state
+                        self.hooks.persistence.scheduleSave(session)
+                    }
                     let providerInitializationOutcome = switch sendOutcome {
                     case .sent:
                         "ready"
@@ -173,7 +193,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     switch sendOutcome {
                     case .sent:
                         didSendToProvider = true
-                        if !isPeriodic { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, true) }
+                        if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, true) }
                     case .failed:
                         nativeFailureMetadata = (errorText: nil, shouldShutdownSession: false)
                         throw NativeTerminalFailure()
@@ -217,7 +237,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         runID: runID,
                         for: session
                     ) {
-                        if !isPeriodic { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+                        if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
                         let revision = await self.finalize(
                             session: session,
                             runID: runID,
@@ -240,7 +260,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     case .failed: .failed
                     }
                     if !didSendToProvider {
-                        if !isPeriodic { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+                        if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
                     }
                     await self.finalize(
                         session: session,

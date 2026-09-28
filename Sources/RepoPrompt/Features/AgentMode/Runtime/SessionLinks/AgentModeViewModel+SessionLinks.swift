@@ -1317,6 +1317,7 @@ extension AgentModeViewModel {
         case pendingACPSteeringInstructions = "pending_acp_steering_instructions"
         case pendingClaudeSteeringInstructions = "pending_claude_steering_instructions"
         case pendingAutoWake = "pending_auto_wake"
+        case pendingSelfCompact = "pending_self_compact"
         case candidateClosing = "candidate_closing"
     }
 
@@ -1336,6 +1337,7 @@ extension AgentModeViewModel {
         var hasPendingACPSteeringInstructions: Bool
         var hasPendingClaudeSteeringInstructions: Bool
         var hasPendingAutoWake: Bool
+        var hasPendingSelfCompact: Bool
         var isCandidateClosing: Bool
     }
 
@@ -1358,6 +1360,7 @@ extension AgentModeViewModel {
             hasPendingACPSteeringInstructions: !session.pendingACPSteeringInstructions.isEmpty,
             hasPendingClaudeSteeringInstructions: !session.pendingClaudeSteeringInstructions.isEmpty,
             hasPendingAutoWake: session.oversight.pendingAutoWake != nil,
+            hasPendingSelfCompact: session.selfCompactState.blocksOverseerDelivery,
             isCandidateClosing: candidate.isClosing
         )
     }
@@ -1377,6 +1380,7 @@ extension AgentModeViewModel {
         if input.hasPendingACPSteeringInstructions { blockers.append(.pendingACPSteeringInstructions) }
         if input.hasPendingClaudeSteeringInstructions { blockers.append(.pendingClaudeSteeringInstructions) }
         if input.hasPendingAutoWake { blockers.append(.pendingAutoWake) }
+        if input.hasPendingSelfCompact { blockers.append(.pendingSelfCompact) }
         if input.isCandidateClosing { blockers.append(.candidateClosing) }
         return blockers.sorted { $0.rawValue < $1.rawValue }
     }
