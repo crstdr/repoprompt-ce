@@ -478,7 +478,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         let fixture = try await makeFixture()
         await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
         let originalFence = AgentRunStartStopFence(session: fixture.session)
-        let batch = (1...3).map { index in
+        let batch = (1 ... 3).map { index in
             AgentModeViewModel.TabSession.ACPSteeringInstruction(
                 id: UUID(), targetRunID: fixture.session.runID,
                 targetRunAttemptID: fixture.session.activeRunAttemptID,

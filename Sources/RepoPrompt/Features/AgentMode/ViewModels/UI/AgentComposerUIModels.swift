@@ -1,10 +1,15 @@
 import Foundation
 
 struct AgentComposerDraftRestorationOperation: Equatable {
+    struct Fragment: Equatable {
+        let eventID: UUID
+        let text: String
+    }
+
     let rejectedDraftText: String
     let draftTextBeforeRestoration: String
     let composedDraftText: String
-    let previousRestorationEventID: UUID?
+    let fragments: [Fragment]
 }
 
 enum AgentComposerDraftRestorationReducer {
@@ -26,10 +31,12 @@ enum AgentComposerDraftRestorationReducer {
         {
             return operation.composedDraftText
         }
-        if operation.previousRestorationEventID == lastAppliedRestorationEventID {
-            return compose(restoredText: operation.rejectedDraftText, above: currentLocalText)
+        let firstMissingIndex = lastAppliedRestorationEventID.flatMap { appliedID in
+            operation.fragments.lastIndex { $0.eventID == appliedID }.map { $0 + 1 }
+        } ?? operation.fragments.startIndex
+        return operation.fragments[firstMissingIndex...].reduce(currentLocalText) { text, fragment in
+            compose(restoredText: fragment.text, above: text)
         }
-        return compose(restoredText: operation.composedDraftText, above: currentLocalText)
     }
 }
 

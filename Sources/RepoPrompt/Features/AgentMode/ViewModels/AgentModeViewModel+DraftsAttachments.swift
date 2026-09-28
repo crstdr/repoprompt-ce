@@ -13,29 +13,43 @@ extension AgentModeViewModel {
         operation: AgentComposerDraftRestorationOperation? = nil
     ) {
         // A later queued recovery can arrive before SwiftUI applies the previous event.
-        // Compose against the session-owned draft now, then publish the complete value so
-        // successive restorations cannot overwrite one another or prepend twice in the UI.
+        // Compose against the session-owned draft now, and carry the fragment history so
+        // the UI can apply only recoveries it has not already consumed.
+        let eventID = UUID()
+        let previousFragments = draftRestorationEvent.flatMap { event in
+            event.tabID == tabID ? event.operation?.fragments : nil
+        } ?? []
         let restoredText: String
         let restoredStrategy: AgentModeRunService.DraftRestorationStrategy
-        let restoredOperation: AgentComposerDraftRestorationOperation?
+        let baseOperation: AgentComposerDraftRestorationOperation?
         if case .prependAlways = strategy, operation == nil {
             let existingDraft = retrieveDraftText(for: tabID)
             restoredText = AgentComposerDraftRestorationReducer.compose(restoredText: text, above: existingDraft)
             restoredStrategy = .replaceAlways
-            restoredOperation = AgentComposerDraftRestorationOperation(
+            baseOperation = AgentComposerDraftRestorationOperation(
                 rejectedDraftText: text,
                 draftTextBeforeRestoration: existingDraft,
                 composedDraftText: restoredText,
-                previousRestorationEventID: draftRestorationEvent.flatMap { $0.tabID == tabID ? $0.id : nil }
+                fragments: []
             )
         } else {
             restoredText = text
             restoredStrategy = strategy
-            restoredOperation = operation
+            baseOperation = operation
+        }
+        let restoredOperation = baseOperation.map { operation in
+            AgentComposerDraftRestorationOperation(
+                rejectedDraftText: operation.rejectedDraftText,
+                draftTextBeforeRestoration: operation.draftTextBeforeRestoration,
+                composedDraftText: operation.composedDraftText,
+                fragments: previousFragments + [
+                    .init(eventID: eventID, text: operation.rejectedDraftText)
+                ]
+            )
         }
         storeDraftText(for: tabID, restoredText)
         draftRestorationEvent = DraftRestorationEvent(
-            id: UUID(),
+            id: eventID,
             tabID: tabID,
             text: restoredText,
             message: message,
@@ -104,14 +118,11 @@ extension AgentModeViewModel {
             restoredText: draftText,
             above: existingDraft
         )
-        let previousRestorationEventID = draftRestorationEvent.flatMap { event in
-            event.tabID == tabID ? event.id : nil
-        }
         let operation = AgentComposerDraftRestorationOperation(
             rejectedDraftText: draftText,
             draftTextBeforeRestoration: existingDraft,
             composedDraftText: composedDraft,
-            previousRestorationEventID: previousRestorationEventID
+            fragments: []
         )
         restoreComposerDraft(
             tabID: tabID,
