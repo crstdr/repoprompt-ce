@@ -631,7 +631,14 @@ class PromptViewModel: ObservableObject {
     }
 
     private func isContextBuilderModelRawValidForAgent(_ rawModel: String, agent: AgentProviderKind) -> Bool {
-        AgentModelCatalog.isValid(rawModel: rawModel, for: agent, availability: agentAvailabilityContext)
+        // Cursor membership is a discovery snapshot. A saved model stays until
+        // admission; a cold catalogue would otherwise replace it with Auto.
+        if agent == .cursor,
+           !rawModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return true
+        }
+        return AgentModelCatalog.isValid(rawModel: rawModel, for: agent, availability: agentAvailabilityContext)
     }
 
     private func handleAgentProviderAvailabilityChanged(reason: String) {
