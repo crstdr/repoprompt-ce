@@ -35,16 +35,54 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(first["result"], .string("scheduled"))
         XCTAssertEqual(first["duplicate"], .bool(false))
         XCTAssertEqual(first["note_bytes"], .int("continue\n  verbatim".utf8.count))
+        XCTAssertTrue(first["guidance"]?.stringValue?.contains("finish this turn normally") == true)
         XCTAssertEqual(fixture.schedules, 1)
         let repeatResult = try await fixture.execute(args)
         XCTAssertEqual(repeatResult["request_id"], first["request_id"])
         XCTAssertEqual(repeatResult["duplicate"], .bool(true))
+        XCTAssertTrue(repeatResult["detail"]?.stringValue?.contains("no new compaction") == true)
         XCTAssertEqual(fixture.schedules, 1)
         let conflict = try await fixture.execute(args.merging(["note": .string("different")]) { _, new in new })
         XCTAssertEqual(conflict["reason"], .string("idempotency_conflict"))
+        XCTAssertTrue(conflict["detail"]?.stringValue?.contains("latest settlement") == true)
         let pending = try await fixture.execute(args.merging(["idempotency_key": .string("request-2")]) { _, new in new })
         XCTAssertEqual(pending["reason"], .string("compact_already_pending"))
+        XCTAssertTrue(pending["detail"]?.stringValue?.contains("active request") == true)
         XCTAssertEqual(fixture.schedules, 1)
+    }
+
+    func testUnsupportedCompactAndUnverifiedParkedStatusHaveJustInTimeGuidance() async throws {
+        let fixture = Fixture()
+        fixture.forcedAdmission = .blocked(reason: "not_supported")
+        let blocked = try await fixture.execute([
+            "op": .string("compact"), "note": .string("continue"), "idempotency_key": .string("key")
+        ])
+        XCTAssertTrue(blocked["detail"]?.stringValue?.contains("/compact") == true)
+
+        fixture.snapshot = .init(context: nil, selfCompact: .init(
+            requestID: UUID(), phase: "parked", outcome: .completionUnverified,
+            completionVerified: false, noteDelivery: .parked, recoveryNote: "continue"
+        ))
+        let context = try await fixture.execute(["op": .string("context")])
+        let detail = context["self_compact"]?.objectValue?["detail"]?.stringValue
+        XCTAssertTrue(detail?.contains("not verified") == true)
+        XCTAssertTrue(detail?.contains("next ordinary send") == true)
+
+        fixture.snapshot = .init(context: nil, selfCompact: .init(
+            requestID: UUID(), phase: "acpSettling", outcome: nil,
+            completionVerified: nil, noteDelivery: nil, recoveryNote: nil
+        ))
+        let settling = try await fixture.execute(["op": .string("context")])
+        XCTAssertTrue(settling["self_compact"]?.objectValue?["detail"]?.stringValue?.contains("may still be running") == true)
+
+        fixture.snapshot = .init(context: nil, selfCompact: .init(
+            requestID: UUID(), phase: nil, outcome: .recoveryRequired,
+            completionVerified: false, noteDelivery: .deliveryUnknown, recoveryNote: "continue"
+        ))
+        let recovery = try await fixture.execute(["op": .string("context")])
+        let recoveryDetail = recovery["self_compact"]?.objectValue?["detail"]?.stringValue
+        XCTAssertTrue(recoveryDetail?.contains("not automatically retried") == true)
+        XCTAssertTrue(recoveryDetail?.contains("explicit recovery") == true)
     }
 
     func testNoTargetSelectorOrUnknownOperationCanReachReadOrSchedule() async {
@@ -127,6 +165,7 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
         var state = AgentSelfCompactState()
         var reads = 0
         var schedules = 0
+        var forcedAdmission: AgentSelfMCPToolService.Admission?
 
         init() {
             endpoint = .init(
@@ -150,6 +189,7 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
                     return self.snapshot
                 },
                 scheduleCompact: { _, _, _, note, key in
+                    if let forcedAdmission = self.forcedAdmission { return forcedAdmission }
                     var state = self.state
                     let reservation = state.reserve(note: note, idempotencyKey: key)
                     switch reservation {

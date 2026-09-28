@@ -23,6 +23,21 @@ final class AgentSelfToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(MCPDomainToolCatalog.operationIdentity(for: name, input: .value("poll")).normalizedOperation, MCPDomainToolOperationIdentity.unknownOperation)
     }
 
+    func testCanonicalSelfDefinitionFitsOneThousandCharactersWithEssentialContract() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "agent_self"))
+        let serialized = String(decoding: try JSONEncoder().encode(definition), as: UTF8.self)
+        XCTAssertLessThanOrEqual(serialized.count, 1_000, "Complete minified definition, not description alone")
+        let description = definition.description
+        for required in [
+            "Agent Mode session", "no target selector", "`context`", "load", "status",
+            "`compact`", "nonempty `note`", "8,192 UTF-8 bytes", "`idempotency_key`",
+            "200 UTF-8 bytes", "same note", "`scheduled`", "finish this turn normally",
+            "no new authority"
+        ] {
+            XCTAssertTrue(description.contains(required), required)
+        }
+    }
+
     func testSelfToolGrantedToAllAgentProfilesIncludingExploreButNotDirectOrDiscovery() {
         let name = "agent_self"
         for profile in MCPClientToolPolicyProfile.allCases {

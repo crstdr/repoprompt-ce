@@ -24,7 +24,9 @@ struct AgentSelfMCPToolService {
     let readSelf: (WindowState, Endpoint, AgentSelfMCPCallOrigin) -> AgentSelfContextSnapshot?
     let scheduleCompact: (WindowState, Endpoint, AgentSelfMCPCallOrigin, String, String) async -> Admission
 
-    static let unavailableError = MCPError.invalidParams("agent_self is not available for this session.")
+    static let unavailableError = MCPError.invalidParams(
+        "agent_self is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access."
+    )
 
     func execute(args: [String: Value]) async throws -> Value {
         guard let op = AgentMCPToolHelpers.normalizedString(args["op"])?.lowercased() else {
@@ -85,17 +87,23 @@ struct AgentSelfMCPToolService {
                     "provider": attempt.admittedSupport.map { .string($0.rawValue) } ?? .null,
                     "note_bytes": .int(bytes),
                     "duplicate": .bool(false),
-                    "phase": .string(attempt.phase.rawValue)
+                    "phase": .string(attempt.phase.rawValue),
+                    "guidance": .string("No compaction has run yet; finish this turn normally. Do not park in wait_for_next_user_instruction or send a verification prompt.")
                 ])
             case let .duplicate(requestID, status):
                 return .object([
                     "result": .string(status?.phase == nil ? "settled" : "scheduled"),
                     "request_id": .string(requestID.uuidString),
                     "duplicate": .bool(true),
-                    "self_compact": Self.statusValue(status)
+                    "self_compact": Self.statusValue(status),
+                    "detail": .string("Identical retry of the active request or latest retained settlement; no new compaction was scheduled. Only these retained records are deduplicated.")
                 ])
             case let .blocked(reason):
-                return .object(["result": .string("blocked"), "reason": .string(reason)])
+                return .object([
+                    "result": .string("blocked"),
+                    "reason": .string(reason),
+                    "detail": .string(Self.blockedDetail(for: reason))
+                ])
             case .unavailable:
                 throw Self.unavailableError
             }
@@ -104,15 +112,58 @@ struct AgentSelfMCPToolService {
         }
     }
 
+    private static func blockedDetail(for reason: String) -> String {
+        switch reason {
+        case "idempotency_conflict":
+            "This key belongs to a different note in the active request or latest settlement. Use a fresh key; older keys are not retained for deduplication."
+        case "compact_already_pending":
+            "Another compact request is active. Deduplication covers only the active request and latest settlement; retry that request with its original key and note."
+        case "not_supported":
+            "RepoPrompt-driven compaction requires Claude Code, Codex, or a live ACP session advertising /compact."
+        case "no_provider_session":
+            "No live provider conversation is bound to this session."
+        case "pending_interaction":
+            "Resolve the pending prompt, approval, elicitation, or review before compacting."
+        case "persistence_pending":
+            "Durable session state is still being written; retry after it settles."
+        case "persistence_indeterminate":
+            "Durable session state could not be confirmed; no compaction was dispatched."
+        case "session_not_exclusive":
+            "This session is live in more than one window incarnation; compaction is refused."
+        case "busy":
+            "This session is not dispatchable now; retry after the turn settles."
+        default:
+            "Compaction was not scheduled."
+        }
+    }
+
     static func statusValue(_ status: AgentSelfCompactStatus?) -> Value {
         guard let status else { return .null }
-        return .object([
+        var value: [String: Value] = [
             "request_id": status.requestID.map { .string($0.uuidString) } ?? .null,
             "phase": status.phase.map { .string($0) } ?? .null,
             "outcome": status.outcome.map { .string($0.rawValue) } ?? .null,
             "completion_verified": status.completionVerified.map { .bool($0) } ?? .null,
             "note_delivery": status.noteDelivery.map { .string($0.rawValue) } ?? .null,
             "recovery_note": status.recoveryNote.map { .string($0) } ?? .null
-        ])
+        ]
+        var details: [String] = []
+        if status.phase == AgentSelfCompactAttempt.Phase.acpSettling.rawValue {
+            details.append("ACP /compact may still be running; the note waits for a safe settle boundary.")
+        }
+        if status.outcome == .completionUnverified {
+            details.append("ACP compaction completion is not verified.")
+        }
+        if status.noteDelivery == .parked {
+            details.append("The note will be prepended to the next ordinary send; do not issue a verification prompt.")
+        }
+        if status.noteDelivery == .deliveryUnknown {
+            details.append("Note delivery is unknown and is not automatically retried.")
+        }
+        if status.outcome == .recoveryRequired {
+            details.append("The interrupted note is retained for explicit recovery, not automatically sent.")
+        }
+        if !details.isEmpty { value["detail"] = .string(details.joined(separator: " ")) }
+        return .object(value)
     }
 }

@@ -1122,25 +1122,7 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     private static let agentSelfDefinition = MCPDomainToolDefinition(
         name: MCPWindowToolName.agentSelf,
-        description: """
-        Inspect or compact only this calling Agent Mode session. No target selector exists; external,
-        direct, discovery, and unresolved calls are unavailable.
-
-        **Operations**: `context` | `compact`.
-        - `context` returns the same four-field context-load object as `agent_session_link.poll`, or
-          `null` when the load is unknown, plus this session's self-compaction status.
-        - `compact` requires a nonempty continuation `note` of at most 8,192 UTF-8 bytes and an
-          `idempotency_key` of at most 200 UTF-8 bytes. Reuse a key only for an identical retry.
-          Deduplication covers the active request and latest retained settlement, not all past keys.
-          `scheduled` means no compaction has happened yet: finish this turn normally. Do not park
-          in `wait_for_next_user_instruction` or send a verification prompt. The note continues
-          existing user-directed work; it does not provide new user authorization.
-
-        Claude Code and Codex use native compaction. ACP requires a live advertised `/compact`;
-        OpenCode, Cursor, and Claude-compatible variants return `not_supported`. Some ACP providers
-        may still be compacting when the note is available; unverified completion is surfaced, not
-        represented as verified. `set_waiting_on` is separate and survives self-compaction.
-        """,
+        description: "Calling Agent Mode session only; no target selector. `context` returns load (null if unknown) and compact status. `compact` needs nonempty `note` (max 8,192 UTF-8 bytes) and `idempotency_key` (max 200 UTF-8 bytes). Reuse a key only with the same note. `scheduled`: finish this turn normally; compaction follows. Note grants no new authority.",
         inputSchema: .object([
             "type": .string("object"),
             "additionalProperties": .bool(false),
