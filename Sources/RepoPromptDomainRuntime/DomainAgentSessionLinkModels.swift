@@ -852,6 +852,9 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
     package let resultingRunState: String
     /// Set by the authority when an identical key/digest pair replays a stored outcome.
     package let duplicate: Bool
+    /// Compaction only: the command went out on a provider path that may keep compacting in the
+    /// background after its prompt turn completes, so an early next turn can cancel it.
+    package let compactionRunsInBackground: Bool
 
     package init(
         targetSessionID: UUID,
@@ -859,7 +862,8 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
         acceptedAt: Date,
         deliveryState: DomainAgentSessionLinkDeliveryState,
         resultingRunState: String,
-        duplicate: Bool = false
+        duplicate: Bool = false,
+        compactionRunsInBackground: Bool = false
     ) {
         self.targetSessionID = targetSessionID
         self.targetItemID = targetItemID
@@ -867,6 +871,7 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
         self.deliveryState = deliveryState
         self.resultingRunState = resultingRunState
         self.duplicate = duplicate
+        self.compactionRunsInBackground = compactionRunsInBackground
     }
 
     package func markedDuplicate() -> DomainAgentSessionLinkSendReceipt {
@@ -876,7 +881,8 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
             acceptedAt: acceptedAt,
             deliveryState: deliveryState,
             resultingRunState: resultingRunState,
-            duplicate: true
+            duplicate: true,
+            compactionRunsInBackground: compactionRunsInBackground
         )
     }
 }

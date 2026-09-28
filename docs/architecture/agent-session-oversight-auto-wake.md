@@ -461,7 +461,9 @@ ACP is advertisement-driven and live-unverified. `ACPAgentSessionController` rec
 normalization (which drop it), and forgets it when a session starts opening, the process exits or
 fails, a prompt fails, or the controller shuts down. A Devin, Grok Build, or Antigravity target is
 supported only while its live controller advertises `compact` for the target's own provider
-session; otherwise, including after a relaunch before the next turn, it is `not_supported`. OpenCode
+session. With no live provider session — after a relaunch, before the next turn, or while the
+controller is still opening — the result is the retryable `no_provider_session`; `not_supported`
+is reserved for a live session whose observed command list provably lacks `compact`. OpenCode
 advertises the user's own commands and skills, so an advertised `compact` there may not be native
 compaction; it and Cursor are never supported. The command reuses the live controller only (never a
 fresh or replacement one) and skips model/mode configuration. `promptAdvertisedCommand` checks that

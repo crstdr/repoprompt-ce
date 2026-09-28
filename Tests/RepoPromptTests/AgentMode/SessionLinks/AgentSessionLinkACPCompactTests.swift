@@ -447,6 +447,37 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
         XCTAssertTrue(fixture.session.acpController === liveController)
     }
 
+    /// Devin's `/compact` is fire-and-forget: the prompt answer returns immediately with an empty
+    /// turn while compaction continues in the provider's background. A lane transcript row must
+    /// say so — both so the lane's user sees it and so nothing reads the empty turn as done or
+    /// failed. The fake provider answers every prompt instantly with no stream events, which is
+    /// exactly that signature.
+    func testAnInstantlyEmptyCommandTurnLeavesABackgroundCompactionNote() async throws {
+        let fixture = try makeFixture()
+        let itemsBeforeOrdinary = fixture.session.items.count
+        await run(fixture, message: "acp initial")
+        XCTAssertTrue(
+            fixture.session.items.dropFirst(itemsBeforeOrdinary)
+                .allSatisfy { !($0.kind == .system && $0.text.contains("background")) },
+            "The note is scoped to provider control commands, not every instant-empty turn"
+        )
+        fixture.session.runState = .idle
+        let before = fixture.session.items.count
+
+        let outcome = await runCommand(fixture, compactCommand(fixture))
+
+        XCTAssertTrue(outcome.outcome.didStart)
+        XCTAssertEqual(fixture.session.runState, .completed)
+        let appended = fixture.session.items.dropFirst(before)
+        let notes = appended.filter { $0.kind == .system && $0.text.contains("background") }
+        XCTAssertEqual(
+            notes.count,
+            1,
+            "One row names the unobservable background work instead of a silently empty turn"
+        )
+        XCTAssertTrue(notes.allSatisfy { $0.text.contains("cancel") })
+    }
+
     func testARefusalAfterARebindSendsNothingAndKeepsTheLiveSession() async throws {
         let fixture = try makeFixture()
         await run(fixture, message: "acp initial")
@@ -647,8 +678,12 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
 
     /// Installs a bootstrapped, idle controller exactly as a completed ordinary turn leaves it.
     /// The request is the run service's own, so the runner's reuse compatibility check is exact.
+    /// `waitForAdvertisement` is off only for fixtures whose fake provider never sends one.
     @discardableResult
-    private func installLiveController(_ fixture: Fixture) async throws -> ACPAgentSessionController {
+    private func installLiveController(
+        _ fixture: Fixture,
+        waitForAdvertisement: Bool = true
+    ) async throws -> ACPAgentSessionController {
         let request = try XCTUnwrap(AgentModeRunService.makeACPRunRequest(
             session: fixture.session,
             workspacePath: fixture.workspacePath,
@@ -661,8 +696,10 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         let controller = try ACPAgentSessionController(provider: fixture.provider, runRequest: request)
         liveControllers.append(controller)
         let bootstrap = try await controller.bootstrap()
-        try await AsyncTestWait.waitUntil("the advertisement to be captured") {
-            controller.currentAdvertisedCommands() != nil
+        if waitForAdvertisement {
+            try await AsyncTestWait.waitUntil("the advertisement to be captured") {
+                controller.currentAdvertisedCommands() != nil
+            }
         }
         fixture.session.acpController = controller
         fixture.session.providerSessionID = bootstrap.sessionID
@@ -720,31 +757,63 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
 
     func testSupportFollowsTheLiveAdvertisementForTheTargetsOwnProviderSession() async throws {
         let advertising = try makeFixture()
-        XCTAssertEqual(advertising.viewModel.agentSessionLinkCompactSupport(for: advertising.session), .noProviderSession)
+        var support = await advertising.viewModel.agentSessionLinkCompactSupport(for: advertising.session)
+        XCTAssertEqual(support, .noProviderSession)
         try await installLiveController(advertising)
-        XCTAssertEqual(advertising.viewModel.agentSessionLinkCompactSupport(for: advertising.session), .acpAdvertisedCommand)
+        support = await advertising.viewModel.agentSessionLinkCompactSupport(for: advertising.session)
+        XCTAssertEqual(support, .acpAdvertisedCommand)
         advertising.session.providerSessionID = "restored-older-session"
+        support = await advertising.viewModel.agentSessionLinkCompactSupport(for: advertising.session)
         XCTAssertEqual(
-            advertising.viewModel.agentSessionLinkCompactSupport(for: advertising.session),
+            support,
             .notSupported,
             "An advertisement from another provider session never answers for this one"
         )
 
         let silent = try makeFixture(environment: ["ACP_ADVERTISE_COMMANDS": "review"])
         try await installLiveController(silent)
-        XCTAssertEqual(silent.viewModel.agentSessionLinkCompactSupport(for: silent.session), .notSupported)
+        let silentSupport = await silent.viewModel.agentSessionLinkCompactSupport(for: silent.session)
+        XCTAssertEqual(silentSupport, .notSupported)
 
         let relaunched = try makeFixture(agent: .devin, providerID: .devin)
         relaunched.session.providerSessionID = ACPCompactFixtures.sessionID
+        let relaunchedSupport = await relaunched.viewModel.agentSessionLinkCompactSupport(for: relaunched.session)
         XCTAssertEqual(
-            relaunched.viewModel.agentSessionLinkCompactSupport(for: relaunched.session),
-            .notSupported,
-            "No live controller (for example after a relaunch) means no advertisement"
+            relaunchedSupport,
+            .noProviderSession,
+            "No live controller (for example after a relaunch) means the session is retryable, "
+                + "not incapable: one ordinary turn brings the provider session up"
         )
 
         let openCode = try makeFixture(agent: .openCode, providerID: .openCode)
         try await installLiveController(openCode)
-        XCTAssertEqual(openCode.viewModel.agentSessionLinkCompactSupport(for: openCode.session), .notSupported)
+        let openCodeSupport = await openCode.viewModel.agentSessionLinkCompactSupport(for: openCode.session)
+        XCTAssertEqual(openCodeSupport, .notSupported)
+    }
+
+    /// Only a live provider session's *observed* command list can prove incapability. Everything
+    /// short of that — no controller at all (post-relaunch), a dead controller, or a live session
+    /// whose `available_commands_update` has not been seen — is the retryable `noProviderSession`.
+    /// `notSupported` is reserved for a snapshot that provably lacks `compact`.
+    func testOnlyALiveSessionsAdvertisementDecidesBetweenRetryableAndUnsupported() async throws {
+        let dead = try makeFixture(agent: .devin, providerID: .devin)
+        let deadController = try await installLiveController(dead)
+        await deadController.shutdown()
+        let deadSupport = await dead.viewModel.agentSessionLinkCompactSupport(for: dead.session)
+        XCTAssertEqual(
+            deadSupport,
+            .noProviderSession,
+            "A closed controller leaves no live provider session; the next turn reopens one"
+        )
+
+        let silent = try makeFixture(agent: .devin, providerID: .devin, environment: [:])
+        try await installLiveController(silent, waitForAdvertisement: false)
+        let silentSupport = await silent.viewModel.agentSessionLinkCompactSupport(for: silent.session)
+        XCTAssertEqual(
+            silentSupport,
+            .noProviderSession,
+            "A live session whose command list was never observed is unproven, not incapable"
+        )
     }
 
     func testAnAcceptedCompactionRecordsTheRequestAndRunsOnlyOnTheLiveSession() async throws {
@@ -758,8 +827,15 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
             return XCTFail("Expected an accepted compaction, got \(outcome)")
         }
         XCTAssertEqual(delivery.deliveryState, .runStarted)
-        XCTAssertEqual(fixture.session.items.count, before + 1)
-        let row = try XCTUnwrap(fixture.session.items.last)
+        XCTAssertTrue(
+            delivery.compactionRunsInBackground,
+            "The ACP path is fire-and-forget, so the overseer must be told not to send early"
+        )
+        // The command run may append its own rows concurrently; the request row is found by
+        // identity rather than position.
+        let row = try XCTUnwrap(
+            fixture.session.items.first(where: { $0.id == delivery.targetItemID })
+        )
         XCTAssertEqual(row.kind, .system, "RepoPrompt issued the command, not the target's user")
         XCTAssertEqual(row.text, AgentChatItem.overseerCompactionRequestText)
         XCTAssertEqual(row.crossSessionAttribution?.sourceName, "Planning")

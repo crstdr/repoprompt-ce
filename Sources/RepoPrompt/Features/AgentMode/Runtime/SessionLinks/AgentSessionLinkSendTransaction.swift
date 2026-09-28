@@ -185,8 +185,9 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     case steerUnconfirmed = "steer_unconfirmed"
     /// Compaction only: the target's provider runtime has no verified native compaction path.
     case notSupported = "not_supported"
-    /// Compaction only: the provider supports compaction, but this target has no provider
-    /// conversation yet, so there is nothing to compact.
+    /// Compaction only: this target has no live provider session to compact yet — no recorded
+    /// conversation, or a remembered one (e.g. right after a relaunch) whose provider process is
+    /// not live. Retryable: one ordinary turn brings the session and its command surface up.
     case noProviderSession = "no_provider_session"
 
     init(_ reason: AgentSessionLinkDeliveryReadiness.BlockReason) {
@@ -200,16 +201,17 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     /// Whether polling and retrying with the *same* idempotency key is the right next move.
     ///
     /// A revoked link and an invalidated endpoint are permanent for this grant; the rest describe a
-    /// target that is merely busy, loading, or mid-save.
+    /// target that is merely busy, loading, mid-save, or — for compaction — not yet attached to a
+    /// live provider session.
     /// An indeterminate persistence outcome is deliberately **not** retryable: retrying the same key
     /// can only replay the same tombstone, and a new key could duplicate a row that did commit.
     var isRetryable: Bool {
         switch self {
         case .targetLoading, .targetNotIdle, .persistenceFailed, .targetAwaitingInteraction,
-             .targetBusy, .steerUnavailable, .steerNotAccepted:
+             .targetBusy, .steerUnavailable, .steerNotAccepted, .noProviderSession:
             true
         case .endpointInvalidated, .linkRevoked, .persistenceIndeterminate, .shuttingDown,
-             .managementRevoked, .steerUnconfirmed, .notSupported, .noProviderSession:
+             .managementRevoked, .steerUnconfirmed, .notSupported:
             false
         }
     }
@@ -260,7 +262,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .notSupported:
             "The overseen session's provider has no supported context compaction. Nothing was requested."
         case .noProviderSession:
-            "The overseen session has no provider conversation to compact yet. Nothing was requested."
+            "The overseen session has no live provider session to compact yet; run one turn "
+                + "first, then retry. Nothing was requested."
         }
     }
 }
@@ -272,6 +275,10 @@ struct AgentSessionLinkSendDelivery: Equatable {
     let acceptedAt: Date
     let deliveryState: DomainAgentSessionLinkDeliveryState
     let resultingRunState: String
+    /// Compaction only: the command went out on the ACP path, where a provider may keep
+    /// compacting in the background after its prompt turn completes — a next prompt can cancel
+    /// it. False for send, steer, and the native Codex/Claude compaction paths.
+    var compactionRunsInBackground = false
 }
 
 enum AgentSessionLinkSendTransactionOutcome: Equatable {
