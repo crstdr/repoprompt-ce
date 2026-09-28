@@ -3,6 +3,17 @@ import MCP
 import RepoPromptDomainRuntime
 
 extension WindowStatesManager {
+    func agentSessionLinkBindingCount(sessionID: UUID) -> Int {
+        guard !isTerminating else { return 0 }
+        return allWindows.filter { !$0.isClosing }.reduce(0) { count, window in
+            count + window.workspaceManager.workspaces.reduce(0) { workspaceCount, workspace in
+                workspaceCount + workspace.composeTabs.filter {
+                    $0.activeAgentSessionID == sessionID
+                }.count
+            }
+        }
+    }
+
     /// Route only to a registered, non-closing window whose requested workspace is already active.
     /// No window focus or workspace switch is performed on the overseer's behalf.
     func agentSessionLinkCreateLane(
@@ -27,7 +38,8 @@ extension WindowStatesManager {
             expectedWorkspaceID: workspaceID
         )
         switch outcome {
-        case let .created(sessionID, tabID): return .created(sessionID: sessionID, tabID: tabID)
+        case let .created(sessionID, tabID, bindingToken):
+            return .created(sessionID: sessionID, tabID: tabID, bindingToken: bindingToken)
         case let .creationIncomplete(sessionID, tabID):
             return .creationIncomplete(sessionID: sessionID, tabID: tabID)
         }

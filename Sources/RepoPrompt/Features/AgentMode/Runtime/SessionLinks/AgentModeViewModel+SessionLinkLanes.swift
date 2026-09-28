@@ -4,7 +4,7 @@ import RepoPromptDomainRuntime
 
 extension AgentModeViewModel {
     enum MCPOversightLaneCreationOutcome: Equatable {
-        case created(sessionID: UUID, tabID: UUID)
+        case created(sessionID: UUID, tabID: UUID, bindingToken: AgentSessionRestorationBindingToken)
         case creationIncomplete(sessionID: UUID, tabID: UUID)
     }
 
@@ -34,6 +34,12 @@ extension AgentModeViewModel {
         // A published lane is an ordinary session even if later configuration or persistence fails.
         // Accept the provisional admission rather than invoking MCP's discard/delete recovery path.
         mcpAcceptSessionTarget(target)
+        // Acceptance settles the recovery claim. Subsequent configuration checks must use the
+        // claimless exact lifecycle identity, not ask a settled claim to still be provisional.
+        let settledTarget = MCPSessionTarget(
+            tabID: target.tabID, sessionID: target.sessionID,
+            origin: .existingSession, lifecycleIdentity: target.lifecycleIdentity
+        )
         guard let sessionID = target.sessionID else {
             throw MCPError.internalError("The new lane has no session ID.")
         }
@@ -51,8 +57,11 @@ extension AgentModeViewModel {
 
         // Provenance was installed by the fresh-session seam before this first dirty marking.
         session.isDirty = true
+        #if DEBUG
+            await test_afterOversightLaneProvision?(target.tabID)
+        #endif
         do {
-            try requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
+            try requireCurrentMCPWorkspaceTarget(settledTarget, expectedWorkspaceID: expectedWorkspaceID)
             try await mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: selection.agentRaw,
@@ -60,19 +69,17 @@ extension AgentModeViewModel {
                 reasoningEffortRaw: selection.reasoningEffortRaw,
                 requireInactiveRunState: true,
                 workspaceAuthority: .init(
-                    target: target,
+                    target: settledTarget,
                     expectedWorkspaceID: expectedWorkspaceID,
                     allowMatchingControlledSession: false
                 )
             )
-            try requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
+            try requireCurrentMCPWorkspaceTarget(settledTarget, expectedWorkspaceID: expectedWorkspaceID)
             try mcpApplyModelParameterSelections(
                 tabID: target.tabID,
                 selections: selection.modelParameterSelections
             )
-            guard session.selectedAgent.rawValue == selection.agentRaw,
-                  session.selectedModelRaw == selection.modelRaw,
-                  selection.reasoningEffortRaw.map({ session.selectedReasoningEffortRaw == $0 }) ?? true
+            guard mcpOversightLaneSelectionMatches(selection, session: session)
             else {
                 scheduleSave(for: session)
                 return incomplete
@@ -96,7 +103,29 @@ extension AgentModeViewModel {
               session.mcpControlContext == nil,
               !session.isMCPOriginated
         else { return incomplete }
-        return .created(sessionID: sessionID, tabID: target.tabID)
+        guard case let .authoritative(bindingToken, .freshBindingDurablyCreated) = session.restorationReadiness
+        else { return incomplete }
+        return .created(sessionID: sessionID, tabID: target.tabID, bindingToken: bindingToken)
+    }
+
+    private func mcpOversightLaneSelectionMatches(
+        _ selection: AgentSessionLanePolicy.RoleSelection,
+        session: TabSession
+    ) -> Bool {
+        guard session.selectedAgent.rawValue == selection.agentRaw,
+              selection.reasoningEffortRaw.map({ session.selectedReasoningEffortRaw == $0 }) ?? true
+        else { return false }
+        if session.selectedAgent == .codexExec {
+            let requested = CodexModelSpecifier(raw: selection.modelRaw)
+            let installed = CodexModelSpecifier(raw: session.selectedModelRaw)
+            return requested.baseModel == installed.baseModel
+                && requested.serviceTier == installed.serviceTier
+        }
+        if session.selectedAgent.usesClaudeNativeRuntime {
+            return ClaudeModelSpecifier(raw: selection.modelRaw).baseModel
+                == ClaudeModelSpecifier(raw: session.selectedModelRaw).baseModel
+        }
+        return session.selectedModelRaw == selection.modelRaw
     }
 
     /// Exact-incarnation read for cap and retirement checks; a stale endpoint never inherits a

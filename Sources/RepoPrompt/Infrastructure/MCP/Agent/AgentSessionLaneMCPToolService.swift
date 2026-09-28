@@ -36,11 +36,13 @@ enum AgentSessionLaneMCPToolService {
         workspaceSelector: String?,
         callerWindowID: Int
     ) -> Destination? {
-        candidates.filter { candidate in
+        let matches = candidates.filter { candidate in
             guard let workspaceSelector else { return candidate.windowID == callerWindowID }
-            return candidate.workspaceID == UUID(uuidString: workspaceSelector)
-                || candidate.workspaceName.localizedCaseInsensitiveCompare(workspaceSelector) == .orderedSame
-        }.min { lhs, rhs in
+            if let id = UUID(uuidString: workspaceSelector) { return candidate.workspaceID == id }
+            return candidate.workspaceName.localizedCaseInsensitiveCompare(workspaceSelector) == .orderedSame
+        }
+        if workspaceSelector != nil, Set(matches.map(\.workspaceID)).count != 1 { return nil }
+        return matches.min { lhs, rhs in
             let lhsIsCaller = lhs.windowID == callerWindowID
             let rhsIsCaller = rhs.windowID == callerWindowID
             if lhsIsCaller != rhsIsCaller { return lhsIsCaller }

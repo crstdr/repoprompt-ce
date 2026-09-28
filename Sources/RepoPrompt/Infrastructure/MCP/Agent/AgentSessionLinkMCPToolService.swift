@@ -501,23 +501,23 @@ struct AgentSessionLinkMCPToolService {
             workspaceSelector = nil
         }
         let callerWindow = try requireTargetWindow()
-        guard let destination = AgentSessionLaneMCPToolService.resolveDestination(
-            workspaceSelector: workspaceSelector,
-            callerWindow: callerWindow
-        ) else {
-            return AgentSessionLaneMCPToolService.refusal("destination_unavailable")
-        }
         let receipt = await bridge.createLane(
             observerEndpoint: observerEndpoint,
             request: AgentSessionLaneCreateRequest(
                 idempotencyKey: key,
                 role: role,
                 sessionName: sessionName,
-                destinationWindowID: destination.windowID,
-                workspaceID: destination.workspaceID,
+                destinationWindowID: nil,
+                workspaceID: nil,
+                workspaceSelector: workspaceSelector,
                 message: message,
                 workflowReference: workflowReference
-            )
+            ),
+            resolveDestination: {
+                AgentSessionLaneMCPToolService.resolveDestination(
+                    workspaceSelector: workspaceSelector, callerWindow: callerWindow
+                ).map { (windowID: $0.windowID, workspaceID: $0.workspaceID) }
+            }
         )
         if receipt.reason == .denied { throw Self.unavailableError }
         return AgentSessionLaneMCPToolService.render(receipt)

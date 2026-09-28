@@ -6,23 +6,31 @@ struct AgentSessionLaneCreateRequest {
     let idempotencyKey: String
     let role: String?
     let sessionName: String?
-    let destinationWindowID: Int
-    let workspaceID: UUID
+    let destinationWindowID: Int?
+    let workspaceID: UUID?
+    /// The caller's selector, not a window/workspace binding that can move after the request.
+    var workspaceSelector: String? = nil
     let message: String?
     let workflowReference: AgentWorkflowReference?
 
     var digest: String {
         let fields = [
-            role ?? "pair", sessionName ?? "", String(destinationWindowID), workspaceID.uuidString,
+            role ?? "pair", sessionName ?? "", Self.canonicalSelector(workspaceSelector),
             message ?? "", AgentWorkflowReference.canonicalSelector(for: workflowReference),
         ]
         let canonical = fields.map { "\($0.utf8.count):\($0)" }.joined()
         return AgentSessionLinkMessageDigest.digest(message: canonical, workflowSelector: "create_lane/v1")
     }
+
+    private static func canonicalSelector(_ value: String?) -> String {
+        guard let value else { return "caller-workspace" }
+        if let id = UUID(uuidString: value) { return "id:\(id.uuidString)" }
+        return "name:\(value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil))"
+    }
 }
 
 enum AgentSessionLaneHostCreationOutcome {
-    case created(sessionID: UUID, tabID: UUID)
+    case created(sessionID: UUID, tabID: UUID, bindingToken: AgentSessionRestorationBindingToken)
     case creationIncomplete(sessionID: UUID, tabID: UUID)
 }
 

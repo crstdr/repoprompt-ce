@@ -665,13 +665,19 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
             mode: .enabled
         ))
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
         let args: [String: Value] = [
             "op": .string("create_lane"),
             "idempotency_key": .string("service-replay-1"),
-            "session_name": .string("Service lane")
+            "session_name": .string("Service lane"),
+            "workspace": .string(workspace.name)
         ]
 
         let first = try await Self.executeObject(fixture.service, args: args)
+        let workspaceIndex = try XCTUnwrap(fixture.window.workspaceManager.workspaces.firstIndex {
+            $0.id == workspace.id
+        })
+        fixture.window.workspaceManager.workspaces[workspaceIndex].name = "Renamed after creation"
         let replay = try await Self.executeObject(fixture.service, args: args)
         XCTAssertEqual(first["result"], .string("created"))
         XCTAssertEqual(replay["session_id"], first["session_id"])
@@ -718,6 +724,18 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
             candidates: candidates, workspaceSelector: workspace.name, callerWindowID: 8
         )?.windowID, 2)
+        let ambiguousName = candidates + [AgentSessionLaneMCPToolService.Destination(
+            windowID: 9, workspaceID: UUID(), workspaceName: workspace.name
+        )]
+        XCTAssertNil(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: ambiguousName, workspaceSelector: workspace.name, callerWindowID: 4
+        ))
+        let uuidShapedName = UUID()
+        XCTAssertNil(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: [AgentSessionLaneMCPToolService.Destination(
+                windowID: 10, workspaceID: UUID(), workspaceName: uuidShapedName.uuidString
+            )], workspaceSelector: uuidShapedName.uuidString, callerWindowID: 10
+        ))
     }
 
     /// The missing-op and unsupported-op errors teach the same operation list the schema advertises.
@@ -2601,7 +2619,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             lane.restorationReadiness = .authoritative(token, .freshBindingDurablyCreated)
             candidates.append(lane)
             laneCreatorByEndpoint[lane.domainEndpoint] = creatorSessionID
-            return .created(sessionID: lane.sessionID, tabID: lane.tabID)
+            return .created(sessionID: lane.sessionID, tabID: lane.tabID, bindingToken: token)
         }
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
         var waitingOn: DomainAgentSessionWaitingOn?

@@ -88,6 +88,9 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// All live compose-tab/session bindings across every non-closing window.
     func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate]
 
+    /// Count compose-tab bindings in every workspace, including inactive ones, without hydration.
+    func agentSessionLinkBindingCount(sessionID: UUID) -> Int
+
     func agentSessionLinkCreateLane(
         destinationWindowID: Int,
         workspaceID: UUID,
@@ -429,6 +432,10 @@ extension AgentSessionLinkEndpointHost {
     func agentSessionLinkLaneCreatorLabel(
         for _: DomainAgentSessionLinkEndpointIdentity
     ) -> String? { nil }
+
+    func agentSessionLinkBindingCount(sessionID: UUID) -> Int {
+        agentSessionLinkCandidates().filter { $0.sessionID == sessionID }.count
+    }
 
     /// Fail-closed management defaults: a host that does not model interactions or steering exposes
     /// none, answers none, and steers nothing.
@@ -890,13 +897,14 @@ final class AgentSessionLinkRuntimeBridge {
         let idempotencyKey: String
     }
     private struct LaneCreationEntry {
+        let id: UUID
         let digest: String
         let task: Task<AgentSessionLaneCreateReceipt, Never>
     }
     private var laneCreationTasks: [LaneCreationKey: LaneCreationEntry] = [:]
     private var laneCreationReceipts: [LaneCreationKey: (digest: String, receipt: AgentSessionLaneCreateReceipt)] = [:]
-    private var laneCreationReceiptOrder: [LaneCreationKey] = []
     private var laneCreationCapReservations: [UUID: Int] = [:]
+    private var laneCreationCapGeneration: [UUID: UInt64] = [:]
     private var retiringTargets: Set<DomainAgentSessionLinkEndpointIdentity> = []
     /// One retirement lane per pair. Every durable removal for a pair — user Stop, launch
     /// retirement, and cleanup retry alike — runs in it, and an Add holds it across its own insert,
@@ -983,9 +991,12 @@ final class AgentSessionLinkRuntimeBridge {
         /// transaction, but before its final live-candidate checks and activation.
         var test_afterReservationBeforeActivation:
             (@MainActor (AgentSessionOversightIntent) async -> Void)?
-        /// Pauses retirement after its relationship snapshot but before the target fence and Stop.
-        /// Tests use this to commit a replacement generation or deletion at that exact cutoff.
+        /// Pauses retirement after its fenced relationship snapshot but before Stop.
         var test_afterRetireRelationshipPrecheck: (@MainActor () async -> Void)?
+        /// Pauses after authorization but before the target fence and relationship snapshot.
+        var test_afterRetireAuthorizationBeforeFence: (@MainActor () async -> Void)?
+        /// Holds a claimed key before its first admission hop; replays must join this task.
+        var test_afterLaneCreationClaim: (@MainActor () async -> Void)?
         /// Signals that an Add is waiting behind another complete establishment for the same
         /// semantic UUID pair. Tests use it instead of timing assumptions.
         var test_beforePairEstablishmentWait:
@@ -1898,6 +1909,7 @@ final class AgentSessionLinkRuntimeBridge {
                 existing.value,
                 pair: pair,
                 token: token,
+                proof: proof,
                 expectedEndpoints: expectedEndpoints,
                 preserveOnExpectationMismatch: true
             )
@@ -1932,6 +1944,7 @@ final class AgentSessionLinkRuntimeBridge {
             task.value,
             pair: pair,
             token: token,
+            proof: proof,
             expectedEndpoints: expectedEndpoints,
             preserveOnExpectationMismatch: false
         )
@@ -1950,6 +1963,7 @@ final class AgentSessionLinkRuntimeBridge {
         _ result: EstablishmentResult,
         pair: AgentSessionOversightIntent,
         token: AgentSessionOversightIntentToken?,
+        proof: AgentSessionOversightRestorationProof?,
         expectedEndpoints: AddEndpointExpectations,
         preserveOnExpectationMismatch: Bool
     ) async -> EstablishmentResult {
@@ -1976,6 +1990,12 @@ final class AgentSessionLinkRuntimeBridge {
                 settlesDurableIntent: false
             )
             return EstablishmentResult(outcome: .failed(.closing))
+        }
+        if isRetiringEndpoint(in: pair) || (proof.map { !liveCandidatesStillMatch($0) } ?? false) {
+            if !preserveOnExpectationMismatch && !result.isAlreadyLinked {
+                await revoke(reference: reference, settlesDurableIntent: false)
+            }
+            return EstablishmentResult(outcome: .failed(.rebinding))
         }
         guard await tokenIsCurrent(token) else {
             await revoke(reference: reference, settlesDurableIntent: false)
@@ -2007,6 +2027,17 @@ final class AgentSessionLinkRuntimeBridge {
             }
             await revoke(reference: reference, settlesDurableIntent: false)
             return EstablishmentResult(outcome: .failed(.rebinding))
+        }
+        // No await remains after this check. A readiness regression or retirement fence that
+        // landed during the final token/deletion hops cannot be reported as an accepted Add.
+        if isRetiringEndpoint(in: pair) || (proof.map { !liveCandidatesStillMatch($0) } ?? false) {
+            if !preserveOnExpectationMismatch && !result.isAlreadyLinked {
+                await revoke(reference: reference, settlesDurableIntent: false)
+            }
+            return EstablishmentResult(
+                outcome: .failed(.rebinding),
+                preservesDurableIntentOnFailure: preserveOnExpectationMismatch || result.isAlreadyLinked
+            )
         }
         return result
     }
@@ -2102,7 +2133,8 @@ final class AgentSessionLinkRuntimeBridge {
         pair: AgentSessionOversightIntent,
         expectedObserverEndpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
         expectedTargetEndpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
-        requiresExistingOutboundLink: Bool = false
+        requiresExistingOutboundLink: Bool = false,
+        proof: AgentSessionOversightRestorationProof? = nil
     ) async -> AgentMonitorAddOutcome {
         let expectedEndpoints = AddEndpointExpectations(
             observer: expectedObserverEndpoint,
@@ -2115,21 +2147,23 @@ final class AgentSessionLinkRuntimeBridge {
             }
             return await performAddMonitorLink(
                 pair: pair,
-                expectedEndpoints: expectedEndpoints
+                expectedEndpoints: expectedEndpoints,
+                proof: proof
             )
         }
     }
 
     private func performAddMonitorLink(
         pair: AgentSessionOversightIntent,
-        expectedEndpoints: AddEndpointExpectations
+        expectedEndpoints: AddEndpointExpectations,
+        proof: AgentSessionOversightRestorationProof?
     ) async -> AgentMonitorAddOutcome {
         guard host != nil else { return .rejected(message: Self.unavailableMessage) }
         guard !isFrozenForTermination else {
             return .rejected(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
         }
         guard pair.observerSessionID != pair.targetSessionID else { return .failed(.selfMonitor) }
-        if isRetiringTarget(pair.targetSessionID) { return .failed(.closing) }
+        if isRetiringEndpoint(in: pair) { return .failed(.closing) }
         // A deleted transcript is not an oversight endpoint, however live its tab still looks: the
         // view-model teardown that removes it from the candidate sweep runs several awaits after the
         // file is gone.
@@ -2164,7 +2198,7 @@ final class AgentSessionLinkRuntimeBridge {
                     .rejected(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
                 )
             }
-            if isRetiringTarget(pair.targetSessionID) { return .refused(.failed(.closing)) }
+            if isRetiringEndpoint(in: pair) { return .refused(.failed(.closing)) }
             // Preflight the live resolver before writing anything. This is for the popover's precise
             // messages only — it is not authorization, and the shared path below re-resolves
             // everything.
@@ -2249,6 +2283,7 @@ final class AgentSessionLinkRuntimeBridge {
             pair: pair,
             token: token,
             assertedAt: assertionGeneration,
+            proof: proof,
             expectedEndpoints: expectedEndpoints
         )
         let outcome = establishment.outcome
@@ -2565,7 +2600,7 @@ final class AgentSessionLinkRuntimeBridge {
         // Re-read rather than trusted from the caller's preflight: a deletion can commit while an Add
         // is resolving, and restoration enters here without a preflight at all.
         if let refusal = Self.deletionRefusal(for: pair) { return EstablishmentResult(outcome: refusal) }
-        if isRetiringTarget(pair.targetSessionID) {
+        if isRetiringEndpoint(in: pair) {
             return EstablishmentResult(outcome: .failed(.closing))
         }
         guard !isFrozenForTermination else {
@@ -2672,14 +2707,14 @@ final class AgentSessionLinkRuntimeBridge {
                 bookkeepingByReference.removeValue(forKey: Self.reference(for: pending))
                 return EstablishmentResult(outcome: .failed(.closing))
             }
-            guard !retiringTargets.contains(targetEndpoint) else {
+            guard !isRetiringEndpoint(observerEndpoint, targetEndpoint) else {
                 await authority.abandonReservation(pending)
                 bookkeepingByReference.removeValue(forKey: Self.reference(for: pending))
                 return EstablishmentResult(outcome: .failed(.closing))
             }
         case let .existing(grant):
             let reference = Self.reference(for: grant)
-            if retiringTargets.contains(targetEndpoint) {
+            if isRetiringEndpoint(observerEndpoint, targetEndpoint) {
                 return EstablishmentResult(
                     outcome: .failed(.closing), preservesDurableIntentOnFailure: true
                 )
@@ -2713,7 +2748,7 @@ final class AgentSessionLinkRuntimeBridge {
                 )
                 return EstablishmentResult(outcome: .failed(.closing))
             }
-            if retiringTargets.contains(targetEndpoint) {
+            if isRetiringEndpoint(observerEndpoint, targetEndpoint) {
                 return EstablishmentResult(
                     outcome: .failed(.closing), preservesDurableIntentOnFailure: true
                 )
@@ -2741,7 +2776,7 @@ final class AgentSessionLinkRuntimeBridge {
                 )
                 return EstablishmentResult(outcome: .failed(.closing))
             }
-            if retiringTargets.contains(targetEndpoint) {
+            if isRetiringEndpoint(observerEndpoint, targetEndpoint) {
                 return EstablishmentResult(
                     outcome: .failed(.closing), preservesDurableIntentOnFailure: true
                 )
@@ -2768,7 +2803,7 @@ final class AgentSessionLinkRuntimeBridge {
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
             return EstablishmentResult(outcome: .failed(.closing))
         }
-        guard !retiringTargets.contains(targetEndpoint) else {
+        guard !isRetiringEndpoint(observerEndpoint, targetEndpoint) else {
             await authority.abandonReservation(reservation)
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
             return EstablishmentResult(outcome: .failed(.closing))
@@ -2787,7 +2822,7 @@ final class AgentSessionLinkRuntimeBridge {
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
             return EstablishmentResult(outcome: .failed(.closing))
         }
-        guard !retiringTargets.contains(targetEndpoint) else {
+        guard !isRetiringEndpoint(observerEndpoint, targetEndpoint) else {
             await authority.abandonReservation(reservation)
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
             return EstablishmentResult(outcome: .failed(.closing))
@@ -2907,7 +2942,7 @@ final class AgentSessionLinkRuntimeBridge {
             )
             return EstablishmentResult(outcome: .failed(.closing))
         }
-        guard !retiringTargets.contains(targetEndpoint) else {
+        guard !isRetiringEndpoint(observerEndpoint, targetEndpoint) else {
             await revoke(reference: grantReference, settlesDurableIntent: false)
             return EstablishmentResult(outcome: .failed(.closing))
         }
@@ -6317,6 +6352,17 @@ final class AgentSessionLinkRuntimeBridge {
         retiringTargets.contains { $0.sessionID == sessionID }
     }
 
+    private func isRetiringEndpoint(in pair: AgentSessionOversightIntent) -> Bool {
+        isRetiringTarget(pair.observerSessionID) || isRetiringTarget(pair.targetSessionID)
+    }
+
+    private func isRetiringEndpoint(
+        _ observer: DomainAgentSessionLinkEndpointIdentity,
+        _ target: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        retiringTargets.contains(observer) || retiringTargets.contains(target)
+    }
+
     private func linkedCreatedLaneCount(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         candidates: [AgentSessionLinkEndpointCandidate]
@@ -6350,21 +6396,12 @@ final class AgentSessionLinkRuntimeBridge {
 
     func createLane(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        request: AgentSessionLaneCreateRequest
+        request: AgentSessionLaneCreateRequest,
+        resolveDestination: (@MainActor () -> (windowID: Int, workspaceID: UUID)?)? = nil
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination else { return .refused(.shuttingDown) }
         let key = LaneCreationKey(endpoint: observerEndpoint, idempotencyKey: request.idempotencyKey)
         let digest = request.digest
-        guard let host,
-              let observer = host.agentSessionLinkCandidates().first(where: {
-                  $0.domainEndpoint == observerEndpoint
-              }),
-              AgentSessionLinkEndpointEligibility.addDisabledReason(
-                  observer.eligibilityInput,
-                  roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-              ) == nil,
-              await authority.hasActiveLink(endpoint: observerEndpoint)
-        else { return .refused(.denied) }
         if let settled = laneCreationReceipts[key] {
             guard settled.digest == digest else { return .refused(.idempotencyConflict) }
             var replay = settled.receipt
@@ -6377,77 +6414,106 @@ final class AgentSessionLinkRuntimeBridge {
             joined.duplicate = true
             return joined
         }
-        guard !isFrozenForTermination else { return .refused(.shuttingDown) }
+        guard laneCreationReceipts.count + laneCreationTasks.count < 256,
+              laneCreationTasks.count < 8
+        else {
+            return .refused(.ledgerFull)
+        }
+        // The claim is MainActor-local and happens before the first suspension. Replays join this
+        // exact task even while authorization, persistence, or destination discovery is suspended.
+        let claimID = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return AgentSessionLaneCreateReceipt.refused(.denied) }
+            #if DEBUG
+                await test_afterLaneCreationClaim?()
+            #endif
+            let transaction = registerTransaction()
+            defer { finishTransaction(transaction) }
+            return await performClaimedLaneCreation(
+                observerEndpoint: observerEndpoint,
+                request: request,
+                resolveDestination: resolveDestination
+            )
+        }
+        laneCreationTasks[key] = LaneCreationEntry(id: claimID, digest: digest, task: task)
+        let receipt = await task.value
+        if laneCreationTasks[key]?.id == claimID {
+            laneCreationTasks.removeValue(forKey: key)
+            if !isFrozenForTermination { laneCreationReceipts[key] = (digest, receipt) }
+        }
+        return receipt
+    }
+
+    private func performClaimedLaneCreation(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        request: AgentSessionLaneCreateRequest,
+        resolveDestination: (@MainActor () -> (windowID: Int, workspaceID: UUID)?)?
+    ) async -> AgentSessionLaneCreateReceipt {
+        guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+        guard let host,
+              let observer = host.agentSessionLinkCandidates().first(where: {
+                  $0.domainEndpoint == observerEndpoint
+              }),
+              AgentSessionLinkEndpointEligibility.addDisabledReason(
+                  observer.eligibilityInput,
+                  roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
+              ) == nil,
+              await authority.hasActiveLink(endpoint: observerEndpoint)
+        else { return .refused(.denied) }
         guard case .available = await intentPersistenceAdmission() else {
             return .refused(.persistenceUnavailable)
         }
-        guard !isFrozenForTermination else { return .refused(.shuttingDown) }
-        let candidates = host.agentSessionLinkCandidates()
-        guard candidates.contains(where: { $0.domainEndpoint == observerEndpoint }) else {
-            return .refused(.denied)
-        }
-        let linkedCount = await linkedCreatedLaneCount(observerEndpoint: observerEndpoint, candidates: candidates)
-        let reservedCount = laneCreationCapReservations[observerEndpoint.sessionID, default: 0]
-        guard linkedCount + reservedCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount else {
-            return .refused(.laneLimitReached, laneCount: linkedCount)
-        }
+        guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+        guard let destination = resolveDestination?()
+                ?? (request.destinationWindowID.flatMap { windowID in
+                    request.workspaceID.map { (windowID: windowID, workspaceID: $0) }
+                })
+        else { return .refused(.destinationUnavailable) }
         let selection: AgentSessionLanePolicy.RoleSelection
         do {
             selection = try AgentSessionLanePolicy.resolveRole(
-                request.role,
-                availability: .current,
-                workspaceID: request.workspaceID
+                request.role, availability: .current, workspaceID: destination.workspaceID
             )
-        } catch { return .refused(.roleUnavailable, laneCount: linkedCount) }
-        guard !isFrozenForTermination,
-              host.agentSessionLinkCandidates().contains(where: {
-                  $0.domainEndpoint == observerEndpoint
-                      && AgentSessionLinkEndpointEligibility.addDisabledReason(
-                          $0.eligibilityInput,
-                          roleAllowsOutboundMonitoring: $0.roleAllowsOutboundMonitoring
-                      ) == nil
-              }),
-              await authority.hasActiveLink(endpoint: observerEndpoint)
-        else { return .refused(.denied, laneCount: linkedCount) }
-        guard laneCreationTasks.count < 8 else { return .refused(.ledgerFull, laneCount: linkedCount) }
-        // The reservation is MainActor-local and precedes task launch. Concurrent creators of the
-        // same UUID therefore count each other's not-yet-linked lanes against the cap.
-        laneCreationCapReservations[observerEndpoint.sessionID, default: 0] += 1
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return AgentSessionLaneCreateReceipt.refused(.denied) }
-            let transaction = registerTransaction()
-            defer {
-                finishTransaction(transaction)
-                laneCreationCapReservations[observerEndpoint.sessionID, default: 1] -= 1
-                if laneCreationCapReservations[observerEndpoint.sessionID] == 0 {
-                    laneCreationCapReservations.removeValue(forKey: observerEndpoint.sessionID)
-                }
-            }
-            return await performLaneCreation(
-                observerEndpoint: observerEndpoint,
-                request: request,
-                selection: selection
+        } catch { return .refused(.roleUnavailable) }
+        guard await authority.hasActiveLink(endpoint: observerEndpoint) else { return .refused(.denied) }
+        // No suspension between this count and the reservation: admission is creator-scoped and
+        // counts both active lanes and the pending allocations that have not linked yet.
+        let creatorID = observerEndpoint.sessionID
+        var linkedCount: Int
+        while true {
+            let generation = laneCreationCapGeneration[creatorID, default: 0]
+            let candidates = host.agentSessionLinkCandidates()
+            linkedCount = await linkedCreatedLaneCount(
+                observerEndpoint: observerEndpoint, candidates: candidates
             )
+            if generation == laneCreationCapGeneration[creatorID, default: 0] { break }
         }
-        laneCreationTasks[key] = LaneCreationEntry(digest: digest, task: task)
-        let receipt = await task.value
-        if laneCreationTasks[key]?.digest == digest {
-            laneCreationTasks.removeValue(forKey: key)
-        }
-        if !isFrozenForTermination {
-            laneCreationReceipts[key] = (digest, receipt)
-            laneCreationReceiptOrder.append(key)
-            if laneCreationReceiptOrder.count > 256 {
-                laneCreationReceipts.removeValue(forKey: laneCreationReceiptOrder.removeFirst())
+        guard !isFrozenForTermination, !Task.isCancelled,
+              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint }),
+              linkedCount + laneCreationCapReservations[creatorID, default: 0]
+                  < AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        else { return .refused(.laneLimitReached, laneCount: linkedCount) }
+        laneCreationCapReservations[creatorID, default: 0] += 1
+        laneCreationCapGeneration[creatorID, default: 0] &+= 1
+        defer {
+            laneCreationCapReservations[creatorID, default: 1] -= 1
+            laneCreationCapGeneration[creatorID, default: 0] &+= 1
+            if laneCreationCapReservations[creatorID] == 0 {
+                laneCreationCapReservations.removeValue(forKey: creatorID)
             }
         }
-        return receipt
+        return await performLaneCreation(
+            observerEndpoint: observerEndpoint, request: request, selection: selection,
+            destinationWindowID: destination.windowID, workspaceID: destination.workspaceID
+        )
     }
 
     private func performLaneCreation(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         request: AgentSessionLaneCreateRequest,
-        selection: AgentSessionLanePolicy.RoleSelection
+        selection: AgentSessionLanePolicy.RoleSelection,
+        destinationWindowID: Int,
+        workspaceID: UUID
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination, !Task.isCancelled, let host else {
             return .refused(.shuttingDown)
@@ -6465,8 +6531,8 @@ final class AgentSessionLinkRuntimeBridge {
         let creation: AgentSessionLaneHostCreationOutcome
         do {
             creation = try await host.agentSessionLinkCreateLane(
-                destinationWindowID: request.destinationWindowID,
-                workspaceID: request.workspaceID,
+                destinationWindowID: destinationWindowID,
+                workspaceID: workspaceID,
                 creatorSessionID: observerEndpoint.sessionID,
                 sessionName: request.sessionName,
                 selection: selection
@@ -6474,10 +6540,13 @@ final class AgentSessionLinkRuntimeBridge {
         } catch { return .refused(.destinationUnavailable) }
         let sessionID: UUID
         let tabID: UUID
+        let bindingToken: AgentSessionRestorationBindingToken?
         let saved: Bool
         switch creation {
-        case let .created(id, tab): (sessionID, tabID, saved) = (id, tab, true)
-        case let .creationIncomplete(id, tab): (sessionID, tabID, saved) = (id, tab, false)
+        case let .created(id, tab, token):
+            (sessionID, tabID, bindingToken, saved) = (id, tab, token, true)
+        case let .creationIncomplete(id, tab):
+            (sessionID, tabID, bindingToken, saved) = (id, tab, nil, false)
         }
         func receipt(_ linked: Bool, _ reason: AgentSessionLaneCreateReceipt.Reason?,
                      _ firstTask: AgentSessionLaneCreateReceipt.FirstTask = .none) async -> AgentSessionLaneCreateReceipt {
@@ -6498,16 +6567,28 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let matches = host.agentSessionLinkCandidates().filter { $0.sessionID == sessionID }
         guard matches.count == 1, matches[0].tabID == tabID,
-              matches[0].restorationReadiness.isAuthoritative,
+              let bindingToken,
+              matches[0].restorationReadiness == .authoritative(
+                  bindingToken, .freshBindingDurablyCreated
+              ),
               host.agentSessionLinkLaneProvenance(for: matches[0].domainEndpoint) == observerEndpoint.sessionID
         else { return await receipt(false, .addFailed) }
         let laneEndpoint = matches[0].domainEndpoint
+        let observers = host.agentSessionLinkCandidates().filter {
+            $0.domainEndpoint == observerEndpoint
+        }
+        guard observers.count == 1,
+              let proof = AgentSessionOversightRestorationProof(
+                  observer: observers[0], target: matches[0], requireObserverAuthoritative: false
+              )
+        else { return await receipt(false, .addFailed) }
         let add = await addMonitorLink(
             pair: AgentSessionOversightIntent(
                 observerSessionID: observerEndpoint.sessionID, targetSessionID: sessionID
             ),
             expectedObserverEndpoint: observerEndpoint,
-            expectedTargetEndpoint: laneEndpoint
+            expectedTargetEndpoint: laneEndpoint,
+            proof: proof
         )
         switch add {
         case .added, .alreadyLinked: break
@@ -6571,32 +6652,38 @@ final class AgentSessionLinkRuntimeBridge {
         guard host.agentSessionLinkLaneProvenance(for: endpoint) == observerEndpoint.sessionID else {
             return .notRetired(sessionID: targetSessionID, reason: .notRetirable)
         }
-        let candidates = host.agentSessionLinkCandidates()
-        guard candidates.filter({ $0.sessionID == targetSessionID }).count == 1 else {
+        #if DEBUG
+            await test_afterRetireAuthorizationBeforeFence?()
+        #endif
+        guard host.agentSessionLinkBindingCount(sessionID: targetSessionID) == 1 else {
             return .notRetired(sessionID: targetSessionID, reason: .laneInUse)
         }
-        let inbound = await authority.links(forTarget: targetSessionID)
-        let outbound = await authority.links(forObserver: targetSessionID)
-        guard inbound.items.count == 1,
-              inbound.items[0].linkID == target.lease.linkID,
-              inbound.items[0].generation == target.lease.linkGeneration,
-              outbound.items.isEmpty,
-              pendingSendsByReference[target.lease.reference] == nil
-        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUse) }
-        #if DEBUG
-            await test_afterRetireRelationshipPrecheck?()
-        #endif
+        // Install the fence before the relationship snapshot. New Adds in either direction now
+        // fail at preflight, reservation, activation and caller completion.
         guard !isFrozenForTermination, !retiringTargets.contains(endpoint) else {
             return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
         }
         retiringTargets.insert(endpoint)
         defer { retiringTargets.remove(endpoint) }
+        let relationships = await authority.relationshipInventories(forSessionID: targetSessionID)
+        guard relationships.inbound.items.count == 1,
+              relationships.inbound.items[0].linkID == target.lease.linkID,
+              relationships.inbound.items[0].generation == target.lease.linkGeneration,
+              relationships.outbound.items.isEmpty,
+              pendingSendsByReference[target.lease.reference] == nil
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUse) }
+        #if DEBUG
+            await test_afterRetireRelationshipPrecheck?()
+        #endif
         let stillRetirable: @MainActor () -> Bool = { [weak self, weak host] in
             guard let self, let host, !self.isFrozenForTermination,
                   self.retiringTargets.contains(endpoint),
                   !AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: targetSessionID),
                   host.agentSessionLinkLaneProvenance(for: endpoint) == observerEndpoint.sessionID
             else { return false }
+            guard host.agentSessionLinkBindingCount(sessionID: targetSessionID) == 1 else {
+                return false
+            }
             let live = host.agentSessionLinkCandidates().filter { $0.sessionID == targetSessionID }
             return live.count == 1 && live[0].domainEndpoint == endpoint
         }
@@ -6614,9 +6701,10 @@ final class AgentSessionLinkRuntimeBridge {
         case .alreadyStopped: return .notRetired(sessionID: targetSessionID, reason: .alreadyStopped)
         case .stopped: break
         }
+        let remaining = await authority.relationshipInventories(forSessionID: targetSessionID)
         guard !isFrozenForTermination, stillRetirable(),
-              (await authority.links(forTarget: targetSessionID)).items.isEmpty,
-              (await authority.links(forObserver: targetSessionID)).items.isEmpty
+              remaining.inbound.items.isEmpty,
+              remaining.outbound.items.isEmpty
         else { return .unlinkedNotStashed(sessionID: targetSessionID) }
         return await host.agentSessionLinkRetireLane(
             endpoint: endpoint, commit: true, isStillRetirable: stillRetirable

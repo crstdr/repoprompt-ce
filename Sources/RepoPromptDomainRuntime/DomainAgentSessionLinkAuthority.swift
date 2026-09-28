@@ -228,6 +228,14 @@ package actor DomainAgentSessionLinkAuthority {
         )
     }
 
+    /// One actor turn for retirement's both-direction relationship cutoff. UUID-scoped rather
+    /// than exact-endpoint-scoped so a stale grant on another incarnation also blocks stash.
+    package func relationshipInventories(
+        forSessionID sessionID: UUID
+    ) -> (inbound: DomainAgentSessionLinkInventory, outbound: DomainAgentSessionLinkInventory) {
+        (links(forTarget: sessionID), links(forObserver: sessionID))
+    }
+
     // MARK: - Change feed
 
     /// Identity/revision-only change feed. Consumers refetch an authoritative snapshot.

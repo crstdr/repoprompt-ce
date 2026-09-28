@@ -977,6 +977,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     #if DEBUG
         var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)?
+        /// Holds lane creation after provenance is installed and before configuration.
+        var test_afterOversightLaneProvision: (@MainActor (UUID) async -> Void)?
         var test_updateBindingsCallCount: Int = 0
         var test_syncComposerCallCount: Int = 0
         var test_syncRuntimeMetricsCallCount: Int = 0
@@ -8881,6 +8883,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let expectedToken = session.currentRestorationBindingToken,
                 !Task.isCancelled
             else { return false }
+
+            // An ordinary save may already have entered before lane provenance/configuration was
+            // installed. Invalidate its commit token, wait for its physical write to finish, then
+            // drive the authoritative first save last; cancelling the debounce alone cannot do it.
+            session.saveRequestGeneration &+= 1
+            while saveInFlightSessionIDs.contains(sessionID) {
+                await waitForInFlightSave(sessionID: sessionID)
+            }
+            guard sessions[session.tabID] === session,
+                  session.currentRestorationBindingToken == expectedToken,
+                  workspaceManager?.activeWorkspaceID == workspaceID,
+                  !Task.isCancelled
+            else { return false }
+            session.saveDebounceTask?.cancel()
+            session.saveDebounceTask = nil
+            session.isDirty = true
 
             let firstSave = await saveSessionCore(for: session.tabID)
             guard case let .durablySaved(bindingToken) = firstSave,
