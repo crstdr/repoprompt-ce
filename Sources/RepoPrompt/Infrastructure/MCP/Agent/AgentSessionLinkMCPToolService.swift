@@ -160,6 +160,12 @@ struct AgentSessionLinkMCPToolService {
         case "stop":
             try validateAllowedKeys(args, op: op, allowed: Self.stopKeys)
             return try await executeStop(args: args)
+        case "create_lane":
+            try validateAllowedKeys(args, op: op, allowed: Self.createLaneKeys)
+            return try await executeCreateLane(args: args)
+        case "retire_lane":
+            try validateAllowedKeys(args, op: op, allowed: Self.retireLaneKeys)
+            return try await executeRetireLane(args: args)
         default:
             let retiredInteractionHint = op == "get_interaction"
                 ? " For a pending prompt, use poll or wait on the exact target, then respond with its interaction_id."
@@ -175,7 +181,7 @@ struct AgentSessionLinkMCPToolService {
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
         "Use list, poll, wait, read, send, cancel_pending_send, compact, set_waiting_on, snooze_auto_wake, "
-            + "request_attention, respond, steer, or stop."
+            + "request_attention, respond, steer, stop, create_lane, or retire_lane."
 
     private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
         let endpoint = try await resolveCallerEndpointIdentity()
@@ -529,6 +535,92 @@ struct AgentSessionLinkMCPToolService {
 
     // MARK: - list
 
+    /// The bridge owns authority and sequencing; this surface owns only parsing and receipts.
+    private func executeCreateLane(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        if let refusal = await bridge.laneCreationCallerPreflight(observerEndpoint) {
+            if refusal == .denied { throw Self.unavailableError }
+            return AgentSessionLaneMCPToolService.refusal(refusal.rawValue)
+        }
+        let key = try Self.parseIdempotencyKey(args["idempotency_key"], op: "create_lane")
+        let role: String?
+        if let value = args["role"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane role must be a string.")
+            }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard AgentModelCatalog.TaskLabelKind(rawValue: normalized) != nil else {
+                let roles = AgentModelCatalog.TaskLabelKind.allCases.map(\.rawValue).joined(separator: ", ")
+                throw MCPError.invalidParams("agent_session_link create_lane role must be one of: \(roles).")
+            }
+            role = normalized
+        } else {
+            role = nil
+        }
+        let sessionName: String?
+        if let value = args["session_name"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane session_name must be a string.")
+            }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty, normalized.utf8.count <= 120 else {
+                throw MCPError.invalidParams("agent_session_link create_lane session_name must be 1–120 UTF-8 bytes.")
+            }
+            sessionName = normalized
+        } else {
+            sessionName = nil
+        }
+        let message = try args["message"].map { try Self.parseMessage($0, op: "create_lane") }
+        let workflowReference = try AgentWorkflowReference.parse(args: args)
+        guard message != nil || workflowReference == nil else {
+            throw MCPError.invalidParams("agent_session_link create_lane workflow requires message.")
+        }
+        let workspaceSelector: String?
+        if let value = args["workspace"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane workspace must be a name or UUID string.")
+            }
+            workspaceSelector = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard workspaceSelector?.isEmpty == false else {
+                throw MCPError.invalidParams("agent_session_link create_lane workspace must not be empty.")
+            }
+        } else {
+            workspaceSelector = nil
+        }
+        let callerWindow = try requireTargetWindow()
+        let receipt = await bridge.createLane(
+            observerEndpoint: observerEndpoint,
+            request: AgentSessionLaneCreateRequest(
+                idempotencyKey: key,
+                role: role,
+                sessionName: sessionName,
+                workspaceSelector: workspaceSelector,
+                message: message,
+                workflowReference: workflowReference
+            ),
+            resolveDestination: {
+                AgentSessionLaneMCPToolService.resolveDestination(
+                    workspaceSelector: workspaceSelector, callerWindow: callerWindow
+                ).map { (windowID: $0.windowID, workspaceID: $0.workspaceID) }
+            }
+        )
+        if receipt.reason == .denied { throw Self.unavailableError }
+        return AgentSessionLaneMCPToolService.render(receipt)
+    }
+
+    private func executeRetireLane(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        let targetSessionID = try Self.parseSingleSessionID(args["session_id"], op: "retire_lane")
+        let outcome = await bridge.retireLane(
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        )
+        if case .notRetired(_, .denied) = outcome {
+            throw Self.denialError(targetSessionID: targetSessionID)
+        }
+        return AgentSessionLaneMCPToolService.render(outcome)
+    }
+
     private func executeList(args: [String: Value]) async throws -> Value {
         let observerEndpoint = try await resolveCallerEndpointIdentity()
         let inventory: DomainAgentSessionLinkInventory
@@ -565,6 +657,10 @@ struct AgentSessionLinkMCPToolService {
         }
 
         let page = inventory.items.dropFirst(offset).prefix(maxItems)
+        let createdByYou = Set(
+            bridge.laneAnnotatedPromptInventory(inventory).items
+                .filter(\.createdByYou).map(\.targetSessionID)
+        )
         let nextOffset = offset + page.count
         let hasMore = nextOffset < inventory.items.count
 
@@ -577,7 +673,8 @@ struct AgentSessionLinkMCPToolService {
                     "session_id": .string(item.targetSessionID.uuidString),
                     "name": AgentMCPToolHelpers.stringOrNull(item.displayName),
                     "capabilities": .array(item.capabilityNames.map { .string($0) }),
-                    "managed": .bool(item.capabilities.contains(.manage))
+                    "managed": .bool(item.capabilities.contains(.manage)),
+                    "created_by_you": .bool(createdByYou.contains(item.targetSessionID))
                 ])
             }),
             "has_more": .bool(hasMore),
@@ -1520,6 +1617,11 @@ struct AgentSessionLinkMCPToolService {
     /// now, into whatever the target is doing, under its own current settings.
     static let steerKeys: Set<String> = ["op", "session_id", "message", "idempotency_key"]
     static let stopKeys: Set<String> = ["op", "session_id", "idempotency_key"]
+    static let createLaneKeys: Set<String> = [
+        "op", "idempotency_key", "role", "session_name", "workspace", "message",
+        "workflow_id", "workflow_name"
+    ]
+    static let retireLaneKeys: Set<String> = ["op", "session_id"]
     // The caller still comes only from server-owned run routing. `observer_session_id` is a selector
     // over that caller's exact inbound grants, never a caller identity or an authority claim.
 

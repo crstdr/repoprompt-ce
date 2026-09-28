@@ -306,7 +306,8 @@ package enum MCPDomainToolCatalog {
         .init(name: MCPWindowToolName.agentSessionLink, scope: .window, capability: .agentSessionLinkControl, admissionClass: .control, operationPolicy: .init(
             operations: [
                 "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact", "set_waiting_on",
-                "snooze_auto_wake", "request_attention", "respond", "steer", "stop"
+                "snooze_auto_wake", "request_attention", "respond", "steer", "stop",
+                "create_lane", "retire_lane"
             ],
             normalization: .trimmedLowercased
         )),

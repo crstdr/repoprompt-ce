@@ -229,14 +229,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 9 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 10 supersedes"))
         // The rule revision 8 changes: a context taught it may only observe — and that may have
         // refused its own user on that basis — is told outright what replaced it.
         XCTAssertTrue(reOwed.fragment.contains("including anything said earlier in this conversation"))
         XCTAssertTrue(reOwed.fragment.contains("by RepoPrompt or by you"))
         XCTAssertTrue(reOwed.fragment.contains("being unable to steer it"))
         XCTAssertTrue(reOwed.fragment.contains("direct it with `steer`"))
-        XCTAssertTrue(reOwed.fragment.contains("compact` is newly permitted at watch level"))
+        XCTAssertTrue(reOwed.fragment.contains("compact` is permitted at watch level"))
         XCTAssertTrue(reOwed.fragment.contains("attributed attention request"))
         XCTAssertTrue(reOwed.fragment.contains("master Auto-wake"))
         XCTAssertTrue(reOwed.fragment.contains("lane&apos;s own toggle"))

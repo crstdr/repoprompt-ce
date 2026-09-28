@@ -40,7 +40,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             [
                 "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact",
                 "set_waiting_on", "snooze_auto_wake", "request_attention",
-                "respond", "steer", "stop"
+                "respond", "steer", "stop", "create_lane", "retire_lane"
             ]
         )
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
@@ -166,7 +166,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         ] {
             XCTAssertTrue(definition.description.contains(invariant), invariant)
         }
-        XCTAssertLessThan(definition.description.count, 4_500)
+        XCTAssertLessThan(definition.description.count, 4_800)
         XCTAssertFalse(definition.description.contains("questions take `answers`"))
         XCTAssertFalse(definition.description.contains("Never answer, approve, deny"))
         XCTAssertFalse(definition.description.contains("Answer prompts"))
@@ -473,6 +473,17 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(again.inputSchema, current.inputSchema)
         XCTAssertEqual(again.annotations, current.annotations)
         XCTAssertEqual(again.isEnabledByDefault, current.isEnabledByDefault)
+    }
+
+    func testPreviousCompactDefinitionMigratesThroughOuterLaneStage() throws {
+        let previous = MCPDomainCanonicalToolDefinitions.test_agentSessionLinkPreviousCompactDefinition()
+        let migrated = MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(previous)
+        let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        XCTAssertEqual(migrated.description, current.description)
+        XCTAssertEqual(migrated.inputSchema, current.inputSchema)
+        let again = MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(migrated)
+        XCTAssertEqual(again.description, current.description)
+        XCTAssertEqual(again.inputSchema, current.inputSchema)
     }
 
     /// An exact revision-4 Snooze pair is a supported historical input. Both owned anchors advance
