@@ -8,16 +8,17 @@ import Foundation
 // writes them on link creation and removal. Invariants: the durable payload carries no link IDs,
 // generations, endpoint incarnations, or Auto-wake/snooze state — those are process-local and are
 // re-derived on restore — and every mutation is token-fenced so a stale attempt cannot overwrite a
-// newer document.
+// newer document. Optional upstream `delegations` rows are retained for wire compatibility but
+// are not consulted when this fork restores or adds a link; neither stored bit confers authority.
 
 // MARK: - Durable model
 
 /// One directed overseer → overseen relationship the user explicitly created.
 ///
-/// This is the **entire** durable payload. Link IDs, generations, endpoint incarnations, binding
-/// generations, capabilities, reservations, observations, cursors, waiters, prompt inventories, and
-/// delivery state stay process-local in `DomainAgentSessionLinkAuthority` and are never written to
-/// disk: a persisted grant would be an authorization this process never re-derived.
+/// Together with its optional `AgentSessionOversightDelegation`, this is the **entire** durable
+/// payload. Link IDs, generations, endpoint incarnations, binding generations, reservations,
+/// observations, cursors, waiters, prompt inventories, and delivery state stay process-local in
+/// `DomainAgentSessionLinkAuthority` and are never written to disk.
 struct AgentSessionOversightIntent: Codable, Hashable {
     let observerSessionID: UUID
     let targetSessionID: UUID
@@ -41,16 +42,64 @@ struct AgentSessionOversightIntent: Codable, Hashable {
     }
 }
 
-/// Versioned on-disk envelope. Version 1 carries only the directed UUID pairs.
+/// Upstream delegation fields retained in the intent-store compatibility model.
+///
+/// This fork never applies either field to a live grant. New grants start managed by default,
+/// and permission prompts always require an explicit response.
+struct AgentSessionOversightDelegation: Hashable {
+    /// Former upstream management preference; ignored by this fork.
+    var manage = false
+    /// Former upstream auto-approval preference; ignored by this fork.
+    var autoApprovePermissions = false
+
+    static let none = AgentSessionOversightDelegation()
+
+    var isEmpty: Bool {
+        !manage && !autoApprovePermissions
+    }
+}
+
+/// One on-disk compatibility row. Retained only when its pair is present in `links`.
+struct AgentSessionOversightDelegationRecord: Codable, Hashable {
+    let observerSessionID: UUID
+    let targetSessionID: UUID
+    /// Optional so a future field can be added without breaking older decoders, and so an absent
+    /// value reads as "not delegated".
+    var manage: Bool?
+    var autoApprovePermissions: Bool?
+
+    var pair: AgentSessionOversightIntent {
+        AgentSessionOversightIntent(observerSessionID: observerSessionID, targetSessionID: targetSessionID)
+    }
+
+    var delegation: AgentSessionOversightDelegation {
+        AgentSessionOversightDelegation(
+            manage: manage ?? false,
+            autoApprovePermissions: autoApprovePermissions ?? false
+        )
+    }
+}
+
+/// Versioned on-disk envelope.
+///
+/// Version 1 carries the directed UUID pairs plus an optional, additive `delegations` array. The
+/// array is omitted when empty, so a document with no delegation is byte-identical to the original
+/// format; an older build ignores the unknown key and still loads every pair.
 struct AgentSessionOversightIntentDocument: Codable {
     static let currentVersion = 1
 
     let version: Int
     let links: [AgentSessionOversightIntent]
+    let delegations: [AgentSessionOversightDelegationRecord]?
 
-    init(version: Int = AgentSessionOversightIntentDocument.currentVersion, links: [AgentSessionOversightIntent]) {
+    init(
+        version: Int = AgentSessionOversightIntentDocument.currentVersion,
+        links: [AgentSessionOversightIntent],
+        delegations: [AgentSessionOversightDelegationRecord]? = nil
+    ) {
         self.version = version
         self.links = links
+        self.delegations = delegations
     }
 }
 
@@ -142,6 +191,8 @@ struct AgentSessionOversightIntentReadyLoad: Equatable {
     let source: Source
     let storeRevision: UInt64
     let tokenByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentToken]
+    /// Compatibility data for loaded pairs, never applied to live grants in this fork.
+    var delegationByPair: [AgentSessionOversightIntent: AgentSessionOversightDelegation] = [:]
 
     var pairs: Set<AgentSessionOversightIntent> {
         Set(tokenByPair.keys)
@@ -256,6 +307,8 @@ actor AgentSessionOversightIntentStore {
     private var settledSource: AgentSessionOversightIntentReadyLoad.Source?
     private var blockReason: AgentSessionOversightPersistenceBlockReason?
     private var tokenByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentToken] = [:]
+    /// Preserved compatibility rows. Every key is in `tokenByPair`; no value is empty.
+    private var delegationByPair: [AgentSessionOversightIntent: AgentSessionOversightDelegation] = [:]
     /// How many times each pair has been *asserted* in this process. Monotonic and never reset, not
     /// even by a removal.
     ///
@@ -374,6 +427,13 @@ actor AgentSessionOversightIntentStore {
             guard tokenByPair[pair] == nil else { continue }
             tokenByPair[pair] = mintToken(for: pair)
         }
+        // A compatibility row is retained only for a present pair; an orphan has no relationship.
+        for record in document.delegations ?? [] {
+            let pair = record.pair
+            let delegation = record.delegation
+            guard tokenByPair[pair] != nil, !delegation.isEmpty else { continue }
+            delegationByPair[pair] = delegation
+        }
         return .ready(readyLoad(source: .loaded))
     }
 
@@ -428,7 +488,8 @@ actor AgentSessionOversightIntentStore {
         return AgentSessionOversightIntentReadyLoad(
             source: source,
             storeRevision: storeRevision,
-            tokenByPair: tokenByPair
+            tokenByPair: tokenByPair,
+            delegationByPair: delegationByPair
         )
     }
 
@@ -470,6 +531,7 @@ actor AgentSessionOversightIntentStore {
         replacement[pair] = mintToken(for: pair, revision: storeRevision &+ 1)
         var receipt = commit(
             pairs: Set(replacement.keys),
+            delegations: delegationByPair,
             revisionBefore: storeRevision,
             transitions: [.init(pair: pair, before: nil, after: replacement[pair])],
             apply: { [self] in
@@ -543,14 +605,23 @@ actor AgentSessionOversightIntentStore {
         }
         var remaining = tokenByPair
         remaining.removeValue(forKey: pair)
+        var remainingDelegations = delegationByPair
+        remainingDelegations.removeValue(forKey: pair)
         return commit(
             pairs: Set(remaining.keys),
+            delegations: remainingDelegations,
             revisionBefore: storeRevision,
             transitions: [.init(pair: pair, before: current, after: nil)],
             apply: { [self] in
                 tokenByPair = remaining
+                delegationByPair = remainingDelegations
             }
         )
+    }
+
+    /// Retained compatibility fields for one saved pair, or `.none` otherwise.
+    func delegation(for pair: AgentSessionOversightIntent) -> AgentSessionOversightDelegation {
+        delegationByPair[pair] ?? .none
     }
 
     /// Removes every intent touching one session. Used only when the session itself is known to be
@@ -593,19 +664,23 @@ actor AgentSessionOversightIntentStore {
             )
         }
         var remaining = tokenByPair
+        var remainingDelegations = delegationByPair
         for pair in matches.keys {
             remaining.removeValue(forKey: pair)
+            remainingDelegations.removeValue(forKey: pair)
         }
         let transitions = matches
             .map { AgentSessionOversightIntentTokenTransition(pair: $0.key, before: $0.value, after: nil) }
             .sorted { AgentSessionOversightIntent.canonicallyOrdered($0.pair, $1.pair) }
         return commit(
             pairs: Set(remaining.keys),
+            delegations: remainingDelegations,
             revisionBefore: storeRevision,
             transitions: transitions,
             attemptedCurrentByPair: attempted,
             apply: { [self] in
                 tokenByPair = remaining
+                delegationByPair = remainingDelegations
             }
         )
     }
@@ -705,6 +780,7 @@ actor AgentSessionOversightIntentStore {
     ///   blocked or fails, so committed-deletion cleanup can queue exact retries without another hop.
     private func commit(
         pairs: Set<AgentSessionOversightIntent>,
+        delegations: [AgentSessionOversightIntent: AgentSessionOversightDelegation],
         revisionBefore: UInt64,
         transitions: [AgentSessionOversightIntentTokenTransition],
         attemptedCurrentByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentCurrentAttempt] = [:],
@@ -717,8 +793,21 @@ actor AgentSessionOversightIntentStore {
         guard pairs.count <= maxDecodedRowCount else {
             return blockedReceipt(attemptedCurrentByPair: attemptedCurrentByPair)
         }
+        let delegationRecords = delegations
+            .filter { pairs.contains($0.key) && !$0.value.isEmpty }
+            .sorted { AgentSessionOversightIntent.canonicallyOrdered($0.key, $1.key) }
+            .map { pair, delegation in
+                AgentSessionOversightDelegationRecord(
+                    observerSessionID: pair.observerSessionID,
+                    targetSessionID: pair.targetSessionID,
+                    manage: delegation.manage ? true : nil,
+                    autoApprovePermissions: delegation.autoApprovePermissions ? true : nil
+                )
+            }
         let document = AgentSessionOversightIntentDocument(
-            links: pairs.sorted(by: AgentSessionOversightIntent.canonicallyOrdered)
+            links: pairs.sorted(by: AgentSessionOversightIntent.canonicallyOrdered),
+            // Omitted when empty so a document without delegation keeps the original format.
+            delegations: delegationRecords.isEmpty ? nil : delegationRecords
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
