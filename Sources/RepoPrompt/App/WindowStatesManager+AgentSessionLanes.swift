@@ -11,7 +11,7 @@ extension WindowStatesManager {
         creatorSessionID: UUID,
         sessionName: String?,
         selection: AgentSessionLanePolicy.RoleSelection
-    ) async throws -> AgentModeViewModel.MCPOversightLaneCreationOutcome {
+    ) async throws -> AgentSessionLaneHostCreationOutcome {
         guard !isTerminating,
               let window = window(withID: destinationWindowID),
               !window.isClosing,
@@ -20,11 +20,34 @@ extension WindowStatesManager {
         else {
             throw MCPError.invalidParams("The lane destination is unavailable.")
         }
-        return try await window.agentModeViewModel.mcpCreateOversightLane(
+        let outcome = try await window.agentModeViewModel.mcpCreateOversightLane(
             creatorSessionID: creatorSessionID,
             sessionName: sessionName,
             selection: selection,
             expectedWorkspaceID: workspaceID
+        )
+        switch outcome {
+        case let .created(sessionID, tabID): return .created(sessionID: sessionID, tabID: tabID)
+        case let .creationIncomplete(sessionID, tabID):
+            return .creationIncomplete(sessionID: sessionID, tabID: tabID)
+        }
+    }
+
+    func agentSessionLinkRetireLane(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        commit: Bool,
+        isStillRetirable: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        guard !isTerminating,
+              let window = window(withID: endpoint.windowID),
+              !window.isClosing,
+              window.workspaceManager.activeWorkspaceID == endpoint.workspaceID,
+              window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+        else { return false }
+        return await window.agentModeViewModel.agentSessionLinkRetireLane(
+            endpoint: endpoint,
+            commit: commit,
+            isStillRetirable: isStillRetirable
         )
     }
 

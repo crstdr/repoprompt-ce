@@ -113,4 +113,45 @@ extension AgentModeViewModel {
         }
         return ownerValidatedSessionIndex[endpoint.sessionID]?.createdByOverseerSessionID
     }
+
+    /// Preflight or stash one exact inactive lane. Both removal CAS hooks repeat the check around
+    /// the required session flush; a prompt or run starting during that await keeps the tab open.
+    func agentSessionLinkRetireLane(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        commit: Bool,
+        isStillRetirable: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        let canRetire: @MainActor () -> Bool = { [weak self] in
+            guard let self,
+                  isStillRetirable(),
+                  self.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+                  let session = self.session(for: endpoint.tabID, createIfNeeded: false),
+                  session.activeAgentSessionID == endpoint.sessionID,
+                  !session.runState.isActive,
+                  session.waitingPrompt == nil,
+                  Self.pendingInteractionKind(for: session) == nil,
+                  !session.isComposerSubmissionInFlight,
+                  !session.mcpFollowUpRunPending,
+                  !session.terminalCommitInProgress,
+                  session.pendingInstructions.isEmpty,
+                  session.pendingACPSteeringInstructions.isEmpty,
+                  session.pendingClaudeSteeringInstructions.isEmpty,
+                  session.oversight.pendingAutoWake == nil
+            else { return false }
+            return true
+        }
+        guard canRetire(), let promptManager else { return false }
+        guard commit else { return true }
+        let report = await promptManager.stashComposeTabs(
+            withIDs: [endpoint.tabID],
+            isMutationContextCurrent: canRetire,
+            postPreflightValidation: canRetire,
+            expandCascade: false
+        )
+        return report.rejections.isEmpty
+            && report.removedComposeTabIDs.contains(endpoint.tabID)
+            && workspaceManager?.activeWorkspace?.stashedTabs.contains(where: {
+                $0.tab.id == endpoint.tabID
+            }) == true
+    }
 }
