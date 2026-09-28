@@ -96,6 +96,14 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> DomainAgentSessionObservationSnapshot
 
+    /// Batch-refreshes durable child metadata without doing a registry scan for each target.
+    func agentSessionLinkRefreshSubagentCensus(
+        for candidates: [AgentSessionLinkEndpointCandidate]
+    ) async
+
+    /// Removes one committed deletion from every live board cache before tab teardown finishes.
+    func agentSessionLinkForgetDeletedSubagent(_ sessionID: UUID)
+
     /// Status/activity-only projection for one exact live candidate.
     ///
     /// Reads only the run-state, pending-interaction, and canonical activity fields. It must never materialize, scan, or
@@ -387,6 +395,12 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkRefreshSubagentCensus(
+        for _: [AgentSessionLinkEndpointCandidate]
+    ) async {}
+
+    func agentSessionLinkForgetDeletedSubagent(_: UUID) {}
+
     /// Fail-closed management defaults: a host that does not model interactions or steering exposes
     /// none, answers none, and steers nothing.
     func agentSessionLinkPerformSteer(
@@ -978,7 +992,9 @@ final class AgentSessionLinkRuntimeBridge {
         // metadata cleanup, the next batch file, or view-model teardown while this UUID's grants are
         // still live and its saved rows still on disk.
         AgentSessionDeletionRegistry.shared.commitObserver = { [weak self] sessionID in
-            await self?.handleCommittedSessionDeletion(sessionID)
+            guard let self else { return }
+            await handleCommittedSessionDeletion(sessionID)
+            self.host?.agentSessionLinkForgetDeletedSubagent(sessionID)
         }
         AgentSessionDeletionRegistry.shared.changeObserver = { [weak self] in
             self?.noteCandidateReadinessChanged()
@@ -3429,15 +3445,19 @@ final class AgentSessionLinkRuntimeBridge {
     ///
     /// Sequence allocation happens before the actor hop, so ordering is decided by MainActor order
     /// rather than by task scheduling; the authority's high-water rule is the second line of defence.
-    private func publishTargetSnapshot(forTargetSession sessionID: UUID) {
+    private func publishTargetSnapshot(
+        forTargetSession sessionID: UUID,
+        validatedCandidate: AgentSessionLinkEndpointCandidate? = nil
+    ) {
         guard let chain = chains[sessionID], let host else { return }
         let endpoint = chain.endpoint
         // Resolved by exact incarnation, never by session UUID. A UUID lookup that demands a unique
         // match reports "ambiguous" the moment a second live incarnation of this UUID opens, which
         // would revoke this still-valid grant as `.targetIdentityDrift`; a lookup that tolerated
         // ambiguity would publish some other incarnation's state under this grant.
-        guard let candidate = host.agentSessionLinkCandidates()
-            .first(where: { $0.domainEndpoint == endpoint })
+        guard let candidate = validatedCandidate ?? host.agentSessionLinkCandidates()
+            .first(where: { $0.domainEndpoint == endpoint }),
+            candidate.domainEndpoint == endpoint
         else {
             // Identity drift: revoke rather than publish state for a different incarnation.
             removeChain(forTargetSession: sessionID, matching: endpoint)
@@ -5174,6 +5194,26 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Current sanitized target state plus a freshly minted successor wait cursor.
+    /// Loads durable child metadata once for the batch, then publishes the resulting target
+    /// snapshots before a poll or wait reads the authority. One live-candidate map serves all rows.
+    func refreshLaneBoardCensus(for targets: [AuthorizedTarget]) async {
+        guard let host, !targets.isEmpty else { return }
+        await host.agentSessionLinkRefreshSubagentCensus(for: targets.map(\.candidate))
+        let candidatesByEndpoint = Dictionary(
+            host.agentSessionLinkCandidates().map { ($0.domainEndpoint, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        for target in targets {
+            publishTargetSnapshot(
+                forTargetSession: target.lease.target.sessionID,
+                validatedCandidate: candidatesByEndpoint[target.candidate.domainEndpoint]
+            )
+        }
+        for target in targets {
+            await chains[target.lease.target.sessionID]?.tail?.value
+        }
+    }
+
     func targetState(
         for lease: DomainAgentSessionLinkLease
     ) async -> DomainAgentSessionLinkTargetState? {

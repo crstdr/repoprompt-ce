@@ -304,11 +304,94 @@ extension AgentModeViewModel {
                 lastActivityAt: Date()
             )
         }
+        let counts = agentSessionLinkCensusWorkspaceID == candidate.workspaceID
+            ? agentSessionLinkSubagentCensus.counts(for: candidate.sessionID)
+            : .init()
         return Self.observationSnapshot(
             for: session,
             candidate: candidate,
-            subagentCounts: (running: 0, finished: 0)
+            subagentCounts: (running: counts.running, finished: counts.finished)
         )
+    }
+
+    /// Refresh durable child metadata once for a poll/wait batch. The synchronous snapshot path
+    /// reads only the already-merged parent lookup and never scans the registry per target.
+    func agentSessionLinkRefreshSubagentCensus(for workspace: WorkspaceModel) async {
+        agentSessionLinkSubagentRefreshGeneration &+= 1
+        let generation = agentSessionLinkSubagentRefreshGeneration
+        guard let persisted = try? await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace),
+              !Task.isCancelled,
+              generation == agentSessionLinkSubagentRefreshGeneration,
+              workspaceManager?.activeWorkspace?.id == workspace.id
+        else { return }
+        agentSessionLinkPersistedSubagentWorkspaceID = workspace.id
+        agentSessionLinkPersistedSubagentMeta = persisted
+        rebuildAgentSessionLinkSubagentCensus()
+    }
+
+    /// A durable tombstone is definitive even before all windows finish closing their tabs or
+    /// metadata/index cleanup. Forget it process-wide so parked parent observers see removal.
+    func agentSessionLinkForgetDeletedSubagent(_ sessionID: UUID) {
+        agentSessionLinkPersistedSubagentMeta.removeAll { $0.id == sessionID }
+        rebuildAgentSessionLinkSubagentCensus()
+    }
+
+    func rebuildAgentSessionLinkSubagentCensus(reconcileLiveObservers: Bool = false) {
+        if reconcileLiveObservers {
+            agentSessionLinkChildRunSubscriptions.removeAll()
+            for session in sessions.values {
+                agentSessionLinkChildRunSubscriptions[session.tabID] = session.$runState
+                    .dropFirst()
+                    .receive(on: DispatchQueue.main)
+                    .sink { [weak self] _ in
+                        MainActor.assumeIsolated {
+                            self?.rebuildAgentSessionLinkSubagentCensus()
+                        }
+                    }
+            }
+        }
+
+        let activeWorkspaceID = workspaceManager?.activeWorkspace?.id
+        let persisted: [AgentSessionLinkSubagentCensus.Record] =
+            agentSessionLinkPersistedSubagentWorkspaceID == activeWorkspaceID
+                ? agentSessionLinkPersistedSubagentMeta.compactMap {
+                    guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: $0.id) else { return nil }
+                    return .init(sessionID: $0.id, parentSessionID: $0.parentSessionID, isLiveNonTerminal: false)
+                }
+                : []
+        let index = ownerValidatedSessionIndex.values.compactMap { entry -> AgentSessionLinkSubagentCensus.Record? in
+            guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: entry.id) else { return nil }
+            return .init(sessionID: entry.id, parentSessionID: entry.parentSessionID, isLiveNonTerminal: false)
+        }
+        var knownParentBySessionID: [UUID: UUID] = [:]
+        for record in persisted {
+            if let parentID = record.parentSessionID { knownParentBySessionID[record.sessionID] = parentID }
+        }
+        for record in index {
+            if let parentID = record.parentSessionID { knownParentBySessionID[record.sessionID] = parentID }
+        }
+        let live = sessions.values.compactMap { session -> AgentSessionLinkSubagentCensus.Record? in
+            guard let sessionID = session.activeAgentSessionID,
+                  !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID)
+            else { return nil }
+            let isNonTerminal = switch session.runState {
+            case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval: true
+            case .completed, .cancelled, .failed: false
+            }
+            return .init(
+                sessionID: sessionID,
+                parentSessionID: session.parentSessionID
+                    ?? (session.hasLoadedPersistedState ? nil : knownParentBySessionID[sessionID]),
+                isLiveNonTerminal: isNonTerminal
+            )
+        }
+        let updated = AgentSessionLinkSubagentCensus(persisted: persisted, index: index, live: live)
+        let changedParents = updated.changedParents(comparedTo: agentSessionLinkSubagentCensus)
+        agentSessionLinkSubagentCensus = updated
+        agentSessionLinkCensusWorkspaceID = activeWorkspaceID
+        if !changedParents.isEmpty {
+            agentSessionLinkSubagentCensusChanged.send(changedParents)
+        }
     }
 
     /// Status/activity-only projection: run state, pending interaction, and canonical activity.
@@ -662,7 +745,11 @@ extension AgentModeViewModel {
             session.$pendingMCPElicitationRequest.map { _ in () }.eraseToAnyPublisher(),
             session.$pendingApplyEditsReview.map { _ in () }.eraseToAnyPublisher(),
             session.$pendingWorktreeMergeReview.map { _ in () }.eraseToAnyPublisher(),
-            session.monitorObservationSignal.eraseToAnyPublisher()
+            session.monitorObservationSignal.eraseToAnyPublisher(),
+            agentSessionLinkSubagentCensusChanged
+                .filter { $0.contains(candidate.sessionID) }
+                .map { _ in () }
+                .eraseToAnyPublisher()
         ]
 
         let cancellable = Publishers.MergeMany(publishers)

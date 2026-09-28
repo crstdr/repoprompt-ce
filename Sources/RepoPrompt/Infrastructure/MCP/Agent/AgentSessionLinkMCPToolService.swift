@@ -520,6 +520,8 @@ struct AgentSessionLinkMCPToolService {
             targetSessionIDs: request.sessionIDs
         )
 
+        await bridge.refreshLaneBoardCensus(for: targets)
+
         var states: [DomainAgentSessionLinkTargetState] = []
         var pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:]
         var snoozes: [UUID: AgentSessionLinkAutoWakeSnoozeProjection] = [:]
@@ -611,6 +613,7 @@ struct AgentSessionLinkMCPToolService {
             observerEndpoint: observerEndpoint,
             targetSessionIDs: request.sessionIDs
         )
+        await bridge.refreshLaneBoardCensus(for: targets)
         let waitRequests = targets.map { target in
             DomainAgentSessionLinkWaitRequest(
                 lease: target.lease,

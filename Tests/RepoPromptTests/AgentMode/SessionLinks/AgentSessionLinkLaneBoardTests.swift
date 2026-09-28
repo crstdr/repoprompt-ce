@@ -5,12 +5,17 @@ import XCTest
 
 @MainActor
 final class AgentSessionLinkLaneBoardTests: XCTestCase {
-    private func candidate(tabID: UUID, isClosing: Bool = false) -> AgentSessionLinkEndpointCandidate {
+    private func candidate(
+        tabID: UUID,
+        sessionID: UUID = UUID(),
+        workspaceID: UUID = UUID(),
+        isClosing: Bool = false
+    ) -> AgentSessionLinkEndpointCandidate {
         AgentSessionLinkEndpointCandidate(
             windowID: 1,
-            workspaceID: UUID(),
+            workspaceID: workspaceID,
             tabID: tabID,
-            sessionID: UUID(),
+            sessionID: sessionID,
             persistentBindingGeneration: UUID(),
             bindingTransitionGeneration: 1,
             isTopLevel: true,
@@ -143,5 +148,250 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             running.board.sendBlockers,
             ["pending_instructions", "run_state_active", "status_not_idle"]
         )
+    }
+
+    func testCensusMergesLiveIndexAndPersistedBySessionIDThenDropsCleanedUpChildren() {
+        typealias Record = AgentSessionLinkSubagentCensus.Record
+        let parentID = UUID()
+        let unrelatedID = UUID()
+        let liveID = UUID()
+        let terminalID = UUID()
+        let persistedOnlyID = UUID()
+        let indexOnlyID = UUID()
+        let movedID = UUID()
+        let persisted = [
+            Record(sessionID: liveID, parentSessionID: unrelatedID, isLiveNonTerminal: false),
+            Record(sessionID: terminalID, parentSessionID: parentID, isLiveNonTerminal: false),
+            Record(sessionID: persistedOnlyID, parentSessionID: parentID, isLiveNonTerminal: false),
+            Record(sessionID: movedID, parentSessionID: parentID, isLiveNonTerminal: false)
+        ]
+        let index = [
+            Record(sessionID: terminalID, parentSessionID: unrelatedID, isLiveNonTerminal: false),
+            Record(sessionID: indexOnlyID, parentSessionID: parentID, isLiveNonTerminal: false),
+            Record(sessionID: movedID, parentSessionID: nil, isLiveNonTerminal: false)
+        ]
+        let live = [
+            Record(sessionID: liveID, parentSessionID: parentID, isLiveNonTerminal: true),
+            Record(sessionID: terminalID, parentSessionID: parentID, isLiveNonTerminal: false)
+        ]
+        let census = AgentSessionLinkSubagentCensus(persisted: persisted, index: index, live: live)
+        XCTAssertEqual(census.counts(for: parentID), .init(running: 1, finished: 3))
+        XCTAssertEqual(census.counts(for: unrelatedID), .init())
+
+        let afterCleanup = AgentSessionLinkSubagentCensus(
+            persisted: persisted.filter { $0.sessionID != persistedOnlyID },
+            index: index,
+            live: live
+        )
+        XCTAssertEqual(afterCleanup.counts(for: parentID), .init(running: 1, finished: 2))
+        XCTAssertEqual(afterCleanup.changedParents(comparedTo: census), [parentID])
+    }
+
+    func testLiveAndPersistedChildrenAppearOnParentsActualObservationSnapshot() throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Lane-board tests must not start a provider")
+            }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: tabID, name: "Lane board census"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let parent = viewModel.session(for: tabID)
+        parent.hasLoadedPersistedState = true
+        let parentID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(parent))
+        let target = try candidate(
+            tabID: tabID,
+            sessionID: parentID,
+            workspaceID: XCTUnwrap(workspaceManager.activeWorkspace?.id)
+        )
+
+        let runningChild = AgentModeViewModel.TabSession(tabID: UUID())
+        runningChild.parentSessionID = parentID
+        runningChild.runState = .running
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: runningChild))
+        viewModel.test_installLiveSession(runningChild)
+        let finishedChild = AgentModeViewModel.TabSession(tabID: UUID())
+        finishedChild.parentSessionID = parentID
+        finishedChild.runState = .completed
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: finishedChild))
+        viewModel.test_installLiveSession(finishedChild)
+        let unrelated = AgentModeViewModel.TabSession(tabID: UUID())
+        unrelated.parentSessionID = UUID()
+        unrelated.runState = .running
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: unrelated))
+        viewModel.test_installLiveSession(unrelated)
+
+        let persistedID = UUID()
+        viewModel.agentSessionLinkPersistedSubagentWorkspaceID = workspaceManager.activeWorkspace?.id
+        viewModel.agentSessionLinkPersistedSubagentMeta = [AgentSessionMeta(
+            id: persistedID,
+            composeTabID: nil,
+            name: "Finished child",
+            lastModified: Date(),
+            itemCount: 0,
+            agentKind: nil,
+            agentModel: nil,
+            lastRunState: AgentSessionRunState.completed.rawValue,
+            acpModelParameterSelections: [],
+            parentSessionID: parentID,
+            isMCPOriginated: true,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
+        )]
+        viewModel.rebuildAgentSessionLinkSubagentCensus()
+        var board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+        XCTAssertEqual(board.subagentRunning, 1)
+        XCTAssertEqual(board.subagentFinished, 2)
+
+        runningChild.runState = .failed
+        viewModel.rebuildAgentSessionLinkSubagentCensus()
+        board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+        XCTAssertEqual(board.subagentRunning, 0)
+        XCTAssertEqual(board.subagentFinished, 3)
+
+        viewModel.test_removeSession(tabID: finishedChild.tabID)
+        viewModel.agentSessionLinkPersistedSubagentMeta = []
+        viewModel.rebuildAgentSessionLinkSubagentCensus()
+        board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+        XCTAssertEqual(board.subagentRunning, 0)
+        XCTAssertEqual(board.subagentFinished, 1)
+    }
+
+    func testUnhydratedLiveChildKeepsPersistedParentAndInPlaceUnbindRebuildsCensus() throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Lane-board tests must not start a provider")
+            }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: tabID, name: "Lane board unhydrated child"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let parent = viewModel.session(for: tabID)
+        let parentID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(parent))
+        let target = try candidate(
+            tabID: tabID,
+            sessionID: parentID,
+            workspaceID: XCTUnwrap(workspaceManager.activeWorkspace?.id)
+        )
+        let childID = UUID()
+        viewModel.agentSessionLinkPersistedSubagentWorkspaceID = workspaceManager.activeWorkspace?.id
+        viewModel.agentSessionLinkPersistedSubagentMeta = [AgentSessionMeta(
+            id: childID,
+            composeTabID: nil,
+            name: "Restoring child",
+            lastModified: Date(),
+            itemCount: 0,
+            agentKind: nil,
+            agentModel: nil,
+            lastRunState: AgentSessionRunState.completed.rawValue,
+            acpModelParameterSelections: [],
+            parentSessionID: parentID,
+            isMCPOriginated: true,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
+        )]
+        let child = AgentModeViewModel.TabSession(tabID: UUID())
+        XCTAssertFalse(child.hasLoadedPersistedState)
+        XCTAssertNil(child.parentSessionID)
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: childID, on: child))
+        viewModel.test_installLiveSession(child)
+        var board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+        XCTAssertEqual(board.subagentRunning, 1, "unhydrated live state must retain known persisted parentage")
+        XCTAssertEqual(board.subagentFinished, 0)
+
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: nil, on: child)
+        board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+        XCTAssertEqual(board.subagentRunning, 0)
+        XCTAssertEqual(board.subagentFinished, 1, "old persisted identity remains known after unbind")
+
+        viewModel.agentSessionLinkPersistedSubagentMeta = []
+        viewModel.rebuildAgentSessionLinkSubagentCensus()
+        board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+        XCTAssertEqual(board.subagentRunning, 0)
+        XCTAssertEqual(board.subagentFinished, 0)
+
+        child.parentSessionID = parentID
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: child))
+        board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+        XCTAssertEqual(board.subagentRunning, 1, "in-place rebind must rebuild without a sessions dictionary mutation")
+    }
+
+    func testChildRunAndCleanupRepublishParentBoardWithoutManualRebuild() async throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Lane-board tests must not start a provider")
+            }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: tabID, name: "Lane board observation"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let parent = viewModel.session(for: tabID)
+        let parentID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(parent))
+        let target = try candidate(
+            tabID: tabID,
+            sessionID: parentID,
+            workspaceID: XCTUnwrap(workspaceManager.activeWorkspace?.id)
+        )
+        let child = AgentModeViewModel.TabSession(tabID: UUID())
+        child.parentSessionID = parentID
+        child.runState = .running
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: child))
+        viewModel.test_installLiveSession(child)
+        XCTAssertEqual(viewModel.agentSessionLinkObservationSnapshot(for: target).board.subagentRunning, 1)
+
+        var observedFinished = false
+        var observedEmpty = false
+        let token = try XCTUnwrap(viewModel.agentSessionLinkInstallObservation(for: target) {
+            let board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+            observedFinished = observedFinished || (board.subagentRunning == 0 && board.subagentFinished == 1)
+            observedEmpty = observedEmpty || (board.subagentRunning == 0 && board.subagentFinished == 0)
+        })
+        defer { token.invalidate() }
+        child.runState = .completed
+        try await AsyncTestWait.waitUntil("parent board observed child completion") { observedFinished }
+        viewModel.test_removeSession(tabID: child.tabID)
+        try await AsyncTestWait.waitUntil("parent board observed child cleanup") { observedEmpty }
+    }
+
+    func testThirtyTwoTargetSnapshotBuildUsesOneLargeCensus() {
+        typealias Record = AgentSessionLinkSubagentCensus.Record
+        let parentIDs = (0 ..< 32).map { _ in UUID() }
+        let targetSessions = parentIDs.map { parentID -> (AgentModeViewModel.TabSession, AgentSessionLinkEndpointCandidate) in
+            let tabID = UUID()
+            let session = AgentModeViewModel.TabSession(tabID: tabID)
+            session.hasLoadedPersistedState = true
+            return (session, candidate(tabID: tabID, sessionID: parentID))
+        }
+        let persisted = (0 ..< 16384).map { index in
+            Record(
+                sessionID: UUID(),
+                parentSessionID: parentIDs[index % parentIDs.count],
+                isLiveNonTerminal: false
+            )
+        }
+        let start = ProcessInfo.processInfo.systemUptime
+        let census = AgentSessionLinkSubagentCensus(persisted: persisted, index: [], live: [])
+        let snapshots = targetSessions.map { session, target in
+            let counts = census.counts(for: target.sessionID)
+            return snapshot(
+                for: session,
+                candidate: target,
+                subagentCounts: (running: counts.running, finished: counts.finished)
+            )
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        XCTAssertEqual(snapshots.count, 32)
+        XCTAssertTrue(snapshots.allSatisfy { $0.board.subagentFinished == 512 })
+        print("LaneBoardCensusStress: 32 targets, 16384 children, elapsed=\(String(format: "%.4f", elapsed))s")
+        XCTAssertLessThan(elapsed, 0.5, "One 32-target board batch should stay below 500 ms")
     }
 }
