@@ -1468,6 +1468,74 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertNil(idle["respond_hint"])
     }
 
+    func testPendingInteractionNearLimitProjectsAndRendersWithinOneSecond() throws {
+        let sessionID = UUID()
+        let raw = try XCTUnwrap(Self.sampleInspection(
+            manualOnly: nil,
+            prompt: String(repeating: "a", count: 63 * 1024) + " api_key=private-value"
+        ).interaction)
+        let started = ProcessInfo.processInfo.systemUptime
+        let projected = AgentModeViewModel.overseerProjection(of: raw)
+        let projectionSeconds = ProcessInfo.processInfo.systemUptime - started
+        let inspection = AgentSessionLinkPendingInteractionInspection(
+            interaction: projected, manualOnlyReason: nil
+        )
+        let result = AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: .object(["session_id": .string(sessionID.uuidString)]),
+            inspections: [sessionID: inspection],
+            isSingle: true
+        )
+        let totalSeconds = ProcessInfo.processInfo.systemUptime - started
+        let prompt = try XCTUnwrap(result.objectValue?["pending_interaction"]?.objectValue?["prompt"]?.stringValue)
+        XCTAssertTrue(prompt.contains(AgentSessionLinkTextRedactor.placeholder))
+        XCTAssertFalse(prompt.contains("private-value"))
+        XCTAssertLessThan(totalSeconds, 1, "projection=\(projectionSeconds)s total=\(totalSeconds)s")
+    }
+
+    func testOversizedPendingInteractionIsRefusedWithinOneSecond() throws {
+        let sessionID = UUID()
+        let raw = try XCTUnwrap(Self.sampleInspection(
+            manualOnly: nil,
+            prompt: String(repeating: "a", count: 70 * 1024) + " api_key=private-value"
+        ).interaction)
+        let started = ProcessInfo.processInfo.systemUptime
+        let projected = AgentModeViewModel.overseerProjection(of: raw)
+        let projectionSeconds = ProcessInfo.processInfo.systemUptime - started
+        let inspection = AgentSessionLinkPendingInteractionInspection(
+            interaction: projected, manualOnlyReason: nil
+        )
+        let result = AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: .object(["session_id": .string(sessionID.uuidString)]),
+            inspections: [sessionID: inspection],
+            isSingle: true
+        )
+        let totalSeconds = ProcessInfo.processInfo.systemUptime - started
+        let pending = try XCTUnwrap(result.objectValue?["pending_interaction"]?.objectValue)
+        XCTAssertEqual(pending["manual_only_reason"], .string("too_large"))
+        XCTAssertEqual(pending["respondable"], .bool(false))
+        XCTAssertNil(pending["prompt"])
+        XCTAssertLessThan(totalSeconds, 1, "projection=\(projectionSeconds)s total=\(totalSeconds)s")
+    }
+
+    func testRepeatedUnclosedPEMMarkersProjectWithinOneSecond() throws {
+        let keyType = "PRIVATE " + "KEY"
+        let begin = "-----BEGIN \(keyType)-----"
+        let end = "-----END \(keyType)-----"
+        let tail = String(repeating: begin, count: 2300)
+        let complete = "\(begin)\nconfidential\n\(end)"
+        for (input, expected) in [
+            (tail, tail),
+            (complete + tail, AgentSessionLinkTextRedactor.placeholder + tail)
+        ] {
+            let raw = try XCTUnwrap(Self.sampleInspection(manualOnly: nil, prompt: input).interaction)
+            let started = ProcessInfo.processInfo.systemUptime
+            let projected = AgentModeViewModel.overseerProjection(of: raw)
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            XCTAssertEqual(projected.prompt, expected)
+            XCTAssertLessThan(elapsed, 1)
+        }
+    }
+
     func testManagedWaitCarriesPendingInteractionOutsideThePassiveSnapshot() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
