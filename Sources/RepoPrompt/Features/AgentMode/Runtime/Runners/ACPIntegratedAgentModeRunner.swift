@@ -656,8 +656,14 @@ final class ACPIntegratedAgentModeRunner {
             return false
         }
 
-        let carry = AgentSelfCompactParkedPrefix.prepare(messageForRun, session: session) {
+        var carry = AgentSelfCompactParkedPrefix.prepare(messageForRun, session: session) {
             hooks.persistence.scheduleSave(session)
+        }
+        if let dispatchID = carry.dispatchID,
+           !session.selfCompactNoteDispatchIsCurrent(dispatchID)
+        {
+            if carry.exactNote { return false }
+            carry = .init(text: messageForRun, dispatchID: nil)
         }
         let agentMessage = carry.exactNote
             ? AgentMessage(systemPrompt: "", userMessage: carry.text, resumeSessionID: session.providerSessionID)
@@ -703,7 +709,9 @@ final class ACPIntegratedAgentModeRunner {
             promptMessage = decorated.message
         }
         if let dispatchID = carry.dispatchID {
-            guard AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session) else {
+            guard session.selfCompactNoteDispatchIsCurrent(dispatchID),
+                  AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session)
+            else {
                 // The failed claim does not own an attempt marker to clear.
                 if !carry.exactNote {
                     hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(session, oversightDispatch)

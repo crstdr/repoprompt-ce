@@ -489,9 +489,28 @@ actor ACPAgentSessionController {
 
     #if DEBUG
         private var testRejectNextTurnPreparation = false
+        private var testHoldNextSteeringInterrupt = false
+        private var testSteeringInterruptEntered = false
+        private var testSteeringInterruptEntryWaiter: CheckedContinuation<Void, Never>?
+        private var testSteeringInterruptGate: CheckedContinuation<Void, Never>?
 
         func test_rejectNextTurnPreparation() {
             testRejectNextTurnPreparation = true
+        }
+
+        func test_holdNextSteeringInterrupt() {
+            testHoldNextSteeringInterrupt = true
+            testSteeringInterruptEntered = false
+        }
+
+        func test_waitForSteeringInterruptEntry() async {
+            if testSteeringInterruptEntered { return }
+            await withCheckedContinuation { testSteeringInterruptEntryWaiter = $0 }
+        }
+
+        func test_releaseSteeringInterrupt() {
+            testSteeringInterruptGate?.resume()
+            testSteeringInterruptGate = nil
         }
     #endif
 
@@ -1477,6 +1496,15 @@ actor ACPAgentSessionController {
         guard sessionID != nil else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
+        #if DEBUG
+            if testHoldNextSteeringInterrupt {
+                testHoldNextSteeringInterrupt = false
+                testSteeringInterruptEntered = true
+                testSteeringInterruptEntryWaiter?.resume()
+                testSteeringInterruptEntryWaiter = nil
+                await withCheckedContinuation { testSteeringInterruptGate = $0 }
+            }
+        #endif
         log("ACP steering interrupt requested state=\(state.rawValue) hasActiveTurn=\(activePromptTurnID != nil)")
 
         if let promptTurnID = activePromptTurnID {
