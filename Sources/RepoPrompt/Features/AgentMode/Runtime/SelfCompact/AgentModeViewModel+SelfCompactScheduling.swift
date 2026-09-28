@@ -84,6 +84,11 @@ extension AgentModeViewModel {
             guard session.selfCompactAdmissionPendingID != requestID else {
                 return .blocked(reason: "persistence_pending")
             }
+            if session.selfCompactState.active?.id == requestID,
+               agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID)
+            {
+                return .blocked(reason: "session_not_exclusive")
+            }
             return .duplicate(requestID: requestID, status: session.selfCompactState.status)
         case .conflict:
             return .blocked(reason: "idempotency_conflict")
@@ -95,15 +100,9 @@ extension AgentModeViewModel {
             break
         }
 
-        let sameWindowWriter = sessions.values.contains { other in
-            other !== session && other.activeAgentSessionID == endpoint.sessionID
+        guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
+            return .blocked(reason: "session_not_exclusive")
         }
-        let competingWriter = sameWindowWriter || WindowStatesManager.shared.allWindows.contains { window in
-            window.agentModeViewModel.sessions.values.contains { other in
-                other !== session && other.activeAgentSessionID == endpoint.sessionID
-            }
-        }
-        guard !competingWriter else { return .blocked(reason: "session_not_exclusive") }
         guard !session.selfCompactPersistenceWarning,
               endpoint.persistentBindingGeneration != nil
         else { return .blocked(reason: "session_not_exclusive") }
@@ -114,6 +113,9 @@ extension AgentModeViewModel {
               session.runID == origin.runID,
               session.activeRunOwnership?.attemptID == origin.runAttemptID
         else { return .unavailable }
+        guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
+            return .blocked(reason: "session_not_exclusive")
+        }
         switch support {
         case .notSupported: return .blocked(reason: "not_supported")
         case .noProviderSession: return .blocked(reason: "no_provider_session")
@@ -160,7 +162,25 @@ extension AgentModeViewModel {
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.selfCompactState.active?.id == attempt.id
         else { return .blocked(reason: "busy") }
+        guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
+            var state = session.selfCompactState
+            state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+            session.selfCompactState = state
+            scheduleSave(for: session)
+            return .blocked(reason: "session_not_exclusive")
+        }
         return .scheduled(session.selfCompactState.active ?? attempt)
+    }
+
+    private func agentSelfCompactHasCompetingWriter(_ session: TabSession, sessionID: UUID) -> Bool {
+        let sameWindowWriter = sessions.values.contains { other in
+            other !== session && other.activeAgentSessionID == sessionID
+        }
+        return sameWindowWriter || WindowStatesManager.shared.allWindows.contains { window in
+            window.agentModeViewModel.sessions.values.contains { other in
+                other !== session && other.activeAgentSessionID == sessionID
+            }
+        }
     }
 
     func agentSelfCompactTerminalSettled(

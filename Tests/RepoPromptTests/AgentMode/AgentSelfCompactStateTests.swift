@@ -54,8 +54,7 @@ final class AgentSelfCompactStateTests: XCTestCase {
             XCTAssertEqual(restored.selfCompactState?.latest?.requestID, attempt.id, "\(phase)")
             XCTAssertEqual(restored.selfCompactState?.status?.recoveryNote, "verbatim\n  note", "\(phase)")
             let expectedDelivery: AgentSelfCompactSettlement.NoteDelivery = switch phase {
-            case .parked: .parked
-            case .dispatchingNote: .deliveryUnknown
+            case .parked, .dispatchingNote: .deliveryUnknown
             default: .notSent
             }
             XCTAssertEqual(restored.selfCompactState?.status?.noteDelivery, expectedDelivery, "\(phase)")
@@ -75,6 +74,42 @@ final class AgentSelfCompactStateTests: XCTestCase {
         // A persisted dispatching phase cannot prove the transport was never attempted.
         XCTAssertEqual(restored.selfCompactState?.latest?.noteDelivery, .deliveryUnknown)
         XCTAssertEqual(restored.selfCompactState?.latest?.recoveryNote, "recover")
+    }
+
+    func testColdRestoreOfParkedSnapshotAfterOrdinaryAcceptanceIsDeliveryUnknown() throws {
+        // Claude, Codex, and ACP ordinary sends all persist the parked state before their
+        // attempt marker, then schedule (rather than require) the marker save at transport.
+        for provider in [
+            AgentSessionLinkCompactSupport.claudeCode,
+            .codex,
+            .acpAdvertisedCommand
+        ] {
+            var session = AgentSession(name: "Parked \(provider.rawValue)", autoEditEnabled: true)
+            var state = AgentSelfCompactState()
+            let attempt = try XCTUnwrap(state.reserve(
+                note: "recover once", idempotencyKey: "parked-\(provider.rawValue)"
+            ).scheduledAttempt)
+            state.active?.admittedSupport = provider
+            state.active?.phase = .parked
+            session.selfCompactState = state
+            let durableBeforeSend = try JSONEncoder().encode(session)
+
+            // Hold the durable snapshot while the live ordinary turn enters transport and is
+            // accepted. The debounced marker/settlement save has not committed at crash time.
+            let dispatchID = AgentSelfCompactionDispatchID(requestID: attempt.id, stage: .note)
+            XCTAssertTrue(state.noteWillAttempt(dispatchID))
+            XCTAssertTrue(state.noteAccepted(dispatchID))
+            XCTAssertEqual(state.latest?.noteDelivery, .prepended)
+
+            let restored = try JSONDecoder().decode(AgentSession.self, from: durableBeforeSend)
+            XCTAssertNil(restored.selfCompactState?.active)
+            XCTAssertEqual(restored.selfCompactState?.latest?.noteDelivery, .deliveryUnknown, provider.rawValue)
+            XCTAssertEqual(restored.selfCompactState?.latest?.recoveryNote, "recover once")
+            var retry = try XCTUnwrap(restored.selfCompactState)
+            XCTAssertEqual(retry.reserve(
+                note: "recover once", idempotencyKey: "parked-\(provider.rawValue)"
+            ), .duplicate(attempt.id))
+        }
     }
 
     func testMalformedOptionalRecordsDoNotDiscardSession() throws {

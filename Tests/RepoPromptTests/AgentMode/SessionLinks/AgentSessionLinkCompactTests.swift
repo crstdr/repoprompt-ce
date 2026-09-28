@@ -398,6 +398,42 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertEqual(requestID, attempt.id)
     }
 
+    func testSelfMCPAdmissionRejectsCompetingWriterArrivingDuringRequiredSave() async throws {
+        let gate = FirstSaveGate()
+        let fixture = try makeFixture(firstSaveGate: gate)
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.writerDuringSave")
+        fixture.session.isDirty = false
+        let endpoint = fixture.candidate.domainEndpoint
+        let origin = AgentSelfMCPCallOrigin(
+            endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID
+        )
+        let admission = Task { @MainActor in
+            await fixture.viewModel.agentSelfCompactMCPAdmission(
+                endpoint: endpoint, origin: origin,
+                note: "retain for recovery", idempotencyKey: "writer-during-save"
+            )
+        }
+        await gate.waitUntilEntered()
+        let otherTabID = UUID()
+        let competing = fixture.viewModel.session(for: otherTabID)
+        competing.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(
+            tabID: otherTabID, sessionID: endpoint.sessionID
+        ))
+        gate.release()
+
+        let result = await admission.value
+        guard case let .blocked(reason) = result else {
+            return XCTFail("A new competing writer must prevent a scheduled receipt")
+        }
+        XCTAssertEqual(reason, "session_not_exclusive")
+        XCTAssertNil(fixture.session.selfCompactState.active)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .cancelled)
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
     func testSelfMCPAdmissionPersistenceFailureNeverLeavesExecutableRequest() async throws {
         let gate = FirstSaveGate()
         let fixture = try makeFixture(saverBehavior: .fail, firstSaveGate: gate)

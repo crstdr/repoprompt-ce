@@ -112,10 +112,12 @@ struct AgentSelfCompactSettlement: Codable, Equatable {
     static func recoveryRequired(from attempt: AgentSelfCompactAttempt, at date: Date = Date()) -> Self {
         // The dispatching phase is durably saved before transport, but the later attempted
         // marker is debounced. A crash after provider acceptance can restore that older record.
-        let delivery: NoteDelivery = if attempt.noteDispatchStarted || attempt.phase == .dispatchingNote {
+        let delivery: NoteDelivery = if attempt.noteDispatchStarted
+            || attempt.phase == .dispatchingNote || attempt.phase == .parked
+        {
+            // An ordinary send can accept a parked note before its debounced attempt marker
+            // or settlement is saved. The old parked snapshot cannot prove non-delivery.
             .deliveryUnknown
-        } else if attempt.phase == .parked {
-            .parked
         } else {
             .notSent
         }
@@ -241,7 +243,7 @@ struct AgentSelfCompactState: Codable, Equatable {
     mutating func bindCompactRun(_ dispatchID: AgentSelfCompactionDispatchID, runID: UUID?, attemptID: UUID?) -> Bool {
         guard dispatchID.stage == .compact,
               active?.id == dispatchID.requestID,
-              active?.phase == .dispatchingCompact,
+              active?.phase == .dispatchingCompact || active?.phase == .awaitingCompactTurn,
               let runID, let attemptID
         else { return false }
         active?.compactRunID = runID

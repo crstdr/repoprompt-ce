@@ -4,6 +4,29 @@ import XCTest
 
 @MainActor
 final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
+    @MainActor private final class BindGate {
+        private var entered = false
+        private var enteredWaiter: CheckedContinuation<Void, Never>?
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+        func wait() async {
+            entered = true
+            enteredWaiter?.resume()
+            enteredWaiter = nil
+            await withCheckedContinuation { releaseWaiter = $0 }
+        }
+
+        func waitUntilEntered() async {
+            if entered { return }
+            await withCheckedContinuation { enteredWaiter = $0 }
+        }
+
+        func release() {
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
+
     @MainActor private final class Fake {
         var state = AgentSelfCompactState()
         var endpointIsCurrent = true
@@ -220,6 +243,45 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         await drain()
         XCTAssertEqual(changed.dispatched, 0)
         XCTAssertEqual(changed.state.latest?.outcome, .failed)
+    }
+
+    func testACPBindAfterPipelineStartCanFollowAwaitingCompactTurn() async throws {
+        let fake = Fake()
+        fake.arm()
+        fake.state.active?.admittedSupport = .acpAdvertisedCommand
+        fake.support = .acpAdvertisedCommand
+        let requestID = try XCTUnwrap(fake.state.active?.id)
+        let runID = UUID()
+        let runAttemptID = UUID()
+        let gate = BindGate()
+        let completion = AgentSelfCompactNativeCompletionCoordinator(
+            load: { fake.state },
+            store: { fake.state = $0 },
+            isCurrentOwner: { _ in true },
+            dispatchNote: { _, _ in false }
+        )
+        let bindAfterPreparation = Task { @MainActor in
+            await gate.wait()
+            return completion.bindCompact(
+                .init(requestID: requestID, stage: .compact),
+                runID: runID, runAttemptID: runAttemptID
+            )
+        }
+        await gate.waitUntilEntered()
+        fake.scheduler().terminalSettled(
+            runID: fake.runID, runAttemptID: fake.attemptID,
+            terminalState: .completed, publication: .accepted(successorEpoch: nil),
+            successorClaimed: false, teardownSettled: { true }
+        )
+        await drain()
+        XCTAssertEqual(fake.dispatched, 1)
+        XCTAssertEqual(fake.state.active?.phase, .awaitingCompactTurn)
+        gate.release()
+        let bound = await bindAfterPreparation.value
+        XCTAssertTrue(bound, "ACP physical command must still bind after pipeline-start receipt")
+        XCTAssertEqual(fake.state.active?.compactRunID, runID)
+        XCTAssertEqual(fake.state.active?.compactRunAttemptID, runAttemptID)
+        completion.cancelRuntimeWork()
     }
 
     func testACPAdvertisedCommandDispatchesTheCompactTurn() async {
