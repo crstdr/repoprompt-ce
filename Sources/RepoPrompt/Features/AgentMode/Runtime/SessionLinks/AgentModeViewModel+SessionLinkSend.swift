@@ -93,6 +93,8 @@ extension AgentModeViewModel {
         guard let session = agentSessionLinkLiveSession(matching: candidate) else {
             return .blocked(.endpointInvalidated)
         }
+        let stopFence = request.startStopFence ?? AgentRunStartStopFence(session: session)
+        guard stopFence.permitsStart(of: session) else { return .blocked(.targetStopped) }
         let admissionLiveness = liveness()
         guard admissionLiveness.permitsDelivery else {
             return .blocked(.endpointInvalidated)
@@ -257,6 +259,7 @@ extension AgentModeViewModel {
         guard agentSessionLinkLiveSession(matching: candidate) === liveSession,
               dispatchLiveness.permitsDelivery,
               composerSubmitClaimIsCurrent(claim),
+              stopFence.permitsStart(of: liveSession),
               workspaceManager?.activeWorkspace?.id == candidate.workspaceID
         else {
             releaseComposerSubmitClaim(claim)
@@ -301,7 +304,9 @@ extension AgentModeViewModel {
         _ = await startAgentRun(
             tabID: candidate.tabID,
             initialMessage: providerMessage,
-            directStartOptions: .crossSessionDelivery,
+            directStartOptions: AgentDirectRunStartOptions(
+                ignoresPendingHandoff: true, stopFence: stopFence
+            ),
             startOutcome: startRecorder
         )
         releaseComposerSubmitClaim(claim)

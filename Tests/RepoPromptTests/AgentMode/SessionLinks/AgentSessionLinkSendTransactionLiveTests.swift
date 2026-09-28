@@ -479,6 +479,22 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
     }
 
+    func testCommittedQueuedDrainCannotDispatchAfterUserStopGenerationAdvances() async throws {
+        let fixture = try makeFixture()
+        var request = makeRequest(message: "committed queue entry")
+        request.startStopFence = AgentRunStartStopFence(session: fixture.session)
+        fixture.driftHook.duringDeliveryFlush = {
+            // The queued entry crossed its commit cutoff, so Stop cannot withdraw it.
+            fixture.session.stopState.invalidateScheduledStarts()
+        }
+        let outcome = await send(fixture, request: request)
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("expected durable-only delivery, got \(outcome)")
+        }
+        XCTAssertEqual(delivery.deliveryState, .persisted)
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
     func testEndpointDriftAfterTheCommitFenceAbortsBeforeMutating() async throws {
         let fixture = try makeFixture()
 

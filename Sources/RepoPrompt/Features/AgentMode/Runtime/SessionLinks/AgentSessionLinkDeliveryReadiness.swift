@@ -222,7 +222,6 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingClaudeSteeringCount > 0
             || snapshot.pendingOversightAutoWake
             || snapshot.stopInProgress
-            || snapshot.compactionSettling
             || snapshot.hasWaitingPrompt
             || snapshot.hasPendingAskUser
             || snapshot.hasPendingUserInputRequest

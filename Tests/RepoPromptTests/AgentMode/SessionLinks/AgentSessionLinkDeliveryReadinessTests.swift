@@ -107,6 +107,12 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertEqual(Readiness.evaluate(snapshot: closing), .blocked(.endpointInvalidated))
     }
 
+    func testCompactSettlingDoesNotBlockOrdinarySendReadiness() {
+        var snapshot = AgentSessionLinkDeliveryReadiness.Snapshot.ready
+        snapshot.compactionSettling = true
+        XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: snapshot), .ready)
+    }
+
     func testHydrationAndRebindingAreRetryableRatherThanNotIdle() {
         var loading = Snapshot.ready
         loading.hasLoadedPersistedState = false

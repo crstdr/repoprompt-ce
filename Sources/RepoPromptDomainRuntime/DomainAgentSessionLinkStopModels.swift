@@ -1,7 +1,7 @@
 import Foundation
 
 /// One immutable answer for a stop request within a link generation.
-package struct DomainAgentSessionLinkStopReceipt: Hashable {
+package struct DomainAgentSessionLinkStopReceipt: Hashable, Sendable {
     package let requestID: UUID
     package let targetSessionID: UUID
     package let result: Result
@@ -56,13 +56,13 @@ package struct DomainAgentSessionLinkStopReceipt: Hashable {
         )
     }
 
-    package enum Result: String, Hashable {
+    package enum Result: String, Hashable, Sendable {
         case stopped
         case notRunning = "not_running"
         case stopFailed = "stop_failed"
     }
 
-    package enum FailureReason: String, Hashable {
+    package enum FailureReason: String, Hashable, Sendable {
         case targetChanged = "target_changed"
         case cancellationUnconfirmed = "cancellation_unconfirmed"
         case terminalPublicationRejected = "terminal_publication_rejected"
@@ -70,7 +70,7 @@ package struct DomainAgentSessionLinkStopReceipt: Hashable {
         case teardownTimeout = "teardown_timeout"
     }
 
-    package enum AuditStatus: String, Hashable {
+    package enum AuditStatus: String, Hashable, Sendable {
         case notRequired = "not_required"
         case persisted
         case failed
@@ -79,7 +79,7 @@ package struct DomainAgentSessionLinkStopReceipt: Hashable {
 }
 
 /// Stop uses the existing shared send reservation and ledger limits, but never returns a send receipt.
-package enum DomainAgentSessionLinkStopReservationDisposition: Equatable {
+package enum DomainAgentSessionLinkStopReservationDisposition: Equatable, Sendable {
     case reserved(DomainAgentSessionLinkSendReservation)
     case duplicate(DomainAgentSessionLinkStopReceipt)
     case inProgress

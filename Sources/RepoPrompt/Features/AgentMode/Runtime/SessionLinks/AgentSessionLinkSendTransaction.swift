@@ -47,6 +47,8 @@ struct AgentSessionLinkSendRequest: Equatable {
     /// a `steer` whose commit fence re-proved the user's management delegation is framed as managed
     /// direction.
     var framing: AgentSessionLinkMessageFraming = .coordination
+    /// Queued sends retain their admission-time Stop fence across every drain suspension.
+    var startStopFence: AgentRunStartStopFence?
 
     /// Canonical session UUID of the granted observer incarnation. Attribution and the provider
     /// envelope are session-scoped by design; only the fences need the full identity.

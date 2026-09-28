@@ -50,6 +50,10 @@ extension AgentModeViewModel {
         guard let binding = session.persistentSessionBindingIdentity else { return .blocked(.targetBusy) }
 
         if selection == .notRunning {
+            // A reserved wake has no run yet, but its captured start fence must not survive Stop.
+            if session.oversight.pendingAutoWake != nil {
+                prepareAgentRunCancellation(session: session, intent: .userStop)
+            }
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
                 result: .notRunning, stopRequested: false, audit: .notRequired,
@@ -107,6 +111,15 @@ extension AgentModeViewModel {
         guard session.stopState.claimManagedStop(id: request.requestID, binding: binding) else {
             return .blocked(.targetBusy)
         }
+        // Claim-time withdrawal is independent of whether the run still exists when cleanup starts.
+        prepareAgentRunCancellation(session: session, intent: .userStop)
+        withdrawQueuedWorkForManagedStop(session: session)
+        let claimedAdmission = AgentRunCancellationAdmission(
+            scope: .activeRun, session: session, binding: binding,
+            expectedOwnership: admission.expectedOwnership, expectedRunID: admission.expectedRunID,
+            cancellationGeneration: session.stopState.cancellationGeneration,
+            pendingStartFence: nil, validateAndClaim: admission.validateAndClaim
+        )
         session.noteMonitorObservationInputsChanged()
         requestUIRefresh(tabID: candidate.tabID, urgent: true)
         let recorder = AgentRunCancellationOutcomeRecorder(
@@ -125,13 +138,17 @@ extension AgentModeViewModel {
         Task { [weak self, weak session] in
             session?.stopState.markCleanupStarted(id: request.requestID, binding: binding)
             guard let self, let session else {
+                if let session {
+                    _ = session.stopState.releaseManagedStop(id: request.requestID, binding: binding)
+                    session.noteMonitorObservationInputsChanged()
+                }
                 teardown.finish(false)
                 audit.finish(.unknown)
                 return
             }
             beforeCleanupTask()
             let routed = await cancelAgentRunForSessionLink(
-                session: session, admission: admission, outcomeRecorder: recorder
+                session: session, admission: claimedAdmission, outcomeRecorder: recorder
             )
             teardown.finish(routed && recorder.teardownCompleted)
             if session.stopState.releaseManagedStop(id: request.requestID, binding: binding) {
@@ -164,14 +181,14 @@ extension AgentModeViewModel {
                 ))
             }
             let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
-            case .accepted?: nil
+            case .accepted?: .teardownTimeout
             case .stale?: .terminalPublicationStale
             case .rejected?: .terminalPublicationRejected
             case nil: .cancellationUnconfirmed
             }
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
-                result: accepted ? .stopped : .stopFailed, failure: failure,
+                result: .stopFailed, failure: failure,
                 stopRequested: recorder.initiatedCancellation,
                 teardownCompleted: recorder.teardownCompleted,
                 itemID: itemID, audit: itemID == nil ? .notRequired : .unknown,
@@ -183,10 +200,16 @@ extension AgentModeViewModel {
             audit.finish(.unknown)
         }
         let auditStatus = await audit.value()
+        let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
+        case .accepted?: nil
+        case .stale?: .terminalPublicationStale
+        case .rejected?: .terminalPublicationRejected
+        case nil: .cancellationUnconfirmed
+        }
         return .settled(Self.agentSessionLinkStopReceipt(
             request: request, targetSessionID: candidate.sessionID,
             result: accepted ? .stopped : .stopFailed,
-            failure: accepted ? nil : .cancellationUnconfirmed,
+            failure: failure,
             stopRequested: recorder.initiatedCancellation,
             teardownCompleted: recorder.teardownCompleted,
             itemID: itemID, audit: auditStatus,
@@ -222,18 +245,30 @@ extension AgentModeViewModel {
         deadlineSeconds: TimeInterval,
         deadlineSleep: @escaping @MainActor (TimeInterval) async -> Void
     ) async -> DomainAgentSessionLinkStopReceipt.AuditStatus {
-        guard itemID != nil else { return .failed }
+        guard let itemID else { return .failed }
         guard agentSessionLinkLiveSession(matching: candidate) === session,
               session.persistentSessionBindingIdentity == binding
         else { return .failed }
         let signal = AgentSessionLinkStopSignal<DomainAgentSessionLinkStopReceipt.AuditStatus>()
-        Task { [weak self] in
-            guard let self else { signal.finish(.unknown)
+        Task { [weak self, weak session] in
+            guard let self, let session else { signal.finish(.unknown)
+                return
+            }
+            guard agentSessionLinkLiveSession(matching: candidate) === session,
+                  session.persistentSessionBindingIdentity == binding,
+                  session.items.contains(where: { $0.id == itemID })
+            else { signal.finish(.failed)
                 return
             }
             let result = await flushSaveRequired(
                 for: candidate.tabID, workspaceID: candidate.workspaceID
             )
+            guard agentSessionLinkLiveSession(matching: candidate) === session,
+                  session.persistentSessionBindingIdentity == binding,
+                  session.items.contains(where: { $0.id == itemID })
+            else { signal.finish(.failed)
+                return
+            }
             switch result {
             case .success: signal.finish(.persisted)
             case .failure: signal.finish(.failed)

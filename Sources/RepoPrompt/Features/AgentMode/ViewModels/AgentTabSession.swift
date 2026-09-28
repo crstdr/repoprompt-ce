@@ -417,6 +417,8 @@ final class AgentTabSession: ObservableObject {
 
     /// Task that drains `pendingACPSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
     var acpSteeringFlushTask: Task<Void, Never>?
+    /// Identifies the owner so a cancelled old flush cannot clear a successor task on unwind.
+    var acpSteeringFlushID: UUID?
 
     /// Number of upcoming turnCompleted events that should be treated as intermediate
     /// because we successfully queued a follow-up prompt during the same run.
@@ -1322,6 +1324,7 @@ final class AgentTabSession: ObservableObject {
         claudeSteeringFlushTask = nil
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
+        acpSteeringFlushID = nil
         clearClaudeReasoningStatus(clearDisplayedStatus: true)
         assistantDeltaFlushTask?.cancel()
         assistantDeltaFlushTask = nil

@@ -337,7 +337,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
                 "agent_session_link.read", "agent_session_link.send",
                 "agent_session_link.snooze_auto_wake",
                 "agent_session_link.respond",
-                "agent_session_link.steer", "agent_session_link.compact"
+                "agent_session_link.steer", "agent_session_link.stop", "agent_session_link.compact"
             ]
         )
         for operation in sessionControlOperations where operation.requiredMonitorCapability != nil {

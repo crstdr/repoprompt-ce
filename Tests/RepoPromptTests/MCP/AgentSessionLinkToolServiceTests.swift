@@ -428,13 +428,18 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 XCTFail("Malformed Stop accepted")
             } catch {}
         }
-        let result = try await Self.executeObject(fixture.service, args: [
-            "op": .string("stop"), "session_id": .string(targetID),
-            "idempotency_key": .string("routed-stop")
-        ])
-        XCTAssertEqual(result["result"], .string("target_busy"))
-        XCTAssertEqual(result["reason"], .string("endpoint_invalidated"))
-        XCTAssertEqual(Set(result.keys), ["result", "session_id", "reason"])
+        do {
+            _ = try await Self.executeObject(fixture.service, args: [
+                "op": .string("stop"), "session_id": .string(targetID),
+                "idempotency_key": .string("routed-stop")
+            ])
+            XCTFail("A stale target must use the same denial as a missing link")
+        } catch let error as MCPError {
+            let expected = AgentSessionLinkMCPToolService.denialError(
+                targetSessionID: fixture.target.sessionID
+            )
+            XCTAssertEqual("\(error)", "\(expected)")
+        }
     }
 
     // MARK: - compact

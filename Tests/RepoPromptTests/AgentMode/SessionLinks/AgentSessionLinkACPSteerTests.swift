@@ -203,6 +203,63 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertEqual(fixture.session.pendingInstructions.first, envelope)
     }
 
+    func testOldFlushResumingAfterStopCannotClearSuccessorSteering() async throws {
+        let fixture = try await makeFixture()
+        let oldRunID = try XCTUnwrap(fixture.session.runID)
+        let oldAttemptID = try XCTUnwrap(fixture.session.activeRunAttemptID)
+        let oldFence = AgentRunStartStopFence(session: fixture.session)
+        // The old flush is held at MCP-idle wait while Stop invalidates its fence. A newly
+        // accepted run queues its own steer before that old waiter resumes.
+        fixture.session.stopState.invalidateScheduledStarts()
+        let successor = AgentModeViewModel.TabSession.ACPSteeringInstruction(
+            id: UUID(), targetRunID: UUID(), targetRunAttemptID: UUID(),
+            providerText: "successor direction", interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "successor direction",
+            optimisticUserItemID: nil, createdAt: Date()
+        )
+        fixture.session.pendingACPSteeringInstructions = [successor]
+        fixture.viewModel.test_resumeStaleACPFlush(
+            session: fixture.session, runID: oldRunID,
+            runAttemptID: oldAttemptID, stopFence: oldFence
+        )
+        XCTAssertEqual(fixture.session.pendingACPSteeringInstructions.map(\.id), [successor.id])
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+    }
+
+    func testStoppedFlushRestoresOnlyDequeuedLocalACPDraft() async throws {
+        let fixture = try await makeFixture()
+        let oldFence = AgentRunStartStopFence(session: fixture.session)
+        let local = AgentModeViewModel.TabSession.ACPSteeringInstruction(
+            id: UUID(), targetRunID: fixture.session.runID,
+            targetRunAttemptID: fixture.session.activeRunAttemptID,
+            providerText: "local direction", interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "local direction",
+            optimisticUserItemID: nil, createdAt: Date()
+        )
+        let message = request("managed direction")
+        let sink = AgentSessionLinkManagedSteerSink()
+        let managed = AgentModeViewModel.TabSession.ACPSteeringInstruction(
+            id: UUID(), targetRunID: fixture.session.runID,
+            targetRunAttemptID: fixture.session.activeRunAttemptID,
+            providerText: "managed direction", interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "",
+            optimisticUserItemID: nil, createdAt: Date(),
+            managed: .init(
+                sink: sink, attributedItemID: UUID(),
+                candidate: fixture.candidate, attribution: message.attribution
+            )
+        )
+        fixture.session.stopState.invalidateScheduledStarts()
+        fixture.viewModel.test_requeueDequeuedACPSteeringAfterStop(
+            [local, managed], session: fixture.session, stopFence: oldFence
+        )
+        guard case .notAccepted = sink.outcome else { return XCTFail("managed steer must be refused") }
+        let draft = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        XCTAssertTrue(draft.contains("local direction"))
+        XCTAssertFalse(draft.contains("managed direction"))
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+    }
+
     func testCancelWipesManagedQueueWithoutRestoringItsDraft() async throws {
         let fixture = try await makeFixture()
         let message = request("managed queue entry")

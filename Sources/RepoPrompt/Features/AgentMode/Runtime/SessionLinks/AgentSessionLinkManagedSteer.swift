@@ -120,6 +120,7 @@ extension AgentSessionLinkSteerAdmission {
         pendingPromptExists: Bool,
         route: AgentSessionLinkManagedSteerRoute?
     ) -> AgentSessionLinkSteerAdmission {
+        if readiness.compactionSettling { return .blocked(.compactionSettling) }
         switch AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness) {
         case .ready:
             return .idleTurn
@@ -132,9 +133,6 @@ extension AgentSessionLinkSteerAdmission {
         }
         if pendingPromptExists {
             return .blocked(.targetAwaitingInteraction)
-        }
-        if readiness.compactionSettling {
-            return .blocked(.compactionSettling)
         }
         guard runStateIsActive else {
             // Idle but not yet send-ready: a last turn still committing, a queued instruction or

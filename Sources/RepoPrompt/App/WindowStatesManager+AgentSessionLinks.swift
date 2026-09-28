@@ -314,6 +314,14 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     /// transaction runs on that window's `AgentModeViewModel`, and a terminating manager or closing
     /// window must refuse before any target state is touched. Nothing here focuses or activates the
     /// window.
+    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+        guard !isTerminating,
+              let window = window(withID: candidate.windowID), !window.isClosing,
+              let session = window.agentModeViewModel.agentSessionLinkLiveSession(matching: candidate)
+        else { return nil }
+        return AgentRunStartStopFence(session: session)
+    }
+
     func agentSessionLinkPerformSend(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,

@@ -13969,6 +13969,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.provider = nil
         session.acpSteeringFlushTask?.cancel()
         session.acpSteeringFlushTask = nil
+        session.acpSteeringFlushID = nil
         session.pendingACPSteeringInstructions.removeAll()
         let acpController = session.acpController
         session.acpController = nil
@@ -16302,10 +16303,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
             Self.logCodexDebug("[AgentModeVM][RunID] deferring send until hydration completes for tab \(tabID)")
             let stopFence = AgentRunStartStopFence(session: session)
+            let originalBinding = session.persistentSessionBindingIdentity
             Task { [weak self] in
                 guard let self else { return }
                 await submitUserTurnAfterHydration(
                     tabID: tabID,
+                    originalSession: session,
+                    originalBinding: originalBinding,
                     trimmedText: trimmedText,
                     attachmentsToSend: attachmentsToSend,
                     taggedFilesToSend: taggedFilesToSend,
@@ -16342,8 +16346,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func submitUserTurnAfterHydration(
+    #if DEBUG
+        func test_replaceSessionForDeferredHydration(tabID: UUID, with replacement: TabSession) {
+            sessions[tabID] = replacement
+        }
+    #endif
+
+    func submitUserTurnAfterHydration(
         tabID: UUID,
+        originalSession: TabSession,
+        originalBinding: AgentPersistentSessionBindingIdentity?,
         trimmedText: String,
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
@@ -16358,8 +16370,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
         stopFence: AgentRunStartStopFence
     ) async {
-        guard let session = sessions[tabID] else { return }
+        guard sessions[tabID] === originalSession,
+              originalSession.persistentSessionBindingIdentity == originalBinding
+        else { return }
+        let session = originalSession
         func restoreStoppedSubmission() {
+            guard sessions[tabID] === originalSession,
+                  originalSession.persistentSessionBindingIdentity == originalBinding
+            else { return }
             restoreRejectedManualSubmissionComposerState(
                 tabID: tabID,
                 session: session,
@@ -20582,7 +20600,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func prepareAgentRunCancellation(
+    #if DEBUG
+        func test_resumeStaleACPFlush(
+            session: TabSession, runID: UUID, runAttemptID: UUID, stopFence: AgentRunStartStopFence
+        ) {
+            runService.test_resumeStaleACPFlush(
+                session: session, runID: runID, runAttemptID: runAttemptID, stopFence: stopFence
+            )
+        }
+
+        func test_requeueDequeuedACPSteeringAfterStop(
+            _ instructions: [TabSession.ACPSteeringInstruction],
+            session: TabSession, stopFence: AgentRunStartStopFence
+        ) {
+            runService.test_requeueDequeuedACPSteeringAfterStop(
+                instructions, session: session, stopFence: stopFence
+            )
+        }
+    #endif
+
+    func withdrawQueuedWorkForManagedStop(session: TabSession) {
+        runService.withdrawQueuedWorkForManagedStop(tabID: session.tabID, session: session)
+        updateBindingsFromSession(session)
+        scheduleSave(for: session.tabID)
+    }
+
+    func prepareAgentRunCancellation(
         session: TabSession,
         intent: DomainAgentRunCancellationIntent
     ) {

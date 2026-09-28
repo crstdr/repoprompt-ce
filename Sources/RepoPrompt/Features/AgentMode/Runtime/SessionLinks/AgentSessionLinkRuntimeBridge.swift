@@ -306,6 +306,8 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// dispatch. Returning a value outcome keeps the bridge free of view-model types.
     ///
     /// - Parameter liveness: host-backed probe re-read at every fence the transaction crosses.
+    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence?
+
     func agentSessionLinkPerformSend(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,
@@ -397,6 +399,10 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkStartStopFence(for _: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+        .unavailable()
+    }
+
     /// Fail-closed management defaults: a host that does not model interactions or steering exposes
     /// none, answers none, and steers nothing.
     func agentSessionLinkPerformSteer(
@@ -5302,6 +5308,7 @@ final class AgentSessionLinkRuntimeBridge {
     enum StopOutcome: Equatable {
         case receipt(DomainAgentSessionLinkStopReceipt)
         case blocked(AgentSessionLinkSendFailure)
+        case indeterminate
         case rejected(SendRejection)
     }
 
@@ -5400,6 +5407,7 @@ final class AgentSessionLinkRuntimeBridge {
         messageDigest: String,
         workflow workflowInput: SendWorkflowInput,
         commitFence: SendCommitFence?,
+        startStopFence: AgentRunStartStopFence? = nil,
         delivery: DeliveryKind = .attributedSend
     ) async -> SendOutcome {
         guard let host else { return .rejected(.denied) }
@@ -5468,7 +5476,7 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
 
-        let request = AgentSessionLinkSendRequest(
+        var request = AgentSessionLinkSendRequest(
             linkID: target.lease.linkID,
             linkGeneration: target.lease.linkGeneration,
             // The exact granted incarnation, not its session UUID. The transaction crosses two awaits
@@ -5480,6 +5488,7 @@ final class AgentSessionLinkRuntimeBridge {
             workflow: workflow,
             framing: delivery == .managedSteer ? .management : .coordination
         )
+        request.startStopFence = startStopFence
         // Re-read at every fence the transaction crosses. It is deliberately pure endpoint/window
         // liveness and never consults the authority: after the commit fence, manual revocation is
         // intentionally allowed to lose, so link liveness must not gate the post-persistence recheck.
@@ -5573,7 +5582,7 @@ final class AgentSessionLinkRuntimeBridge {
         case let .reserved(value): reservation = value
         case let .duplicate(receipt): return .receipt(receipt)
         case .inProgress: return .rejected(.sendAlreadyInProgress)
-        case .indeterminate: return .blocked(.targetBusy)
+        case .indeterminate: return .indeterminate
         case .conflict: return .rejected(.idempotencyConflict)
         case .inFlightLimitReached: return .rejected(.deliveryLedgerFull)
         case .retainedOutcomeLimitReached: return .rejected(.deliveryLedgerExhausted)
@@ -5867,12 +5876,16 @@ final class AgentSessionLinkRuntimeBridge {
         // Atomic on the main actor: the old entry stops existing and the new one starts in the same
         // synchronous step, so no drain can ever observe a slot that is momentarily empty or doubly
         // occupied. A drain already suspended on the old revision compares out at its next fence.
+        guard let startStopFence = host.agentSessionLinkStartStopFence(for: target.candidate) else {
+            return .send(.blocked(.endpointInvalidated))
+        }
         let entry = AgentSessionLinkPendingSend(
             revision: UUID(),
             reference: reference,
             observerEndpoint: target.lease.observer,
             targetSessionID: target.lease.target.sessionID,
             targetEndpoint: target.lease.target,
+            startStopFence: startStopFence,
             message: message,
             idempotencyKey: idempotencyKey,
             requestDigest: digest,
@@ -6059,7 +6072,8 @@ final class AgentSessionLinkRuntimeBridge {
                 didCommit: { [weak self] in
                     self?.notePendingSendCommitted(reference: reference, revision: revision)
                 }
-            )
+            ),
+            startStopFence: entry.startStopFence
         )
         settlePendingSend(
             reference: reference,

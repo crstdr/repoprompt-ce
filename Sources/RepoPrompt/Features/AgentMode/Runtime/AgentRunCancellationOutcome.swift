@@ -72,6 +72,17 @@ struct AgentRunStartStopFence: Equatable {
         cancellationCount = session.stopState.cancellationCount
     }
 
+    /// Test/legacy hosts without a live session cannot bless a deferred provider start.
+    static func unavailable() -> Self {
+        Self(binding: nil, cancellationGeneration: UUID(), cancellationCount: 0)
+    }
+
+    private init(binding: AgentPersistentSessionBindingIdentity?, cancellationGeneration: UUID, cancellationCount: UInt64) {
+        self.binding = binding
+        self.cancellationGeneration = cancellationGeneration
+        self.cancellationCount = cancellationCount
+    }
+
     @MainActor
     func permitsStart(of session: AgentTabSession) -> Bool {
         binding == session.persistentSessionBindingIdentity

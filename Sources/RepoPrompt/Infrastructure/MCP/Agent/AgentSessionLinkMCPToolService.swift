@@ -418,10 +418,24 @@ struct AgentSessionLinkMCPToolService {
             }
             return .object(payload)
         case let .blocked(failure):
+            switch failure {
+            case .endpointInvalidated, .linkRevoked, .managementRevoked:
+                throw Self.denialError(targetSessionID: targetSessionID)
+            case .shuttingDown:
+                throw MCPError.internalError("RepoPrompt is shutting down.")
+            default:
+                return .object([
+                    "result": .string("target_busy"),
+                    "session_id": .string(targetSessionID.uuidString),
+                    "reason": .string(failure.rawValue)
+                ])
+            }
+        case .indeterminate:
             return .object([
-                "result": .string("target_busy"),
+                "result": .string("stop_failed"),
                 "session_id": .string(targetSessionID.uuidString),
-                "reason": .string(failure.rawValue)
+                "reason": .string("cancellation_unconfirmed"),
+                "retryable": .bool(false)
             ])
         case let .rejected(rejection):
             switch rejection {
@@ -1584,7 +1598,7 @@ struct AgentSessionLinkMCPToolService {
 /// executor resumes it, and so response shapes can be asserted without a window.
 enum AgentSessionLinkResponseRenderer {
     static let managementNotGrantedMessage =
-        "Your user has not granted you management of this session, so you may observe it and send messages when it is idle, but not stop it, steer it, or inspect or answer its prompts or steer it. Leave its prompts for its own user; a newly added oversight link includes Manage."
+        "Your user has not granted you management of this session, so you may observe it and send messages when it is idle, but not stop it, steer it, or inspect or answer its prompts. Leave its prompts for its own user; a newly added oversight link includes Manage."
 
     static func managementNotGrantedValue(targetSessionID: UUID) -> Value {
         .object([

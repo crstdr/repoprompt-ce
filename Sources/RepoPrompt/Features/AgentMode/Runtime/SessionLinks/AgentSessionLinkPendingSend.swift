@@ -77,6 +77,8 @@ struct AgentSessionLinkPendingSend: Equatable {
     let targetSessionID: UUID
     /// Exact target incarnation captured from the authorizing grant, never a UUID-only lookup.
     let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+    /// Captured before the queued drain can suspend; a later user Stop invalidates it.
+    let startStopFence: AgentRunStartStopFence?
     let message: String
     let idempotencyKey: String
     /// Message bytes plus the caller's canonical workflow selector — never the resolved workflow's
@@ -106,6 +108,7 @@ struct AgentSessionLinkPendingSend: Equatable {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        startStopFence: AgentRunStartStopFence? = nil,
         message: String,
         idempotencyKey: String,
         requestDigest: String,
@@ -120,6 +123,7 @@ struct AgentSessionLinkPendingSend: Equatable {
         self.observerEndpoint = observerEndpoint
         self.targetSessionID = targetSessionID
         self.targetEndpoint = targetEndpoint
+        self.startStopFence = startStopFence
         self.message = message
         self.idempotencyKey = idempotencyKey
         self.requestDigest = requestDigest
