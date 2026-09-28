@@ -29,22 +29,23 @@ final class AgentSessionLinkStopTranscriptTests: XCTestCase {
         XCTAssertEqual(decoded.crossSessionAttribution, attribution)
     }
 
-    func testFailedAndDuplicateStopReceiptsExposeOnlyDecisionFields() throws {
+    func testTimedOutAndDuplicateStopReceiptsExposeOnlyDecisionFields() throws {
         let targetID = UUID()
-        let failed = DomainAgentSessionLinkStopReceipt(
+        let timedOut = DomainAgentSessionLinkStopReceipt(
             requestID: UUID(), targetSessionID: targetID,
-            result: .stopFailed, failureReason: .teardownTimeout,
+            result: .stopped,
             stopRequested: true, teardownCompleted: false,
             targetItemID: UUID().uuidString, auditStatus: .unknown,
             resultingRunState: "cancelled", settledAt: Date(), duplicate: true
         )
         let value = try AgentSessionLinkMCPToolService.stopOutcomeValue(
-            .receipt(failed), targetSessionID: targetID
+            .receipt(timedOut), targetSessionID: targetID
         )
         guard case let .object(payload) = value else { return XCTFail("expected object") }
-        XCTAssertEqual(Set(payload.keys), ["result", "session_id", "duplicate", "reason", "warning"])
-        XCTAssertEqual(payload["result"]?.stringValue, "stop_failed")
-        XCTAssertEqual(payload["reason"]?.stringValue, "teardown_timeout")
+        XCTAssertEqual(Set(payload.keys), ["result", "session_id", "duplicate", "warning"])
+        XCTAssertEqual(payload["result"]?.stringValue, "stopped")
+        XCTAssertNotNil(payload["warning"]?.stringValue)
+        XCTAssertNil(payload["reason"])
         XCTAssertEqual(payload["duplicate"], .bool(true))
         let idle = DomainAgentSessionLinkStopReceipt(
             requestID: UUID(), targetSessionID: targetID,
@@ -56,6 +57,17 @@ final class AgentSessionLinkStopTranscriptTests: XCTestCase {
         )
         let idlePayload = try XCTUnwrap(idleValue.objectValue)
         XCTAssertEqual(Set(idlePayload.keys), ["result", "session_id"])
+        let failed = DomainAgentSessionLinkStopReceipt(
+            requestID: UUID(), targetSessionID: targetID,
+            result: .stopFailed, failureReason: .terminalPublicationRejected,
+            stopRequested: true, auditStatus: .notRequired, settledAt: Date()
+        )
+        let failedValue = try AgentSessionLinkMCPToolService.stopOutcomeValue(
+            .receipt(failed), targetSessionID: targetID
+        )
+        let failedPayload = try XCTUnwrap(failedValue.objectValue)
+        XCTAssertEqual(failedPayload["result"]?.stringValue, "stop_failed")
+        XCTAssertEqual(failedPayload["reason"]?.stringValue, "terminal_publication_rejected")
     }
 
     func testFlatReceiptContainsNoAuditOrRequestIdentity() throws {

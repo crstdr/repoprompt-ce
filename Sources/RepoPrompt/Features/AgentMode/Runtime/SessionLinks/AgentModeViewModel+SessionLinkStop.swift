@@ -13,6 +13,9 @@ extension AgentModeViewModel {
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome,
         teardownDeadlineSeconds: TimeInterval = 30,
         auditDeadlineSeconds: TimeInterval = 5,
+        deadlineSleep: @escaping @MainActor (TimeInterval) async -> Void = { seconds in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+        },
         beforeCleanupTask: @escaping @MainActor () -> Void = {}
     ) async -> AgentSessionLinkStopTransactionOutcome {
         guard let session = agentSessionLinkLiveSession(matching: candidate), liveness().permitsDelivery else {
@@ -86,7 +89,8 @@ extension AgentModeViewModel {
             )
             let audit = await agentSessionLinkFlushStopAudit(
                 candidate: candidate, session: session, binding: binding,
-                itemID: itemID, deadlineSeconds: auditDeadlineSeconds
+                itemID: itemID, deadlineSeconds: auditDeadlineSeconds,
+                deadlineSleep: deadlineSleep
             )
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
@@ -138,11 +142,12 @@ extension AgentModeViewModel {
                 ? request.requestID : nil
             await audit.finish(agentSessionLinkFlushStopAudit(
                 candidate: candidate, session: session, binding: binding,
-                itemID: itemID, deadlineSeconds: auditDeadlineSeconds
+                itemID: itemID, deadlineSeconds: auditDeadlineSeconds,
+                deadlineSleep: deadlineSleep
             ))
         }
         Task {
-            try? await Task.sleep(nanoseconds: UInt64(max(0, teardownDeadlineSeconds) * 1_000_000_000))
+            await deadlineSleep(teardownDeadlineSeconds)
             teardown.finish(false)
             session.stopState.markCleanupUnclaimedIfNeverStarted(id: request.requestID, binding: binding)
         }
@@ -158,15 +163,15 @@ extension AgentModeViewModel {
                     audit: .notRequired, runState: session.runState.rawValue
                 ))
             }
-            let failure: DomainAgentSessionLinkStopReceipt.FailureReason = switch recorder.publicationResult {
-            case .accepted?: .teardownTimeout
+            let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
+            case .accepted?: nil
             case .stale?: .terminalPublicationStale
             case .rejected?: .terminalPublicationRejected
             case nil: .cancellationUnconfirmed
             }
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
-                result: .stopFailed, failure: failure,
+                result: accepted ? .stopped : .stopFailed, failure: failure,
                 stopRequested: recorder.initiatedCancellation,
                 teardownCompleted: recorder.teardownCompleted,
                 itemID: itemID, audit: itemID == nil ? .notRequired : .unknown,
@@ -174,7 +179,7 @@ extension AgentModeViewModel {
             ))
         }
         Task {
-            try? await Task.sleep(nanoseconds: UInt64(max(0, auditDeadlineSeconds) * 1_000_000_000))
+            await deadlineSleep(auditDeadlineSeconds)
             audit.finish(.unknown)
         }
         let auditStatus = await audit.value()
@@ -214,7 +219,8 @@ extension AgentModeViewModel {
         session: TabSession,
         binding: AgentPersistentSessionBindingIdentity,
         itemID: UUID?,
-        deadlineSeconds: TimeInterval
+        deadlineSeconds: TimeInterval,
+        deadlineSleep: @escaping @MainActor (TimeInterval) async -> Void
     ) async -> DomainAgentSessionLinkStopReceipt.AuditStatus {
         guard itemID != nil else { return .failed }
         guard agentSessionLinkLiveSession(matching: candidate) === session,
@@ -234,7 +240,7 @@ extension AgentModeViewModel {
             }
         }
         Task {
-            try? await Task.sleep(nanoseconds: UInt64(max(0, deadlineSeconds) * 1_000_000_000))
+            await deadlineSleep(deadlineSeconds)
             signal.finish(.unknown)
         }
         return await signal.value()

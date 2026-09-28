@@ -255,6 +255,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         var stopRequests: [(AgentSessionLinkEndpointCandidate, AgentSessionLinkStopRequest)] = []
         var stopResult: DomainAgentSessionLinkStopReceipt.Result = .notRunning
+        var stopTeardownCompleted: Bool?
+        var currentStopRunID: UUID?
+        var stoppedRunIDs: [UUID] = []
 
         func agentSessionLinkPerformStop(
             to candidate: AgentSessionLinkEndpointCandidate,
@@ -271,11 +274,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             await afterSendCommit?()
             guard commit == .committed else { return .blocked(commit.refusal) }
             guard !queueHasCommittedDrain(), withdrawInbound() else { return .blocked(.targetBusy) }
+            if let currentStopRunID { stoppedRunIDs.append(currentStopRunID) }
             return .settled(DomainAgentSessionLinkStopReceipt(
                 requestID: request.requestID,
                 targetSessionID: candidate.sessionID,
                 result: stopResult,
                 stopRequested: stopResult == .stopped,
+                teardownCompleted: stopTeardownCompleted,
                 auditStatus: .notRequired,
                 settledAt: Date(timeIntervalSince1970: 2000)
             ))
@@ -3761,6 +3766,40 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(duplicate.requestID, receipt.requestID)
         XCTAssertEqual(fixture.host.stopRequests.count, 1)
         XCTAssertEqual(fixture.host.stopRequests.first?.1.observerDisplayName, "Planning")
+    }
+
+    func testTimedOutStopReceiptCannotRetargetASuccessorRunOnDuplicateKey() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        fixture.host.stopResult = .stopped
+        fixture.host.stopTeardownCompleted = false
+        let firstRunID = UUID()
+        fixture.host.currentStopRunID = firstRunID
+        let authorized = await fixture.bridge.authorizeTarget(
+            operation: .monitorStop,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(authorized.success)
+        guard case let .receipt(first) = await fixture.bridge.stop(
+            target: target, idempotencyKey: "teardown-timeout"
+        ) else { return XCTFail("expected timeout receipt") }
+        XCTAssertEqual(first.result, .stopped)
+        XCTAssertEqual(first.teardownCompleted, false)
+
+        // The same endpoint now owns another run; replay must not invoke the host again.
+        let successorRunID = UUID()
+        fixture.host.currentStopRunID = successorRunID
+        fixture.host.stopTeardownCompleted = true
+        guard case let .receipt(replay) = await fixture.bridge.stop(
+            target: target, idempotencyKey: "teardown-timeout"
+        ) else { return XCTFail("expected retained receipt") }
+        XCTAssertTrue(replay.duplicate)
+        XCTAssertEqual(replay.requestID, first.requestID)
+        XCTAssertEqual(replay.teardownCompleted, false)
+        XCTAssertEqual(fixture.host.stopRequests.count, 1)
+        XCTAssertEqual(fixture.host.stoppedRunIDs, [firstRunID])
+        XCTAssertNotEqual(fixture.host.stoppedRunIDs.last, successorRunID)
     }
 
     func testStopRevokedBeforeAuthorityFenceNeverMutatesTarget() async throws {

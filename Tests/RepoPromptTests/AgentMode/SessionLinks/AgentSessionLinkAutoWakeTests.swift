@@ -1472,6 +1472,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         try publishInventory(observer, revision: 1)
         observer.session.oversight.autoWakeOnUpdates = true
         observer.session.runState = .running
+        XCTAssertNil(observer.session.oversight.suppressedWakeFingerprint)
         try publishLane(
             observer, linkSetRevision: 1, queueRevision: 0,
             targetIndices: [], laneIndices: [0]

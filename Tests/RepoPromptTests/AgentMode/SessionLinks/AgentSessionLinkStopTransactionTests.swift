@@ -68,7 +68,9 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
 
     private func stop(
         _ fixture: Fixture,
+        teardownDeadlineSeconds: TimeInterval = 1,
         auditDeadlineSeconds: TimeInterval = 1,
+        deadlineSleep: (@MainActor (TimeInterval) async -> Void)? = nil,
         beforeCleanupTask: @escaping @MainActor () -> Void = {}
     ) async -> AgentSessionLinkStopTransactionOutcome {
         let observer = DomainAgentSessionLinkEndpointIdentity(
@@ -88,8 +90,11 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             queueHasCommittedDrain: { false },
             withdrawInbound: { true },
             commitAuthorization: { .committed },
-            teardownDeadlineSeconds: 1,
+            teardownDeadlineSeconds: teardownDeadlineSeconds,
             auditDeadlineSeconds: auditDeadlineSeconds,
+            deadlineSleep: deadlineSleep ?? { seconds in
+                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+            },
             beforeCleanupTask: beforeCleanupTask
         )
     }
@@ -166,8 +171,102 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
         XCTAssertEqual(receipt.result, .stopped)
         XCTAssertEqual(receipt.auditStatus, .failed)
+        let rendered = try AgentSessionLinkMCPToolService.stopOutcomeValue(
+            .receipt(receipt), targetSessionID: fixture.candidate.sessionID
+        )
+        XCTAssertNotNil(rendered.objectValue?["warning"]?.stringValue)
         XCTAssertEqual(fixture.session.runState, .cancelled)
         XCTAssertEqual(fixture.session.items.count(where: { $0.text == AgentChatItem.overseerRunStoppedText }), 1)
+    }
+
+    func testTeardownReleasedBeforeDeadlineReturnsStoppedWithCompletedCleanup() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        let ownership = fixture.session.beginRunAttempt(source: "stop-teardown-before-deadline")
+        let entered = AgentSessionLinkStopSignal<Void>()
+        let release = AgentSessionLinkStopSignal<Void>()
+        let deadline = AgentSessionLinkStopSignal<Void>()
+        fixture.session.installRunAttemptTerminalResources(ownership: ownership) { _ in
+            {
+                entered.finish(())
+                await release.value()
+            }
+        }
+        addTeardownBlock {
+            release.finish(())
+            deadline.finish(())
+        }
+
+        let stopping = Task {
+            await self.stop(fixture, teardownDeadlineSeconds: 30, deadlineSleep: { seconds in
+                if seconds == 30 {
+                    await deadline.value()
+                } else {
+                    try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                }
+            })
+        }
+        await entered.value()
+        release.finish(())
+        guard case let .settled(receipt) = await stopping.value else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.teardownCompleted, true)
+        XCTAssertEqual(receipt.auditStatus, .persisted)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        deadline.finish(())
+    }
+
+    func testTeardownDeadlineRetainsStoppedWarningAndKeepsExecutingCleanupClaimed() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        let ownership = fixture.session.beginRunAttempt(source: "stop-teardown-after-deadline")
+        let entered = AgentSessionLinkStopSignal<Void>()
+        let release = AgentSessionLinkStopSignal<Void>()
+        let deadline = AgentSessionLinkStopSignal<Void>()
+        fixture.session.installRunAttemptTerminalResources(ownership: ownership) { _ in
+            {
+                entered.finish(())
+                await release.value()
+            }
+        }
+        addTeardownBlock {
+            release.finish(())
+            deadline.finish(())
+        }
+
+        let stopping = Task {
+            await self.stop(fixture, teardownDeadlineSeconds: 30, deadlineSleep: { seconds in
+                if seconds == 30 {
+                    await deadline.value()
+                } else {
+                    try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                }
+            })
+        }
+        await entered.value()
+        deadline.finish(())
+        guard case let .settled(receipt) = await stopping.value else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.teardownCompleted, false)
+        XCTAssertEqual(receipt.auditStatus, .unknown)
+        let rendered = try AgentSessionLinkMCPToolService.stopOutcomeValue(
+            .receipt(receipt), targetSessionID: fixture.candidate.sessionID
+        )
+        XCTAssertNotNil(rendered.objectValue?["warning"]?.stringValue)
+        XCTAssertNil(rendered.objectValue?["reason"])
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+        XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
+        XCTAssertFalse(
+            fixture.session.stopState.forceRetireUnclaimedStop(binding: binding),
+            "deadline must not mark already-started teardown unclaimed"
+        )
+        release.finish(())
+        try await AsyncTestWait.waitUntil("late teardown releases the stop gate") {
+            !fixture.session.stopState.isStopping(binding: binding)
+        }
     }
 
     func testAuditDeadlineRetainsUnknownWithoutRepeatingCancellation() async throws {
@@ -175,18 +274,40 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "stop-save-timeout")
-        let gate = AgentSessionLinkStopSignal<Void>()
+        let saveEntered = AgentSessionLinkStopSignal<Void>()
+        let saveRelease = AgentSessionLinkStopSignal<Void>()
+        let deadline = AgentSessionLinkStopSignal<Void>()
         fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
-            await gate.value()
+            saveEntered.finish(())
+            await saveRelease.value()
             return URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("\(UUID().uuidString).json")
         }
-        let outcome = await stop(fixture, auditDeadlineSeconds: 0.05)
-        guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
+        addTeardownBlock {
+            saveRelease.finish(())
+            deadline.finish(())
+        }
+        let stopping = Task {
+            await self.stop(fixture, auditDeadlineSeconds: 5, deadlineSleep: { seconds in
+                if seconds == 5 {
+                    await deadline.value()
+                } else {
+                    try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                }
+            })
+        }
+        await saveEntered.value()
+        deadline.finish(())
+        guard case let .settled(receipt) = await stopping.value else { return XCTFail("expected receipt") }
         XCTAssertEqual(receipt.result, .stopped)
         XCTAssertEqual(receipt.auditStatus, .unknown)
+        let rendered = try AgentSessionLinkMCPToolService.stopOutcomeValue(
+            .receipt(receipt), targetSessionID: fixture.candidate.sessionID
+        )
+        XCTAssertNotNil(rendered.objectValue?["warning"]?.stringValue)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
         XCTAssertEqual(fixture.session.items.count(where: { $0.text == AgentChatItem.overseerRunStoppedText }), 1)
-        gate.finish(())
+        saveRelease.finish(())
     }
 
     func testSecondUserStopForceRetiresUnclaimedTerminalGate() async throws {
@@ -199,6 +320,11 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         let wedgedID = UUID()
         XCTAssertTrue(fixture.session.stopState.claimManagedStop(id: wedgedID, binding: binding))
         fixture.session.stopState.markCleanupUnclaimedIfNeverStarted(id: wedgedID, binding: binding)
+        XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
+        let foreignBinding = AgentPersistentSessionBindingIdentity(
+            tabID: fixture.tabID, sessionID: UUID()
+        )
+        XCTAssertFalse(fixture.session.stopState.forceRetireUnclaimedStop(binding: foreignBinding))
         XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
         await fixture.viewModel.cancelAgentRun(tabID: fixture.tabID)
         XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding))
