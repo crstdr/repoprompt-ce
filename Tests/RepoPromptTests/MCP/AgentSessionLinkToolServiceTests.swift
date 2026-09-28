@@ -633,6 +633,20 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         } catch {
             XCTAssertTrue("\(error)".contains("workflow requires message"))
         }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-bad-role"),
+                "role": .string("unsupported")
+            ])
+            XCTFail("Expected an unknown role to fail")
+        } catch {
+            let message = "\(error)"
+            XCTAssertTrue(message.contains("role must be one of"))
+            for role in AgentModelCatalog.TaskLabelKind.allCases {
+                XCTAssertTrue(message.contains(role.rawValue))
+            }
+        }
         let list = try await Self.executeObject(fixture.service, args: ["op": .string("list")])
         XCTAssertEqual(list["items"]?.arrayValue?.first?.objectValue?["created_by_you"], .bool(false))
         fixture.host.laneCreatorByEndpoint[fixture.target.domainEndpoint] = fixture.observer.sessionID

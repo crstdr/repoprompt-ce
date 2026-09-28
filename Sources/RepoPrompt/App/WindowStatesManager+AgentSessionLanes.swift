@@ -4,7 +4,8 @@ import RepoPromptDomainRuntime
 
 extension WindowStatesManager {
     func agentSessionLinkWasCreatedBy(sessionID: UUID, creatorSessionID: UUID) -> Bool {
-        allWindows.contains { window in
+        guard !isTerminating else { return false }
+        return allWindows.contains { window in
             !window.isClosing && window.agentModeViewModel.agentSessionLinkWasCreatedBy(
                 sessionID: sessionID, creatorSessionID: creatorSessionID
             )
@@ -12,7 +13,8 @@ extension WindowStatesManager {
     }
 
     func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool {
-        allWindows.contains { window in
+        guard !isTerminating else { return true }
+        return allWindows.contains { window in
             !window.isClosing && window.agentModeViewModel.agentSessionLinkHasChildSessions(
                 parentSessionID: parentSessionID
             )

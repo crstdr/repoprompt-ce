@@ -57,6 +57,12 @@ enum AgentSessionLaneMCPToolService {
 
     static func render(_ receipt: AgentSessionLaneCreateReceipt) -> Value {
         if receipt.result == .refused {
+            if receipt.reason == .laneLimitReached {
+                return .object([
+                    "result": .string(AgentSessionLaneCreateReceipt.Reason.laneLimitReached.rawValue),
+                    "lanes": .string("\(receipt.laneCount)/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)")
+                ])
+            }
             return refusal(receipt.reason?.rawValue ?? "creation_incomplete")
         }
         var fields: [String: Value] = [

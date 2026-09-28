@@ -26,9 +26,10 @@ final class AgentSessionLaneMCPToolServiceTests: XCTestCase {
         XCTAssertNil(payload?["link_reason"])
 
         let refused = AgentSessionLaneMCPToolService.render(
-            AgentSessionLaneCreateReceipt.refused(.laneLimitReached)
+            AgentSessionLaneCreateReceipt.refused(.laneLimitReached, laneCount: 8)
         ).objectValue
         XCTAssertEqual(refused?["result"]?.stringValue, "lane_limit_reached")
+        XCTAssertEqual(refused?["lanes"]?.stringValue, "8/8")
         XCTAssertNil(refused?["session_id"])
     }
 

@@ -6642,6 +6642,8 @@ final class AgentSessionLinkRuntimeBridge {
                 sessionName: request.sessionName,
                 selection: selection
             )
+        } catch is AgentSessionLaneHostUnavailable {
+            return .refused(.hostUnavailable)
         } catch { return .refused(.destinationUnavailable) }
         let sessionID: UUID
         let tabID: UUID

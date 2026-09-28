@@ -42,6 +42,7 @@ struct AgentSessionLaneCreateReceipt: Equatable {
         case denied
         case persistenceUnavailable = "persistence_unavailable"
         case destinationUnavailable = "destination_unavailable"
+        case hostUnavailable = "host_unavailable"
         case laneLimitReached = "lane_limit_reached"
         case admissionUnstable = "admission_unstable"
         case roleUnavailable = "role_unavailable"

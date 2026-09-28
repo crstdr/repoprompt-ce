@@ -5441,6 +5441,20 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.host.laneCreationCount, 0)
     }
 
+    func testMissingLaneCreationHostHasDistinctRefusalFromDestinationUnavailable() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        let receipt = await createLane(
+            fixture, observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "missing-host")
+        )
+        XCTAssertEqual(receipt.result, .refused)
+        XCTAssertEqual(receipt.reason, .hostUnavailable)
+        XCTAssertNil(receipt.sessionID)
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+    }
+
     func testLaneCreationJoinsInFlightAndReplaysBoundedReceiptWithoutSecondAllocation() async throws {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)

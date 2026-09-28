@@ -463,8 +463,9 @@ struct AgentSessionLinkMCPToolService {
                 throw MCPError.invalidParams("agent_session_link create_lane role must be a string.")
             }
             let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard ["explore", "engineer", "pair", "design"].contains(normalized) else {
-                throw MCPError.invalidParams("agent_session_link create_lane role must be explore, engineer, pair, or design.")
+            guard AgentModelCatalog.TaskLabelKind(rawValue: normalized) != nil else {
+                let roles = AgentModelCatalog.TaskLabelKind.allCases.map(\.rawValue).joined(separator: ", ")
+                throw MCPError.invalidParams("agent_session_link create_lane role must be one of: \(roles).")
             }
             role = normalized
         } else {
