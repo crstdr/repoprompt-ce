@@ -1772,6 +1772,16 @@ actor ACPAgentSessionController {
         return result
     }
 
+    /// The caller must first route server requests and exhaust owned-request correlation.
+    /// Known maintenance replies are ignored regardless of their payload or protocol version.
+    nonisolated static func isRecognizedUnmatchedResponse(
+        _ json: [String: Any],
+        provider: any ACPAgentProvider
+    ) -> Bool {
+        guard let id = json["id"] as? String, !json.keys.contains("method") else { return false }
+        return provider.recognizesUnmatchedResponseID(id)
+    }
+
     private func handleJSONLine(_ lineData: Data) {
         guard let trimmed = trimmedASCIIWhitespace(lineData), !trimmed.isEmpty else { return }
         let rawLine = String(data: trimmed, encoding: .utf8) ?? "<non-utf8>"
@@ -1814,6 +1824,10 @@ actor ACPAgentSessionController {
                 } else {
                     pendingRequest.continuation.resume(throwing: ControllerError.protocolViolation("Missing result/error for request \(id.displayValue)"))
                 }
+                return
+            }
+            if Self.isRecognizedUnmatchedResponse(json, provider: provider) {
+                log("Ignored provider-recognized unmatched ACP response provider=\(provider.providerID.rawValue) id=\(id.displayValue).")
                 return
             }
             diagnose(.unmatchedResponse(id: id.displayValue, line: rawLine))

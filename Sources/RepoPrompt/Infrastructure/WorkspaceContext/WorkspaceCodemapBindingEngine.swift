@@ -135,7 +135,6 @@ actor WorkspaceCodemapBindingEngine {
 
     /// Graph state removed from an epoch and owned by the caller across its suspensions.
     private struct DetachedGraphRoot {
-        let rootEpoch: WorkspaceCodemapRootEpoch
         let graph: WorkspaceCodemapSelectionGraph?
         let pull: (id: UUID, task: Task<Void, Never>)?
     }
@@ -1239,8 +1238,8 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         taskID: UUID
     ) {
-        abandonGraphFlushWaiters(rootEpoch: rootEpoch)
         guard graphPullTasksByRootEpoch[rootEpoch]?.id == taskID else { return }
+        abandonGraphFlushWaiters(rootEpoch: rootEpoch)
         graphPullTasksByRootEpoch.removeValue(forKey: rootEpoch)
     }
 
@@ -1257,8 +1256,9 @@ actor WorkspaceCodemapBindingEngine {
     /// afterwards, so a replacement registered for the same epoch while they were suspended cannot
     /// have its graph removed by an epoch lookup that no longer describes them.
     private func detachGraphRoot(rootEpoch: WorkspaceCodemapRootEpoch) -> DetachedGraphRoot {
-        DetachedGraphRoot(
-            rootEpoch: rootEpoch,
+        // Settle the old epoch's waiters before any shutdown await can admit a replacement.
+        abandonGraphFlushWaiters(rootEpoch: rootEpoch)
+        return DetachedGraphRoot(
             graph: selectionGraphsByRootEpoch.removeValue(forKey: rootEpoch),
             pull: graphPullTasksByRootEpoch.removeValue(forKey: rootEpoch)
         )
@@ -1278,7 +1278,6 @@ actor WorkspaceCodemapBindingEngine {
             pull.task.cancel()
             await pull.task.value
         }
-        abandonGraphFlushWaiters(rootEpoch: detached.rootEpoch)
     }
 
     #if DEBUG
@@ -4148,9 +4147,10 @@ actor WorkspaceCodemapBindingEngine {
         guard let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               let stage = job.manifestStages[pipelineIdentity],
               case let .eligible(session)? = roots[rootEpoch],
-              let pipeline = session.pipelines[pipelineIdentity]
+              let pipeline = session.pipelines[pipelineIdentity],
+              let gitPipeline = pipeline.git
         else { return false }
-        return stage.namespace == pipeline.git?.namespace && stage.pipelineSessionID == pipeline.id
+        return stage.namespace == gitPipeline.namespace && stage.pipelineSessionID == pipeline.id
     }
 
     private func graphIndexEntry(
@@ -4249,8 +4249,9 @@ actor WorkspaceCodemapBindingEngine {
         guard case var .eligible(session)? = roots.removeValue(forKey: rootEpoch) else { return }
         defer { roots[rootEpoch] = .eligible(session) }
         guard var pipeline = session.pipelines.removeValue(forKey: pipelineIdentity) else { return }
+        defer { session.pipelines[pipelineIdentity] = pipeline }
+        guard pipeline.git != nil else { return }
         pipeline.git?.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
-        session.pipelines[pipelineIdentity] = pipeline
     }
 
     private func resolveGraphIndexCandidate(
@@ -5070,8 +5071,10 @@ actor WorkspaceCodemapBindingEngine {
               session.pipelines[pipelineIdentity] != nil,
               candidate.identity.rootID == rootEpoch.rootID,
               candidate.identity.rootLifetimeID == rootEpoch.rootLifetimeID,
-              candidate.identity.standardizedRootPath ==
-              session.registration.capabilityRequest.loadedRootURL.path,
+              WorkspaceCodemapRootPathBinding.matches(
+                  candidate.identity.standardizedRootPath,
+                  authorizedRootURL: session.registration.capabilityRequest.loadedRootURL
+              ),
               candidate.requestGeneration > 0,
               candidate.requestGeneration == candidate.pathGeneration,
               (
@@ -5965,8 +5968,10 @@ actor WorkspaceCodemapBindingEngine {
                 guard let candidate,
                       candidate.identity.rootID == rootEpoch.rootID,
                       candidate.identity.rootLifetimeID == rootEpoch.rootLifetimeID,
-                      candidate.identity.standardizedRootPath ==
-                      initial.registration.capabilityRequest.loadedRootURL.path,
+                      WorkspaceCodemapRootPathBinding.matches(
+                          candidate.identity.standardizedRootPath,
+                          authorizedRootURL: initial.registration.capabilityRequest.loadedRootURL
+                      ),
                       candidate.identity.standardizedRelativePath == loadedPath,
                       candidate.ingressGeneration == initial.registration.ingressGeneration,
                       candidate.requestGeneration == candidate.pathGeneration,
@@ -6812,8 +6817,10 @@ actor WorkspaceCodemapBindingEngine {
         guard demand.identity.rootID == session.capability.rootEpoch.rootID,
               demand.identity.rootLifetimeID == session.capability.rootEpoch.rootLifetimeID
         else { return .result(.rejected(.rootEpochMismatch)) }
-        guard demand.identity.standardizedRootPath ==
-            session.registration.capabilityRequest.loadedRootURL.path
+        guard WorkspaceCodemapRootPathBinding.matches(
+            demand.identity.standardizedRootPath,
+            authorizedRootURL: session.registration.capabilityRequest.loadedRootURL
+        )
         else { return .result(.rejected(.rootPathMismatch)) }
         guard WorkspaceCodemapArtifactBindingIdentity(
             rootID: demand.identity.rootID,
@@ -6872,8 +6879,10 @@ actor WorkspaceCodemapBindingEngine {
         guard case let .eligible(session)? = roots[rootEpoch] else {
             return .failure(.rootUnavailable)
         }
-        guard request.identity.standardizedRootPath ==
-            session.registration.capabilityRequest.loadedRootURL.path,
+        guard WorkspaceCodemapRootPathBinding.matches(
+            request.identity.standardizedRootPath,
+            authorizedRootURL: session.registration.capabilityRequest.loadedRootURL
+        ),
             request.catalogGeneration == session.registration.catalogGeneration,
             request.ingressGeneration == session.registration.ingressGeneration,
             request.requestGeneration == request.pathGeneration,

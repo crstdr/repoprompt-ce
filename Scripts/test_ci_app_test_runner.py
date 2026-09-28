@@ -47,6 +47,21 @@ class LocalExecutionTests(unittest.TestCase):
         self.assertEqual(lanes, ["build"])
         self.assertEqual(cwd, root)
 
+    def test_job_ticket_reaches_only_the_operation_runner(self) -> None:
+        import conductor
+
+        registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
+        internal = registry._internal_argv("swift_build_all", {})
+        self.assertTrue(conductor.argv_is_operation_runner(internal))
+        test_argv, _, _, _, _ = registry.prepare({"operation": "test", "args": {"filter": "X"}})
+        self.assertFalse(conductor.argv_is_operation_runner(test_argv))
+        self.assertFalse(conductor.argv_is_operation_runner(["swift", "build", "--product", "RepoPrompt"]))
+
+        environ = {conductor.CONDUCTOR_JOB_TICKET_ENV: "ticket-1", "PATH": "/usr/bin"}
+        self.assertEqual(conductor.capture_job_ticket(environ), "ticket-1")
+        self.assertEqual(conductor.current_job_ticket(), "ticket-1")
+        self.assertEqual(environ, {"PATH": "/usr/bin"})
+
     def test_local_build_then_sandboxed_execution_preserves_selection_and_exit(self) -> None:
         calls = []
         sandbox = None
@@ -86,6 +101,111 @@ class LocalExecutionTests(unittest.TestCase):
             swift_binary="swift", cwd=None, executor=executor,
         ), 9)
         executor.assert_called_once()
+
+
+class DirectXCTestExecutionTests(unittest.TestCase):
+    LISTED = [
+        "RepoPromptTests.AlphaTests/testOne",
+        "RepoPromptTests.AlphaTests/testTwo",
+        "RepoPromptTests.BetaTests/testOne",
+        "RepoPromptRegexCoreTests.RegexTests/testMatch",
+    ]
+
+    def test_flatten_listed_tests_matches_swiftpm_specifiers(self) -> None:
+        document = {"name": "All Tests", "tests": [{"name": "RepoPromptCEPackageTests.xctest", "tests": [
+            {"name": "RepoPromptTests.AlphaTests", "tests": [{"name": "testTwo"}, {"name": "testOne"}]},
+            {"name": "RepoPromptTests.EmptyTests", "tests": []},
+        ]}]}
+        self.assertEqual(runner.flatten_listed_tests(document), [
+            "RepoPromptTests.AlphaTests/testOne", "RepoPromptTests.AlphaTests/testTwo",
+        ])
+
+    def test_flatten_ignores_bundles_containing_only_empty_suites(self) -> None:
+        document = {"name": "All Tests", "tests": [{"name": "Pkg.xctest", "tests": [
+            {"name": "M.EmptyA", "tests": []},
+            {"name": "M.EmptyB", "tests": []},
+        ]}]}
+        self.assertEqual(runner.flatten_listed_tests(document), [])
+
+    def test_select_specifiers_uses_regex_search_and_collapses_whole_suites(self) -> None:
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "AlphaTests"), ["RepoPromptTests.AlphaTests"])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "testOne"), [
+            "RepoPromptTests.AlphaTests/testOne", "RepoPromptTests.BetaTests",
+        ])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "RepoPromptRegexCoreTests"), [
+            "RepoPromptRegexCoreTests.RegexTests",
+        ])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "Alpha|Regex"), [
+            "RepoPromptRegexCoreTests.RegexTests", "RepoPromptTests.AlphaTests",
+        ])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, None), ["All"])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "Nope"), [])
+        self.assertIsNone(runner.select_xctest_specifiers(self.LISTED, "(unclosed"))
+
+    def direct(self, root: Path, **overrides):
+        options = dict(
+            swift_binary="swift", cwd=root, test_filter="AlphaTests", environment={"HOME": "/sandbox"},
+            lister=lambda bundle, env: list(self.LISTED),
+            bundle_discovery=lambda swift, cwd: {"RepoPromptCEPackageTests": Path("/b/RepoPromptCEPackageTests.xctest")},
+            xctest_binary=lambda: ("/x/xctest",),
+        )
+        options.update(overrides)
+        return runner.direct_xctest_command(**options)
+
+    def test_direct_command_runs_bundle_with_selectors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.direct(Path(tmp)), (
+                "/x/xctest", "-XCTest", "RepoPromptTests.AlphaTests", "/b/RepoPromptCEPackageTests.xctest",
+            ))
+            self.assertEqual(self.direct(Path(tmp), test_filter="Nope"), ())
+
+    def test_direct_command_falls_back_when_equivalence_is_not_guaranteed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(self.direct(root, bundle_discovery=lambda swift, cwd: {}))
+            self.assertIsNone(self.direct(root, lister=lambda bundle, env: None))
+            self.assertIsNone(self.direct(root, test_filter="(bad"))
+            tests = root / "Tests" / "NewTests"
+            tests.mkdir(parents=True)
+            (tests / "SwiftTestingTests.swift").write_text("import Testing\n@Test func works() {}\n")
+            self.assertIsNone(self.direct(root))
+
+    def test_run_local_tests_uses_direct_command_in_sandbox(self) -> None:
+        calls = []
+
+        def execute(command, cwd, environment):
+            calls.append((tuple(command), environment.get("HOME")))
+            return 0
+
+        def direct(**kwargs):
+            self.assertIn("rpce-local-tests-", kwargs["environment"]["HOME"])
+            return ("/x/xctest", "-XCTest", "S", "/b.xctest")
+
+        with mock.patch.dict(runner.os.environ, {"PATH": "/usr/bin", "HOME": "/real"}, clear=True):
+            self.assertEqual(runner.run_local_tests(
+                swift_binary="swift", cwd=None, test_filter="S", executor=execute, direct_command=direct,
+            ), 0)
+        self.assertEqual(calls[0], (("swift", "build", "--build-tests"), "/real"))
+        self.assertEqual(calls[1][0], ("/x/xctest", "-XCTest", "S", "/b.xctest"))
+        self.assertIn("rpce-local-tests-", calls[1][1])
+
+    def test_run_local_tests_reports_no_match_without_launching(self) -> None:
+        executor = mock.Mock(return_value=0)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(runner.run_local_tests(
+                swift_binary="swift", cwd=None, test_filter="Nope", executor=executor,
+                direct_command=lambda **kwargs: (),
+            ), 0)
+        executor.assert_called_once()
+        self.assertIn("No matching test cases were run", stdout.getvalue())
+
+    def test_run_local_tests_falls_back_to_swiftpm(self) -> None:
+        executor = mock.Mock(return_value=0)
+        runner.run_local_tests(
+            swift_binary="swift", cwd=None, test_filter="S", executor=executor,
+            direct_command=lambda **kwargs: None,
+        )
+        self.assertEqual(executor.call_args_list[1].args[0], ("swift", "test", "--skip-build", "--filter", "S"))
 
 
 class TestDiscoveryTests(unittest.TestCase):
