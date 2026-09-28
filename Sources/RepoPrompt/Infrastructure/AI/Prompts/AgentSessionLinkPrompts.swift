@@ -689,6 +689,7 @@ enum AgentSessionLinkPrompts {
         }
         attributes += " capabilities=\"\(escaped(item.capabilityNames.joined(separator: ",")))\""
         attributes += " managed=\"\(item.capabilityNames.contains("manage") ? "true" : "false")\""
+        attributes += " created_by_you=\"\(item.createdByYou ? "true" : "false")\""
         return "<session \(attributes) />"
     }
 

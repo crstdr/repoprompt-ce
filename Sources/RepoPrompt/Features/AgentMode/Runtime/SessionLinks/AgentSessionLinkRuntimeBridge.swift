@@ -107,6 +107,10 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UUID?
 
+    func agentSessionLinkLaneCreatorLabel(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> String?
+
     /// Sanitized observation snapshot for one exact live candidate.
     ///
     /// This is the agent-facing path: it materializes and redacts the latest assistant preview, so it
@@ -421,6 +425,10 @@ extension AgentSessionLinkEndpointHost {
     func agentSessionLinkLaneProvenance(
         for _: DomainAgentSessionLinkEndpointIdentity
     ) -> UUID? { nil }
+
+    func agentSessionLinkLaneCreatorLabel(
+        for _: DomainAgentSessionLinkEndpointIdentity
+    ) -> String? { nil }
 
     /// Fail-closed management defaults: a host that does not model interactions or steering exposes
     /// none, answers none, and steers nothing.
@@ -2844,7 +2852,7 @@ final class AgentSessionLinkRuntimeBridge {
             host.agentSessionLinkReleasePromptInventoryHold(
                 hold,
                 for: observerEndpoint,
-                publishing: AgentSessionLinkPromptInventory(value.observerInventory)
+                publishing: laneAnnotatedPromptInventory(value.observerInventory)
             )
         case let .rejected(rejection):
             // The authority already dropped the reservation on every rejection path, so there is no
@@ -3686,9 +3694,22 @@ final class AgentSessionLinkRuntimeBridge {
             // Built from the authority inventory, not from the UI rows: those substitute a live
             // candidate's name and status when the grant carries none, and neither substitution may
             // leak into agent-facing prompt text.
-            promptInventory: AgentSessionLinkPromptInventory(inputs.outbound),
+            promptInventory: laneAnnotatedPromptInventory(inputs.outbound),
             passiveNotices: passiveNotices
         )
+    }
+
+    /// Annotate only uniquely resolved live targets; an ambiguous session UUID grants no provenance.
+    func laneAnnotatedPromptInventory(
+        _ inventory: DomainAgentSessionLinkInventory
+    ) -> AgentSessionLinkPromptInventory {
+        let candidates = host?.agentSessionLinkCandidates() ?? []
+        let bySessionID = Dictionary(grouping: candidates, by: \.sessionID)
+        return AgentSessionLinkPromptInventory(inventory) { targetID in
+            guard let matches = bySessionID[targetID], matches.count == 1 else { return false }
+            return host?.agentSessionLinkLaneProvenance(for: matches[0].domainEndpoint)
+                == inventory.sessionID
+        }
     }
 
     /// One endpoint's Oversee rows plus the passive status samples those same rows were built from.
@@ -3810,7 +3831,8 @@ final class AgentSessionLinkRuntimeBridge {
             sidebarOversightMenu: AgentSidebarOversightMenuProjection.make(
                 target: candidate,
                 inputs: inputs,
-                candidates: candidates
+                candidates: candidates,
+                createdByLabel: host?.agentSessionLinkLaneCreatorLabel(for: endpoint)
             ),
             outbound: outbound,
             inbound: inbound,
@@ -6305,6 +6327,22 @@ final class AgentSessionLinkRuntimeBridge {
             guard matches.count == 1 else { return nil }
             return host?.agentSessionLinkLaneProvenance(for: matches[0].domainEndpoint)
         }
+    }
+
+    /// Early service gate so workspace resolution cannot disclose destinations to an unlinked caller.
+    func laneCreationCallerEligible(
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> Bool {
+        guard !isFrozenForTermination,
+              let candidate = host?.agentSessionLinkCandidates().first(where: {
+                  $0.domainEndpoint == endpoint
+              }),
+              AgentSessionLinkEndpointEligibility.addDisabledReason(
+                  candidate.eligibilityInput,
+                  roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+              ) == nil
+        else { return false }
+        return await authority.hasActiveLink(endpoint: endpoint)
     }
 
     func createLane(

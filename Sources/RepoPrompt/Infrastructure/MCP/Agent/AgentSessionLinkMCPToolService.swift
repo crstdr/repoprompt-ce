@@ -443,6 +443,101 @@ struct AgentSessionLinkMCPToolService {
 
     // MARK: - list
 
+    // These executors are exposed only with the atomic lane contract migration.
+    private func executeCreateLane(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        guard await bridge.laneCreationCallerEligible(observerEndpoint) else {
+            throw Self.unavailableError
+        }
+        let key = try Self.parseIdempotencyKey(args["idempotency_key"], op: "create_lane")
+        let role: String?
+        if let value = args["role"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane role must be a string.")
+            }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard ["explore", "engineer", "pair", "design"].contains(normalized) else {
+                throw MCPError.invalidParams("agent_session_link create_lane role must be explore, engineer, pair, or design.")
+            }
+            role = normalized
+        } else {
+            role = nil
+        }
+        let sessionName: String?
+        if let value = args["session_name"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane session_name must be a string.")
+            }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty, normalized.utf8.count <= 120 else {
+                throw MCPError.invalidParams("agent_session_link create_lane session_name must be 1–120 UTF-8 bytes.")
+            }
+            sessionName = normalized
+        } else {
+            sessionName = nil
+        }
+        let message = try args["message"].map { try Self.parseMessage($0, op: "create_lane") }
+        let workflowReference = try AgentWorkflowReference.parse(args: args)
+        guard message != nil || workflowReference == nil else {
+            throw MCPError.invalidParams("agent_session_link create_lane workflow requires message.")
+        }
+        let workspaceSelector: String?
+        if let value = args["workspace"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane workspace must be a name or UUID string.")
+            }
+            workspaceSelector = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard workspaceSelector?.isEmpty == false else {
+                throw MCPError.invalidParams("agent_session_link create_lane workspace must not be empty.")
+            }
+        } else {
+            workspaceSelector = nil
+        }
+        let callerWindow = try requireTargetWindow()
+        let matchingWindows = WindowStatesManager.shared.allWindows.filter { window in
+            guard !window.isClosing, let workspace = window.workspaceManager.activeWorkspace else {
+                return false
+            }
+            guard let workspaceSelector else { return window.windowID == callerWindow.windowID }
+            return workspace.id == UUID(uuidString: workspaceSelector)
+                || workspace.name.localizedCaseInsensitiveCompare(workspaceSelector) == .orderedSame
+        }
+        guard let destination = matchingWindows.sorted(by: { lhs, rhs in
+            if lhs.windowID == callerWindow.windowID { return true }
+            if rhs.windowID == callerWindow.windowID { return false }
+            return lhs.windowID < rhs.windowID
+        }).first, let workspaceID = destination.workspaceManager.activeWorkspace?.id else {
+            return AgentSessionLaneMCPToolService.refusal("destination_unavailable")
+        }
+        let receipt = await bridge.createLane(
+            observerEndpoint: observerEndpoint,
+            request: AgentSessionLaneCreateRequest(
+                idempotencyKey: key,
+                role: role,
+                sessionName: sessionName,
+                destinationWindowID: destination.windowID,
+                workspaceID: workspaceID,
+                message: message,
+                workflowReference: workflowReference
+            )
+        )
+        if receipt.reason == .denied { throw Self.unavailableError }
+        return AgentSessionLaneMCPToolService.render(receipt)
+    }
+
+    private func executeRetireLane(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        let targetSessionID = try Self.parseSingleSessionID(args["session_id"], op: "retire_lane")
+        let outcome = await bridge.retireLane(
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        )
+        if case .notRetired(_, .denied) = outcome {
+            throw Self.denialError(targetSessionID: targetSessionID)
+        }
+        return AgentSessionLaneMCPToolService.render(outcome)
+    }
+
     private func executeList(args: [String: Value]) async throws -> Value {
         let observerEndpoint = try await resolveCallerEndpointIdentity()
         let inventory: DomainAgentSessionLinkInventory
@@ -479,6 +574,8 @@ struct AgentSessionLinkMCPToolService {
         }
 
         let page = inventory.items.dropFirst(offset).prefix(maxItems)
+        let createdByYou = Set(bridge.laneAnnotatedPromptInventory(inventory).items
+            .filter(\.createdByYou).map(\.targetSessionID))
         let nextOffset = offset + page.count
         let hasMore = nextOffset < inventory.items.count
 
@@ -491,7 +588,8 @@ struct AgentSessionLinkMCPToolService {
                     "session_id": .string(item.targetSessionID.uuidString),
                     "name": AgentMCPToolHelpers.stringOrNull(item.displayName),
                     "capabilities": .array(item.capabilityNames.map { .string($0) }),
-                    "managed": .bool(item.capabilities.contains(.manage))
+                    "managed": .bool(item.capabilities.contains(.manage)),
+                    "created_by_you": .bool(createdByYou.contains(item.targetSessionID))
                 ])
             }),
             "has_more": .bool(hasMore),

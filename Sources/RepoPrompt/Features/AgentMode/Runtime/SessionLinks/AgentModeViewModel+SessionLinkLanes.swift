@@ -114,6 +114,26 @@ extension AgentModeViewModel {
         return ownerValidatedSessionIndex[endpoint.sessionID]?.createdByOverseerSessionID
     }
 
+    func agentSessionLinkLaneCreatorLabel(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> String? {
+        guard let creatorID = agentSessionLinkLaneProvenance(for: endpoint) else { return nil }
+        return agentSessionLinkLaneCreatorLabel(creatorID: creatorID)
+    }
+
+    func agentSessionLinkLaneCreatorLabel(for sessionID: UUID) -> String? {
+        guard let creatorID = ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID else {
+            return nil
+        }
+        return agentSessionLinkLaneCreatorLabel(creatorID: creatorID)
+    }
+
+    private func agentSessionLinkLaneCreatorLabel(creatorID: UUID) -> String {
+        let name = ownerValidatedSessionIndex[creatorID]?.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.flatMap { $0.isEmpty ? nil : $0 }
+            ?? AgentMonitorSessionIDFormatter.short(creatorID)
+    }
+
     /// Preflight or stash one exact inactive lane. Both removal CAS hooks repeat the check around
     /// the required session flush; a prompt or run starting during that await keeps the tab open.
     func agentSessionLinkRetireLane(

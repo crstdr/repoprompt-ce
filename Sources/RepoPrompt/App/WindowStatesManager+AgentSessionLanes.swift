@@ -60,4 +60,14 @@ extension WindowStatesManager {
         else { return nil }
         return window.agentModeViewModel.agentSessionLinkLaneProvenance(for: endpoint)
     }
+
+    func agentSessionLinkLaneCreatorLabel(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> String? {
+        guard !isTerminating,
+              let window = window(withID: endpoint.windowID),
+              !window.isClosing
+        else { return nil }
+        return window.agentModeViewModel.agentSessionLinkLaneCreatorLabel(for: endpoint)
+    }
 }

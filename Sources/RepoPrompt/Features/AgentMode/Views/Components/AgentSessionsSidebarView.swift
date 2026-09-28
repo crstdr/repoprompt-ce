@@ -556,6 +556,9 @@ struct AgentModeSessionsListView: View {
                             title: session.title,
                             isActive: session.tabID == currentTabID,
                             isOverseer: isOverseer,
+                            createdByLabel: session.sessionID.flatMap {
+                                agentModeVM.agentSessionLinkLaneCreatorLabel(for: $0)
+                            },
                             isPinned: session.isPinned,
                             isMCPControlled: session.isMCPControlled,
                             runState: runState,
@@ -1495,6 +1498,9 @@ struct ArchivedSessionsList: View {
                 )
                 AgentStashedSessionRow(
                     stashed: stashed,
+                    createdByLabel: sessionIDByStashedTabID[stashed.id].flatMap {
+                        agentModeVM.agentSessionLinkLaneCreatorLabel(for: $0)
+                    },
                     isSelected: selectionState.selectedIdentities.contains(identity),
                     showsSelectionPresentation: selectionState.showsSelectionPresentation,
                     isInteractionEnabled: !selectionState.isMutationInFlight,
