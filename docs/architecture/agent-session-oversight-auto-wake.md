@@ -201,6 +201,22 @@ worktree-merge reviews, and secret input stay with the target's user. Auto-wake 
 are admission policy for observer turns, not permission authority. Provider-wide Claude and ACP
 permission preferences and MCP client permissions are separate controls, not oversight link choices.
 
+## Saved oversight restoration across relaunch
+
+After window restoration settles, a saved oversight pair can still wait on a described background
+compose tab whose session has not hydrated. The launch coordinator requests one passive load per
+waiting endpoint per launch, only after the restore barriers clear. The host uses
+`ensureSessionReady(tabID:)` without selecting or focusing a tab, activating a window, or starting or
+reconnecting a provider. Ordinary candidate-readiness signals then re-enter the restoration pass;
+both endpoints must still prove authoritative before a link is established. An undescribed,
+duplicate, deleting, or terminal endpoint is not hydrated to manufacture a grant.
+
+The version-1 intent document accepts optional `delegations` rows for compatibility with upstream
+files. In this lean fork those stored `manage` and `autoApprovePermissions` bits are **not consulted**
+when links are restored or explicitly re-added. Every new grant has the same managed default,
+and provider permissions still require an explicit response. Removing an intent also drops its
+stored row; no UI or runtime path writes a new delegation.
+
 ## Management is an authority-owned grant capability
 
 A new exact outbound link includes `.manage` by default. The user sees fixed Oversee disclosure at
