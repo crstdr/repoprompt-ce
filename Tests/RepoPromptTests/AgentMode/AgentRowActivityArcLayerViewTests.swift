@@ -32,8 +32,8 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
     /// A hidden window keeps no layer arc at all: `AgentRowRunningIndicator` swaps to the still
     /// shape so no window commit ever has to walk a live animation.
     func testHiddenWindowKeepsNoAnimation() {
-        let visible = hostIndicator(isWindowPresentationVisible: true)
-        let hidden = hostIndicator(isWindowPresentationVisible: false)
+        let visible = hostIndicator(isWindowPresentationVisible: true, reduceMotion: false)
+        let hidden = hostIndicator(isWindowPresentationVisible: false, reduceMotion: false)
         defer {
             visible.window.close()
             hidden.window.close()
@@ -150,10 +150,11 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
 
     /// The row's mode-resolving indicator, hosted with an explicit window-visibility override.
     private func hostIndicator(
-        isWindowPresentationVisible: Bool
+        isWindowPresentationVisible: Bool,
+        reduceMotion: Bool
     ) -> (host: NSHostingView<AnyView>, window: NSWindow) {
         let host = NSHostingView(rootView: AnyView(
-            AgentRowRunningIndicator()
+            AgentRowRunningIndicator(reduceMotionOverride: reduceMotion)
                 .environment(\.windowIsPresentationVisible, isWindowPresentationVisible)
         ))
         let window = makeWindow()
