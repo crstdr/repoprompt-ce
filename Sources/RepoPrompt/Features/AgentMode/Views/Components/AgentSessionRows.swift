@@ -115,6 +115,7 @@ struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
     var isOverseer = false
+    var createdByLabel: String?
     let isPinned: Bool
     let isMCPControlled: Bool
     let runState: AgentSessionRunState
@@ -765,6 +766,14 @@ struct AgentSessionRow: View {
                         overseerBadge
                     }
 
+                    if let creatorLabel = createdByLabel ?? sidebarOversightMenu?.createdByLabel {
+                        Text("Created by \(creatorLabel)")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .accessibilityLabel("Created by \(creatorLabel)")
+                    }
+
                     if isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinFontSize))
@@ -1396,6 +1405,7 @@ struct AgentSessionRow: View {
 
 struct AgentStashedSessionRow: View {
     let stashed: StashedTab
+    var createdByLabel: String?
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
@@ -1521,6 +1531,13 @@ struct AgentStashedSessionRow: View {
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                    if let createdByLabel {
+                        Text("Created by \(createdByLabel)")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .accessibilityLabel("Created by \(createdByLabel)")
+                    }
                     if stashed.tab.isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinIconSize))

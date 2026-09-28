@@ -208,6 +208,24 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         ))
     }
 
+    func testCreatorLabelSurvivesAnEmptyUnlinkedMenuWithoutChangingEligibility() throws {
+        let target = candidate(windowID: 1, isMCPControlled: false, isMCPOriginated: false)
+        let menu = try XCTUnwrap(AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(target: target),
+            candidates: [target],
+            createdByLabel: "Overseer"
+        ))
+        XCTAssertTrue(menu.isEmpty)
+        XCTAssertEqual(menu.createdByLabel, "Overseer")
+        XCTAssertNil(AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(target: target),
+            candidates: [target]
+        )?.createdByLabel)
+        XCTAssertFalse(target.isMCPControlled)
+    }
+
     func testMenuLabelsPrefixLiveObserverLocationAndFallBackWhenUnavailable() throws {
         let target = candidate(windowID: 10, displayName: "Target")
         let linked = candidate(
