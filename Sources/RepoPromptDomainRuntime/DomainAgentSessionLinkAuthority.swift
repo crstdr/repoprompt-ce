@@ -308,7 +308,7 @@ package actor DomainAgentSessionLinkAuthority {
             return .rejected(.observerHasNoActiveOutboundLink)
         }
         guard !requiresExistingDirectLink || hasActiveLink(endpoint: observer) else {
-            return .rejected(.observerHasNoActiveOutboundLink)
+            return .rejected(.observerHasNoActiveLink)
         }
         if pendingReservations.values.contains(where: { $0.observer == observer && $0.target == target }) {
             return .rejected(.reservationAlreadyPending)
@@ -389,7 +389,7 @@ package actor DomainAgentSessionLinkAuthority {
            !hasActiveLink(endpoint: reservation.observer)
         {
             pendingReservations.removeValue(forKey: reservation.linkID)
-            return .rejected(.observerHasNoActiveOutboundLink)
+            return .rejected(.observerHasNoActiveLink)
         }
 
         pendingReservations.removeValue(forKey: reservation.linkID)
@@ -860,7 +860,7 @@ package actor DomainAgentSessionLinkAuthority {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Result<DomainAgentSessionLinkInventory, DomainAgentSessionLinkError> {
         guard !isDraining, !isShutDown else { return .failure(.runtimeShuttingDown) }
-        guard operation == .monitorList else { return .failure(.noActiveLink) }
+        guard operation == .monitorList else { return .failure(.invalidRequest) }
         let decision = DomainAgentSessionOperationAuthorizer.authorizeObserverScoped(
             operation: operation,
             caller: .agentSession(observerEndpoint.sessionID),

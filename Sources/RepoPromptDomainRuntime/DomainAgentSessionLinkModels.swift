@@ -598,6 +598,7 @@ package enum DomainAgentSessionLinkReservationRejection: String, Equatable, Send
     case targetBindingUnresolved = "target_binding_unresolved"
     case reservationAlreadyPending = "reservation_already_pending"
     case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
+    case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
 package enum DomainAgentSessionLinkActivationDisposition: Equatable, Sendable {
@@ -621,6 +622,7 @@ package enum DomainAgentSessionLinkActivationRejection: String, Equatable, Senda
     case endpointDrift = "endpoint_drift"
     case snapshotSessionMismatch = "snapshot_session_mismatch"
     case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
+    case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
 package enum DomainAgentSessionLinkRevocationDisposition: Equatable, Sendable {

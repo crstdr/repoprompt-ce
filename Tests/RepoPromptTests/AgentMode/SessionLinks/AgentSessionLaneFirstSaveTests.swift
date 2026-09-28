@@ -150,14 +150,16 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 } catch { XCTFail("test rebind failed: \(error)") }
             }
             defer { viewModel.test_setAfterDurableChildTabCreation(nil) }
-            do {
-                _ = try await viewModel.mcpCreateOversightLane(
-                    creatorSessionID: creatorID, sessionName: "Rebound lane",
-                    selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
-                )
-                XCTFail("rebound lane unexpectedly received a first-save proof")
-            } catch {}
+            let outcome = try await viewModel.mcpCreateOversightLane(
+                creatorSessionID: creatorID, sessionName: "Rebound lane",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
             let tabID = try XCTUnwrap(reboundTabID)
+            guard case let .creationIncomplete(sessionID, publishedTabID) = outcome else {
+                return XCTFail("rebound lane unexpectedly received a first-save proof")
+            }
+            XCTAssertEqual(publishedTabID, tabID)
+            XCTAssertNotEqual(sessionID, replacementID)
             let replacement = try XCTUnwrap(viewModel.sessions[tabID])
             XCTAssertEqual(replacement.activeAgentSessionID, replacementID)
             XCTAssertNil(replacement.createdByOverseerSessionID)
@@ -185,6 +187,27 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
                 $0.id == tabID && $0.activeAgentSessionID == sessionID
             } == true)
+        }
+    }
+
+    func testCreatorLabelUsesLiveLaneBeforeSidebarIndexCatchesUp() async throws {
+        try await withFixture { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            let creatorID = UUID()
+            var capturedLabel: String?
+            viewModel.test_afterOversightLaneProvision = { tabID in
+                guard let sessionID = viewModel.sessions[tabID]?.activeAgentSessionID else {
+                    return XCTFail("published lane missing a session")
+                }
+                XCTAssertNil(viewModel.test_ownerValidatedSessionIndex[sessionID])
+                capturedLabel = viewModel.agentSessionLinkLaneCreatorLabel(for: sessionID)
+            }
+            defer { viewModel.test_afterOversightLaneProvision = nil }
+            _ = try await viewModel.mcpCreateOversightLane(
+                creatorSessionID: creatorID, sessionName: "Fresh label",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
+            XCTAssertEqual(capturedLabel, AgentMonitorSessionIDFormatter.short(creatorID))
         }
     }
 
@@ -233,6 +256,42 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     parentSessionID: parentID
                 )
                 XCTAssertTrue(hasPersistedChild)
+            } catch {
+                await dataService.test_setWorkspaceRootOverride(nil)
+                throw error
+            }
+            await dataService.test_setWorkspaceRootOverride(nil)
+        }
+    }
+
+    func testUnreadablePersistedChildAncestorCannotProveRetirementSafe() async throws {
+        try await withFixture { fixture in
+            let dataService = AgentSessionDataService.shared
+            let protectedRoot = fixture.root.appendingPathComponent("protected", isDirectory: true)
+            try FileManager.default.createDirectory(at: protectedRoot, withIntermediateDirectories: true)
+            await dataService.test_setWorkspaceRootOverride(protectedRoot)
+            do {
+                let parentID = UUID()
+                var child = AgentSession(id: UUID(), name: "Unindexed child", savedAt: Date())
+                child.parentSessionID = parentID
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                _ = try await dataService.saveAgentSession(child, for: workspace)
+                try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: protectedRoot.path)
+                defer {
+                    try? FileManager.default.setAttributes(
+                        [.posixPermissions: 0o700], ofItemAtPath: protectedRoot.path
+                    )
+                }
+                do {
+                    _ = try await dataService.hasPersistedChildSession(
+                        parentSessionID: parentID, workspace: workspace
+                    )
+                    XCTFail("inaccessible inventory was treated as child-free")
+                } catch {}
+                let retirementBlocked = await WindowStatesManager.shared.agentSessionLinkHasPersistedChildSessions(
+                    parentSessionID: parentID
+                )
+                XCTAssertTrue(retirementBlocked)
             } catch {
                 await dataService.test_setWorkspaceRootOverride(nil)
                 throw error

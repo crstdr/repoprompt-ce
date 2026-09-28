@@ -2,6 +2,13 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
+/// A fresh lane has already published its durable tab binding. The idempotency key must be spent
+/// even if subsequent hydration or lifecycle validation cannot complete.
+struct AgentSessionLanePublishedFailure: Error {
+    let sessionID: UUID
+    let tabID: UUID
+}
+
 extension AgentModeViewModel {
     func agentSessionLinkWasCreatedBy(sessionID: UUID, creatorSessionID: UUID) -> Bool {
         ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID == creatorSessionID
@@ -34,16 +41,24 @@ extension AgentModeViewModel {
         else {
             throw MCPError.invalidParams("The destination workspace is not active.")
         }
-        let target = try await mcpResolveOrCreateSessionTarget(
-            tabID: nil,
-            sessionID: nil,
-            createIfNeeded: true,
-            sessionName: sessionName,
-            parentSessionID: nil,
-            inheritWorktreeBindings: false,
-            expectedWorkspaceID: expectedWorkspaceID,
-            creationKind: .oversightLane(creatorSessionID: creatorSessionID)
-        )
+        let target: MCPSessionTarget
+        do {
+            target = try await mcpResolveOrCreateSessionTarget(
+                tabID: nil,
+                sessionID: nil,
+                createIfNeeded: true,
+                sessionName: sessionName,
+                parentSessionID: nil,
+                inheritWorktreeBindings: false,
+                expectedWorkspaceID: expectedWorkspaceID,
+                creationKind: .oversightLane(creatorSessionID: creatorSessionID)
+            )
+        } catch let published as AgentSessionLanePublishedFailure {
+            return .creationIncomplete(sessionID: published.sessionID, tabID: published.tabID)
+        }
+        guard let sessionID = target.sessionID ?? target.recoveryClaim?.identity.sessionID else {
+            throw MCPError.internalError("The new lane has no session ID.")
+        }
         // A published lane is an ordinary session even if later configuration or persistence fails.
         // Accept the provisional admission rather than invoking MCP's discard/delete recovery path.
         mcpAcceptSessionTarget(target)
@@ -53,9 +68,6 @@ extension AgentModeViewModel {
             tabID: target.tabID, sessionID: target.sessionID,
             origin: .existingSession, lifecycleIdentity: target.lifecycleIdentity
         )
-        guard let sessionID = target.sessionID else {
-            throw MCPError.internalError("The new lane has no session ID.")
-        }
         let incomplete: MCPOversightLaneCreationOutcome = .creationIncomplete(
             sessionID: sessionID,
             tabID: target.tabID
@@ -164,9 +176,11 @@ extension AgentModeViewModel {
     }
 
     func agentSessionLinkLaneCreatorLabel(for sessionID: UUID) -> String? {
-        guard let creatorID = ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID else {
-            return nil
-        }
+        let live = sessions.values.first { $0.activeAgentSessionID == sessionID }
+        let creatorID = live?.createdByOverseerSessionID
+            ?? (live?.hasLoadedPersistedState == true
+                ? nil : ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID)
+        guard let creatorID else { return nil }
         return agentSessionLinkLaneCreatorLabel(creatorID: creatorID)
     }
 

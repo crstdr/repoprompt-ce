@@ -116,10 +116,17 @@ struct AgentSessionOversightRestorationProof: Equatable {
     ) -> Bool {
         observer.domainEndpoint == observerEndpoint
             && target.domainEndpoint == targetEndpoint
-            && (requireObserverAuthoritative
-                ? observer.restorationReadiness == observerReadiness
-                : observer.restorationReadiness.bindingToken == observerReadiness.bindingToken)
+            && (observer.restorationReadiness == observerReadiness
+                || (!requireObserverAuthoritative
+                    && isObserverHydrationAdvance(observer.restorationReadiness)))
             && target.restorationReadiness == targetReadiness
+    }
+
+    private func isObserverHydrationAdvance(_ current: AgentSessionRestorationReadiness) -> Bool {
+        guard case let .pending(before) = observerReadiness,
+              case let .authoritative(after, _) = current
+        else { return false }
+        return before == after
     }
 
     /// Whether both proved incarnations are still present in one live candidate snapshot.

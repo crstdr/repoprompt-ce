@@ -6422,7 +6422,7 @@ final class AgentSessionLinkRuntimeBridge {
         _ observer: DomainAgentSessionLinkEndpointIdentity,
         _ target: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        retiringTargets.contains(observer) || retiringTargets.contains(target)
+        isRetiringTarget(observer.sessionID) || isRetiringTarget(target.sessionID)
     }
 
     private func linkedCreatedLaneIDs(creatorSessionID: UUID) async -> (ids: Set<UUID>, revision: UInt64) {
@@ -6593,9 +6593,9 @@ final class AgentSessionLinkRuntimeBridge {
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
         guard host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
         else { return .refused(.denied) }
-        guard admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
-                < AgentSessionLanePolicy.agentSessionLaneMaximumCount
-        else { return .refused(.laneLimitReached, laneCount: linkedIDs.count) }
+        let admittedCount = admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
+        guard admittedCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        else { return .refused(.laneLimitReached, laneCount: admittedCount) }
         laneCreationCapReservations[creatorID, default: [:]][ticket] = .pending
         laneCreationCapGeneration[creatorID, default: 0] &+= 1
         defer {
@@ -6659,12 +6659,12 @@ final class AgentSessionLinkRuntimeBridge {
         func receipt(_ linked: Bool, _ reason: AgentSessionLaneCreateReceipt.Reason?,
                      _ firstTask: AgentSessionLaneCreateReceipt.FirstTask = .none) async -> AgentSessionLaneCreateReceipt {
             let candidates = host.agentSessionLinkCandidates()
+            let matchingNames = candidates.filter { $0.sessionID == sessionID }
             let count = await linkedCreatedLaneIDs(creatorSessionID: observerEndpoint.sessionID).ids.count
             return AgentSessionLaneCreateReceipt(
                 result: saved && linked ? .created : .creationIncomplete,
                 sessionID: sessionID,
-                sessionName: candidates.first(where: { $0.sessionID == sessionID })?.resolvedDisplayName
-                    ?? request.sessionName,
+                sessionName: matchingNames.count == 1 ? matchingNames[0].resolvedDisplayName : nil,
                 linked: linked,
                 reason: reason, firstTask: firstTask, laneCount: count
             )
@@ -6773,8 +6773,11 @@ final class AgentSessionLinkRuntimeBridge {
         else { return .notRetired(sessionID: targetSessionID, reason: .laneInUse) }
         // Install the fence before the relationship snapshot. New Adds in either direction now
         // fail at preflight, reservation, activation and caller completion.
-        guard !isFrozenForTermination, !retiringTargets.contains(endpoint) else {
+        guard !isFrozenForTermination else {
             return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
+        }
+        guard !isRetiringTarget(targetSessionID) else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneBusy)
         }
         retiringTargets.insert(endpoint)
         defer { retiringTargets.remove(endpoint) }
@@ -6923,7 +6926,7 @@ final class AgentSessionLinkRuntimeBridge {
             AgentSessionLinkResolveFailure.bindingUnresolved.uiMessage
         case .reservationAlreadyPending:
             "That session is already being added."
-        case .observerHasNoActiveOutboundLink:
+        case .observerHasNoActiveOutboundLink, .observerHasNoActiveLink:
             existingOverseerRequiredMessage
         }
     }
@@ -6938,7 +6941,7 @@ final class AgentSessionLinkRuntimeBridge {
             AgentSessionLinkResolveFailure.rebinding.uiMessage
         case .snapshotSessionMismatch:
             "That session changed while it was being added. Try again."
-        case .observerHasNoActiveOutboundLink:
+        case .observerHasNoActiveOutboundLink, .observerHasNoActiveLink:
             existingOverseerRequiredMessage
         }
     }

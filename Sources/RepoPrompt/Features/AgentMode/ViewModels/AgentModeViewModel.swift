@@ -8191,6 +8191,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let discardAuthorityID = UUID()
         var reservedSessionID: UUID?
+        var publishedLaneTarget: MCPSessionTarget?
         do {
             if let intendedSessionID = selector.intendedSessionID {
                 guard let reservationWorkspaceID = expectedWorkspaceID ?? workspaceManager?.activeWorkspaceID else {
@@ -8218,6 +8219,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 expectedWorkspaceID: expectedWorkspaceID,
                 creationKind: creationKind
             )
+            if case .oversightLane = creationKind { publishedLaneTarget = target }
             guard let resolvedSessionID = target.sessionID else { return target }
             guard target.recoveryClaim != nil else {
                 if reservedSessionID != nil {
@@ -8247,6 +8249,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return provisionalTarget
         } catch {
+            let propagatedError: Error
+            if case .oversightLane = creationKind,
+               let publishedLaneTarget,
+               let sessionID = publishedLaneTarget.sessionID
+                   ?? publishedLaneTarget.recoveryClaim?.identity.sessionID {
+                mcpAcceptSessionTarget(publishedLaneTarget)
+                propagatedError = AgentSessionLanePublishedFailure(
+                    sessionID: sessionID, tabID: publishedLaneTarget.tabID
+                )
+            } else {
+                propagatedError = error
+            }
             if let reservedSessionID {
                 let recoveryRetainsAuthority = outstandingProvisionalMCPSessionTargets.values.contains { target in
                     target.sessionID == reservedSessionID
@@ -8261,7 +8275,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 }
             }
-            throw error
+            throw propagatedError
         }
     }
 
@@ -8696,6 +8710,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     // A published lane remains an ordinary session even when hydration loses its
                     // exact binding; never route it through MCP's destructive discard recovery.
                     mcpAcceptSessionTarget(provisionalTarget)
+                    throw AgentSessionLanePublishedFailure(
+                        sessionID: intendedSessionID, tabID: createdTabID
+                    )
                 } else {
                     _ = await mcpDiscardSessionTarget(provisionalTarget)
                 }

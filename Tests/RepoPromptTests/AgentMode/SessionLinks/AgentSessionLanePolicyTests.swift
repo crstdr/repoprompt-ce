@@ -3,26 +3,6 @@ import Foundation
 import XCTest
 
 final class AgentSessionLanePolicyTests: XCTestCase {
-    func testCapCountsOnlyDistinctLiveLinkedLanesCreatedByCaller() {
-        XCTAssertEqual(AgentSessionLanePolicy.agentSessionLaneMaximumCount, 8)
-        let creator = UUID()
-        let otherCreator = UUID()
-        let owned = UUID()
-        let other = UUID()
-        let ordinary = UUID()
-        let orphan = UUID()
-        let provenance: [UUID: UUID] = [owned: creator, other: otherCreator, orphan: creator]
-        XCTAssertEqual(
-            AgentSessionLanePolicy.linkedCreatedLaneCount(
-                targetSessionIDs: [owned, owned, other, ordinary],
-                creatorSessionID: creator,
-                createdBy: { provenance[$0] }
-            ),
-            1,
-            "an unlinked orphan and a duplicate grant target consume no extra slot"
-        )
-    }
-
     @MainActor
     func testEveryRoleUsesItsEffectiveRoleDefaultAndMappedEffort() throws {
         let workspaceID = UUID()

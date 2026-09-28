@@ -38,7 +38,7 @@ enum AgentSessionLaneHostUnavailable: Error { case unavailable }
 struct AgentSessionLaneCreateReceipt: Equatable {
     enum Result: Equatable { case created, creationIncomplete, refused }
     enum Reason: String, Equatable {
-        case shuttingDown = "freeze"
+        case shuttingDown = "shutting_down"
         case denied
         case persistenceUnavailable = "persistence_unavailable"
         case destinationUnavailable = "destination_unavailable"
@@ -69,7 +69,9 @@ struct AgentSessionLaneCreateReceipt: Equatable {
 
 enum AgentSessionLaneRetireOutcome: Equatable {
     enum Reason: String, Equatable {
-        case denied, shuttingDown, notRetirable = "not_retirable"
+        case denied
+        case shuttingDown = "shutting_down"
+        case notRetirable = "not_retirable"
         case managementNotGranted = "management_not_granted"
         case laneInUse = "lane_in_use"
         case laneBusy = "lane_busy"

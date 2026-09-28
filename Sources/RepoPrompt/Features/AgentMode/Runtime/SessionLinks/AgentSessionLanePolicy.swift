@@ -16,16 +16,6 @@ enum AgentSessionLanePolicy {
         let modelParameterSelections: [ACPModelParameterSelection]
     }
 
-    /// Counts only distinct targets of the creator's live outbound grants. An unlinked lane does
-    /// not consume a slot; the caller supplies provenance from each target's owning session index.
-    static func linkedCreatedLaneCount(
-        targetSessionIDs: [UUID],
-        creatorSessionID: UUID,
-        createdBy: (UUID) -> UUID?
-    ) -> Int {
-        Set(targetSessionIDs).filter { createdBy($0) == creatorSessionID }.count
-    }
-
     @MainActor
     static func resolveRole(
         _ rawRole: String?,
