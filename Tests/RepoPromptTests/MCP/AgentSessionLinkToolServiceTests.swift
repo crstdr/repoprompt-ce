@@ -1686,6 +1686,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             rawTargetSessionID: second.sessionID.uuidString
         ) else { return XCTFail("Expected a second link") }
         fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let queued = try await Self.executeObject(fixture.service, args: [
+            "op": .string("send"),
+            "session_id": .string(fixture.target.sessionID.uuidString),
+            "message": .string("Review the diff when ready"),
+            "idempotency_key": .string("survivor-queued-send"),
+            "delivery": .string("when_sendable")
+        ])
+        XCTAssertEqual(queued["result"]?.stringValue, "queued")
         let waiting = Task { @MainActor in
             try await fixture.service.execute(args: [
                 "op": .string("wait"),
@@ -1711,6 +1719,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(rows.count, 1)
         XCTAssertEqual(sibling["session_id"]?.stringValue, fixture.target.sessionID.uuidString)
         XCTAssertNotNil(sibling["wait_cursor"]?.stringValue)
+        XCTAssertEqual(
+            sibling["pending_send"]?.objectValue?["idempotency_key"]?.stringValue,
+            "survivor-queued-send"
+        )
+        XCTAssertEqual(sibling["last_pending_send_result"], .null)
         XCTAssertNil(sibling["pending_interaction"])
         XCTAssertNil(sibling["respond_hint"])
         XCTAssertFalse("\(result)".contains(Self.sampleInteractionPrompt))

@@ -638,6 +638,10 @@ struct AgentSessionLinkMCPToolService {
             // generic denial, but no prompt from the invalidated batch may be released with it.
             switch waitResult.outcome {
             case .revoked, .linkUnavailable:
+                // Queue projections are observer-local and keyed by the exact leased generation.
+                // Render them only for siblings that still pass the authority's target-state check;
+                // an invalidated batch still skips prompt inspection entirely.
+                let pendingSends = await bridge.pendingSendProjections(for: leases)
                 var survivingStates: [DomainAgentSessionLinkTargetState] = []
                 if !isSingle {
                     for lease in leases {
@@ -648,6 +652,7 @@ struct AgentSessionLinkMCPToolService {
                 }
                 return AgentSessionLinkResponseRenderer.waitValue(
                     DomainAgentSessionLinkWaitResult(outcome: waitResult.outcome, targets: survivingStates),
+                    pendingSends: pendingSends,
                     isSingle: isSingle
                 )
             case .shuttingDown:
