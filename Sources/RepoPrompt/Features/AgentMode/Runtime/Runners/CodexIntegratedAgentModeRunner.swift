@@ -22,7 +22,8 @@ final class CodexIntegratedAgentModeRunner {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
-        autoEffortSelection: AutoEffortTurnSelection? = nil
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         let ownership: AgentRunOwnership
         let createdOwnership: Bool
@@ -60,7 +61,8 @@ final class CodexIntegratedAgentModeRunner {
                     fallbackContext: fallbackContext,
                     attachmentReservationID: attachmentReservationID,
                     terminalizeRejectedSend: createdOwnership,
-                    autoEffortSelection: autoEffortSelection
+                    autoEffortSelection: autoEffortSelection,
+                    selfCompactDispatchID: selfCompactDispatchID
                 )
                 // Explicit cancellation can terminalize the original run before its
                 // suspended send observes CancellationError. Preserve the caller-level
@@ -71,7 +73,9 @@ final class CodexIntegratedAgentModeRunner {
                 return outcome
             }
             let outcome = execution.nativeOutcome
-            if !isPeriodic { hooks.providerInput.recordPendingHandoffSendOutcome(session, outcome.didSend) }
+            if !isPeriodic, selfCompactDispatchID == nil {
+                hooks.providerInput.recordPendingHandoffSendOutcome(session, outcome.didSend)
+            }
             if execution.didStartProviderRun {
                 session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
             } else if createdOwnership, execution.shouldReleaseCreatedOwnership {

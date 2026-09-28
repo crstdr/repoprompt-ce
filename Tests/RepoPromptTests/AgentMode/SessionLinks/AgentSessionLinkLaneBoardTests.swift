@@ -145,6 +145,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             ("pending_acp_steering_instructions", \.hasPendingACPSteeringInstructions, true),
             ("pending_claude_steering_instructions", \.hasPendingClaudeSteeringInstructions, true),
             ("pending_auto_wake", \.hasPendingAutoWake, true),
+            ("pending_self_compact", \.hasPendingSelfCompact, true),
             ("candidate_closing", \.isCandidateClosing, true)
         ]
         for (expected, keyPath, blockedValue) in cases {
@@ -196,6 +197,17 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             running.board.sendBlockers,
             ["pending_instructions", "run_state_active", "status_not_idle"]
         )
+
+        session.pendingInstructions = []
+        session.runState = .idle
+        var compact = session.selfCompactState
+        guard case .scheduled = compact.reserve(note: "resume here", idempotencyKey: "lane-board-compact") else {
+            return XCTFail("Expected self-compact reservation")
+        }
+        session.selfCompactState = compact
+        let compacting = snapshot(for: session, candidate: target)
+        XCTAssertFalse(compacting.idleForSend)
+        XCTAssertEqual(compacting.board.sendBlockers, ["pending_self_compact"])
     }
 
     func testCensusMergesLiveIndexAndPersistedBySessionIDThenDropsCleanedUpChildren() {
