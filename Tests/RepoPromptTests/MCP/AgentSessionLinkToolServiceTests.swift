@@ -219,7 +219,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     private func makeTargetState(
         sessionID: UUID = UUID(),
         status: DomainAgentSessionLinkStatus = .running,
-        pending: DomainAgentSessionLinkPendingInteractionKind? = .approval
+        pending: DomainAgentSessionLinkPendingInteractionKind? = .approval,
+        board: DomainAgentSessionLaneBoard = .empty
     ) -> DomainAgentSessionLinkTargetState {
         DomainAgentSessionLinkTargetState(
             sessionID: sessionID,
@@ -230,6 +231,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 displayName: String(repeating: "n", count: 400),
                 providerDisplayName: "Codex CLI",
                 status: status,
+                board: board,
                 idleForSend: false,
                 pendingInteractionKind: pending,
                 latestVisibleAssistantPreview: String(repeating: "p", count: 600),
@@ -251,7 +253,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 "session_id", "name", "provider", "status", "idle_for_send", "idle_since", "waiting_on",
                 "has_pending_interaction", "pending_interaction_kind",
                 "latest_visible_assistant_preview", "visible_row_count",
-                "last_activity_at", "change_sequence", "context"
+                "last_activity_at", "change_sequence", "context", "board"
             ]
         )
         for forbidden in [
@@ -274,6 +276,37 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(object["idle_for_send"]?.boolValue, false)
     }
 
+    func testSnapshotSerializesLaneBoardWithOmitEmptyFields() throws {
+        let quiet = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeTargetState()).objectValue?["board"]?.objectValue
+        )
+        XCTAssertEqual(Set(quiet.keys), ["run_outcome"])
+        XCTAssertEqual(quiet["run_outcome"]?.stringValue, "none")
+
+        let board = DomainAgentSessionLaneBoard(
+            runOutcome: .failed,
+            failureReason: .processCrash,
+            sendBlockers: ["running", "terminal_commit_in_progress"],
+            subagentRunning: 0,
+            subagentFinished: 2
+        )
+        let populated = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeTargetState(board: board)).objectValue?["board"]?.objectValue
+        )
+        XCTAssertEqual(
+            Set(populated.keys),
+            ["run_outcome", "failure_reason", "send_blockers", "subagents"]
+        )
+        XCTAssertEqual(populated["run_outcome"]?.stringValue, "failed")
+        XCTAssertEqual(populated["failure_reason"]?.stringValue, "process_crash")
+        XCTAssertEqual(populated["send_blockers"]?.arrayValue, [
+            .string("running"), .string("terminal_commit_in_progress")
+        ])
+        let subagents = try XCTUnwrap(populated["subagents"]?.objectValue)
+        XCTAssertEqual(subagents["running"]?.intValue, 0)
+        XCTAssertEqual(subagents["finished"]?.intValue, 2)
+    }
+
     func testSnapshotSerializesAuthoritativeIdleAndAgentDeclaredWaitingMetadata() throws {
         let sessionID = UUID()
         let idleSince = Date(timeIntervalSince1970: 100)
@@ -287,6 +320,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 displayName: "Worker",
                 providerDisplayName: "Codex",
                 status: .idle,
+                board: .empty,
                 idleForSend: false,
                 idleSince: idleSince,
                 waitingOn: DomainAgentSessionWaitingOn(summary: "CI artifact", declaredAt: declaredAt),
@@ -319,6 +353,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 displayName: "Worker",
                 providerDisplayName: "Claude Code",
                 status: .running,
+                board: .empty,
                 idleForSend: false,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,
@@ -2522,6 +2557,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 displayName: candidate.displayName,
                 providerDisplayName: candidate.providerDisplayName,
                 status: .idle,
+                board: .empty,
                 idleForSend: true,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,

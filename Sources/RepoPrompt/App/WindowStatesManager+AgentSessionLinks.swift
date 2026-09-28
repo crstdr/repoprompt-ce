@@ -27,6 +27,13 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
                 displayName: candidate.displayName,
                 providerDisplayName: candidate.providerDisplayName,
                 status: .idle,
+                board: DomainAgentSessionLaneBoard(
+                    runOutcome: .none,
+                    failureReason: nil,
+                    sendBlockers: ["session_unavailable"],
+                    subagentRunning: 0,
+                    subagentFinished: 0
+                ),
                 idleForSend: false,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,

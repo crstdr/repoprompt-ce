@@ -290,6 +290,13 @@ extension AgentModeViewModel {
                 displayName: candidate.displayName,
                 providerDisplayName: candidate.providerDisplayName,
                 status: .idle,
+                board: DomainAgentSessionLaneBoard(
+                    runOutcome: .none,
+                    failureReason: nil,
+                    sendBlockers: ["session_unavailable"],
+                    subagentRunning: 0,
+                    subagentFinished: 0
+                ),
                 idleForSend: false,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,
@@ -514,6 +521,7 @@ extension AgentModeViewModel {
             displayName: candidate.displayName,
             providerDisplayName: candidate.providerDisplayName,
             status: projection.status,
+            board: .empty,
             idleForSend: isIdleForSend(
                 session: session,
                 candidate: candidate,

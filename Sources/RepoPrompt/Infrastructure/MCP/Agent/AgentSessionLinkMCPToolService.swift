@@ -1648,6 +1648,7 @@ enum AgentSessionLinkResponseRenderer {
             "name": AgentMCPToolHelpers.stringOrNull(snapshot.displayName),
             "provider": AgentMCPToolHelpers.stringOrNull(snapshot.providerDisplayName),
             "status": .string(snapshot.status.rawValue),
+            "board": laneBoardValue(snapshot.board),
             "idle_for_send": .bool(snapshot.idleForSend),
             "idle_since": snapshot.idleSince.map { .string(AgentMCPToolHelpers.timestamp($0)) } ?? .null,
             "waiting_on": snapshot.waitingOn.map { waitingOn in
@@ -1668,6 +1669,23 @@ enum AgentSessionLinkResponseRenderer {
             "change_sequence": .int(Int(clamping: state.changeSequence)),
             "context": contextLoadValue(snapshot.context)
         ])
+    }
+
+    static func laneBoardValue(_ board: DomainAgentSessionLaneBoard) -> Value {
+        var payload: [String: Value] = ["run_outcome": .string(board.runOutcome.rawValue)]
+        if let failureReason = board.failureReason {
+            payload["failure_reason"] = .string(failureReason.rawValue)
+        }
+        if !board.sendBlockers.isEmpty {
+            payload["send_blockers"] = .array(board.sendBlockers.map(Value.string))
+        }
+        if board.subagentRunning > 0 || board.subagentFinished > 0 {
+            payload["subagents"] = .object([
+                "running": .int(board.subagentRunning),
+                "finished": .int(board.subagentFinished)
+            ])
+        }
+        return .object(payload)
     }
 
     /// Target-global context load, or `null` when unknown. Always present, so a caller can tell

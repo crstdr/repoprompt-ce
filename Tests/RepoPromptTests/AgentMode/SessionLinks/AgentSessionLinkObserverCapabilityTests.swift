@@ -129,6 +129,7 @@ final class AgentSessionLinkObserverCapabilityTests: XCTestCase {
             displayName: "Build API",
             providerDisplayName: "Codex CLI",
             status: .running,
+            board: .empty,
             idleForSend: false,
             pendingInteractionKind: nil,
             latestVisibleAssistantPreview: preview,
