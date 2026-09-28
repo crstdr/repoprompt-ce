@@ -830,6 +830,7 @@ package actor DomainAgentSessionLinkAuthority {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Result<DomainAgentSessionLinkInventory, DomainAgentSessionLinkError> {
         guard !isDraining, !isShutDown else { return .failure(.runtimeShuttingDown) }
+        guard operation == .monitorList else { return .failure(.noActiveLink) }
         let decision = DomainAgentSessionOperationAuthorizer.authorizeObserverScoped(
             operation: operation,
             caller: .agentSession(observerEndpoint.sessionID),

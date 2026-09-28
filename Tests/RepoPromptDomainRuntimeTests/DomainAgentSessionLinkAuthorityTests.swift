@@ -527,6 +527,11 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let inventory = try await authority.authorizeInventory(observerEndpoint: observer).get()
         XCTAssertEqual(inventory.items.map(\.targetSessionID), [target.sessionID])
         XCTAssertEqual(inventory.linkSetRevision, 1)
+        let createIsNotInventory = await authority.authorizeInventory(
+            operation: .monitorCreateLane,
+            observerEndpoint: observer
+        )
+        XCTAssertEqual(createIsNotInventory.failureError, .noActiveLink)
 
         // The target is not an observer, so it cannot list anything.
         let reversed = await authority.authorizeInventory(observerEndpoint: target)
