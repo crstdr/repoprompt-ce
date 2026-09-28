@@ -218,6 +218,13 @@ respectively. Delivered cross-session send, steer, and compact transcript rows r
 source-session attribution and its visible badge. The badge identifies who acted; it is not a
 separate grant or proof of permission.
 
+The optional `managed` wire-attribute rename is deferred to preserve existing MCP consumers for
+no authority gain. An additional inbound badge is also deferred: the target-side management eye
+and attributed action rows already serve the chosen UI, without restoring per-row Manage badges.
+This cleanup leaves the defensive commit fences unchanged, so an extra mid-fence interleaving test
+is deferred to a future behavioral change. None of these presentation nits warrants expanding the
+always-on lean guidance.
+
 ### Inspecting and answering prompts
 
 A managed observer's `poll` or `wait` may return an observer-local redacted

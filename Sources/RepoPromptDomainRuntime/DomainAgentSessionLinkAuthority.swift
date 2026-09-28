@@ -1421,9 +1421,9 @@ package actor DomainAgentSessionLinkAuthority {
     /// that wins first is allowed to settle even if manual Stop follows; lifecycle invalidation may
     /// still abort it later because the endpoint no longer exists.
     ///
-    /// `requiresManagement` makes the user's management delegation part of the same fence: a managed
-    /// delivery whose delegation was withdrawn before this point is refused with nothing delivered,
-    /// and its uncommitted reservation is released so the key may be retried.
+    /// `requiresManagement` also checks Manage on the exact live grant. An existing restricted grant
+    /// is refused with nothing delivered and its uncommitted reservation released for retry. A
+    /// full-link revocation is reported separately by the link-liveness check above.
     package func commitSendAuthorization(
         reservation: DomainAgentSessionLinkSendReservation,
         linkGeneration: UInt64,

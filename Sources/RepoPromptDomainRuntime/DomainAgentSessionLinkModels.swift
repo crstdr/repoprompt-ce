@@ -341,8 +341,8 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
 /// Deterministically ordered inventory for one endpoint.
 package struct DomainAgentSessionLinkInventory: Hashable, Sendable {
     package let sessionID: UUID
-    /// Advances only when this observer's grant membership changes, or when the user changes the
-    /// management delegation of one of its grants (the capabilities this observer is told about).
+    /// Advances when this observer's outbound grant membership changes. An existing grant's
+    /// capability set is fixed; full-link revocation removes it from the inventory.
     package let linkSetRevision: UInt64
     package let authorityRevision: UInt64
     package let items: [DomainAgentSessionLinkInventoryItem]
@@ -933,8 +933,8 @@ package enum DomainAgentSessionLinkSendCommitDisposition: Equatable, Sendable {
     /// The authorization linearization fence was won before manual revocation.
     case committed
     case linkRevoked
-    /// The delivery required the user's management delegation, and the user withdrew it before the
-    /// fence. The link itself may still be active; nothing was delivered.
+    /// A live grant lacks Manage at the final fence (for example, an existing restricted grant).
+    /// Full-link revocation is `linkRevoked`; neither case delivers the message.
     case managementRevoked
     case unknownReservation
     case shuttingDown

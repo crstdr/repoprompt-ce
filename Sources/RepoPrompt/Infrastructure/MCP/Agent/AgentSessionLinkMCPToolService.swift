@@ -250,7 +250,7 @@ struct AgentSessionLinkMCPToolService {
     /// Authorization for one management operation.
     private enum ManagedAuthorization {
         case authorized(AgentSessionLinkRuntimeBridge.AuthorizedTarget)
-        /// A live watch link without the user's management delegation.
+        /// A live, existing restricted grant without Manage.
         case managementNotGranted
     }
 
@@ -310,9 +310,9 @@ struct AgentSessionLinkMCPToolService {
             // Same error class `agent_run respond` uses for an answer that does not fit.
             throw MCPError.invalidParams(message)
         case .responded(.unavailable):
-            // The grant, the management delegation, or an endpoint stopped holding mid-call. The
-            // caller cannot tell a withdrawn delegation from a revoked link here, by design: both
-            // mean nothing was applied and the observer must re-check with `list` or `poll`.
+            // The exact grant or endpoint stopped holding, or its live capability was insufficient
+            // at the final fence. This denial does not disclose which condition failed; nothing was
+            // applied and the observer must re-check with `list` or `poll`.
             throw Self.denialError(targetSessionID: targetSessionID)
         case let .responded(outcome):
             return AgentSessionLinkResponseRenderer.respondValue(
@@ -358,8 +358,8 @@ struct AgentSessionLinkMCPToolService {
         guard case var .object(payload) = try Self.sendOutcomeValue(outcome, targetSessionID: targetSessionID) else {
             throw MCPError.internalError("agent_session_link steer produced an unexpected result.")
         }
-        // Re-read after the steer settled, so a delegation withdrawn mid-call (`management_revoked`)
-        // is reported as the authority the observer holds now, never the one it started with.
+        // Re-read the exact grant after settlement for factual metadata. A revoked or rebound lease
+        // must not inherit a replacement grant's Manage capability.
         payload["managed"] = await .bool(bridge.managementIsGranted(for: target.lease))
         payload["steered_by_session_id"] = .string(observerEndpoint.sessionID.uuidString)
         return .object(payload)
@@ -530,8 +530,8 @@ struct AgentSessionLinkMCPToolService {
                 throw Self.error(for: .denied, targetSessionID: target.lease.target.sessionID)
             }
             states.append(state)
-            // Read from the exact grant this poll was authorized under, so a mid-session grant or
-            // withdrawal of management shows on the very next poll rather than the next turn.
+            // Report the exact grant's current capability. Existing restricted grants read false;
+            // full-link revocation remains a denial, not a management toggle.
             managed[state.sessionID] = await bridge.managementIsGranted(for: target.lease)
             // Read through this caller's own lease, so the queue state one observer staged is
             // structurally unreachable from another observer of the same target.

@@ -129,7 +129,7 @@ typealias AgentSessionLinkSendLivenessProbe = @MainActor () -> AgentSessionLinkS
 enum AgentSessionLinkSendCommitOutcome: Equatable {
     case committed
     case linkRevoked
-    /// A managed delivery lost the user's management delegation before the fence.
+    /// A live grant lacks Manage at the final fence; full-link revocation is separate.
     case managementRevoked
     case unknownReservation
     case shuttingDown
@@ -167,7 +167,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     /// row may or may not be on disk. The idempotency key is permanently spent.
     case persistenceIndeterminate = "persistence_indeterminate"
     case shuttingDown = "shutting_down"
-    /// A managed `steer` whose user management delegation was withdrawn before its commit fence.
+    /// A managed `steer` whose live grant lacks Manage at its commit fence.
     case managementRevoked = "management_revoked"
     /// A managed `steer` found the target holding a prompt. It must be answered first (`respond`),
     /// or by the target's user when it is manual-only; steering never routes around it.
@@ -238,8 +238,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .shuttingDown:
             "RepoPrompt is shutting down."
         case .managementRevoked:
-            "Your user withdrew management of this session before the steer was authorized. "
-                + "Nothing was delivered. Without management you may observe, send, and request native compaction."
+            "This oversight link does not include management of this session. Nothing was delivered. "
+                + "You may still observe, send, and request native compaction under this link."
         case .targetAwaitingInteraction:
             "The overseen session is waiting on a prompt. Refresh with poll or wait and answer "
                 + "it with respond, or leave it for the session's user if it is manual-only. Nothing "

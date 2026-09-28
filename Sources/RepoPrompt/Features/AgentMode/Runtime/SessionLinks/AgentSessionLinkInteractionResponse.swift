@@ -85,7 +85,7 @@ enum AgentSessionLinkInteractionResponseOutcome: Equatable {
     case manualOnly(AgentSessionLinkInteractionManualOnlyReason)
     /// The answer did not fit the interaction; the message says why. Nothing was applied.
     case invalid(String)
-    /// The target endpoint, grant, or management delegation stopped holding before submission.
+    /// The target endpoint or exact grant failed its final live Manage proof before submission.
     case unavailable
 }
 

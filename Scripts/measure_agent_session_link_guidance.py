@@ -79,7 +79,9 @@ def inventory(ref, managed):
     autonomy = literals(section(source, "static let autonomyContract: [String] = [", "\n    ]"))
     lines = initial + host + autonomy + trailing
     guidance_revision = re.search(r"currentInventoryGuidanceRevision: UInt64 = (\d+)", source)
-    revision_attribute = f' guidance_revision="{guidance_revision[1]}"' if guidance_revision else ""
+    if guidance_revision is None:
+        raise ValueError(f"{ref}: currentInventoryGuidanceRevision is missing from {PROMPTS}")
+    revision_attribute = f' guidance_revision="{guidance_revision[1]}"'
     capabilities = "manage,poll,read,send_when_idle,wait" if managed else "poll,read,send_when_idle,wait"
     row = (
         f'<session id="{TARGET}" name="{escaped(NAME)}" capabilities="{capabilities}" '

@@ -313,14 +313,14 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome
 
-    // MARK: Management delegation
+    // MARK: Managed operations
 
     /// Runs one managed `steer` on the target's MainActor.
     ///
     /// An idle target is delivered through the send transaction (framed as managed direction); a
     /// running target, or one waiting for its next instruction, is steered through its own provider
-    /// routing after `commitAuthorization` — which re-proves the grant and the management delegation
-    /// — returns `.committed`. A conforming host never reads, clears, or restores composer state.
+    /// routing after `commitAuthorization` re-proves the exact grant and its Manage capability.
+    /// A conforming host never reads, clears, or restores composer state.
     func agentSessionLinkPerformSteer(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,
@@ -4373,8 +4373,8 @@ final class AgentSessionLinkRuntimeBridge {
     ///
     /// The host validates the answer and compares the interaction ID, then calls `authorize` as the
     /// last suspension point, re-compares, and submits synchronously. `authorize` re-validates the
-    /// management lease inside the authority plus both live endpoints, so an unlink, relink,
-    /// withdrawn management, or endpoint replacement that lands mid-call applies nothing.
+    /// Manage capability on the exact lease inside the authority plus both live endpoints, so an
+    /// unlink, relink, restricted grant, or endpoint replacement applies nothing.
     func respondToInteraction(
         target: AuthorizedTarget,
         request: AgentSessionLinkInteractionResponseRequest
@@ -5160,8 +5160,7 @@ final class AgentSessionLinkRuntimeBridge {
         return host.agentSessionLinkSetWaitingOn(value, for: endpoint)
     }
 
-    /// Current sanitized target state plus a freshly minted successor wait cursor.
-    /// Whether the exact grant behind `lease` currently carries the user's management delegation.
+    /// Whether the exact grant behind `lease` currently carries Manage.
     ///
     /// Presentation for the observer's own results only; every management operation still proves
     /// management through its own lease and fence. A stale generation or drifted endpoint answers
@@ -5174,6 +5173,7 @@ final class AgentSessionLinkRuntimeBridge {
         return grant.capabilities.contains(.manage)
     }
 
+    /// Current sanitized target state plus a freshly minted successor wait cursor.
     func targetState(
         for lease: DomainAgentSessionLinkLease
     ) async -> DomainAgentSessionLinkTargetState? {
@@ -5292,7 +5292,7 @@ final class AgentSessionLinkRuntimeBridge {
         /// Ordinary attributed coordination (`send`): idle-only, coordination framing.
         case attributedSend
         /// The user-delegated `steer`: management framing, active or idle target, and a commit fence
-        /// that also re-proves the management delegation.
+        /// that also re-proves Manage on the exact grant.
         case managedSteer
     }
 
@@ -5336,13 +5336,13 @@ final class AgentSessionLinkRuntimeBridge {
         )
     }
 
-    /// One managed steer: the user's management delegation, the shared exactly-once ledger, and the
+    /// One managed steer: the grant's Manage capability, the shared exactly-once ledger, and the
     /// target's own provider routing.
     ///
     /// `target` must have been authorized for `.monitorSteer`; its `.manage` lease is what the ledger
-    /// reserves under, and the commit fence re-proves management at the linearization point, so a
-    /// withdrawal that wins the race delivers nothing. A retry with the same key replays the stored
-    /// receipt instead of steering twice.
+    /// reserves under, and the commit fence re-proves that capability at the linearization point.
+    /// Revocation or a restricted grant delivers nothing. A retry with the same key replays the
+    /// stored receipt instead of steering twice.
     func steer(
         target: AuthorizedTarget,
         message: String,
@@ -6420,21 +6420,5 @@ private extension Result {
     var success: Success? {
         guard case let .success(value) = self else { return nil }
         return value
-    }
-}
-
-/// Resumes one continuation with whichever outcome arrives first; later outcomes are ignored.
-@MainActor
-private final class AgentSessionLinkFirstOutcome {
-    private var continuation: CheckedContinuation<Bool?, Never>?
-
-    init(_ continuation: CheckedContinuation<Bool?, Never>) {
-        self.continuation = continuation
-    }
-
-    func resolve(_ value: Bool?) {
-        guard let continuation else { return }
-        self.continuation = nil
-        continuation.resume(returning: value)
     }
 }

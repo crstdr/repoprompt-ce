@@ -4,8 +4,8 @@ import RepoPromptDomainRuntime
 
 /// Target-side half of the exact-link **Answer prompts** delegation.
 ///
-/// Runs on the *target's* view model. The bridge has already proved the exact outbound grant and the
-/// per-link delegation; this layer owns the interaction itself: which kinds and decisions an
+/// Runs on the *target's* view model. The bridge has already proved the exact outbound grant and
+/// its Manage capability; this layer owns the interaction itself: which kinds and decisions an
 /// observer may choose, the interaction-ID compare-and-set, and a synchronous submission after the
 /// final authority check. It reuses the exact parser behind `agent_run respond`, so an answer is
 /// accepted or refused with the same message on both surfaces.
