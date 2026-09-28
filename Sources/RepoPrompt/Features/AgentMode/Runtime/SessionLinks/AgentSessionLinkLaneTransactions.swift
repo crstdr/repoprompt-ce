@@ -6,8 +6,6 @@ struct AgentSessionLaneCreateRequest {
     let idempotencyKey: String
     let role: String?
     let sessionName: String?
-    let destinationWindowID: Int?
-    let workspaceID: UUID?
     /// The caller's selector, not a window/workspace binding that can move after the request.
     var workspaceSelector: String? = nil
     let message: String?
@@ -22,10 +20,10 @@ struct AgentSessionLaneCreateRequest {
         return AgentSessionLinkMessageDigest.digest(message: canonical, workflowSelector: "create_lane/v1")
     }
 
-    private static func canonicalSelector(_ value: String?) -> String {
+    static func canonicalSelector(_ value: String?) -> String {
         guard let value else { return "caller-workspace" }
         if let id = UUID(uuidString: value) { return "id:\(id.uuidString)" }
-        return "name:\(value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil))"
+        return "name:\(value.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX")))"
     }
 }
 
@@ -49,8 +47,6 @@ struct AgentSessionLaneCreateReceipt: Equatable {
         case ledgerFull = "ledger_full"
         case saveFailed = "save_failed"
         case addFailed = "add_failed"
-        case deleted
-        case independentlyLinked = "independently_linked"
     }
     enum FirstTask: Equatable { case none, delivered, queued, failed }
 

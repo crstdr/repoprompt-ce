@@ -3,6 +3,19 @@ import MCP
 import RepoPromptDomainRuntime
 
 extension AgentModeViewModel {
+    func agentSessionLinkWasCreatedBy(sessionID: UUID, creatorSessionID: UUID) -> Bool {
+        ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID == creatorSessionID
+            || sessions.values.contains {
+                $0.activeAgentSessionID == sessionID
+                    && $0.createdByOverseerSessionID == creatorSessionID
+            }
+    }
+
+    func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool {
+        sessions.values.contains { $0.parentSessionID == parentSessionID }
+            || ownerValidatedSessionIndex.values.contains { $0.parentSessionID == parentSessionID }
+    }
+
     enum MCPOversightLaneCreationOutcome: Equatable {
         case created(sessionID: UUID, tabID: UUID, bindingToken: AgentSessionRestorationBindingToken)
         case creationIncomplete(sessionID: UUID, tabID: UUID)

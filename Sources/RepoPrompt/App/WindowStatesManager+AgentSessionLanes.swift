@@ -3,6 +3,22 @@ import MCP
 import RepoPromptDomainRuntime
 
 extension WindowStatesManager {
+    func agentSessionLinkWasCreatedBy(sessionID: UUID, creatorSessionID: UUID) -> Bool {
+        allWindows.contains { window in
+            !window.isClosing && window.agentModeViewModel.agentSessionLinkWasCreatedBy(
+                sessionID: sessionID, creatorSessionID: creatorSessionID
+            )
+        }
+    }
+
+    func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool {
+        allWindows.contains { window in
+            !window.isClosing && window.agentModeViewModel.agentSessionLinkHasChildSessions(
+                parentSessionID: parentSessionID
+            )
+        }
+    }
+
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int {
         guard !isTerminating else { return 0 }
         return allWindows.filter { !$0.isClosing }.reduce(0) { count, window in

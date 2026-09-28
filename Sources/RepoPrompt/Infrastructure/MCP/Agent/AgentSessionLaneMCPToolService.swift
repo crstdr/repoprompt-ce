@@ -39,7 +39,8 @@ enum AgentSessionLaneMCPToolService {
         let matches = candidates.filter { candidate in
             guard let workspaceSelector else { return candidate.windowID == callerWindowID }
             if let id = UUID(uuidString: workspaceSelector) { return candidate.workspaceID == id }
-            return candidate.workspaceName.localizedCaseInsensitiveCompare(workspaceSelector) == .orderedSame
+            return AgentSessionLaneCreateRequest.canonicalSelector(candidate.workspaceName)
+                == AgentSessionLaneCreateRequest.canonicalSelector(workspaceSelector)
         }
         if workspaceSelector != nil, Set(matches.map(\.workspaceID)).count != 1 { return nil }
         return matches.min { lhs, rhs in

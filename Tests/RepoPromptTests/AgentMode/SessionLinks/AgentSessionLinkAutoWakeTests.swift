@@ -236,7 +236,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertTrue(reOwed.fragment.contains("by RepoPrompt or by you"))
         XCTAssertTrue(reOwed.fragment.contains("being unable to steer it"))
         XCTAssertTrue(reOwed.fragment.contains("direct it with `steer`"))
-        XCTAssertTrue(reOwed.fragment.contains("compact` is newly permitted at watch level"))
+        XCTAssertTrue(reOwed.fragment.contains("compact` is permitted at watch level"))
         XCTAssertTrue(reOwed.fragment.contains("attributed attention request"))
         XCTAssertTrue(reOwed.fragment.contains("master Auto-wake"))
         XCTAssertTrue(reOwed.fragment.contains("lane&apos;s own toggle"))

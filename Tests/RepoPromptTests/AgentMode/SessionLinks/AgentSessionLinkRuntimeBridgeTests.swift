@@ -21,6 +21,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var beforeLaneCreationReturn: (() async -> Void)?
         var laneProvenance: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
         var hiddenBindingsBySessionID: [UUID: Int] = [:]
+        var childSessionIDsByParent: [UUID: Set<UUID>] = [:]
         var retirePreflightAllowed = true
         var retireCommitAllowed = true
         var beforeRetireCommit: (() async -> Void)?
@@ -57,10 +58,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         func agentSessionLinkLaneProvenance(
             for endpoint: DomainAgentSessionLinkEndpointIdentity
-        ) -> UUID? { laneProvenance[endpoint] }
+        ) -> UUID? {
+            guard candidates.contains(where: { $0.domainEndpoint == endpoint }) else { return nil }
+            return laneProvenance[endpoint]
+        }
+        func agentSessionLinkWasCreatedBy(sessionID: UUID, creatorSessionID: UUID) -> Bool {
+            laneProvenance.contains { $0.key.sessionID == sessionID && $0.value == creatorSessionID }
+        }
         func agentSessionLinkBindingCount(sessionID: UUID) -> Int {
             candidates.filter { $0.sessionID == sessionID }.count
                 + hiddenBindingsBySessionID[sessionID, default: 0]
+        }
+        func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool {
+            childSessionIDsByParent[parentSessionID]?.isEmpty == false
         }
         var snapshotOverrides: [UUID: DomainAgentSessionObservationSnapshot] = [:]
         var installCountsBySession: [UUID: Int] = [:]
@@ -5378,10 +5388,18 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         -> AgentSessionLaneCreateRequest {
         AgentSessionLaneCreateRequest(
             idempotencyKey: key, role: "pair", sessionName: "New lane",
-            destinationWindowID: fixture.observer.windowID,
-            workspaceID: fixture.observer.workspaceID,
             message: message, workflowReference: nil
         )
+    }
+
+    private func createLane(
+        _ fixture: Fixture,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        request: AgentSessionLaneCreateRequest
+    ) async -> AgentSessionLaneCreateReceipt {
+        await fixture.bridge.createLane(observerEndpoint: observerEndpoint, request: request) {
+            (windowID: fixture.observer.windowID, workspaceID: fixture.observer.workspaceID)
+        }
     }
 
     private func prepareCreatedLane(_ fixture: Fixture, saved: Bool = true) -> AgentSessionLinkEndpointCandidate {
@@ -5404,7 +5422,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     func testLanePersistencePreflightRefusesBeforeAllocating() async {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        let receipt = await fixture.bridge.createLane(
+        let receipt = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture)
         )
@@ -5429,7 +5447,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let completed = expectation(description: "joined creation completed")
         completed.expectedFulfillmentCount = 2
         Task { @MainActor in
-            first = await fixture.bridge.createLane(
+            first = await createLane(fixture,
                 observerEndpoint: fixture.observer.domainEndpoint, request: request
             )
             completed.fulfill()
@@ -5438,7 +5456,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let beforeDurableProof = await fixture.authority.links(forTarget: lane.sessionID)
         XCTAssertTrue(beforeDurableProof.items.isEmpty, "Add must wait for the host's first-save proof")
         Task { @MainActor in
-            second = await fixture.bridge.createLane(
+            second = await createLane(fixture,
                 observerEndpoint: fixture.observer.domainEndpoint, request: request
             )
             completed.fulfill()
@@ -5449,12 +5467,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(first?.sessionID, lane.sessionID)
         XCTAssertEqual(second?.sessionID, lane.sessionID)
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
-        let replay = await fixture.bridge.createLane(
+        let replay = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint, request: request
         )
         XCTAssertTrue(replay.duplicate)
         XCTAssertEqual(replay.sessionID, lane.sessionID)
-        let conflict = await fixture.bridge.createLane(
+        let conflict = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture, message: "different")
         )
@@ -5477,19 +5495,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var first: AgentSessionLaneCreateReceipt?
         var joined: AgentSessionLaneCreateReceipt?
         Task { @MainActor in
-            first = await fixture.bridge.createLane(
+            first = await createLane(fixture,
                 observerEndpoint: fixture.observer.domainEndpoint, request: laneRequest(fixture)
             )
             completed.fulfill()
         }
         await fulfillment(of: [entered], timeout: 3)
         Task { @MainActor in
-            joined = await fixture.bridge.createLane(
+            joined = await createLane(fixture,
                 observerEndpoint: fixture.observer.domainEndpoint, request: laneRequest(fixture)
             )
             completed.fulfill()
         }
-        let conflict = await fixture.bridge.createLane(
+        let conflict = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture, message: "different payload")
         )
@@ -5516,7 +5534,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let completed = expectation(description: "frozen claim settled")
         var receipt: AgentSessionLaneCreateReceipt?
         Task { @MainActor in
-            receipt = await fixture.bridge.createLane(
+            receipt = await createLane(fixture,
                 observerEndpoint: fixture.observer.domainEndpoint,
                 request: laneRequest(fixture)
             )
@@ -5530,28 +5548,42 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.host.laneCreationCount, 0)
     }
 
-    func testLaneReceiptLedgerNeverEvictsAnAcceptedKey() async throws {
+    func testLanePreallocationRefusalCanRetrySameKey() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        for index in 0..<256 {
-            let refusal = await fixture.bridge.createLane(
-                observerEndpoint: fixture.observer.domainEndpoint,
-                request: laneRequest(fixture, key: "ledger-\(index)")
-            )
-            XCTAssertEqual(refusal.reason, .persistenceUnavailable)
-        }
-        let full = await fixture.bridge.createLane(
+        let refused = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "ledger-new")
+            request: laneRequest(fixture, key: "retry")
         )
-        XCTAssertEqual(full.reason, .ledgerFull)
-        let replay = await fixture.bridge.createLane(
+        XCTAssertEqual(refused.reason, .persistenceUnavailable)
+        try installLaneIntentStore(fixture)
+        _ = prepareCreatedLane(fixture)
+        let retried = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "ledger-0")
+            request: laneRequest(fixture, key: "retry")
         )
-        XCTAssertEqual(replay.reason, .persistenceUnavailable)
-        XCTAssertTrue(replay.duplicate)
-        XCTAssertEqual(fixture.host.laneCreationCount, 0)
+        XCTAssertEqual(retried.result, .created)
+        XCTAssertFalse(retried.duplicate)
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+    }
+
+    func testLaneDestinationRefusalCanRetrySameKeyAfterWorkspaceReturns() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        _ = prepareCreatedLane(fixture)
+        let request = laneRequest(fixture, key: "workspace-retry")
+        let unavailable = await fixture.bridge.createLane(
+            observerEndpoint: fixture.observer.domainEndpoint, request: request,
+            resolveDestination: { nil }
+        )
+        XCTAssertEqual(unavailable.reason, .destinationUnavailable)
+        let resumed = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint, request: request
+        )
+        XCTAssertEqual(resumed.result, .created)
+        XCTAssertFalse(resumed.duplicate)
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
     }
 
     func testLaneSaveFailureNeverCallsAdd() async throws {
@@ -5559,7 +5591,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let lane = prepareCreatedLane(fixture, saved: false)
-        let receipt = await fixture.bridge.createLane(
+        let receipt = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint, request: laneRequest(fixture)
         )
         XCTAssertEqual(receipt.result, .creationIncomplete)
@@ -5567,6 +5599,38 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(receipt.sessionID, lane.sessionID)
         let inbound = await fixture.authority.links(forTarget: lane.sessionID)
         XCTAssertEqual(inbound.items.count, 0)
+        let replay = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint, request: laneRequest(fixture)
+        )
+        XCTAssertEqual(replay.result, .creationIncomplete)
+        XCTAssertTrue(replay.duplicate)
+        XCTAssertEqual(replay.sessionID, lane.sessionID)
+        XCTAssertEqual(fixture.host.laneCreationCount, 1, "an incomplete key cannot allocate again")
+    }
+
+    func testAllocatedKeyTombstoneLimitIsPerEndpoint() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        _ = prepareCreatedLane(fixture, saved: false)
+        for index in 0..<256 {
+            let receipt = await createLane(fixture,
+                observerEndpoint: fixture.observer.domainEndpoint,
+                request: laneRequest(fixture, key: "incomplete-\(index)")
+            )
+            XCTAssertEqual(receipt.result, .creationIncomplete)
+        }
+        let full = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "incomplete-257")
+        )
+        XCTAssertEqual(full.reason, .ledgerFull)
+        let other = await createLane(fixture,
+            observerEndpoint: fixture.target.domainEndpoint,
+            request: laneRequest(fixture, key: "other-endpoint")
+        )
+        XCTAssertEqual(other.result, .creationIncomplete)
+        XCTAssertEqual(fixture.host.laneCreationCount, 257)
     }
 
     func testLaneBindingWithoutAuthoritativeFirstSaveCannotBeLinked() async throws {
@@ -5576,7 +5640,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var lane = prepareCreatedLane(fixture)
         lane.restorationReadiness = .unbound
         fixture.host.laneCandidate = lane
-        let receipt = await fixture.bridge.createLane(
+        let receipt = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture)
         )
@@ -5601,7 +5665,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             )
             fixture.host.candidates[index] = regressed
         }
-        let receipt = await fixture.bridge.createLane(
+        let receipt = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint, request: laneRequest(fixture)
         )
         XCTAssertEqual(receipt.reason, .addFailed)
@@ -5633,7 +5697,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             replacement.restorationReadiness = .authoritative(token, .freshBindingDurablyCreated)
             fixture.host.laneCandidate = replacement
         }
-        let receipt = await fixture.bridge.createLane(
+        let receipt = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint, request: laneRequest(fixture)
         )
         XCTAssertEqual(receipt.reason, .addFailed)
@@ -5647,7 +5711,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let directory = try installLaneIntentStore(fixture, mode: .dormant)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let lane = prepareCreatedLane(fixture)
-        let receipt = await fixture.bridge.createLane(
+        let receipt = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture)
         )
@@ -5668,7 +5732,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let lane = prepareCreatedLane(fixture)
         stageReadyTarget(fixture)
-        let receipt = await fixture.bridge.createLane(
+        let receipt = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture, message: "Build the API")
         )
@@ -5697,7 +5761,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let completed = expectation(description: "frozen creation settles")
         var outcome: AgentSessionLaneCreateReceipt?
         Task { @MainActor in
-            outcome = await fixture.bridge.createLane(
+            outcome = await createLane(fixture,
                 observerEndpoint: fixture.observer.domainEndpoint,
                 request: laneRequest(fixture)
             )
@@ -5710,6 +5774,33 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(outcome?.result, .creationIncomplete)
         XCTAssertEqual(outcome?.reason, .shuttingDown)
         XCTAssertEqual(outcome?.sessionID, lane.sessionID)
+        let inbound = await fixture.authority.links(forTarget: lane.sessionID)
+        XCTAssertTrue(inbound.items.isEmpty)
+    }
+
+    func testLaneCreationCannotLinkAfterSoleDirectGrantStopsDuringHostSave() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture),
+              let reference = await linkReference(fixture)
+        else { return XCTFail("seed link failed") }
+        let lane = prepareCreatedLane(fixture)
+        fixture.host.beforeLaneCreationReturn = {
+            let stop = await fixture.bridge.stopMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: fixture.target.domainEndpoint,
+                expectedReference: reference
+            )
+            XCTAssertEqual(stop, .stopped)
+        }
+        let receipt = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "revoked-before-add", message: "Do work")
+        )
+        XCTAssertEqual(receipt.result, .creationIncomplete)
+        XCTAssertEqual(receipt.sessionID, lane.sessionID)
+        XCTAssertFalse(receipt.linked)
+        XCTAssertTrue(fixture.host.sendRequests.isEmpty)
         let inbound = await fixture.authority.links(forTarget: lane.sessionID)
         XCTAssertTrue(inbound.items.isEmpty)
     }
@@ -5727,7 +5818,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let completed = expectation(description: "creation settles after deletion begins")
         var receipt: AgentSessionLaneCreateReceipt?
         Task { @MainActor in
-            receipt = await fixture.bridge.createLane(
+            receipt = await createLane(fixture,
                 observerEndpoint: fixture.observer.domainEndpoint,
                 request: laneRequest(fixture, message: "Must not dispatch")
             )
@@ -5760,7 +5851,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         completed.expectedFulfillmentCount = 8
         for index in 0..<8 {
             Task { @MainActor in
-                _ = await fixture.bridge.createLane(
+                _ = await createLane(fixture,
                     observerEndpoint: fixture.observer.domainEndpoint,
                     request: laneRequest(fixture, key: "cap-\(index)")
                 )
@@ -5771,7 +5862,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let refused = expectation(description: "over-cap attempt refuses without waiting for a host save")
         var ninth: AgentSessionLaneCreateReceipt?
         Task { @MainActor in
-            ninth = await fixture.bridge.createLane(
+            ninth = await createLane(fixture,
                 observerEndpoint: fixture.observer.domainEndpoint,
                 request: laneRequest(fixture, key: "cap-9")
             )
@@ -5808,19 +5899,168 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let completed = expectation(description: "admitted creation settled")
         var first: AgentSessionLaneCreateReceipt?
         Task { @MainActor in
-            first = await fixture.bridge.createLane(
+            first = await createLane(fixture,
                 observerEndpoint: fixture.observer.domainEndpoint,
                 request: laneRequest(fixture, key: "seven-first")
             )
             completed.fulfill()
         }
         await fulfillment(of: [entered], timeout: 3)
-        let second = await fixture.bridge.createLane(
+        let second = await createLane(fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture, key: "seven-second")
         )
         XCTAssertEqual(second.reason, .laneLimitReached)
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
+        release?.resume()
+        await fulfillment(of: [completed], timeout: 3)
+        XCTAssertEqual(first?.result, .created)
+    }
+
+    func testDuplicateLaneIncarnationDoesNotFreeACreatorSlot() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        var firstLane: AgentSessionLinkEndpointCandidate?
+        for index in 0..<8 {
+            let lane = makeCandidate(windowID: 70 + index)
+            if firstLane == nil { firstLane = lane }
+            fixture.host.candidates.append(lane)
+            fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
+            guard case .added = await fixture.bridge.addMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: lane.domainEndpoint
+            ) else { return XCTFail("seed lane \(index) failed") }
+        }
+        let original = try XCTUnwrap(firstLane)
+        fixture.host.candidates.append(makeCandidate(windowID: 90, sessionID: original.sessionID))
+        _ = prepareCreatedLane(fixture)
+        let refused = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "duplicate-target")
+        )
+        XCTAssertEqual(refused.reason, .laneLimitReached)
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
+        fixture.host.candidates.removeAll { $0.domainEndpoint == original.domainEndpoint }
+        let staleGrant = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "stale-target-binding")
+        )
+        XCTAssertEqual(staleGrant.reason, .laneLimitReached)
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
+        guard let reference = await linkReference(fixture, target: original.sessionID) else {
+            return XCTFail("linked lane reference missing")
+        }
+        let stopped = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: original.domainEndpoint,
+            expectedReference: reference
+        )
+        XCTAssertEqual(stopped, .stopped)
+        let retried = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "stale-target-binding")
+        )
+        XCTAssertEqual(retried.result, .created)
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+    }
+
+    func testCreatorIncarnationsShareSettledLaneCap() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        let sibling = makeCandidate(windowID: 91, sessionID: fixture.observer.sessionID)
+        fixture.host.candidates.append(sibling)
+        for index in 0..<8 {
+            let lane = makeCandidate(windowID: 100 + index)
+            fixture.host.candidates.append(lane)
+            fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
+            let creator = index.isMultiple(of: 2) ? fixture.observer : sibling
+            guard case .added = await fixture.bridge.addMonitorLink(
+                observerEndpoint: creator.domainEndpoint,
+                targetEndpoint: lane.domainEndpoint
+            ) else { return XCTFail("seed lane \(index) failed") }
+        }
+        _ = prepareCreatedLane(fixture)
+        let refused = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "duplicate-creator")
+        )
+        XCTAssertEqual(refused.reason, .laneLimitReached)
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
+    }
+
+    func testExternalActivationDuringCapInventoryForcesRecount() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        for index in 0..<7 {
+            let lane = makeCandidate(windowID: 120 + index)
+            fixture.host.candidates.append(lane)
+            fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
+            guard case .added = await fixture.bridge.addMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: lane.domainEndpoint
+            ) else { return XCTFail("seed lane \(index) failed") }
+        }
+        let external = makeCandidate(windowID: 129)
+        fixture.host.candidates.append(external)
+        fixture.host.laneProvenance[external.domainEndpoint] = fixture.observer.sessionID
+        _ = prepareCreatedLane(fixture)
+        fixture.bridge.test_afterLaneCapInventoryBeforeRevision = {
+            fixture.bridge.test_afterLaneCapInventoryBeforeRevision = nil
+            guard case .added = await fixture.bridge.addMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: external.domainEndpoint
+            ) else { XCTFail("external Add failed"); return }
+        }
+        let refused = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "external-add")
+        )
+        XCTAssertEqual(refused.reason, .laneLimitReached)
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
+    }
+
+    func testLinkedLaneInFirstSendIsNotCountedAgainAsReservation() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        for index in 0..<6 {
+            let lane = makeCandidate(windowID: 140 + index)
+            fixture.host.candidates.append(lane)
+            fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
+            guard case .added = await fixture.bridge.addMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: lane.domainEndpoint
+            ) else { return XCTFail("seed lane \(index) failed") }
+        }
+        _ = prepareCreatedLane(fixture)
+        stageReadyTarget(fixture)
+        let sending = expectation(description: "first lane linked and entered attributed send")
+        var release: CheckedContinuation<Void, Never>?
+        fixture.host.beforeSendCommit = {
+            fixture.host.beforeSendCommit = nil
+            sending.fulfill()
+            await withCheckedContinuation { release = $0 }
+        }
+        let completed = expectation(description: "first creation settled")
+        var first: AgentSessionLaneCreateReceipt?
+        Task { @MainActor in
+            first = await createLane(fixture,
+                observerEndpoint: fixture.observer.domainEndpoint,
+                request: laneRequest(fixture, key: "first-send", message: "First task")
+            )
+            completed.fulfill()
+        }
+        await fulfillment(of: [sending], timeout: 3)
+        _ = prepareCreatedLane(fixture)
+        let second = await createLane(fixture,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "eighth")
+        )
+        XCTAssertEqual(second.result, .created)
+        XCTAssertEqual(fixture.host.laneCreationCount, 2)
         release?.resume()
         await fulfillment(of: [completed], timeout: 3)
         XCTAssertEqual(first?.result, .created)
@@ -5845,6 +6085,65 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 0)
         XCTAssertFalse(fixture.host.candidates.contains(fixture.target))
+    }
+
+    func testLaneRetirementRefusesLaneWithChildSession() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        fixture.host.childSessionIDsByParent[fixture.target.sessionID] = [UUID()]
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        let outcome = await fixture.bridge.retireLane(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
+        XCTAssertEqual(inbound.items.count, 1)
+    }
+
+    func testRetireRemovesDurableRowAfterFencedUnchangedAddBumpedAssertion() async throws {
+        let fixture = makeFixture()
+        let directory = try installLaneIntentStore(fixture)
+        fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        let inserted = expectation(description: "unchanged assertion committed")
+        var release: CheckedContinuation<Void, Never>?
+        fixture.bridge.test_afterAddInsertionBeforeEstablishment = { pair in
+            guard pair.targetSessionID == fixture.target.sessionID else { return }
+            inserted.fulfill()
+            await withCheckedContinuation { release = $0 }
+        }
+        let addCompleted = expectation(description: "racing Add settled")
+        Task { @MainActor in
+            _ = await fixture.bridge.addMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: fixture.target.domainEndpoint
+            )
+            addCompleted.fulfill()
+        }
+        await fulfillment(of: [inserted], timeout: 3)
+        let retirementDone = expectation(description: "retirement settles despite the paused Add")
+        var retired: AgentSessionLaneRetireOutcome?
+        Task { @MainActor in
+            retired = await fixture.bridge.retireLane(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetSessionID: fixture.target.sessionID
+            )
+            retirementDone.fulfill()
+        }
+        await fulfillment(of: [retirementDone], timeout: 3)
+        XCTAssertEqual(retired, .retired(sessionID: fixture.target.sessionID))
+        release?.resume()
+        await fulfillment(of: [addCompleted], timeout: 3)
+        let data = try Data(contentsOf: directory.appendingPathComponent(
+            AgentSessionOversightIntentStore.filename
+        ))
+        let saved = try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: data)
+        XCTAssertFalse(saved.links.contains(AgentSessionOversightIntent(
+            observerSessionID: fixture.observer.sessionID,
+            targetSessionID: fixture.target.sessionID
+        )))
     }
 
     func testLaneRetirementRefusesBusyAndOtherRelationshipsWithoutStopping() async throws {

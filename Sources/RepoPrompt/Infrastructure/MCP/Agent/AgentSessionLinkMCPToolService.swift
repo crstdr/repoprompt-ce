@@ -507,8 +507,6 @@ struct AgentSessionLinkMCPToolService {
                 idempotencyKey: key,
                 role: role,
                 sessionName: sessionName,
-                destinationWindowID: nil,
-                workspaceID: nil,
                 workspaceSelector: workspaceSelector,
                 message: message,
                 workflowReference: workflowReference

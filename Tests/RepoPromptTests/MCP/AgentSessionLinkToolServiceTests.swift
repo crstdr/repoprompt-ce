@@ -738,6 +738,30 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ))
     }
 
+    func testLaneWorkspaceDigestUsesExactlyDestinationNameEquivalence() {
+        let plain = AgentSessionLaneMCPToolService.Destination(
+            windowID: 1, workspaceID: UUID(), workspaceName: "Cafe"
+        )
+        let accented = AgentSessionLaneMCPToolService.Destination(
+            windowID: 2, workspaceID: UUID(), workspaceName: "Café"
+        )
+        let candidates = [plain, accented]
+        func request(_ selector: String) -> AgentSessionLaneCreateRequest {
+            AgentSessionLaneCreateRequest(
+                idempotencyKey: "same-key", role: "pair", sessionName: nil,
+                workspaceSelector: selector, message: nil, workflowReference: nil
+            )
+        }
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: "CAFE", callerWindowID: 2
+        )?.workspaceID, plain.workspaceID)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: "Café", callerWindowID: 1
+        )?.workspaceID, accented.workspaceID)
+        XCTAssertEqual(request("Cafe").digest, request("CAFE").digest)
+        XCTAssertNotEqual(request("Cafe").digest, request("Café").digest)
+    }
+
     /// The missing-op and unsupported-op errors teach the same operation list the schema advertises.
     func testSetWaitingOnIsSelfScopedAndRequiresExactlyOneMutation() async throws {
         let fixture = try await makeReadReleaseFixture()
