@@ -345,6 +345,20 @@ actor CodexAppServerClient {
         let processFamilyCleanupWasCompleted: Bool
     }
 
+    /// Only the Codex rollout-path lookup diagnostic is eligible for a fresh fallback.
+    /// Generic missing-file errors can describe unrelated configuration or workspace files.
+    static func isMissingRolloutPathResolutionMessage(_ message: String) -> Bool {
+        let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let prefix = "failed to resolve rollout path"
+        guard normalized.hasPrefix(prefix) else { return false }
+        let detail = normalized.dropFirst(prefix.count)
+        guard detail.first == " " || detail.first == ":" else { return false }
+        let reason = "file does not exist"
+        guard normalized.hasSuffix(reason) || normalized.hasSuffix("\(reason).") else { return false }
+        let reasonStart = detail.index(detail.endIndex, offsetBy: -(reason.count + (normalized.hasSuffix(".") ? 1 : 0)))
+        return !detail[..<reasonStart].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     static func isTimeoutError(_ error: Error) -> Bool {
         if let clientError = error as? ClientError,
            case let .requestFailed(failure) = clientError

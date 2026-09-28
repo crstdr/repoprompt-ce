@@ -1189,6 +1189,7 @@ final class CodexNativeSessionController {
         return normalized == "no rollout found for thread id \(normalizedThreadID)"
             || normalized == "thread not found: \(normalizedThreadID)"
             || normalized == "thread not loaded: \(normalizedThreadID)"
+            || CodexAppServerClient.isMissingRolloutPathResolutionMessage(failure.message)
     }
 
     private func prepareHookTrustThreadBindingRestoration() async throws -> ThreadSnapshot {
