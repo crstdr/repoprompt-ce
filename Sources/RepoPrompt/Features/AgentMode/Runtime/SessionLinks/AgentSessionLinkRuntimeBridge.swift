@@ -835,8 +835,6 @@ final class AgentSessionLinkRuntimeBridge {
     /// Termination freeze. Set synchronously, before any async shutdown work, and never cleared:
     /// after it, no Add/Stop/cleanup is admitted and no teardown callback may delete durable intent.
     private var isFrozenForTermination = false
-    /// How long a Manage change waits for a running-turn push before reporting it as in progress.
-    /// The push itself is never cancelled by this bound.
     /// Bridge-registered pre-freeze transactions. Bounded settlement waits only for these.
     private var registeredTransactionIDs: Set<UUID> = []
     /// Resumed by whichever of "last transaction finished" and "deadline elapsed" happens first.

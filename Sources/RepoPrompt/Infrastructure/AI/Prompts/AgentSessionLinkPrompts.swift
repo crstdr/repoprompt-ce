@@ -788,7 +788,7 @@ enum AgentSessionLinkPrompts {
         guard isHostDeterminedToolReference(toolReference) else { return [] }
         let server = MCPIntegrationHelper.repoPromptMCPServerName
         return [
-            "Your host may prefix the RepoPrompt tool name. Use the advertised tool containing `\(toolReference)` from `\(server)`; the bare spelling need not appear verbatim."
+            "Your host may prefix the RepoPrompt tool name. Use the advertised tool containing `\(toolReference)` from `\(server)`; it may appear as `mcp__\(server)__\(toolReference)`, `\(toolReference) (\(server))`, or `\(server)-\(toolReference)`. The bare spelling need not be callable."
         ]
     }
 

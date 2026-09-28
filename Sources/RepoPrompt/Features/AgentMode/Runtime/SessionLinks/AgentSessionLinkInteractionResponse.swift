@@ -94,6 +94,5 @@ enum AgentSessionLinkInteractionResponseOutcome: Equatable {
 enum AgentSessionLinkInteractionDisposition: Equatable {
     case denied
     case shuttingDown
-    case inspected(AgentSessionLinkPendingInteractionInspection)
     case responded(AgentSessionLinkInteractionResponseOutcome)
 }

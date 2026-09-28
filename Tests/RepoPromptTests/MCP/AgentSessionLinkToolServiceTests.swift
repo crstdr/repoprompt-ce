@@ -1222,7 +1222,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let waiting = try await Self.executeObject(fixture.service, args: [
             "op": .string("poll"), "session_id": sessionID
         ])
-        XCTAssertEqual(waiting["pending_interaction"]?.objectValue?["note"]?.stringValue, AgentSessionLinkResponseRenderer.instructionWaitNote)
+        XCTAssertEqual(waiting["pending_interaction"]?.objectValue?["note"]?.stringValue, AgentSessionLinkPendingInteractionInspection.instructionWaitNote)
 
         let interactionID = UUID()
         func respond(_ extra: [String: Value] = ["response": .string("accept")]) async throws -> [String: Value] {
@@ -1592,6 +1592,90 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    func testParkedSingleTargetWaitPreservesRevokedResultWithoutPrompt() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let waiting = Task { @MainActor in
+            try await Self.executeObject(fixture.service, args: [
+                "op": .string("wait"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "timeout_seconds": .int(5)
+            ])
+        }
+        for _ in 0 ..< 100 {
+            if await fixture.authority.snapshot().parkedWaiterCount == 1 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        let parked = await fixture.authority.snapshot().parkedWaiterCount
+        XCTAssertEqual(parked, 1)
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        let result = try await waiting.value
+        XCTAssertEqual(result["result"]?.stringValue, "revoked")
+        XCTAssertTrue(result["detail"]?.stringValue?.contains(fixture.target.sessionID.uuidString) == true)
+        XCTAssertNil(result["pending_interaction"])
+        XCTAssertNil(result["respond_hint"])
+    }
+
+    func testWaitPreservesLinkUnavailableResultWithoutPrompt() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        let service = AgentSessionLinkMCPToolService(
+            toolName: MCPWindowToolName.agentSessionLink,
+            captureRequestMetadata: {
+                MCPServerViewModel.RequestMetadata(
+                    connectionID: UUID(),
+                    clientName: "agent-session-link-tool-service-tests",
+                    windowID: fixture.window.windowID
+                )
+            },
+            requireTargetWindow: { fixture.window },
+            resolveObserverEndpoint: { _, _ in fixture.observer.domainEndpoint },
+            withHeartbeat: { _, _, _, _, operation in
+                await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+                return try await operation()
+            },
+            bridge: fixture.bridge
+        )
+        let result = try await Self.executeObject(service, args: [
+            "op": .string("wait"),
+            "session_id": .string(fixture.target.sessionID.uuidString),
+            "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(result["result"]?.stringValue, "link_unavailable")
+        XCTAssertNil(result["pending_interaction"])
+        XCTAssertNil(result["respond_hint"])
+    }
+
+    func testParkedWaitPreservesShuttingDownResultWithoutPrompt() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let waiting = Task { @MainActor in
+            try await Self.executeObject(fixture.service, args: [
+                "op": .string("wait"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "timeout_seconds": .int(5)
+            ])
+        }
+        for _ in 0 ..< 100 {
+            if await fixture.authority.snapshot().parkedWaiterCount == 1 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        let parked = await fixture.authority.snapshot().parkedWaiterCount
+        XCTAssertEqual(parked, 1)
+        await fixture.authority.beginDrain()
+        let result = try await waiting.value
+        XCTAssertEqual(result["result"]?.stringValue, "shutting_down")
+        XCTAssertNil(result["pending_interaction"])
+        XCTAssertNil(result["respond_hint"])
+    }
+
     func testParkedMultiTargetWaitRechecksWholeBatchBeforeReleasingAnyPrompt() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
@@ -1613,20 +1697,23 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
         for _ in 0 ..< 100 {
             if await fixture.authority.snapshot().parkedWaiterCount == 1 { break }
-            try await Task.sleep(for: .milliseconds(10))
+            try? await Task.sleep(for: .milliseconds(10))
         }
         let parked = await fixture.authority.snapshot().parkedWaiterCount
         XCTAssertEqual(parked, 1, "the batch must be parked before revocation")
         let inventory = await fixture.authority.links(forObserverEndpoint: fixture.observer.domainEndpoint)
         let secondLink = try XCTUnwrap(inventory.items.first { $0.targetSessionID == second.sessionID })
         await fixture.bridge.revokeLink(linkID: secondLink.linkID, generation: secondLink.generation)
-        do {
-            let value = try await waiting.value
-            XCTFail("revocation must release no sibling prompt; got \(value)")
-        } catch let error as MCPError {
-            XCTAssertEqual("\(error)", "\(AgentSessionLinkMCPToolService.denialError(targetSessionID: nil))")
-            XCTAssertFalse("\(error)".contains(Self.sampleInteractionPrompt))
-        }
+        let result = try await waiting.value
+        XCTAssertEqual(result.objectValue?["result"]?.stringValue, "revoked")
+        let rows = try XCTUnwrap(result.objectValue?["targets"]?.arrayValue)
+        let sibling = try XCTUnwrap(rows.first?.objectValue)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(sibling["session_id"]?.stringValue, fixture.target.sessionID.uuidString)
+        XCTAssertNotNil(sibling["wait_cursor"]?.stringValue)
+        XCTAssertNil(sibling["pending_interaction"])
+        XCTAssertNil(sibling["respond_hint"])
+        XCTAssertFalse("\(result)".contains(Self.sampleInteractionPrompt))
     }
 
     func testOperationHelpNamesEverySupportedOperation() async throws {
@@ -1663,9 +1750,9 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 _ = try await fixture.service.execute(args: args)
                 XCTFail("an absent or unknown op must be refused")
             } catch let error as MCPError {
-                XCTAssertTrue(
-                    "\(error)".contains(AgentSessionLinkMCPToolService.supportedOperationsSentence)
-                )
+                let message = "\(error)"
+                XCTAssertTrue(message.contains(AgentSessionLinkMCPToolService.supportedOperationsSentence))
+                XCTAssertEqual(message.contains("use poll or wait"), args["op"] == .string("get_interaction"))
             }
         }
     }

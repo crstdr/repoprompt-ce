@@ -279,7 +279,7 @@ enum AgentMonitorAutoWakeCopy {
 /// Fixed disclosure for the authority conferred by a new exact oversight link.
 enum AgentMonitorOversightDisclosure {
     static let outbound = "Oversee lets this session watch, message, answer one-time prompts, and steer the linked session under your instructions. Session-wide approvals, hook trust, merge reviews, and secret inputs stay with you."
-    static let inbound = "A linked overseer may answer one-time prompts and steer this session under your instructions. Session-wide approvals, hook trust, merge reviews, and secret inputs stay with you."
+    static let inbound = "A linked overseer can watch and message this session. Links with Manage may also answer one-time prompts and steer under your instructions; already-live watch-only links cannot. Session-wide approvals, hook trust, merge reviews, and secret inputs stay with you."
 }
 
 /// Why the observer's own `Wake now` cannot run, or `nil` when it can.

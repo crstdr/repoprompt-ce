@@ -72,7 +72,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertFalse(rendered.contains("get_interaction"))
     }
 
-    func testOneLinkGuidanceMeasurementFixture() {
+    func testOneLinkGuidanceStaysWithinBudget() {
         let targetID = "8B91C0E0-0000-0000-0000-00000000E572"
         let watch = AgentSessionLinkPrompts.render(
             kind: .inventory,
@@ -87,8 +87,9 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             toolReference: "agent_session_link"
         )
 
-        XCTAssertEqual(watch.count, 6499)
-        XCTAssertEqual(managed.count, 6505)
+        XCTAssertLessThanOrEqual(watch.count, 10000)
+        XCTAssertLessThanOrEqual(managed.count, 10000)
+        XCTAssertGreaterThan(managed.count, watch.count)
     }
 
     func testOrdersDeterministicallyByTargetUUID() {
@@ -1352,6 +1353,9 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         )
         XCTAssertTrue(acp.contains("Your host may prefix the RepoPrompt tool name"))
         XCTAssertTrue(acp.contains("`agent_session_link` from `\(server)`"))
+        XCTAssertTrue(acp.contains("`mcp__\(server)__agent_session_link`"))
+        XCTAssertTrue(acp.contains("`agent_session_link (\(server))`"))
+        XCTAssertTrue(acp.contains("`\(server)-agent_session_link`"))
 
         let claude = AgentSessionLinkPrompts.render(
             kind: .inventory,

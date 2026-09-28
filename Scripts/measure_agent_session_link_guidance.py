@@ -2,8 +2,9 @@
 """Replay the fixed one-link oversight inventory fixture at two Git refs.
 
 Usage: python3 Scripts/measure_agent_session_link_guidance.py 21e5c584 worktree
-The literal replay is checked against the Swift-rendered fixture in
-AgentSessionLinkPromptRendererTests.testOneLinkGuidanceMeasurementFixture.
+This is a static literal estimate, not an automated Swift-renderer check. The fixture
+uses the bare, host-determined tool name and includes its naming guidance. Compare
+the resulting counts against a Swift-rendered one-link fixture when changing the renderer.
 """
 
 import json
@@ -33,6 +34,7 @@ def section(source, start, end):
 
 
 def swift_literal(value):
+    # Keep the capability-change interpolation for historical before-ref comparisons.
     for key, replacement in {
         "toolReference": TOOL,
         "server": "RepoPromptCE",

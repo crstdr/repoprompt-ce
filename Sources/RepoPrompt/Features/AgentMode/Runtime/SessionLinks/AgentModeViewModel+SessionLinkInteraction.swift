@@ -40,6 +40,8 @@ extension AgentModeViewModel {
         let inspection = AgentSessionLinkPendingInteractionInspection(
             interaction: Self.overseerProjection(of: interaction), manualOnlyReason: manualOnlyReason
         )
+        // The hard disclosure cap takes precedence even for an already manual-only category:
+        // poll/wait return an ID-only too_large stub, so respond must report the same reason.
         if inspection.exceedsPromptLimit {
             return .manualOnly(.tooLarge)
         }

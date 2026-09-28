@@ -158,9 +158,12 @@ struct AgentSessionLinkMCPToolService {
             try validateAllowedKeys(args, op: op, allowed: Self.steerKeys)
             return try await executeSteer(args: args)
         default:
+            let retiredInteractionHint = op == "get_interaction"
+                ? " For a pending prompt, use poll or wait on the exact target, then respond with its interaction_id."
+                : ""
             throw MCPError.invalidParams(
-                "Unsupported agent_session_link op '\(op)'. \(Self.supportedOperationsSentence) "
-                    + "For a pending prompt, use poll or wait on the exact target, then respond with its interaction_id."
+                "Unsupported agent_session_link op '\(op)'. \(Self.supportedOperationsSentence)"
+                    + retiredInteractionHint
             )
         }
     }
@@ -318,7 +321,7 @@ struct AgentSessionLinkMCPToolService {
                 interactionID: interactionID,
                 observerSessionID: observerEndpoint.sessionID
             )
-        case .denied, .inspected:
+        case .denied:
             throw Self.denialError(targetSessionID: targetSessionID)
         case .shuttingDown:
             throw MCPError.internalError("RepoPrompt is shutting down.")
@@ -630,6 +633,29 @@ struct AgentSessionLinkMCPToolService {
                 until: predicate,
                 timeoutSeconds: timeoutSeconds
             )
+            // A terminal wait result is itself the authority's answer to a lost lease or runtime.
+            // The whole-batch Manage fence below must not replace that structured result with a
+            // generic denial, but no prompt from the invalidated batch may be released with it.
+            switch waitResult.outcome {
+            case .revoked, .linkUnavailable:
+                var survivingStates: [DomainAgentSessionLinkTargetState] = []
+                if !isSingle {
+                    for lease in leases {
+                        if let state = await bridge.targetState(for: lease) {
+                            survivingStates.append(state)
+                        }
+                    }
+                }
+                return AgentSessionLinkResponseRenderer.waitValue(
+                    DomainAgentSessionLinkWaitResult(outcome: waitResult.outcome, targets: survivingStates),
+                    isSingle: isSingle
+                )
+            case .shuttingDown:
+                return AgentSessionLinkResponseRenderer.waitValue(waitResult, isSingle: isSingle)
+            case .changed, .idle, .timedOut, .cancelled, .waitAlreadyPending,
+                 .cursorExpired, .invalidRequest:
+                break
+            }
             // Read after the wait resumes, so a queued send that drained while this call was parked
             // reports its terminal outcome rather than the pending entry it had on entry.
             let pendingSends = await bridge.pendingSendProjections(for: leases)
@@ -1491,7 +1517,6 @@ enum AgentSessionLinkResponseRenderer {
         ])
     }
 
-    static let instructionWaitNote = AgentSessionLinkPendingInteractionInspection.instructionWaitNote
     static let respondHint = AgentSessionLinkPrompts.respondHint
     static let pendingInteractionOmittedHint =
         "Poll this session alone to inspect its pending interaction."
@@ -1511,9 +1536,9 @@ enum AgentSessionLinkResponseRenderer {
                 ?? payload["snapshot"]?.objectValue?["session_id"]?.stringValue
             if let sessionID, let id = UUID(uuidString: sessionID),
                let inspection = inspections[id],
-               let pending = pendingInteractionValue(inspection)
+               let pending = pendingInteractionPayload(inspection)
             {
-                payload["pending_interaction"] = pending
+                payload["pending_interaction"] = pending.value
                 payload["respond_hint"] = .string(respondHint)
             }
             return .object(payload)
@@ -1525,13 +1550,13 @@ enum AgentSessionLinkResponseRenderer {
                   let rawID = row["session_id"]?.stringValue,
                   let id = UUID(uuidString: rawID),
                   let inspection = inspections[id],
-                  let pending = pendingInteractionValue(inspection)
+                  let pending = pendingInteractionPayload(inspection)
             else { return entry }
-            let bytes = encodedByteCount(pending) + respondHint.utf8.count
-            if bytes <= remaining {
-                row["pending_interaction"] = pending
+            let hintBytes = respondHint.utf8.count
+            if hintBytes <= remaining, pending.byteCount <= remaining - hintBytes {
+                row["pending_interaction"] = pending.value
                 row["respond_hint"] = .string(respondHint)
-                remaining -= bytes
+                remaining -= pending.byteCount + hintBytes
             } else {
                 row["pending_interaction_omitted"] = .bool(true)
                 row["pending_interaction_hint"] = .string(pendingInteractionOmittedHint)
@@ -1542,19 +1567,27 @@ enum AgentSessionLinkResponseRenderer {
     }
 
     static func pendingInteractionValue(_ inspection: AgentSessionLinkPendingInteractionInspection) -> Value? {
+        pendingInteractionPayload(inspection)?.value
+    }
+
+    private static func pendingInteractionPayload(
+        _ inspection: AgentSessionLinkPendingInteractionInspection
+    ) -> (value: Value, byteCount: Int)? {
         guard let interaction = inspection.interaction,
               let object = inspection.projectedObject()
         else { return nil }
         let full = Value.object(object)
-        guard !inspection.exceedsPromptLimit else {
-            return .object([
+        let fullBytes = encodedByteCount(full)
+        guard fullBytes <= AgentSessionLinkPendingInteractionInspection.promptMaxBytes else {
+            let stub = Value.object([
                 "interaction_id": .string(interaction.id.uuidString),
                 "kind": .string(interaction.kind.rawValue),
                 "respondable": .bool(false),
                 "manual_only_reason": .string("too_large")
             ])
+            return (stub, encodedByteCount(stub))
         }
-        return full
+        return (full, fullBytes)
     }
 
     private static func encodedByteCount(_ value: Value) -> Int {
