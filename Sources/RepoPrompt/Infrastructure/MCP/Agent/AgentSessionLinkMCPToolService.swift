@@ -671,6 +671,7 @@ struct AgentSessionLinkMCPToolService {
                 to: AgentSessionLinkResponseRenderer.waitValue(
                     waitResult,
                     pendingSends: pendingSends,
+                    managedTargets: Set(inspections.keys),
                     isSingle: isSingle
                 ),
                 inspections: inspections,
@@ -2049,6 +2050,7 @@ enum AgentSessionLinkResponseRenderer {
     static func waitValue(
         _ result: DomainAgentSessionLinkWaitResult,
         pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:],
+        managedTargets: Set<UUID>? = nil,
         isSingle: Bool
     ) -> Value {
         var payload: [String: Value] = [
@@ -2065,6 +2067,9 @@ enum AgentSessionLinkResponseRenderer {
             if let state = result.targets.first {
                 payload["snapshot"] = snapshotValue(state)
                 payload["wait_cursor"] = .string(state.waitCursor)
+                if let managedTargets {
+                    payload["managed"] = .bool(managedTargets.contains(state.sessionID))
+                }
                 payload.merge(pendingSendFields(
                     pendingSends[state.sessionID] ?? .empty,
                     targetSessionID: state.sessionID
@@ -2072,7 +2077,12 @@ enum AgentSessionLinkResponseRenderer {
             }
         } else {
             payload["targets"] = .array(result.targets.map { state in
-                targetEntryValue(state, pendingSend: pendingSends[state.sessionID] ?? .empty)
+                var entry = targetEntryValue(state, pendingSend: pendingSends[state.sessionID] ?? .empty)
+                if let managedTargets, case var .object(fields) = entry {
+                    fields["managed"] = .bool(managedTargets.contains(state.sessionID))
+                    entry = .object(fields)
+                }
+                return entry
             })
         }
         return .object(payload)

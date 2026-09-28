@@ -937,6 +937,8 @@ final class AgentSessionLinkRuntimeBridge {
         /// Observes only the domain operation selected for Seen authorization.
         var test_observeSeenAuthorizationOperation:
             (@MainActor (DomainAgentSessionTargetOperation) -> Void)?
+        /// Parks prompt projection after the final authority hop, before its no-suspension release.
+        var test_afterManagedObservationAuthorityValidation: (@MainActor () async -> Void)?
     #endif
 
     init(
@@ -4336,6 +4338,18 @@ final class AgentSessionLinkRuntimeBridge {
         }
         guard let managedIDs = await authority.managedObservationTargetsIfValid(leases: leases),
               !isFrozenForTermination
+        else { return nil }
+        #if DEBUG
+            await test_afterManagedObservationAuthorityValidation?()
+        #endif
+        // Deletion can begin while the authority hop is suspended without revoking a valid grant.
+        // Recheck both endpoints after that hop, before releasing any observer-local prompt body.
+        let registry = AgentSessionDeletionRegistry.shared
+        guard !isFrozenForTermination,
+              !leases.contains(where: {
+                  registry.blocksNewOversight(sessionID: $0.observer.sessionID)
+                      || registry.blocksNewOversight(sessionID: $0.target.sessionID)
+              })
         else { return nil }
         let candidates = host.agentSessionLinkCandidates()
         var inspections: [UUID: AgentSessionLinkPendingInteractionInspection] = [:]

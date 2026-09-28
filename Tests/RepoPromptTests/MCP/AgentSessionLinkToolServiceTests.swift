@@ -1536,6 +1536,143 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    @MainActor
+    private final class ObservationReleaseGate {
+        private var entered = false
+        private var enteredContinuation: CheckedContinuation<Void, Never>?
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+        func pause() async {
+            entered = true
+            enteredContinuation?.resume()
+            enteredContinuation = nil
+            await withCheckedContinuation { releaseContinuation = $0 }
+        }
+
+        func waitUntilPaused() async {
+            if entered { return }
+            await withCheckedContinuation { enteredContinuation = $0 }
+        }
+
+        func release() {
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+    }
+
+    func testDeletionStartingAfterManagedObservationAuthorityHopReleasesNoPrompt() async throws {
+        for deleteObserver in [true, false] {
+            let fixture = try await makeReadReleaseFixture()
+            defer { fixture.tearDown() }
+            fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+            let authorized = await fixture.bridge.authorizeTarget(
+                operation: .monitorPoll,
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetSessionID: fixture.target.sessionID
+            )
+            guard case let .success(target) = authorized else { return XCTFail("Expected an exact grant") }
+            let gate = ObservationReleaseGate()
+            fixture.bridge.test_afterManagedObservationAuthorityValidation = { await gate.pause() }
+            let observing = Task { @MainActor in
+                await fixture.bridge.pendingInteractionsForObservation(leases: [target.lease])
+            }
+            await gate.waitUntilPaused()
+            let deletedSessionID = deleteObserver ? fixture.observer.sessionID : fixture.target.sessionID
+            let registry = AgentSessionDeletionRegistry.shared
+            let attempt = registry.beginDurableDeletion(sessionID: deletedSessionID)
+            XCTAssertTrue(registry.isDeletionInProgress(sessionID: deletedSessionID))
+            gate.release()
+            let inspections = await observing.value
+            XCTAssertNil(inspections, "No prompt may escape after \(deleteObserver ? "observer" : "target") deletion begins")
+            registry.didFailDurableDeletion(attempt)
+            let stillAuthorized = await fixture.authority.validate(lease: target.lease)
+            XCTAssertNil(stillAuthorized, "In-progress deletion must not revoke an otherwise valid grant")
+        }
+    }
+
+    private func addRestrictedLink(
+        to target: AgentSessionLinkEndpointCandidate,
+        fixture: ReadReleaseFixture
+    ) async throws {
+        fixture.host.candidates.append(target)
+        let reserved = await fixture.authority.reserveLink(
+            observer: fixture.observer.domainEndpoint,
+            target: target.domainEndpoint,
+            capabilities: DomainAgentSessionLinkCapability.version1
+        )
+        guard case let .reserved(reservation, _) = reserved else {
+            return XCTFail("Expected a restricted reservation, got \(reserved)")
+        }
+        let activated = await fixture.authority.activateLink(
+            reservation: reservation,
+            initialSnapshot: fixture.host.agentSessionLinkObservationSnapshot(for: target),
+            sourcePublicationSequence: 1
+        )
+        guard case .activated = activated else {
+            return XCTFail("Expected a restricted grant, got \(activated)")
+        }
+    }
+
+    func testWaitReportsExactManagedMetadataForSingleAndMultiSnapshots() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let managedID = fixture.target.sessionID
+        let restricted = makeCandidate(windowID: 3, displayName: "Restricted target")
+        try await addRestrictedLink(to: restricted, fixture: fixture)
+        let secondManaged = makeCandidate(windowID: 4, displayName: "Second managed target")
+        fixture.host.candidates.append(secondManaged)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            rawTargetSessionID: secondManaged.sessionID.uuidString
+        ) else { return XCTFail("Expected a second managed grant") }
+
+        let managedNoPrompt = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"), "session_id": .string(managedID.uuidString), "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(managedNoPrompt["managed"], .bool(true))
+        XCTAssertNil(managedNoPrompt["pending_interaction"])
+        XCTAssertNil(managedNoPrompt["respond_hint"])
+        let restrictedNoPrompt = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"), "session_id": .string(restricted.sessionID.uuidString),
+            "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(restrictedNoPrompt["managed"], .bool(false))
+        XCTAssertNil(restrictedNoPrompt["pending_interaction"])
+        XCTAssertNil(restrictedNoPrompt["respond_hint"])
+
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(
+            manualOnly: nil, prompt: String(repeating: "m", count: 12 * 1024)
+        )
+        let managedPrompt = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"), "session_id": .string(managedID.uuidString), "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(managedPrompt["managed"], .bool(true))
+        XCTAssertNotNil(managedPrompt["pending_interaction"])
+        let restrictedPrompt = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"), "session_id": .string(restricted.sessionID.uuidString),
+            "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(restrictedPrompt["managed"], .bool(false))
+        XCTAssertNil(restrictedPrompt["pending_interaction"])
+        XCTAssertNil(restrictedPrompt["respond_hint"])
+
+        let batched = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"),
+            "session_ids": .array(
+                [managedID, secondManaged.sessionID, restricted.sessionID]
+                    .map { .string($0.uuidString) }
+            ),
+            "timeout_seconds": .int(0)
+        ])
+        let rows = try XCTUnwrap(batched["targets"]?.arrayValue)
+        XCTAssertEqual(rows.map { $0.objectValue?["managed"] }, [.bool(true), .bool(true), .bool(false)])
+        XCTAssertNotNil(rows[0].objectValue?["pending_interaction"])
+        XCTAssertEqual(rows[1].objectValue?["pending_interaction_omitted"], .bool(true))
+        XCTAssertNil(rows[1].objectValue?["pending_interaction"])
+        XCTAssertNil(rows[2].objectValue?["pending_interaction"])
+        XCTAssertNil(rows[2].objectValue?["pending_interaction_omitted"])
+    }
+
     func testManagedWaitCarriesPendingInteractionOutsideThePassiveSnapshot() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
