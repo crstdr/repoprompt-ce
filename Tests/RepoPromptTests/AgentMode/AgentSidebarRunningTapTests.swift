@@ -15,8 +15,7 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let pressedIndex = 3
         let pressedID = harness.rows[pressedIndex].tabID
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         let appeared = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
         XCTAssertTrue(appeared)
         let point = Self.point(in: host, rowIndex: pressedIndex)
@@ -38,8 +37,7 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         XCTAssertNotEqual(promotedID, pressedID)
 
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
 
         let sectionIDAtPress = harness.seenSectionIDs.last
@@ -72,8 +70,7 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let pressedID = harness.rows[pressedIndex].tabID
 
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
 
         let point = Self.point(in: host, rowIndex: pressedIndex)
@@ -101,8 +98,7 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let harness = SidebarRunningTapHarness(now: now)
         harness.rows = [pinned, today, pressed]
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
 
         let sectionIDAtPress = harness.sectionIDByRow[pressed.tabID]
@@ -136,8 +132,7 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let harness = SidebarRunningTapHarness(now: now)
         harness.rows = [parent, pressed]
         let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
+        Self.showForClicks(window)
         _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
 
         let groupIDAtPress = harness.groupIDByRow[pressed.tabID]
@@ -450,6 +445,32 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         _ = render(until: Date().addingTimeInterval(0.4)) { sink.frames.count >= 7 }
         window.orderOut(nil)
         return sink.frames
+    }
+
+    /// A fresh XCTest process has an application that has not finished launching, so
+    /// `makeKeyAndOrderFront` does not make the window key and SwiftUI drops the click.
+    /// Finish launch, activate, and place the window on a screen before sending events.
+    private static func showForClicks(_ window: NSWindow) {
+        let app = NSApplication.shared
+        if app.activationPolicy() == .prohibited {
+            app.setActivationPolicy(.accessory)
+        }
+        if !app.isRunning {
+            app.finishLaunching()
+        }
+        app.activate(ignoringOtherApps: true)
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            var frame = window.frame
+            frame.origin = NSPoint(
+                x: screen.visibleFrame.minX + 80,
+                y: screen.visibleFrame.minY + 80
+            )
+            window.setFrame(frame, display: true)
+        } else {
+            window.setFrameOrigin(NSPoint(x: 80, y: 80))
+        }
+        window.orderFrontRegardless()
+        window.makeKey()
     }
 
     private static func makeWindow(

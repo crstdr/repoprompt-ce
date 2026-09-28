@@ -316,6 +316,20 @@ enum AgentModelCatalog {
             }
         }
 
+        // A persisted Cursor model is an identity, not a membership check. The catalogue
+        // can be cold or stale; rewriting it to Auto here would drop the saved choice
+        // before admission gets a chance to reject an unadvertised model.
+        if preserveUnavailableAgent,
+           agent == .cursor,
+           let candidateModelRaw,
+           !candidateModelRaw.isEmpty
+        {
+            let identity = CursorAIModelCatalog.canonicalIdentity(candidateModelRaw)
+            if !identity.isEmpty {
+                return NormalizedAgentSelection(agent: .cursor, modelRaw: identity)
+            }
+        }
+
         let fallbackModelRaw = defaultModelRaw(
             for: agent,
             availability: effectiveAvailability,
@@ -1875,6 +1889,10 @@ enum AgentModelCatalog {
     }
 
     /// Explicit candidate chains per role. Order matters: first available wins.
+    ///
+    /// Engineer, pair, and design keep Cursor Auto after Grok. Composer wins once it has
+    /// been discovered; Grok still wins before discovery when it is connected; Auto is
+    /// only the floor when Cursor is the only available agent and Composer is not advertised.
     private static func candidateChain(
         for kind: TaskLabelKind,
         availability: AvailabilityContext
@@ -1908,7 +1926,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue),
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue)
             ]
         case .pair:
             [
@@ -1918,7 +1937,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue),
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue)
             ]
         case .design:
             [
@@ -1928,7 +1948,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
                 SelectionCandidate(agent: .codexExec, modelRaw: solMedium),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue),
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue)
             ]
         }
     }
