@@ -129,7 +129,7 @@ struct AgentSelfMCPToolService {
         case "persistence_indeterminate":
             "Durable session state could not be confirmed; no compaction was dispatched."
         case "session_not_exclusive":
-            "This session is live in more than one window incarnation; compaction is refused."
+            "Exclusive durable ownership could not be confirmed; compaction is refused."
         case "busy":
             "This session is not dispatchable now; retry after the turn settles."
         default:
@@ -152,7 +152,7 @@ struct AgentSelfMCPToolService {
             details.append("ACP /compact may still be running; the note waits for a safe settle boundary.")
         }
         if status.outcome == .completionUnverified {
-            details.append("ACP compaction completion is not verified.")
+            details.append("Compaction completion is not verified.")
         }
         if status.noteDelivery == .parked {
             details.append("The note will be prepended to the next ordinary send; do not issue a verification prompt.")

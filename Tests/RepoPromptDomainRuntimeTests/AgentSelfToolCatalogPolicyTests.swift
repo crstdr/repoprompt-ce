@@ -31,7 +31,7 @@ final class AgentSelfToolCatalogPolicyTests: XCTestCase {
         for required in [
             "Agent Mode session", "no target selector", "`context`", "load", "status",
             "`compact`", "nonempty `note`", "8,192 UTF-8 bytes", "`idempotency_key`",
-            "200 UTF-8 bytes", "same note", "`scheduled`", "finish this turn normally",
+            "200 UTF-8 bytes", "same note", "New `scheduled`", "finish this turn normally",
             "no new authority"
         ] {
             XCTAssertTrue(description.contains(required), required)

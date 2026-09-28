@@ -1122,7 +1122,7 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     private static let agentSelfDefinition = MCPDomainToolDefinition(
         name: MCPWindowToolName.agentSelf,
-        description: "Calling Agent Mode session only; no target selector. `context` returns load (null if unknown) and compact status. `compact` needs nonempty `note` (max 8,192 UTF-8 bytes) and `idempotency_key` (max 200 UTF-8 bytes). Reuse a key only with the same note. `scheduled`: finish this turn normally; compaction follows. Note grants no new authority.",
+        description: "Calling Agent Mode session only; no target selector. `context` returns load (null if unknown) and compact status. `compact` needs nonempty `note` (max 8,192 UTF-8 bytes) and `idempotency_key` (max 200 UTF-8 bytes). Reuse a key only with the same note. New `scheduled`: finish this turn normally; compaction follows. Note grants no new authority.",
         inputSchema: .object([
             "type": .string("object"),
             "additionalProperties": .bool(false),

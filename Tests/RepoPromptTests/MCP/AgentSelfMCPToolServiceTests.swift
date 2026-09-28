@@ -85,6 +85,29 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
         XCTAssertTrue(recoveryDetail?.contains("explicit recovery") == true)
     }
 
+    func testNativeUnverifiedAndPersistenceWarningReasonHaveProviderNeutralGuidance() async throws {
+        let fixture = Fixture()
+        fixture.snapshot = .init(context: nil, selfCompact: .init(
+            requestID: UUID(), phase: nil, outcome: .completionUnverified,
+            completionVerified: false, noteDelivery: .notSent, recoveryNote: "continue"
+        ))
+        let context = try await fixture.execute(["op": .string("context")])
+        XCTAssertEqual(
+            context["self_compact"]?.objectValue?["detail"],
+            .string("Compaction completion is not verified.")
+        )
+
+        fixture.forcedAdmission = .blocked(reason: "session_not_exclusive")
+        let blocked = try await fixture.execute([
+            "op": .string("compact"), "note": .string("continue"), "idempotency_key": .string("key")
+        ])
+        XCTAssertEqual(blocked["reason"], .string("session_not_exclusive"))
+        XCTAssertEqual(
+            blocked["detail"],
+            .string("Exclusive durable ownership could not be confirmed; compaction is refused.")
+        )
+    }
+
     func testNoTargetSelectorOrUnknownOperationCanReachReadOrSchedule() async {
         let fixture = Fixture()
         for key in [
