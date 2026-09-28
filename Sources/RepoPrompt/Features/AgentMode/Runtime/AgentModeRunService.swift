@@ -146,6 +146,9 @@ final class AgentModeRunService {
         let selectedAgent = session.selectedAgent
         if let selfCompactDispatchID {
             guard session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
+                  selfCompactDispatchID.stage == .note
+                  ? session.selfCompactNoteDispatchIsCurrent(selfCompactDispatchID)
+                  : session.selfCompactDispatchIsCurrent?() != false,
                   Self.allowsSelfCompactDispatch(session),
                   (selfCompactDispatchID.stage == .compact) == (providerControlCommand != nil)
             else {

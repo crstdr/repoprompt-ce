@@ -149,6 +149,25 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         }
     }
 
+    /// A writer can bind after the note pipeline starts but before its physical send. Release the
+    /// hold only while the note is provably unattempted; an attempted send remains ambiguous.
+    @discardableResult
+    func cancelUnattemptedNoteIfOwnerLost(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+        var state = load()
+        guard dispatchID.stage == .note,
+              let attempt = state.active,
+              attempt.id == dispatchID.requestID,
+              attempt.phase == .noteDispatchPending || attempt.phase == .dispatchingNote || attempt.phase == .parked,
+              !attempt.noteDispatchStarted,
+              let owner = attempt.owner,
+              !isCurrentOwner(owner)
+        else { return false }
+        noteTask?.cancel()
+        state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+        store(state)
+        return true
+    }
+
     func cancelRuntimeWork() {
         deadlineTask?.cancel()
         deadlineTask = nil
@@ -310,7 +329,12 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         guard state.active?.id == requestID,
               state.active?.phase == .awaitingNoteBoundary
         else { return }
-        guard teardownSettled(), isCurrentOwner(owner) else {
+        guard isCurrentOwner(owner) else {
+            state.settle(.cancelled, noteDelivery: .notSent, completionVerified: true)
+            store(state)
+            return
+        }
+        guard teardownSettled() else {
             state.active?.phase = .parked
             store(state)
             return
@@ -327,7 +351,11 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         state = load()
         guard state.active?.id == requestID else { return }
         if !didStart, state.active?.noteDispatchStarted == false {
-            state.active?.phase = .parked
+            if !isCurrentOwner(owner) {
+                state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+            } else {
+                state.active?.phase = .parked
+            }
             store(state)
         }
     }

@@ -129,8 +129,12 @@ final class AgentSelfCompactTerminalScheduler {
             return
         }
         let admittedSupport = await support()
-        guard isPending(requestID, owner: owner), isCurrentOwner(owner),
-              load().active?.admittedSupport == admittedSupport,
+        guard isPending(requestID, owner: owner) else { return }
+        guard isCurrentOwner(owner) else {
+            settleCancellation(requestID)
+            return
+        }
+        guard load().active?.admittedSupport == admittedSupport,
               admittedSupport == .codex || admittedSupport == .claudeCode
               || admittedSupport == .acpAdvertisedCommand
         else {
@@ -151,7 +155,7 @@ final class AgentSelfCompactTerminalScheduler {
             if didStart {
                 settleCompletionUnverified(requestID)
             } else {
-                settleFailure(requestID)
+                settleCancellation(requestID)
             }
             return
         }

@@ -58,7 +58,8 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         agent: AgentProviderKind = .claudeCode,
         providerConversation: Bool = true,
         saverBehavior: LiveSendEventLog.SaverBehavior = .succeed,
-        firstSaveGate: FirstSaveGate? = nil
+        firstSaveGate: FirstSaveGate? = nil,
+        secondSaveGate: FirstSaveGate? = nil
     ) throws -> Fixture {
         let events = LiveSendEventLog()
         let driftHook = AgentSessionLinkSendTransactionLiveTests.LiveSendDriftHook()
@@ -115,6 +116,8 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             if saveIndex == 0 {
                 driftHook.duringDeliveryFlush?()
                 await firstSaveGate?.pause()
+            } else if saveIndex == 1 {
+                await secondSaveGate?.pause()
             }
             switch saverBehavior {
             case .succeed:
@@ -304,6 +307,49 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         })
         XCTAssertFalse(row.text.contains("verbatim private continuation"))
         XCTAssertTrue(fixture.events.saveHappenedBeforeProviderStart())
+    }
+
+    func testWriterBoundAfterReceiptBeforeDeferredNativeDispatchPreventsProviderStart() async throws {
+        let gate = FirstSaveGate()
+        let fixture = try makeFixture(secondSaveGate: gate)
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.lateWriter")
+        let endpoint = fixture.candidate.domainEndpoint
+        let origin = AgentSelfMCPCallOrigin(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
+        guard case .scheduled = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            endpoint: endpoint, origin: origin, note: "private continuation", idempotencyKey: "late-writer"
+        ) else { return XCTFail("Expected a durable scheduled receipt") }
+
+        fixture.session.runState = .completed
+        _ = fixture.session.endRunAttempt(ifCurrent: ownership, source: "test.selfCompact.lateWriterTerminal")
+        let revision = AgentRunTerminalCommitRevision(
+            commitID: UUID(), ownership: ownership, terminalState: .completed,
+            failureReason: nil, expectedRunID: runID,
+            sourceItemsRevision: fixture.session.sourceItemsRevision,
+            assistantDeltaFlushGeneration: fixture.session.assistantDeltaFlushGeneration,
+            providerDrainGeneration: fixture.session.providerTerminalDrainGeneration,
+            mcpPublicationEnvelope: nil, successorKind: nil, providerSuccessorID: nil
+        )
+        fixture.viewModel.agentSelfCompactTerminalSettled(
+            session: fixture.session, revision: revision,
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        await gate.waitUntilEntered()
+        let otherTabID = UUID()
+        let competing = fixture.viewModel.session(for: otherTabID)
+        competing.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(
+            tabID: otherTabID, sessionID: endpoint.sessionID
+        ))
+        gate.release()
+        for _ in 0 ..< 500 {
+            if fixture.session.selfCompactState.active == nil { break }
+            await Task.yield()
+        }
+        XCTAssertNil(fixture.session.selfCompactState.active)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .cancelled)
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
     }
 
     func testSelfMCPAdmissionPersistsExactOriginBeforeReceiptAndReplaysOnlyIdenticalKey() async throws {
@@ -957,6 +1003,36 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         XCTAssertEqual(session.draftText, "unsent draft")
         XCTAssertEqual(session.selectedWorkflow, workflow)
         XCTAssertEqual(session.pendingImageAttachments, [attachment])
+    }
+
+    func testDedicatedClaudeNoteRefusesLateLostWriterAndReleasesTheHold() async throws {
+        let controller = MonitorFakeNativeController()
+        let (viewModel, session, _, _) = try makeViewModel(controller: controller)
+        session.providerSessionID = "monitor-native-session"
+        let runIntent = try intent(for: session)
+        let dispatchID = try armSelfNote(session: session, note: "private continuation")
+        session.selfCompactDispatchIsCurrent = { false } // Another tab bound after note pipeline admission.
+        session.selfCompactNativeCompletion = AgentSelfCompactNativeCompletionCoordinator(
+            load: { session.selfCompactState },
+            store: { session.selfCompactState = $0 },
+            isCurrentOwner: { _ in false },
+            dispatchNote: { _, _ in XCTFail("No second note dispatch")
+                return false
+            }
+        )
+
+        let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: session, text: AgentSelfCompactNoteEnvelope.frame("private continuation"),
+            attachments: [], intent: runIntent, allowsCatalogRouteControllerRecovery: false,
+            selfCompactDispatchID: dispatchID
+        )
+        XCTAssertEqual(outcome, .superseded)
+        let sent = await controller.sentMessages
+        XCTAssertEqual(sent, [])
+        XCTAssertNil(session.selfCompactState.active)
+        XCTAssertEqual(session.selfCompactState.latest?.outcome, .cancelled)
+        XCTAssertFalse(session.selfCompactState.blocksOverseerDelivery)
+        XCTAssertFalse(session.selfCompactState.blocksAutomaticWake)
     }
 
     func testClaudeAmbiguousNoteTransportRetainsRecoveryWithoutRetry() async throws {

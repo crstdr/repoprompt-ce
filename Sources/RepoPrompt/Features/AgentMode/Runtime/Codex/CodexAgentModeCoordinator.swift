@@ -6877,8 +6877,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
         let isSelfNote = selfCompactDispatchID?.stage == .note
         if isSelfNote {
-            guard let active = session.selfCompactState.active,
-                  active.id == selfCompactDispatchID?.requestID,
+            guard let selfCompactDispatchID,
+                  session.selfCompactNoteDispatchIsCurrent(selfCompactDispatchID),
+                  let active = session.selfCompactState.active,
+                  active.id == selfCompactDispatchID.requestID,
                   active.phase == .dispatchingNote,
                   active.owner?.matchesLocalBinding(session) == true,
                   active.compactProviderConversation == session.codexConversationID,
@@ -6893,7 +6895,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.selfCompactState = state
                 viewModel?.scheduleSave(for: session.tabID)
             }
-            return session.selfCompactState.parkedNote
+            guard let parked = session.selfCompactState.parkedNote,
+                  session.selfCompactNoteDispatchIsCurrent(parked.dispatchID)
+            else { return nil }
+            return parked
         }
         let auditTurnID = fallbackContext?.optimisticUserItemID
             ?? session.pendingTurnRuntimeAnchors.first?.userItemID
@@ -7219,6 +7224,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                       active.id == selfCompactDispatchID?.requestID,
                       active.phase == .dispatchingNote,
                       active.owner?.matchesLocalBinding(session) == true,
+                      selfCompactDispatchID.map(session.selfCompactNoteDispatchIsCurrent) == true,
                       active.compactProviderConversation == session.codexConversationID,
                       session.codexController.map(ObjectIdentifier.init) == expectedControllerID
                 else { return .preDispatchRejected(message: "Continuation note scope changed before Codex dispatch.") }
@@ -7379,6 +7385,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             viewModel?.scheduleSave(for: session.tabID)
                         }
                         if let noteDispatchID {
+                            guard session.selfCompactNoteDispatchIsCurrent(noteDispatchID) else {
+                                throw CancellationError()
+                            }
                             var state = session.selfCompactState
                             guard state.noteWillAttempt(noteDispatchID) else {
                                 throw CancellationError()
@@ -7445,6 +7454,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 do {
                     if let parkedNote {
+                        guard session.selfCompactNoteDispatchIsCurrent(parkedNote.dispatchID) else {
+                            return .cancelled
+                        }
                         var state = session.selfCompactState
                         guard state.noteWillAttempt(parkedNote.dispatchID) else { return .cancelled }
                         session.selfCompactState = state

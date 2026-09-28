@@ -1116,6 +1116,19 @@ final class AgentTabSession: ObservableObject {
     /// original reservation's required save has completed.
     var selfCompactAdmissionPendingID: UUID?
 
+    /// Runtime-only owner/exclusivity fence, rechecked at provider-bound send seams after startup awaits.
+    /// A restored attempt has no executable fence and cannot resume dispatch.
+    var selfCompactDispatchIsCurrent: (@MainActor () -> Bool)?
+
+    @MainActor
+    func selfCompactNoteDispatchIsCurrent(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+        guard selfCompactDispatchIsCurrent?() != false else {
+            selfCompactNativeCompletion?.cancelUnattemptedNoteIfOwnerLost(dispatchID)
+            return false
+        }
+        return true
+    }
+
     /// Runtime-only timer and note worker; persisted state is deliberately inert on restore.
     var selfCompactNativeCompletion: AgentSelfCompactNativeCompletionCoordinator?
 

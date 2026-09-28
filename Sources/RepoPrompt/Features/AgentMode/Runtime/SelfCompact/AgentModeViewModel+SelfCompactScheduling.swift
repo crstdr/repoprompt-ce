@@ -274,6 +274,7 @@ extension AgentModeViewModel {
             && endpoint.sessionID == owner.sessionID
             && endpoint.persistentBindingGeneration == owner.persistentBindingGeneration
             && endpoint.bindingTransitionGeneration == owner.bindingTransitionGeneration
+            && !agentSelfCompactHasCompetingWriter(session, sessionID: owner.sessionID)
     }
 
     private func agentSelfCompactDispatchNative(
@@ -288,6 +289,10 @@ extension AgentModeViewModel {
               target.route == .existingAgentSession,
               target.expectedSourceAgentSessionID == owner.sessionID
         else { return false }
+        session.selfCompactDispatchIsCurrent = { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return agentSelfCompactOwnerIsCurrent(owner, session: session)
+        }
         let attempt = AgentComposerSubmitAttempt(
             id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
         )

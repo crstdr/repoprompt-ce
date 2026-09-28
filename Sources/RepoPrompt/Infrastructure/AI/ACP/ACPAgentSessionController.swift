@@ -487,8 +487,22 @@ actor ACPAgentSessionController {
         autoApproveAllToolPermissions = enabled
     }
 
+    #if DEBUG
+        private var testRejectNextTurnPreparation = false
+
+        func test_rejectNextTurnPreparation() {
+            testRejectNextTurnPreparation = true
+        }
+    #endif
+
     @discardableResult
     func prepareForNextTurn() -> Bool {
+        #if DEBUG
+            if testRejectNextTurnPreparation {
+                testRejectNextTurnPreparation = false
+                return false
+            }
+        #endif
         guard state == .sessionOpen, process != nil, sessionID != nil else { return false }
         didEmitTerminal = false
         eventStreamFinished = false

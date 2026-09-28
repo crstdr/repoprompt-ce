@@ -1065,7 +1065,9 @@ final class ClaudeAgentModeCoordinator {
 
         for attempt in 0 ..< 3 {
             if isSelfNote {
-                guard session.claudeController != nil,
+                guard let selfCompactDispatchID,
+                      session.selfCompactNoteDispatchIsCurrent(selfCompactDispatchID),
+                      session.claudeController != nil,
                       !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session),
                       session.providerSessionID == session.selfCompactState.active?.compactProviderConversation,
                       session.selfCompactState.active?.owner?.matchesLocalBinding(session) == true
@@ -1397,13 +1399,19 @@ final class ClaudeAgentModeCoordinator {
                           dispatchID.stage == .compact,
                           active?.id == dispatchID.requestID,
                           active?.compactRunID == intent.runID,
-                          active?.phase == .dispatchingCompact || active?.phase == .awaitingCompactTurn
+                          active?.phase == .dispatchingCompact || active?.phase == .awaitingCompactTurn,
+                          session.selfCompactDispatchIsCurrent?() != false
                     else { return .superseded }
                 }
                 // The last check before the write: the controller has no atomic idle-send, so this
                 // narrows the window to the send call itself.
                 if let refusal = await controlCommandRefusal(providerControlCommand, controller: controller) {
                     return refusal
+                }
+                if providerControlCommand.selfCompactDispatchID != nil,
+                   session.selfCompactDispatchIsCurrent?() == false
+                {
+                    return .superseded
                 }
                 do {
                     let turnID = try await controller.sendUserMessage(providerControlCommand.providerText)
@@ -1443,7 +1451,8 @@ final class ClaudeAgentModeCoordinator {
                       text == active.map({ AgentSelfCompactNoteEnvelope.frame($0.note) }),
                       await !(controller.hasTurnInFlight),
                       intentIsCurrent(intent, for: session),
-                      sessionOwnsClaudeController(controller, for: session)
+                      sessionOwnsClaudeController(controller, for: session),
+                      session.selfCompactNoteDispatchIsCurrent(dispatchID)
                 else { return .superseded }
                 var state = session.selfCompactState
                 guard state.noteWillAttempt(dispatchID) else { return .superseded }
@@ -1483,7 +1492,9 @@ final class ClaudeAgentModeCoordinator {
                     session.selfCompactState = selfCompactState
                     hostCapabilities.scheduleSave(session)
                 }
-                let parked = session.selfCompactState.parkedNote
+                let parked = session.selfCompactState.parkedNote.flatMap { candidate in
+                    session.selfCompactNoteDispatchIsCurrent(candidate.dispatchID) ? candidate : nil
+                }
                 let textWithNote = parked.map { $0.frame + "\n\n" + outboundText } ?? outboundText
                 // Applied after handoff composition and before delivery-mode packaging, so the
                 // oversight supplement remains the final RepoPrompt envelope in the user-message

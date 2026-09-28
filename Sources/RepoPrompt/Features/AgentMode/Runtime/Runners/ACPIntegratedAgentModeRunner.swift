@@ -523,6 +523,22 @@ final class ACPIntegratedAgentModeRunner {
             )
             return
         }
+        // Bind before handing the run to a task. Preparation can refuse before the command's
+        // physical send seam; its terminal publication must still identify and settle this attempt.
+        if let dispatchID = command.selfCompactDispatchID, dispatchID.stage == .compact {
+            guard session.selfCompactDispatchIsCurrent?() != false,
+                  session.selfCompactNativeCompletion?.bindCompact(
+                      dispatchID, runID: runID, runAttemptID: runAttemptID
+                  ) == true
+            else {
+                await failProviderControlCommandBeforeSend(
+                    session: session, runAttemptID: runAttemptID,
+                    attachmentReservationID: attachmentReservationID,
+                    errorText: "\(displayName) did not run the requested command because self-compaction was no longer admissible."
+                )
+                return
+            }
+        }
         launchReusedSessionRun(
             tabID: tabID,
             session: session,
@@ -1075,8 +1091,14 @@ final class ACPIntegratedAgentModeRunner {
         }
         log("prompt turn begin prepare=\(prepareControllerForNextTurn)", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
-        let carry = AgentSelfCompactParkedPrefix.prepare(initialMessageForRun, session: session) {
+        var carry = AgentSelfCompactParkedPrefix.prepare(initialMessageForRun, session: session) {
             hooks.persistence.scheduleSave(session)
+        }
+        if let dispatchID = carry.dispatchID,
+           !session.selfCompactNoteDispatchIsCurrent(dispatchID)
+        {
+            if dedicatedNoteID != nil { return .cancelled }
+            carry = .init(text: initialMessageForRun, dispatchID: nil)
         }
         // This run was created only to send the captured note. If an ordinary local turn
         // consumed or superseded it while ACP setup suspended, never reinterpret its frame
@@ -1104,8 +1126,10 @@ final class ACPIntegratedAgentModeRunner {
             let prepared = await controller.prepareForNextTurn()
             guard prepared else {
                 if carry.exactNote, let dispatchID = carry.dispatchID {
-                    AgentSelfCompactParkedPrefix.markNotAttempted(dispatchID, session: session)
-                    hooks.persistence.scheduleSave(session)
+                    if session.selfCompactNoteDispatchIsCurrent(dispatchID) {
+                        AgentSelfCompactParkedPrefix.markNotAttempted(dispatchID, session: session)
+                        hooks.persistence.scheduleSave(session)
+                    }
                 }
                 return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
             }
@@ -1165,7 +1189,9 @@ final class ACPIntegratedAgentModeRunner {
             promptMessage = decorated.message
         }
         if let dispatchID = carry.dispatchID {
-            guard AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session) else {
+            guard session.selfCompactNoteDispatchIsCurrent(dispatchID),
+                  AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session)
+            else {
                 // Another sender may already own this note's one-shot attempt. A stale dedicated
                 // sender has no marker to clear and must not re-park an ordinary in-flight send.
                 if !carry.exactNote {
@@ -1300,7 +1326,8 @@ final class ACPIntegratedAgentModeRunner {
         }
         guard session.persistentSessionBindingIdentity == command.expectedBinding,
               !session.bindingTransitionInProgress,
-              session.providerSessionID == command.expectedProviderConversation
+              session.providerSessionID == command.expectedProviderConversation,
+              command.selfCompactDispatchID == nil || session.selfCompactDispatchIsCurrent?() != false
         else {
             await abandonConsumer()
             return .refusedBeforeSend(
@@ -1322,21 +1349,15 @@ final class ACPIntegratedAgentModeRunner {
         let transcriptItemsAtDispatch = session.items.count
         do {
             log("controller.promptAdvertisedCommand begin", runID: runID)
-            if let dispatchID = command.selfCompactDispatchID, dispatchID.stage == .compact {
-                session.selfCompactACPCommandItemIDs = Set(session.items.map(\.id))
-                let bound = session.selfCompactNativeCompletion?.bindCompact(
-                    dispatchID,
-                    runID: runID,
-                    runAttemptID: runAttemptID
-                ) == true
-                guard bound else {
-                    session.selfCompactACPCommandItemIDs = nil
+            if command.selfCompactDispatchID?.stage == .compact {
+                guard session.selfCompactDispatchIsCurrent?() != false else {
                     await abandonConsumer()
                     session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
                     return .refusedBeforeSend(
                         errorText: "\(displayName) did not run the requested command because self-compaction was no longer admissible."
                     )
                 }
+                session.selfCompactACPCommandItemIDs = Set(session.items.map(\.id))
             }
             try await controller.promptAdvertisedCommand(
                 command.kind.rawValue,
