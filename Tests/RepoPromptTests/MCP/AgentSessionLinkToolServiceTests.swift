@@ -1414,7 +1414,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ).objectValue)
         XCTAssertEqual(full["pending_interaction"]?.objectValue?["prompt"]?.stringValue?.utf8.count, 60 * 1024)
         XCTAssertEqual(full["pending_interaction"]?.objectValue?["respondable"], .bool(true))
-        XCTAssertEqual(full["respond_hint"]?.stringValue, AgentSessionLinkResponseRenderer.respondHint)
+        XCTAssertEqual(full["respond_hint"]?.stringValue, AgentSessionLinkPrompts.respondHint)
+        XCTAssertLessThanOrEqual(AgentSessionLinkPrompts.respondHint.count, 200)
+        XCTAssertTrue(AgentSessionLinkPrompts.respondHint.contains("`interaction_id`"))
+        XCTAssertTrue(AgentSessionLinkPrompts.respondHint.contains("Manual-only"))
+        XCTAssertTrue(AgentSessionLinkPrompts.respondHint.contains("refresh"))
 
         let oversized = Self.sampleInspection(manualOnly: nil, prompt: String(repeating: "z", count: 70 * 1024))
         let refused = try XCTUnwrap(AgentSessionLinkResponseRenderer.addPendingInteractions(

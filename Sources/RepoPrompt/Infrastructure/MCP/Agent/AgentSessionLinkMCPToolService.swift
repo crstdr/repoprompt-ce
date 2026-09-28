@@ -1492,8 +1492,7 @@ enum AgentSessionLinkResponseRenderer {
     }
 
     static let instructionWaitNote = AgentSessionLinkPendingInteractionInspection.instructionWaitNote
-    static let respondHint =
-        "Use respond with this exact interaction_id and only a one-time allowed choice. Manual-only prompts belong to the target's user. If respond reports a mismatch, refresh with poll or wait; never auto-retry an approval."
+    static let respondHint = AgentSessionLinkPrompts.respondHint
     static let pendingInteractionOmittedHint =
         "Poll this session alone to inspect its pending interaction."
     static let multiPromptMaxBytes = 20 * 1024

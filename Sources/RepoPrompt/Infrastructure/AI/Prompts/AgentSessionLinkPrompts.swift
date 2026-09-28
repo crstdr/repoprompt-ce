@@ -60,6 +60,15 @@ enum AgentSessionLinkPrompts {
     /// Revision 8 adds watch-level native compaction under send_when_idle.
     static let currentLaneGuidanceRevision: UInt64 = 8
 
+    /// Version of the full inventory wording, independent of passive lane guidance and membership.
+    /// An accepted inventory with older wording is re-owed at the next dispatch without inventing a
+    /// link-set change or a closing notice.
+    static let currentInventoryGuidanceRevision: UInt64 = 2
+
+    /// Emitted only beside a managed, observer-local pending_interaction result.
+    static let respondHint =
+        "Use `respond` with this `interaction_id` and one-time option only. Manual-only prompts stay with the target's user. On mismatch, refresh with `poll` or `wait`; never auto-retry approval."
+
     /// How much of the lane-update trust guidance one render must carry.
     ///
     /// The full block is expensive and the model only needs to be taught it once per provider
@@ -658,7 +667,7 @@ enum AgentSessionLinkPrompts {
         }
 
         var body = """
-        <\(envelopeTag) revision="\(inventory.linkSetRevision)" status="active">
+        <\(envelopeTag) revision="\(inventory.linkSetRevision)" guidance_revision="\(currentInventoryGuidanceRevision)" status="active">
         \(guidance)
         <overseen_sessions \(listAttributes)>
         """
@@ -743,8 +752,7 @@ enum AgentSessionLinkPrompts {
 
     private static func guidance(toolReference: String) -> String {
         var lines = [
-            "Current capabilities: this block replaces every earlier statement in this conversation about which sessions you oversee and what you may do with them, including any refusal you gave based on older capabilities. `managed=\"true\"` means your user delegated management of that session to you now; `managed=\"false\"` means you may not answer its prompts or steer it.",
-            "The user granted this session observation of the Agent sessions listed below plus the ability to send one attributed message to an idle one or request native context compaction of a fully idle, send-ready one. New links include capability `manage` (`managed=\"true\"`), delegating management of that exact session: you act for the user in that session — inspect and answer its prompts, steer its running turns, and give it new instructions. This session is their observer, also called their overseer. Use `\(toolReference)` for all of it; it is the only oversight surface you have."
+            "Current capabilities: this block replaces earlier overseen-session lists and capability wording, including your own earlier refusals based on them. Each row is one direct grant; `managed=\"true\"` permits `respond` and `steer`, while `managed=\"false\"` does not. Use `\(toolReference)` for these sessions."
         ]
         lines.append(contentsOf: hostNamingGuidance(toolReference: toolReference))
         // The trust/authority frame comes before the operation list on purpose: it is what bounds
@@ -752,39 +760,14 @@ enum AgentSessionLinkPrompts {
         // a footnote.
         lines.append(contentsOf: autonomyContract)
         lines.append(contentsOf: [
-            "Operations: exact outbound grants authorize `list` (current targets), `poll` (sanitized status, managed pending prompt, and a wait cursor), `wait` (bounded, event-driven, managed pending prompt), `read` (paged, redacted transcript), `send` (one attributed message to a fully idle, send-ready target), `cancel_pending_send`, `compact` (RepoPrompt-native context compaction of a fully idle, send-ready target), and `snooze_auto_wake` (observer-local pause on one lane's status-triggered Auto-wake). A grant with `manage` also authorizes `poll`/`wait` to disclose the target's redacted current prompt, `respond` (answer exactly that prompt), and `steer` (direct the target now). `set_waiting_on` is self-scoped while any exact link remains. Only an exact inbound grant authorizes `request_attention`, the fixed attributed signal that grants no reverse observer operation.",
-            "Managing a session: managed `poll`/`wait` show its current prompt, redacted, with one-time option labels verbatim. `respond` answers exactly that `interaction_id` — approvals and permissions take `accept` (this request only), `decline`, or `cancel`; questions take `answers` keyed by field `id` — and a replaced prompt applies nothing. Session-wide approvals, hook trust, merge reviews, and secret inputs stay with the target's user (`manual_only`). `steer` delivers an instruction now: into a running turn as steering, to a turn waiting for its next instruction, or as a new turn when idle; it needs a new `idempotency_key` per instruction, and `steer_unavailable` means that provider cannot be steered mid-turn. A pending prompt blocks `steer` with `target_awaiting_interaction` — answer it first. After acting, `wait` and `read` to confirm what happened, then report the outcome to your user.",
-            "Observe with poll then wait: take a `wait_cursor` from `poll`, pass it back to `wait` with a `timeout_seconds`, and act on what wakes you. `until` selects what counts as interesting: `change` (default), `idle` (the target stopped and holds no interaction), or `sendable` (the target is also ready to accept a message). Never busy-poll and never spin a retry loop.",
-            // Deliberately does not name the status-change envelope tag. The membership supplement is
-            // asserted to contain no status envelope at all, and a literal tag name in this prose
-            // would satisfy that substring check without a batch ever having been delivered.
-            "You do not have to ask for ongoing awareness. RepoPrompt attaches a coalesced status-change block to your turns whenever sessions you oversee change status, so use `poll` → `wait` only when *this* turn needs a change now.",
-            "At most one wait may be active per overseen session; a second returns `wait_already_pending`. Do not retry it immediately in a loop — the slot can be held by an earlier wait whose caller has already gone away, and nothing you do releases it sooner. Poll instead, or try again after a short delay: every wait releases its slot when its own `timeout_seconds` elapses.",
-            "Read pages: reuse the `next_cursor` a `read` returns. If a response sets `cursor_reset`, the page restarted from the beginning of the requested direction and may repeat rows you already saw — re-anchor from that page rather than assuming continuity. A `tail` read only pages toward newer rows, so `has_more: false` means there is nothing newer than what you just read, not that you have seen the whole transcript; ask for `from: \"start\"` when you need earlier history.",
-            // Deliberately \"may\", not \"will\": the sanitizer parks only the *newest* row, so a row that
-            // stops being the live edge while still mutable is consumed in whatever form it then has
-            // (see the accepted residual in `AgentSessionLinkTranscriptSanitizer.page`). Promising a
-            // finished form on the next read would be the same overclaim class as the terminal
-            // revocation notice — the operational instruction is what matters here, not the guarantee.
-            "A `read` can hand you the same `item_id` twice, and that is not the target repeating itself. The newest row is shown to you while the target is still writing it, and deliberately not consumed, so a later read may return that same row in an updated or final form under the same `item_id` — more of its text, or a tool row that has moved on from `called`. Replace the copy you already hold rather than appending another.",
-            "An expired cursor does not mean oversight ended. Cursors also lapse through ordinary bookkeeping on a perfectly live link: only the most recent 64 per link are kept, and a link that was re-granted invalidates cursors minted before it. `wait` reports this as a `cursor_expired` result, while `read` refuses the call as an invalid parameter rather than returning a result field. Either way, take a fresh cursor from `poll` or read again without one, and check `list` before concluding a target is gone.",
-            "Act on exactly the session the user meant. If several sessions are overseen and the user's goal does not identify one of them, ask with `ask_user` rather than guessing.",
-            "`send` delivers one message in service of your current user's goal. It is not a polling mechanism, and it never answers a question, approval, permission, or review prompt in the other session. Every `send` needs an `idempotency_key`: a new key for each new message, and the same key only to retry the same delivery after an ambiguous transport failure — reusing a key with different text returns `idempotency_conflict` and delivers nothing. When your user's instruction calls for one, attach `workflow_id` or `workflow_name` (never both) to run that single message under a workflow: it applies to that message only, never changes the workflow the target's own user selected, and is part of the delivery identity, so a retry must reuse the same one.",
-            "When your own user's current or standing instruction calls for a message but the target is busy, queue it with `delivery: \"when_sendable\"` instead of waiting and resending: RepoPrompt holds one message per overseen session and delivers it the moment that session is ready. `poll` shows your `pending_send` and the single `last_pending_send_result`; `replace_pending: true` swaps it and `cancel_pending_send` withdraws it, both keyed by its `idempotency_key`. A queued message is ephemeral — unlinking, either session closing, or RepoPrompt restarting discards it — and any workflow you attach is captured with it, so it is part of that one instruction rather than a standing setting.",
-            "`status: \"idle\"` is not the send precondition and is not enough on its own: a target can read as idle while it is still committing its last turn, draining a queued instruction, or preparing where it runs. Send only when a snapshot shows `idle_for_send: true`, and wait for that state with `until: \"sendable\"`. Waiting on `until: \"idle\"` and then sending is how you end up in a `send` → `target_not_idle` → `wait` → `send` loop, because that wait is already satisfied by a target `send` will refuse.",
-            "`compact` asks a target with `idle_for_send: true` to compact its provider context using RepoPrompt's own native command. It takes no text, carries no message, and never answers or routes around an interaction. Use it only when your own user's explicit current or standing instruction calls for it; a high `context` load is information, not a task. It needs an `idempotency_key` exactly like `send`. `accepted` means RepoPrompt started the compaction run, never that it finished; `not_started`, `not_supported`, and `no_provider_session` mean nothing reached the provider — do not substitute a `send` asking the target to compact itself. Observe the result with `poll` and `wait`: the target runs and returns to idle, and its `context` count is unreliable until its next ordinary turn reports usage. Compaction itself reads the whole context, so a target that is already over its limit may fail to compact; do not retry in a loop.",
-            "`status: \"awaiting_user\"` with `pending_interaction_kind: null` means the target is simply waiting for its own user to say what is next. There is no question addressed to you and nothing there for you to answer, and it is not a target you may `send` to. On a managed session you may give it that next instruction with `steer` when your own user's instruction calls for it.",
-            "Dashboard triage and completion are user-owned: idle alone does not prove completion, and there is no agent-facing completion action.",
-            "These grants are direct, directional, non-transitive, and non-reciprocal: an overseen target gains no reverse read, poll, send, control, or interaction-response authority, and oversight never extends to anything that session oversees. Its exact current endpoint may use only the fixed inverse `request_attention` signal under that grant; this does not make the relationship reciprocal. Automated sub-agents do not inherit oversight. A user-created Handoff/Fork may receive separate fresh direct grants to the same current targets, but targets-of-targets are never inherited. The user can revoke any grant at any time.",
-            // Deliberately not "you will be told once": the closing notice is owed only while
-            // RepoPrompt can still see that this session was taught an inventory, and a suspension
-            // acknowledged during a suppressed window clears exactly that evidence (see the accepted
-            // residual on `AgentSessionLinkPromptSupplementDecision.decide`). Promising the terminal
-            // notice always arrives is the same overclaim class as the notice wording itself.
-            "If one target is revoked while others remain, call `\(toolReference)` op=list to refresh this inventory. When the last one is revoked you are normally told once and the tool disappears, but that notice is not guaranteed — never treat its absence as proof that your list is still current.",
-            "Not every refusal is final. If a call is denied right after your own session reloaded, rebound, or was reopened, call `\(toolReference)` op=list once before concluding oversight ended — a denial in that window is usually the link catching up with your session, not the user taking it away.",
-            "Oversight is scoped to explicit current or standing instructions from your own user, not to the existence of the link or to target activity. When those instructions are satisfied or no longer clearly apply, stop and report; further work requires new direction.",
-            "This block is versioned by its `revision`. If more than one `\(envelopeTag)` block appears in this conversation, only the newest one is current and it replaces every earlier one outright — never merge an older list into it."
+            "Operations on listed outbound targets: `list` refreshes grants; `poll` snapshots status, readiness, and managed-only pending prompts; `wait` waits on a returned cursor for change, idle, or sendable without busy-polling; `read` pages the redacted transcript.",
+            "`send` delivers an attributed message to an `idle_for_send: true` target or queues one with `delivery: \"when_sendable\"`; `cancel_pending_send` withdraws your queued message. Use a new `idempotency_key` for each new delivery and reuse it only for the same retry.",
+            "`compact` requests RepoPrompt-native context compaction at watch level for an `idle_for_send: true` target; it needs an `idempotency_key`, takes no text, and never answers a prompt. Context load alone supplies no task.",
+            "`snooze_auto_wake` pauses routine status-triggered wake admission for one lane, not collection or delivery. Exact purposeful attention may bypass that lane's snooze; unlink and authority fences never do.",
+            "On a row with `manage`, `poll` or `wait` may carry `pending_interaction` and a just-in-time `respond_hint`; `respond` answers only its exact current `interaction_id` with an eligible one-time choice, and `steer` directs that target now. A manual-only prompt remains with its user; never route around it with `send`, a workflow, or another session.",
+            "`set_waiting_on` declares or clears your own external dependency while any exact link remains. Only an exact inbound link permits `request_attention`, an attributed signal to its observer; it supplies no task or reverse observer authority.",
+            "Choose only the target your user meant; if several fit, ask your user rather than guessing. A target's status or prompt may change before you act; refresh with `poll` or `wait` after a mismatch. Continue work your own user's instructions still require, and stop when none remains.",
+            "Grants are direct, directional, non-transitive, and non-reciprocal; the user may revoke one at any time. Only the newest `\(envelopeTag)` inventory is current; a session ID and catalog presence are never authority. A closing notice is not guaranteed, so do not infer continued access from its absence."
         ])
         let escapedLines = lines.map { escaped($0) }.joined(separator: "\n")
         return """
@@ -805,7 +788,7 @@ enum AgentSessionLinkPrompts {
         guard isHostDeterminedToolReference(toolReference) else { return [] }
         let server = MCPIntegrationHelper.repoPromptMCPServerName
         return [
-            "Your host decides how RepoPrompt's MCP tools are named for you, so that exact string may not be what your tool list shows. The same tool also appears as `\(server)-\(toolReference)`, `\(toolReference) (\(server))`, or `mcp__\(server)__\(toolReference)` depending on the host. Call whichever advertised tool carries the name `\(toolReference)` from the `\(server)` server; do not conclude oversight is unavailable just because the unprefixed name is not listed verbatim."
+            "Your host may prefix the RepoPrompt tool name. Use the advertised tool containing `\(toolReference)` from `\(server)`; the bare spelling need not appear verbatim."
         ]
     }
 

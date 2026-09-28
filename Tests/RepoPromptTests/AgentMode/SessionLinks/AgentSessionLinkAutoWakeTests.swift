@@ -212,6 +212,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 displayAttribution: passive.displayAttribution
             ),
             laneGuidanceMode: first.laneGuidanceMode,
+            inventoryGuidanceRevision: first.inventoryGuidanceRevision,
             fragment: first.fragment
         )
         store.accept(priorRevisionClaim)
