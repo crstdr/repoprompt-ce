@@ -653,6 +653,38 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    func testCreateLaneServiceReplaysReceiptAndRejectsConflictingDigest() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lane-service-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        fixture.bridge.installIntentStore(AgentSessionOversightIntentStore(
+            fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+            backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
+            mode: .enabled
+        ))
+        let args: [String: Value] = [
+            "op": .string("create_lane"),
+            "idempotency_key": .string("service-replay-1"),
+            "session_name": .string("Service lane")
+        ]
+
+        let first = try await Self.executeObject(fixture.service, args: args)
+        let replay = try await Self.executeObject(fixture.service, args: args)
+        XCTAssertEqual(first["result"], .string("created"))
+        XCTAssertEqual(replay["session_id"], first["session_id"])
+        XCTAssertEqual(replay["duplicate"], .bool(true))
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+
+        var conflictArgs = args
+        conflictArgs["session_name"] = .string("Different lane")
+        let conflict = try await Self.executeObject(fixture.service, args: conflictArgs)
+        XCTAssertEqual(conflict["result"], .string("idempotency_conflict"))
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+    }
+
     func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
@@ -2531,6 +2563,46 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     private final class ReadReleaseHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
         var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
+        private(set) var laneCreationCount = 0
+
+        func agentSessionLinkCreateLane(
+            destinationWindowID: Int,
+            workspaceID: UUID,
+            creatorSessionID: UUID,
+            sessionName: String?,
+            selection _: AgentSessionLanePolicy.RoleSelection
+        ) async throws -> AgentSessionLaneHostCreationOutcome {
+            laneCreationCount += 1
+            var lane = AgentSessionLinkEndpointCandidate(
+                windowID: destinationWindowID,
+                workspaceID: workspaceID,
+                tabID: UUID(),
+                sessionID: UUID(),
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: 1,
+                isTopLevel: true,
+                hasLoadedPersistedState: true,
+                bindingTransitionInProgress: false,
+                isClosing: false,
+                isMCPControlled: false,
+                isMCPOriginated: false,
+                roleAllowsOutboundMonitoring: true,
+                displayName: sessionName ?? "Lane",
+                providerDisplayName: "Codex CLI",
+                locationLabel: "worktree/main"
+            )
+            let token = AgentSessionRestorationBindingToken(
+                bindingIdentity: AgentPersistentSessionBindingIdentity(
+                    tabID: lane.tabID, sessionID: lane.sessionID,
+                    generation: lane.persistentBindingGeneration!
+                ),
+                bindingTransitionGeneration: lane.bindingTransitionGeneration
+            )
+            lane.restorationReadiness = .authoritative(token, .freshBindingDurablyCreated)
+            candidates.append(lane)
+            laneCreatorByEndpoint[lane.domainEndpoint] = creatorSessionID
+            return .created(sessionID: lane.sessionID, tabID: lane.tabID)
+        }
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
         var waitingOn: DomainAgentSessionWaitingOn?
         var publishedPromptInventories:

@@ -983,6 +983,9 @@ final class AgentSessionLinkRuntimeBridge {
         /// transaction, but before its final live-candidate checks and activation.
         var test_afterReservationBeforeActivation:
             (@MainActor (AgentSessionOversightIntent) async -> Void)?
+        /// Pauses retirement after its relationship snapshot but before the target fence and Stop.
+        /// Tests use this to commit a replacement generation or deletion at that exact cutoff.
+        var test_afterRetireRelationshipPrecheck: (@MainActor () async -> Void)?
         /// Signals that an Add is waiting behind another complete establishment for the same
         /// semantic UUID pair. Tests use it instead of timing assumptions.
         var test_beforePairEstablishmentWait:
@@ -6580,6 +6583,9 @@ final class AgentSessionLinkRuntimeBridge {
               outbound.items.isEmpty,
               pendingSendsByReference[target.lease.reference] == nil
         else { return .notRetired(sessionID: targetSessionID, reason: .laneInUse) }
+        #if DEBUG
+            await test_afterRetireRelationshipPrecheck?()
+        #endif
         guard !isFrozenForTermination, !retiringTargets.contains(endpoint) else {
             return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
         }

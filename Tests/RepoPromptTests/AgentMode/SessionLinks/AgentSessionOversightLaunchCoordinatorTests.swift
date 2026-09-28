@@ -25,6 +25,12 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         var discovery: [AgentSessionLinkDiscoveryState] = []
         var topology: AgentSessionOversightRestoreTopologyState = .completeAllEntriesConsumed
         private(set) var publishedPresentations: [AgentSessionOversightPersistencePresentation] = []
+        var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
+        private(set) var providerTaskRequests = 0
+
+        func agentSessionLinkLaneProvenance(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> UUID? {
+            laneCreatorByEndpoint[endpoint]
+        }
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
             candidateCallCount += 1
@@ -129,7 +135,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             liveness _: @escaping AgentSessionLinkSendLivenessProbe,
             commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
         ) async -> AgentSessionLinkSendTransactionOutcome {
-            .blocked(.shuttingDown)
+            providerTaskRequests += 1
+            return .blocked(.shuttingDown)
         }
 
         func agentSessionLinkPerformCompact(
@@ -301,6 +308,28 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     }
 
     // MARK: - Barriers
+
+    func testCreatorLaneRestoresAsOrdinaryManagedLinkWithoutStartingAProviderTask() async throws {
+        try seedSavedPair()
+        let originalFile = try Data(contentsOf: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename))
+        let fixture = makeFixture()
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let lane = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        fixture.host.candidates = [observer, lane]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: lane)]
+        fixture.host.laneCreatorByEndpoint[lane.domainEndpoint] = observerSessionID
+
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+
+        let inventory = await fixture.authority.links(forObserverEndpoint: observer.domainEndpoint)
+        XCTAssertEqual(inventory.items.map(\.targetSessionID), [targetSessionID])
+        XCTAssertEqual(inventory.items.first?.capabilities, DomainAgentSessionLinkCapability.managed)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
+        XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+        XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename)), originalFile)
+    }
 
     func testNothingIsReservedWhileTheRestoreTopologyIsStillPending() async throws {
         try seedSavedPair()
