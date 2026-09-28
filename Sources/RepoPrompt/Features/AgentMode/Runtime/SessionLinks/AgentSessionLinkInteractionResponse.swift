@@ -1,8 +1,9 @@
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 
 // Value types for a managing observer inspecting and explicitly answering its target's current
-// pending interaction through `agent_session_link` `get_interaction` and `respond`.
+// pending interaction through managed `agent_session_link` `poll`/`wait` and `respond`.
 //
 // Authority is layered and every layer is required:
 // 1. the exact outbound grant carrying the user's `.manage` delegation (a management lease from
@@ -30,6 +31,8 @@ enum AgentSessionLinkInteractionManualOnlyReason: String, Equatable {
     case persistentDecision = "persistent_decision"
     /// An ACP provider offered no genuine one-time allow option for this request.
     case noOneTimeAllowOption = "no_one_time_allow_option"
+    /// The redacted interaction exceeds the hard single-target prompt disclosure limit.
+    case tooLarge = "too_large"
 }
 
 /// What the observer sees for one target's current pending interaction.
@@ -41,6 +44,31 @@ struct AgentSessionLinkPendingInteractionInspection: Equatable {
     let manualOnlyReason: AgentSessionLinkInteractionManualOnlyReason?
 
     static let none = AgentSessionLinkPendingInteractionInspection(interaction: nil, manualOnlyReason: nil)
+    static let promptMaxBytes = 64 * 1024
+    static let instructionWaitNote =
+        "The session is waiting for its next instruction rather than asking a question. Give it that instruction with steer."
+
+    /// The exact object measured for the hard disclosure cap and, if it fits, emitted on the wire.
+    func projectedObject() -> [String: Value]? {
+        guard let interaction else { return nil }
+        var object = interaction.asObject()
+        object["interaction_id"] = .string(interaction.id.uuidString)
+        object["respondable"] = .bool(manualOnlyReason == nil)
+        object["manual_only_reason"] = manualOnlyReason.map { .string($0.rawValue) } ?? .null
+        if manualOnlyReason != nil {
+            object["options"] = .array([])
+        }
+        if manualOnlyReason == .instructionPrompt {
+            object["note"] = .string(Self.instructionWaitNote)
+        }
+        return object
+    }
+
+    var exceedsPromptLimit: Bool {
+        guard let object = projectedObject() else { return false }
+        guard let bytes = try? JSONEncoder().encode(Value.object(object)).count else { return true }
+        return bytes > Self.promptMaxBytes
+    }
 }
 
 /// One explicit answer an observer asked RepoPrompt to submit on the target's behalf.

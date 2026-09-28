@@ -31,9 +31,6 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     /// about the overseen session is read, written, resumed, or notified. The authority it needs is
     /// therefore the plain read grant the observer already holds over that lane.
     case monitorSnoozeAutoWake = "agent_session_link.snooze_auto_wake"
-    /// Inspects the target's current pending prompt payload. Management-only: prompt text, commands,
-    /// and paths are more than a watch grant discloses.
-    case monitorGetInteraction = "agent_session_link.get_interaction"
     /// Answers the target's exact current pending prompt on the user's behalf.
     case monitorRespond = "agent_session_link.respond"
     /// Steers the target: injects an instruction into its active run or starts its next turn.
@@ -60,7 +57,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
              .manageResume, .manageStop, .manageCleanup:
             .sessionControl
         case .monitorList, .monitorPoll, .monitorWait, .monitorRead, .monitorSend,
-             .monitorSnoozeAutoWake, .monitorGetInteraction, .monitorRespond, .monitorSteer, .monitorCompact:
+             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorCompact:
             .monitor
         }
     }
@@ -72,7 +69,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
         case .monitorList:
             true
         case .monitorPoll, .monitorWait, .monitorRead, .monitorSend,
-             .monitorSnoozeAutoWake, .monitorGetInteraction, .monitorRespond, .monitorSteer, .monitorCompact,
+             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorCompact,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
              .manageList, .manageGetLog, .manageExtractHandoff,
              .manageResume, .manageStop, .manageCleanup:
@@ -94,7 +91,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
             .read
         case .monitorSend, .monitorCompact:
             .sendWhenIdle
-        case .monitorGetInteraction, .monitorRespond, .monitorSteer:
+        case .monitorRespond, .monitorSteer:
             .manage
         case .monitorList,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
@@ -112,7 +109,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
             true
         case .runPoll, .runWait, .manageList, .manageGetLog, .manageExtractHandoff,
              .monitorList, .monitorPoll, .monitorWait, .monitorRead,
-             .monitorSnoozeAutoWake, .monitorGetInteraction:
+             .monitorSnoozeAutoWake:
             false
         }
     }

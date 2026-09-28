@@ -151,9 +151,6 @@ struct AgentSessionLinkMCPToolService {
         case "request_attention":
             try validateAllowedKeys(args, op: op, allowed: Self.requestAttentionKeys)
             return try await executeRequestAttention(args: args)
-        case "get_interaction":
-            try validateAllowedKeys(args, op: op, allowed: Self.getInteractionKeys)
-            return try await executeGetInteraction(args: args)
         case "respond":
             try validateAllowedKeys(args, op: op, allowed: Self.respondKeys)
             return try await executeRespond(args: args)
@@ -162,7 +159,8 @@ struct AgentSessionLinkMCPToolService {
             return try await executeSteer(args: args)
         default:
             throw MCPError.invalidParams(
-                "Unsupported agent_session_link op '\(op)'. \(Self.supportedOperationsSentence)"
+                "Unsupported agent_session_link op '\(op)'. \(Self.supportedOperationsSentence) "
+                    + "For a pending prompt, use poll or wait on the exact target, then respond with its interaction_id."
             )
         }
     }
@@ -171,7 +169,7 @@ struct AgentSessionLinkMCPToolService {
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
         "Use list, poll, wait, read, send, cancel_pending_send, compact, set_waiting_on, snooze_auto_wake, "
-            + "request_attention, get_interaction, respond, or steer."
+            + "request_attention, respond, or steer."
 
     private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
         let endpoint = try await resolveCallerEndpointIdentity()
@@ -244,7 +242,7 @@ struct AgentSessionLinkMCPToolService {
         }
     }
 
-    // MARK: - get_interaction / respond / steer (management)
+    // MARK: - respond / steer (management)
 
     /// Authorization for one management operation.
     private enum ManagedAuthorization {
@@ -274,38 +272,6 @@ struct AgentSessionLinkMCPToolService {
         }
     }
 
-    /// Read-only inspection of one target's current pending interaction.
-    ///
-    /// Management-only: prompt text, commands, and paths are more than a watch grant discloses, so a
-    /// watch-only link reports `management_not_granted` and no payload. `poll` still reports the
-    /// interaction kind on every link.
-    private func executeGetInteraction(args: [String: Value]) async throws -> Value {
-        let observerEndpoint = try await resolveCallerEndpointIdentity()
-        let targetSessionID = try Self.parseSingleSessionID(args["session_id"], op: "get_interaction")
-        let target: AgentSessionLinkRuntimeBridge.AuthorizedTarget
-        switch try await authorizeManaged(
-            operation: .monitorGetInteraction,
-            observerEndpoint: observerEndpoint,
-            targetSessionID: targetSessionID
-        ) {
-        case let .authorized(value):
-            target = value
-        case .managementNotGranted:
-            return AgentSessionLinkResponseRenderer.managementNotGrantedValue(targetSessionID: targetSessionID)
-        }
-        switch bridge.pendingInteraction(target: target) {
-        case let .inspected(inspection):
-            return AgentSessionLinkResponseRenderer.interactionValue(
-                inspection,
-                targetSessionID: targetSessionID
-            )
-        case .denied, .responded:
-            throw Self.denialError(targetSessionID: targetSessionID)
-        case .shuttingDown:
-            throw MCPError.internalError("RepoPrompt is shutting down.")
-        }
-    }
-
     /// Submits one explicit answer to the target's exact current interaction on the user's behalf.
     ///
     /// Authorized by the management lease, then re-proven inside the authority as the final
@@ -318,7 +284,7 @@ struct AgentSessionLinkMCPToolService {
               let interactionID = UUID(uuidString: rawInteractionID)
         else {
             throw MCPError.invalidParams(
-                "agent_session_link respond requires the canonical interaction_id from get_interaction."
+                "agent_session_link respond requires the canonical interaction_id from a fresh poll or wait."
             )
         }
         let payload = try AgentRunMCPToolService.parseResponsePayload(args: args)
@@ -589,6 +555,12 @@ struct AgentSessionLinkMCPToolService {
             }
         }
 
+        guard let inspections = await bridge.pendingInteractionsForObservation(
+            leases: targets.map(\.lease)
+        ) else {
+            throw Self.denialError(targetSessionID: request.isSingle ? request.sessionIDs.first : nil)
+        }
+
         if request.isSingle, let state = states.first {
             var payload: [String: Value] = [
                 "notice": .string(Self.untrustedContentNotice),
@@ -603,9 +575,11 @@ struct AgentSessionLinkMCPToolService {
                 pendingSends[state.sessionID] ?? .empty,
                 targetSessionID: state.sessionID
             )) { _, new in new }
-            return .object(payload)
+            return AgentSessionLinkResponseRenderer.addPendingInteractions(
+                to: .object(payload), inspections: inspections, isSingle: true
+            )
         }
-        return .object([
+        return AgentSessionLinkResponseRenderer.addPendingInteractions(to: .object([
             "notice": .string(Self.untrustedContentNotice),
             "targets": .array(states.map { state in
                 AgentSessionLinkResponseRenderer.pollTargetEntryValue(
@@ -615,7 +589,7 @@ struct AgentSessionLinkMCPToolService {
                     managed: managed[state.sessionID] ?? false
                 )
             })
-        ])
+        ]), inspections: inspections, isSingle: false)
     }
 
     // MARK: - wait
@@ -659,9 +633,16 @@ struct AgentSessionLinkMCPToolService {
             // Read after the wait resumes, so a queued send that drained while this call was parked
             // reports its terminal outcome rather than the pending entry it had on entry.
             let pendingSends = await bridge.pendingSendProjections(for: leases)
-            return AgentSessionLinkResponseRenderer.waitValue(
-                waitResult,
-                pendingSends: pendingSends,
+            guard let inspections = await bridge.pendingInteractionsForObservation(leases: leases) else {
+                throw Self.denialError(targetSessionID: isSingle ? leases.first?.target.sessionID : nil)
+            }
+            return AgentSessionLinkResponseRenderer.addPendingInteractions(
+                to: AgentSessionLinkResponseRenderer.waitValue(
+                    waitResult,
+                    pendingSends: pendingSends,
+                    isSingle: isSingle
+                ),
+                inspections: inspections,
                 isSingle: isSingle
             )
         }
@@ -1409,7 +1390,6 @@ struct AgentSessionLinkMCPToolService {
     /// are mutually exclusive, which this schema shape cannot express and the service enforces.
     static let snoozeAutoWakeKeys: Set<String> = ["op", "session_id", "duration_seconds", "clear"]
     static let requestAttentionKeys: Set<String> = ["op", "observer_session_id"]
-    static let getInteractionKeys: Set<String> = ["op", "session_id"]
     /// The same answer fields `agent_run respond` accepts, minus `amendment` and workflow selection:
     /// an observer may not amend exec policy or start a workflow on another session's behalf.
     static let respondKeys: Set<String> = [
@@ -1427,7 +1407,7 @@ struct AgentSessionLinkMCPToolService {
     ///
     /// It is deliberately identical whether the UUID is unknown, belongs to an unrelated live
     /// session, or names a link that was just revoked, so a caller cannot probe for existence.
-    static func denialError(targetSessionID: UUID?) -> MCPError {
+    nonisolated static func denialError(targetSessionID: UUID?) -> MCPError {
         guard let targetSessionID else {
             return MCPError.invalidParams("No active session link for one or more requested sessions.")
         }
@@ -1499,7 +1479,7 @@ struct AgentSessionLinkMCPToolService {
 /// executor resumes it, and so response shapes can be asserted without a window.
 enum AgentSessionLinkResponseRenderer {
     static let managementNotGrantedMessage =
-        "Your user has not granted you management of this session, so you may observe it and send messages when it is idle, but not inspect or answer its prompts or steer it. Leave its prompts for its own user, or ask your user to turn on Manage for this session in the Oversee dashboard."
+        "Your user has not granted you management of this session, so you may observe it and send messages when it is idle, but not inspect or answer its prompts or steer it. Leave its prompts for its own user; a newly added oversight link includes Manage."
 
     static func managementNotGrantedValue(targetSessionID: UUID) -> Value {
         .object([
@@ -1511,33 +1491,75 @@ enum AgentSessionLinkResponseRenderer {
         ])
     }
 
-    static let instructionWaitNote =
-        "The session is waiting for its next instruction rather than asking a question. Give it that instruction with steer."
+    static let instructionWaitNote = AgentSessionLinkPendingInteractionInspection.instructionWaitNote
+    static let respondHint =
+        "Use respond with this exact interaction_id and only a one-time allowed choice. Manual-only prompts belong to the target's user. If respond reports a mismatch, refresh with poll or wait; never auto-retry an approval."
+    static let pendingInteractionOmittedHint =
+        "Poll this session alone to inspect its pending interaction."
+    static let multiPromptMaxBytes = 20 * 1024
 
-    static func interactionValue(
-        _ inspection: AgentSessionLinkPendingInteractionInspection,
-        targetSessionID: UUID
+    /// Attach current, managed-only prompt bodies beside snapshots, never inside passive/domain
+    /// snapshots. A large single prompt has an ID-only refusal; a multi-target result omits whole
+    /// objects past its aggregate budget rather than truncating text or answer options.
+    static func addPendingInteractions(
+        to value: Value,
+        inspections: [UUID: AgentSessionLinkPendingInteractionInspection],
+        isSingle: Bool
     ) -> Value {
-        var payload: [String: Value] = [
-            "session_id": .string(targetSessionID.uuidString),
-            "notice": .string(AgentSessionLinkMCPToolService.untrustedContentNotice)
-        ]
-        guard let interaction = inspection.interaction else {
-            payload["result"] = .string("no_pending_interaction")
-            payload["managed"] = .bool(true)
-            payload["interaction"] = .null
-            payload["respondable"] = .bool(false)
+        guard case var .object(payload) = value else { return value }
+        if isSingle {
+            let sessionID = payload["session_id"]?.stringValue
+                ?? payload["snapshot"]?.objectValue?["session_id"]?.stringValue
+            if let sessionID, let id = UUID(uuidString: sessionID),
+               let inspection = inspections[id],
+               let pending = pendingInteractionValue(inspection)
+            {
+                payload["pending_interaction"] = pending
+                payload["respond_hint"] = .string(respondHint)
+            }
             return .object(payload)
         }
-        payload["result"] = .string("pending")
-        payload["managed"] = .bool(true)
-        payload["interaction"] = .object(interaction.asObject())
-        payload["respondable"] = .bool(inspection.manualOnlyReason == nil)
-        payload["manual_only_reason"] = inspection.manualOnlyReason.map { .string($0.rawValue) } ?? .null
-        if inspection.manualOnlyReason == .instructionPrompt {
-            payload["note"] = .string(instructionWaitNote)
-        }
+        guard let entries = payload["targets"]?.arrayValue else { return .object(payload) }
+        var remaining = multiPromptMaxBytes
+        payload["targets"] = .array(entries.map { entry in
+            guard case var .object(row) = entry,
+                  let rawID = row["session_id"]?.stringValue,
+                  let id = UUID(uuidString: rawID),
+                  let inspection = inspections[id],
+                  let pending = pendingInteractionValue(inspection)
+            else { return entry }
+            let bytes = encodedByteCount(pending) + respondHint.utf8.count
+            if bytes <= remaining {
+                row["pending_interaction"] = pending
+                row["respond_hint"] = .string(respondHint)
+                remaining -= bytes
+            } else {
+                row["pending_interaction_omitted"] = .bool(true)
+                row["pending_interaction_hint"] = .string(pendingInteractionOmittedHint)
+            }
+            return .object(row)
+        })
         return .object(payload)
+    }
+
+    static func pendingInteractionValue(_ inspection: AgentSessionLinkPendingInteractionInspection) -> Value? {
+        guard let interaction = inspection.interaction,
+              let object = inspection.projectedObject()
+        else { return nil }
+        let full = Value.object(object)
+        guard !inspection.exceedsPromptLimit else {
+            return .object([
+                "interaction_id": .string(interaction.id.uuidString),
+                "kind": .string(interaction.kind.rawValue),
+                "respondable": .bool(false),
+                "manual_only_reason": .string("too_large")
+            ])
+        }
+        return full
+    }
+
+    private static func encodedByteCount(_ value: Value) -> Int {
+        (try? JSONEncoder().encode(value).count) ?? Int.max
     }
 
     /// Every non-submitted result states `applied: false`, so a caller never has to infer it.

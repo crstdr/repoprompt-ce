@@ -645,12 +645,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         let authorized = try await authorizedTarget(
             fixture.bridge,
-            operation: .monitorGetInteraction,
+            operation: .monitorPoll,
             observer: fixture.observer,
             target: fixture.target
         )
-        XCTAssertEqual(authorized.lease.capability, .manage)
-        XCTAssertEqual(fixture.bridge.pendingInteraction(target: authorized), .inspected(.none))
+        XCTAssertEqual(authorized.lease.capability, .poll)
+        let inspections = await fixture.bridge.pendingInteractionsForObservation(leases: [authorized.lease])
+        XCTAssertEqual(inspections?[fixture.target.sessionID], AgentSessionLinkPendingInteractionInspection.none)
         let granted = await fixture.bridge.managementIsGranted(for: authorized.lease)
         XCTAssertTrue(granted)
         let inventory = try XCTUnwrap(fixture.host.publishedPromptInventories[fixture.observer.sessionID])
@@ -744,11 +745,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         session.pendingApproval = approval
         let readTarget = try await authorizedTarget(
             bridge,
-            operation: .monitorGetInteraction,
+            operation: .monitorPoll,
             observer: observer,
             target: target
         )
-        guard case let .inspected(inspection) = bridge.pendingInteraction(target: readTarget),
+        guard let inspections = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease]),
+              let inspection = inspections[target.sessionID],
               let interaction = inspection.interaction
         else { return XCTFail("Expected the pending approval to be visible on the managed link") }
         XCTAssertEqual(interaction.id, approval.id)
@@ -902,11 +904,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         let readTarget = try await authorizedTarget(
             bridge,
-            operation: .monitorGetInteraction,
+            operation: .monitorPoll,
             observer: observer,
             target: target
         )
-        guard case let .inspected(inspection) = bridge.pendingInteraction(target: readTarget),
+        guard let inspections = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease]),
+              let inspection = inspections[target.sessionID],
               let visible = inspection.interaction
         else { return XCTFail("Expected the pending question to be visible") }
         XCTAssertEqual(visible.kind, .question)
@@ -949,6 +952,26 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             details: []
         )
         XCTAssertEqual(viewModel.overseerManualOnlyReason(for: hook, session: session), .hookApproval)
+        let instruction = AgentRunMCPSnapshot.Interaction(
+            id: UUID(), kind: .instruction, responseType: .text, title: nil, prompt: nil,
+            context: nil, allowsMultiple: nil, options: [], fields: [], details: []
+        )
+        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: instruction, session: session), .instructionPrompt)
+        let acpApproval = AgentApprovalRequest(
+            requestID: .acp("request-1"), method: "session/request_permission", kind: .commandExecution,
+            threadID: "session", turnID: "turn", itemID: "tool",
+            overseerOneTimeAllowAvailable: false
+        )
+        session.pendingApproval = acpApproval
+        let acpInteraction = AgentRunMCPSnapshot.Interaction(
+            id: acpApproval.id, kind: .approval, responseType: .decision, title: nil, prompt: nil,
+            context: nil, allowsMultiple: nil, options: [], fields: [], details: []
+        )
+        XCTAssertEqual(
+            viewModel.overseerManualOnlyReason(for: acpInteraction, session: session),
+            .noOneTimeAllowOption
+        )
+        session.pendingApproval = nil
     }
 
     private func pollState(

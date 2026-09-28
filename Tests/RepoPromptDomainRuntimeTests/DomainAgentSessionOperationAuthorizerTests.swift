@@ -150,7 +150,6 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             // lane and nothing stronger.
             .monitorSnoozeAutoWake: .poll,
             // Acting for the user in the target needs the user's explicit management delegation.
-            .monitorGetInteraction: .manage,
             .monitorRespond: .manage,
             .monitorSteer: .manage,
             // A compaction starts a provider turn on an idle target exactly as a send does, so it
@@ -336,7 +335,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
                 "agent_session_link.list", "agent_session_link.poll", "agent_session_link.wait",
                 "agent_session_link.read", "agent_session_link.send",
                 "agent_session_link.snooze_auto_wake",
-                "agent_session_link.get_interaction", "agent_session_link.respond",
+                "agent_session_link.respond",
                 "agent_session_link.steer", "agent_session_link.compact",
             ]
         )
@@ -359,12 +358,11 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .poll
         )
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorSnoozeAutoWake.family, .monitor)
-        // Management: inspection reads, answering and steering mutate, and none is observer-scoped.
-        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorGetInteraction.mutatesTarget)
+        // Management: answering and steering mutate, and neither is observer-scoped.
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorRespond.mutatesTarget)
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorSteer.mutatesTarget)
         for operation in [
-            DomainAgentSessionTargetOperation.monitorGetInteraction, .monitorRespond, .monitorSteer
+            DomainAgentSessionTargetOperation.monitorRespond, .monitorSteer
         ] {
             XCTAssertFalse(operation.isObserverScoped, operation.rawValue)
             XCTAssertEqual(operation.requiredMonitorCapability, .manage, operation.rawValue)

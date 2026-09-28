@@ -40,7 +40,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             [
                 "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact",
                 "set_waiting_on", "snooze_auto_wake", "request_attention",
-                "get_interaction", "respond", "steer"
+                "respond", "steer"
             ]
         )
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
@@ -118,7 +118,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     func testManagementOperationsAreAdmittedAndAdvertisedWithTheirManageGate() throws {
-        for operation in ["get_interaction", "respond", "steer"] {
+        for operation in ["respond", "steer"] {
             XCTAssertEqual(
                 MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(operation)),
                 MCPDomainToolOperationIdentity(canonicalTool: toolName, normalizedOperation: operation)
@@ -142,14 +142,20 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let operations = try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue)
             .compactMap(\.stringValue)
         XCTAssertTrue(operations.contains("steer"))
+        XCTAssertFalse(operations.contains("get_interaction"))
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value("get_interaction"))
+                .normalizedOperation,
+            MCPDomainToolOperationIdentity.unknownOperation
+        )
         XCTAssertFalse(definition.description.contains("capability_notice"))
         XCTAssertFalse(definition.description.contains("capabilities_changed"))
         for invariant in [
-            "`get_interaction`, `respond`, and `steer` require the `manage` capability",
+            "`respond` and `steer` require the `manage` capability",
             "New oversight links include it by default",
             "an existing live link keeps the capabilities its current grant actually has",
             "each result’s `managed` field report that grant",
-            "Without `manage` it returns `management_not_granted` and no payload",
+            "managed-only redacted `pending_interaction` when present",
             "exactly the current `interaction_id`",
             "`accept` (this request only)",
             "return `manual_only`",
@@ -1012,7 +1018,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     func testDescriptionDoesNotOverclaimTranscriptPrivacy() throws {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
         XCTAssertFalse(definition.description.contains("never exposes interaction IDs"))
-        XCTAssertTrue(definition.description.contains("Results other than `get_interaction` exclude interaction payloads"))
+        XCTAssertTrue(definition.description.contains("Only managed `poll`/`wait` results include observer-local redacted pending interactions"))
         XCTAssertTrue(definition.description.contains("transcript prose is redacted but may itself mention commands, paths, or details"))
     }
 

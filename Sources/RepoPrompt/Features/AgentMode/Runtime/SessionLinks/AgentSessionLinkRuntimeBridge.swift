@@ -4326,19 +4326,35 @@ final class AgentSessionLinkRuntimeBridge {
             && AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil
     }
 
-    /// Read-only inspection of the target's current pending interaction.
-    ///
-    /// `target` was authorized for `.monitorGetInteraction`, so its lease already proves the exact
-    /// grant carries management; a watch-only link never reaches here and never sees prompt text,
-    /// commands, or paths.
-    func pendingInteraction(target: AuthorizedTarget) -> AgentSessionLinkInteractionDisposition {
-        guard !isFrozenForTermination else { return .shuttingDown }
-        guard let host,
-              host.agentSessionLinkCandidates().contains(where: {
-                  $0.domainEndpoint == target.candidate.domainEndpoint
-              })
-        else { return .denied }
-        return .inspected(host.agentSessionLinkPendingInteraction(for: target.candidate))
+    /// Fresh observer-local prompt projection after the whole requested batch passes a final
+    /// authority and live-endpoint fence. A parked wait never trusts its pre-wait candidates or a
+    /// snapshot's coarse `hasPendingInteraction` bit. Watch-only leases get no prompt body.
+    func pendingInteractionsForObservation(
+        leases: [DomainAgentSessionLinkLease]
+    ) async -> [UUID: AgentSessionLinkPendingInteractionInspection]? {
+        guard !isFrozenForTermination, let host else { return nil }
+        for lease in leases {
+            guard await revalidateEndpoints(for: lease) != nil else { return nil }
+        }
+        guard let managedIDs = await authority.managedObservationTargetsIfValid(leases: leases),
+              !isFrozenForTermination
+        else { return nil }
+        let candidates = host.agentSessionLinkCandidates()
+        var inspections: [UUID: AgentSessionLinkPendingInteractionInspection] = [:]
+        for lease in leases {
+            guard let candidate = candidates.first(where: { $0.domainEndpoint == lease.target }),
+                  AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate) == nil,
+                  let observer = candidates.first(where: { $0.domainEndpoint == lease.observer }),
+                  AgentSessionLinkEndpointEligibility.observerOperationEligibility(
+                      observer.eligibilityInput,
+                      roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
+                  ) == .eligible
+            else { return nil }
+            if managedIDs.contains(lease.target.sessionID) {
+                inspections[lease.target.sessionID] = host.agentSessionLinkPendingInteraction(for: candidate)
+            }
+        }
+        return inspections
     }
 
     /// Submits one explicit observer answer to the target's exact current interaction.

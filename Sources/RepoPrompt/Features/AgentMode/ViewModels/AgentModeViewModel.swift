@@ -7006,7 +7006,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     /// Single source for the current pending interaction a remote responder may see: `agent_run`
-    /// snapshots and the oversight `get_interaction` projection both start from this value.
+    /// snapshots and the managed oversight `poll`/`wait` projection both start from this value.
     func mcpPendingInteraction(for session: TabSession) -> AgentRunMCPSnapshot.Interaction? {
         if let request = session.pendingCodexHookReview {
             return mcpCodexHookInteraction(

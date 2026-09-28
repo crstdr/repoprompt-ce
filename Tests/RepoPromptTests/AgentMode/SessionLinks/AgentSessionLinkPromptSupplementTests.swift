@@ -1100,7 +1100,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         )
         XCTAssertTrue(rendered.contains("including any refusal you gave based on older capabilities"))
         XCTAssertTrue(rendered.contains("you act for the user in that session"))
-        XCTAssertTrue(rendered.contains("A grant with `manage` also authorizes `get_interaction`"))
+        XCTAssertTrue(rendered.contains("A grant with `manage` also authorizes `poll`/`wait`"))
         XCTAssertTrue(rendered.contains("`respond` (answer exactly that prompt), and `steer` (direct the target now)"))
         XCTAssertTrue(rendered.contains("A pending prompt blocks `steer` with `target_awaiting_interaction`"))
         XCTAssertTrue(rendered.contains("then report the outcome to your user"))
@@ -1122,7 +1122,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
                 toolReference: "agent_session_link"
             )
             XCTAssertTrue(
-                rendered.contains("snooze_auto_wake, get_interaction, respond, or steer against a previously overseen session"),
+                rendered.contains("snooze_auto_wake, respond, or steer against a previously overseen session"),
                 "\(kind)"
             )
         }

@@ -855,6 +855,24 @@ package actor DomainAgentSessionLinkAuthority {
         return nil
     }
 
+    /// Atomically fences an observer-local batch before any pending prompt is projected. Every
+    /// watch lease must still be exact; only grants carrying Manage may disclose prompt bodies.
+    /// A revoked member denies the whole batch rather than releasing a sibling's prompt.
+    package func managedObservationTargetsIfValid(
+        leases: [DomainAgentSessionLinkLease]
+    ) -> Set<UUID>? {
+        var managed: Set<UUID> = []
+        for lease in leases {
+            guard validate(lease: lease) == nil,
+                  let record = links[lease.linkID]
+            else { return nil }
+            if record.grant.capabilities.contains(.manage) {
+                managed.insert(lease.target.sessionID)
+            }
+        }
+        return managed
+    }
+
     // MARK: - Target publication
 
     /// Applies one sanitized target snapshot under high-water semantics so a late task crossing the

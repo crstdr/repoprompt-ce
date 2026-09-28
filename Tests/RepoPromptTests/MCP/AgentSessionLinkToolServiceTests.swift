@@ -5,9 +5,8 @@ import RepoPromptDomainRuntime
 import XCTest
 
 /// Wire contract for `agent_session_link`: strict argument validation, opaque paging, and response
-/// shapes that never carry interaction identifiers, prompts, tool payloads, paths, or worktree
-/// metadata — except the redacted interaction that `get_interaction` returns on a link where the user
-/// delegated management (`manage`).
+/// shapes that keep prompt bodies out of passive snapshots, inventory, and read results. Only a
+/// freshly fenced managed poll/wait may carry a redacted pending interaction.
 @MainActor
 final class AgentSessionLinkToolServiceTests: XCTestCase {
     // MARK: - Strict allowed keys
@@ -1153,7 +1152,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
-    // MARK: - Management (get_interaction / respond / steer)
+    // MARK: - Managed pending interactions / respond / steer
 
     /// Executes one call and unwraps its object result, outside `XCTUnwrap`'s synchronous autoclosure.
     private static func executeObject(
@@ -1165,7 +1164,6 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     }
 
     func testManagementOperationsAcceptOnlyTheirDocumentedFields() {
-        XCTAssertEqual(AgentSessionLinkMCPToolService.getInteractionKeys, ["op", "session_id"])
         XCTAssertEqual(
             AgentSessionLinkMCPToolService.respondKeys,
             ["op", "session_id", "interaction_id", "response", "answers", "skip", "content", "meta"]
@@ -1202,26 +1200,29 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
         fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
         let inspected = try await Self.executeObject(fixture.service, args: [
-            "op": .string("get_interaction"), "session_id": sessionID
+            "op": .string("poll"), "session_id": sessionID
         ])
-        XCTAssertEqual(inspected["result"]?.stringValue, "pending")
+        let pending = try XCTUnwrap(inspected["pending_interaction"]?.objectValue)
         XCTAssertEqual(inspected["managed"], .bool(true))
-        XCTAssertEqual(inspected["respondable"], .bool(true))
-        XCTAssertEqual(inspected["manual_only_reason"], .null)
-        XCTAssertEqual(inspected["interaction"]?.objectValue?["prompt"]?.stringValue, Self.sampleInteractionPrompt)
+        XCTAssertEqual(pending["respondable"], .bool(true))
+        XCTAssertEqual(pending["manual_only_reason"], .null)
+        XCTAssertEqual(pending["prompt"]?.stringValue, Self.sampleInteractionPrompt)
+        XCTAssertEqual(pending["kind"]?.stringValue, "approval")
+        XCTAssertEqual(pending["interaction_id"]?.stringValue, fixture.host.pendingInteractionInspection.interaction?.id.uuidString)
         XCTAssertEqual(inspected["notice"]?.stringValue, AgentSessionLinkMCPToolService.untrustedContentNotice)
+        XCTAssertNil(inspected["snapshot"]?.objectValue?["pending_interaction"])
 
         fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: .hookApproval)
         let manual = try await Self.executeObject(fixture.service, args: [
-            "op": .string("get_interaction"), "session_id": sessionID
+            "op": .string("poll"), "session_id": sessionID
         ])
-        XCTAssertEqual(manual["respondable"], .bool(false))
-        XCTAssertEqual(manual["manual_only_reason"]?.stringValue, "hook_approval")
+        XCTAssertEqual(manual["pending_interaction"]?.objectValue?["respondable"], .bool(false))
+        XCTAssertEqual(manual["pending_interaction"]?.objectValue?["manual_only_reason"]?.stringValue, "hook_approval")
         fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: .instructionPrompt)
         let waiting = try await Self.executeObject(fixture.service, args: [
-            "op": .string("get_interaction"), "session_id": sessionID
+            "op": .string("poll"), "session_id": sessionID
         ])
-        XCTAssertEqual(waiting["note"]?.stringValue, AgentSessionLinkResponseRenderer.instructionWaitNote)
+        XCTAssertEqual(waiting["pending_interaction"]?.objectValue?["note"]?.stringValue, AgentSessionLinkResponseRenderer.instructionWaitNote)
 
         let interactionID = UUID()
         func respond(_ extra: [String: Value] = ["response": .string("accept")]) async throws -> [String: Value] {
@@ -1383,7 +1384,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     private static let sampleInteractionPrompt = "Run the migration script?"
 
     private static func sampleInspection(
-        manualOnly: AgentSessionLinkInteractionManualOnlyReason?
+        manualOnly: AgentSessionLinkInteractionManualOnlyReason?,
+        prompt: String = sampleInteractionPrompt
     ) -> AgentSessionLinkPendingInteractionInspection {
         AgentSessionLinkPendingInteractionInspection(
             interaction: AgentRunMCPSnapshot.Interaction(
@@ -1391,7 +1393,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 kind: .approval,
                 responseType: .decision,
                 title: "Command approval",
-                prompt: sampleInteractionPrompt,
+                prompt: prompt,
                 context: nil,
                 allowsMultiple: nil,
                 options: [.init(label: "accept"), .init(label: "decline"), .init(label: "cancel")],
@@ -1402,18 +1404,172 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         )
     }
 
+    func testPendingInteractionBudgetsNeverTruncateAndHintsAppearOnlyWithPayloads() throws {
+        let first = UUID()
+        let second = UUID()
+        let single: Value = .object(["session_id": .string(first.uuidString)])
+        let nearLimit = Self.sampleInspection(manualOnly: nil, prompt: String(repeating: "a", count: 60 * 1024))
+        let full = try XCTUnwrap(AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: single, inspections: [first: nearLimit], isSingle: true
+        ).objectValue)
+        XCTAssertEqual(full["pending_interaction"]?.objectValue?["prompt"]?.stringValue?.utf8.count, 60 * 1024)
+        XCTAssertEqual(full["pending_interaction"]?.objectValue?["respondable"], .bool(true))
+        XCTAssertEqual(full["respond_hint"]?.stringValue, AgentSessionLinkResponseRenderer.respondHint)
+
+        let oversized = Self.sampleInspection(manualOnly: nil, prompt: String(repeating: "z", count: 70 * 1024))
+        let refused = try XCTUnwrap(AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: single, inspections: [first: oversized], isSingle: true
+        ).objectValue)
+        let tooLarge = try XCTUnwrap(refused["pending_interaction"]?.objectValue)
+        XCTAssertEqual(tooLarge["interaction_id"]?.stringValue, oversized.interaction?.id.uuidString)
+        XCTAssertEqual(tooLarge["manual_only_reason"]?.stringValue, "too_large")
+        XCTAssertEqual(tooLarge["respondable"], .bool(false))
+        XCTAssertNil(tooLarge["prompt"])
+        XCTAssertNil(tooLarge["options"])
+        XCTAssertTrue(oversized.exceedsPromptLimit)
+        let instructionNearBoundary = Self.sampleInspection(
+            manualOnly: .instructionPrompt,
+            prompt: String(repeating: "i", count: 65300)
+        )
+        XCTAssertTrue(
+            instructionNearBoundary.exceedsPromptLimit,
+            "the instruction note must be included in the measured wire object"
+        )
+        let instructionStub = AgentSessionLinkResponseRenderer.pendingInteractionValue(instructionNearBoundary)
+        XCTAssertEqual(instructionStub?.objectValue?["manual_only_reason"]?.stringValue, "too_large")
+
+        let rows: Value = .object(["targets": .array([
+            .object(["session_id": .string(first.uuidString)]),
+            .object(["session_id": .string(second.uuidString)])
+        ])])
+        let mediumPrompt = String(repeating: "m", count: 12 * 1024)
+        let one = Self.sampleInspection(manualOnly: nil, prompt: mediumPrompt)
+        let two = Self.sampleInspection(manualOnly: nil, prompt: mediumPrompt)
+        let batched = try XCTUnwrap(AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: rows, inspections: [first: one, second: two], isSingle: false
+        ).objectValue?["targets"]?.arrayValue)
+        XCTAssertEqual(batched[0].objectValue?["pending_interaction"]?.objectValue?["prompt"]?.stringValue, mediumPrompt)
+        XCTAssertNotNil(batched[0].objectValue?["respond_hint"])
+        XCTAssertNil(batched[1].objectValue?["pending_interaction"])
+        XCTAssertNil(batched[1].objectValue?["respond_hint"])
+        XCTAssertEqual(batched[1].objectValue?["pending_interaction_omitted"], .bool(true))
+        XCTAssertEqual(
+            batched[1].objectValue?["pending_interaction_hint"]?.stringValue,
+            AgentSessionLinkResponseRenderer.pendingInteractionOmittedHint
+        )
+        let idle = try XCTUnwrap(AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: single, inspections: [first: .none], isSingle: true
+        ).objectValue)
+        XCTAssertNil(idle["pending_interaction"])
+        XCTAssertNil(idle["respond_hint"])
+    }
+
+    func testManagedWaitCarriesPendingInteractionOutsideThePassiveSnapshot() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: .hookApproval)
+        let result = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"),
+            "session_id": .string(fixture.target.sessionID.uuidString),
+            "timeout_seconds": .int(0)
+        ])
+        let pending = try XCTUnwrap(result["pending_interaction"]?.objectValue)
+        XCTAssertEqual(
+            pending["interaction_id"]?.stringValue,
+            fixture.host.pendingInteractionInspection.interaction?.id.uuidString
+        )
+        XCTAssertEqual(pending["manual_only_reason"]?.stringValue, "hook_approval")
+        XCTAssertEqual(pending["respondable"], .bool(false))
+        XCTAssertNil(result["snapshot"]?.objectValue?["pending_interaction"])
+        XCTAssertNotNil(result["respond_hint"])
+    }
+
+    func testFinalBatchFenceDeniesAllPromptsWhenOneLinkIsRevoked() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second target")
+        fixture.host.candidates.append(second)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            rawTargetSessionID: second.sessionID.uuidString
+        ) else { return XCTFail("Expected a second link") }
+        let granted = await fixture.bridge.authorizeTargets(
+            operation: .monitorPoll,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionIDs: [fixture.target.sessionID, second.sessionID]
+        )
+        guard case let .success(targets) = granted else { return XCTFail("Expected a whole authorized batch") }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let reference = DomainAgentSessionLinkReference(
+            linkID: targets[1].lease.linkID, generation: targets[1].lease.linkGeneration
+        )
+        await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        let afterRevocation = await fixture.bridge.pendingInteractionsForObservation(leases: targets.map(\.lease))
+        XCTAssertNil(afterRevocation)
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("poll"),
+                "session_ids": .array([
+                    .string(fixture.target.sessionID.uuidString), .string(second.sessionID.uuidString)
+                ])
+            ])
+            XCTFail("one revoked member must deny the whole batch")
+        } catch let error as MCPError {
+            XCTAssertEqual("\(error)", "\(AgentSessionLinkMCPToolService.denialError(targetSessionID: nil))")
+            XCTAssertFalse("\(error)".contains(Self.sampleInteractionPrompt))
+        }
+    }
+
+    func testParkedMultiTargetWaitRechecksWholeBatchBeforeReleasingAnyPrompt() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second target")
+        fixture.host.candidates.append(second)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            rawTargetSessionID: second.sessionID.uuidString
+        ) else { return XCTFail("Expected a second link") }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let waiting = Task { @MainActor in
+            try await fixture.service.execute(args: [
+                "op": .string("wait"),
+                "session_ids": .array([
+                    .string(fixture.target.sessionID.uuidString), .string(second.sessionID.uuidString)
+                ]),
+                "timeout_seconds": .int(5)
+            ])
+        }
+        for _ in 0 ..< 100 {
+            if await fixture.authority.snapshot().parkedWaiterCount == 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let parked = await fixture.authority.snapshot().parkedWaiterCount
+        XCTAssertEqual(parked, 1, "the batch must be parked before revocation")
+        let inventory = await fixture.authority.links(forObserverEndpoint: fixture.observer.domainEndpoint)
+        let secondLink = try XCTUnwrap(inventory.items.first { $0.targetSessionID == second.sessionID })
+        await fixture.bridge.revokeLink(linkID: secondLink.linkID, generation: secondLink.generation)
+        do {
+            let value = try await waiting.value
+            XCTFail("revocation must release no sibling prompt; got \(value)")
+        } catch let error as MCPError {
+            XCTAssertEqual("\(error)", "\(AgentSessionLinkMCPToolService.denialError(targetSessionID: nil))")
+            XCTAssertFalse("\(error)".contains(Self.sampleInteractionPrompt))
+        }
+    }
+
     func testOperationHelpNamesEverySupportedOperation() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         for op in [
             "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact", "set_waiting_on",
-            "snooze_auto_wake", "request_attention", "get_interaction", "respond"
+            "snooze_auto_wake", "request_attention", "respond"
         ] {
             XCTAssertTrue(
                 AgentSessionLinkMCPToolService.supportedOperationsSentence.contains(op),
                 "the supported-operation sentence must name \(op)"
             )
         }
+        XCTAssertFalse(AgentSessionLinkMCPToolService.supportedOperationsSentence.contains("get_interaction"))
         XCTAssertFalse(
             AgentSessionLinkMCPToolService.supportedOperationsSentence.contains("set_passive_updates"),
             "the superseded operation must not be taught by the help text"
@@ -1428,6 +1584,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         for args in [
             [:],
             ["op": Value.string("set_passive_updates")],
+            ["op": Value.string("get_interaction")],
             ["op": Value.string(retiredDashboardOperation)]
         ] as [[String: Value]] {
             do {

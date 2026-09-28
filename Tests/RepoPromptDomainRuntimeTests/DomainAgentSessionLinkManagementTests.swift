@@ -69,6 +69,37 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
         return activated.grant
     }
 
+    func testAtomicObservationBatchSeparatesManagedAndRestrictedGrantsAndDeniesRevocation() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint(windowID: 1)
+        let managedTarget = makeEndpoint(windowID: 2)
+        let restrictedTarget = makeEndpoint(windowID: 3)
+        _ = try await activateLink(authority, observer: observer, target: managedTarget)
+        let restricted = try await activateLink(
+            authority, observer: observer, target: restrictedTarget,
+            restrictedCapabilities: DomainAgentSessionLinkCapability.version1
+        )
+        let managedLease = try await authority.authorize(
+            operation: .monitorPoll, observerEndpoint: observer,
+            targetSessionID: managedTarget.sessionID
+        ).get()
+        let restrictedLease = try await authority.authorize(
+            operation: .monitorPoll, observerEndpoint: observer,
+            targetSessionID: restrictedTarget.sessionID
+        ).get()
+        let before = await authority.managedObservationTargetsIfValid(
+            leases: [managedLease, restrictedLease]
+        )
+        XCTAssertEqual(before, [managedTarget.sessionID])
+        _ = await authority.revoke(
+            linkID: restricted.id, generation: restricted.generation, reason: .userRequested
+        )
+        let after = await authority.managedObservationTargetsIfValid(
+            leases: [managedLease, restrictedLease]
+        )
+        XCTAssertNil(after, "one revoked member must withhold the managed sibling's prompt")
+    }
+
     func testNewGrantsStartManagedAndKeepWatchOperationsAvailable() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint(windowID: 1)
@@ -76,7 +107,7 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
         let grant = try await activateLink(authority, observer: observer, target: target)
 
         XCTAssertEqual(grant.capabilities, DomainAgentSessionLinkCapability.managed)
-        for operation in [DomainAgentSessionTargetOperation.monitorGetInteraction, .monitorRespond, .monitorSteer] {
+        for operation in [DomainAgentSessionTargetOperation.monitorRespond, .monitorSteer] {
             let lease = try await authority.authorize(
                 operation: operation,
                 observerEndpoint: observer,
