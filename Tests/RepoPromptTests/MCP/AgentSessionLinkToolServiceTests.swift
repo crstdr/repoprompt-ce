@@ -224,7 +224,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     private func makeTargetState(
         sessionID: UUID = UUID(),
         status: DomainAgentSessionLinkStatus = .running,
-        pending: DomainAgentSessionLinkPendingInteractionKind? = .approval
+        pending: DomainAgentSessionLinkPendingInteractionKind? = .approval,
+        board: DomainAgentSessionLaneBoard = .empty
     ) -> DomainAgentSessionLinkTargetState {
         DomainAgentSessionLinkTargetState(
             sessionID: sessionID,
@@ -235,6 +236,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 displayName: String(repeating: "n", count: 400),
                 providerDisplayName: "Codex CLI",
                 status: status,
+                board: board,
                 idleForSend: false,
                 pendingInteractionKind: pending,
                 latestVisibleAssistantPreview: String(repeating: "p", count: 600),
@@ -256,7 +258,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 "session_id", "name", "provider", "status", "idle_for_send", "idle_since", "waiting_on",
                 "has_pending_interaction", "pending_interaction_kind",
                 "latest_visible_assistant_preview", "visible_row_count",
-                "last_activity_at", "change_sequence", "context"
+                "last_activity_at", "change_sequence", "context", "board"
             ]
         )
         for forbidden in [
@@ -279,6 +281,37 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(object["idle_for_send"]?.boolValue, false)
     }
 
+    func testSnapshotSerializesLaneBoardWithOmitEmptyFields() throws {
+        let quiet = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeTargetState()).objectValue?["board"]?.objectValue
+        )
+        XCTAssertEqual(Set(quiet.keys), ["run_outcome"])
+        XCTAssertEqual(quiet["run_outcome"]?.stringValue, "none")
+
+        let board = DomainAgentSessionLaneBoard(
+            runOutcome: .failed,
+            failureReason: .processCrash,
+            sendBlockers: ["running", "terminal_commit_in_progress"],
+            subagentRunning: 0,
+            subagentFinished: 2
+        )
+        let populated = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeTargetState(board: board)).objectValue?["board"]?.objectValue
+        )
+        XCTAssertEqual(
+            Set(populated.keys),
+            ["run_outcome", "failure_reason", "send_blockers", "subagents"]
+        )
+        XCTAssertEqual(populated["run_outcome"]?.stringValue, "failed")
+        XCTAssertEqual(populated["failure_reason"]?.stringValue, "process_crash")
+        XCTAssertEqual(populated["send_blockers"]?.arrayValue, [
+            .string("running"), .string("terminal_commit_in_progress")
+        ])
+        let subagents = try XCTUnwrap(populated["subagents"]?.objectValue)
+        XCTAssertEqual(subagents["running"]?.intValue, 0)
+        XCTAssertEqual(subagents["finished"]?.intValue, 2)
+    }
+
     func testSnapshotSerializesAuthoritativeIdleAndAgentDeclaredWaitingMetadata() throws {
         let sessionID = UUID()
         let idleSince = Date(timeIntervalSince1970: 100)
@@ -292,6 +325,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 displayName: "Worker",
                 providerDisplayName: "Codex",
                 status: .idle,
+                board: .empty,
                 idleForSend: false,
                 idleSince: idleSince,
                 waitingOn: DomainAgentSessionWaitingOn(summary: "CI artifact", declaredAt: declaredAt),
@@ -324,6 +358,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 displayName: "Worker",
                 providerDisplayName: "Claude Code",
                 status: .running,
+                board: .empty,
                 idleForSend: false,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,
@@ -448,12 +483,64 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    /// ACP providers can treat `/compact` as fire-and-forget (Devin does): the prompt turn ends
+    /// instantly while the compaction keeps running in the background, where the session's next
+    /// prompt cancels it. A started ACP compaction must warn the overseer; other paths and
+    /// non-started receipts must not.
+    func testAStartedBackgroundCompactionReceiptWarnsAgainstAnEarlyNextSend() throws {
+        let background = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .runStarted,
+            resultingRunState: "running",
+            compactionRunsInBackground: true
+        )
+        let warned = try XCTUnwrap(AgentSessionLinkResponseRenderer.compactReceiptValue(background).objectValue)
+        let detail = try XCTUnwrap(warned["detail"]?.stringValue)
+        XCTAssertTrue(detail.contains("background"))
+        XCTAssertTrue(detail.contains("cancelled"), "The warning names the consequence")
+
+        let inTurn = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        )
+        let inTurnObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactReceiptValue(inTurn).objectValue
+        )
+        let inTurnDetail = try XCTUnwrap(inTurnObject["detail"]?.stringValue)
+        XCTAssertFalse(
+            inTurnDetail.contains("background"),
+            "Codex/Claude compactions run in the turn; the warning would be wrong there"
+        )
+
+        let withheld = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .persisted,
+            resultingRunState: "idle",
+            compactionRunsInBackground: true
+        )
+        let withheldObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactReceiptValue(withheld).objectValue
+        )
+        let withheldDetail = try XCTUnwrap(withheldObject["detail"]?.stringValue)
+        XCTAssertFalse(
+            withheldDetail.contains("background"),
+            "Nothing started, so nothing can still be running"
+        )
+    }
+
     func testCompactRefusalsUseTheSharedReadinessVocabularyAndHonestSupportResults() throws {
         let sessionID = UUID()
         for (failure, retryable) in [
             (AgentSessionLinkSendFailure.targetNotIdle, true),
             (.notSupported, false),
-            (.noProviderSession, false),
+            (.noProviderSession, true),
             (.persistenceIndeterminate, false)
         ] {
             let object = try XCTUnwrap(
@@ -465,6 +552,15 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
         XCTAssertEqual(AgentSessionLinkSendFailure.notSupported.rawValue, "not_supported")
         XCTAssertEqual(AgentSessionLinkSendFailure.noProviderSession.rawValue, "no_provider_session")
+        let noSession = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactBlockedValue(.noProviderSession, targetSessionID: sessionID)
+                .objectValue
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(noSession["detail"]?.stringValue)
+                .contains("run one turn"),
+            "A retryable no_provider_session tells the overseer how to make the session live"
+        )
 
         let inProgress = try XCTUnwrap(
             AgentSessionLinkResponseRenderer.compactRejectedValue(.sendAlreadyInProgress, targetSessionID: sessionID)
@@ -2706,6 +2802,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 displayName: candidate.displayName,
                 providerDisplayName: candidate.providerDisplayName,
                 status: .idle,
+                board: .empty,
                 idleForSend: true,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,

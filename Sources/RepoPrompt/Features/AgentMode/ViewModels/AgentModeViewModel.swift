@@ -474,6 +474,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
+            rebuildAgentSessionLinkSubagentCensus(reconcileLiveObservers: true)
             syncSidebarUIState(refresh: true, reason: .sessionList)
             // One eager revocation hook covering every live-session removal path (tab close, stash,
             // delete, MCP control teardown) instead of five separate call sites that could drift.
@@ -481,6 +482,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             syncAttentionNotificationObservers()
         }
     }
+
+    /// Passive board census, rebuilt once when a source changes rather than once per target.
+    var agentSessionLinkSubagentCensus = AgentSessionLinkSubagentCensus(persisted: [], index: [], live: [])
+    var agentSessionLinkCensusWorkspaceID: UUID?
+    var agentSessionLinkPersistedSubagentMeta: [AgentSessionMeta] = []
+    var agentSessionLinkPersistedSubagentWorkspaceID: UUID?
+    var agentSessionLinkSubagentRefreshGeneration: UInt64 = 0
+    var agentSessionLinkChildRunSubscriptions: [UUID: AnyCancellable] = [:]
+    let agentSessionLinkSubagentCensusChanged = PassthroughSubject<Set<UUID>, Never>()
 
     private var provisionalParentSessionIDBySessionID: [UUID: UUID] = [:]
 
@@ -4963,6 +4973,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             tabID: session.tabID,
             sessionID: sessionID
         )
+        rebuildAgentSessionLinkSubagentCensus()
         postAgentSessionBindingDidChange(
             tabID: session.tabID,
             previousSessionID: previousSessionID,
@@ -7505,6 +7516,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessionID: sessionID,
             parentSessionID: effectiveParentSessionID
         )
+        rebuildAgentSessionLinkSubagentCensus()
         let didCopyParentWorktreeBindings = assignedParent
             && inheritWorktreeBindings
             && copyParentWorktreeBindingsIfNeeded(parentSessionID: effectiveParentSessionID, to: session)
@@ -21825,6 +21837,7 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
     ) {
         switch reason {
         case .sessionIndex:
+            rebuildAgentSessionLinkSubagentCensus()
             syncSidebarUIState(refresh: true, reason: .sessionIndex)
         case .sortDates:
             syncSidebarUIState(refresh: true, reason: .sortDates)

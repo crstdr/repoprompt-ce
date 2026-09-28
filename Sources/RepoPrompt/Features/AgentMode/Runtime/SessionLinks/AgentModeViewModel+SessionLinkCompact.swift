@@ -22,7 +22,8 @@ enum AgentSessionLinkCompactSupport: Equatable {
     case acpAdvertisedCommand
     /// No verified native compaction path for this runtime. Never downgraded to a message.
     case notSupported
-    /// The runtime supports compaction but this target has no provider conversation yet.
+    /// No live provider session to compact: no recorded conversation, or a remembered one whose
+    /// controller is absent, still opening, or has not reported its command surface yet.
     case noProviderSession
 }
 
@@ -32,10 +33,14 @@ extension AgentModeViewModel {
     /// Claude-compatible variants share the Claude CLI but their backends are not verified to honor
     /// the native command, so they are `notSupported` rather than guessed at. An ACP session is
     /// supported only while its live controller advertises `compact` for the target's own provider
-    /// session; without a live advertisement (including after a relaunch, before the next turn) it is
-    /// `notSupported`. OpenCode and Cursor are never supported (see
+    /// session. A stored ACP conversation without a live provider session — after a relaunch,
+    /// before the session's first turn, or while its controller is still opening — is
+    /// `noProviderSession`, a retryable state: one ordinary turn brings the conversation and its
+    /// command advertisement up. `notSupported` needs the live session's command list to have been
+    /// observed and to provably lack `compact` (or to name another conversation); an unobserved
+    /// list is retryable too. OpenCode and Cursor are never supported (see
     /// `AgentProviderControlCommand.acpRuntimeAdvertisesNativeCommands`).
-    func agentSessionLinkCompactSupport(for session: TabSession) -> AgentSessionLinkCompactSupport {
+    func agentSessionLinkCompactSupport(for session: TabSession) async -> AgentSessionLinkCompactSupport {
         switch session.selectedAgent {
         case .codexExec:
             let thread = session.codexConversationID?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -46,17 +51,38 @@ extension AgentModeViewModel {
             let conversation = session.providerSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
             return conversation?.isEmpty == false ? .claudeCode : .noProviderSession
         case .devin, .grokBuild, .antigravity:
-            guard let conversation = session.providerSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !conversation.isEmpty
+            // Bind the exact stored conversation — it is what the controller's snapshot compares.
+            guard let conversation = session.providerSessionID,
+                  !conversation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else {
                 return .noProviderSession
             }
-            // The exact stored conversation, not the trimmed one: it is what the controller compares.
-            return AgentProviderControlCommand.acpSession(
-                session,
-                advertises: .compact,
-                inProviderConversation: session.providerSessionID ?? ""
-            ) ? .acpAdvertisedCommand : .notSupported
+            // No live provider session means its command surface cannot have been observed yet —
+            // retryable, not incapable.
+            guard let controller = session.acpController, await controller.hasLiveProviderSession else {
+                return .noProviderSession
+            }
+            // Everything unobservable after the hop is retryable rather than unsupported. A single
+            // snapshot read answers both questions at once — snapshot present (an unobserved list,
+            // dropped while the session opens or never sent, is indistinguishable from "about to
+            // advertise") and list contents — while the same-stretch re-checks bind the verdict to
+            // the controller, conversation, and runtime proven before the hop. `notSupported` is
+            // reserved for a snapshot that names another conversation or provably lacks `compact`.
+            guard session.acpController === controller,
+                  session.providerSessionID == conversation,
+                  AgentProviderControlCommand.acpRuntimeAdvertisesNativeCommands(session.selectedAgent)
+            else {
+                return .noProviderSession
+            }
+            guard let advertised = controller.currentAdvertisedCommands() else {
+                return .noProviderSession
+            }
+            guard advertised.sessionID == conversation else {
+                return .notSupported
+            }
+            return advertised.names.contains(AgentProviderControlCommand.Kind.compact.rawValue)
+                ? .acpAdvertisedCommand
+                : .notSupported
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
             return .notSupported
         }
@@ -104,7 +130,7 @@ extension AgentModeViewModel {
         if Self.agentSessionLinkCompactHasQueuedProviderWork(session) {
             return .blocked(.targetNotIdle)
         }
-        let support = agentSessionLinkCompactSupport(for: session)
+        let support = await agentSessionLinkCompactSupport(for: session)
         switch support {
         case .notSupported:
             return .blocked(.notSupported)
@@ -144,9 +170,18 @@ extension AgentModeViewModel {
 
         // 5. Re-prove everything the commit await could have changed, including provider support: a
         //    provider switch during the hop must not dispatch a command the new runtime cannot honor.
-        let postCommitLiveness = liveness()
+        //    The support answer itself suspends on the controller actor, so it is fetched first;
+        //    liveness, identity, claim, readiness, and workspace are then proved in one MainActor
+        //    stretch with no suspension between them and the durable row.
         guard let liveSession = agentSessionLinkLiveSession(matching: candidate),
-              liveSession === session,
+              liveSession === session
+        else {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.endpointInvalidated)
+        }
+        let postCommitSupport = await agentSessionLinkCompactSupport(for: liveSession)
+        let postCommitLiveness = liveness()
+        guard agentSessionLinkLiveSession(matching: candidate) === liveSession,
               postCommitLiveness.permitsDelivery,
               composerSubmitClaimIsCurrent(claim)
         else {
@@ -169,7 +204,6 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .blocked(.targetNotIdle)
         }
-        let postCommitSupport = agentSessionLinkCompactSupport(for: liveSession)
         guard postCommitSupport == support else {
             releaseComposerSubmitClaim(claim)
             return .blocked(postCommitSupport == .noProviderSession ? .noProviderSession : .notSupported)
@@ -215,13 +249,17 @@ extension AgentModeViewModel {
         }
 
         // 7. The flush awaited: re-prove every admission fact before anything reaches a provider.
-        //    Drift keeps the durable request and withholds only the command.
+        //    Drift keeps the durable request and withholds only the command. The support answer
+        //    suspends on the controller actor, so it is fetched first; the liveness probe and
+        //    every guard below then run after the last suspension.
+        let dispatchSupport = await agentSessionLinkCompactSupport(for: liveSession)
         let dispatchLiveness = liveness()
-        guard agentSessionLinkLiveSession(matching: candidate) === liveSession,
+        guard !Task.isCancelled,
+              agentSessionLinkLiveSession(matching: candidate) === liveSession,
               dispatchLiveness.permitsDelivery,
               composerSubmitClaimIsCurrent(claim),
               workspaceManager?.activeWorkspace?.id == candidate.workspaceID,
-              agentSessionLinkCompactSupport(for: liveSession) == support
+              dispatchSupport == support
         else {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
@@ -311,7 +349,8 @@ extension AgentModeViewModel {
             targetItemID: requestItem.id,
             acceptedAt: acceptedAt,
             deliveryState: didStart ? .runStarted : .runStartFailed,
-            resultingRunState: resultingRunState.rawValue
+            resultingRunState: resultingRunState.rawValue,
+            compactionRunsInBackground: postCommitSupport == .acpAdvertisedCommand
         ))
     }
 

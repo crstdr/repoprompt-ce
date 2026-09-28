@@ -218,11 +218,61 @@ package struct DomainAgentSessionContextLoad: Hashable, Sendable {
     }
 }
 
+/// Derived target state for passive oversight. Blocker names are internal and opaque on the wire;
+/// only an empty versus non-empty list is contractual. Counts are zero until the census is wired.
+package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
+    package enum RunOutcome: String, Hashable, Sendable {
+        case none
+        case running
+        case awaitingUser = "awaiting_user"
+        case completed
+        case cancelled
+        case failed
+    }
+
+    package enum FailureReason: String, Hashable, Sendable {
+        case processCrash = "process_crash"
+        case timeout
+        case agentError = "agent_error"
+        case cancelled
+    }
+
+    package let runOutcome: RunOutcome
+    package let failureReason: FailureReason?
+    package let sendBlockers: [String]
+    package let subagentRunning: Int
+    package let subagentFinished: Int
+
+    package init(
+        runOutcome: RunOutcome,
+        failureReason: FailureReason?,
+        sendBlockers: [String],
+        subagentRunning: Int,
+        subagentFinished: Int
+    ) {
+        self.runOutcome = runOutcome
+        self.failureReason = failureReason
+        self.sendBlockers = sendBlockers
+        self.subagentRunning = subagentRunning
+        self.subagentFinished = subagentFinished
+    }
+
+    /// Explicit quiet board for fixtures; snapshot construction itself has no default.
+    package static let empty = DomainAgentSessionLaneBoard(
+        runOutcome: .none,
+        failureReason: nil,
+        sendBlockers: [],
+        subagentRunning: 0,
+        subagentFinished: 0
+    )
+}
+
 package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
     package let sessionID: UUID
     package let displayName: String?
     package let providerDisplayName: String?
     package let status: DomainAgentSessionLinkStatus
+    package let board: DomainAgentSessionLaneBoard
     package let idleForSend: Bool
     package let idleSince: Date?
     package let waitingOn: DomainAgentSessionWaitingOn?
@@ -244,6 +294,7 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         displayName: String?,
         providerDisplayName: String?,
         status: DomainAgentSessionLinkStatus,
+        board: DomainAgentSessionLaneBoard,
         idleForSend: Bool,
         idleSince: Date? = nil,
         waitingOn: DomainAgentSessionWaitingOn? = nil,
@@ -263,6 +314,7 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
             maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
         )
         self.status = status
+        self.board = board
         // A target that is not idle can never be admitted for send, regardless of what the bridge claims.
         self.idleForSend = idleForSend && status == .idle && pendingInteractionKind == nil
         self.idleSince = status == .idle && pendingInteractionKind == nil ? idleSince : nil
@@ -858,6 +910,9 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
     package let resultingRunState: String
     /// Set by the authority when an identical key/digest pair replays a stored outcome.
     package let duplicate: Bool
+    /// Compaction only: the command went out on a provider path that may keep compacting in the
+    /// background after its prompt turn completes, so an early next turn can cancel it.
+    package let compactionRunsInBackground: Bool
 
     package init(
         targetSessionID: UUID,
@@ -865,7 +920,8 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
         acceptedAt: Date,
         deliveryState: DomainAgentSessionLinkDeliveryState,
         resultingRunState: String,
-        duplicate: Bool = false
+        duplicate: Bool = false,
+        compactionRunsInBackground: Bool = false
     ) {
         self.targetSessionID = targetSessionID
         self.targetItemID = targetItemID
@@ -873,6 +929,7 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
         self.deliveryState = deliveryState
         self.resultingRunState = resultingRunState
         self.duplicate = duplicate
+        self.compactionRunsInBackground = compactionRunsInBackground
     }
 
     package func markedDuplicate() -> DomainAgentSessionLinkSendReceipt {
@@ -882,7 +939,8 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
             acceptedAt: acceptedAt,
             deliveryState: deliveryState,
             resultingRunState: resultingRunState,
-            duplicate: true
+            duplicate: true,
+            compactionRunsInBackground: compactionRunsInBackground
         )
     }
 }

@@ -958,6 +958,7 @@ package actor DomainAgentSessionLinkAuthority {
             displayName: incoming.displayName,
             providerDisplayName: incoming.providerDisplayName,
             status: incoming.status,
+            board: incoming.board,
             idleForSend: incoming.idleForSend,
             idleSince: idleSince,
             waitingOn: incoming.waitingOn,
