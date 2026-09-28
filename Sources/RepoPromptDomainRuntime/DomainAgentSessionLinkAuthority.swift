@@ -228,6 +228,14 @@ package actor DomainAgentSessionLinkAuthority {
         )
     }
 
+    /// One actor turn for retirement's both-direction relationship cutoff. UUID-scoped rather
+    /// than exact-endpoint-scoped so a stale grant on another incarnation also blocks stash.
+    package func relationshipInventories(
+        forSessionID sessionID: UUID
+    ) -> (inbound: DomainAgentSessionLinkInventory, outbound: DomainAgentSessionLinkInventory) {
+        (links(forTarget: sessionID), links(forObserver: sessionID))
+    }
+
     // MARK: - Change feed
 
     /// Identity/revision-only change feed. Consumers refetch an authoritative snapshot.
@@ -283,7 +291,8 @@ package actor DomainAgentSessionLinkAuthority {
         observer: DomainAgentSessionLinkEndpointIdentity,
         target: DomainAgentSessionLinkEndpointIdentity,
         capabilities: Set<DomainAgentSessionLinkCapability> = DomainAgentSessionLinkCapability.managed,
-        requiresExistingOutboundLink: Bool = false
+        requiresExistingOutboundLink: Bool = false,
+        requiresExistingDirectLink: Bool = false
     ) -> DomainAgentSessionLinkReservationDisposition {
         guard !isDraining, !isShutDown else { return .rejected(.shuttingDown) }
         guard observer.sessionID != target.sessionID, observer != target else {
@@ -297,6 +306,9 @@ package actor DomainAgentSessionLinkAuthority {
         }
         guard !requiresExistingOutboundLink || hasActiveOutboundLink(observerEndpoint: observer) else {
             return .rejected(.observerHasNoActiveOutboundLink)
+        }
+        guard !requiresExistingDirectLink || hasActiveLink(endpoint: observer) else {
+            return .rejected(.observerHasNoActiveLink)
         }
         if pendingReservations.values.contains(where: { $0.observer == observer && $0.target == target }) {
             return .rejected(.reservationAlreadyPending)
@@ -329,6 +341,7 @@ package actor DomainAgentSessionLinkAuthority {
             target: target,
             capabilities: capabilities,
             requiresExistingOutboundLink: requiresExistingOutboundLink,
+            requiresExistingDirectLink: requiresExistingDirectLink,
             provisionallyInstallsTargetObservation: targets[target.sessionID] == nil
                 && !hasPendingInboundReservation,
             reservedAtAuthorityRevision: advanceAuthorityRevision()
@@ -371,6 +384,12 @@ package actor DomainAgentSessionLinkAuthority {
         {
             pendingReservations.removeValue(forKey: reservation.linkID)
             return .rejected(.observerHasNoActiveOutboundLink)
+        }
+        if reservation.requiresExistingDirectLink,
+           !hasActiveLink(endpoint: reservation.observer)
+        {
+            pendingReservations.removeValue(forKey: reservation.linkID)
+            return .rejected(.observerHasNoActiveLink)
         }
 
         pendingReservations.removeValue(forKey: reservation.linkID)
@@ -488,6 +507,17 @@ package actor DomainAgentSessionLinkAuthority {
             forObserver: observerSessionID,
             matching: { $0.grant.observer.sessionID == observerSessionID }
         )
+    }
+
+    /// Cap accounting is UUID-scoped, unlike caller authorization. Keep the grant's exact target
+    /// incarnation so a second live binding with the same session UUID cannot hide its slot.
+    package func linkedTargetEndpoints(
+        forObserverSessionID sessionID: UUID
+    ) -> (endpoints: [DomainAgentSessionLinkEndpointIdentity], authorityRevision: UInt64) {
+        let endpoints = links.values.compactMap { record in
+            record.grant.observer.sessionID == sessionID ? record.grant.target : nil
+        }
+        return (endpoints, authorityRevision)
     }
 
     private func inventory(
@@ -830,6 +860,7 @@ package actor DomainAgentSessionLinkAuthority {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Result<DomainAgentSessionLinkInventory, DomainAgentSessionLinkError> {
         guard !isDraining, !isShutDown else { return .failure(.runtimeShuttingDown) }
+        guard operation == .monitorList else { return .failure(.invalidRequest) }
         let decision = DomainAgentSessionOperationAuthorizer.authorizeObserverScoped(
             operation: operation,
             caller: .agentSession(observerEndpoint.sessionID),
