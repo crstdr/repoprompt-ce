@@ -629,6 +629,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_afterClaudeAttachmentSelfCancel: (@MainActor () async -> Void)?
         var test_claudeAttachmentRestartFinished: (@MainActor () -> Void)?
         var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
+        var test_beforeACPToolIdleWait: (@MainActor () async throws -> Void)?
         var test_beforeScheduledACPFollowUpStart: (@MainActor () async -> Void)?
         var test_didFinishScheduledACPFollowUpStart: (@MainActor () -> Void)?
 
@@ -3041,7 +3042,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 self?.cancelActiveToolsForRun(runID: runID, reason: reason)
             },
             awaitNoActiveMCPTools: { [weak self] runID in
-                guard let self, let mcp = mcpServer else { return }
+                guard let self else { return }
+                #if DEBUG
+                    if let test_beforeACPToolIdleWait {
+                        try await test_beforeACPToolIdleWait()
+                        return
+                    }
+                #endif
+                guard let mcp = mcpServer else { return }
                 try await mcp.awaitNoActiveToolExecutions(runID: runID)
             },
             activeAgentRunWaitQuery: { [weak self] runID in
@@ -3251,57 +3259,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             ),
             continuation: .init(
-                startFollowUpRun: { [weak self] session, initialMessage in
+                startFollowUpRun: { [weak self] session, instruction in
+                    if session.selectedAgent.acpProviderID != nil {
+                        self?.scheduleTypedACPFollowUpRun(session: session, instruction: instruction)
+                        return
+                    }
                     let stopFence = AgentRunStartStopFence(session: session)
                     Task { @MainActor [weak self, weak session] in
                         guard let self, let session else { return }
                         await startFollowUpRun(
                             for: session,
-                            initialMessage: initialMessage,
+                            initialMessage: instruction.providerText,
                             stopFence: stopFence
                         )
                     }
                 },
                 startTypedACPFollowUpRun: { [weak self] session, instruction in
-                    if session.scheduledACPFollowUp != nil {
-                        session.pendingInstructions.append(instruction)
-                        session.isDirty = true
-                        self?.updateBindingsFromSession(session)
-                        self?.scheduleSave(for: session.tabID)
-                        return
-                    }
-                    let stopFence = AgentRunStartStopFence(session: session)
-                    let scheduled = AgentTabSession.ScheduledACPFollowUp(
-                        id: UUID(), instruction: instruction, binding: stopFence.binding
-                    )
-                    session.scheduledACPFollowUp = scheduled
-                    Task { @MainActor [weak self, weak session] in
-                        guard let self, let session else { return }
-                        #if DEBUG
-                            defer { test_didFinishScheduledACPFollowUpStart?() }
-                            await test_beforeScheduledACPFollowUpStart?()
-                        #endif
-                        guard session.scheduledACPFollowUp?.id == scheduled.id else { return }
-                        let startOutcome = AgentRunStartOutcomeRecorder()
-                        _ = await startAgentRun(
-                            tabID: session.tabID, initialMessage: instruction.providerText,
-                            directStartOptions: AgentDirectRunStartOptions(stopFence: stopFence),
-                            startOutcome: startOutcome
-                        )
-                        guard session.scheduledACPFollowUp?.id == scheduled.id else { return }
-                        session.scheduledACPFollowUp = nil
-                        if !startOutcome.outcome.didStart,
-                           sessions[session.tabID] === session,
-                           session.persistentSessionBindingIdentity == scheduled.binding,
-                           let draft = instruction.localDraftText
-                        {
-                            restoreComposerDraft(
-                                tabID: session.tabID, text: draft,
-                                message: "Restored local ACP follow-up after failed start",
-                                strategy: .prependAlways
-                            )
-                        }
-                    }
+                    self?.scheduleTypedACPFollowUpRun(session: session, instruction: instruction)
                 },
                 signalMCPInstructionDelivered: { [weak self] session in
                     await self?.signalMCPInstructionDelivered(for: session)
@@ -3319,6 +3293,52 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             hooks: hooks,
             toolTrackingHooks: toolTrackingHooks
         )
+    }
+
+    private func scheduleTypedACPFollowUpRun(
+        session: TabSession,
+        instruction: TabSession.PendingInstruction
+    ) {
+        session.mcpFollowUpRunPending = true
+        if session.scheduledACPFollowUp != nil {
+            session.pendingInstructions.append(instruction)
+            session.isDirty = true
+            updateBindingsFromSession(session)
+            scheduleSave(for: session.tabID)
+            return
+        }
+        let stopFence = AgentRunStartStopFence(session: session)
+        let scheduled = TabSession.ScheduledACPFollowUp(
+            id: UUID(), instruction: instruction, binding: stopFence.binding
+        )
+        session.scheduledACPFollowUp = scheduled
+        Task { @MainActor [weak self, weak session] in
+            guard let self, let session else { return }
+            #if DEBUG
+                defer { test_didFinishScheduledACPFollowUpStart?() }
+                await test_beforeScheduledACPFollowUpStart?()
+            #endif
+            guard session.scheduledACPFollowUp?.id == scheduled.id else { return }
+            let startOutcome = AgentRunStartOutcomeRecorder()
+            _ = await startAgentRun(
+                tabID: session.tabID, initialMessage: instruction.providerText,
+                directStartOptions: AgentDirectRunStartOptions(stopFence: stopFence),
+                startOutcome: startOutcome
+            )
+            guard session.scheduledACPFollowUp?.id == scheduled.id else { return }
+            session.scheduledACPFollowUp = nil
+            if !startOutcome.outcome.didStart,
+               sessions[session.tabID] === session,
+               session.persistentSessionBindingIdentity == scheduled.binding,
+               let draft = instruction.localDraftText
+            {
+                restoreComposerDraft(
+                    tabID: session.tabID, text: draft,
+                    message: "Restored local ACP follow-up after failed start",
+                    strategy: .prependAlways
+                )
+            }
+        }
     }
 
     private func startFollowUpRun(
@@ -17625,6 +17645,35 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return true
     }
 
+    private func settleRejectedACPSteeringSubmission(
+        id: UUID,
+        session: TabSession,
+        stopFence: AgentRunStartStopFence
+    ) {
+        guard stopFence.permitsStart(of: session),
+              let queuedIndex = session.pendingACPSteeringInstructions.firstIndex(where: { $0.id == id })
+        else { return }
+        let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
+        let instruction = TabSession.PendingInstruction(
+            providerText: queued.providerText,
+            localDraftText: queued.managed == nil ? queued.draftText : nil
+        )
+        if session.runState.isActive {
+            session.pendingInstructions.insert(instruction, at: 0)
+            queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
+        } else if session.runState == .completed, session.acpController != nil {
+            queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
+            scheduleTypedACPFollowUpRun(session: session, instruction: instruction)
+        } else {
+            // A rejected ACP steer remains a provider follow-up, never a composer draft.
+            session.pendingInstructions.insert(instruction, at: 0)
+            queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
+            session.isDirty = true
+            updateBindingsFromSession(session)
+            scheduleSave(for: session.tabID)
+        }
+    }
+
     private func submitActiveProviderSteering(
         _ route: ActiveProviderSteeringRoute,
         session: TabSession,
@@ -17677,38 +17726,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let self, let session, producerStopFence.permitsStart(of: session) else { return }
                 let accepted = await runService.submitQueuedACPSteeringIfSupported(session: session)
                 guard producerStopFence.permitsStart(of: session) else { return }
-                guard !accepted,
-                      let queuedIndex = session.pendingACPSteeringInstructions.firstIndex(where: { $0.id == steering.id })
-                else {
-                    return
-                }
-                let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
-                if session.runState.isActive {
-                    session.pendingInstructions.insert(
-                        .init(providerText: queued.providerText, localDraftText: queued.managed == nil ? queued.draftText : nil),
-                        at: 0
-                    )
-                    queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
-                } else if session.runState == .completed, session.acpController != nil {
-                    queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
-                    await startAgentRun(
-                        tabID: session.tabID,
-                        initialMessage: queued.providerText,
-                        directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence)
-                    )
-                } else {
-                    // ACP steering should never bounce back into the composer. If the
-                    // active-steering queue was rejected before the run service could take it,
-                    // preserve it as a normal provider follow-up instead.
-                    session.pendingInstructions.insert(
-                        .init(providerText: queued.providerText, localDraftText: queued.managed == nil ? queued.draftText : nil),
-                        at: 0
-                    )
-                    queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
-                    session.isDirty = true
-                    updateBindingsFromSession(session)
-                    scheduleSave(for: session.tabID)
-                }
+                guard !accepted else { return }
+                settleRejectedACPSteeringSubmission(
+                    id: steering.id, session: session, stopFence: producerStopFence
+                )
             }
         case .claudeNativeInterrupt:
             // Claude Code preserves draft text and wakes current MCP waiters as soon
@@ -20819,8 +20840,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             runService.testBeforeCancellationCommit = action
         }
 
-        func test_publishNaturalCompletion(_ session: TabSession) async {
-            await runService.test_publishNaturalCompletion(session)
+        func test_publishNaturalCompletion(_ session: TabSession, supportsFollowUp: Bool = false) async {
+            await runService.test_publishNaturalCompletion(session, supportsFollowUp: supportsFollowUp)
+        }
+
+        func test_settleRejectedACPSteeringSubmission(
+            id: UUID, session: TabSession, stopFence: AgentRunStartStopFence
+        ) {
+            settleRejectedACPSteeringSubmission(id: id, session: session, stopFence: stopFence)
         }
 
         func test_submitWaitingClaudeAttachment(

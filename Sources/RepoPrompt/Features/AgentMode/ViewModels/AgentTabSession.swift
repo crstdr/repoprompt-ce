@@ -333,25 +333,7 @@ final class AgentTabSession: ObservableObject {
     /// when MCP control is active, `.userConfigured` otherwise.
     var permissionProfile: AgentModeViewModel.AgentPermissionProfile = .userConfigured
 
-    /// A provider follow-up and its separately typed, locally restorable draft. Provider text
-    /// may mix local and managed ACP steering; its contents never establish draft authorship.
-    struct PendingInstruction: Equatable, ExpressibleByStringLiteral {
-        let providerText: String
-        let localDraftText: String?
-
-        init(providerText: String, localDraftText: String?) {
-            self.providerText = providerText
-            self.localDraftText = localDraftText
-        }
-
-        init(stringLiteral value: String) {
-            self.init(providerText: value, localDraftText: value)
-        }
-
-        static func providerOnly(_ text: String) -> Self {
-            Self(providerText: text, localDraftText: nil)
-        }
-    }
+    typealias PendingInstruction = AgentRunPendingInstruction
 
     /// An ACP fallback handed to the scheduled-start task but not yet accepted by a provider.
     /// Stop owns its local recovery payload until that start is accepted or withdrawn.
@@ -437,10 +419,24 @@ final class AgentTabSession: ObservableObject {
         var managed: ACPSteeringManagedContext?
     }
 
-    /// Lifecycle discards that cannot preserve the queue still owe every managed caller a result.
+    /// Lifecycle disposal withdraws only rows from the exact binding that accepted the steer.
+    /// A queued-follow-up receipt is already settled and no longer lives in this steering queue.
     func settlePendingManagedACPSteeringAsNotAccepted() {
         for instruction in pendingACPSteeringInstructions {
-            instruction.managed?.sink.resolve(.notAccepted(
+            guard let managed = instruction.managed else { continue }
+            let candidate = managed.candidate
+            if tabID == candidate.tabID,
+               activeAgentSessionID == candidate.sessionID,
+               persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration,
+               bindingTransitionGeneration == candidate.bindingTransitionGeneration,
+               let index = items.firstIndex(where: {
+                   $0.id == managed.attributedItemID
+                       && $0.crossSessionAttribution == managed.attribution
+               })
+            {
+                _ = removeItem(at: index)
+            }
+            managed.sink.resolve(.notAccepted(
                 message: "The ACP steer was withdrawn before the provider accepted it."
             ))
         }

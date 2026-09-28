@@ -57,7 +57,7 @@ final class AgentModeRunService {
     #if DEBUG
         var testBeforeCancellationCommit: (@MainActor (AgentTabSession) async -> Void)?
 
-        func test_publishNaturalCompletion(_ session: AgentTabSession) async {
+        func test_publishNaturalCompletion(_ session: AgentTabSession, supportsFollowUp: Bool = false) async {
             guard let ownership = session.activeRunOwnership else { return }
             _ = await terminalCommitBarrier.commit(.init(
                 binding: hooks.bindTerminalSession(session),
@@ -67,7 +67,7 @@ final class AgentModeRunService {
                 source: "test.naturalCompletion",
                 attachmentDisposition: .deleteFiles,
                 finalizeNonCodexUsage: false,
-                supportsFollowUp: false,
+                supportsFollowUp: supportsFollowUp,
                 notifyTurnComplete: false,
                 providerDrainGeneration: session.providerTerminalDrainGeneration,
                 prepareProviderState: {

@@ -410,7 +410,7 @@ final class AgentRunTerminalCommitBarrier {
         binding: AgentRunTerminalSessionBinding,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult?
-    ) -> String? {
+    ) -> AgentRunPendingInstruction? {
         guard revision.successorKind != nil,
               revision.providerSuccessorID == nil,
               let publicationResult
