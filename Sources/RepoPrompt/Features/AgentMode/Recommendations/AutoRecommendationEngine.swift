@@ -366,7 +366,7 @@ final class AutoRecommendationEngine {
            AgentModelCatalog.isAgentAvailable(agent, availability: availability),
            isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability)
         {
-            return AgentModelCatalog.normalizePersistedSelection(
+            return AgentModelCatalog.normalizeSelection(
                 agentRaw: agent.rawValue,
                 modelRaw: modelRaw,
                 availability: availability,
