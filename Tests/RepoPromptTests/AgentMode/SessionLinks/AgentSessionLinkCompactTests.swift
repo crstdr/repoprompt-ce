@@ -266,6 +266,108 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertTrue(fixture.events.saveHappenedBeforeProviderStart())
     }
 
+    func testSelfMCPAdmissionPersistsExactOriginBeforeReceiptAndReplaysOnlyIdenticalKey() async throws {
+        let fixture = try makeFixture()
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.mcp")
+        let endpoint = fixture.candidate.domainEndpoint
+        let origin = AgentSelfMCPCallOrigin(
+            endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID
+        )
+        fixture.session.isDirty = false // The reservation itself must make the required save necessary.
+
+        let first = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            endpoint: endpoint, origin: origin,
+            note: "continue exactly", idempotencyKey: "self-mcp-key"
+        )
+        guard case let .scheduled(attempt) = first else {
+            return XCTFail("Expected a durable scheduled receipt")
+        }
+        XCTAssertEqual(attempt.admittedSupport, .claudeCode)
+        XCTAssertTrue(fixture.events.contains(.save), "reservation must persist before receipt")
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated), "no inline native dispatch")
+
+        let replay = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            endpoint: endpoint, origin: origin,
+            note: "continue exactly", idempotencyKey: "self-mcp-key"
+        )
+        guard case let .duplicate(requestID, status) = replay else {
+            return XCTFail("Expected same-key retry to replay")
+        }
+        XCTAssertEqual(requestID, attempt.id)
+        XCTAssertEqual(status?.phase, AgentSelfCompactAttempt.Phase.scheduled.rawValue)
+
+        let conflict = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            endpoint: endpoint, origin: origin,
+            note: "changed", idempotencyKey: "self-mcp-key"
+        )
+        guard case let .blocked(reason) = conflict else { return XCTFail("Expected conflict") }
+        XCTAssertEqual(reason, "idempotency_conflict")
+        let rebound = AgentSelfMCPCallOrigin(
+            endpoint: endpoint, runID: runID, runAttemptID: UUID()
+        )
+        let unavailable = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            endpoint: endpoint, origin: rebound,
+            note: "continue exactly", idempotencyKey: "other-key"
+        )
+        guard case .unavailable = unavailable else { return XCTFail("Rebound attempt must be denied") }
+        XCTAssertEqual(fixture.session.selfCompactState.active?.id, attempt.id)
+    }
+
+    func testSelfMCPAdmissionPersistenceFailureNeverLeavesExecutableRequest() async throws {
+        let fixture = try makeFixture(saverBehavior: .fail)
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.failedSave")
+        fixture.session.isDirty = false
+        let endpoint = fixture.candidate.domainEndpoint
+        let origin = AgentSelfMCPCallOrigin(
+            endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID
+        )
+
+        let result = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            endpoint: endpoint, origin: origin,
+            note: "retain after failed save", idempotencyKey: "failed-save-key"
+        )
+        guard case let .blocked(reason) = result else {
+            return XCTFail("Expected an indeterminate persistence refusal")
+        }
+        XCTAssertEqual(reason, "persistence_indeterminate")
+        XCTAssertNil(fixture.session.selfCompactState.active)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .recoveryRequired)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.recoveryNote, "retain after failed save")
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
+    func testSelfMCPAdmissionRefusesDuplicateWriterEvenWithinOneWindow() async throws {
+        let fixture = try makeFixture()
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.duplicateWriter")
+        let endpoint = fixture.candidate.domainEndpoint
+        let otherTabID = UUID()
+        let other = fixture.viewModel.session(for: otherTabID)
+        other.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(
+            tabID: otherTabID, sessionID: endpoint.sessionID
+        ))
+        let origin = AgentSelfMCPCallOrigin(
+            endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID
+        )
+
+        let result = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            endpoint: endpoint, origin: origin,
+            note: "continue", idempotencyKey: "duplicate-writer-key"
+        )
+        guard case let .blocked(reason) = result else { return XCTFail("Expected nonexclusive refusal") }
+        XCTAssertEqual(reason, "session_not_exclusive")
+        XCTAssertNil(fixture.session.selfCompactState.active)
+        XCTAssertFalse(fixture.events.contains(.save))
+    }
+
     func testProviderControlOptionsSkipEveryUserAugmentationAndOnlyClaudeCodeDispatchesThem() {
         let command = AgentProviderControlCommand.compact(
             expectedBinding: AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID()),

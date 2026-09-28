@@ -39,9 +39,114 @@ extension AgentModeViewModel {
             }
             state.active?.admittedSupport = support
             session.selfCompactState = state
+            session.isDirty = true
             scheduleSave(for: session)
         }
         return reservation
+    }
+
+    /// Exact self read: never hydrate a target or search by a caller-supplied session UUID.
+    func agentSelfContextSnapshot(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        origin: AgentSelfMCPCallOrigin
+    ) -> AgentSelfContextSnapshot? {
+        guard endpoint == origin.endpoint,
+              let session = sessions[endpoint.tabID],
+              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              session.runID == origin.runID,
+              session.activeRunOwnership?.attemptID == origin.runAttemptID
+        else { return nil }
+        return AgentSelfContextSnapshot(
+            context: Self.observationContextLoad(for: session),
+            selfCompact: session.selfCompactState.status
+        )
+    }
+
+    /// MCP admission is synchronous until the reservation exists. The required save completes while
+    /// this tool execution still owns the originating run's active-tool slot, so terminal dispatch
+    /// cannot outrun durability. A failed/ambiguous save never leaves an executable request armed.
+    func agentSelfCompactMCPAdmission(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        origin: AgentSelfMCPCallOrigin,
+        note: String,
+        idempotencyKey: String
+    ) async -> AgentSelfMCPToolService.Admission {
+        guard endpoint == origin.endpoint,
+              let session = sessions[endpoint.tabID],
+              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              session.runID == origin.runID,
+              session.activeRunOwnership?.attemptID == origin.runAttemptID
+        else { return .unavailable }
+
+        var candidate = session.selfCompactState
+        let reservation = candidate.reserve(note: note, idempotencyKey: idempotencyKey)
+        switch reservation {
+        case let .duplicate(requestID):
+            return .duplicate(requestID: requestID, status: session.selfCompactState.status)
+        case .conflict:
+            return .blocked(reason: "idempotency_conflict")
+        case .alreadyPending:
+            return .blocked(reason: "compact_already_pending")
+        case .invalidNote, .invalidIdempotencyKey:
+            return .blocked(reason: "busy") // Service validation rejects these before admission.
+        case .scheduled:
+            break
+        }
+
+        let sameWindowWriter = sessions.values.contains { other in
+            other !== session && other.activeAgentSessionID == endpoint.sessionID
+        }
+        let competingWriter = sameWindowWriter || WindowStatesManager.shared.allWindows.contains { window in
+            window.agentModeViewModel.sessions.values.contains { other in
+                other !== session && other.activeAgentSessionID == endpoint.sessionID
+            }
+        }
+        guard !competingWriter else { return .blocked(reason: "session_not_exclusive") }
+        guard !session.selfCompactPersistenceWarning,
+              endpoint.persistentBindingGeneration != nil
+        else { return .blocked(reason: "session_not_exclusive") }
+
+        switch agentSessionLinkCompactSupport(for: session) {
+        case .notSupported: return .blocked(reason: "not_supported")
+        case .noProviderSession: return .blocked(reason: "no_provider_session")
+        case .codex, .claudeCode, .acpAdvertisedCommand: break
+        }
+        var readiness = Self.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )
+        readiness.runStateIsActive = false // The caller's own still-running turn is expected.
+        readiness.pendingSelfCompact = false
+        let hasInteraction = readiness.hasWaitingPrompt || readiness.hasPendingAskUser
+            || readiness.hasPendingUserInputRequest || readiness.hasPendingApproval
+            || readiness.hasPendingPermissionsRequest || readiness.hasPendingMCPElicitationRequest
+            || readiness.hasPendingApplyEditsReview || readiness.hasPendingWorktreeMergeReview
+        if hasInteraction { return .blocked(reason: "pending_interaction") }
+        guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness) == .ready,
+              !Self.agentSessionLinkCompactHasQueuedProviderWork(session)
+        else { return .blocked(reason: "busy") }
+
+        guard let accepted = agentSelfCompactSchedule(
+            endpoint: endpoint, runID: origin.runID, runAttemptID: origin.runAttemptID,
+            note: note, idempotencyKey: idempotencyKey
+        ) else { return .blocked(reason: "busy") }
+        guard case let .scheduled(attempt) = accepted else {
+            return .blocked(reason: "busy")
+        }
+        guard case .success = await flushSaveRequired(for: endpoint.tabID, workspaceID: endpoint.workspaceID) else {
+            var state = session.selfCompactState
+            if state.active?.id == attempt.id {
+                state.settle(.recoveryRequired, noteDelivery: .notSent, completionVerified: false)
+                session.selfCompactState = state
+                session.isDirty = true
+                scheduleSave(for: session)
+            }
+            return .blocked(reason: "persistence_indeterminate")
+        }
+        guard sessions[endpoint.tabID] === session,
+              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              session.selfCompactState.active?.id == attempt.id
+        else { return .blocked(reason: "busy") }
+        return .scheduled(session.selfCompactState.active ?? attempt)
     }
 
     func agentSelfCompactTerminalSettled(

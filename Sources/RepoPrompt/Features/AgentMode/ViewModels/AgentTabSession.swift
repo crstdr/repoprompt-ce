@@ -1107,6 +1107,8 @@ final class AgentTabSession: ObservableObject {
         didSet { noteMonitorObservationInputsChanged() }
     }
 
+    var selfCompactPersistenceWarning = false
+
     /// Runtime-only timer and note worker; persisted state is deliberately inert on restore.
     var selfCompactNativeCompletion: AgentSelfCompactNativeCompletionCoordinator?
 

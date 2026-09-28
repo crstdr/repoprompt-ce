@@ -5714,6 +5714,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isStagedForSend: false
         )
         session.selfCompactState = agentSession.selfCompactState ?? .init()
+        session.selfCompactPersistenceWarning = agentSession.selfCompactPersistenceWarning
 
         codexCoordinator.restoreCodexMetadata(from: agentSession, session: session)
         switch session.selectedAgent {
