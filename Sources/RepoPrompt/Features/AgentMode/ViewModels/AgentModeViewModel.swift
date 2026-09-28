@@ -619,6 +619,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_afterClaudeAttachmentSelfCancel: (@MainActor () async -> Void)?
         var test_claudeAttachmentRestartFinished: (@MainActor () -> Void)?
         var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
+        var test_beforeScheduledACPFollowUpStart: (@MainActor () async -> Void)?
+        var test_didFinishScheduledACPFollowUpStart: (@MainActor () -> Void)?
 
         /// Test-only live-authority seam for prompt readiness orchestration.
         var test_agentSessionLinkHasActiveOutboundLink:
@@ -3246,6 +3248,47 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                             initialMessage: initialMessage,
                             stopFence: stopFence
                         )
+                    }
+                },
+                startTypedACPFollowUpRun: { [weak self] session, instruction in
+                    if session.scheduledACPFollowUp != nil {
+                        session.pendingInstructions.append(instruction)
+                        session.isDirty = true
+                        self?.updateBindingsFromSession(session)
+                        self?.scheduleSave(for: session.tabID)
+                        return
+                    }
+                    let stopFence = AgentRunStartStopFence(session: session)
+                    let scheduled = AgentTabSession.ScheduledACPFollowUp(
+                        id: UUID(), instruction: instruction, binding: stopFence.binding
+                    )
+                    session.scheduledACPFollowUp = scheduled
+                    Task { @MainActor [weak self, weak session] in
+                        guard let self, let session else { return }
+                        #if DEBUG
+                            defer { test_didFinishScheduledACPFollowUpStart?() }
+                            await test_beforeScheduledACPFollowUpStart?()
+                        #endif
+                        guard session.scheduledACPFollowUp?.id == scheduled.id else { return }
+                        let startOutcome = AgentRunStartOutcomeRecorder()
+                        _ = await startAgentRun(
+                            tabID: session.tabID, initialMessage: instruction.providerText,
+                            directStartOptions: AgentDirectRunStartOptions(stopFence: stopFence),
+                            startOutcome: startOutcome
+                        )
+                        guard session.scheduledACPFollowUp?.id == scheduled.id else { return }
+                        session.scheduledACPFollowUp = nil
+                        if !startOutcome.outcome.didStart,
+                           sessions[session.tabID] === session,
+                           session.persistentSessionBindingIdentity == scheduled.binding,
+                           let draft = instruction.localDraftText
+                        {
+                            restoreComposerDraft(
+                                tabID: session.tabID, text: draft,
+                                message: "Restored local ACP follow-up after failed start",
+                                strategy: .prependAlways
+                            )
+                        }
                     }
                 },
                 signalMCPInstructionDelivered: { [weak self] session in

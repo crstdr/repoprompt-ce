@@ -170,25 +170,39 @@ extension AgentModeViewModel {
             session.stopState.markCleanupUnclaimedIfNeverStarted(id: request.requestID, binding: binding)
         }
         let teardownCompleted = await teardown.value()
+        /// A terminal state on this mutable session is not evidence that the captured run ended:
+        /// the same object can be rebound or repurposed for a replacement attempt while cleanup waits.
+        func matchedTerminalRunState() -> String? {
+            guard session.persistentSessionBindingIdentity == binding,
+                  session.runState.isTerminalForCommit else { return nil }
+            if let revision = session.lastTerminalCommitRevision {
+                guard revision.ownership == ownership,
+                      revision.expectedRunID == admission.expectedRunID else { return nil }
+                return revision.terminalState.rawValue
+            }
+            guard session.activeRunOwnership == ownership,
+                  session.runID == admission.expectedRunID else { return nil }
+            return session.runState.rawValue
+        }
         let accepted = if case .accepted? = recorder.publicationResult { true } else { false }
         let itemID = session.items.contains(where: { $0.id == request.requestID })
             ? request.requestID : nil
         if !teardownCompleted {
-            if !recorder.initiatedCancellation, session.runState.isTerminalForCommit {
+            if !recorder.initiatedCancellation, let terminalState = matchedTerminalRunState() {
                 return .settled(Self.agentSessionLinkStopReceipt(
                     request: request, targetSessionID: candidate.sessionID,
                     result: .notRunning, stopRequested: false,
-                    audit: .notRequired, runState: session.runState.rawValue
+                    audit: .notRequired, runState: terminalState
                 ))
             }
             if recorder.initiatedCancellation, recorder.teardownCompleted,
-               recorder.publicationResult == nil
+               recorder.publicationResult == nil, let terminalState = matchedTerminalRunState()
             {
                 return .settled(Self.agentSessionLinkStopReceipt(
                     request: request, targetSessionID: candidate.sessionID,
                     result: .notRunning, stopRequested: true,
                     teardownCompleted: true, audit: .notRequired,
-                    runState: session.runState.rawValue
+                    runState: terminalState
                 ))
             }
             let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
@@ -212,13 +226,13 @@ extension AgentModeViewModel {
         }
         let auditStatus = await audit.value()
         if recorder.initiatedCancellation, recorder.teardownCompleted,
-           recorder.publicationResult == nil
+           recorder.publicationResult == nil, let terminalState = matchedTerminalRunState()
         {
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
                 result: .notRunning, stopRequested: true,
                 teardownCompleted: true, audit: .notRequired,
-                runState: session.runState.rawValue
+                runState: terminalState
             ))
         }
         let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {

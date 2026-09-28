@@ -213,6 +213,7 @@ extension AgentModeRunService {
     /// Authority: lifecycle command issuance back into the host.
     struct RunContinuationHooks {
         let startFollowUpRun: (AgentTabSession, String) -> Void
+        let startTypedACPFollowUpRun: (AgentTabSession, AgentTabSession.PendingInstruction) -> Void
         /// Wakes MCP waiters once a steering instruction has actually been delivered to the provider.
         let signalMCPInstructionDelivered: (_ session: AgentTabSession) async -> Void
     }

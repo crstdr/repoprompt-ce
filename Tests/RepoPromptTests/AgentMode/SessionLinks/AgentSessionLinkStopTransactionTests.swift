@@ -524,6 +524,37 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(receipt.stopRequested, false)
     }
 
+    func testTerminalReplacementBeforeCleanupCannotMasqueradeAsNaturalCompletion() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "captured-before-terminal-rebind")
+        let outcome = await stop(fixture, beforeCleanupTask: {
+            fixture.session.installPersistentSessionBinding(
+                AgentPersistentSessionBindingIdentity(tabID: fixture.tabID, sessionID: UUID())
+            )
+            fixture.session.installRunID(UUID())
+            _ = fixture.session.beginRunAttempt(source: "terminal-replacement")
+            fixture.session.runState = .completed
+        })
+        guard case let .settled(receipt) = outcome else { return XCTFail("expected retained receipt") }
+        XCTAssertEqual(receipt.result, .stopFailed)
+        XCTAssertEqual(receipt.failureReason, .targetChanged)
+        XCTAssertEqual(receipt.stopRequested, false)
+        XCTAssertNil(receipt.resultingRunState)
+        XCTAssertNil(receipt.targetItemID)
+        XCTAssertEqual(fixture.session.runState, .completed)
+        XCTAssertFalse(fixture.session.items.contains(where: { $0.text == AgentChatItem.overseerRunStoppedText }))
+        let rendered = try AgentSessionLinkMCPToolService.stopOutcomeValue(
+            .receipt(receipt), targetSessionID: fixture.candidate.sessionID
+        )
+        fixture.session.runState = .failed
+        let replay = try AgentSessionLinkMCPToolService.stopOutcomeValue(
+            .receipt(receipt), targetSessionID: fixture.candidate.sessionID
+        )
+        XCTAssertEqual(replay, rendered, "retained receipt must not resample replacement state")
+    }
+
     func testNaturalCompletionBeforeTaskEntryIsNoopWithoutAttribution() async throws {
         let fixture = try makeFixture()
         fixture.session.runState = .running

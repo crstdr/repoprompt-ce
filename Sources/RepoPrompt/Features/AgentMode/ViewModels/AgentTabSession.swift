@@ -353,6 +353,16 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// An ACP fallback handed to the scheduled-start task but not yet accepted by a provider.
+    /// Stop owns its local recovery payload until that start is accepted or withdrawn.
+    struct ScheduledACPFollowUp {
+        let id: UUID
+        let instruction: PendingInstruction
+        let binding: AgentPersistentSessionBindingIdentity?
+    }
+
+    var scheduledACPFollowUp: ScheduledACPFollowUp?
+
     /// Instruction queue for when user sends while agent is not waiting (shared across all runners)
     var pendingInstructions: [PendingInstruction] = [] {
         didSet {

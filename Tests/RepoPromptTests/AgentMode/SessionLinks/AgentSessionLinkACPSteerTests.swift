@@ -253,6 +253,86 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
     }
 
+    func testCompletedACPFallbackStopRestoresOnlyScheduledLocalDraft() async throws {
+        let fixture = try await makeFixture()
+        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        let terminalRevision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
+        XCTAssertEqual(fixture.session.runState, .completed)
+        XCTAssertTrue(fixture.session.acpController === fixture.controller)
+
+        let entered = AgentSessionLinkStopSignal<Void>()
+        let release = AgentSessionLinkStopSignal<Void>()
+        let finished = AgentSessionLinkStopSignal<Void>()
+        addTeardownBlock { release.finish(()) }
+        fixture.viewModel.test_didFinishScheduledACPFollowUpStart = { finished.finish(()) }
+        fixture.viewModel.test_beforeScheduledACPFollowUpStart = {
+            entered.finish(())
+            await release.value()
+        }
+        defer {
+            fixture.viewModel.test_beforeScheduledACPFollowUpStart = nil
+            fixture.viewModel.test_didFinishScheduledACPFollowUpStart = nil
+        }
+        let local = AgentModeViewModel.TabSession.ACPSteeringInstruction(
+            id: UUID(), targetRunID: fixture.session.runID,
+            targetRunAttemptID: fixture.session.activeRunAttemptID,
+            providerText: "local provider text", interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "typed local draft",
+            optimisticUserItemID: nil, createdAt: Date()
+        )
+        let message = request("managed scheduled direction")
+        let envelope = AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: message.observerSessionID, sourceName: message.observerDisplayName,
+            linkID: message.linkID, linkGeneration: message.linkGeneration,
+            message: message.message, framing: .management
+        )
+        let row = AgentChatItem.user(
+            message.message, sequenceIndex: fixture.session.nextSequenceIndex,
+            crossSessionAttribution: message.attribution, dispatchedProviderText: envelope
+        )
+        fixture.session.appendItem(row)
+        let sink = AgentSessionLinkManagedSteerSink()
+        let managed = AgentModeViewModel.TabSession.ACPSteeringInstruction(
+            id: UUID(), targetRunID: fixture.session.runID,
+            targetRunAttemptID: fixture.session.activeRunAttemptID,
+            providerText: envelope, interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "",
+            optimisticUserItemID: row.id, createdAt: Date(),
+            managed: .init(
+                sink: sink, attributedItemID: row.id,
+                candidate: fixture.candidate, attribution: message.attribution
+            )
+        )
+        fixture.viewModel.test_requeueDequeuedACPSteeringAfterStop(
+            [local, managed], session: fixture.session,
+            stopFence: AgentRunStartStopFence(session: fixture.session)
+        )
+        await entered.value()
+        XCTAssertEqual(sink.outcome, .delivered(.queuedFollowUp))
+        XCTAssertNotNil(fixture.session.scheduledACPFollowUp)
+        let stopRequest = AgentSessionLinkStopRequest(
+            requestID: UUID(), linkID: UUID(), linkGeneration: 1,
+            observerEndpoint: Self.observer, observerDisplayName: "Overseer"
+        )
+        let stop = await fixture.viewModel.agentSessionLinkPerformStop(
+            to: fixture.candidate, request: stopRequest,
+            liveness: { Self.liveness }, queueHasCommittedDrain: { false },
+            withdrawInbound: { true }, commitAuthorization: { .committed }
+        )
+        guard case let .settled(receipt) = stop else { return XCTFail("Expected Stop receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertNil(fixture.session.scheduledACPFollowUp)
+        release.finish(())
+        await finished.value()
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
+        XCTAssertEqual(fixture.session.lastTerminalCommitRevision, terminalRevision)
+        XCTAssertEqual(fixture.session.runState, .completed)
+        let draft = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        XCTAssertTrue(draft.contains("typed local draft"))
+        XCTAssertFalse(draft.contains(message.message))
+        XCTAssertFalse(draft.contains(envelope))
+    }
+
     func testOldFlushResumingAfterStopCannotClearSuccessorSteering() async throws {
         let fixture = try await makeFixture()
         let oldRunID = try XCTUnwrap(fixture.session.runID)
@@ -392,6 +472,31 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         await fixture.session.teardownACPControllerIfPresent()
         guard case .notAccepted = sink.outcome else { return XCTFail("Teardown left a managed sink pending") }
         XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+    }
+
+    func testControllerTeardownWithdrawsDequeuedManagedBatchDuringAugmentation() async throws {
+        let fixture = try await makeFixture()
+        let entered = AgentSessionLinkStopSignal<Void>()
+        let release = AgentSessionLinkStopSignal<Void>()
+        addTeardownBlock { release.finish(()) }
+        fixture.viewModel.test_afterProviderInputAugmentation = {
+            entered.finish(())
+            await release.value()
+        }
+        defer { fixture.viewModel.test_afterProviderInputAugmentation = nil }
+        let message = request("managed direction during teardown")
+        let steering = Task { await self.steer(fixture, request: message) }
+        await entered.value()
+        XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+        let optimisticRow = try XCTUnwrap(fixture.session.items.first(where: { $0.text == message.message }))
+        await fixture.session.teardownACPControllerIfPresent()
+        release.finish(())
+        let outcome = await steering.value
+        XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
+        XCTAssertFalse(fixture.session.items.contains(where: { $0.id == optimisticRow.id }))
+        XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
     }
 
     func testInterruptedAttributedReplayUsesExactStoredProviderBytes() async throws {

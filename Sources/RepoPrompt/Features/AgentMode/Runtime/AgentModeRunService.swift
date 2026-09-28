@@ -418,6 +418,7 @@ final class AgentModeRunService {
             }
 
             while true {
+                guard !Task.isCancelled, session.acpSteeringFlushID == flushID else { return }
                 guard isCurrentACPSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID, controller: controller) else {
                     requeueQueuedACPSteeringAsFollowUp(
                         tabID: tabID,
@@ -467,6 +468,8 @@ final class AgentModeRunService {
                 } catch {
                     releaseSupersedingProtectionIfUnused()
                     steeringDebugLog("[AgentRunSteeringWake] ACP flush MCP idle cancelled tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) error=\(error)")
+                    guard !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                          session.acpController === controller else { return }
                     requeueQueuedACPSteeringAsFollowUp(
                         tabID: tabID,
                         session: session,
@@ -477,6 +480,12 @@ final class AgentModeRunService {
                     return
                 }
 
+                guard !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                      session.acpController === controller
+                else {
+                    releaseSupersedingProtectionIfUnused()
+                    return
+                }
                 guard isCurrentACPSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID, controller: controller),
                       !session.pendingACPSteeringInstructions.isEmpty
                 else {
@@ -519,8 +528,18 @@ final class AgentModeRunService {
                     steeringBatch.flatMap(\.taggedFileAttachments),
                     session
                 )
-                // Augmentation suspended. Re-prove every attributed endpoint before the provider
-                // call; if one went stale, never send the already-coalesced batch containing it.
+                // Augmentation suspended. A retired flush owns this dequeued batch, which teardown
+                // cannot see in the queue; withdraw it rather than requeueing into a dead controller.
+                guard !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                      session.acpController === controller
+                else {
+                    releaseSupersedingProtectionIfUnused()
+                    withdrawManagedACPSteering(steeringBatch, session: session, stopFence: flushStopFence)
+                    restoreLocalACPSteeringDrafts(steeringBatch, tabID: tabID, session: session, stopFence: flushStopFence)
+                    return
+                }
+                // Re-prove every attributed endpoint before the provider call; if one went stale,
+                // never send the already-coalesced batch containing it.
                 guard flushStopFence.permitsStart(of: session),
                       hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
                 else {
@@ -550,14 +569,21 @@ final class AgentModeRunService {
                     targetRunAttemptID: runAttemptID,
                     targetController: controller
                 )
-                hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
+                if !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                   session.acpController === controller,
+                   hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
+                {
+                    hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
+                }
                 if sent {
                     steeringBatch.forEach { $0.managed?.sink.resolve(.delivered(.steered)) }
                     await hooks.continuation.signalMCPInstructionDelivered(session)
                 }
                 if !sent {
                     releaseSupersedingProtectionIfUnused()
-                    guard flushStopFence.permitsStart(of: session),
+                    guard !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                          session.acpController === controller,
+                          flushStopFence.permitsStart(of: session),
                           hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
                     else {
                         withdrawManagedACPSteering(steeringBatch, session: session, stopFence: flushStopFence)
@@ -816,7 +842,7 @@ final class AgentModeRunService {
         current.forEach { $0.managed?.sink.resolve(.delivered(.queuedFollowUp)) }
         if session.runState == .completed, session.acpController != nil {
             session.mcpFollowUpRunPending = true
-            hooks.continuation.startFollowUpRun(session, followUp.providerText)
+            hooks.continuation.startTypedACPFollowUpRun(session, followUp)
             return
         }
         session.pendingInstructions.insert(followUp, at: 0)
@@ -1187,6 +1213,16 @@ final class AgentModeRunService {
         restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
         session.pendingClaudeSteeringInstructions.removeAll()
         restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID)
+        if let scheduled = session.scheduledACPFollowUp {
+            session.scheduledACPFollowUp = nil
+            if scheduled.binding == session.persistentSessionBindingIdentity,
+               let draft = scheduled.instruction.localDraftText
+            {
+                hooks.queuedWorkRecovery.restoreDraftText(
+                    tabID, draft, "Restored local ACP follow-up after Stop", .prependAlways
+                )
+            }
+        }
         let localPending = session.pendingInstructions.compactMap(\.localDraftText)
         if !localPending.isEmpty {
             hooks.queuedWorkRecovery.restoreDraftText(
