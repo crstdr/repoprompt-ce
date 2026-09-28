@@ -357,15 +357,6 @@ enum AgentSessionLinkMessageEnvelope {
     /// Version of the management framing below. Revisions count per `delegation` value.
     static let managementFramingRevision = "1"
 
-    /// Fail closed when restoring provider payloads into a local composer draft. The envelope
-    /// may be nested in an ACP coalesced batch, and attributes need not keep render order.
-    static func containsManagedEnvelope(_ text: String) -> Bool {
-        text.range(
-            of: #"<cross_session_message\b[^>]*\bdelegation\s*=\s*["']user_delegated_management["']"#,
-            options: .regularExpression
-        ) != nil
-    }
-
     /// Fixed framing for direction from a user-delegated overseer (`steer`).
     ///
     /// The coordination preamble tells a target to refuse permission decisions and scope changes

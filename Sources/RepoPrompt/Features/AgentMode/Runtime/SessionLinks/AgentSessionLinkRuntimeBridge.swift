@@ -400,7 +400,8 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
     func agentSessionLinkStartStopFence(for _: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
-        .unavailable()
+        // A host without a live session cannot admit a queued send; reject before enqueuing.
+        nil
     }
 
     /// Fail-closed management defaults: a host that does not model interactions or steering exposes

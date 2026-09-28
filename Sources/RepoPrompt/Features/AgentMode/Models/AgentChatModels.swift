@@ -386,7 +386,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     }
 
     /// Provider-replay-safe fact row: the overseer's name remains typed display metadata only.
-    public static let overseerRunStoppedText = "The run was stopped by an overseeing session."
+    public static let overseerRunStoppedText = "Run stopped by an overseeing session."
 
     public static func overseerRunStopped(
         stopID: UUID,

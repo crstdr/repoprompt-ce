@@ -333,8 +333,28 @@ final class AgentTabSession: ObservableObject {
     /// when MCP control is active, `.userConfigured` otherwise.
     var permissionProfile: AgentModeViewModel.AgentPermissionProfile = .userConfigured
 
+    /// A provider follow-up and its separately typed, locally restorable draft. Provider text
+    /// may mix local and managed ACP steering; its contents never establish draft authorship.
+    struct PendingInstruction: Equatable, ExpressibleByStringLiteral {
+        let providerText: String
+        let localDraftText: String?
+
+        init(providerText: String, localDraftText: String?) {
+            self.providerText = providerText
+            self.localDraftText = localDraftText
+        }
+
+        init(stringLiteral value: String) {
+            self.init(providerText: value, localDraftText: value)
+        }
+
+        static func providerOnly(_ text: String) -> Self {
+            Self(providerText: text, localDraftText: nil)
+        }
+    }
+
     /// Instruction queue for when user sends while agent is not waiting (shared across all runners)
-    var pendingInstructions: [String] = [] {
+    var pendingInstructions: [PendingInstruction] = [] {
         didSet {
             if oldValue.count != pendingInstructions.count {
                 noteMonitorObservationInputsChanged()
@@ -405,6 +425,15 @@ final class AgentTabSession: ObservableObject {
         let optimisticUserItemID: UUID?
         let createdAt: Date
         var managed: ACPSteeringManagedContext?
+    }
+
+    /// Lifecycle discards that cannot preserve the queue still owe every managed caller a result.
+    func settlePendingManagedACPSteeringAsNotAccepted() {
+        for instruction in pendingACPSteeringInstructions {
+            instruction.managed?.sink.resolve(.notAccepted(
+                message: "The ACP steer was withdrawn before the provider accepted it."
+            ))
+        }
     }
 
     var pendingACPSteeringInstructions: [ACPSteeringInstruction] = [] {
@@ -983,8 +1012,13 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
-    func clearACPCompactSettling() {
-        guard acpCompactSettling != nil else { return }
+    func clearACPCompactSettling(
+        providerSessionID: String? = nil,
+        controller: ACPAgentSessionController? = nil
+    ) {
+        guard let marker = acpCompactSettling else { return }
+        if let providerSessionID, marker.providerSessionID != providerSessionID { return }
+        if let controller, marker.controllerID != ObjectIdentifier(controller) { return }
         acpCompactSettleDeadlineTask?.cancel()
         acpCompactSettleDeadlineTask = nil
         acpCompactSettling = nil

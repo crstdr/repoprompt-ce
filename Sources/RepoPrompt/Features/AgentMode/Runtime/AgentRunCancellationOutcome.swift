@@ -16,6 +16,11 @@ struct AgentRunStopState {
     }
 
     mutating func claimManagedStop(id: UUID, binding: AgentPersistentSessionBindingIdentity) -> Bool {
+        // An in-place rebind retires the previous gate even if its cleanup timed out. Its
+        // late release still carries the old binding and cannot release this successor.
+        if activeManagedStopBinding != binding {
+            clearManagedStop()
+        }
         guard activeManagedStopID == nil else { return false }
         activeManagedStopID = id
         activeManagedStopBinding = binding
@@ -27,12 +32,16 @@ struct AgentRunStopState {
 
     mutating func releaseManagedStop(id: UUID, binding: AgentPersistentSessionBindingIdentity) -> Bool {
         guard activeManagedStopID == id, activeManagedStopBinding == binding else { return false }
+        clearManagedStop()
+        return true
+    }
+
+    private mutating func clearManagedStop() {
         activeManagedStopID = nil
         activeManagedStopBinding = nil
         managedStopCleanupClaimed = false
         managedStopCleanupStarted = false
         managedStopClaimedAt = nil
-        return true
     }
 
     mutating func markCleanupStarted(id: UUID, binding: AgentPersistentSessionBindingIdentity) {
@@ -57,11 +66,7 @@ struct AgentRunStopState {
         let startedTeardownTimedOut = runIsTerminal && managedStopCleanupStarted
             && managedStopClaimedAt.map { now.timeIntervalSince($0) >= deadlineSeconds } == true
         guard !managedStopCleanupClaimed || startedTeardownTimedOut else { return false }
-        activeManagedStopID = nil
-        activeManagedStopBinding = nil
-        managedStopCleanupClaimed = false
-        managedStopCleanupStarted = false
-        managedStopClaimedAt = nil
+        clearManagedStop()
         return true
     }
 
@@ -87,11 +92,6 @@ struct AgentRunStartStopFence: Equatable {
         binding = session.persistentSessionBindingIdentity
         cancellationGeneration = session.stopState.cancellationGeneration
         cancellationCount = session.stopState.cancellationCount
-    }
-
-    /// Test/legacy hosts without a live session cannot bless a deferred provider start.
-    static func unavailable() -> Self {
-        Self(binding: nil, cancellationGeneration: UUID(), cancellationCount: 0)
     }
 
     private init(binding: AgentPersistentSessionBindingIdentity?, cancellationGeneration: UUID, cancellationCount: UInt64) {

@@ -801,23 +801,25 @@ final class AgentModeRunService {
         }
         let current = currentACPSteeringInstructions(instructions, session: session)
         guard !current.isEmpty else { return }
-        var providerTexts = [coalescedACPProviderText(for: current)]
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        guard !providerTexts.isEmpty else {
+        let providerText = coalescedACPProviderText(for: current)
+        guard !providerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             current.forEach { $0.managed?.sink.resolve(.notAccepted(message: "The ACP steer contained no provider text.")) }
             return
         }
+        let localDrafts = current.filter { $0.managed == nil }
+            .map(\.draftText)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let followUp = AgentTabSession.PendingInstruction(
+            providerText: providerText,
+            localDraftText: localDrafts.isEmpty ? nil : localDrafts.joined(separator: "\n")
+        )
         current.forEach { $0.managed?.sink.resolve(.delivered(.queuedFollowUp)) }
         if session.runState == .completed, session.acpController != nil {
-            let first = providerTexts.removeFirst()
-            if !providerTexts.isEmpty {
-                session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
-            }
             session.mcpFollowUpRunPending = true
-            hooks.continuation.startFollowUpRun(session, first)
+            hooks.continuation.startFollowUpRun(session, followUp.providerText)
             return
         }
-        session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
+        session.pendingInstructions.insert(followUp, at: 0)
         session.isDirty = true
         hooks.bindingObservation.updateBindings(session)
         hooks.persistence.scheduleSave(session)
@@ -1133,12 +1135,8 @@ final class AgentModeRunService {
     ) {
         let drafts = (
             session.pendingClaudeSteeringInstructions.map(\.draftText)
-                + session.pendingACPSteeringInstructions.map(\.draftText)
-                + session.pendingInstructions.filter { text in
-                    // Managed ACP follow-ups retain their provider envelope in this shared queue.
-                    // Never restore that attributed provider text as the lane user's draft.
-                    !AgentSessionLinkMessageEnvelope.containsManagedEnvelope(text)
-                }
+                + session.pendingACPSteeringInstructions.filter { $0.managed == nil }.map(\.draftText)
+                + session.pendingInstructions.compactMap(\.localDraftText)
         )
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
@@ -1189,9 +1187,7 @@ final class AgentModeRunService {
         restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
         session.pendingClaudeSteeringInstructions.removeAll()
         restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID)
-        let localPending = session.pendingInstructions.filter { text in
-            !AgentSessionLinkMessageEnvelope.containsManagedEnvelope(text)
-        }
+        let localPending = session.pendingInstructions.compactMap(\.localDraftText)
         if !localPending.isEmpty {
             hooks.queuedWorkRecovery.restoreDraftText(
                 tabID, localPending.joined(separator: "\n"),

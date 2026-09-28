@@ -40,6 +40,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var sendLivenessReadings: [AgentSessionLinkSendLiveness] = []
         /// Overrides the target window's teardown state without removing its candidate.
         var targetWindowIsClosing = false
+        var providesStartStopFence = true
+        private let fenceSession = AgentTabSession(tabID: UUID())
+        func agentSessionLinkStartStopFence(for _: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+            providesStartStopFence ? AgentRunStartStopFence(session: fenceSession) : nil
+        }
+
         /// When true the fake invokes the commit fence exactly as the real host does.
         var invokesSendCommit = true
         /// Runs after the reservation exists but before the commit fence, so a test can land a
@@ -4282,6 +4288,18 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             .delivered(receipt),
             "The terminal outcome stays readable through poll until the next queue mutation"
         )
+    }
+
+    func testMissingStartStopFenceRejectsQueuedSendBeforeAdmission() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        fixture.host.providesStartStopFence = false
+
+        let outcome = await queueSend(fixture)
+        XCTAssertEqual(outcome, .send(.blocked(.endpointInvalidated)))
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
     }
 
     func testStopWithdrawalRetainsTargetStoppedOnlyForTheExactTargetEndpoint() async {

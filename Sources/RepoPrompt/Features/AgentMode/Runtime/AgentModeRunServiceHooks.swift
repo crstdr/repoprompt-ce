@@ -323,14 +323,14 @@ extension AgentModeRunService.Hooks {
                 session.items.last(where: { $0.kind == .user })?.id
             },
             queuedFollowUp: {
-                session.pendingInstructions.first
+                session.pendingInstructions.first?.providerText
             },
             setFollowUpPending: { pending in
                 session.mcpFollowUpRunPending = pending
             },
             removeFirstQueuedFollowUp: {
                 guard !session.pendingInstructions.isEmpty else { return nil }
-                return session.pendingInstructions.removeFirst()
+                return session.pendingInstructions.removeFirst().providerText
             },
             appendError: { errorText in
                 session.appendItem(

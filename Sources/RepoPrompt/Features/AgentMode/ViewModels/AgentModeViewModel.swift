@@ -11732,7 +11732,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 + pendingClaudeReasoningStatusBytes
                 + pendingAssistantDeltaBytes
             let pendingInstructionBytes = session.pendingInstructions.reduce(0) { partial, instruction in
-                partial + instruction.utf8.count
+                partial + instruction.providerText.utf8.count
             }
             let ownership = session.activeRunOwnership
             let liveness = session.activeRunLiveness
@@ -13978,6 +13978,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.acpSteeringFlushTask?.cancel()
         session.acpSteeringFlushTask = nil
         session.acpSteeringFlushID = nil
+        session.settlePendingManagedACPSteeringAsNotAccepted()
         session.pendingACPSteeringInstructions.removeAll()
         let acpController = session.acpController
         session.acpController = nil
@@ -17381,7 +17382,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         } else {
             // Shared follow-up queue for providers that consume queued instructions at the next turn boundary.
-            session.pendingInstructions.append(wrappedText)
+            session.pendingInstructions.append(.init(
+                providerText: wrappedText,
+                localDraftText: managedTurn == nil ? wrappedText : nil
+            ))
         }
         return UserTurnSubmissionResult.submitted
     }
@@ -17506,7 +17510,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
                 if session.runState.isActive {
-                    session.pendingInstructions.insert(queued.providerText, at: 0)
+                    session.pendingInstructions.insert(
+                        .init(providerText: queued.providerText, localDraftText: queued.managed == nil ? queued.draftText : nil),
+                        at: 0
+                    )
                     queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
                 } else if session.runState == .completed, session.acpController != nil {
                     queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
@@ -17519,7 +17526,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     // ACP steering should never bounce back into the composer. If the
                     // active-steering queue was rejected before the run service could take it,
                     // preserve it as a normal provider follow-up instead.
-                    session.pendingInstructions.insert(queued.providerText, at: 0)
+                    session.pendingInstructions.insert(
+                        .init(providerText: queued.providerText, localDraftText: queued.managed == nil ? queued.draftText : nil),
+                        at: 0
+                    )
                     queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
                     session.isDirty = true
                     updateBindingsFromSession(session)
@@ -20124,7 +20134,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if !session.pendingInstructions.isEmpty {
             let queuedText = session.pendingInstructions.removeFirst()
             let text = await augmentUserMessageForProviderSend(
-                queuedText,
+                queuedText.providerText,
                 agent: session.selectedAgent,
                 session: session
             )

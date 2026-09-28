@@ -128,8 +128,15 @@ struct AgentDirectRunStartOptions: Equatable {
     static let crossSessionDelivery = AgentDirectRunStartOptions(ignoresPendingHandoff: true)
 
     /// Options for one overseer-requested provider control command.
-    static func providerControl(_ command: AgentProviderControlCommand) -> AgentDirectRunStartOptions {
-        AgentDirectRunStartOptions(ignoresPendingHandoff: true, providerControlCommand: command)
+    static func providerControl(
+        _ command: AgentProviderControlCommand,
+        stopFence: AgentRunStartStopFence? = nil
+    ) -> AgentDirectRunStartOptions {
+        AgentDirectRunStartOptions(
+            ignoresPendingHandoff: true,
+            providerControlCommand: command,
+            stopFence: stopFence
+        )
     }
 
     /// Options for one automatic lane-update follow-up.

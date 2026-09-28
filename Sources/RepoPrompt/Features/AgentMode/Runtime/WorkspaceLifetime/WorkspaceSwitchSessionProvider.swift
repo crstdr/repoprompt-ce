@@ -262,6 +262,7 @@ extension AgentTabSession {
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
         acpSteeringFlushID = nil
+        settlePendingManagedACPSteeringAsNotAccepted()
         pendingACPSteeringInstructions.removeAll()
         guard let controller = acpController else { return }
         acpController = nil

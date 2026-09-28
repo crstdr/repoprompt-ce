@@ -84,6 +84,7 @@ extension AgentModeViewModel {
         guard let session = agentSessionLinkLiveSession(matching: candidate) else {
             return .blocked(.endpointInvalidated)
         }
+        let stopFence = AgentRunStartStopFence(session: session)
         let admissionLiveness = liveness()
         guard admissionLiveness.permitsDelivery else {
             return .blocked(.endpointInvalidated)
@@ -147,6 +148,7 @@ extension AgentModeViewModel {
         guard let liveSession = agentSessionLinkLiveSession(matching: candidate),
               liveSession === session,
               postCommitLiveness.permitsDelivery,
+              stopFence.permitsStart(of: liveSession),
               composerSubmitClaimIsCurrent(claim)
         else {
             releaseComposerSubmitClaim(claim)
@@ -218,6 +220,7 @@ extension AgentModeViewModel {
         guard agentSessionLinkLiveSession(matching: candidate) === liveSession,
               dispatchLiveness.permitsDelivery,
               composerSubmitClaimIsCurrent(claim),
+              stopFence.permitsStart(of: liveSession),
               workspaceManager?.activeWorkspace?.id == candidate.workspaceID,
               agentSessionLinkCompactSupport(for: liveSession) == support
         else {
@@ -261,6 +264,7 @@ extension AgentModeViewModel {
                           agentSessionLinkLiveSession(matching: candidate) === liveSession,
                           current.permitsDelivery,
                           composerSubmitClaimIsCurrent(claim),
+                          stopFence.permitsStart(of: liveSession),
                           workspaceManager?.activeWorkspace?.id == candidate.workspaceID
                     else { return false }
                     return AgentSessionLinkDeliveryReadiness.evaluate(
@@ -293,7 +297,7 @@ extension AgentModeViewModel {
             _ = await startAgentRun(
                 tabID: candidate.tabID,
                 initialMessage: command.providerText,
-                directStartOptions: .providerControl(command),
+                directStartOptions: .providerControl(command, stopFence: stopFence),
                 startOutcome: startRecorder
             )
             didStart = startRecorder.outcome.didStart

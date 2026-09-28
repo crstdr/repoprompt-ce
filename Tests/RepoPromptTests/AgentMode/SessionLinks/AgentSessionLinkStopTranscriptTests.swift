@@ -20,7 +20,7 @@ final class AgentSessionLinkStopTranscriptTests: XCTestCase {
         )
         XCTAssertEqual(row.id, stopID)
         XCTAssertEqual(row.kind, .system)
-        XCTAssertEqual(row.text, "The run was stopped by an overseeing session.")
+        XCTAssertEqual(row.text, "Run stopped by an overseeing session.")
         XCTAssertFalse(row.text.contains("Overseer"))
         XCTAssertEqual(row.crossSessionAttribution, attribution)
         let decoded = try JSONDecoder().decode(AgentChatItem.self, from: JSONEncoder().encode(row))
@@ -77,13 +77,14 @@ final class AgentSessionLinkStopTranscriptTests: XCTestCase {
         XCTAssertEqual(failedPayload["reason"]?.stringValue, "terminal_publication_rejected")
     }
 
-    func testManagedEnvelopeDetectionCoversIndentedAndCoalescedPayloads() {
-        let envelope = "  <cross_session_message origin=\"user_granted_session_link\" delegation=\"user_delegated_management\">"
-        XCTAssertTrue(AgentSessionLinkMessageEnvelope.containsManagedEnvelope(envelope))
-        XCTAssertTrue(AgentSessionLinkMessageEnvelope.containsManagedEnvelope(
-            "<steering_messages>\n<message>\n\(envelope)\n</message>\n</steering_messages>"
-        ))
-        XCTAssertFalse(AgentSessionLinkMessageEnvelope.containsManagedEnvelope("local queued instruction"))
+    func testPendingInstructionRecoveryUsesTypedLocalDraftNotEnvelopeText() {
+        let providerText = "<cross_session_message delegation=\"user_delegated_management\">managed-looking</cross_session_message>"
+        let local = AgentTabSession.PendingInstruction(
+            providerText: providerText, localDraftText: "local draft"
+        )
+        let managed = AgentTabSession.PendingInstruction.providerOnly("plain provider text")
+        XCTAssertEqual(local.localDraftText, "local draft")
+        XCTAssertNil(managed.localDraftText)
     }
 
     func testFlatReceiptContainsNoAuditOrRequestIdentity() throws {

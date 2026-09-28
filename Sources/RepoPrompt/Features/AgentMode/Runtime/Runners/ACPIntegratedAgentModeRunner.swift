@@ -1186,14 +1186,20 @@ final class ACPIntegratedAgentModeRunner {
             // Nothing was sent, so the count still describes the context.
             await abandonConsumer()
             session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
-            session.clearACPCompactSettling()
+            session.clearACPCompactSettling(
+                providerSessionID: command.expectedProviderConversation,
+                controller: controller
+            )
             log("provider control command refused: \(refusal.reason)", runID: runID)
             let errorText = "\(displayName) did not run the requested command: \(refusal.reason)"
             return refusal.sessionIsUsable ? .refusedBeforeSend(errorText: errorText) : .failed(errorText: errorText)
         } catch is ACPAgentSessionController.ProviderCommandCancelledBeforeSend {
             await abandonConsumer()
             session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
-            session.clearACPCompactSettling()
+            session.clearACPCompactSettling(
+                providerSessionID: command.expectedProviderConversation,
+                controller: controller
+            )
             return .cancelled
         } catch is CancellationError {
             await abandonConsumer()

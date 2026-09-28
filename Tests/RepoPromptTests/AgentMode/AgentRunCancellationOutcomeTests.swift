@@ -30,6 +30,21 @@ final class AgentRunCancellationOutcomeTests: XCTestCase {
     }
 
     @MainActor
+    func testDeferredCompactOptionsRetainPreStopFence() {
+        let session = AgentTabSession(tabID: UUID())
+        let binding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID())
+        session.installPersistentSessionBinding(binding)
+        let fence = AgentRunStartStopFence(session: session)
+        let command = AgentProviderControlCommand.compact(
+            expectedBinding: binding, expectedProviderConversation: "provider-session"
+        )
+        let options = AgentDirectRunStartOptions.providerControl(command, stopFence: fence)
+        XCTAssertTrue(options.stopFence?.permitsStart(of: session) == true)
+        session.stopState.invalidateScheduledStarts()
+        XCTAssertFalse(options.stopFence?.permitsStart(of: session) == true)
+    }
+
+    @MainActor
     func testStopGateCanOnlyBeReleasedByItsOwnBindingAndRequest() {
         var state = AgentRunStopState()
         let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID())
@@ -45,6 +60,26 @@ final class AgentRunCancellationOutcomeTests: XCTestCase {
         XCTAssertTrue(state.isStopping(binding: binding))
         XCTAssertTrue(state.releaseManagedStop(id: stopID, binding: binding))
         XCTAssertFalse(state.isStopping(binding: binding))
+    }
+
+    @MainActor
+    func testTimedOutStopGateExpiresOnInPlaceRebindWithoutReleasingSuccessor() {
+        let session = AgentTabSession(tabID: UUID())
+        let oldBinding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID())
+        session.installPersistentSessionBinding(oldBinding)
+        let oldStopID = UUID()
+        XCTAssertTrue(session.stopState.claimManagedStop(id: oldStopID, binding: oldBinding))
+        session.stopState.markCleanupStarted(id: oldStopID, binding: oldBinding)
+        session.stopState.test_ageManagedStopClaim(by: 31)
+
+        let newBinding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: oldBinding.sessionID)
+        session.installPersistentSessionBinding(newBinding)
+        XCTAssertFalse(session.stopState.isStopping(binding: newBinding))
+        let newStopID = UUID()
+        XCTAssertTrue(session.stopState.claimManagedStop(id: newStopID, binding: newBinding))
+        XCTAssertFalse(session.stopState.releaseManagedStop(id: oldStopID, binding: oldBinding))
+        XCTAssertTrue(session.stopState.isStopping(binding: newBinding))
+        XCTAssertTrue(session.stopState.releaseManagedStop(id: newStopID, binding: newBinding))
     }
 
     @MainActor

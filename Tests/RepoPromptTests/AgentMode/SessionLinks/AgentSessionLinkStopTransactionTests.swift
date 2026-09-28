@@ -168,10 +168,10 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         let fixture = try makeFixture()
         fixture.viewModel.storeDraftText(for: fixture.tabID, "the user's own draft")
         fixture.session.mcpFollowUpRunPending = true
-        fixture.session.pendingInstructions = [AgentSessionLinkMessageEnvelope.render(
+        fixture.session.pendingInstructions = [.providerOnly(AgentSessionLinkMessageEnvelope.render(
             sourceSessionID: UUID(), sourceName: "Overseer", linkID: UUID(),
             linkGeneration: 1, message: "overseer-only", framing: .management
-        )]
+        ))]
         fixture.session.pendingClaudeSteeringInstructions = [
             .init(
                 id: UUID(), targetRunID: nil, targetRunAttemptID: nil,
@@ -198,6 +198,33 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.session.runState, .cancelled)
         XCTAssertTrue(receipt.teardownCompleted == true)
         XCTAssertEqual(fixture.session.items.count(where: { $0.text == AgentChatItem.overseerRunStoppedText }), 1)
+    }
+
+    func testTimedOutOldBindingGateDoesNotWedgeStopAfterInPlaceRebind() async throws {
+        let fixture = try makeFixture()
+        let oldBinding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+        let oldStopID = UUID()
+        XCTAssertTrue(fixture.session.stopState.claimManagedStop(id: oldStopID, binding: oldBinding))
+        fixture.session.stopState.markCleanupStarted(id: oldStopID, binding: oldBinding)
+        fixture.session.stopState.test_ageManagedStopClaim(by: 31)
+        fixture.session.installPersistentSessionBinding(
+            AgentPersistentSessionBindingIdentity(tabID: fixture.tabID, sessionID: fixture.candidate.sessionID)
+        )
+        let reboundCandidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidate(
+            tabID: fixture.tabID, sessionID: fixture.candidate.sessionID,
+            tabName: "Stop target", isWindowClosing: false
+        ))
+        let rebound = Fixture(
+            viewModel: fixture.viewModel, tabID: fixture.tabID,
+            session: fixture.session, candidate: reboundCandidate
+        )
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "rebound-managed-stop")
+        let outcome = await stop(rebound)
+        guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertFalse(fixture.session.stopState.releaseManagedStop(id: oldStopID, binding: oldBinding))
     }
 
     func testSuccessfulStopRetainsResultWhenAuditSaveFails() async throws {

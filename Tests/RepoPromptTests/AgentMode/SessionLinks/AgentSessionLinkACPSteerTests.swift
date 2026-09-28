@@ -154,7 +154,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             linkID: message.linkID, linkGeneration: message.linkGeneration,
             message: message.message, framing: .management
         )
-        XCTAssertEqual(fixture.session.pendingInstructions.first, envelope)
+        XCTAssertEqual(fixture.session.pendingInstructions.first?.providerText, envelope)
     }
 
     func testMixedLocalAndManagedBatchSettlesManagedOnly() async throws {
@@ -200,7 +200,57 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertEqual(settled, .delivered(.queuedFollowUp))
         sink.resolve(.notAccepted(message: "late duplicate"))
         XCTAssertEqual(sink.outcome, .delivered(.queuedFollowUp))
-        XCTAssertEqual(fixture.session.pendingInstructions.first, envelope)
+        XCTAssertEqual(fixture.session.pendingInstructions.first?.providerText, envelope)
+    }
+
+    func testMixedACPFollowUpRestoresOnlyTypedLocalDraftAfterStop() async throws {
+        let fixture = try await makeFixture()
+        let local = AgentModeViewModel.TabSession.ACPSteeringInstruction(
+            id: UUID(), targetRunID: fixture.session.runID,
+            targetRunAttemptID: fixture.session.activeRunAttemptID,
+            providerText: "local provider text", interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "local draft",
+            optimisticUserItemID: nil, createdAt: Date()
+        )
+        let message = request("managed direction")
+        let envelope = AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: message.observerSessionID, sourceName: message.observerDisplayName,
+            linkID: message.linkID, linkGeneration: message.linkGeneration,
+            message: message.message, framing: .management
+        )
+        let row = AgentChatItem.user(
+            message.message, sequenceIndex: fixture.session.nextSequenceIndex,
+            crossSessionAttribution: message.attribution, dispatchedProviderText: envelope
+        )
+        fixture.session.appendItem(row)
+        let sink = AgentSessionLinkManagedSteerSink()
+        let managed = AgentModeViewModel.TabSession.ACPSteeringInstruction(
+            id: UUID(), targetRunID: fixture.session.runID,
+            targetRunAttemptID: fixture.session.activeRunAttemptID,
+            providerText: envelope, interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "",
+            optimisticUserItemID: row.id, createdAt: Date(),
+            managed: .init(
+                sink: sink, attributedItemID: row.id,
+                candidate: fixture.candidate, attribution: message.attribution
+            )
+        )
+        fixture.viewModel.test_requeueDequeuedACPSteeringAfterStop(
+            [local, managed], session: fixture.session,
+            stopFence: AgentRunStartStopFence(session: fixture.session)
+        )
+        XCTAssertEqual(sink.outcome, .delivered(.queuedFollowUp))
+        let queued = try XCTUnwrap(fixture.session.pendingInstructions.first)
+        XCTAssertTrue(queued.providerText.contains("local provider text"))
+        XCTAssertTrue(queued.providerText.contains(envelope))
+        XCTAssertEqual(queued.localDraftText, "local draft")
+
+        fixture.viewModel.withdrawQueuedWorkForManagedStop(session: fixture.session)
+        let restored = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        XCTAssertTrue(restored.contains("local draft"))
+        XCTAssertFalse(restored.contains("managed direction"))
+        XCTAssertFalse(restored.contains("local provider text"))
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
     }
 
     func testOldFlushResumingAfterStopCannotClearSuccessorSteering() async throws {
@@ -324,6 +374,26 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
     }
 
+    func testACPControllerTeardownSettlesQueuedManagedSink() async throws {
+        let fixture = try await makeFixture()
+        let message = request("queued before shutdown")
+        let sink = AgentSessionLinkManagedSteerSink()
+        fixture.session.pendingACPSteeringInstructions.append(.init(
+            id: UUID(), targetRunID: fixture.session.runID,
+            targetRunAttemptID: fixture.session.activeRunAttemptID,
+            providerText: "managed provider text", interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "",
+            optimisticUserItemID: nil, createdAt: Date(),
+            managed: .init(
+                sink: sink, attributedItemID: UUID(),
+                candidate: fixture.candidate, attribution: message.attribution
+            )
+        ))
+        await fixture.session.teardownACPControllerIfPresent()
+        guard case .notAccepted = sink.outcome else { return XCTFail("Teardown left a managed sink pending") }
+        XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+    }
+
     func testInterruptedAttributedReplayUsesExactStoredProviderBytes() async throws {
         let fixture = try await makeFixture()
         let attribution = request("x").attribution
@@ -373,6 +443,29 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             fixture.viewModel.agentSessionLinkSteerAdmission(for: fixture.session, liveness: Self.liveness),
             .steer(.acpQueued)
         )
+    }
+
+    func testOldACPRefusalCannotClearSuccessorSettlingMarker() async throws {
+        let old = try await makeFixture()
+        let successor = try await makeFixture()
+        old.session.beginACPCompactSettling(
+            providerSessionID: "monitor-acp-session", controller: old.controller,
+            scheduleDeadline: false
+        )
+        old.session.acpController = successor.controller
+        old.session.providerSessionID = "replacement-session"
+        old.session.beginACPCompactSettling(
+            providerSessionID: "replacement-session", controller: successor.controller,
+            scheduleDeadline: false
+        )
+        old.session.clearACPCompactSettling(
+            providerSessionID: "monitor-acp-session", controller: old.controller
+        )
+        XCTAssertTrue(old.session.isACPCompactSettling())
+        old.session.clearACPCompactSettling(
+            providerSessionID: "replacement-session", controller: successor.controller
+        )
+        XCTAssertFalse(old.session.isACPCompactSettling())
     }
 
     func testEndpointInvalidationOutranksCompactSettlingForManagedSteer() {
