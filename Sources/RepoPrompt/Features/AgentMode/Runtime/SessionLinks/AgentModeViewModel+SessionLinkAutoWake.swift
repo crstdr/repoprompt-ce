@@ -1799,6 +1799,7 @@ extension AgentModeViewModel {
             && !session.bindingTransitionInProgress
             && !session.terminalCommitInProgress
             && !session.mcpFollowUpRunPending
+            && session.selfCompactState.active == nil
             && !session.isComposerSubmissionInFlight
             && !session.isPreparingInitialWorktree
             && !session.isChangingExecutionLocation

@@ -35,6 +35,7 @@ struct AgentSelfCompactAttempt: Codable, Equatable {
     let acceptedAt: Date
     var phase: Phase
     var compactDispatchStarted = false
+    var admittedSupport: AgentSessionLinkCompactSupport?
     var noteDispatchStarted = false
 
     init(

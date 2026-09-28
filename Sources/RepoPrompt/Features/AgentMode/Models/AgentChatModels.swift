@@ -377,6 +377,33 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         )
     }
 
+    /// Fixed replay-safe provenance. The continuation note remains only in the attempt record.
+    public static func selfCompactionRequest(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Context compaction was requested by this session.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe cancellation text. The retained recovery note is not interpolated here.
+    public static func selfCompactionCancelled(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Scheduled self-compaction was cancelled before it reached the provider.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe failure text; no note bytes or provider error are interpolated.
+    public static func selfCompactionCouldNotStart(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Self-compaction could not start. The continuation note was retained for recovery.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
     public static func error(_ text: String, sequenceIndex: Int = 0) -> AgentChatItem {
         AgentChatItem(kind: .error, text: text, sequenceIndex: sequenceIndex)
     }

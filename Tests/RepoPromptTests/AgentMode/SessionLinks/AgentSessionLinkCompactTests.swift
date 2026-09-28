@@ -211,6 +211,61 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt, "The composer claim is released")
     }
 
+    func testSelfTerminalBoundaryStartsNativeCommandPipelineAfterPersistingFixedRow() async throws {
+        let fixture = try makeFixture()
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.origin")
+        let reservation = fixture.viewModel.agentSelfCompactSchedule(
+            endpoint: fixture.candidate.domainEndpoint,
+            runID: runID,
+            runAttemptID: ownership.attemptID,
+            note: "verbatim private continuation",
+            idempotencyKey: "self-compact-integration"
+        )
+        guard case .scheduled = reservation else {
+            return XCTFail("Expected a correlated self-compaction reservation")
+        }
+        fixture.session.runState = .completed
+        _ = fixture.session.endRunAttempt(ifCurrent: ownership, source: "test.selfCompact.terminal")
+        let revision = AgentRunTerminalCommitRevision(
+            commitID: UUID(),
+            ownership: ownership,
+            terminalState: .completed,
+            failureReason: nil,
+            expectedRunID: runID,
+            sourceItemsRevision: fixture.session.sourceItemsRevision,
+            assistantDeltaFlushGeneration: fixture.session.assistantDeltaFlushGeneration,
+            providerDrainGeneration: fixture.session.providerTerminalDrainGeneration,
+            mcpPublicationEnvelope: nil,
+            successorKind: nil,
+            providerSuccessorID: nil
+        )
+        fixture.viewModel.agentSelfCompactTerminalSettled(
+            session: fixture.session,
+            revision: revision,
+            publication: .accepted(successorEpoch: nil),
+            teardownSettled: { true }
+        )
+        XCTAssertEqual(fixture.session.selfCompactState.active?.phase, .compactDispatchPending)
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated), "No inline provider start")
+
+        for _ in 0 ..< 500 {
+            if fixture.session.selfCompactState.active?.phase == .awaitingCompactTurn { break }
+            await Task.yield()
+        }
+        // The run-start recorder is pipeline admission, not physical transport acceptance. The
+        // raw Claude dispatch suite separately pins the provider-bound bytes to exactly `/compact`.
+        XCTAssertEqual(fixture.session.selfCompactState.active?.phase, .awaitingCompactTurn)
+        XCTAssertTrue(fixture.session.selfCompactState.active?.compactDispatchStarted == true)
+        let row = try XCTUnwrap(fixture.session.items.first {
+            $0.kind == .system && $0.text == "Context compaction was requested by this session."
+        })
+        XCTAssertFalse(row.text.contains("verbatim private continuation"))
+        XCTAssertTrue(fixture.events.saveHappenedBeforeProviderStart())
+    }
+
     func testProviderControlOptionsSkipEveryUserAugmentationAndOnlyClaudeCodeDispatchesThem() {
         let command = AgentProviderControlCommand.compact(
             expectedBinding: AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID()),

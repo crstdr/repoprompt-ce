@@ -670,6 +670,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let workspaceFileContextStore: WorkspaceFileContextStore?
     weak var workspaceManager: WorkspaceManagerViewModel?
     private weak var mcpServer: MCPServerViewModel?
+
+    /// Narrow read-only drain probe for the self-compaction terminal worker.
+    func agentSelfCompactHasActiveMCPTools(runID: UUID) -> Bool {
+        mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
+    }
+
     private let dataService = AgentSessionDataService.shared
     private var sidebarPrioritizedIndexBuilder: SidebarPrioritizedIndexBuilder = { request in
         try await AgentSessionDataService.shared.buildPrioritizedSidebarIndex(request)
@@ -3226,6 +3232,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         mcpRemoveAgentRunOracleReviewContext(sessionID: sessionID, runID: runID)
                     }
                     return result
+                },
+                onSelfCompactTerminalSettled: { [weak self] session, revision, result, teardownSettled in
+                    self?.agentSelfCompactTerminalSettled(
+                        session: session,
+                        revision: revision,
+                        publication: result,
+                        teardownSettled: teardownSettled
+                    )
                 }
             ),
             continuation: .init(
@@ -16217,6 +16231,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     action: goalAction,
                     session: session
                 )
+                agentSelfCompactCancelForAcceptedLocalInput(session)
                 appendOptimisticGoalObjectiveUserBubbleIfNeeded(
                     action: goalAction,
                     session: session,
@@ -16282,6 +16297,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
             Self.logCodexDebug("[AgentModeVM][RunID] deferring send until hydration completes for tab \(tabID)")
+            agentSelfCompactCancelForAcceptedLocalInput(session)
             Task { [weak self] in
                 guard let self else { return }
                 await submitUserTurnAfterHydration(
@@ -16917,6 +16933,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             flushPendingAssistantDelta(session)
         }
 
+        // An accepted local or managed steer owns the boundary before its user row is published.
+        agentSelfCompactCancelForAcceptedLocalInput(session)
         let userItem = AgentChatItem.user(
             bubbleText,
             attachments: attachmentsToSend,

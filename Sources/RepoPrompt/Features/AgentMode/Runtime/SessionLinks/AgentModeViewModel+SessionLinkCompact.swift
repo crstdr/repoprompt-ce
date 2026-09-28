@@ -12,7 +12,7 @@ import RepoPromptDomainRuntime
 // length) is idle and therefore admissible — the case compaction exists for.
 
 /// Whether a target's provider can take an overseer compaction right now.
-enum AgentSessionLinkCompactSupport: Equatable {
+enum AgentSessionLinkCompactSupport: String, Codable, Equatable {
     /// Codex: native `thread/compact/start` on the existing thread.
     case codex
     /// Claude Code: the bare native `/compact` command in the existing provider conversation.
@@ -24,6 +24,12 @@ enum AgentSessionLinkCompactSupport: Equatable {
     case notSupported
     /// The runtime supports compaction but this target has no provider conversation yet.
     case noProviderSession
+}
+
+enum AgentNativeCompactDispatchResult: Equatable {
+    case started
+    case notStarted
+    case startFailed
 }
 
 extension AgentModeViewModel {
@@ -247,60 +253,30 @@ extension AgentModeViewModel {
         //    never sends a message; Claude Code and an advertising ACP session receive exactly
         //    `/compact` through their ordinary run pipelines, so status, events, and (for Claude) the
         //    compaction boundary flow as for any turn.
-        let didStart: Bool
-        switch support {
-        case .codex:
-            guard let expectedThreadID = liveSession.codexConversationID else {
-                releaseComposerSubmitClaim(claim)
-                return .delivered(persistedOnly)
+        let dispatch = await agentSessionLinkDispatchNativeCompact(
+            session: liveSession,
+            tabID: candidate.tabID,
+            support: support,
+            isStillAdmissible: { [weak self] in
+                guard let self else { return false }
+                let current = liveness()
+                guard !Task.isCancelled,
+                      agentSessionLinkLiveSession(matching: candidate) === liveSession,
+                      current.permitsDelivery,
+                      composerSubmitClaimIsCurrent(claim),
+                      workspaceManager?.activeWorkspace?.id == candidate.workspaceID
+                else { return false }
+                return AgentSessionLinkDeliveryReadiness.evaluate(
+                    snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
+                        session: liveSession,
+                        endpointMatchesGrant: current.targetEndpointIsLive,
+                        isClosing: current.targetWindowIsClosing,
+                        ignoresComposerSubmissionInFlight: true
+                    )
+                ) == .ready && !Self.agentSessionLinkCompactHasQueuedProviderWork(liveSession)
             }
-            let start = await codexCoordinator.startOversightCompaction(
-                session: liveSession,
-                expectedThreadID: expectedThreadID,
-                isStillAdmissible: { [weak self] in
-                    guard let self else { return false }
-                    let current = liveness()
-                    guard !Task.isCancelled,
-                          agentSessionLinkLiveSession(matching: candidate) === liveSession,
-                          current.permitsDelivery,
-                          composerSubmitClaimIsCurrent(claim),
-                          workspaceManager?.activeWorkspace?.id == candidate.workspaceID
-                    else { return false }
-                    return AgentSessionLinkDeliveryReadiness.evaluate(
-                        snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
-                            session: liveSession,
-                            endpointMatchesGrant: current.targetEndpointIsLive,
-                            isClosing: current.targetWindowIsClosing,
-                            ignoresComposerSubmissionInFlight: true
-                        )
-                    ) == .ready && !Self.agentSessionLinkCompactHasQueuedProviderWork(liveSession)
-                }
-            )
-            didStart = start == .started
-            if case .notStarted = start {
-                releaseComposerSubmitClaim(claim)
-                return .delivered(persistedOnly)
-            }
-        case .claudeCode, .acpAdvertisedCommand:
-            guard let conversation = liveSession.providerSessionID,
-                  let binding = liveSession.persistentSessionBindingIdentity
-            else {
-                releaseComposerSubmitClaim(claim)
-                return .delivered(persistedOnly)
-            }
-            let command = AgentProviderControlCommand.compact(
-                expectedBinding: binding,
-                expectedProviderConversation: conversation
-            )
-            let startRecorder = AgentRunStartOutcomeRecorder()
-            _ = await startAgentRun(
-                tabID: candidate.tabID,
-                initialMessage: command.providerText,
-                directStartOptions: .providerControl(command),
-                startOutcome: startRecorder
-            )
-            didStart = startRecorder.outcome.didStart
-        case .notSupported, .noProviderSession:
+        )
+        if dispatch == .notStarted {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
@@ -310,9 +286,58 @@ extension AgentModeViewModel {
         return .delivered(AgentSessionLinkSendDelivery(
             targetItemID: requestItem.id,
             acceptedAt: acceptedAt,
-            deliveryState: didStart ? .runStarted : .runStartFailed,
+            deliveryState: dispatch == .started ? .runStarted : .runStartFailed,
             resultingRunState: resultingRunState.rawValue
         ))
+    }
+
+    /// Shared native leaves only. The overseer authorization/persistence transaction above remains
+    /// eight separate steps; self-compaction invokes this only after its own independent fences.
+    func agentSessionLinkDispatchNativeCompact(
+        session: TabSession,
+        tabID: UUID,
+        support: AgentSessionLinkCompactSupport,
+        isStillAdmissible: @escaping @MainActor () -> Bool
+    ) async -> AgentNativeCompactDispatchResult {
+        guard isStillAdmissible(), agentSessionLinkCompactSupport(for: session) == support else {
+            return .notStarted
+        }
+        switch support {
+        case .codex:
+            guard let expectedThreadID = session.codexConversationID else { return .notStarted }
+            let start = await codexCoordinator.startOversightCompaction(
+                session: session,
+                expectedThreadID: expectedThreadID,
+                isStillAdmissible: { [weak self] in
+                    guard let self else { return false }
+                    return isStillAdmissible() && agentSessionLinkCompactSupport(for: session) == support
+                }
+            )
+            switch start {
+            case .started: return .started
+            case .notStarted: return .notStarted
+            case .startFailed: return .startFailed
+            }
+        case .claudeCode, .acpAdvertisedCommand:
+            guard let conversation = session.providerSessionID,
+                  let binding = session.persistentSessionBindingIdentity,
+                  isStillAdmissible()
+            else { return .notStarted }
+            let command = AgentProviderControlCommand.compact(
+                expectedBinding: binding,
+                expectedProviderConversation: conversation
+            )
+            let recorder = AgentRunStartOutcomeRecorder()
+            _ = await startAgentRun(
+                tabID: tabID,
+                initialMessage: command.providerText,
+                directStartOptions: .providerControl(command),
+                startOutcome: recorder
+            )
+            return recorder.outcome.didStart ? .started : .startFailed
+        case .notSupported, .noProviderSession:
+            return .notStarted
+        }
     }
 
     /// Provider-side queued work a compaction must never race or discard.
