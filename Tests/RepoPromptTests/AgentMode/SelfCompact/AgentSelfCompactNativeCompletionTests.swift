@@ -300,6 +300,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
             AgentChatItem.selfCompactionRequest(sequenceIndex: 0),
             AgentChatItem.selfCompactionCancelled(sequenceIndex: 0),
             AgentChatItem.selfCompactionCouldNotStart(sequenceIndex: 0),
+            AgentChatItem.selfCompactionCompletionUnverified(sequenceIndex: 0),
             AgentChatItem.selfCompactionNoteRestored(sequenceIndex: 0)
         ]
         XCTAssertEqual(
@@ -308,6 +309,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
                 "Context compaction was requested by this session.",
                 "Scheduled self-compaction was cancelled before it reached the provider.",
                 "Self-compaction could not start. The continuation note was retained for recovery.",
+                "The provider did not confirm that compaction finished. The continuation note will be attached to the next message in this session.",
                 "A continuation note from before compaction was restored to this session."
             ]
         )

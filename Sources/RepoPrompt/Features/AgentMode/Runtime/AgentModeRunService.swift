@@ -118,6 +118,17 @@ final class AgentModeRunService {
         )
     }
 
+    /// Claude and Codex use correlated completion. ACP self-compaction is admitted only for
+    /// runtimes whose advertised `compact` is a native command, and only after that support was
+    /// recorded on the attempt.
+    private static func allowsSelfCompactDispatch(_ session: AgentTabSession) -> Bool {
+        if session.selectedAgent == .codexExec || session.selectedAgent == .claudeCode {
+            return true
+        }
+        return AgentProviderControlCommand.acpRuntimeAdvertisesNativeCommands(session.selectedAgent)
+            && session.selfCompactState.active?.admittedSupport == .acpAdvertisedCommand
+    }
+
     @discardableResult
     func startRun(
         tabID: UUID,
@@ -135,7 +146,7 @@ final class AgentModeRunService {
         let selectedAgent = session.selectedAgent
         if let selfCompactDispatchID {
             guard session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
-                  selectedAgent == .codexExec || selectedAgent == .claudeCode,
+                  Self.allowsSelfCompactDispatch(session),
                   (selfCompactDispatchID.stage == .compact) == (providerControlCommand != nil)
             else {
                 startOutcome?.recordStartFailure(message: nil)

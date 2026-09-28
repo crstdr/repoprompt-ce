@@ -51,6 +51,11 @@ struct AgentSelfCompactAttempt: Codable, Equatable {
     var compactRunID: UUID?
     var compactRunAttemptID: UUID?
     var compactTurnSucceeded: Bool?
+    /// Vouched occupancy captured before the compact command withdrew it. Runtime evidence for an
+    /// ACP drop check; a restored attempt never dispatches from this figure.
+    var usedTokensBeforeCompact: Int?
+    /// Set when an ACP command turn ended without a vouched drop. The note stays parked.
+    var acpCompletionUnverified: Bool?
 
     init(
         id: UUID = UUID(),
@@ -261,10 +266,11 @@ struct AgentSelfCompactState: Codable, Equatable {
               active?.phase == .dispatchingNote,
               active?.noteDispatchStarted == true
         else { return false }
+        let unverified = active?.acpCompletionUnverified == true
         settle(
-            .noteAccepted,
+            unverified ? .completionUnverified : .noteAccepted,
             noteDelivery: active?.noteWasPrepended == true ? .prepended : .accepted,
-            completionVerified: active?.compactTurnSucceeded == true
+            completionVerified: unverified ? false : active?.compactTurnSucceeded == true
         )
         return true
     }
@@ -331,6 +337,19 @@ struct AgentSelfCompactState: Codable, Equatable {
         return true
     }
 
+    /// Overseer delivery stays blocked while compaction or its settle hold owns the next input.
+    /// A parked note does not: the next ordinary send carries it.
+    var blocksOverseerDelivery: Bool {
+        guard let phase = active?.phase else { return false }
+        return phase != .parked
+    }
+
+    /// Automatic wakes stay blocked for every live attempt, including a parked note, so RepoPrompt
+    /// does not manufacture a prompt while a continuation is still owed.
+    var blocksAutomaticWake: Bool {
+        active != nil
+    }
+
     /// Reading the frame does not consume it; only final provider acknowledgment can do that.
     var parkedNote: (dispatchID: AgentSelfCompactionDispatchID, frame: String)? {
         guard let attempt = active, attempt.phase == .parked, !attempt.noteDispatchStarted else { return nil }
@@ -339,13 +358,14 @@ struct AgentSelfCompactState: Codable, Equatable {
 
     var status: AgentSelfCompactStatus? {
         if let active {
+            let unverified = active.acpCompletionUnverified == true && active.phase == .parked
             return AgentSelfCompactStatus(
                 requestID: active.id,
                 phase: active.phase.rawValue,
-                outcome: nil,
-                completionVerified: nil,
-                noteDelivery: nil,
-                recoveryNote: nil
+                outcome: unverified ? .completionUnverified : nil,
+                completionVerified: unverified ? false : nil,
+                noteDelivery: active.phase == .parked ? .parked : nil,
+                recoveryNote: unverified ? active.note : nil
             )
         }
         guard let latest else { return nil }

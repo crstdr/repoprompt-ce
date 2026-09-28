@@ -222,7 +222,7 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         XCTAssertEqual(changed.state.latest?.outcome, .failed)
     }
 
-    func testACPIsNotSelfDispatchedBeforeItsCompletionContractExists() async {
+    func testACPAdvertisedCommandDispatchesTheCompactTurn() async {
         let fake = Fake()
         fake.arm()
         fake.state.active?.admittedSupport = .acpAdvertisedCommand
@@ -233,8 +233,9 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
             successorClaimed: false, teardownSettled: { true }
         )
         await drain()
-        XCTAssertEqual(fake.dispatched, 0)
-        XCTAssertEqual(fake.state.latest?.outcome, .failed)
+        XCTAssertEqual(fake.dispatched, 1)
+        XCTAssertEqual(fake.state.active?.phase, .awaitingCompactTurn)
+        XCTAssertNil(fake.state.latest)
     }
 
     func testTeardownAndToolDrainAreBoundedWithoutCancellingForeignTools() async {

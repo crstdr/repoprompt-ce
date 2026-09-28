@@ -597,43 +597,78 @@ final class ACPIntegratedAgentModeRunner {
             return false
         }
 
-        let agentMessage = hooks.providerInput.buildHeadlessAgentMessage(
-            session,
-            messageForRun,
-            runID,
-            attachments
-        )
+        let carry = AgentSelfCompactParkedPrefix.prepare(messageForRun, session: session)
+        let agentMessage = carry.exactNote
+            ? AgentMessage(systemPrompt: "", userMessage: carry.text, resumeSessionID: session.providerSessionID)
+            : hooks.providerInput.buildHeadlessAgentMessage(
+                session,
+                carry.text,
+                runID,
+                attachments
+            )
         // Active ACP steering is its own logical dispatch. If this send returns `false` the batch is
         // requeued as a follow-up, which composes again through `runPromptTurn` under a different
         // dispatch ID — correct, because this attempt was never accepted and the follow-up must
         // render whatever membership is current when it dispatches.
-        let monitoring = hooks.providerInput.decoratedAgentMessage(
-            agentMessage,
-            session: session,
-            dispatchID: .acpActiveSteering(runAttemptID: runAttemptID)
-        )
-        guard !monitoring.mustAbortDispatch else {
-            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
-                session,
-                .acpActiveSteering(runAttemptID: runAttemptID)
+        let oversightDispatch = AgentSessionLinkPromptDispatchID.acpActiveSteering(runAttemptID: runAttemptID)
+        var monitoring: AgentModeRunService.AgentSessionLinkDecoratedAgentMessage?
+        let promptMessage: AgentMessage
+        if carry.exactNote {
+            promptMessage = agentMessage
+        } else {
+            let decorated = hooks.providerInput.decoratedAgentMessage(
+                agentMessage,
+                session: session,
+                dispatchID: oversightDispatch
             )
-            return false
+            guard !decorated.mustAbortDispatch else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                    session,
+                    oversightDispatch
+                )
+                return false
+            }
+            guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+                session,
+                oversightDispatch
+            ) else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                    session,
+                    oversightDispatch
+                )
+                return false
+            }
+            monitoring = decorated
+            promptMessage = decorated.message
         }
-        guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
-            session,
-            .acpActiveSteering(runAttemptID: runAttemptID)
-        ) else {
-            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
-                session,
-                .acpActiveSteering(runAttemptID: runAttemptID)
-            )
-            return false
+        if let dispatchID = carry.dispatchID {
+            guard AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session) else {
+                if carry.exactNote {
+                    AgentSelfCompactParkedPrefix.markNotAttempted(dispatchID, session: session)
+                } else {
+                    hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(session, oversightDispatch)
+                }
+                hooks.persistence.scheduleSave(session)
+                return false
+            }
+            hooks.persistence.scheduleSave(session)
         }
 
         do {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
-            try await controller.prompt(monitoring.message, request: runRequest)
-            hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, monitoring.claim)
+            try await controller.prompt(promptMessage, request: runRequest)
+            if let monitoring {
+                hooks.providerInput.acceptAgentSessionLinkPrompt(
+                    session, monitoring.dispatchContext, monitoring.claim
+                )
+            }
+            if let dispatchID = carry.dispatchID {
+                if AgentSelfCompactParkedPrefix.markAccepted(dispatchID, session: session) {
+                    hooks.presentation.requestUIRefresh(session.tabID, true)
+                    hooks.bindingObservation.updateBindings(session)
+                }
+                hooks.persistence.scheduleSave(session)
+            }
             log("active steering session/prompt completed attempt=\(runAttemptID)", runID: runID)
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
@@ -643,10 +678,16 @@ final class ACPIntegratedAgentModeRunner {
             // activeRunAttemptID to still be present here.
             return true
         } catch {
-            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
-                session,
-                .acpActiveSteering(runAttemptID: runAttemptID)
-            )
+            if let dispatchID = carry.dispatchID {
+                AgentSelfCompactParkedPrefix.markTransportFailed(dispatchID, session: session)
+                hooks.persistence.scheduleSave(session)
+            }
+            if !carry.exactNote {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                    session,
+                    oversightDispatch
+                )
+            }
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalized = await controller.normalizeError(error)
@@ -979,19 +1020,28 @@ final class ACPIntegratedAgentModeRunner {
         }
         log("prompt turn begin prepare=\(prepareControllerForNextTurn)", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
-        let agentMessage = hooks.providerInput.buildHeadlessAgentMessage(
-            session,
-            initialMessageForRun,
-            runID,
-            attachments
-        )
-        hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
+        let carry = AgentSelfCompactParkedPrefix.prepare(initialMessageForRun, session: session)
+        let agentMessage = carry.exactNote
+            ? AgentMessage(systemPrompt: "", userMessage: carry.text, resumeSessionID: session.providerSessionID)
+            : hooks.providerInput.buildHeadlessAgentMessage(
+                session,
+                carry.text,
+                runID,
+                attachments
+            )
+        if !carry.exactNote {
+            hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
+        }
         hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
         hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
 
         if prepareControllerForNextTurn {
             let prepared = await controller.prepareForNextTurn()
             guard prepared else {
+                if carry.exactNote, let dispatchID = carry.dispatchID {
+                    AgentSelfCompactParkedPrefix.markNotAttempted(dispatchID, session: session)
+                    hooks.persistence.scheduleSave(session)
+                }
                 return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
             }
         }
@@ -1015,44 +1065,86 @@ final class ACPIntegratedAgentModeRunner {
         // routes, which all converge here. Resumed providers still omit `AgentMessage.systemPrompt`;
         // the supplement rides the user-message channel precisely because a resumed thread cannot
         // refresh system text.
-        let monitoring = hooks.providerInput.decoratedAgentMessage(
-            agentMessage,
-            session: session,
-            dispatchID: .acpPromptTurn(runAttemptID: runAttemptID)
-        )
-        // Required lane content is the turn's only new provider input. Refusal is a quiet
-        // pre-acceptance cancellation, not an ACP prompt failure.
-        guard !monitoring.mustAbortDispatch else {
-            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
-                session,
-                .acpPromptTurn(runAttemptID: runAttemptID)
+        let oversightDispatch = AgentSessionLinkPromptDispatchID.acpPromptTurn(runAttemptID: runAttemptID)
+        var monitoring: AgentModeRunService.AgentSessionLinkDecoratedAgentMessage?
+        let promptMessage: AgentMessage
+        if carry.exactNote {
+            // The framed note is the whole provider input. Decoration would change those bytes.
+            promptMessage = agentMessage
+        } else {
+            let decorated = hooks.providerInput.decoratedAgentMessage(
+                agentMessage,
+                session: session,
+                dispatchID: oversightDispatch
             )
-            return .cancelled
+            // Required lane content is the turn's only new provider input. Refusal is a quiet
+            // pre-acceptance cancellation, not an ACP prompt failure.
+            guard !decorated.mustAbortDispatch else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                    session,
+                    oversightDispatch
+                )
+                return .cancelled
+            }
+            guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+                session,
+                oversightDispatch
+            ) else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                    session,
+                    oversightDispatch
+                )
+                return .cancelled
+            }
+            monitoring = decorated
+            promptMessage = decorated.message
         }
-        guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
-            session,
-            .acpPromptTurn(runAttemptID: runAttemptID)
-        ) else {
-            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
-                session,
-                .acpPromptTurn(runAttemptID: runAttemptID)
-            )
-            return .cancelled
+        if let dispatchID = carry.dispatchID {
+            guard AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session) else {
+                if carry.exactNote {
+                    AgentSelfCompactParkedPrefix.markNotAttempted(dispatchID, session: session)
+                } else {
+                    hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                        session,
+                        oversightDispatch
+                    )
+                }
+                hooks.persistence.scheduleSave(session)
+                return .cancelled
+            }
+            hooks.persistence.scheduleSave(session)
         }
 
         do {
             log("controller.prompt begin", runID: runID)
-            try await controller.prompt(monitoring.message, request: runRequest)
+            try await controller.prompt(promptMessage, request: runRequest)
             // A non-throwing `controller.prompt` return is ACP's acceptance signal.
-            hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, monitoring.claim)
+            if let monitoring {
+                hooks.providerInput.acceptAgentSessionLinkPrompt(
+                    session, monitoring.dispatchContext, monitoring.claim
+                )
+            }
+            if let dispatchID = carry.dispatchID {
+                if AgentSelfCompactParkedPrefix.markAccepted(dispatchID, session: session) {
+                    hooks.presentation.requestUIRefresh(session.tabID, true)
+                    hooks.bindingObservation.updateBindings(session)
+                }
+                hooks.persistence.scheduleSave(session)
+            }
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
             log("controller.prompt returned; awaiting event consumer", runID: runID)
         } catch {
-            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
-                session,
-                .acpPromptTurn(runAttemptID: runAttemptID)
-            )
+            if let dispatchID = carry.dispatchID {
+                AgentSelfCompactParkedPrefix.markTransportFailed(dispatchID, session: session)
+                hooks.persistence.scheduleSave(session)
+            }
+            if !carry.exactNote {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                    session,
+                    oversightDispatch
+                )
+            }
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalizedError = await controller.normalizeError(error)
@@ -1159,6 +1251,22 @@ final class ACPIntegratedAgentModeRunner {
         defer { session.endCompactionContextCountSuspension() }
         do {
             log("controller.promptAdvertisedCommand begin", runID: runID)
+            if let dispatchID = command.selfCompactDispatchID, dispatchID.stage == .compact {
+                session.selfCompactACPCommandItemIDs = Set(session.items.map(\.id))
+                let bound = session.selfCompactNativeCompletion?.bindCompact(
+                    dispatchID,
+                    runID: runID,
+                    runAttemptID: runAttemptID
+                ) == true
+                guard bound else {
+                    session.selfCompactACPCommandItemIDs = nil
+                    await abandonConsumer()
+                    session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
+                    return .refusedBeforeSend(
+                        errorText: "\(displayName) did not run the requested command because self-compaction was no longer admissible."
+                    )
+                }
+            }
             try await controller.promptAdvertisedCommand(
                 command.kind.rawValue,
                 expectedSessionID: command.expectedProviderConversation,

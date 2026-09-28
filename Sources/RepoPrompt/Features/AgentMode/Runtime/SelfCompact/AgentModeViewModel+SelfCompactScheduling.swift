@@ -34,8 +34,7 @@ extension AgentModeViewModel {
         let reservation = state.reserve(note: note, idempotencyKey: idempotencyKey, owner: owner)
         if case .scheduled = reservation {
             let support = agentSessionLinkCompactSupport(for: session)
-            // ACP self-dispatch stays disabled until its fire-and-forget completion contract lands.
-            guard support == .codex || support == .claudeCode else {
+            guard support == .codex || support == .claudeCode || support == .acpAdvertisedCommand else {
                 return nil
             }
             state.active?.admittedSupport = support
@@ -64,7 +63,9 @@ extension AgentModeViewModel {
             session.selfCompactNativeCompletion?.compactTurnSettled(
                 revision: revision,
                 publication: publication,
-                teardownSettled: teardownSettled
+                teardownSettled: teardownSettled,
+                assistantOrToolRowCount: agentSelfCompactACPNewAssistantOrToolRows(session),
+                vouchedTokenCount: session.vouchedContextCount?.tokens
             )
         }
     }
@@ -189,6 +190,7 @@ extension AgentModeViewModel {
         var state = session.selfCompactState
         state.active?.compactProviderConversation = support == .codex
             ? session.codexConversationID : session.providerSessionID
+        state.active?.usedTokensBeforeCompact = session.vouchedContextCount?.tokens
         session.selfCompactState = state
         session.selfCompactNativeCompletion = agentSelfCompactNativeCompletion(for: session)
         let result = await agentSessionLinkDispatchNativeCompact(
@@ -209,6 +211,14 @@ extension AgentModeViewModel {
             store: { [weak self] state in
                 let previous = session.selfCompactState
                 session.selfCompactState = state
+                if previous.active?.acpCompletionUnverified != true,
+                   state.active?.acpCompletionUnverified == true
+                {
+                    session.appendItem(
+                        AgentChatItem.selfCompactionCompletionUnverified(sequenceIndex: session.nextSequenceIndex)
+                    )
+                    self?.updateBindingsFromSession(session)
+                }
                 if previous.active != nil, state.active == nil {
                     let row: AgentChatItem? = switch state.latest?.outcome {
                     case .failed:
@@ -284,5 +294,21 @@ extension AgentModeViewModel {
             startOutcome: recorder
         )
         return recorder.outcome.didStart
+    }
+
+    /// Assistant and tool rows appended after the ACP compact command was issued. Nil when this
+    /// turn was not an ACP self-compact command, which the detector treats as an unknown shape.
+    private func agentSelfCompactACPNewAssistantOrToolRows(_ session: TabSession) -> Int? {
+        guard let baseline = session.selfCompactACPCommandItemIDs else { return nil }
+        session.selfCompactACPCommandItemIDs = nil
+        return session.items.reduce(into: 0) { count, item in
+            guard !baseline.contains(item.id) else { return }
+            switch item.kind {
+            case .assistant, .assistantInline, .toolCall, .toolResult:
+                count += 1
+            case .user, .system, .error, .thinking:
+                break
+            }
+        }
     }
 }

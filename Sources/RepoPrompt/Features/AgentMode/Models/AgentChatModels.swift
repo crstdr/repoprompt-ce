@@ -404,6 +404,16 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         )
     }
 
+    /// Fixed replay-safe text for an ACP settle that never saw a vouched context drop.
+    /// The continuation note is not interpolated here; it stays parked for the next ordinary send.
+    public static func selfCompactionCompletionUnverified(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "The provider did not confirm that compaction finished. The continuation note will be attached to the next message in this session.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
     /// Fixed replay-safe provenance; the provider input, not this row, contains the note.
     public static func selfCompactionNoteRestored(sequenceIndex: Int) -> AgentChatItem {
         AgentChatItem(

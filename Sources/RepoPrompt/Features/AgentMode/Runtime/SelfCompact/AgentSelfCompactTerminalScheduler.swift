@@ -131,6 +131,7 @@ final class AgentSelfCompactTerminalScheduler {
         let admittedSupport = support()
         guard load().active?.admittedSupport == admittedSupport,
               admittedSupport == .codex || admittedSupport == .claudeCode
+              || admittedSupport == .acpAdvertisedCommand
         else {
             settleFailure(requestID)
             return

@@ -845,6 +845,7 @@ final class AgentTabSession: ObservableObject {
             contextCountVouchRevision &+= 1
             if vouchedContextCount == nil { vouchedContextCountConfidence = nil }
             noteContextVouchTransition(from: oldValue, to: vouchedContextCount)
+            selfCompactNativeCompletion?.noteVouchedContextCount(vouchedContextCount?.tokens)
         }
     }
 
@@ -1108,6 +1109,10 @@ final class AgentTabSession: ObservableObject {
 
     /// Runtime-only timer and note worker; persisted state is deliberately inert on restore.
     var selfCompactNativeCompletion: AgentSelfCompactNativeCompletionCoordinator?
+
+    /// Transcript item IDs present when an ACP self-compact command was issued. Rows added after
+    /// this set are the command turn. Not persisted.
+    var selfCompactACPCommandItemIDs: Set<UUID>?
 
     var isProviderSelectionLocked: Bool {
         hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
