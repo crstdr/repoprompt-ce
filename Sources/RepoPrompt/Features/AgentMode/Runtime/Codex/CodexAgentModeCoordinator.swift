@@ -7476,10 +7476,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 } catch let mismatch as CodexTurnSteerError {
                     if let parkedNote {
                         var state = session.selfCompactState
-                        if case .expectedTurnMismatch = mismatch {
+                        if mismatch.definitivelyRejectsInput {
                             _ = state.noteDefinitivelyNotAttempted(parkedNote.dispatchID)
-                        } else {
-                            _ = state.noteTransportFailed(parkedNote.dispatchID)
                         }
                         session.selfCompactState = state
                         viewModel?.scheduleSave(for: session.tabID)

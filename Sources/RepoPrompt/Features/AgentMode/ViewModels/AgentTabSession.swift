@@ -1104,7 +1104,10 @@ final class AgentTabSession: ObservableObject {
 
     /// Session-owned self-compaction state. No restored attempt is executable.
     var selfCompactState = AgentSelfCompactState() {
-        didSet { noteMonitorObservationInputsChanged() }
+        didSet {
+            if oldValue != selfCompactState { isDirty = true }
+            noteMonitorObservationInputsChanged()
+        }
     }
 
     var selfCompactPersistenceWarning = false

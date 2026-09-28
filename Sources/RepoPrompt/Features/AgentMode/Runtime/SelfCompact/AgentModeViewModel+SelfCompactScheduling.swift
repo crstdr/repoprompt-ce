@@ -164,12 +164,14 @@ extension AgentModeViewModel {
                 successorClaimed: revision.successorKind != nil,
                 teardownSettled: teardownSettled
             )
-        } else {
-            session.selfCompactNativeCompletion?.compactTurnSettled(
+        } else if let completion = session.selfCompactNativeCompletion {
+            let rowCount = completion.acceptsCompactTerminal(revision, publication: publication)
+                ? agentSelfCompactACPNewAssistantOrToolRows(session) : nil
+            completion.compactTurnSettled(
                 revision: revision,
                 publication: publication,
                 teardownSettled: teardownSettled,
-                assistantOrToolRowCount: agentSelfCompactACPNewAssistantOrToolRows(session),
+                assistantOrToolRowCount: rowCount,
                 vouchedTokenCount: session.vouchedContextCount?.tokens
             )
         }

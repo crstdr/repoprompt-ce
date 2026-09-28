@@ -193,6 +193,17 @@ final class ACPIntegratedAgentModeRunner {
         hooks.presentation.setAgentRunActive(session, true)
         setRunningStatus(initialTransportStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
+        let dedicatedNoteID = AgentSelfCompactParkedPrefix.preparedDedicatedNoteID(
+            initialMessageForRun, session: session
+        )
+        var handedToRunTask = false
+        defer {
+            if let dedicatedNoteID, !handedToRunTask {
+                AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
+                    dedicatedNoteID, session: session
+                ) { hooks.persistence.scheduleSave(session) }
+            }
+        }
         let freshRunRequest = runRequest
         // A provider control command acts only on the live session that advertised it. It never
         // replaces, starts, or shuts down a controller, so it cannot fall through to a fresh one.
@@ -208,11 +219,31 @@ final class ACPIntegratedAgentModeRunner {
             )
             return
         }
+        if dedicatedNoteID != nil, session.acpController == nil {
+            await failProviderControlCommandBeforeSend(
+                session: session,
+                runAttemptID: runAttemptID,
+                attachmentReservationID: attachmentReservationID,
+                errorText: "The self-compaction note has no live ACP session, so it was not sent."
+            )
+            return
+        }
         if let existingController = session.acpController {
             let isCompatible = await existingController.isCompatibleWith(request: runRequest)
             guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return }
             let hasReusableSession = isCompatible ? await existingController.hasReusableSession : false
             guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return }
+            if dedicatedNoteID != nil, !isCompatible || !hasReusableSession
+                || AgentModeProcessRunIdentity.existingProcessRunID(for: session) == nil
+            {
+                await failProviderControlCommandBeforeSend(
+                    session: session,
+                    runAttemptID: runAttemptID,
+                    attachmentReservationID: attachmentReservationID,
+                    errorText: "The self-compaction note could not reuse its live ACP session, so it was not sent."
+                )
+                return
+            }
             if isCompatible,
                hasReusableSession,
                let runID = AgentModeProcessRunIdentity.existingProcessRunID(for: session)
@@ -231,6 +262,7 @@ final class ACPIntegratedAgentModeRunner {
                     providerControlCommand: nil,
                     makeLease: makeLease
                 )
+                handedToRunTask = true
                 return
             }
 
@@ -597,7 +629,9 @@ final class ACPIntegratedAgentModeRunner {
             return false
         }
 
-        let carry = AgentSelfCompactParkedPrefix.prepare(messageForRun, session: session)
+        let carry = AgentSelfCompactParkedPrefix.prepare(messageForRun, session: session) {
+            hooks.persistence.scheduleSave(session)
+        }
         let agentMessage = carry.exactNote
             ? AgentMessage(systemPrompt: "", userMessage: carry.text, resumeSessionID: session.providerSessionID)
             : hooks.providerInput.buildHeadlessAgentMessage(
@@ -924,7 +958,18 @@ final class ACPIntegratedAgentModeRunner {
         providerControlCommand: AgentProviderControlCommand? = nil,
         leaseDisposition: ProviderControlLeaseDisposition? = nil
     ) async {
+        let dedicatedNoteID = AgentSelfCompactParkedPrefix.preparedDedicatedNoteID(
+            initialMessageForRun, session: session
+        )
         let classification = await Self.executeTransientOperation {
+            var reachedPromptTurn = false
+            defer {
+                if let dedicatedNoteID, !reachedPromptTurn {
+                    AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
+                        dedicatedNoteID, session: session
+                    ) { hooks.persistence.scheduleSave(session) }
+                }
+            }
             do {
                 // A controller that can no longer run turns is retired as after any failed turn, even
                 // when the turn was a control command that never got as far as sending.
@@ -963,6 +1008,7 @@ final class ACPIntegratedAgentModeRunner {
                     log("deferred MCP routing until ACP follow-up prompt", runID: runID)
                 }
 
+                reachedPromptTurn = true
                 return await runPromptTurn(
                     session: session,
                     runID: runID,
@@ -1020,7 +1066,9 @@ final class ACPIntegratedAgentModeRunner {
         }
         log("prompt turn begin prepare=\(prepareControllerForNextTurn)", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
-        let carry = AgentSelfCompactParkedPrefix.prepare(initialMessageForRun, session: session)
+        let carry = AgentSelfCompactParkedPrefix.prepare(initialMessageForRun, session: session) {
+            hooks.persistence.scheduleSave(session)
+        }
         let agentMessage = carry.exactNote
             ? AgentMessage(systemPrompt: "", userMessage: carry.text, resumeSessionID: session.providerSessionID)
             : hooks.providerInput.buildHeadlessAgentMessage(

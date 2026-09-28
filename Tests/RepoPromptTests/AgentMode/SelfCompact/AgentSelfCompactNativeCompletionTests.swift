@@ -92,6 +92,28 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         }
     }
 
+    func testCodexSteerRejectionsReparkOnlyOnDefinitiveNonAttempt() throws {
+        let failure = CodexAppServerClient.RequestFailure(
+            method: "turn/steer", code: nil, message: "rejected", data: nil
+        )
+        let definitive: [CodexTurnSteerError] = [
+            .expectedTurnMismatch(expectedTurnID: "old", actualTurnID: "new", failure: failure),
+            .noActiveTurn(failure),
+            .activeTurnNotSteerable(turnKind: "compact", failure: failure)
+        ]
+        for error in definitive {
+            XCTAssertTrue(error.definitivelyRejectsInput)
+            var state = AgentSelfCompactState()
+            _ = state.reserve(note: "recover", idempotencyKey: "key")
+            state.active?.phase = .dispatchingNote
+            let dispatchID = try AgentSelfCompactionDispatchID(requestID: XCTUnwrap(state.active?.id), stage: .note)
+            XCTAssertTrue(state.noteWillAttempt(dispatchID))
+            XCTAssertTrue(state.noteDefinitivelyNotAttempted(dispatchID))
+            XCTAssertEqual(state.active?.phase, .parked)
+            XCTAssertEqual(state.active?.noteDispatchStarted, false)
+        }
+    }
+
     func testClaudeCompletionSendsVerbatimFramedNoteOnce() async {
         let fake = Fake()
         let id = fake.arm()

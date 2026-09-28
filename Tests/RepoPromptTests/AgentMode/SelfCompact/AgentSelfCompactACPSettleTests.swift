@@ -220,6 +220,21 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         }
     }
 
+    func testOnlyAcceptedCorrelatedCompactTerminalMayConsumeACPRowBaseline() {
+        let fake = Fake()
+        let coordinator = fake.coordinator()
+        fake.bind(coordinator)
+        let matched = fake.revision()
+        XCTAssertTrue(coordinator.acceptsCompactTerminal(matched, publication: .accepted(successorEpoch: nil)))
+        XCTAssertFalse(coordinator.acceptsCompactTerminal(
+            fake.revision(runAttemptID: UUID()), publication: .accepted(successorEpoch: nil)
+        ))
+        XCTAssertFalse(coordinator.acceptsCompactTerminal(matched, publication: .rejected(reason: "not accepted")))
+        XCTAssertFalse(coordinator.acceptsCompactTerminal(matched, publication: .stale))
+        XCTAssertNotNil(fake.state.active)
+        coordinator.cancelRuntimeWork()
+    }
+
     func testStalePublicationAndSuccessorDoNotManufactureAPrompt() async {
         let stale = Fake()
         let staleCoordinator = stale.coordinator()
@@ -279,7 +294,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         state.active?.acpCompletionUnverified = true
         session.selfCompactState = state
 
-        let ordinary = AgentSelfCompactParkedPrefix.prepare("next turn", session: session)
+        let ordinary = AgentSelfCompactParkedPrefix.prepare("next turn", session: session, scheduleSave: {})
         let frame = AgentSelfCompactNoteEnvelope.frame(note)
         XCTAssertEqual(ordinary.text, frame + "\n\nnext turn")
         XCTAssertFalse(ordinary.exactNote)
@@ -295,9 +310,59 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         _ = exactState.reserve(note: note, idempotencyKey: "exact")
         exactState.active?.phase = .dispatchingNote
         session.selfCompactState = exactState
-        let exact = AgentSelfCompactParkedPrefix.prepare(frame, session: session)
+        let exact = AgentSelfCompactParkedPrefix.prepare(frame, session: session, scheduleSave: {})
         XCTAssertTrue(exact.exactNote)
         XCTAssertEqual(exact.text, frame)
+    }
+
+    func testUnattemptedACPNoteStartupReparksAndSaves() throws {
+        let session = AgentTabSession(tabID: UUID())
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: note, idempotencyKey: "startup")
+        state.active?.phase = .dispatchingNote
+        session.selfCompactState = state
+        session.isDirty = false
+        let frame = AgentSelfCompactNoteEnvelope.frame(note)
+        let dispatchID = try XCTUnwrap(AgentSelfCompactParkedPrefix.preparedDedicatedNoteID(frame, session: session))
+        var saves = 0
+        XCTAssertTrue(AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
+            dispatchID, session: session, scheduleSave: { saves += 1 }
+        ))
+        XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
+        XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, false)
+        XCTAssertTrue(session.isDirty)
+        XCTAssertEqual(saves, 1)
+        XCTAssertFalse(AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
+            dispatchID, session: session, scheduleSave: { saves += 1 }
+        ))
+        XCTAssertEqual(saves, 1)
+
+        state = session.selfCompactState
+        state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+        _ = state.reserve(note: "newer", idempotencyKey: "newer")
+        state.active?.phase = .dispatchingNote
+        session.selfCompactState = state
+        XCTAssertFalse(AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
+            dispatchID, session: session, scheduleSave: { saves += 1 }
+        ))
+        XCTAssertEqual(session.selfCompactState.active?.phase, .dispatchingNote)
+        XCTAssertEqual(saves, 1)
+    }
+
+    func testStaleParkedNoteCancellationSchedulesPersistence() {
+        let session = AgentTabSession(tabID: UUID())
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: note, idempotencyKey: "stale", owner: Fake().owner)
+        state.active?.phase = .parked
+        session.selfCompactState = state
+        session.isDirty = false
+        var saves = 0
+        let carry = AgentSelfCompactParkedPrefix.prepare("next turn", session: session) { saves += 1 }
+        XCTAssertEqual(carry.text, "next turn")
+        XCTAssertNil(carry.dispatchID)
+        XCTAssertEqual(session.selfCompactState.latest?.outcome, .cancelled)
+        XCTAssertTrue(session.isDirty)
+        XCTAssertEqual(saves, 1)
     }
 
     func testEightKilobyteNoteSurvivesRepeatedInstantReturnsInsideTheWallBudget() async {
@@ -403,6 +468,29 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             instant = instant.advanced(by: duration)
         }
 
+        func revision(
+            status: AgentSessionRunState = .completed,
+            successor: AgentRunEpochTransitionKind? = nil,
+            runAttemptID: UUID? = nil
+        ) -> AgentRunTerminalCommitRevision {
+            AgentRunTerminalCommitRevision(
+                commitID: UUID(),
+                ownership: AgentRunOwnership(
+                    attemptID: runAttemptID ?? compactAttemptID,
+                    binding: AgentRunBindingIdentity(tabID: owner.tabID, persistentSessionID: owner.sessionID)
+                ),
+                terminalState: status,
+                failureReason: nil,
+                expectedRunID: compactRunID,
+                sourceItemsRevision: 0,
+                assistantDeltaFlushGeneration: 0,
+                providerDrainGeneration: 0,
+                mcpPublicationEnvelope: nil,
+                successorKind: successor,
+                providerSuccessorID: nil
+            )
+        }
+
         func settle(
             _ coordinator: AgentSelfCompactNativeCompletionCoordinator,
             status: AgentSessionRunState = .completed,
@@ -412,22 +500,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             publication: AgentRunTerminalPublicationResult = .accepted(successorEpoch: nil)
         ) {
             coordinator.compactTurnSettled(
-                revision: AgentRunTerminalCommitRevision(
-                    commitID: UUID(),
-                    ownership: AgentRunOwnership(
-                        attemptID: compactAttemptID,
-                        binding: AgentRunBindingIdentity(tabID: owner.tabID, persistentSessionID: owner.sessionID)
-                    ),
-                    terminalState: status,
-                    failureReason: nil,
-                    expectedRunID: compactRunID,
-                    sourceItemsRevision: 0,
-                    assistantDeltaFlushGeneration: 0,
-                    providerDrainGeneration: 0,
-                    mcpPublicationEnvelope: nil,
-                    successorKind: successor,
-                    providerSuccessorID: nil
-                ),
+                revision: revision(status: status, successor: successor),
                 publication: publication,
                 teardownSettled: { true },
                 assistantOrToolRowCount: rows,

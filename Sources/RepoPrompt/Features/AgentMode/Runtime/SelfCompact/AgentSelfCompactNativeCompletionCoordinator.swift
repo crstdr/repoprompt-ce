@@ -75,6 +75,22 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         return true
     }
 
+    /// The ACP row baseline is consumed only for this accepted command turn. An unrelated,
+    /// duplicate, or rejected publication must leave it available for the real terminal.
+    func acceptsCompactTerminal(
+        _ revision: AgentRunTerminalCommitRevision,
+        publication: AgentRunTerminalPublicationResult
+    ) -> Bool {
+        guard let attempt = load().active,
+              attempt.admittedSupport == .acpAdvertisedCommand,
+              attempt.phase == .dispatchingCompact || attempt.phase == .awaitingCompactTurn,
+              attempt.compactRunID == revision.expectedRunID,
+              attempt.compactRunAttemptID == revision.ownership.attemptID,
+              case .accepted(successorEpoch: nil) = publication
+        else { return false }
+        return true
+    }
+
     func compactTurnSettled(
         revision: AgentRunTerminalCommitRevision,
         publication: AgentRunTerminalPublicationResult,

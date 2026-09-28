@@ -11,13 +11,18 @@ enum AgentSelfCompactParkedPrefix {
     }
 
     @MainActor
-    static func prepare(_ text: String, session: AgentTabSession) -> Carry {
+    static func prepare(
+        _ text: String,
+        session: AgentTabSession,
+        scheduleSave: @MainActor () -> Void
+    ) -> Carry {
         if let dedicated = dedicatedNoteID(text: text, session: session) {
             return Carry(text: text, dispatchID: dedicated, exactNote: true)
         }
         var state = session.selfCompactState
         if state.cancelStaleParkedNote(for: session) {
             session.selfCompactState = state
+            scheduleSave()
         }
         guard let parked = session.selfCompactState.parkedNote else {
             return Carry(text: text, dispatchID: nil)
@@ -57,6 +62,32 @@ enum AgentSelfCompactParkedPrefix {
         var state = session.selfCompactState
         _ = state.noteDefinitivelyNotAttempted(dispatchID)
         session.selfCompactState = state
+    }
+
+    /// A dedicated note that never reached `session/prompt` can safely be carried by the next
+    /// ordinary input. This is not used after transport was attempted.
+    @MainActor
+    @discardableResult
+    static func reparkUnattemptedDedicatedNote(
+        _ dispatchID: AgentSelfCompactionDispatchID,
+        session: AgentTabSession,
+        scheduleSave: @MainActor () -> Void
+    ) -> Bool {
+        var state = session.selfCompactState
+        guard state.active?.noteDispatchStarted == false,
+              state.noteDefinitivelyNotAttempted(dispatchID)
+        else { return false }
+        session.selfCompactState = state
+        scheduleSave()
+        return true
+    }
+
+    @MainActor
+    static func preparedDedicatedNoteID(
+        _ text: String,
+        session: AgentTabSession
+    ) -> AgentSelfCompactionDispatchID? {
+        dedicatedNoteID(text: text, session: session)
     }
 
     @MainActor
