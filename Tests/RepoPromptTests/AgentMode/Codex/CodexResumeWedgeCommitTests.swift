@@ -7,7 +7,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     private static let oldThreadID = "old-committed-thread"
     private static let oldRolloutPath = "/tmp/old-committed-rollout.jsonl"
     private static let missingRolloutMessage =
-        "failed to resolve rollout path /tmp/rollout-new.jsonl: file does not exist"
+        "failed to resolve rollout path /tmp/old-committed-rollout.jsonl: file does not exist"
 
     @MainActor
     private struct Fixture {
@@ -21,7 +21,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
     }
 
-    private func makeFixture(_ plans: [[WedgeFakeCodexController.Response]]) -> Fixture {
+    private func makeFixture(
+        _ plans: [[WedgeFakeCodexController.Response]],
+        routeOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true }
+    ) -> Fixture {
         let factory = WedgeControllerFactory(plans: plans)
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
@@ -30,7 +33,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             shouldManageCodexTooling: true,
             codexControllerFactory: { runID, _, _, _, _, _ in factory.make(runID: runID) },
             mcpServerEnabler: { true },
-            testCodexLeaseRoutingTimeoutMs: 5000
+            testCodexLeaseRoutingTimeoutMs: 5000,
+            testCodexRouteOwnerValidator: routeOwnerValidator
         )
         let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
             on: viewModel,
@@ -211,6 +215,146 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(successor.factory.controllers[0].startedTurnCount, 0)
     }
 
+    func testInheritedRoutedOutcomeCannotCommitWithoutCurrentControllerRoute() async throws {
+        let fixture = makeFixture(
+            [[.success("unrouted-fresh-thread")]],
+            routeOwnerValidator: { _, _, _, _ in false }
+        )
+        fixture.session.codexNativeStartupDisposition = .resumed
+        let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
+        defer { startup.cancel() }
+        try await waitForPendingStart(fixture)
+        let runID = try XCTUnwrap(fixture.session.runID)
+        let policyWasInstalled = await hasPendingPolicy(for: runID)
+        XCTAssertTrue(policyWasInstalled)
+        await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+        await startup.value
+
+        assertOldTuple(fixture.session)
+        let policyWasCleared = await hasPendingPolicy(for: runID)
+        XCTAssertFalse(policyWasCleared)
+        XCTAssertNil(fixture.session.codexNativeStartupDisposition)
+        XCTAssertNil(fixture.session.codexController)
+        XCTAssertFalse(fixture.session.codexNeedsReconnect)
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
+    }
+
+    func testCancellationDuringRouteOwnerCheckCleansPolicyAndUncommittedController() async throws {
+        let gate = TestReleaseFence(name: "Codex route owner check")
+        let fixture = makeFixture(
+            [[.success("cancelled-owner-thread")]],
+            routeOwnerValidator: { _, _, _, _ in
+                await gate.enterAndWait()
+                return true
+            }
+        )
+        let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
+        defer {
+            gate.release()
+            startup.cancel()
+        }
+        try await waitForPendingStart(fixture)
+        let runID = try XCTUnwrap(fixture.session.runID)
+        await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+        let ownerCheckEntered = await gate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(ownerCheckEntered)
+        startup.cancel()
+        gate.release()
+        await startup.value
+
+        assertOldTuple(fixture.session)
+        let policyWasCleared = await hasPendingPolicy(for: runID)
+        XCTAssertFalse(policyWasCleared)
+        XCTAssertNil(fixture.session.codexController)
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+    }
+
+    private func hasPendingPolicy(for runID: UUID) async -> Bool {
+        guard let clientName = AgentProviderKind.codexExec.mcpClientNameHint else { return false }
+        let policies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: clientName)
+        return policies.contains { $0.runID == runID }
+    }
+
+    func testAlreadyInstalledPolicyRecoveryStillStagesUntilRouting() async throws {
+        let fixture = makeFixture([[.success("event-recovery-thread")]])
+        let startup = Task {
+            await fixture.coordinator.ensureCodexNativeSession(
+                session: fixture.session,
+                policyAlreadyInstalled: true,
+                preserveExistingRunID: true
+            )
+        }
+        defer { startup.cancel() }
+        try await waitForPendingStart(fixture)
+        assertOldTuple(fixture.session)
+        try await MCPRoutingWaiter.shared.notifyFailed(runID: XCTUnwrap(fixture.session.runID))
+        await startup.value
+        assertOldTuple(fixture.session)
+        XCTAssertNil(fixture.session.codexController)
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+    }
+
+    func testSameRunAttemptDriftRetiresOnlyUncommittedControllerBeforeLaterSend() async throws {
+        let fixture = makeFixture([
+            [.success("drifted-fresh-thread")],
+            [.success("later-fresh-thread")]
+        ])
+        fixture.session.appendItem(.system("Earlier Codex history", sequenceIndex: fixture.session.nextSequenceIndex))
+        let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
+        defer { startup.cancel() }
+        try await waitForPendingStart(fixture)
+        let runID = try XCTUnwrap(fixture.session.runID)
+        fixture.session.beginRunAttempt(source: "same-run-successor")
+        XCTAssertEqual(fixture.session.runID, runID)
+        await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+        await startup.value
+
+        assertOldTuple(fixture.session)
+        XCTAssertNil(fixture.session.codexController)
+        XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
+        try await AsyncTestWait.waitUntil("uncommitted Codex controller retired", timeout: 4) {
+            fixture.factory.controllers[0].shutdownCount == 1
+        }
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "later-send")
+        let later = Task {
+            await fixture.coordinator.sendCodexNativeMessage(
+                session: fixture.session,
+                text: "continue",
+                attachments: []
+            )
+        }
+        defer { later.cancel() }
+        try await waitForPendingStart(fixture)
+        XCTAssertEqual(fixture.factory.controllers[1].receivedExistingIDs, [Self.oldThreadID])
+        try await MCPRoutingWaiter.shared.notifyFailed(runID: XCTUnwrap(fixture.session.runID))
+        _ = await later.value
+        assertOldTuple(fixture.session)
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+        XCTAssertEqual(fixture.factory.controllers[1].startedTurnCount, 0)
+    }
+
+    func testAttemptDriftDoesNotRetireSuccessorController() async throws {
+        let fixture = makeFixture([[.success("stale-fresh-thread")]])
+        let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
+        defer { startup.cancel() }
+        try await waitForPendingStart(fixture)
+        let runID = try XCTUnwrap(fixture.session.runID)
+        fixture.session.beginRunAttempt(source: "successor-controller")
+        let successor = WedgeFakeCodexController(runID: runID, responses: [])
+        fixture.session.codexController = successor
+        await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+        await startup.value
+
+        assertOldTuple(fixture.session)
+        XCTAssertEqual(fixture.session.codexController.map(ObjectIdentifier.init), ObjectIdentifier(successor))
+        XCTAssertEqual(successor.shutdownCount, 0)
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+    }
+
     func testResolveRolloutPathClassifierIsNarrow() {
         let ref = CodexNativeSessionController.SessionRef(
             conversationID: Self.oldThreadID,
@@ -225,7 +369,20 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             )
         }
         XCTAssertTrue(classifier(ref, Self.missingRolloutMessage))
-        XCTAssertTrue(classifier(ref, "  FAILED TO RESOLVE ROLLOUT PATH /tmp/x: FILE DOES NOT EXIST.  "))
+        XCTAssertTrue(classifier(ref, "  FAILED TO RESOLVE ROLLOUT PATH /tmp/old-committed-rollout.jsonl: FILE DOES NOT EXIST.  "))
+        XCTAssertFalse(classifier(ref, "failed to resolve rollout path /tmp/other-rollout.jsonl: file does not exist"))
+        let mixedCaseRef = CodexNativeSessionController.SessionRef(
+            conversationID: Self.oldThreadID,
+            rolloutPath: "/tmp/CaseSensitive.jsonl",
+            model: nil,
+            reasoningEffort: nil
+        )
+        XCTAssertTrue(classifier(mixedCaseRef, "failed to resolve rollout path /tmp/CaseSensitive.jsonl: file does not exist"))
+        XCTAssertFalse(classifier(mixedCaseRef, "failed to resolve rollout path /tmp/casesensitive.jsonl: file does not exist"))
+        XCTAssertTrue(classifier(
+            .init(conversationID: Self.oldThreadID, rolloutPath: nil, model: nil, reasoningEffort: nil),
+            "failed to resolve rollout path /tmp/other-rollout.jsonl: file does not exist"
+        ))
         XCTAssertTrue(classifier(ref, "no rollout found for thread id old-committed-thread"))
         XCTAssertFalse(classifier(nil, Self.missingRolloutMessage))
         XCTAssertFalse(classifier(ref, "failed to resolve workspace path /tmp/x: file does not exist"))
@@ -237,6 +394,30 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             method: "thread/resume",
             code: -32600,
             message: Self.missingRolloutMessage
+        ))
+        XCTAssertFalse(CodexAgentModeCoordinator.test_shouldRetryCodexStartWithoutResume(
+            existingRef: ref,
+            method: "thread/resume",
+            code: -32600,
+            message: "failed to resolve rollout path /tmp/other-rollout.jsonl: file does not exist"
+        ))
+        XCTAssertFalse(CodexAgentModeCoordinator.test_shouldRetryCodexStartWithoutResume(
+            existingRef: mixedCaseRef,
+            method: "thread/resume",
+            code: -32600,
+            message: "failed to resolve rollout path /tmp/casesensitive.jsonl: file does not exist"
+        ))
+        XCTAssertFalse(CodexAgentModeCoordinator.test_shouldRetryCodexStartWithoutResume(
+            existingRef: mixedCaseRef,
+            method: "config/read",
+            code: -32600,
+            message: "failed to resolve rollout path /tmp/CaseSensitive.jsonl: file does not exist"
+        ))
+        XCTAssertFalse(CodexAgentModeCoordinator.test_shouldRetryCodexStartWithoutResume(
+            existingRef: mixedCaseRef,
+            method: "config/read",
+            code: -32600,
+            message: "failed to resolve rollout path /tmp/casesensitive.jsonl: file does not exist"
         ))
         XCTAssertFalse(CodexAgentModeCoordinator.test_shouldRetryCodexStartWithoutResume(
             existingRef: ref,
@@ -285,6 +466,7 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
     private var existingIDs: [String?] = []
     private var active = false
     private var turnCount = 0
+    private var shutdowns = 0
     private let continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
     let events: AsyncStream<CodexNativeSessionController.Event>
 
@@ -306,6 +488,10 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
 
     var startedTurnCount: Int {
         lock.withLock { turnCount }
+    }
+
+    var shutdownCount: Int {
+        lock.withLock { shutdowns }
     }
 
     func startOrResume(
@@ -331,7 +517,7 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
             throw CodexAppServerClient.ClientError.requestFailed(.init(
                 method: "thread/resume",
                 code: -32600,
-                message: "failed to resolve rollout path /tmp/rollout-new.jsonl: file does not exist",
+                message: "failed to resolve rollout path /tmp/old-committed-rollout.jsonl: file does not exist",
                 data: nil
             ))
         case let .suspendedSuccess(threadID, gate):
@@ -371,7 +557,10 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
     }
 
     func shutdown() async {
-        lock.withLock { active = false }
+        lock.withLock {
+            active = false
+            shutdowns += 1
+        }
         continuation.finish()
     }
 }

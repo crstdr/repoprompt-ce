@@ -32,6 +32,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ allowsAgentExternalControlTools: Bool,
         _ requiresExpectedAgentPID: Bool
     ) async -> Void
+    typealias CodexRouteOwnerValidator = @MainActor (
+        _ controller: any CodexSessionControlling,
+        _ runID: UUID,
+        _ windowID: Int,
+        _ tabID: UUID
+    ) async -> Bool
     typealias ActiveToolQuery = AgentModeViewModel.CodexActiveToolQuery
     typealias ActiveAgentRunWaitQuery = AgentModeViewModel.CodexAgentRunWaitQuery
     typealias ActiveAgentRunWaitDrain = AgentModeViewModel.CodexAgentRunWaitDrain
@@ -260,6 +266,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let codexControllerFactory: CodexControllerFactory
     private let codexCapabilitiesForLaunch: (_ isMCPRelated: Bool) -> CodexCapabilitySettings
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
+    private let routeOwnerValidator: CodexRouteOwnerValidator
     private let shouldManageCodexTooling: Bool
     private let activeToolQuery: ActiveToolQuery
     private let activeAgentRunWaitQuery: ActiveAgentRunWaitQuery
@@ -387,6 +394,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         runtimeWorkspacePathsProvider: @escaping (AgentTabSession) throws -> CodexRuntimeWorkspacePaths,
         codexControllerFactory: @escaping CodexControllerFactory,
         connectionPolicyInstaller: @escaping ConnectionPolicyInstaller,
+        routeOwnerValidator: @escaping CodexRouteOwnerValidator = { controller, runID, windowID, tabID in
+            guard let processID = await controller.routingProcessID() else { return false }
+            return await ServerNetworkManager.shared.isRunRouteAuthoritativelyCommitted(
+                runID: runID,
+                windowID: windowID,
+                tabID: tabID,
+                expectedAgentPID: processID
+            )
+        },
         shouldManageCodexTooling: Bool,
         codexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
@@ -410,6 +426,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.codexControllerFactory = codexControllerFactory
         self.codexCapabilitiesForLaunch = codexCapabilitiesForLaunch
         self.connectionPolicyInstaller = connectionPolicyInstaller
+        self.routeOwnerValidator = routeOwnerValidator
         self.shouldManageCodexTooling = shouldManageCodexTooling
         self.authRecovery = authRecovery
         self.codexHookApprovalSettings = codexHookApprovalSettings
@@ -4256,8 +4273,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if case let CodexAppServerClient.ClientError.requestFailed(failure) = error,
            CodexAppServerClient.isMissingRolloutPathResolutionMessage(failure.message)
         {
+            // A recognized typed diagnostic must not fall through to the looser
+            // NSError text classifier after its method or path is rejected.
             return ["thread/resume", "thread/memoryMode/set"].contains(failure.method)
                 && failure.code != -32601 && failure.code != -32602
+                && CodexAppServerClient.isMissingRolloutPathResolutionMessage(
+                    failure.message,
+                    expectedRolloutPath: existingRef?.rolloutPath
+                )
         }
 
         let nsError = error as NSError
@@ -4267,7 +4290,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             nsError.localizedRecoverySuggestion
         ].compactMap(\.self)
 
-        return candidates.contains { isMissingRolloutErrorMessage($0) }
+        return candidates.contains {
+            isMissingRolloutErrorMessage($0, expectedRolloutPath: existingRef?.rolloutPath)
+        }
     }
 
     private static func hasResumeEligibleCodexHistory(_ items: [AgentChatItem]) -> Bool {
@@ -4497,7 +4522,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         "Codex's last turn failed while Repo Prompt was reconnecting."
     }
 
-    private static func isMissingRolloutErrorMessage(_ message: String) -> Bool {
+    private static func isMissingRolloutErrorMessage(
+        _ message: String,
+        expectedRolloutPath: String?
+    ) -> Bool {
         let normalized = message
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -4509,7 +4537,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         }
 
-        if CodexAppServerClient.isMissingRolloutPathResolutionMessage(normalized) {
+        if CodexAppServerClient.isMissingRolloutPathResolutionMessage(
+            message,
+            expectedRolloutPath: expectedRolloutPath
+        ) {
             return true
         }
         guard normalized.contains("rollout") else { return false }
@@ -4751,6 +4782,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         else { return }
         pendingCodexStartsByTabID.removeValue(forKey: session.tabID)
         logCodex("[AgentModeVM][CodexBootstrap] discarded uncommitted thread \(pending.result.sessionRef?.conversationID ?? "nil") for tab \(session.tabID)")
+    }
+
+    /// A superseded attempt may still own the same live controller. Retire only the
+    /// uncommitted instance/generation; never touch a successor controller.
+    private func retireUncommittedCodexControllerIfInstalled(
+        for session: AgentTabSession,
+        pending: PendingCodexStart,
+        controller: any CodexSessionControlling,
+        source: String
+    ) {
+        guard session.codexControllerGeneration == pending.controllerGeneration,
+              session.codexController.map(ObjectIdentifier.init) == pending.controllerID
+        else { return }
+        _ = invalidateCodexControllerForReconnect(
+            session: session,
+            expectedController: controller,
+            source: source,
+            preserveRunID: true
+        )
+        session.codexNeedsReconnect = false
     }
 
     private func applyCodexNativeSessionStartResult(
@@ -6674,7 +6725,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         let shouldInstallPolicy = shouldManageCodexTooling
             && shouldBootstrapSessionInitialization
-            && !policyAlreadyInstalled
+            && (!policyAlreadyInstalled || !deferPublicationUntilRouting)
             && requiresTransportStart
         let shouldWaitForRouting = requiresTransportStart
         if shouldInstallPolicy {
@@ -6699,6 +6750,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     existingRef: routingReadinessResumeCandidate,
                     allowResumeTimeoutFallback: allowResumeTimeoutFallback
                 )
+            session.codexNativeStartupDisposition = nil
             await ensureCodexNativeSession(
                 session: session,
                 policyAlreadyInstalled: true,
@@ -6733,17 +6785,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 // A provider response with no owning startup is not a routable session.
                 discardPendingCodexStart(for: session)
                 if let pendingStart,
-                   session.runID == pendingStart.runID,
-                   session.activeRunAttemptID == pendingStart.runAttemptID,
-                   session.codexController.map(ObjectIdentifier.init) == pendingStart.controllerID
+                   let controller = session.codexController
                 {
-                    _ = invalidateCodexControllerForReconnect(
-                        session: session,
-                        expectedController: session.codexController,
-                        source: "uncommitted-start-not-ready",
-                        preserveRunID: true
+                    retireUncommittedCodexControllerIfInstalled(
+                        for: session,
+                        pending: pendingStart,
+                        controller: controller,
+                        source: "uncommitted-start-not-ready"
                     )
-                    session.codexNeedsReconnect = false
                 }
                 await lease.failAndRelease()
                 return
@@ -6765,8 +6814,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             else { return false }
                             guard let viewModel else { return false }
                             let readiness = await viewModel.ensureProviderInputCatalogReady(for: session)
+                            guard readiness == .ready || readiness == .notRequired else { return false }
+                            // Validate inside the lease boundary: a stale .routed outcome
+                            // cannot retain an unconsumed policy for another process.
+                            let routeBelongsToController = await routeOwnerValidator(
+                                expectedController,
+                                runID,
+                                windowID,
+                                session.tabID
+                            )
                             return !Task.isCancelled
-                                && (readiness == .ready || readiness == .notRequired)
+                                && routeBelongsToController
                                 && session.runID == runID
                                 && session.activeRunAttemptID == runAttemptIDAtEntry
                                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
@@ -6788,6 +6846,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                 expectedRunAttemptID: runAttemptIDAtEntry
                             )
                         }
+                        retireUncommittedCodexControllerIfInstalled(
+                            for: session,
+                            pending: pendingStart,
+                            controller: expectedController,
+                            source: "uncommitted-routing-or-attempt"
+                        )
                         return
                     }
                     await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
@@ -6795,17 +6859,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     // Cancellation cannot publish a staged reference even if the provider
                     // already reported an active thread.
                     discardPendingCodexStart(for: session, controllerID: expectedControllerID)
-                    if session.runID == runID,
-                       session.activeRunAttemptID == runAttemptIDAtEntry
-                    {
-                        _ = invalidateCodexControllerForReconnect(
-                            session: session,
-                            expectedController: expectedController,
-                            source: "mcp-routing-cancelled",
-                            preserveRunID: true
-                        )
-                        session.codexNeedsReconnect = false
-                    }
+                    retireUncommittedCodexControllerIfInstalled(
+                        for: session,
+                        pending: pendingStart,
+                        controller: expectedController,
+                        source: "mcp-routing-cancelled"
+                    )
                     logCodex("[AgentModeVM][CodexBootstrap] routing wait cancelled for tab \(session.tabID) run \(runID)")
                 } catch {
                     // Fail closed: RepoPrompt MCP routing was never confirmed for this run, so the
@@ -6824,9 +6883,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         expectedRunID: runID,
                         expectedRunAttemptID: runAttemptIDAtEntry
                     )
+                    retireUncommittedCodexControllerIfInstalled(
+                        for: session,
+                        pending: pendingStart,
+                        controller: expectedController,
+                        source: "uncommitted-routing-failure"
+                    )
                 }
             } else {
                 discardPendingCodexStart(for: session, controllerID: pendingStart.controllerID)
+                retireUncommittedCodexControllerIfInstalled(
+                    for: session,
+                    pending: pendingStart,
+                    controller: expectedController,
+                    source: "uncommitted-no-routing-wait"
+                )
                 await lease.releaseWithoutRoutingWait()
             }
             return
@@ -7273,6 +7344,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return .cancelled
         }
         if session.activeRunAttemptID != sendRunAttemptIDAtEntry {
+            clearCodexPendingAuthRetryTurn(session)
             viewModel?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
