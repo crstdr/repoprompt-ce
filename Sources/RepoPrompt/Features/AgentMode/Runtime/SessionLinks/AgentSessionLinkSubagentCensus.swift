@@ -7,8 +7,8 @@ struct AgentSessionLinkSubagentCensus: Equatable {
     struct Record {
         let sessionID: UUID
         let parentSessionID: UUID?
-        /// Only live records can be running. A live idle child is non-terminal too.
-        let isLiveNonTerminal: Bool
+        /// Only a live child with in-flight run state contributes to `running`.
+        let isLiveInFlight: Bool
     }
 
     struct Counts: Equatable {
@@ -34,7 +34,7 @@ struct AgentSessionLinkSubagentCensus: Equatable {
         for record in childrenByID.values {
             guard let parentID = record.parentSessionID else { continue }
             var counts = countsByParent[parentID, default: Counts()]
-            if record.isLiveNonTerminal {
+            if record.isLiveInFlight {
                 counts.running += 1
             } else {
                 counts.finished += 1

@@ -5193,7 +5193,6 @@ final class AgentSessionLinkRuntimeBridge {
         return grant.capabilities.contains(.manage)
     }
 
-    /// Current sanitized target state plus a freshly minted successor wait cursor.
     /// Loads durable child metadata once for the batch, then publishes the resulting target
     /// snapshots before a poll or wait reads the authority. One live-candidate map serves all rows.
     func refreshLaneBoardCensus(for targets: [AuthorizedTarget]) async {
@@ -5214,6 +5213,7 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
+    /// Current sanitized target state plus a freshly minted successor wait cursor.
     func targetState(
         for lease: DomainAgentSessionLinkLease
     ) async -> DomainAgentSessionLinkTargetState? {

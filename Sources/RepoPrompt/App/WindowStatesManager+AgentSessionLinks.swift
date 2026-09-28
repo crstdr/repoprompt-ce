@@ -30,7 +30,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
                 board: DomainAgentSessionLaneBoard(
                     runOutcome: .none,
                     failureReason: nil,
-                    sendBlockers: ["session_unavailable"],
+                    sendBlockers: [AgentModeViewModel.SendBlocker.sessionUnavailable.rawValue],
                     subagentRunning: 0,
                     subagentFinished: 0
                 ),

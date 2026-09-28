@@ -293,7 +293,7 @@ extension AgentModeViewModel {
                 board: DomainAgentSessionLaneBoard(
                     runOutcome: .none,
                     failureReason: nil,
-                    sendBlockers: ["session_unavailable"],
+                    sendBlockers: [SendBlocker.sessionUnavailable.rawValue],
                     subagentRunning: 0,
                     subagentFinished: 0
                 ),
@@ -319,13 +319,15 @@ extension AgentModeViewModel {
     func agentSessionLinkRefreshSubagentCensus(for workspace: WorkspaceModel) async {
         agentSessionLinkSubagentRefreshGeneration &+= 1
         let generation = agentSessionLinkSubagentRefreshGeneration
-        guard let persisted = try? await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace),
-              !Task.isCancelled,
+        let persisted = try? await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace)
+        guard !Task.isCancelled,
               generation == agentSessionLinkSubagentRefreshGeneration,
               workspaceManager?.activeWorkspace?.id == workspace.id
         else { return }
+        // A metadata read failure must not leave the prior durable census looking current.
+        // Live and owner-validated index entries still provide a bounded fallback.
         agentSessionLinkPersistedSubagentWorkspaceID = workspace.id
-        agentSessionLinkPersistedSubagentMeta = persisted
+        agentSessionLinkPersistedSubagentMeta = persisted ?? []
         rebuildAgentSessionLinkSubagentCensus()
     }
 
@@ -356,12 +358,12 @@ extension AgentModeViewModel {
             agentSessionLinkPersistedSubagentWorkspaceID == activeWorkspaceID
                 ? agentSessionLinkPersistedSubagentMeta.compactMap {
                     guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: $0.id) else { return nil }
-                    return .init(sessionID: $0.id, parentSessionID: $0.parentSessionID, isLiveNonTerminal: false)
+                    return .init(sessionID: $0.id, parentSessionID: $0.parentSessionID, isLiveInFlight: false)
                 }
                 : []
         let index = ownerValidatedSessionIndex.values.compactMap { entry -> AgentSessionLinkSubagentCensus.Record? in
             guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: entry.id) else { return nil }
-            return .init(sessionID: entry.id, parentSessionID: entry.parentSessionID, isLiveNonTerminal: false)
+            return .init(sessionID: entry.id, parentSessionID: entry.parentSessionID, isLiveInFlight: false)
         }
         var knownParentBySessionID: [UUID: UUID] = [:]
         for record in persisted {
@@ -374,15 +376,12 @@ extension AgentModeViewModel {
             guard let sessionID = session.activeAgentSessionID,
                   !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID)
             else { return nil }
-            let isNonTerminal = switch session.runState {
-            case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval: true
-            case .completed, .cancelled, .failed: false
-            }
+            let isInFlight = session.runState.isActive
             return .init(
                 sessionID: sessionID,
                 parentSessionID: session.parentSessionID
                     ?? (session.hasLoadedPersistedState ? nil : knownParentBySessionID[sessionID]),
-                isLiveNonTerminal: isNonTerminal
+                isLiveInFlight: isInFlight
             )
         }
         let updated = AgentSessionLinkSubagentCensus(persisted: persisted, index: index, live: live)
@@ -604,6 +603,11 @@ extension AgentModeViewModel {
         subagentCounts: (running: Int, finished: Int)
     ) -> DomainAgentSessionObservationSnapshot {
         let projection = statusProjection(for: session)
+        let blockers = sendBlockers(sendReadinessInputs(
+            session: session,
+            candidate: candidate,
+            status: projection.status
+        ))
         return DomainAgentSessionObservationSnapshot(
             sessionID: candidate.sessionID,
             displayName: candidate.displayName,
@@ -611,15 +615,10 @@ extension AgentModeViewModel {
             status: projection.status,
             board: laneBoard(
                 for: session,
-                candidate: candidate,
-                status: projection.status,
+                blockers: blockers,
                 subagentCounts: subagentCounts
             ),
-            idleForSend: isIdleForSend(
-                session: session,
-                candidate: candidate,
-                status: projection.status
-            ),
+            idleForSend: blockers.isEmpty,
             waitingOn: session.oversight.waitingOn,
             pendingInteractionKind: projection.pendingInteractionKind,
             latestVisibleAssistantPreview: latestVisibleAssistantPreview(for: session),
@@ -634,8 +633,7 @@ extension AgentModeViewModel {
     /// view model's session collection; the census is wired separately.
     static func laneBoard(
         for session: TabSession,
-        candidate: AgentSessionLinkEndpointCandidate,
-        status: DomainAgentSessionLinkStatus,
+        blockers: [SendBlocker],
         subagentCounts: (running: Int, finished: Int)
     ) -> DomainAgentSessionLaneBoard {
         let runOutcome: DomainAgentSessionLaneBoard.RunOutcome = switch session.runState {
@@ -648,18 +646,14 @@ extension AgentModeViewModel {
         }
         let revision = session.lastTerminalCommitRevision
         let stampedReason = revision.flatMap { revision -> DomainAgentRunSnapshot.FailureReason? in
-            guard revision.terminalState == session.runState,
-                  revision.expectedRunID == session.runID
-            else { return nil }
+            guard revision.terminalState == session.runState else { return nil }
             return revision.failureReason
         }
         let failureReason = laneFailureReason(for: session.runState, stamped: stampedReason)
         return DomainAgentSessionLaneBoard(
             runOutcome: runOutcome,
             failureReason: failureReason,
-            sendBlockers: sendBlockers(
-                sendReadinessInputs(session: session, candidate: candidate, status: status)
-            ).map(\.rawValue),
+            sendBlockers: blockers.map(\.rawValue),
             subagentRunning: subagentCounts.running,
             subagentFinished: subagentCounts.finished
         )
@@ -1280,6 +1274,7 @@ extension AgentModeViewModel {
     /// on exactly this field — so an omission turns the documented wait-then-send recipe back into
     /// the retry loop it exists to prevent.
     enum SendBlocker: String {
+        case sessionUnavailable = "session_unavailable"
         case statusNotIdle = "status_not_idle"
         case runStateActive = "run_state_active"
         case persistedStateNotLoaded = "persisted_state_not_loaded"
@@ -1355,14 +1350,6 @@ extension AgentModeViewModel {
         if input.hasPendingAutoWake { blockers.append(.pendingAutoWake) }
         if input.isCandidateClosing { blockers.append(.candidateClosing) }
         return blockers.sorted { $0.rawValue < $1.rawValue }
-    }
-
-    static func isIdleForSend(
-        session: TabSession,
-        candidate: AgentSessionLinkEndpointCandidate,
-        status: DomainAgentSessionLinkStatus
-    ) -> Bool {
-        sendBlockers(sendReadinessInputs(session: session, candidate: candidate, status: status)).isEmpty
     }
 
     static func latestVisibleAssistantPreview(for session: TabSession) -> String? {

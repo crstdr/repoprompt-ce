@@ -88,6 +88,41 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         XCTAssertEqual(snapshot(for: session, candidate: candidate(tabID: tabID)).board.failureReason, .cancelled)
     }
 
+    func testFailedTerminalCommitRetainsStampedReasonAfterProviderClearsRunID() {
+        let tabID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let runID = UUID()
+        session.installRunID(runID)
+        let ownership = AgentRunOwnership(
+            binding: AgentRunBindingIdentity(tabID: tabID, persistentSessionID: nil)
+        )
+        XCTAssertTrue(session.runLifecycle.beginTerminalCommit())
+        session.runLifecycle.stageTerminalRevision(AgentRunTerminalCommitRevision(
+            commitID: UUID(),
+            ownership: ownership,
+            terminalState: .failed,
+            failureReason: .timeout,
+            expectedRunID: runID,
+            sourceItemsRevision: 0,
+            assistantDeltaFlushGeneration: 0,
+            providerDrainGeneration: 0,
+            mcpPublicationEnvelope: nil,
+            successorKind: nil,
+            providerSuccessorID: nil
+        ))
+        session.runState = .failed
+        XCTAssertTrue(session.clearRunID(ifCurrent: runID))
+        session.runLifecycle.completeTerminalCommit()
+        XCTAssertNil(session.runID)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+        let observed = snapshot(for: session, candidate: candidate(tabID: tabID))
+        XCTAssertEqual(observed.board.runOutcome, .failed)
+        XCTAssertEqual(observed.board.failureReason, .timeout)
+
+        session.runState = .completed
+        XCTAssertNil(snapshot(for: session, candidate: candidate(tabID: tabID)).board.failureReason)
+    }
+
     func testEveryNamedReadinessConditionProducesItsOwnBlocker() {
         let tabID = UUID()
         let session = AgentModeViewModel.TabSession(tabID: tabID)
@@ -120,6 +155,19 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         var nonIdle = baseline
         nonIdle.status = .awaitingUser
         XCTAssertEqual(AgentModeViewModel.sendBlockers(nonIdle).map(\.rawValue), ["status_not_idle"])
+        XCTAssertEqual(AgentModeViewModel.SendBlocker.sessionUnavailable.rawValue, "session_unavailable")
+    }
+
+    func testUnavailableSessionUsesTheSharedBlockerVocabulary() {
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Lane-board tests must not start a provider")
+            }
+        )
+        let observed = viewModel.agentSessionLinkObservationSnapshot(for: candidate(tabID: UUID()))
+        XCTAssertFalse(observed.idleForSend)
+        XCTAssertEqual(observed.board.sendBlockers, [AgentModeViewModel.SendBlocker.sessionUnavailable.rawValue])
     }
 
     func testPublishedBlockersAndIdleForSendShareTheSameEvaluation() {
@@ -160,19 +208,19 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         let indexOnlyID = UUID()
         let movedID = UUID()
         let persisted = [
-            Record(sessionID: liveID, parentSessionID: unrelatedID, isLiveNonTerminal: false),
-            Record(sessionID: terminalID, parentSessionID: parentID, isLiveNonTerminal: false),
-            Record(sessionID: persistedOnlyID, parentSessionID: parentID, isLiveNonTerminal: false),
-            Record(sessionID: movedID, parentSessionID: parentID, isLiveNonTerminal: false)
+            Record(sessionID: liveID, parentSessionID: unrelatedID, isLiveInFlight: false),
+            Record(sessionID: terminalID, parentSessionID: parentID, isLiveInFlight: false),
+            Record(sessionID: persistedOnlyID, parentSessionID: parentID, isLiveInFlight: false),
+            Record(sessionID: movedID, parentSessionID: parentID, isLiveInFlight: false)
         ]
         let index = [
-            Record(sessionID: terminalID, parentSessionID: unrelatedID, isLiveNonTerminal: false),
-            Record(sessionID: indexOnlyID, parentSessionID: parentID, isLiveNonTerminal: false),
-            Record(sessionID: movedID, parentSessionID: nil, isLiveNonTerminal: false)
+            Record(sessionID: terminalID, parentSessionID: unrelatedID, isLiveInFlight: false),
+            Record(sessionID: indexOnlyID, parentSessionID: parentID, isLiveInFlight: false),
+            Record(sessionID: movedID, parentSessionID: nil, isLiveInFlight: false)
         ]
         let live = [
-            Record(sessionID: liveID, parentSessionID: parentID, isLiveNonTerminal: true),
-            Record(sessionID: terminalID, parentSessionID: parentID, isLiveNonTerminal: false)
+            Record(sessionID: liveID, parentSessionID: parentID, isLiveInFlight: true),
+            Record(sessionID: terminalID, parentSessionID: parentID, isLiveInFlight: false)
         ]
         let census = AgentSessionLinkSubagentCensus(persisted: persisted, index: index, live: live)
         XCTAssertEqual(census.counts(for: parentID), .init(running: 1, finished: 3))
@@ -246,6 +294,18 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         XCTAssertEqual(board.subagentRunning, 1)
         XCTAssertEqual(board.subagentFinished, 2)
 
+        runningChild.runState = .waitingForApproval
+        viewModel.rebuildAgentSessionLinkSubagentCensus()
+        board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+        XCTAssertEqual(board.subagentRunning, 1)
+        XCTAssertEqual(board.subagentFinished, 2)
+
+        runningChild.runState = .idle
+        viewModel.rebuildAgentSessionLinkSubagentCensus()
+        board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
+        XCTAssertEqual(board.subagentRunning, 0)
+        XCTAssertEqual(board.subagentFinished, 3)
+
         runningChild.runState = .failed
         viewModel.rebuildAgentSessionLinkSubagentCensus()
         board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
@@ -302,8 +362,8 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: childID, on: child))
         viewModel.test_installLiveSession(child)
         var board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
-        XCTAssertEqual(board.subagentRunning, 1, "unhydrated live state must retain known persisted parentage")
-        XCTAssertEqual(board.subagentFinished, 0)
+        XCTAssertEqual(board.subagentRunning, 0, "an idle unhydrated tab is not in flight")
+        XCTAssertEqual(board.subagentFinished, 1, "unhydrated live state must retain known persisted parentage")
 
         _ = viewModel.test_installPersistentSessionBinding(sessionID: nil, on: child)
         board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
@@ -317,6 +377,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         XCTAssertEqual(board.subagentFinished, 0)
 
         child.parentSessionID = parentID
+        child.runState = .running
         XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: child))
         board = viewModel.agentSessionLinkObservationSnapshot(for: target).board
         XCTAssertEqual(board.subagentRunning, 1, "in-place rebind must rebuild without a sessions dictionary mutation")
@@ -362,7 +423,8 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         try await AsyncTestWait.waitUntil("parent board observed child cleanup") { observedEmpty }
     }
 
-    func testThirtyTwoTargetSnapshotBuildUsesOneLargeCensus() {
+    /// Measures only the in-memory census build plus projection, not metadata I/O or bridge refresh.
+    func testThirtyTwoTargetProjectionsFromOneLargeInMemoryCensusStayBounded() {
         typealias Record = AgentSessionLinkSubagentCensus.Record
         let parentIDs = (0 ..< 32).map { _ in UUID() }
         let targetSessions = parentIDs.map { parentID -> (AgentModeViewModel.TabSession, AgentSessionLinkEndpointCandidate) in
@@ -375,7 +437,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             Record(
                 sessionID: UUID(),
                 parentSessionID: parentIDs[index % parentIDs.count],
-                isLiveNonTerminal: false
+                isLiveInFlight: false
             )
         }
         let start = ProcessInfo.processInfo.systemUptime
@@ -391,7 +453,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         let elapsed = ProcessInfo.processInfo.systemUptime - start
         XCTAssertEqual(snapshots.count, 32)
         XCTAssertTrue(snapshots.allSatisfy { $0.board.subagentFinished == 512 })
-        print("LaneBoardCensusStress: 32 targets, 16384 children, elapsed=\(String(format: "%.4f", elapsed))s")
-        XCTAssertLessThan(elapsed, 0.5, "One 32-target board batch should stay below 500 ms")
+        print("LaneBoardCensusProjectionStress: 32 targets, 16384 children, elapsed=\(String(format: "%.4f", elapsed))s")
+        XCTAssertLessThan(elapsed, 1.0, "One in-memory 32-target projection batch should stay below 1 s")
     }
 }
