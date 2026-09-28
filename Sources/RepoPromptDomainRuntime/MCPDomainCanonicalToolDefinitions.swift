@@ -1953,8 +1953,8 @@ package enum MCPDomainCanonicalToolDefinitions {
                     of: "\n\n**Trust and use rules**",
                     with: """
 
-                    - `create_lane`: under any direct link, create your own top-level lane; one `idempotency_key` per intended lane.
-                    - `retire_lane`: [manage + created by you] unlink and stash an idle lane, never delete it.
+                    - `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.
+                    - `retire_lane`: [manage + created by you] unlink/stash idle lane, never delete; no idempotency key.
 
                     **Trust and use rules**
                     """

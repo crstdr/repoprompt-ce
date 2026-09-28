@@ -87,6 +87,7 @@ struct AgentSessionOversightRestorationProof: Equatable {
     let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
     let observerReadiness: AgentSessionRestorationReadiness
     let targetReadiness: AgentSessionRestorationReadiness
+    let requireObserverAuthoritative: Bool
 
     /// Restoration requires two authoritative proofs. Fresh lane creation can instead carry the
     /// observer's exact current readiness while requiring the target's fresh-save proof.
@@ -104,17 +105,20 @@ struct AgentSessionOversightRestorationProof: Equatable {
         targetEndpoint = target.domainEndpoint
         observerReadiness = observer.restorationReadiness
         targetReadiness = target.restorationReadiness
+        self.requireObserverAuthoritative = requireObserverAuthoritative
     }
 
-    /// Whether these two candidates are still byte-for-byte the proved incarnations, with the same
-    /// authoritative hydration outcome.
+    /// Restoration keeps both complete readiness outcomes; lane creation tolerates an observer's
+    /// pending-to-authoritative transition only when its exact endpoint and binding token persist.
     func matches(
         observer: AgentSessionLinkEndpointCandidate,
         target: AgentSessionLinkEndpointCandidate
     ) -> Bool {
         observer.domainEndpoint == observerEndpoint
             && target.domainEndpoint == targetEndpoint
-            && observer.restorationReadiness == observerReadiness
+            && (requireObserverAuthoritative
+                ? observer.restorationReadiness == observerReadiness
+                : observer.restorationReadiness.bindingToken == observerReadiness.bindingToken)
             && target.restorationReadiness == targetReadiness
     }
 

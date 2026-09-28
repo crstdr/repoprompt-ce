@@ -71,6 +71,11 @@ enum AgentSessionLaneMCPToolService {
         if !receipt.linked, let reason = receipt.reason {
             fields["link_reason"] = .string(reason.rawValue)
         }
+        if receipt.result == .creationIncomplete, let sessionID = receipt.sessionID {
+            fields["recovery_hint"] = .string(
+                "This key only replays this receipt. Retain \(sessionID.uuidString); after recovery, link it with ordinary add."
+            )
+        }
         return .object(fields)
     }
 

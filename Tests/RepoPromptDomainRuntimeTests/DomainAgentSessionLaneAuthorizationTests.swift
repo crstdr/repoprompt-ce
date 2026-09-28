@@ -23,7 +23,7 @@ final class DomainAgentSessionLaneAuthorizationTests: XCTestCase {
             caller: caller,
             hasActiveOutboundLink: false
         )
-        XCTAssertEqual(unlinked.denial, .noActiveOutboundLink)
+        XCTAssertEqual(unlinked.denial, .noActiveLink)
         let listInboundOnly = DomainAgentSessionOperationAuthorizer.authorizeObserverScoped(
             operation: .monitorList,
             caller: caller,
@@ -43,7 +43,7 @@ final class DomainAgentSessionLaneAuthorizationTests: XCTestCase {
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorCreateLane.family, .monitor)
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorCreateLane.isObserverScoped)
         XCTAssertNil(DomainAgentSessionTargetOperation.monitorCreateLane.requiredMonitorCapability)
-        XCTAssertTrue(DomainAgentSessionTargetOperation.monitorCreateLane.mutatesTarget)
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorCreateLane.mutatesTarget)
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorRetireLane.family, .monitor)
         XCTAssertFalse(DomainAgentSessionTargetOperation.monitorRetireLane.isObserverScoped)
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorRetireLane.requiredMonitorCapability, .manage)

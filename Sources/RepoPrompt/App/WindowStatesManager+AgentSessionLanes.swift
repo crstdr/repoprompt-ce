@@ -19,6 +19,24 @@ extension WindowStatesManager {
         }
     }
 
+    func agentSessionLinkHasPersistedChildSessions(parentSessionID: UUID) async -> Bool {
+        guard !isTerminating else { return true }
+        var visited: Set<UUID> = []
+        for window in allWindows where !window.isClosing {
+            for workspace in window.workspaceManager.workspaces where visited.insert(workspace.id).inserted {
+                do {
+                    if try await AgentSessionDataService.shared.hasPersistedChildSession(
+                        parentSessionID: parentSessionID, workspace: workspace
+                    ) { return true }
+                } catch {
+                    // An unreadable inventory cannot prove that retirement is child-free.
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int {
         guard !isTerminating else { return 0 }
         return allWindows.filter { !$0.isClosing }.reduce(0) { count, window in

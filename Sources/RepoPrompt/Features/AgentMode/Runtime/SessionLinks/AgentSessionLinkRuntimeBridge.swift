@@ -114,6 +114,9 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 
     func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool
 
+    /// Authoritative disk inventory across all workspace scopes; uncertainty must block retirement.
+    func agentSessionLinkHasPersistedChildSessions(parentSessionID: UUID) async -> Bool
+
     func agentSessionLinkLaneCreatorLabel(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> String?
@@ -435,15 +438,15 @@ extension AgentSessionLinkEndpointHost {
 
     func agentSessionLinkWasCreatedBy(sessionID _: UUID, creatorSessionID _: UUID) -> Bool { false }
 
-    func agentSessionLinkHasChildSessions(parentSessionID _: UUID) -> Bool { false }
+    func agentSessionLinkHasChildSessions(parentSessionID _: UUID) -> Bool { true }
+
+    func agentSessionLinkHasPersistedChildSessions(parentSessionID _: UUID) async -> Bool { true }
 
     func agentSessionLinkLaneCreatorLabel(
         for _: DomainAgentSessionLinkEndpointIdentity
     ) -> String? { nil }
 
-    func agentSessionLinkBindingCount(sessionID: UUID) -> Int {
-        agentSessionLinkCandidates().filter { $0.sessionID == sessionID }.count
-    }
+    func agentSessionLinkBindingCount(sessionID _: UUID) -> Int { .max }
 
     /// Fail-closed management defaults: a host that does not model interactions or steering exposes
     /// none, answers none, and steers nothing.
@@ -3258,15 +3261,23 @@ final class AgentSessionLinkRuntimeBridge {
             ifCurrent: token,
             assertedAt: mapped.assertionGeneration
         )
-        if receipt.outcome == .tokenMismatch {
+        var compensationAttempts = 0
+        while receipt.outcome == .tokenMismatch,
+              receipt.token(for: pair) == token,
+              compensationAttempts < 3 {
             // An unchanged Add can bump the assertion before its establishment is fenced out.
             // Settle it first; only the *same* mapped reference, still owned by this Stop, may
             // retry removal without the stale generation. A successful reassertion updates that
             // mapping and must keep its durable row.
             await settleEstablishment(pair: pair, token: token)
-            if bookkeepingByReference[reference] == mapped, !isFrozenForTermination {
-                receipt = await intentStore.remove(pair, ifCurrent: token, assertedAt: nil)
-            }
+            guard bookkeepingByReference[reference] == mapped, !isFrozenForTermination else { break }
+            compensationAttempts += 1
+            receipt = await intentStore.remove(pair, ifCurrent: token, assertedAt: nil)
+        }
+        if receipt.outcome == .tokenMismatch,
+           receipt.token(for: pair) == token,
+           bookkeepingByReference[reference] == mapped {
+            return .failed(message: Self.staleRelationshipMessage)
         }
         switch receipt.outcome {
         case .writeFailed:
@@ -6488,6 +6499,7 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let endpointReceiptCount = laneCreationReceipts.keys.filter { $0.endpoint == observerEndpoint }.count
             + laneCreationTombstones.keys.filter { $0.endpoint == observerEndpoint }.count
+        // Global in-flight pressure and per-creator lane capacity happen to share the value eight.
         guard endpointReceiptCount + laneCreationTasks.keys.filter({ $0.endpoint == observerEndpoint }).count < 256,
               laneCreationTasks.count < 8
         else {
@@ -6559,13 +6571,18 @@ final class AgentSessionLinkRuntimeBridge {
         // counts both active lanes and the pending allocations that have not linked yet.
         let creatorID = observerEndpoint.sessionID
         var linkedIDs: Set<UUID>
+        var stabilityAttempts = 0
         while true {
+            guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+            guard stabilityAttempts < 32 else { return .refused(.admissionUnstable) }
+            stabilityAttempts += 1
             let generation = laneCreationCapGeneration[creatorID, default: 0]
             let snapshot = await linkedCreatedLaneIDs(creatorSessionID: creatorID)
             #if DEBUG
                 await test_afterLaneCapInventoryBeforeRevision?()
             #endif
             let currentRevision = await authority.snapshot().authorityRevision
+            guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
             if generation == laneCreationCapGeneration[creatorID, default: 0],
                snapshot.revision == currentRevision {
                 linkedIDs = snapshot.ids
@@ -6573,10 +6590,11 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         let ticket = UUID()
-        guard !isFrozenForTermination, !Task.isCancelled,
-              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint }),
-              admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
-                  < AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+        guard host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
+        else { return .refused(.denied) }
+        guard admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
+                < AgentSessionLanePolicy.agentSessionLaneMaximumCount
         else { return .refused(.laneLimitReached, laneCount: linkedIDs.count) }
         laneCreationCapReservations[creatorID, default: [:]][ticket] = .pending
         laneCreationCapGeneration[creatorID, default: 0] &+= 1
@@ -6664,12 +6682,11 @@ final class AgentSessionLinkRuntimeBridge {
               host.agentSessionLinkLaneProvenance(for: matches[0].domainEndpoint) == observerEndpoint.sessionID
         else { return await receipt(false, .addFailed) }
         let laneEndpoint = matches[0].domainEndpoint
-        let observers = host.agentSessionLinkCandidates().filter {
+        guard let observer = host.agentSessionLinkCandidates().first(where: {
             $0.domainEndpoint == observerEndpoint
-        }
-        guard observers.count == 1,
+        }),
               let proof = AgentSessionOversightRestorationProof(
-                  observer: observers[0], target: matches[0], requireObserverAuthoritative: false
+                  observer: observer, target: matches[0], requireObserverAuthoritative: false
               )
         else { return await receipt(false, .addFailed) }
         let add = await addMonitorLink(
@@ -6752,6 +6769,8 @@ final class AgentSessionLinkRuntimeBridge {
         guard !host.agentSessionLinkHasChildSessions(parentSessionID: targetSessionID) else {
             return .notRetired(sessionID: targetSessionID, reason: .laneInUse)
         }
+        guard !(await host.agentSessionLinkHasPersistedChildSessions(parentSessionID: targetSessionID))
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUse) }
         // Install the fence before the relationship snapshot. New Adds in either direction now
         // fail at preflight, reservation, activation and caller completion.
         guard !isFrozenForTermination, !retiringTargets.contains(endpoint) else {
@@ -6799,6 +6818,8 @@ final class AgentSessionLinkRuntimeBridge {
         case .stopped: break
         }
         let remaining = await authority.relationshipInventories(forSessionID: targetSessionID)
+        guard !(await host.agentSessionLinkHasPersistedChildSessions(parentSessionID: targetSessionID))
+        else { return .unlinkedNotStashed(sessionID: targetSessionID) }
         guard !isFrozenForTermination, stillRetirable(),
               remaining.inbound.items.isEmpty,
               remaining.outbound.items.isEmpty

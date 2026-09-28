@@ -759,7 +759,24 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             candidates: candidates, workspaceSelector: "Café", callerWindowID: 1
         )?.workspaceID, accented.workspaceID)
         XCTAssertEqual(request("Cafe").digest, request("CAFE").digest)
+        let decomposed = "Cafe\u{301}"
+        XCTAssertEqual(request("Café").digest, request(decomposed).digest)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: decomposed, callerWindowID: 1
+        )?.workspaceID, accented.workspaceID)
         XCTAssertNotEqual(request("Cafe").digest, request("Café").digest)
+    }
+
+    func testIncompleteLaneReceiptPointsToOrdinaryAddWithoutReallocating() {
+        let sessionID = UUID()
+        let receipt = AgentSessionLaneCreateReceipt(
+            result: .creationIncomplete, sessionID: sessionID, sessionName: "Retained lane",
+            linked: false, reason: .addFailed, firstTask: .none, laneCount: 1
+        )
+        let rendered = AgentSessionLaneMCPToolService.render(receipt).objectValue
+        XCTAssertEqual(rendered?["session_id"]?.stringValue, sessionID.uuidString)
+        XCTAssertTrue(rendered?["recovery_hint"]?.stringValue?.contains("ordinary add") == true)
+        XCTAssertTrue(rendered?["recovery_hint"]?.stringValue?.contains(sessionID.uuidString) == true)
     }
 
     /// The missing-op and unsupported-op errors teach the same operation list the schema advertises.

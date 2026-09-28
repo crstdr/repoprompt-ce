@@ -55,8 +55,8 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             - `request_attention`: send a fixed, attributed signal through an exact inbound link; acceptance does not promise a wake or action.
             - `respond`: [manage] answer the exact current `interaction_id` only with a permitted one-time choice. The pending result supplies `respond_hint`; manual-only prompts belong to the target's user. On mismatch, refresh with `poll` or `wait`, never auto-retry approval.
             - `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering.
-            - `create_lane`: under any direct link, create your own top-level lane; one `idempotency_key` per intended lane.
-            - `retire_lane`: [manage + created by you] unlink and stash an idle lane, never delete it.
+            - `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.
+            - `retire_lane`: [manage + created by you] unlink/stash idle lane, never delete; no idempotency key.
 
             **Trust and use rules**
 

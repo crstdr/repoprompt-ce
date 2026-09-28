@@ -131,6 +131,39 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         }
     }
 
+    func testRebindDuringHydrationDoesNotMarkReplacementAsCreatorOwned() async throws {
+        try await withFixture { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            let originalTabs = Set(fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? [])
+            let replacementID = UUID()
+            let creatorID = UUID()
+            var reboundTabID: UUID?
+            viewModel.test_setAfterDurableChildTabCreation {
+                guard let tabID = fixture.window.workspaceManager.activeWorkspace?.composeTabs.first(where: {
+                    !originalTabs.contains($0.id)
+                })?.id else { return XCTFail("fresh tab was not published") }
+                reboundTabID = tabID
+                do {
+                    _ = try await viewModel.test_rebindPersistentSession(
+                        replacementID, to: viewModel.session(for: tabID)
+                    )
+                } catch { XCTFail("test rebind failed: \(error)") }
+            }
+            defer { viewModel.test_setAfterDurableChildTabCreation(nil) }
+            do {
+                _ = try await viewModel.mcpCreateOversightLane(
+                    creatorSessionID: creatorID, sessionName: "Rebound lane",
+                    selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+                )
+                XCTFail("rebound lane unexpectedly received a first-save proof")
+            } catch {}
+            let tabID = try XCTUnwrap(reboundTabID)
+            let replacement = try XCTUnwrap(viewModel.sessions[tabID])
+            XCTAssertEqual(replacement.activeAgentSessionID, replacementID)
+            XCTAssertNil(replacement.createdByOverseerSessionID)
+        }
+    }
+
     func testConfigurationFailureAlsoRetainsTheCreatedLane() async throws {
         try await withFixture { fixture in
             let viewModel = fixture.window.agentModeViewModel
@@ -177,6 +210,34 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, fixture.workspaceID)
             XCTAssertNil(fixture.window.agentModeViewModel.sessions[hiddenTabID])
             XCTAssertEqual(WindowStatesManager.shared.agentSessionLinkBindingCount(sessionID: sessionID), 2)
+        }
+    }
+
+    func testPersistedChildAbsentFromLiveSessionsAndSidebarIndexStillBlocksRetirement() async throws {
+        try await withFixture { fixture in
+            let dataService = AgentSessionDataService.shared
+            await dataService.test_setWorkspaceRootOverride(fixture.root)
+            do {
+                let parentID = UUID()
+                var child = AgentSession(id: UUID(), name: "Unindexed child", savedAt: Date())
+                child.parentSessionID = parentID
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                _ = try await dataService.saveAgentSession(child, for: workspace)
+                XCTAssertFalse(fixture.window.agentModeViewModel.sessions.values.contains {
+                    $0.parentSessionID == parentID
+                })
+                XCTAssertFalse(fixture.window.agentModeViewModel.test_ownerValidatedSessionIndex.values.contains {
+                    $0.parentSessionID == parentID
+                })
+                let hasPersistedChild = await WindowStatesManager.shared.agentSessionLinkHasPersistedChildSessions(
+                    parentSessionID: parentID
+                )
+                XCTAssertTrue(hasPersistedChild)
+            } catch {
+                await dataService.test_setWorkspaceRootOverride(nil)
+                throw error
+            }
+            await dataService.test_setWorkspaceRootOverride(nil)
         }
     }
 }

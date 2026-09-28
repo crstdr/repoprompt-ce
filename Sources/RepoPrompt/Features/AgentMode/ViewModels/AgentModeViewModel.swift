@@ -8629,12 +8629,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 discardAuthorityID: discardAuthorityID
             )
             registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
+            // Capture the published lane binding before hydration suspends. A same-tab rebind must
+            // never receive creator provenance, even if ensureSessionReady returns its replacement.
+            let publishedLaneSession: TabSession?
+            let publishedLaneIdentity: AgentSessionLifecycleAuthority.Identity?
+            if case .oversightLane = creationKind {
+                publishedLaneSession = session(for: createdTabID)
+                publishedLaneIdentity = agentSessionLifecycleIdentity(
+                    tabID: createdTabID, expectedSessionID: intendedSessionID
+                )
+            } else {
+                publishedLaneSession = nil
+                publishedLaneIdentity = nil
+            }
             do {
                 #if DEBUG
                     await test_afterDurableChildTabCreation?()
                 #endif
                 let hydrated = await ensureSessionReady(tabID: createdTabID)
                 if case let .oversightLane(creatorSessionID) = creationKind {
+                    guard let expectedWorkspaceID, let publishedLaneSession, let publishedLaneIdentity,
+                          workspaceManager?.activeWorkspaceID == expectedWorkspaceID,
+                          hydrated === publishedLaneSession,
+                          sessions[createdTabID] === publishedLaneSession,
+                          hydrated.tabID == createdTabID,
+                          hydrated.activeAgentSessionID == intendedSessionID,
+                          agentSessionLifecycleIdentity(
+                              tabID: createdTabID, expectedSessionID: intendedSessionID
+                          ) == publishedLaneIdentity
+                    else {
+                        throw MCPError.invalidParams("The fresh lane binding changed during hydration.")
+                    }
                     // Set provenance before configuration can dirty or save this fresh session.
                     hydrated.createdByOverseerSessionID = creatorSessionID
                 }
@@ -8667,7 +8692,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
                 return provisionalTarget
             } catch {
-                _ = await mcpDiscardSessionTarget(provisionalTarget)
+                if case .oversightLane = creationKind {
+                    // A published lane remains an ordinary session even when hydration loses its
+                    // exact binding; never route it through MCP's destructive discard recovery.
+                    mcpAcceptSessionTarget(provisionalTarget)
+                } else {
+                    _ = await mcpDiscardSessionTarget(provisionalTarget)
+                }
                 throw error
             }
         }

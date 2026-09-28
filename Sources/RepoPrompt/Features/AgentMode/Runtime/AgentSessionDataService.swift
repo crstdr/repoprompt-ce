@@ -851,6 +851,19 @@ actor AgentSessionDataService {
         return sorted
     }
 
+    /// Read-only, complete child inventory for lane retirement. The sidebar metadata index can
+    /// be stale or scoped to another workspace, so absence there is never an absence proof.
+    func hasPersistedChildSession(parentSessionID: UUID, workspace: WorkspaceModel) async throws -> Bool {
+        let folder = resolvedWorkspaceFolderURL(for: workspace).appendingPathComponent("AgentSessions")
+        guard FileManager.default.fileExists(atPath: folder.path) else { return false }
+        for file in try agentSessionFiles(in: folder) {
+            if try await loadAgentSessionStub(from: file).parentSessionID == parentSessionID {
+                return true
+            }
+        }
+        return false
+    }
+
     private func metadataIndexNeedsFilenameReconciliation(_ index: AgentSessionMetadataIndex, folder: URL) throws -> Bool {
         #if DEBUG
             let reconcileCheckStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()

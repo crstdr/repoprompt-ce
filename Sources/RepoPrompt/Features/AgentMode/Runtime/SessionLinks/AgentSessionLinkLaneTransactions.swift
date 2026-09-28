@@ -23,7 +23,8 @@ struct AgentSessionLaneCreateRequest {
     static func canonicalSelector(_ value: String?) -> String {
         guard let value else { return "caller-workspace" }
         if let id = UUID(uuidString: value) { return "id:\(id.uuidString)" }
-        return "name:\(value.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX")))"
+        let folded = value.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+        return "name:\(folded.precomposedStringWithCanonicalMapping)"
     }
 }
 
@@ -42,6 +43,7 @@ struct AgentSessionLaneCreateReceipt: Equatable {
         case persistenceUnavailable = "persistence_unavailable"
         case destinationUnavailable = "destination_unavailable"
         case laneLimitReached = "lane_limit_reached"
+        case admissionUnstable = "admission_unstable"
         case roleUnavailable = "role_unavailable"
         case idempotencyConflict = "idempotency_conflict"
         case ledgerFull = "ledger_full"

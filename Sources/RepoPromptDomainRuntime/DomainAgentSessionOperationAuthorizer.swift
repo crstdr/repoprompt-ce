@@ -109,10 +109,10 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
         switch self {
         case .runCancel, .runSteer, .runRespond, .manageResume, .manageStop, .manageCleanup, .monitorSend,
              .monitorRespond, .monitorSteer, .monitorCompact,
-             .monitorCreateLane, .monitorRetireLane:
+             .monitorRetireLane:
             true
         case .runPoll, .runWait, .manageList, .manageGetLog, .manageExtractHandoff,
-             .monitorList, .monitorPoll, .monitorWait, .monitorRead,
+             .monitorList, .monitorCreateLane, .monitorPoll, .monitorWait, .monitorRead,
              .monitorSnoozeAutoWake:
             false
         }
@@ -224,6 +224,7 @@ package enum DomainAgentSessionAuthorizationDenial: String, Error, Equatable, Se
     case observerScopedOperation = "observer_scoped_operation"
     case targetScopedOperation = "target_scoped_operation"
     case noActiveOutboundLink = "no_active_outbound_link"
+    case noActiveLink = "no_active_link"
 }
 
 package enum DomainAgentSessionAuthorizationDecision: Equatable, Sendable {
@@ -309,6 +310,8 @@ package enum DomainAgentSessionOperationAuthorizer {
             return .authorized(.observerGrantSet)
         case .monitorCreateLane where hasActiveOutboundLink || hasActiveInboundLink:
             return .authorized(.observerGrantSet)
+        case .monitorCreateLane:
+            return .denied(.noActiveLink)
         default:
             return .denied(.noActiveOutboundLink)
         }
