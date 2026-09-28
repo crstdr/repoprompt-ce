@@ -315,6 +315,83 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         XCTAssertEqual(exact.text, frame)
     }
 
+    func testSupersededDedicatedACPNoteDoesNotSendItsFrameAfterLocalAcceptance() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SelfCompactACPRace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let scriptURL = try AgentSessionLinkACPServerScript.write(to: directory)
+        let gate = try AgentSessionLinkACPResponseGate(directory: directory)
+        let provider = AgentSessionLinkCapturingACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_HOLD_METHOD": "session/set_config_option", "ACP_RESPONSE_GATE": gate.path]
+        )
+        let harness = AgentSessionLinkRunnerHarness(
+            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            acpProviderFactory: { _, _ in provider },
+            workspacePath: directory.path
+        )
+        let session = harness.makeSession(agent: .openCode)
+        let runner = ACPIntegratedAgentModeRunner(
+            hooks: harness.hooks,
+            terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
+            toolTrackingHooks: .noOp,
+            providerFactory: { _, _ in provider },
+            controllerFactory: { provider, request in
+                try ACPAgentSessionController(provider: provider, runRequest: request)
+            }
+        )
+        let initialRequest = ACPRunRequest(
+            agentKind: .openCode, modelString: nil, workspacePath: directory.path,
+            resumeSessionID: nil, attachments: [], taskLabelKind: nil
+        )
+        await runner.startRun(
+            tabID: session.tabID, session: session,
+            initialUserMessage: "prime", initialMessageForRun: "prime", attachments: [],
+            runRequest: initialRequest,
+            makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+        )
+        await session.agentTask?.value
+        XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime"])
+
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: note, idempotencyKey: "raced-note")
+        state.active?.phase = .dispatchingNote
+        session.selfCompactState = state
+        let frame = AgentSelfCompactNoteEnvelope.frame(note)
+        let noteID = try XCTUnwrap(AgentSelfCompactParkedPrefix.preparedDedicatedNoteID(frame, session: session))
+        session.runState = .idle
+        let noteRequest = ACPRunRequest(
+            agentKind: .openCode, modelString: nil, workspacePath: directory.path,
+            resumeSessionID: nil, attachments: [], taskLabelKind: nil,
+            sessionModeID: "auto_edit"
+        )
+        await runner.startRun(
+            tabID: session.tabID, session: session,
+            initialUserMessage: frame, initialMessageForRun: frame, attachments: [],
+            runRequest: noteRequest,
+            makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+        )
+        // The config RPC suspends after this run captured its dedicated note ID but before
+        // runPromptTurn re-reads the carry. Model an ordinary local send that has accepted the note.
+        try await gate.waitUntilEntered()
+        XCTAssertTrue(AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
+            noteID, session: session, scheduleSave: {}
+        ))
+        let local = AgentSelfCompactParkedPrefix.prepare("accepted local turn", session: session, scheduleSave: {})
+        XCTAssertEqual(local.text, frame + "\n\naccepted local turn")
+        let localDispatchID = try XCTUnwrap(local.dispatchID)
+        XCTAssertTrue(AgentSelfCompactParkedPrefix.markAttempted(localDispatchID, session: session))
+        XCTAssertTrue(AgentSelfCompactParkedPrefix.markAccepted(localDispatchID, session: session))
+        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+
+        gate.release()
+        await session.agentTask?.value
+        XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime"])
+        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+    }
+
     func testUnattemptedACPNoteStartupReparksAndSaves() throws {
         let session = AgentTabSession(tabID: UUID())
         var state = AgentSelfCompactState()

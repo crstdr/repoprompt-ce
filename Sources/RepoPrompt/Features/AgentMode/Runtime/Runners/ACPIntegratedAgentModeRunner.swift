@@ -255,6 +255,7 @@ final class ACPIntegratedAgentModeRunner {
                     ownership: ownership,
                     runID: runID,
                     initialMessageForRun: initialMessageForRun,
+                    dedicatedNoteID: dedicatedNoteID,
                     attachments: attachments,
                     controller: existingController,
                     runRequest: runRequest,
@@ -403,6 +404,7 @@ final class ACPIntegratedAgentModeRunner {
         ownership: AgentRunOwnership,
         runID: UUID,
         initialMessageForRun: String,
+        dedicatedNoteID: AgentSelfCompactionDispatchID?,
         attachments: [AgentImageAttachment],
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
@@ -445,6 +447,7 @@ final class ACPIntegratedAgentModeRunner {
                     runID: runID,
                     runAttemptID: runAttemptID,
                     initialMessageForRun: initialMessageForRun,
+                    dedicatedNoteID: dedicatedNoteID,
                     attachments: attachments,
                     controller: controller,
                     runRequest: runRequest,
@@ -519,6 +522,7 @@ final class ACPIntegratedAgentModeRunner {
             ownership: ownership,
             runID: runID,
             initialMessageForRun: command.providerText,
+            dedicatedNoteID: nil,
             attachments: [],
             controller: controller,
             runRequest: runRequest,
@@ -950,6 +954,7 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
+        dedicatedNoteID: AgentSelfCompactionDispatchID?,
         attachments: [AgentImageAttachment],
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
@@ -958,9 +963,6 @@ final class ACPIntegratedAgentModeRunner {
         providerControlCommand: AgentProviderControlCommand? = nil,
         leaseDisposition: ProviderControlLeaseDisposition? = nil
     ) async {
-        let dedicatedNoteID = AgentSelfCompactParkedPrefix.preparedDedicatedNoteID(
-            initialMessageForRun, session: session
-        )
         let classification = await Self.executeTransientOperation {
             var reachedPromptTurn = false
             defer {
@@ -1019,6 +1021,7 @@ final class ACPIntegratedAgentModeRunner {
                     runRequest: runRequest,
                     attachmentReservationID: attachmentReservationID,
                     prepareControllerForNextTurn: true,
+                    dedicatedNoteID: dedicatedNoteID,
                     providerControlCommand: providerControlCommand
                 )
             } catch is CancellationError {
@@ -1052,6 +1055,7 @@ final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         attachmentReservationID: UUID?,
         prepareControllerForNextTurn: Bool,
+        dedicatedNoteID: AgentSelfCompactionDispatchID? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil
     ) async -> TransientOperationResult {
         if let providerControlCommand {
@@ -1068,6 +1072,14 @@ final class ACPIntegratedAgentModeRunner {
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
         let carry = AgentSelfCompactParkedPrefix.prepare(initialMessageForRun, session: session) {
             hooks.persistence.scheduleSave(session)
+        }
+        // This run was created only to send the captured note. If an ordinary local turn
+        // consumed or superseded it while ACP setup suspended, never reinterpret its frame
+        // as an ordinary prompt (which could send the already-accepted note twice).
+        if let dedicatedNoteID,
+           !carry.exactNote || carry.dispatchID != dedicatedNoteID
+        {
+            return .cancelled
         }
         let agentMessage = carry.exactNote
             ? AgentMessage(systemPrompt: "", userMessage: carry.text, resumeSessionID: session.providerSessionID)
