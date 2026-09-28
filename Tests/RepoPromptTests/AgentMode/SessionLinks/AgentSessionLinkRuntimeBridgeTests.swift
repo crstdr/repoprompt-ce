@@ -253,6 +253,34 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             return sendOutcome
         }
 
+        var stopRequests: [(AgentSessionLinkEndpointCandidate, AgentSessionLinkStopRequest)] = []
+        var stopResult: DomainAgentSessionLinkStopReceipt.Result = .notRunning
+
+        func agentSessionLinkPerformStop(
+            to candidate: AgentSessionLinkEndpointCandidate,
+            request: AgentSessionLinkStopRequest,
+            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+            queueHasCommittedDrain: @escaping @MainActor () -> Bool,
+            withdrawInbound: @escaping @MainActor () -> Bool,
+            commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkStopTransactionOutcome {
+            stopRequests.append((candidate, request))
+            await beforeSendCommit?()
+            let commit = await commitAuthorization()
+            sendCommitOutcomes.append(commit)
+            await afterSendCommit?()
+            guard commit == .committed else { return .blocked(commit.refusal) }
+            guard !queueHasCommittedDrain(), withdrawInbound() else { return .blocked(.targetBusy) }
+            return .settled(DomainAgentSessionLinkStopReceipt(
+                requestID: request.requestID,
+                targetSessionID: candidate.sessionID,
+                result: stopResult,
+                stopRequested: stopResult == .stopped,
+                auditStatus: .notRequired,
+                settledAt: Date(timeIntervalSince1970: 2000)
+            ))
+        }
+
         var compactRequests: [(AgentSessionLinkEndpointCandidate, AgentSessionLinkCompactRequest)] = []
         var compactOutcome: AgentSessionLinkSendTransactionOutcome = .blocked(.targetNotIdle)
 
@@ -3710,6 +3738,77 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             1,
             "A duplicate retry must never reach the target transaction again"
         )
+    }
+
+    // MARK: - Stop
+
+    func testStopUsesOneTargetInvocationPerKeyAndReplaysStoredReceipt() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let authorized = await fixture.bridge.authorizeTarget(
+            operation: .monitorStop,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(authorized.success)
+        let first = await fixture.bridge.stop(target: target, idempotencyKey: "stop-once")
+        guard case let .receipt(receipt) = first else { return XCTFail("expected Stop receipt") }
+        XCTAssertEqual(receipt.result, .notRunning)
+        XCTAssertEqual(fixture.host.stopRequests.count, 1)
+        let replay = await fixture.bridge.stop(target: target, idempotencyKey: "stop-once")
+        guard case let .receipt(duplicate) = replay else { return XCTFail("expected duplicate receipt") }
+        XCTAssertTrue(duplicate.duplicate)
+        XCTAssertEqual(duplicate.requestID, receipt.requestID)
+        XCTAssertEqual(fixture.host.stopRequests.count, 1)
+        XCTAssertEqual(fixture.host.stopRequests.first?.1.observerDisplayName, "Planning")
+    }
+
+    func testStopRevokedBeforeAuthorityFenceNeverMutatesTarget() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let authorized = await fixture.bridge.authorizeTarget(
+            operation: .monitorStop,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(authorized.success)
+        let currentReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(currentReference)
+        fixture.host.beforeSendCommit = {
+            _ = await fixture.bridge.stopMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: fixture.target.domainEndpoint,
+                expectedReference: reference
+            )
+        }
+        let result = await fixture.bridge.stop(target: target, idempotencyKey: "revoked-stop")
+        XCTAssertEqual(result, .blocked(.linkRevoked))
+        XCTAssertEqual(fixture.host.sendCommitOutcomes, [.linkRevoked])
+    }
+
+    func testStopRevokedAfterAuthorityFenceStillSettlesAdmittedRequest() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let authorized = await fixture.bridge.authorizeTarget(
+            operation: .monitorStop,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(authorized.success)
+        let currentReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(currentReference)
+        fixture.host.afterSendCommit = {
+            _ = await fixture.authority.revoke(
+                linkID: reference.linkID,
+                generation: reference.generation,
+                reason: .userRequested
+            )
+        }
+        let result = await fixture.bridge.stop(target: target, idempotencyKey: "revoke-after-fence")
+        guard case let .receipt(receipt) = result else { return XCTFail("committed Stop should finish") }
+        XCTAssertEqual(receipt.result, .notRunning)
+        XCTAssertEqual(fixture.host.sendCommitOutcomes, [.committed])
+        XCTAssertEqual(fixture.host.stopRequests.count, 1)
     }
 
     // MARK: - Compaction

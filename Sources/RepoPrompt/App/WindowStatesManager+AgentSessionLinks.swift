@@ -354,6 +354,29 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         )
     }
 
+    /// Routes Stop without focusing or activating the target window.
+    func agentSessionLinkPerformStop(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkStopRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        queueHasCommittedDrain: @escaping @MainActor () -> Bool,
+        withdrawInbound: @escaping @MainActor () -> Bool,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkStopTransactionOutcome {
+        guard !isTerminating else { return .blocked(.shuttingDown) }
+        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+            return .blocked(.endpointInvalidated)
+        }
+        return await window.agentModeViewModel.agentSessionLinkPerformStop(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            queueHasCommittedDrain: queueHasCommittedDrain,
+            withdrawInbound: withdrawInbound,
+            commitAuthorization: commitAuthorization
+        )
+    }
+
     /// Routes compaction to the exact owning window without focusing or activating it.
     func agentSessionLinkPerformCompact(
         to candidate: AgentSessionLinkEndpointCandidate,

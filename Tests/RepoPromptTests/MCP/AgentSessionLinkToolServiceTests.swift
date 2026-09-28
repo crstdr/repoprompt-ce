@@ -54,6 +54,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ] {
             XCTAssertTrue(keys.isDisjoint(with: ["workflow_id", "workflow_name"]))
         }
+        XCTAssertEqual(AgentSessionLinkMCPToolService.stopKeys, ["op", "session_id", "idempotency_key"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.setWaitingOnKeys, ["op", "summary", "clear"])
         XCTAssertEqual(
             AgentSessionLinkMCPToolService.snoozeAutoWakeKeys,
@@ -398,6 +399,42 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         )
         let multiRow = try XCTUnwrap(multiWait["targets"]?.arrayValue?.first?.objectValue)
         XCTAssertEqual(multiRow["snapshot"]?.objectValue?["context"], expected)
+    }
+
+    // MARK: - stop
+
+    func testStopRoutedServiceRequiresOneKeyAndRejectsEveryExtra() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let targetID = fixture.target.sessionID.uuidString
+        for extra in ["session_ids", "message", "reason", "workflow_id", "delivery", "run_id"] {
+            do {
+                _ = try await fixture.service.execute(args: [
+                    "op": .string("stop"),
+                    "session_id": .string(targetID),
+                    "idempotency_key": .string("stop-key"),
+                    extra: .null
+                ])
+                XCTFail("Stop must reject even null \(extra)")
+            } catch {}
+        }
+        let invalidRequests: [[String: Value]] = [
+            ["op": .string("stop"), "session_id": .string(targetID)],
+            ["op": .string("stop"), "session_ids": .array([.string(targetID)]), "idempotency_key": .string("key")],
+            ["op": .string("stop"), "session_id": .string("not-a-uuid"), "idempotency_key": .string("key")]
+        ]
+        for args in invalidRequests {
+            do { _ = try await fixture.service.execute(args: args)
+                XCTFail("Malformed Stop accepted")
+            } catch {}
+        }
+        let result = try await Self.executeObject(fixture.service, args: [
+            "op": .string("stop"), "session_id": .string(targetID),
+            "idempotency_key": .string("routed-stop")
+        ])
+        XCTAssertEqual(result["result"], .string("target_busy"))
+        XCTAssertEqual(result["reason"], .string("endpoint_invalidated"))
+        XCTAssertEqual(Set(result.keys), ["result", "session_id", "reason"])
     }
 
     // MARK: - compact
@@ -1690,6 +1727,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(steered["result"], .string("management_not_granted"))
         XCTAssertEqual(steered["managed"], .bool(false))
         XCTAssertEqual(steered["applied"], .bool(false))
+        let stopped = try await Self.executeObject(fixture.service, args: [
+            "op": .string("stop"),
+            "session_id": sessionID,
+            "idempotency_key": .string("restricted-stop")
+        ])
+        XCTAssertEqual(stopped["result"], .string("management_not_granted"))
         XCTAssertTrue(fixture.host.respondRequests.isEmpty)
         XCTAssertTrue(fixture.host.respondAuthorizations.isEmpty)
         XCTAssertTrue(fixture.host.steerRequests.isEmpty)

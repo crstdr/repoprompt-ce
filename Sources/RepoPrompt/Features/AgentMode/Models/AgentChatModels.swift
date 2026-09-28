@@ -189,7 +189,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// True for local control-plane echoes that should display in chat but are not provider-backed user turns.
     public var isLocalControlPlaneEcho: Bool
 
-    /// Set only on user rows delivered across a user-granted oversight link.
+    /// Set on attributed user deliveries and fixed-text system control rows.
     public var crossSessionAttribution: AgentCrossSessionAttribution?
 
     /// Set only on the `.system` lane-update row of an accepted automatic wake.
@@ -372,6 +372,25 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         AgentChatItem(
             kind: .system,
             text: overseerCompactionRequestText,
+            sequenceIndex: sequenceIndex,
+            crossSessionAttribution: attribution
+        )
+    }
+
+    /// Provider-replay-safe fact row: the overseer's name remains typed display metadata only.
+    public static let overseerRunStoppedText = "The run was stopped by an overseeing session."
+
+    public static func overseerRunStopped(
+        stopID: UUID,
+        stoppedAt: Date,
+        attribution: AgentCrossSessionAttribution,
+        sequenceIndex: Int
+    ) -> AgentChatItem {
+        AgentChatItem(
+            id: stopID,
+            timestamp: stoppedAt,
+            kind: .system,
+            text: overseerRunStoppedText,
             sequenceIndex: sequenceIndex,
             crossSessionAttribution: attribution
         )

@@ -229,7 +229,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 8 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 9 supersedes"))
         // The rule revision 8 changes: a context taught it may only observe — and that may have
         // refused its own user on that basis — is told outright what replaced it.
         XCTAssertTrue(reOwed.fragment.contains("including anything said earlier in this conversation"))
@@ -1433,6 +1433,36 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             for: reserved.observerEndpoint,
             reason: .settingDisabled
         )
+    }
+
+    func testUserStopRetractsOnlyPreDispatchAutoWakePhases() throws {
+        for phase: AgentSessionLinkAutoWakeAttempt.Phase in [
+            .scheduled, .awaitingSettlement, .preparingDispatch,
+            .cancelledBeforeDispatch, .dispatching
+        ] {
+            let fixture = try makeFixture()
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            fixture.session.runState = .running
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            var reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+            reserved.task?.cancel()
+            reserved.phase = phase
+            fixture.session.oversight.pendingAutoWake = reserved
+
+            fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session)
+            XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, reserved.wakeFingerprint)
+            switch phase {
+            case .scheduled, .awaitingSettlement:
+                XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            case .preparingDispatch, .cancelledBeforeDispatch:
+                XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+                fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session)
+                XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, reserved.wakeID)
+            case .dispatching:
+                XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .dispatching)
+            }
+        }
     }
 
     func testBusyWakeAwaitsOneCancellableObservationSubscription() async throws {

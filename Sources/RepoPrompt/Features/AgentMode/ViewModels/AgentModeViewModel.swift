@@ -19582,6 +19582,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         completion: AgentModeRunService.CancellationCompletion = .terminalPublished
     ) async {
         guard let session = sessions[tabID] else { return }
+        if !session.runState.isActive,
+           session.stopState.forceRetireUnclaimedStop(binding: session.persistentSessionBindingIdentity)
+        {
+            session.noteMonitorObservationInputsChanged()
+            requestUIRefresh(tabID: tabID, urgent: true)
+        }
         await runService.cancelRun(tabID: tabID, session: session, completion: completion)
     }
 
@@ -19602,6 +19608,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             outcomeRecorder: outcomeRecorder
         )
         return outcomeRecorder.initiatedCancellation
+    }
+
+    /// Withdraw the exact startup-pending producer; no terminal run is synthesized.
+    @discardableResult
+    func withdrawPendingStartForSessionLink(
+        session: TabSession,
+        admission: AgentRunCancellationAdmission
+    ) -> Bool {
+        guard sessions[session.tabID] === session else { return false }
+        let withdrawn = runService.withdrawPendingStartForSessionLink(
+            tabID: session.tabID,
+            session: session,
+            admission: admission
+        )
+        if withdrawn {
+            updateBindingsFromSession(session)
+            scheduleSave(for: session.tabID)
+            requestUIRefresh(tabID: session.tabID, urgent: true)
+        }
+        return withdrawn
     }
 
     /// Cancel a render-time run target, refusing if the live tab no longer matches that target.

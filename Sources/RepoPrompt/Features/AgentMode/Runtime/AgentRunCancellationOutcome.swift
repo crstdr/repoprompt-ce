@@ -6,6 +6,8 @@ struct AgentRunStopState {
     private(set) var cancellationCount: UInt64 = 0
     private(set) var activeManagedStopID: UUID?
     private(set) var activeManagedStopBinding: AgentPersistentSessionBindingIdentity?
+    private(set) var managedStopCleanupClaimed = false
+    private(set) var managedStopCleanupStarted = false
 
     mutating func invalidateScheduledStarts() {
         cancellationGeneration = UUID()
@@ -16,6 +18,8 @@ struct AgentRunStopState {
         guard activeManagedStopID == nil else { return false }
         activeManagedStopID = id
         activeManagedStopBinding = binding
+        managedStopCleanupClaimed = true
+        managedStopCleanupStarted = false
         return true
     }
 
@@ -23,6 +27,30 @@ struct AgentRunStopState {
         guard activeManagedStopID == id, activeManagedStopBinding == binding else { return false }
         activeManagedStopID = nil
         activeManagedStopBinding = nil
+        managedStopCleanupClaimed = false
+        managedStopCleanupStarted = false
+        return true
+    }
+
+    mutating func markCleanupStarted(id: UUID, binding: AgentPersistentSessionBindingIdentity) {
+        guard activeManagedStopID == id, activeManagedStopBinding == binding else { return }
+        managedStopCleanupStarted = true
+    }
+
+    mutating func markCleanupUnclaimedIfNeverStarted(id: UUID, binding: AgentPersistentSessionBindingIdentity) {
+        guard activeManagedStopID == id, activeManagedStopBinding == binding,
+              !managedStopCleanupStarted
+        else { return }
+        managedStopCleanupClaimed = false
+    }
+
+    mutating func forceRetireUnclaimedStop(binding: AgentPersistentSessionBindingIdentity?) -> Bool {
+        guard activeManagedStopID != nil, activeManagedStopBinding == binding,
+              !managedStopCleanupClaimed
+        else { return false }
+        activeManagedStopID = nil
+        activeManagedStopBinding = nil
+        managedStopCleanupStarted = false
         return true
     }
 
@@ -77,6 +105,8 @@ struct AgentRunCancellationAdmission {
         switch scope {
         case .activeRun:
             guard let expectedOwnership, let expectedRunID,
+                  candidate.runState.isActive,
+                  !candidate.terminalCommitInProgress,
                   candidate.activeRunOwnership == expectedOwnership,
                   candidate.runID == expectedRunID
             else { return false }

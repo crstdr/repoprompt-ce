@@ -992,6 +992,31 @@ final class AgentModeRunService {
         )
     }
 
+    /// Withdraws a startup producer without manufacturing a cancelled run attempt.
+    /// The exact-object admission is checked before the shared user-Stop preparation invalidates
+    /// its generation. Only locally authored Claude draft text is restored.
+    func withdrawPendingStartForSessionLink(
+        tabID: UUID,
+        session: AgentTabSession,
+        admission: AgentRunCancellationAdmission
+    ) -> Bool {
+        guard admission.scope == .pendingStart, admission.claim(for: session) else { return false }
+        hooks.prepareForCancellation(session, .userStop)
+        session.claudeSteeringFlushTask?.cancel()
+        session.claudeSteeringFlushTask = nil
+        session.acpSteeringFlushTask?.cancel()
+        session.acpSteeringFlushTask = nil
+        restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+        session.pendingInstructions.removeAll()
+        session.pendingClaudeSteeringInstructions.removeAll()
+        session.pendingACPSteeringInstructions.removeAll()
+        session.pendingSupersedingTurnCompletions = 0
+        session.claudeSupersedingProtectedTurnIDs.removeAll()
+        session.claudeExpectedTurnIDs.removeAll()
+        session.isDirty = true
+        return true
+    }
+
     func cancelRun(
         tabID: UUID,
         session: AgentTabSession,
