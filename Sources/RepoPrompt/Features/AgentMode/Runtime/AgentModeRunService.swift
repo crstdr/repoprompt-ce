@@ -128,8 +128,13 @@ final class AgentModeRunService {
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
-        startOutcome: AgentRunStartOutcomeRecorder? = nil
+        startOutcome: AgentRunStartOutcomeRecorder? = nil,
+        stopFence: AgentRunStartStopFence? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+        guard stopFence?.permitsStart(of: session) ?? true else {
+            startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
+            return nil
+        }
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
         let selectedAgent = session.selectedAgent
         // A control command is only ever routed to a runtime that dispatches it natively and
@@ -161,7 +166,8 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 fallbackContext: codexFallbackContext,
-                autoEffortSelection: autoEffortSelection
+                autoEffortSelection: autoEffortSelection,
+                stopFence: stopFence
             )
             startOutcome?.record(codexOutcome: outcome)
             return outcome
@@ -207,7 +213,8 @@ final class AgentModeRunService {
                 attachments: attachments,
                 makeLease: makeLease,
                 autoEffortSelection: autoEffortSelection,
-                providerControlCommand: providerControlCommand
+                providerControlCommand: providerControlCommand,
+                stopFence: stopFence
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
@@ -221,7 +228,8 @@ final class AgentModeRunService {
                 attachments: attachments,
                 runRequest: acpRunRequest,
                 providerControlCommand: providerControlCommand,
-                makeLease: makeLease
+                makeLease: makeLease,
+                stopFence: stopFence
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
@@ -232,7 +240,8 @@ final class AgentModeRunService {
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
-            makeLease: makeLease
+            makeLease: makeLease,
+            stopFence: stopFence
         )
         recordNonCodexStartOutcome(startOutcome, session: session)
         return nil
@@ -987,8 +996,16 @@ final class AgentModeRunService {
         tabID: UUID,
         session: AgentTabSession,
         intent: CancellationIntent = .userStop,
-        completion: CancellationCompletion = .terminalPublished
+        completion: CancellationCompletion = .terminalPublished,
+        admission: AgentRunCancellationAdmission? = nil,
+        outcomeRecorder: AgentRunCancellationOutcomeRecorder? = nil
     ) async {
+        if let admission {
+            // Pending starts are withdrawn synchronously by their producer owner, not terminalized.
+            guard admission.scope == .activeRun, admission.claim(for: session) else { return }
+            outcomeRecorder?.recordCancellationInitiated()
+        }
+        hooks.prepareForCancellation(session, intent)
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
@@ -1119,6 +1136,13 @@ final class AgentModeRunService {
                 AgentModeProcessRunIdentity.clearProcessRunID(for: session)
                 guard let provider, !hasAttemptTerminalResources else { return nil }
                 return { await provider.dispose() }
+            },
+            postCommit: { revision, publicationResult in
+                outcomeRecorder?.recordPrimaryPublication(
+                    revision: revision,
+                    result: publicationResult,
+                    session: session
+                )
             }
         ))
         if completion == .terminalTeardownCompleted {
@@ -1126,6 +1150,9 @@ final class AgentModeRunService {
                 for: ownership,
                 lifecycle: session.runLifecycle
             )
+            if session.runLifecycle.lastTerminalCommitRevision?.ownership == ownership {
+                outcomeRecorder?.recordTeardownCompleted()
+            }
         }
     }
 

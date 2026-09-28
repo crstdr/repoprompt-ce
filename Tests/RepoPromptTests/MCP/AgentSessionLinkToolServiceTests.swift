@@ -2271,6 +2271,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 bindingTransitionGeneration: 1
             ),
             targetSessionID: sessionID,
+            targetEndpoint: DomainAgentSessionLinkEndpointIdentity(
+                windowID: 2,
+                workspaceID: UUID(),
+                tabID: UUID(),
+                sessionID: sessionID,
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: 1
+            ),
             message: "first line\nsecond\u{7} line",
             idempotencyKey: "key-1",
             requestDigest: "digest",

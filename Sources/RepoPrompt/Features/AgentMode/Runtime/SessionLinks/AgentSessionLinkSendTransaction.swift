@@ -175,6 +175,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     /// A managed `steer` found the target between states (committing its last turn, saving, changing
     /// where it runs, or taking a local submission). Nothing was delivered.
     case targetBusy = "target_busy"
+    /// A queued inbound send was withdrawn when its exact target endpoint was stopped.
+    case targetStopped = "target_stopped"
     /// The target is running on a provider path that cannot take live steering. Nothing was
     /// delivered; the message can be queued with `send` and `delivery: "when_sendable"`.
     case steerUnavailable = "steer_unavailable"
@@ -209,7 +211,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
              .targetBusy, .steerUnavailable, .steerNotAccepted:
             true
         case .endpointInvalidated, .linkRevoked, .persistenceIndeterminate, .shuttingDown,
-             .managementRevoked, .steerUnconfirmed, .notSupported, .noProviderSession:
+             .managementRevoked, .steerUnconfirmed, .notSupported, .noProviderSession, .targetStopped:
             false
         }
     }
@@ -247,6 +249,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .targetBusy:
             "The overseen session is between states and cannot take a steer this instant. Nothing "
                 + "was delivered. Wait for a change and try again with the same idempotency_key."
+        case .targetStopped:
+            "The queued message was withdrawn because the target was stopped and was not delivered."
         case .steerUnavailable:
             "This session's provider cannot take live steering while it runs. Nothing was "
                 + "delivered. Steer again once it is idle, or queue a message with send and "
@@ -563,6 +567,13 @@ enum AgentSessionLinkMessageDigest {
     static func steerDigest(message: String) -> String {
         let canonical = "steer:\(message)"
         return SHA256.hash(data: Data(canonical.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    /// A stop request shares the send/steer/compact ledger but cannot collide with any of them.
+    static func stopDigest() -> String {
+        SHA256.hash(data: Data("agent_session_link.stop/v1".utf8))
             .map { String(format: "%02x", $0) }
             .joined()
     }

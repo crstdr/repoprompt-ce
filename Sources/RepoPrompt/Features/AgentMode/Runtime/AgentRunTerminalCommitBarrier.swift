@@ -63,7 +63,7 @@ final class AgentRunTerminalCommitBarrier {
         let providerDrainGeneration: UInt64
         let providerBuffersAreDrained: () -> Bool
         let prepareProviderState: () -> (@MainActor () async -> Void)?
-        let postCommit: () -> Void
+        let postCommit: (_ revision: AgentRunTerminalCommitRevision, _ publicationResult: AgentRunTerminalPublicationResult) -> Void
 
         init(
             binding: AgentRunTerminalSessionBinding,
@@ -83,7 +83,7 @@ final class AgentRunTerminalCommitBarrier {
             providerDrainGeneration: UInt64 = 0,
             providerBuffersAreDrained: @escaping () -> Bool = { true },
             prepareProviderState: @escaping () -> (@MainActor () async -> Void)? = { nil },
-            postCommit: @escaping () -> Void = {}
+            postCommit: @escaping (_ revision: AgentRunTerminalCommitRevision, _ publicationResult: AgentRunTerminalPublicationResult) -> Void = { _, _ in }
         ) {
             self.binding = binding
             self.ownership = ownership
@@ -342,7 +342,7 @@ final class AgentRunTerminalCommitBarrier {
         )
         lifecycle.completeTerminalCommit()
         recordTerminalBarrierState(false, request: request)
-        request.postCommit()
+        request.postCommit(revision, publicationResult)
 
         if let followUpInstruction {
             binding.hooks.startFollowUpRun(followUpInstruction)

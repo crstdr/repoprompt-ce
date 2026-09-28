@@ -46,6 +46,7 @@ extension AgentModeViewModel {
             pendingACPSteeringCount: session.pendingACPSteeringInstructions.count,
             pendingClaudeSteeringCount: session.pendingClaudeSteeringInstructions.count,
             pendingOversightAutoWake: session.oversight.pendingAutoWake != nil,
+            stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,
             hasPendingUserInputRequest: session.pendingUserInputRequest != nil,

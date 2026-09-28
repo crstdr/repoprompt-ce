@@ -62,6 +62,17 @@ final class AgentTabSession: ObservableObject {
     }
 
     @Published var runningStatusText: String? = nil
+    /// Ephemeral cancellation generation and managed-stop gate; never persisted.
+    var stopState = AgentRunStopState() {
+        didSet {
+            if oldValue.cancellationGeneration != stopState.cancellationGeneration
+                || oldValue.activeManagedStopID != stopState.activeManagedStopID
+            {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
     var activeAgentRunStartedAt: Date?
 
     /// Last Jev effort choice submitted for this tab, plus a transient in-flight indication.
@@ -549,6 +560,7 @@ final class AgentTabSession: ObservableObject {
         let optimisticUserItemID: UUID?
         let origin: CodexFallbackOrigin
         let dispatchTicket: UInt64?
+        var stopFence: AgentRunStartStopFence?
     }
 
     struct CodexFallbackBlockingTurn: Equatable {
@@ -595,6 +607,7 @@ final class AgentTabSession: ObservableObject {
         var blockingTurn: CodexFallbackBlockingTurn?
         var state: CodexFallbackQueueState
         var monitoringDispatchContext: AgentSessionLinkDispatchContext?
+        var stopFence: AgentRunStartStopFence?
     }
 
     var codexPendingTurnKind: CodexTurnKind?

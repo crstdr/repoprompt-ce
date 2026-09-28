@@ -4146,6 +4146,33 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
     }
 
+    func testStopWithdrawalRetainsTargetStoppedOnlyForTheExactTargetEndpoint() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        let queued = await queueSend(fixture)
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+
+        let rebound = makeCandidate(
+            windowID: fixture.target.windowID,
+            sessionID: fixture.target.sessionID,
+            workspaceID: fixture.target.workspaceID,
+            tabID: fixture.target.tabID,
+            persistentBindingGeneration: UUID()
+        ).domainEndpoint
+        XCTAssertTrue(fixture.bridge.withdrawCancellableInboundPendingSends(to: rebound))
+        let wrongEndpointProjection = await pendingSend(fixture)
+        XCTAssertNotNil(wrongEndpointProjection?.pending)
+
+        XCTAssertTrue(fixture.bridge.withdrawCancellableInboundPendingSends(
+            to: fixture.target.domainEndpoint
+        ))
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
+        XCTAssertEqual(projection?.lastResult?.outcome, .failed(.targetStopped))
+        XCTAssertEqual(fixture.host.sendRequests.count, 1, "Stop never re-dispatches queued text")
+    }
+
     /// The field case: the target is busy, so the message waits and lands on the next readiness
     /// publication rather than on a retry loop.
     func testBusyTargetHoldsOneEntryAndDeliversOnTheNextReadinessPublication() async throws {
@@ -4763,11 +4790,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     // MARK: Slot arbitration
 
     private func slotEntry(key: String, digest: String, phase: AgentSessionLinkPendingSend.Phase) -> AgentSessionLinkPendingSend {
-        AgentSessionLinkPendingSend(
+        let targetEndpoint = makeCandidate(windowID: 2).domainEndpoint
+        return AgentSessionLinkPendingSend(
             revision: UUID(),
             reference: DomainAgentSessionLinkReference(linkID: UUID(), generation: 1),
             observerEndpoint: makeCandidate(windowID: 1).domainEndpoint,
-            targetSessionID: UUID(),
+            targetSessionID: targetEndpoint.sessionID,
+            targetEndpoint: targetEndpoint,
             message: "queued",
             idempotencyKey: key,
             requestDigest: digest,
@@ -4775,6 +4804,21 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             queuedAt: Date(timeIntervalSince1970: 1000),
             phase: phase
         )
+    }
+
+    func testPendingSendMatchesOnlyItsCapturedTargetIncarnation() {
+        let entry = slotEntry(key: "k", digest: "d", phase: .pending)
+        let exact = entry.targetEndpoint
+        let rebound = makeCandidate(
+            windowID: exact.windowID,
+            sessionID: exact.sessionID,
+            workspaceID: exact.workspaceID,
+            tabID: exact.tabID,
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: exact.bindingTransitionGeneration
+        ).domainEndpoint
+        XCTAssertTrue(entry.addresses(exact))
+        XCTAssertFalse(entry.addresses(rebound), "A reused session UUID cannot inherit a queued send")
     }
 
     /// The arbitration runs twice per admission — once before anything is resolved and again after

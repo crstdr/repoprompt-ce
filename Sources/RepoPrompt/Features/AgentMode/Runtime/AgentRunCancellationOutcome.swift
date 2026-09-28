@@ -1,0 +1,144 @@
+import Foundation
+
+/// Runtime-only cancellation generation and binding-qualified managed-stop gate.
+struct AgentRunStopState {
+    private(set) var cancellationGeneration = UUID()
+    private(set) var cancellationCount: UInt64 = 0
+    private(set) var activeManagedStopID: UUID?
+    private(set) var activeManagedStopBinding: AgentPersistentSessionBindingIdentity?
+
+    mutating func invalidateScheduledStarts() {
+        cancellationGeneration = UUID()
+        cancellationCount &+= 1
+    }
+
+    mutating func claimManagedStop(id: UUID, binding: AgentPersistentSessionBindingIdentity) -> Bool {
+        guard activeManagedStopID == nil else { return false }
+        activeManagedStopID = id
+        activeManagedStopBinding = binding
+        return true
+    }
+
+    mutating func releaseManagedStop(id: UUID, binding: AgentPersistentSessionBindingIdentity) -> Bool {
+        guard activeManagedStopID == id, activeManagedStopBinding == binding else { return false }
+        activeManagedStopID = nil
+        activeManagedStopBinding = nil
+        return true
+    }
+
+    func isStopping(binding: AgentPersistentSessionBindingIdentity?) -> Bool {
+        activeManagedStopID != nil && activeManagedStopBinding == binding
+    }
+}
+
+/// Captured before a deferred producer creates a task; never refreshed by that producer.
+struct AgentRunStartStopFence: Equatable {
+    let binding: AgentPersistentSessionBindingIdentity?
+    let cancellationGeneration: UUID
+    let cancellationCount: UInt64
+
+    @MainActor
+    init(session: AgentTabSession) {
+        binding = session.persistentSessionBindingIdentity
+        cancellationGeneration = session.stopState.cancellationGeneration
+        cancellationCount = session.stopState.cancellationCount
+    }
+
+    @MainActor
+    func permitsStart(of session: AgentTabSession) -> Bool {
+        binding == session.persistentSessionBindingIdentity
+            && cancellationGeneration == session.stopState.cancellationGeneration
+            && !session.stopState.isStopping(binding: binding)
+    }
+}
+
+/// Exact-object claim installed synchronously after the management fence.
+@MainActor
+struct AgentRunCancellationAdmission {
+    enum Scope {
+        case activeRun
+        case pendingStart
+    }
+
+    let scope: Scope
+    let session: AgentTabSession
+    let binding: AgentPersistentSessionBindingIdentity
+    let expectedOwnership: AgentRunOwnership?
+    let expectedRunID: UUID?
+    let cancellationGeneration: UUID
+    let pendingStartFence: AgentRunStartStopFence?
+    let validateAndClaim: @MainActor () -> Bool
+
+    func claim(for candidate: AgentTabSession) -> Bool {
+        guard candidate === session,
+              candidate.persistentSessionBindingIdentity == binding,
+              candidate.stopState.cancellationGeneration == cancellationGeneration
+        else { return false }
+        switch scope {
+        case .activeRun:
+            guard let expectedOwnership, let expectedRunID,
+                  candidate.activeRunOwnership == expectedOwnership,
+                  candidate.runID == expectedRunID
+            else { return false }
+        case .pendingStart:
+            guard candidate.activeRunOwnership == nil,
+                  candidate.mcpFollowUpRunPending,
+                  pendingStartFence?.permitsStart(of: candidate) ?? true
+            else { return false }
+        }
+        return validateAndClaim()
+    }
+}
+
+/// Causal observation of this cancellation's primary terminal commit, not a lifecycle re-read.
+@MainActor
+final class AgentRunCancellationOutcomeRecorder {
+    let expectedOwnership: AgentRunOwnership
+    let expectedRunID: UUID?
+    let expectedBinding: AgentPersistentSessionBindingIdentity
+    var onAcceptedPrimaryPublication: ((AgentRunTerminalCommitRevision) -> Void)?
+
+    private(set) var initiatedCancellation = false
+    private(set) var primaryRevision: AgentRunTerminalCommitRevision?
+    private(set) var publicationResult: AgentRunTerminalPublicationResult?
+    private(set) var teardownCompleted = false
+
+    init(
+        expectedOwnership: AgentRunOwnership,
+        expectedRunID: UUID?,
+        expectedBinding: AgentPersistentSessionBindingIdentity,
+        onAcceptedPrimaryPublication: ((AgentRunTerminalCommitRevision) -> Void)? = nil
+    ) {
+        self.expectedOwnership = expectedOwnership
+        self.expectedRunID = expectedRunID
+        self.expectedBinding = expectedBinding
+        self.onAcceptedPrimaryPublication = onAcceptedPrimaryPublication
+    }
+
+    func recordCancellationInitiated() {
+        initiatedCancellation = true
+    }
+
+    func recordPrimaryPublication(
+        revision: AgentRunTerminalCommitRevision,
+        result: AgentRunTerminalPublicationResult,
+        session: AgentTabSession
+    ) {
+        guard initiatedCancellation,
+              primaryRevision == nil,
+              revision.ownership == expectedOwnership,
+              revision.expectedRunID == expectedRunID,
+              revision.terminalState == .cancelled,
+              session.persistentSessionBindingIdentity == expectedBinding
+        else { return }
+        primaryRevision = revision
+        publicationResult = result
+        if case .accepted = result {
+            onAcceptedPrimaryPublication?(revision)
+        }
+    }
+
+    func recordTeardownCompleted() {
+        teardownCompleted = true
+    }
+}

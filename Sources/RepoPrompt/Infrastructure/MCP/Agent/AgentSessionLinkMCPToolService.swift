@@ -1945,7 +1945,7 @@ enum AgentSessionLinkResponseRenderer {
                 + "idempotency_key is spent. Read the session before requesting again."
         case .endpointInvalidated, .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
              .noProviderSession, .managementRevoked, .targetAwaitingInteraction, .targetBusy,
-             .steerUnavailable, .steerNotAccepted, .steerUnconfirmed:
+             .steerUnavailable, .steerNotAccepted, .steerUnconfirmed, .targetStopped:
             failure.message
         }
     }

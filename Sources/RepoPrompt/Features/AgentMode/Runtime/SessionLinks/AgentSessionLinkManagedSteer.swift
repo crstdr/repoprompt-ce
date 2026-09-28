@@ -137,7 +137,8 @@ extension AgentSessionLinkSteerAdmission {
             // only idle path, so wait for it rather than racing it.
             return .blocked(.targetBusy)
         }
-        if readiness.terminalCommitInProgress
+        if readiness.stopInProgress
+            || readiness.terminalCommitInProgress
             || readiness.isComposerSubmissionInFlight
             || readiness.isPreparingInitialWorktree
             || readiness.isChangingExecutionLocation

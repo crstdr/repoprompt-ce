@@ -433,6 +433,7 @@ final class AgentSessionLinkSteerAdmissionTests: XCTestCase {
         )
         // Running but between states.
         let betweenStates: [(inout AgentSessionLinkDeliveryReadiness.Snapshot) -> Void] = [
+            { $0.stopInProgress = true },
             { $0.terminalCommitInProgress = true },
             { $0.isComposerSubmissionInFlight = true },
             { $0.isPreparingInitialWorktree = true },

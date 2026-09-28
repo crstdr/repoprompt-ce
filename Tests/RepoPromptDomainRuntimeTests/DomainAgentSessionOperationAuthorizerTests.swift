@@ -152,9 +152,10 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             // Acting for the user in the target needs the user's explicit management delegation.
             .monitorRespond: .manage,
             .monitorSteer: .manage,
+            .monitorStop: .manage,
             // A compaction starts a provider turn on an idle target exactly as a send does, so it
             // needs the send grant and nothing new.
-            .monitorCompact: .sendWhenIdle,
+            .monitorCompact: .sendWhenIdle
         ]
         for operation in targetBearingMonitorOperations {
             guard let capability = expected[operation] else {
@@ -326,7 +327,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             [
                 "agent_run.poll", "agent_run.wait", "agent_run.cancel", "agent_run.steer", "agent_run.respond",
                 "agent_manage.list_sessions", "agent_manage.get_log", "agent_manage.extract_handoff",
-                "agent_manage.resume_session", "agent_manage.stop_session", "agent_manage.cleanup_sessions",
+                "agent_manage.resume_session", "agent_manage.stop_session", "agent_manage.cleanup_sessions"
             ]
         )
         XCTAssertEqual(
@@ -336,7 +337,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
                 "agent_session_link.read", "agent_session_link.send",
                 "agent_session_link.snooze_auto_wake",
                 "agent_session_link.respond",
-                "agent_session_link.steer", "agent_session_link.compact",
+                "agent_session_link.steer", "agent_session_link.compact"
             ]
         )
         for operation in sessionControlOperations where operation.requiredMonitorCapability != nil {
@@ -375,6 +376,10 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
         )
         // Compaction mutates the target's provider context, is target-scoped, and borrows the send
         // grant rather than introducing a new capability.
+        XCTAssertTrue(DomainAgentSessionTargetOperation.monitorStop.mutatesTarget)
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorStop.isObserverScoped)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorStop.requiredMonitorCapability, .manage)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorStop.family, .monitor)
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorCompact.mutatesTarget)
         XCTAssertFalse(DomainAgentSessionTargetOperation.monitorCompact.isObserverScoped)
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorCompact.requiredMonitorCapability, .sendWhenIdle)

@@ -227,6 +227,8 @@ extension AgentModeRunService {
         let interactions: RunInteractionHooks
         let terminalSettlement: TerminalSettlementHooks
         let continuation: RunContinuationHooks
+        /// Host-owned synchronous deferred-work cleanup, before the terminal shortcut.
+        var prepareForCancellation: (AgentTabSession, DomainAgentRunCancellationIntent) -> Void = { _, _ in }
     }
 }
 

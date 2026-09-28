@@ -5768,6 +5768,7 @@ final class AgentSessionLinkRuntimeBridge {
             reference: reference,
             observerEndpoint: target.lease.observer,
             targetSessionID: target.lease.target.sessionID,
+            targetEndpoint: target.lease.target,
             message: message,
             idempotencyKey: idempotencyKey,
             requestDigest: digest,
@@ -5818,6 +5819,28 @@ final class AgentSessionLinkRuntimeBridge {
         // stops being current with it.
         pendingSendResultsByReference.removeValue(forKey: reference)
         return .result(.cancelled)
+    }
+
+    /// Synchronous post-fence arbitration for one exact target incarnation.
+    /// A committed drain is past the withdrawal cutoff, so the caller must refuse Stop instead.
+    @discardableResult
+    func withdrawCancellableInboundPendingSends(
+        to targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        requiringNoCommittedDrain: Bool = true
+    ) -> Bool {
+        let matching = pendingSendsByReference.filter { $0.value.addresses(targetEndpoint) }
+        if requiringNoCommittedDrain, matching.values.contains(where: { !$0.phase.isCancellable }) {
+            return false
+        }
+        for (reference, entry) in matching where entry.phase.isCancellable {
+            clearPendingSend(
+                reference: reference,
+                revision: entry.revision,
+                idempotencyKey: entry.idempotencyKey,
+                retaining: .failed(.targetStopped)
+            )
+        }
+        return true
     }
 
     /// This link's observer-facing queue state.
@@ -6022,8 +6045,8 @@ final class AgentSessionLinkRuntimeBridge {
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
                 clear(.failed(failure))
-            case .managementRevoked, .targetAwaitingInteraction, .targetBusy, .steerUnavailable,
-                 .steerNotAccepted, .steerUnconfirmed:
+            case .managementRevoked, .targetAwaitingInteraction, .targetBusy, .targetStopped,
+                 .steerUnavailable, .steerNotAccepted, .steerUnconfirmed:
                 // Steer-only outcomes: a queued `send` never produces them. Settle rather than loop.
                 clear(.failed(failure))
             case .notSupported, .noProviderSession:
