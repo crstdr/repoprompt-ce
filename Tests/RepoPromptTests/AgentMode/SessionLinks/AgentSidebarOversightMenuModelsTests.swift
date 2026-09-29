@@ -208,6 +208,31 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         ))
     }
 
+    func testCreatorBadgeUsesCompactIconAndRetainsFullCreatorTooltip() {
+        XCTAssertEqual(AgentSessionCreatorBadgeCopy.iconName, "rectangle.connected.to.line.below")
+        XCTAssertEqual(
+            AgentSessionCreatorBadgeCopy.tooltip(for: "RepoPrompt PM"),
+            "Created by RepoPrompt PM"
+        )
+    }
+
+    func testCreatorNavigationRequiresOneLiveMatchingRoute() {
+        let creatorID = UUID()
+        let route = AgentSessionDeepLinkRoute(
+            workspaceID: UUID(), tabID: UUID(), sessionID: creatorID
+        )
+        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(for: creatorID, candidates: []))
+        XCTAssertEqual(
+            AgentSidebarCreatorNavigation.uniqueRoute(for: creatorID, candidates: [route]), route
+        )
+        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
+            for: creatorID, candidates: [route, route]
+        ))
+        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
+            for: UUID(), candidates: [route]
+        ))
+    }
+
     func testCreatorLabelSurvivesAnEmptyUnlinkedMenuWithoutChangingEligibility() throws {
         let target = candidate(windowID: 1, isMCPControlled: false, isMCPOriginated: false)
         let menu = try XCTUnwrap(AgentSidebarOversightMenuProjection.make(

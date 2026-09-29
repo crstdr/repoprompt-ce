@@ -4,6 +4,36 @@ import SwiftUI
 
 // MARK: - Sessions Sidebar
 
+@MainActor
+enum AgentSidebarCreatorNavigation {
+    nonisolated static func uniqueRoute(
+        for creatorSessionID: UUID,
+        candidates: [AgentSessionDeepLinkRoute]
+    ) -> AgentSessionDeepLinkRoute? {
+        let matches = candidates.filter { $0.sessionID == creatorSessionID }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    static func openIfAvailable(_ creatorSessionID: UUID) async {
+        let candidates = WindowStatesManager.shared.allWindows
+            .filter { !$0.isClosing }
+            .flatMap { window -> [AgentSessionDeepLinkRoute] in
+                AgentNavigationHUDSnapshotBuilder.currentWindowSnapshot(windowState: window)
+                    .items.compactMap { item in
+                        guard item.sessionID == creatorSessionID, !item.isArchived else { return nil }
+                        return AgentSessionDeepLinkRoute(
+                            windowID: item.windowID,
+                            workspaceID: item.workspaceID,
+                            tabID: item.tabID,
+                            sessionID: creatorSessionID
+                        )
+                    }
+            }
+        guard let route = uniqueRoute(for: creatorSessionID, candidates: candidates) else { return }
+        _ = await AppDeepLinkRouter.shared.route(agentSession: route)
+    }
+}
+
 struct AgentModeSessionsSidebarView: View {
     let rootsStore: AgentWorkspaceRootsSidebarStore
     let agentModeVM: AgentModeViewModel
@@ -552,12 +582,24 @@ struct AgentModeSessionsListView: View {
                                 }
                             }
 
+                        let creatorSessionID = session.sessionID.flatMap {
+                            agentModeVM.agentSessionLinkLaneCreatorSessionID(for: $0)
+                        }
+
                         AgentSessionRow(
                             title: session.title,
                             isActive: session.tabID == currentTabID,
                             isOverseer: isOverseer,
                             createdByLabel: session.sessionID.flatMap {
                                 agentModeVM.agentSessionLinkLaneCreatorLabel(for: $0)
+                            },
+                            onOpenCreator: {
+                                guard let targetSessionID = session.sessionID,
+                                      let creatorSessionID,
+                                      agentModeVM.agentSessionLinkLaneCreatorSessionID(for: targetSessionID)
+                                      == creatorSessionID
+                                else { return }
+                                Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
                             },
                             isPinned: session.isPinned,
                             isMCPControlled: session.isMCPControlled,
@@ -1496,10 +1538,22 @@ struct ArchivedSessionsList: View {
                     stashedTabID: stashed.id,
                     tabID: stashed.tab.id
                 )
+                let stashedSessionID = sessionIDByStashedTabID[stashed.id]
+                let creatorSessionID = stashedSessionID.flatMap {
+                    agentModeVM.agentSessionLinkLaneCreatorSessionID(for: $0)
+                }
                 AgentStashedSessionRow(
                     stashed: stashed,
-                    createdByLabel: sessionIDByStashedTabID[stashed.id].flatMap {
+                    createdByLabel: stashedSessionID.flatMap {
                         agentModeVM.agentSessionLinkLaneCreatorLabel(for: $0)
+                    },
+                    onOpenCreator: {
+                        guard let stashedSessionID,
+                              let creatorSessionID,
+                              agentModeVM.agentSessionLinkLaneCreatorSessionID(for: stashedSessionID)
+                              == creatorSessionID
+                        else { return }
+                        Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
                     },
                     isSelected: selectionState.selectedIdentities.contains(identity),
                     showsSelectionPresentation: selectionState.showsSelectionPresentation,
