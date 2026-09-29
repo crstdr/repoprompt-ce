@@ -589,7 +589,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
     }
 
-    func testEndpointSubreasonPrefersClosingWindowAndHostTeardown() {
+    func testEndpointSubreasonDistinguishesWindowRoutingFromProbeTeardown() {
         let closingWindow = AgentSessionLinkSendLiveness(
             observerEndpointIsLive: true,
             targetEndpointIsLive: false,
@@ -600,7 +600,28 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
             AgentSessionLinkSendFailure.invalidated(closingWindow, postCommit: true),
             .endpointPostWindow
         )
-        XCTAssertEqual(AgentSessionLinkSendFailure.invalidated(.unavailable), .endpointHost)
+        XCTAssertEqual(AgentSessionLinkSendFailure.invalidated(.unavailable), .endpointProbeHost)
+        XCTAssertEqual(AgentSessionLinkSendFailure.endpointHost.subreason, "host")
+        XCTAssertEqual(AgentSessionLinkSendFailure.endpointProbeHost.subreason, "probe_host")
+    }
+
+    func testUnavailableHostProbeAfterCommitDeliversNothing() async throws {
+        let fixture = try makeFixture()
+        var hostAvailable = true
+
+        let outcome = await send(
+            fixture,
+            liveness: { hostAvailable ? Self.liveLiveness : .unavailable },
+            commit: {
+                hostAvailable = false
+                return .committed
+            }
+        )
+
+        XCTAssertEqual(outcome, .blocked(.endpointProbeHost))
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        XCTAssertFalse(fixture.events.contains(.save))
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
     }
 
     func testClaimLostDuringCommitReportsClaimWithoutDelivering() async throws {

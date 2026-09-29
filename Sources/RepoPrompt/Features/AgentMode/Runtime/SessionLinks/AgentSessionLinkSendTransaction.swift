@@ -162,6 +162,7 @@ enum AgentSessionLinkSendCommitOutcome: Equatable {
 enum AgentSessionLinkSendFailure: String, Equatable {
     case endpointInvalidated = "endpoint_invalidated"
     case endpointHost = "endpoint_host"
+    case endpointProbeHost = "endpoint_probe_host"
     case endpointSession = "endpoint_session"
     case endpointObserver = "endpoint_observer"
     case endpointTarget = "endpoint_target"
@@ -229,6 +230,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         switch self {
         case .endpointInvalidated: "unknown"
         case .endpointHost: "host"
+        case .endpointProbeHost: "probe_host"
         case .endpointSession: "session"
         case .endpointObserver: "observer"
         case .endpointTarget: "target"
@@ -249,7 +251,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
 
     static func invalidated(_ liveness: AgentSessionLinkSendLiveness, postCommit: Bool = false) -> Self {
         if !liveness.observerEndpointIsLive, !liveness.targetEndpointIsLive, liveness.targetWindowIsClosing {
-            return .endpointHost
+            return .endpointProbeHost
         }
         if liveness.targetWindowIsClosing { return postCommit ? .endpointPostWindow : .endpointWindow }
         if !liveness.observerEndpointIsLive { return postCommit ? .endpointPostObserver : .endpointObserver }
@@ -269,7 +271,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .targetLoading, .targetNotIdle, .persistenceFailed, .targetAwaitingInteraction,
              .targetBusy, .compactionSettling, .steerUnavailable, .steerNotAccepted, .noProviderSession:
             true
-        case .endpointInvalidated, .endpointHost, .endpointSession, .endpointObserver,
+        case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
              .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
              .endpointMissingWorkspace,
              .endpointReadiness, .endpointStopFence, .endpointPostSession, .endpointPostObserver,
@@ -287,7 +289,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
 
     var message: String {
         switch self {
-        case .endpointInvalidated, .endpointHost, .endpointSession, .endpointObserver,
+        case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
              .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
              .endpointMissingWorkspace,
              .endpointReadiness, .endpointStopFence, .endpointPostSession, .endpointPostObserver,

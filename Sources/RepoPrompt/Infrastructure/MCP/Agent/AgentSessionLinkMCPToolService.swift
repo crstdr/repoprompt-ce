@@ -425,7 +425,7 @@ struct AgentSessionLinkMCPToolService {
             return .object(payload)
         case let .blocked(failure):
             switch failure {
-            case .endpointInvalidated, .endpointHost, .endpointSession, .endpointObserver,
+            case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
                  .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
                  .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
                  .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
@@ -2161,7 +2161,7 @@ enum AgentSessionLinkResponseRenderer {
             "The overseen session could not be saved and the rollback could not be confirmed, so it is "
                 + "unknown whether the request was recorded. No compaction was started and this "
                 + "idempotency_key is spent. Read the session before requesting again."
-        case .endpointInvalidated, .endpointHost, .endpointSession, .endpointObserver,
+        case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
              .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
              .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
              .endpointPostSession, .endpointPostObserver, .endpointPostTarget,

@@ -5773,12 +5773,10 @@ final class AgentSessionLinkRuntimeBridge {
             framing: delivery == .managedSteer ? .management : .coordination
         )
         request.startStopFence = startStopFence
-        // Re-read at every fence the transaction crosses. It is deliberately pure endpoint/window
-        // liveness and never consults the authority: after the commit fence, manual revocation is
-        // intentionally allowed to lose, so link liveness must not gate the post-persistence recheck.
-        let liveness: AgentSessionLinkSendLivenessProbe = { [weak self] in
-            guard let self, let host = self.host else { return .unavailable }
-            return host.agentSessionLinkSendLiveness(
+        // Keep the host that supplied this exact candidate through the send transaction. The
+        // host itself still fences window teardown and both endpoint incarnations at every probe.
+        let liveness: AgentSessionLinkSendLivenessProbe = {
+            host.agentSessionLinkSendLiveness(
                 observer: request.observerEndpoint,
                 target: target.lease.target
             )
@@ -6471,7 +6469,7 @@ final class AgentSessionLinkRuntimeBridge {
                 // The local claim can disappear without losing the grant or either endpoint.
                 // Keep its terminal refusal visible in poll instead of dropping the diagnosis.
                 clear(.failed(failure))
-            case .endpointInvalidated, .endpointHost, .endpointSession, .endpointObserver,
+            case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
                  .endpointTarget, .endpointWindow, .endpointWorkspace,
                  .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
                  .endpointPostSession, .endpointPostObserver, .endpointPostTarget,

@@ -127,6 +127,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         /// When true the fake invokes the commit fence exactly as the real host does.
         var invokesSendCommit = true
+        var readsLivenessAfterCommit = false
         /// Runs after the reservation exists but before the commit fence, so a test can land a
         /// revocation exactly in the window the fence is designed to arbitrate.
         var beforeSendCommit: (() async -> Void)?
@@ -337,6 +338,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 await afterSendCommit?()
                 guard commit == .committed else {
                     return .blocked(commit == .shuttingDown ? .shuttingDown : .linkRevoked)
+                }
+                if readsLivenessAfterCommit {
+                    let postCommitLiveness = liveness()
+                    sendLivenessReadings.append(postCommitLiveness)
+                    if !postCommitLiveness.permitsDelivery {
+                        return .blocked(.invalidated(postCommitLiveness, postCommit: true))
+                    }
                 }
             }
             return sendOutcome
@@ -3805,6 +3813,32 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(request.message, "ship it")
         XCTAssertEqual(request.attribution.sourceSessionID, fixture.observer.sessionID)
         XCTAssertEqual(request.attribution.linkID, target.lease.linkID)
+    }
+
+    func testInFlightSendUsesItsValidatedHostAcrossAttachmentRefresh() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageReadyTarget(fixture)
+        fixture.host.readsLivenessAfterCommit = true
+        let replacement = FakeEndpointHost()
+        replacement.targetWindowIsClosing = true
+        fixture.host.afterSendCommit = { [bridge = fixture.bridge] in
+            bridge.attach(host: replacement)
+        }
+
+        let resolvedTarget = await authorizedSendTarget(fixture)
+        let target = try XCTUnwrap(resolvedTarget)
+        let outcome = await fixture.bridge.send(
+            target: target,
+            message: "continue",
+            idempotencyKey: "host-refresh"
+        )
+
+        guard case .receipt = outcome else {
+            return XCTFail("An unchanged exact endpoint must survive host attachment refresh: \(outcome)")
+        }
+        XCTAssertEqual(fixture.host.sendLivenessReadings.count, 2)
+        XCTAssertTrue(fixture.host.sendLivenessReadings.allSatisfy(\.permitsDelivery))
     }
 
     func testDeliveredSendRetainsAStableReceiptAndReplaysItForADuplicateRetry() async throws {
