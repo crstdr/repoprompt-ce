@@ -403,7 +403,178 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         }
     }
 
-    func testPersistedChildAbsentFromLiveSessionsAndSidebarIndexStillBlocksRetirement() async throws {
+    func testChildRetirementInventoryKeepsActiveDuplicatesAndNestedDescendants() {
+        let parentID = UUID()
+        let childID = UUID()
+        let grandchildID = UUID()
+        let finished = AgentSessionLaneChildRetirementRecord(
+            sessionID: childID, parentSessionID: parentID, blocksRetirement: false
+        )
+        let activeDuplicate = AgentSessionLaneChildRetirementRecord(
+            sessionID: childID, parentSessionID: parentID, blocksRetirement: true
+        )
+        let activeGrandchild = AgentSessionLaneChildRetirementRecord(
+            sessionID: grandchildID, parentSessionID: childID, blocksRetirement: true
+        )
+        XCTAssertFalse(AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(of: parentID, in: [finished]))
+        for records in [[finished, activeDuplicate], [activeDuplicate, finished], [finished, activeGrandchild]] {
+            XCTAssertTrue(AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(of: parentID, in: records))
+        }
+    }
+
+    func testCreatedLaneRetirementStashesFinishedChildrenAndRefusesRunningChild() async throws {
+        try await withFixture { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            let created = try await viewModel.mcpCreateOversightLane(
+                creatorSessionID: UUID(), sessionName: "Parent lane",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
+            guard case let .created(parentID, parentTabID, _) = created else {
+                return XCTFail("fresh lane did not establish its binding")
+            }
+            let childTarget = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Child",
+                parentSessionID: parentID, expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(childTarget)
+            let child = try XCTUnwrap(viewModel.sessions[childTarget.tabID])
+            let childID = try XCTUnwrap(child.activeAgentSessionID)
+            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
+            let childrenSettled = {
+                !WindowStatesManager.shared.agentSessionLinkHasActiveChildSessions(parentSessionID: parentID)
+            }
+
+            child.runState = .running
+            XCTAssertFalse(childrenSettled())
+            let blocked = await WindowStatesManager.shared.agentSessionLinkRetireLane(
+                endpoint: endpoint, commit: true, isStillRetirable: childrenSettled
+            )
+            XCTAssertFalse(blocked)
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == parentTabID
+            } == true)
+
+            child.runState = .completed
+            child.isDirty = true
+            await viewModel.flushSave(for: child.tabID)
+            let grandchildTarget = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Grandchild",
+                parentSessionID: childID, expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(grandchildTarget)
+            let grandchild = try XCTUnwrap(viewModel.sessions[grandchildTarget.tabID])
+            grandchild.runState = .waitingForApproval
+            XCTAssertFalse(childrenSettled(), "an active grandchild must also block the stash cascade")
+            grandchild.runState = .completed
+            grandchild.isDirty = true
+            await viewModel.flushSave(for: grandchild.tabID)
+            XCTAssertTrue(childrenSettled(), "finished children must not block retirement")
+            let persistedBlocker = await WindowStatesManager.shared.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: parentID
+            )
+            XCTAssertFalse(persistedBlocker)
+            let retired = await WindowStatesManager.shared.agentSessionLinkRetireLane(
+                endpoint: endpoint, commit: true, isStillRetirable: childrenSettled
+            )
+            XCTAssertTrue(retired)
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            XCTAssertTrue(workspace.stashedTabs.contains { $0.tab.id == parentTabID })
+            XCTAssertTrue(workspace.stashedTabs.contains { $0.tab.id == child.tabID })
+            XCTAssertTrue(workspace.stashedTabs.contains { $0.tab.id == grandchild.tabID })
+            XCTAssertFalse(workspace.composeTabs.contains { $0.id == child.tabID || $0.id == grandchild.tabID })
+            let savedChild = try await AgentSessionDataService.shared.loadAgentSession(id: childID, for: workspace)
+            let persistedChild = try XCTUnwrap(savedChild)
+            XCTAssertEqual(persistedChild.id, childID)
+            XCTAssertEqual(persistedChild.parentSessionID, parentID)
+        }
+    }
+
+    func testRetirementJoinsDiskOnlyAncestryWithLiveGrandchildState() async throws {
+        try await withFixture { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            let created = try await viewModel.mcpCreateOversightLane(
+                creatorSessionID: UUID(), sessionName: "Mixed lineage",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
+            guard case let .created(parentID, parentTabID, _) = created else {
+                return XCTFail("parent creation failed")
+            }
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            var diskOnlyChild = AgentSession(id: UUID(), name: "Disk-only connector", savedAt: Date())
+            diskOnlyChild.parentSessionID = parentID
+            diskOnlyChild.lastRunState = AgentSessionRunState.completed.rawValue
+            _ = try await AgentSessionDataService.shared.saveAgentSession(diskOnlyChild, for: workspace)
+            let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Live grandchild",
+                parentSessionID: diskOnlyChild.id, expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(target)
+            let grandchild = try XCTUnwrap(viewModel.sessions[target.tabID])
+            grandchild.runState = .completed
+            grandchild.isDirty = true
+            await viewModel.flushSave(for: target.tabID)
+            XCTAssertNil(viewModel.test_ownerValidatedSessionIndex[diskOnlyChild.id])
+            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
+            grandchild.runState = .running // Disk still says completed.
+            let blocked = await WindowStatesManager.shared.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: parentID
+            )
+            XCTAssertTrue(blocked)
+            let refused = await WindowStatesManager.shared.agentSessionLinkRetireLane(
+                endpoint: endpoint, commit: true, isStillRetirable: { true }
+            )
+            XCTAssertFalse(refused)
+            grandchild.runState = .completed
+            let retired = await WindowStatesManager.shared.agentSessionLinkRetireLane(
+                endpoint: endpoint, commit: true, isStillRetirable: { true }
+            )
+            XCTAssertTrue(retired)
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains {
+                $0.tab.id == target.tabID
+            } == true, "disk-only connector must also connect the stash cascade")
+        }
+    }
+
+    func testRetirementRefusesFinishedDescendantBoundInActivePeerWithoutParent() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            let created = try await viewModel.mcpCreateOversightLane(
+                creatorSessionID: UUID(), sessionName: "Parent",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
+            guard case let .created(parentID, parentTabID, _) = created else { return XCTFail("parent creation failed") }
+            let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Finished child",
+                parentSessionID: parentID, expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(target)
+            let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+            child.runState = .completed
+            child.isDirty = true
+            await viewModel.flushSave(for: target.tabID)
+            _ = await fixture.window.workspaceManager.pollAndSaveStateWithOutcomeAsync(
+                workspaceID: fixture.workspaceID, source: WorkspaceSaveSource("retireChildTest")
+            )
+            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
+            try await withSecondRegisteredWindow { peer in
+                let copy = try XCTUnwrap(peer.workspaceManager.workspace(withID: fixture.workspaceID))
+                _ = await peer.workspaceManager.switchWorkspace(to: copy, saveState: false, reason: "retireChildTest")
+                var projected = peer.workspaceManager.workspaces
+                let index = try XCTUnwrap(projected.firstIndex { $0.id == fixture.workspaceID })
+                projected[index].composeTabs.removeAll { $0.id == parentTabID }
+                peer.workspaceManager.workspaces = projected
+                XCTAssertEqual(WindowStatesManager.shared.agentSessionLinkBindingCount(sessionID: parentID), 1)
+                let retired = await WindowStatesManager.shared.agentSessionLinkRetireLane(
+                    endpoint: endpoint, commit: true, isStillRetirable: { true }
+                )
+                XCTAssertFalse(retired)
+                XCTAssertTrue(peer.workspaceManager.activeWorkspace?.composeTabs.contains { $0.id == target.tabID } == true)
+                XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains { $0.id == parentTabID } == true)
+            }
+        }
+    }
+
+    func testPersistedActiveChildAbsentFromLiveSessionsAndSidebarIndexStillBlocksRetirement() async throws {
         try await withFixture { fixture in
             let dataService = AgentSessionDataService.shared
             await dataService.test_setWorkspaceRootOverride(fixture.root)
@@ -411,6 +582,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 let parentID = UUID()
                 var child = AgentSession(id: UUID(), name: "Unindexed child", savedAt: Date())
                 child.parentSessionID = parentID
+                child.lastRunState = AgentSessionRunState.running.rawValue
                 let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
                 _ = try await dataService.saveAgentSession(child, for: workspace)
                 XCTAssertFalse(fixture.window.agentModeViewModel.sessions.values.contains {
@@ -419,7 +591,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 XCTAssertFalse(fixture.window.agentModeViewModel.test_ownerValidatedSessionIndex.values.contains {
                     $0.parentSessionID == parentID
                 })
-                let hasPersistedChild = await WindowStatesManager.shared.agentSessionLinkHasPersistedChildSessions(
+                let hasPersistedChild = await WindowStatesManager.shared.agentSessionLinkHasPersistedActiveChildSessions(
                     parentSessionID: parentID
                 )
                 XCTAssertTrue(hasPersistedChild)
@@ -441,6 +613,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 let parentID = UUID()
                 var child = AgentSession(id: UUID(), name: "Unindexed child", savedAt: Date())
                 child.parentSessionID = parentID
+                child.lastRunState = AgentSessionRunState.running.rawValue
                 let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
                 _ = try await dataService.saveAgentSession(child, for: workspace)
                 try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: protectedRoot.path)
@@ -450,12 +623,10 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     )
                 }
                 do {
-                    _ = try await dataService.hasPersistedChildSession(
-                        parentSessionID: parentID, workspace: workspace
-                    )
+                    _ = try await dataService.persistedChildRetirementRecords(workspace: workspace)
                     XCTFail("inaccessible inventory was treated as child-free")
                 } catch {}
-                let retirementBlocked = await WindowStatesManager.shared.agentSessionLinkHasPersistedChildSessions(
+                let retirementBlocked = await WindowStatesManager.shared.agentSessionLinkHasPersistedActiveChildSessions(
                     parentSessionID: parentID
                 )
                 XCTAssertTrue(retirementBlocked)

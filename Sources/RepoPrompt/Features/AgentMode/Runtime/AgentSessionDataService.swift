@@ -866,9 +866,9 @@ actor AgentSessionDataService {
         return sorted
     }
 
-    /// Read-only, complete child inventory for lane retirement. The sidebar metadata index can
-    /// be stale or scoped to another workspace, so absence there is never an absence proof.
-    func hasPersistedChildSession(parentSessionID: UUID, workspace: WorkspaceModel) async throws -> Bool {
+    /// Complete disk lineage for retirement. Read raw run state: list stubs normalize active
+    /// states to idle on restore and cannot prove that a descendant's work has settled.
+    func persistedChildRetirementRecords(workspace: WorkspaceModel) throws -> [AgentSessionLaneChildRetirementRecord] {
         let folder = resolvedWorkspaceFolderURL(for: workspace).appendingPathComponent("AgentSessions")
         let files: [URL]
         do {
@@ -876,14 +876,15 @@ actor AgentSessionDataService {
         } catch {
             guard Self.isMissingDirectoryError(error), try Self.isConfirmedAbsentDirectory(at: folder)
             else { throw error }
-            return false
+            return []
         }
-        for file in files {
-            if try await loadAgentSessionStub(from: file).parentSessionID == parentSessionID {
-                return true
-            }
+        return try files.map { file in
+            let header = try decoder.decode(AgentSessionHeader.self, from: Data(contentsOf: file, options: .mappedIfSafe))
+            return AgentSessionLaneChildRetirementRecord(
+                sessionID: header.id, parentSessionID: header.parentSessionID,
+                blocksRetirement: header.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))?.isActive ?? true
+            )
         }
-        return false
     }
 
     private static func isMissingDirectoryError(_ error: Error) -> Bool {

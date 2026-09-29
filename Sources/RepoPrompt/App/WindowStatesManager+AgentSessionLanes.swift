@@ -17,31 +17,40 @@ extension WindowStatesManager {
         }
     }
 
-    func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool {
+    func agentSessionLinkHasActiveChildSessions(parentSessionID: UUID) -> Bool {
         guard !isTerminating else { return true }
-        return allWindows.contains { window in
-            !window.isClosing && window.agentModeViewModel.agentSessionLinkHasChildSessions(
-                parentSessionID: parentSessionID
-            )
+        return AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(
+            of: parentSessionID, in: agentSessionLinkLiveChildRetirementRecords()
+        )
+    }
+
+    private func agentSessionLinkLiveChildRetirementRecords() -> [AgentSessionLaneChildRetirementRecord] {
+        allWindows.filter { !$0.isClosing }.flatMap {
+            $0.agentModeViewModel.agentSessionLinkChildRetirementRecords()
         }
     }
 
-    func agentSessionLinkHasPersistedChildSessions(parentSessionID: UUID) async -> Bool {
-        guard !isTerminating else { return true }
+    func agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: UUID) async -> Bool {
+        do {
+            let records = try await agentSessionLinkPersistedChildRetirementRecords()
+                + agentSessionLinkLiveChildRetirementRecords()
+            return isTerminating || AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(
+                of: parentSessionID, in: records
+            )
+        } catch { return true }
+    }
+
+    private func agentSessionLinkPersistedChildRetirementRecords() async throws -> [AgentSessionLaneChildRetirementRecord] {
         var visited: Set<UUID> = []
+        var records: [AgentSessionLaneChildRetirementRecord] = []
         for window in allWindows where !window.isClosing {
             for workspace in window.workspaceManager.workspaces where visited.insert(workspace.id).inserted {
-                do {
-                    if try await AgentSessionDataService.shared.hasPersistedChildSession(
-                        parentSessionID: parentSessionID, workspace: workspace
-                    ) { return true }
-                } catch {
-                    // An unreadable inventory cannot prove that retirement is child-free.
-                    return true
-                }
+                try await records.append(contentsOf: AgentSessionDataService.shared.persistedChildRetirementRecords(
+                    workspace: workspace
+                ))
             }
         }
-        return false
+        return records
     }
 
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int {
@@ -135,39 +144,73 @@ extension WindowStatesManager {
               window.workspaceManager.activeWorkspaceID == endpoint.workspaceID,
               window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
         else { return false }
+        let persisted: [AgentSessionLaneChildRetirementRecord]
+        do { persisted = try await agentSessionLinkPersistedChildRetirementRecords() }
+        catch { return false }
+        let descendants = AgentSessionLaneChildRetirementRecord.descendantIDs(
+            of: endpoint.sessionID, in: persisted + agentSessionLinkLiveChildRetirementRecords()
+        )
+        let subtreeIsRetirable: @MainActor () -> Bool = { [weak self, weak window] in
+            guard let self, let window, !self.isTerminating, !window.isClosing, isStillRetirable() else { return false }
+            let records = persisted + agentSessionLinkLiveChildRetirementRecords()
+            guard !AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(of: endpoint.sessionID, in: records),
+                  AgentSessionLaneChildRetirementRecord.descendantIDs(of: endpoint.sessionID, in: records) == descendants
+            else { return false }
+            // Cascade removal owns only this window's bindings. Other active owners must keep their tabs.
+            for peer in allWindows where !peer.isClosing {
+                for workspace in peer.workspaceManager.workspaces {
+                    for tab in workspace.composeTabs {
+                        guard let sessionID = tab.activeAgentSessionID, descendants.contains(sessionID) else { continue }
+                        guard workspace.id == endpoint.workspaceID,
+                              self.agentSessionLinkBindingCount(sessionID: sessionID) == 1,
+                              peer === window || (!workspace.isEphemeral && peer.workspaceManager.activeWorkspaceID != workspace.id)
+                        else { return false }
+                    }
+                }
+            }
+            return true
+        }
+        var removedTabIDs: Set<UUID> = []
         let retired = await window.agentModeViewModel.agentSessionLinkRetireLane(
             endpoint: endpoint,
             commit: commit,
-            isStillRetirable: isStillRetirable
+            isStillRetirable: subtreeIsRetirable,
+            descendantSessionIDs: descendants,
+            didStash: { removedTabIDs = $0 }
         )
         guard retired else { return false }
         guard commit else { return true }
-        guard let stashed = window.workspaceManager.activeWorkspace?.stashedTabs.first(where: {
-            $0.tab.id == endpoint.tabID
-        }) else { return false }
+        guard let workspace = window.workspaceManager.activeWorkspace,
+              workspace.stashedTabs.contains(where: { $0.tab.id == endpoint.tabID })
+        else { return false }
+        let stashedSubtree = workspace.stashedTabs.filter { removedTabIDs.contains($0.tab.id) }
 
-        // The bridge still holds the workspace activation claim. Bring inactive catalogs into
-        // line with the saved stash before any peer can activate its old in-memory projection.
+        // The bridge holds the workspace activation claim. Reconcile the whole stashed subtree
+        // before a peer can activate its old projection.
         for peer in allWindows where peer !== window && !peer.isClosing {
             let manager = peer.workspaceManager
             var projected = manager.workspaces
             var changed = false
-            for index in projected.indices where projected[index].id == endpoint.workspaceID {
-                guard let tabIndex = projected[index].composeTabs.firstIndex(where: {
-                    $0.id == endpoint.tabID && $0.activeAgentSessionID == endpoint.sessionID
-                }) else { continue }
-                projected[index].composeTabs.remove(at: tabIndex)
-                if let stashedIndex = projected[index].stashedTabs.firstIndex(where: {
-                    $0.tab.id == endpoint.tabID
-                }) {
-                    projected[index].stashedTabs[stashedIndex] = stashed
-                } else {
-                    projected[index].stashedTabs.append(stashed)
+            for index in projected.indices where projected[index].id == endpoint.workspaceID
+                && manager.activeWorkspaceID != endpoint.workspaceID
+            {
+                for stashed in stashedSubtree {
+                    guard let tabIndex = projected[index].composeTabs.firstIndex(where: {
+                        $0.id == stashed.tab.id && $0.activeAgentSessionID == stashed.tab.activeAgentSessionID
+                    }) else { continue }
+                    projected[index].composeTabs.remove(at: tabIndex)
+                    if let stashedIndex = projected[index].stashedTabs.firstIndex(where: {
+                        $0.tab.id == stashed.tab.id
+                    }) {
+                        projected[index].stashedTabs[stashedIndex] = stashed
+                    } else {
+                        projected[index].stashedTabs.append(stashed)
+                    }
+                    if projected[index].activeComposeTabID == stashed.tab.id {
+                        projected[index].activeComposeTabID = projected[index].composeTabs.first?.id
+                    }
+                    changed = true
                 }
-                if projected[index].activeComposeTabID == endpoint.tabID {
-                    projected[index].activeComposeTabID = projected[index].composeTabs.first?.id
-                }
-                changed = true
             }
             if changed { manager.workspaces = projected }
         }

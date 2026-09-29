@@ -116,10 +116,10 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 
     func agentSessionLinkWasCreatedBy(sessionID: UUID, creatorSessionID: UUID) -> Bool
 
-    func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool
+    func agentSessionLinkHasActiveChildSessions(parentSessionID: UUID) -> Bool
 
-    /// Authoritative disk inventory across all workspace scopes; uncertainty must block retirement.
-    func agentSessionLinkHasPersistedChildSessions(parentSessionID: UUID) async -> Bool
+    /// Active descendants across all workspace scopes; uncertain disk state blocks retirement.
+    func agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: UUID) async -> Bool
 
     func agentSessionLinkLaneCreatorLabel(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
@@ -487,11 +487,11 @@ extension AgentSessionLinkEndpointHost {
         false
     }
 
-    func agentSessionLinkHasChildSessions(parentSessionID _: UUID) -> Bool {
+    func agentSessionLinkHasActiveChildSessions(parentSessionID _: UUID) -> Bool {
         true
     }
 
-    func agentSessionLinkHasPersistedChildSessions(parentSessionID _: UUID) async -> Bool {
+    func agentSessionLinkHasPersistedActiveChildSessions(parentSessionID _: UUID) async -> Bool {
         true
     }
 
@@ -7045,10 +7045,10 @@ final class AgentSessionLinkRuntimeBridge {
         guard host.agentSessionLinkBindingCount(sessionID: targetSessionID) == 1 else {
             return .notRetired(sessionID: targetSessionID, reason: .laneInUseBindings)
         }
-        guard !host.agentSessionLinkHasChildSessions(parentSessionID: targetSessionID) else {
+        guard !host.agentSessionLinkHasActiveChildSessions(parentSessionID: targetSessionID) else {
             return .notRetired(sessionID: targetSessionID, reason: .laneInUseChildren)
         }
-        guard await !(host.agentSessionLinkHasPersistedChildSessions(parentSessionID: targetSessionID))
+        guard await !(host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID))
         else { return .notRetired(sessionID: targetSessionID, reason: .laneInUseDiskChild) }
         // Install the fence before the relationship snapshot. New Adds in either direction now
         // fail at preflight, reservation, activation and caller completion.
@@ -7088,7 +7088,7 @@ final class AgentSessionLinkRuntimeBridge {
             guard host.agentSessionLinkBindingCount(sessionID: targetSessionID) == 1 else {
                 return false
             }
-            guard !host.agentSessionLinkHasChildSessions(parentSessionID: targetSessionID) else {
+            guard !host.agentSessionLinkHasActiveChildSessions(parentSessionID: targetSessionID) else {
                 return false
             }
             let live = host.agentSessionLinkCandidates().filter { $0.sessionID == targetSessionID }
@@ -7109,7 +7109,7 @@ final class AgentSessionLinkRuntimeBridge {
         case .stopped: break
         }
         let remaining = await authority.relationshipInventories(forSessionID: targetSessionID)
-        guard await !(host.agentSessionLinkHasPersistedChildSessions(parentSessionID: targetSessionID))
+        guard await !(host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID))
         else { return .unlinkedNotStashed(sessionID: targetSessionID) }
         guard !isFrozenForTermination, stillRetirable(),
               remaining.inbound.items.isEmpty,

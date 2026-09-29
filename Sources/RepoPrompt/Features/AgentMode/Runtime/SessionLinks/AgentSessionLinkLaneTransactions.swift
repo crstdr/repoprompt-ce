@@ -77,6 +77,34 @@ struct AgentSessionLaneCreateReceipt: Equatable {
     }
 }
 
+/// Retirement may stash a settled subtree, but must preserve every descendant that still owns work.
+struct AgentSessionLaneChildRetirementRecord {
+    let sessionID: UUID
+    let parentSessionID: UUID?
+    let blocksRetirement: Bool
+
+    static func hasBlockingDescendant(of parentSessionID: UUID, in records: [Self]) -> Bool {
+        let descendants = descendantIDs(of: parentSessionID, in: records)
+        return records.contains { descendants.contains($0.sessionID) && $0.blocksRetirement }
+    }
+
+    static func descendantIDs(of parentSessionID: UUID, in records: [Self]) -> Set<UUID> {
+        let childrenByParent = Dictionary(grouping: records.compactMap { record in
+            record.parentSessionID.map { ($0, record) }
+        }, by: { $0.0 })
+        var visited: Set<UUID> = [parentSessionID]
+        var pending = [parentSessionID]
+        while let parent = pending.popLast() {
+            for (_, child) in childrenByParent[parent] ?? [] {
+                guard visited.insert(child.sessionID).inserted else { continue }
+                pending.append(child.sessionID)
+            }
+        }
+        visited.remove(parentSessionID)
+        return visited
+    }
+}
+
 enum AgentSessionLaneRetireOutcome: Equatable {
     enum Reason: String, Equatable {
         case denied
