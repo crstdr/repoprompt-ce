@@ -71,7 +71,7 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
     }
 
     private static let managementOperations: [DomainAgentSessionTargetOperation] = [
-        .monitorGetInteraction, .monitorRespond, .monitorSteer
+        .monitorRespond, .monitorSteer
     ]
 
     // MARK: - Default
@@ -100,6 +100,32 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
         XCTAssertNotNil(try? watch.get(), "the watch grant itself is untouched")
         let inventory = await authority.links(forObserverEndpoint: observer)
         XCTAssertEqual(inventory.items.first?.capabilityNames, ["poll", "read", "send_when_idle", "wait"])
+    }
+
+    func testManagedObservationBatchRequiresEveryExactWatchLease() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint(windowID: 1)
+        let first = makeEndpoint(windowID: 2)
+        let second = makeEndpoint(windowID: 3)
+        let firstGrant = try await activateLink(authority, observer: observer, target: first)
+        let secondGrant = try await activateLink(authority, observer: observer, target: second)
+        let firstAuthorization = await authority.authorize(
+            operation: .monitorPoll, observerEndpoint: observer, targetSessionID: first.sessionID
+        )
+        let secondAuthorization = await authority.authorize(
+            operation: .monitorPoll, observerEndpoint: observer, targetSessionID: second.sessionID
+        )
+        let firstLease = try firstAuthorization.get()
+        let secondLease = try secondAuthorization.get()
+        let watchOnly = await authority.managedObservationTargetsIfValid(leases: [firstLease, secondLease])
+        XCTAssertEqual(watchOnly, [])
+
+        _ = await authority.setManagement(true, reference: reference(firstGrant), observer: observer, target: first)
+        let managed = await authority.managedObservationTargetsIfValid(leases: [firstLease, secondLease])
+        XCTAssertEqual(managed, [first.sessionID])
+        _ = await authority.revoke(linkID: secondGrant.id, generation: secondGrant.generation, reason: .userRequested)
+        let revokedBatch = await authority.managedObservationTargetsIfValid(leases: [firstLease, secondLease])
+        XCTAssertNil(revokedBatch)
     }
 
     // MARK: - Grant and withdraw

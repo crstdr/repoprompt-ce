@@ -176,10 +176,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     // MARK: - Guidance revision
 
-    /// A provider context that physically accepted an earlier revision is re-owed revision 7 in full.
-    /// Merely rendering or abandoning revision 7 does not advance the acknowledgement; only physical
+    /// A provider context that physically accepted an earlier revision is re-owed revision 8 in full.
+    /// Merely rendering or abandoning revision 8 does not advance the acknowledgement; only physical
     /// acceptance earns the reminder, and a rebuilt context owes the full block again.
-    func testRevisionSevenReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
+    func testRevisionEightReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
         let observerSessionID = UUID()
         let epoch = Self.epoch(observerSessionID: observerSessionID)
         let inventory = Self.inventory(observerSessionID: observerSessionID, revision: 1)
@@ -212,6 +212,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 displayAttribution: passive.displayAttribution
             ),
             laneGuidanceMode: first.laneGuidanceMode,
+            inventoryGuidanceRevision: first.inventoryGuidanceRevision,
             fragment: first.fragment
         )
         store.accept(priorRevisionClaim)
@@ -228,8 +229,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 7 supersedes"))
-        // The rule revision 7 changes: a context taught it may only observe — and that may have
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 8 supersedes"))
+        // The rule revision 8 changes: a context taught it may only observe — and that may have
         // refused its own user on that basis — is told outright what replaced it.
         XCTAssertTrue(reOwed.fragment.contains("including anything said earlier in this conversation"))
         XCTAssertTrue(reOwed.fragment.contains("by RepoPrompt or by you"))

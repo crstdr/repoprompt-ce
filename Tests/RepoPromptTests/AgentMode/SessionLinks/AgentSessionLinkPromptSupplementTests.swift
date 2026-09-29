@@ -35,6 +35,15 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
 
     // MARK: Inventory content
 
+    func testOneLinkInventoryFitsTrimmedGuidanceBudget() {
+        let rendered = AgentSessionLinkPrompts.render(
+            kind: .inventory,
+            inventory: inventory(items: [item("8B91C0E0-0000-0000-0000-00000000E572")]),
+            toolReference: "agent_session_link"
+        )
+        XCTAssertLessThan(rendered.utf8.count, 8000)
+    }
+
     func testRendersEveryMonitoredSessionByFullUUIDAndName() {
         let rendered = AgentSessionLinkPrompts.render(
             kind: .inventory,
@@ -79,45 +88,13 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         // Each of these is a distinct contract clause from the plan; losing any one of them silently
         // changes what the observing agent believes it is allowed to do.
         for required in [
-            "agent_session_link",
-            "observer, also called their overseer",
-            "wait_already_pending",
-            "busy-poll",
-            "next_cursor",
-            "cursor_reset",
-            "cursor_expired",
-            "untrusted data",
-            "ask_user",
-            "idempotency_key",
-            "idempotency_conflict",
-            "target_not_idle",
-            "fully idle",
-            "non-transitive",
-            "non-reciprocal",
-            "Dashboard triage and completion are user-owned",
-            "idle alone does not prove completion",
-            "no agent-facing completion action",
-            "Handoff/Fork",
-            "targets-of-targets are never inherited",
-            "revoke",
-            "op=list",
-            // Send readiness: `status: "idle"` alone is not the precondition, and the wait that
-            // matches the precondition has to be named or the recipe is a retry loop.
-            "idle_for_send",
-            "sendable",
-            // Corrections to sentences that were true-sounding but wrong.
-            "has_more",
-            "from: &quot;start&quot;",
-            // The newest row is emitted but not consumed, so an observer legitimately sees one row
-            // twice. Without this clause a naive overseer double-counts it or reports the target as
-            // having repeated itself.
-            "item_id",
-            "awaiting_user",
-            "pending_interaction_kind",
-            // Bounding clauses: supersession, transient denial, and the autonomy contract.
-            "only the newest one is current",
-            "before concluding oversight ended",
-            "further work requires new direction"
+            "agent_session_link", "managed=&quot;true&quot;", "capability_notice",
+            "capabilities_changed", "wait_already_pending", "busy-poll", "untrusted data",
+            "idempotency_key", "idle_for_send", "sendable", "pending_interaction",
+            "respond_hint", "interaction_id", "too-large", "manual-only", "item_id",
+            "awaiting_user", "Dashboard triage and completion are user-owned",
+            "idle alone does not prove completion", "no agent-facing completion action",
+            "only the newest is current"
         ] {
             XCTAssertTrue(rendered.contains(required), "missing required guidance: \(required)")
         }
@@ -180,7 +157,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             rendered.contains("you will be told once"),
             "the final-revocation notice is not guaranteed, so the guidance must not promise it"
         )
-        XCTAssertTrue(rendered.contains("never treat its absence as proof"))
+        XCTAssertTrue(rendered.contains("Revocation may close an inventory without a delivered notice"))
     }
 
     func testNeverLeaksStatusProviderOrLocationData() {
@@ -448,7 +425,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertTrue(rendered.contains("bypass a prompt (answer or steer only where `manage` is granted)"))
         XCTAssertTrue(rendered.contains("Surface ambiguity or surprises"))
         XCTAssertTrue(rendered.contains("or impersonate the user"))
-        XCTAssertFalse(rendered.contains("Guidance revision 7 supersedes"))
+        XCTAssertFalse(rendered.contains("Guidance revision 8 supersedes"))
     }
 
     func testAttentionDeliveredWithWaitingOnAbsentChangedBeforeAndChangedAfterComposition() throws {
@@ -814,7 +791,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertLessThan(membershipIndex, statusIndex)
         XCTAssertEqual(rendered.passiveBatch?.entries.count, 1)
         XCTAssertEqual(rendered.passiveBatch?.includesUnattributedOverflow, false)
-        XCTAssertTrue(rendered.fragment.contains("Guidance revision 7 supersedes"))
+        XCTAssertTrue(rendered.fragment.contains("Guidance revision 8 supersedes"))
         XCTAssertTrue(rendered.fragment.contains("op=snooze_auto_wake"))
         XCTAssertTrue(rendered.fragment.contains("Exact purposeful attention may bypass master Auto-wake"))
         for clause in AgentSessionLinkPrompts.autonomyContract {
@@ -936,7 +913,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertTrue(rendered.contains("A snooze cannot enable Auto-wake, select a lane"))
         XCTAssertTrue(rendered.contains("waiting for its own user"))
         XCTAssertFalse(rendered.contains("effective deselection prevents every automatic wake"))
-        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 7)
+        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 8)
     }
 
     /// Revision 5 retains the retired caller-origin fence and attributed-untrusted attention rule
@@ -964,8 +941,8 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
 
         // The acknowledged revision recorded against a provider context may not stand for wording the
         // model was never shown, so the bump is part of the contract rather than bookkeeping.
-        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 7)
-        XCTAssertTrue(rendered.contains("guidance_revision=\"7\""))
+        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 8)
+        XCTAssertTrue(rendered.contains("guidance_revision=\"8\""))
         XCTAssertTrue(
             rendered.contains(
                 AgentSessionLinkMessageEnvelope.escaped(
@@ -973,8 +950,8 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
                 )
             )
         )
-        XCTAssertTrue(rendered.contains("Guidance revision 7 supersedes"))
-        XCTAssertTrue(rendered.contains("fresh-user transport restriction still does not apply"))
+        XCTAssertTrue(rendered.contains("Guidance revision 8 supersedes"))
+        XCTAssertTrue(rendered.contains("retired fresh-user transport restriction still does not apply"))
         XCTAssertTrue(rendered.contains("Exact purposeful attention may bypass master Auto-wake"))
         XCTAssertTrue(rendered.contains("lane&apos;s own toggle"))
         XCTAssertTrue(rendered.contains("without changing any of them"))
@@ -1051,7 +1028,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         )
         XCTAssertTrue(rendered.contains("or impersonate the user"))
         // The full contract is owed once per provider context, not on every delivery.
-        XCTAssertFalse(rendered.contains("Guidance revision 7 supersedes"))
+        XCTAssertFalse(rendered.contains("Guidance revision 8 supersedes"))
         XCTAssertFalse(rendered.contains("Catalog visibility is not authority"))
     }
 
@@ -1062,9 +1039,9 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             inventory: inventory(items: [item("8B91C0E0-0000-0000-0000-00000000E572")]),
             toolReference: "agent_session_link"
         )
-        XCTAssertTrue(rendered.contains("`snooze_auto_wake` (observer-local pause on one lane&apos;s status-triggered Auto-wake)"))
-        XCTAssertTrue(rendered.contains("Only an exact inbound grant authorizes `request_attention`"))
-        XCTAssertTrue(rendered.contains("gains no reverse read, poll, send, control, or interaction-response authority"))
+        XCTAssertTrue(rendered.contains("`snooze_auto_wake` pauses only routine status-triggered admission"))
+        XCTAssertTrue(rendered.contains("an exact inbound grant authorizes only `request_attention`"))
+        XCTAssertTrue(rendered.contains("not a reverse observer grant"))
     }
 
     /// A managed row says so in the row itself, and the membership guidance teaches what management
@@ -1095,16 +1072,15 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             .drop(while: { $0 == "\n" })
             .prefix(while: { $0 != "\n" })
         XCTAssertTrue(
-            firstLine.hasPrefix("Current capabilities: this block replaces every earlier statement"),
+            firstLine.hasPrefix("Current capabilities: this block replaces earlier overseen-session lists"),
             "the correction must be read before anything older text taught"
         )
-        XCTAssertTrue(rendered.contains("including any refusal you gave based on older capabilities"))
-        XCTAssertTrue(rendered.contains("you act for the user in that session"))
-        XCTAssertTrue(rendered.contains("A grant with `manage` also authorizes `get_interaction`"))
-        XCTAssertTrue(rendered.contains("`respond` (answer exactly that prompt), and `steer` (direct the target now)"))
-        XCTAssertTrue(rendered.contains("A pending prompt blocks `steer` with `target_awaiting_interaction`"))
-        XCTAssertTrue(rendered.contains("then report the outcome to your user"))
-        XCTAssertTrue(rendered.contains("On a managed session you may give it that next instruction with `steer`"))
+        XCTAssertTrue(rendered.contains("including your own earlier refusals based on them"))
+        XCTAssertTrue(rendered.contains("managed-only pending prompts"))
+        XCTAssertTrue(rendered.contains("A grant with `manage` lets `poll`/`wait` include a redacted `pending_interaction`"))
+        XCTAssertTrue(rendered.contains("`respond` answers exactly the current `interaction_id`"))
+        XCTAssertTrue(rendered.contains("a pending prompt blocks steering"))
+        XCTAssertTrue(rendered.contains("`steer` may deliver that instruction"))
         XCTAssertFalse(rendered.contains("read-only observation"))
         XCTAssertFalse(rendered.contains("Answer prompts"))
         // The autonomy contract still bounds management by the observer's own user's instruction.
@@ -1122,7 +1098,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
                 toolReference: "agent_session_link"
             )
             XCTAssertTrue(
-                rendered.contains("snooze_auto_wake, get_interaction, respond, or steer against a previously overseen session"),
+                rendered.contains("snooze_auto_wake, respond, or steer against a previously overseen session"),
                 "\(kind)"
             )
         }
@@ -1141,7 +1117,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             "the superseded operation must not be taught anywhere in the membership guidance"
         )
         // Always-on is stated once, as a fact rather than as an operation to call.
-        XCTAssertTrue(rendered.contains("You do not have to ask for ongoing awareness"))
+        XCTAssertTrue(rendered.contains("`wait` waits on a returned cursor"))
         XCTAssertFalse(
             rendered.contains(AgentSessionLinkPrompts.statusChangeEnvelopeTag),
             "membership prose must not name the status envelope it is not carrying"
@@ -1431,6 +1407,29 @@ final class AgentSessionLinkPromptDecisionTests: XCTestCase {
         XCTAssertNil(
             decide(currentRevision: 3, hasLinks: true, lastAcceptedRevision: 3, lastAcceptedHadLinks: true)
         )
+    }
+
+    func testInventoryGuidanceRevisionReOwesUnchangedMembership() {
+        XCTAssertEqual(AgentSessionLinkPromptSupplementDecision.decide(
+            currentRevision: 3,
+            hasLinks: true,
+            isEligibilitySuppressed: false,
+            lastAcceptedRevision: 3,
+            lastAcceptedHadLinks: true,
+            possiblyDeliveredLinkRevision: nil,
+            acceptedInventoryGuidanceRevision: 1,
+            currentInventoryGuidanceRevision: 2
+        ), .inventory)
+        XCTAssertNil(AgentSessionLinkPromptSupplementDecision.decide(
+            currentRevision: 3,
+            hasLinks: true,
+            isEligibilitySuppressed: false,
+            lastAcceptedRevision: 3,
+            lastAcceptedHadLinks: true,
+            possiblyDeliveredLinkRevision: nil,
+            acceptedInventoryGuidanceRevision: 2,
+            currentInventoryGuidanceRevision: 2
+        ))
     }
 
     func testMembershipChangeReopensInventory() {
@@ -2539,7 +2538,7 @@ final class AgentSessionLinkPromptClaimStoreTests: XCTestCase {
             XCTAssertGreaterThan(deliveredCount, 0)
             if acceptedSubsetCount == 0 {
                 XCTAssertEqual(claimed.laneGuidanceMode, .full)
-                XCTAssertTrue(claimed.fragment.contains("Guidance revision 7 supersedes"))
+                XCTAssertTrue(claimed.fragment.contains("Guidance revision 8 supersedes"))
             } else {
                 XCTAssertEqual(claimed.laneGuidanceMode, .reminder)
                 XCTAssertTrue(claimed.fragment.contains("Lane update or attributed attention"))
@@ -2595,7 +2594,7 @@ final class AgentSessionLinkPromptClaimStoreTests: XCTestCase {
             epoch: codex
         ))
         XCTAssertTrue(inFlight.fragment.contains(
-            "Use `mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__agent_session_link` for all of it"
+            "Use `mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__agent_session_link` for these sessions"
         ))
         XCTAssertFalse(
             inFlight.fragment.contains("Your host decides"),
@@ -2615,7 +2614,7 @@ final class AgentSessionLinkPromptClaimStoreTests: XCTestCase {
             "a rebuilt provider context has not been taught oversight"
         )
         XCTAssertTrue(
-            afterSwitch.fragment.contains("Use `agent_session_link` for all of it"),
+            afterSwitch.fragment.contains("Use `agent_session_link` for these sessions"),
             "the fragment must name the tool as the new provider's host advertises it"
         )
         XCTAssertTrue(

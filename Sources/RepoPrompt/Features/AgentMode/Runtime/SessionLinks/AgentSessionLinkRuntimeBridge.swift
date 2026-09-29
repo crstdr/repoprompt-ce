@@ -967,6 +967,10 @@ final class AgentSessionLinkRuntimeBridge {
     private var bindingChangeCancellable: AnyCancellable?
 
     #if DEBUG
+        /// Runs after the terminal survivor authority hop, before release to the observer.
+        var test_afterTerminalWaitSurvivorAuthorityValidation: (@MainActor () -> Void)?
+        /// Parks managed prompt projection after authority validation and before release.
+        var test_afterManagedObservationAuthorityValidation: (@MainActor () async -> Void)?
         /// Deterministic interleaving seam after authority revocation and before durable cleanup enters
         /// the pair lane. Tests use it to reassert the same token in the exact stale-owner window.
         var test_beforeSynchronousSeed: (@MainActor () -> Void)?
@@ -4794,19 +4798,91 @@ final class AgentSessionLinkRuntimeBridge {
         )
     }
 
-    /// Read-only inspection of the target's current pending interaction.
-    ///
-    /// `target` was authorized for `.monitorGetInteraction`, so its lease already proves the exact
-    /// grant carries management; a watch-only link never reaches here and never sees prompt text,
-    /// commands, or paths.
-    func pendingInteraction(target: AuthorizedTarget) -> AgentSessionLinkInteractionDisposition {
-        guard !isFrozenForTermination else { return .shuttingDown }
-        guard let host,
-              host.agentSessionLinkCandidates().contains(where: {
-                  $0.domainEndpoint == target.candidate.domainEndpoint
+    /// Rebuild terminal-wait survivors without releasing a row or successor cursor through a
+    /// deletion, lost endpoint, or no-longer-eligible observer. The revoked member is deliberately
+    /// checked independently rather than failing the entire original batch.
+    func terminalWaitSurvivingStates(
+        leases: [DomainAgentSessionLinkLease]
+    ) async -> [DomainAgentSessionLinkTargetState] {
+        guard !isFrozenForTermination, let host else { return [] }
+        var surviving: [(DomainAgentSessionLinkLease, DomainAgentSessionLinkTargetState)] = []
+        for lease in leases {
+            guard await revalidateEndpoints(for: lease) != nil,
+                  let state = await authority.targetState(for: lease)
+            else { continue }
+            surviving.append((lease, state))
+        }
+        guard await authority.managedObservationTargetsIfValid(leases: surviving.map(\.0)) != nil
+        else { return [] }
+        #if DEBUG
+            test_afterTerminalWaitSurvivorAuthorityValidation?()
+        #endif
+        // Authority validation suspends; termination may freeze the bridge before release.
+        guard !isFrozenForTermination, self.host === host else { return [] }
+        let registry = AgentSessionDeletionRegistry.shared
+        let candidates = host.agentSessionLinkCandidates()
+        return surviving.compactMap { survivor in
+            let (lease, state) = survivor
+            guard !registry.blocksNewOversight(sessionID: lease.observer.sessionID),
+                  !registry.blocksNewOversight(sessionID: lease.target.sessionID),
+                  let observer = candidates.first(where: { $0.domainEndpoint == lease.observer }),
+                  AgentSessionLinkEndpointEligibility.observerOperationEligibility(
+                      observer.eligibilityInput,
+                      roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
+                  ) == .eligible,
+                  let target = candidates.first(where: { $0.domainEndpoint == lease.target }),
+                  AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil
+            else { return nil }
+            return state
+        }
+    }
+
+    /// Fresh observer-local prompt projection after the whole requested batch passes a final
+    /// authority and live-endpoint fence. A parked wait never trusts its pre-wait candidates or a
+    /// snapshot's coarse `hasPendingInteraction` bit. Watch-only leases get no prompt body.
+    func pendingInteractionsForObservation(
+        leases: [DomainAgentSessionLinkLease]
+    ) async -> [UUID: AgentSessionLinkPendingInteractionInspection]? {
+        guard !isFrozenForTermination, let host else { return nil }
+        for lease in leases {
+            guard await revalidateEndpoints(for: lease) != nil else { return nil }
+        }
+        guard await authority.managedObservationTargetsIfValid(leases: leases) != nil,
+              !isFrozenForTermination
+        else { return nil }
+        #if DEBUG
+            await test_afterManagedObservationAuthorityValidation?()
+        #endif
+        // The test seam can suspend while Manage is withdrawn. Re-prove the whole batch after it.
+        guard let managedIDs = await authority.managedObservationTargetsIfValid(leases: leases) else {
+            return nil
+        }
+        // Deletion can begin while the authority hop is suspended without revoking a valid grant.
+        // Recheck both endpoints before the no-suspension release of any prompt body.
+        let registry = AgentSessionDeletionRegistry.shared
+        guard !isFrozenForTermination,
+              self.host === host,
+              !leases.contains(where: {
+                  registry.blocksNewOversight(sessionID: $0.observer.sessionID)
+                      || registry.blocksNewOversight(sessionID: $0.target.sessionID)
               })
-        else { return .denied }
-        return .inspected(host.agentSessionLinkPendingInteraction(for: target.candidate))
+        else { return nil }
+        let candidates = host.agentSessionLinkCandidates()
+        var inspections: [UUID: AgentSessionLinkPendingInteractionInspection] = [:]
+        for lease in leases {
+            guard let candidate = candidates.first(where: { $0.domainEndpoint == lease.target }),
+                  AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate) == nil,
+                  let observer = candidates.first(where: { $0.domainEndpoint == lease.observer }),
+                  AgentSessionLinkEndpointEligibility.observerOperationEligibility(
+                      observer.eligibilityInput,
+                      roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
+                  ) == .eligible
+            else { return nil }
+            if managedIDs.contains(lease.target.sessionID) {
+                inspections[lease.target.sessionID] = host.agentSessionLinkPendingInteraction(for: candidate)
+            }
+        }
+        return inspections
     }
 
     /// Submits one explicit observer answer to the target's exact current interaction.

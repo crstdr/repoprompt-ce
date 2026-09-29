@@ -211,7 +211,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
             "Your user withdrew management of this session before the steer was authorized. "
                 + "Nothing was delivered. Without management you may only observe and send."
         case .targetAwaitingInteraction:
-            "The overseen session is waiting on a prompt. Inspect it with get_interaction and answer "
+            "The overseen session is waiting on a prompt. Inspect it with managed poll or wait and answer "
                 + "it with respond, or leave it for the session's user if it is manual-only. Nothing "
                 + "was delivered."
         case .targetBusy:

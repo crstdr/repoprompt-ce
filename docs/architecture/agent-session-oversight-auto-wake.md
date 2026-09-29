@@ -71,7 +71,9 @@ Revision 7 changes what an exact outbound grant may confer rather than how it is
 grant-level `manage` capability (see *Management is an authority-owned grant capability*) lets an
 overseer answer and steer its target for its own user, and the full block says outright that it
 supersedes earlier observe-only wording — including refusals the overseer itself gave on the
-strength of that wording.
+strength of that wording. Revision 8 moves managed prompt inspection into redacted `poll`/`wait`
+results and retires `get_interaction`; both inventory guidance and passive-lane guidance are
+re-owed when their wording revision changes, even if link membership did not.
 
 ### Feedback loops are an accepted consequence
 
@@ -224,8 +226,8 @@ pair is saved, and it is re-applied only to a grant the user's saved relationshi
 Auto-approval never lets the observer *agent* choose anything; it blindly accepts new provider
 permission prompts. **Management** is the user's delegation of one exact target session to the
 observer: the overseer may then act for the user in that session — inspect and answer its pending
-prompts and direct its runs — through `agent_session_link` `get_interaction`, `respond`, and
-`steer`. It is not a second authority. It is the `.manage` capability on the exact grant in
+prompts and direct its runs — through managed `agent_session_link` `poll`/`wait`, `respond`,
+and `steer`. It is not a second authority. It is the `.manage` capability on the exact grant in
 `DomainAgentSessionLinkAuthority`, so `list` capabilities, `poll`'s `managed` field, the
 prompt inventory's `managed="true"` rows, the dashboard's **Manage** checkbox, and every management
 fence all read the same record.
@@ -239,8 +241,9 @@ fence all read the same record.
 | Withdrawing | Allowed whenever the grant exists, and effective at the next fence of any operation already in flight |
 | Independence | Neither management nor auto-approval implies the other |
 
-Every management operation authorizes `.monitorGetInteraction`, `.monitorRespond`, or `.monitorSteer`,
-each requiring `.manage`. A watch-only link receives a structured `management_not_granted` result
+`respond` and `steer` authorize `.monitorRespond` or `.monitorSteer`, each requiring `.manage`.
+`poll` and `wait` retain their watch-level operation grants but disclose prompt bodies only after a
+separate whole-batch exact-grant Manage fence and live-endpoint check. A watch-only link receives a structured `management_not_granted` result
 (the bridge first re-proves the plain watch grant, so an unlinked UUID still gets the
 indistinguishable denial). Withdrawal applies at the fence, not at the next call: `validate(lease:)`
 fails once `.manage` leaves the grant, and a steer's ledger commit uses
@@ -249,9 +252,12 @@ releases the uncommitted reservation.
 
 ### Inspecting and answering prompts
 
-`get_interaction` returns the target's current pending approval, permission, MCP elicitation, or
-question, with free text through the oversight redactor and option labels verbatim. `respond`
-answers exactly one `interaction_id`: the target view model compares the ID, validates the answer
+Managed `poll` and `wait` may return the target's current pending approval, permission, MCP
+elicitation, or question beside the sanitized snapshot, with free text through the oversight redactor
+and one-time option labels verbatim. Restricted links never receive a prompt body; a single prompt
+over 64 KiB yields an ID-only `too_large` manual-only stub, and multi-target results omit whole
+prompts beyond their 20 KiB aggregate prompt budget. A `respond_hint` appears only with a respondable
+pending interaction. `respond` answers exactly one `interaction_id`: the target view model compares the ID, validates the answer
 with the parser behind `agent_run respond`, awaits the bridge's final fence (the management lease
 re-validated inside the authority, both live endpoints, deletion state), compares again, and
 submits without suspending. Approvals and permissions accept only `accept` (this request only),
@@ -259,7 +265,7 @@ submits without suspending. Approvals and permissions accept only `accept` (this
 app-owned worktree-merge reviews, and user-input requests containing a secret field are visible but
 `manual_only`. ACP permissions use only a genuine one-time allow option for accept and a one-time
 reject for decline. A wait for the session's next instruction is not a prompt `respond` answers;
-`get_interaction` says to deliver that instruction with `steer`.
+the managed pending-interaction note says to deliver that instruction with `steer`.
 
 ### Steering
 
