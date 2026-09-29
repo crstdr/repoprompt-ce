@@ -82,6 +82,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 + hiddenBindingsBySessionID[sessionID, default: 0]
         }
 
+        func agentSessionLinkClaimLaneRetirement(endpoint: DomainAgentSessionLinkEndpointIdentity) -> UUID? {
+            UUID()
+        }
+
+        func agentSessionLinkReleaseLaneRetirement(endpoint: DomainAgentSessionLinkEndpointIdentity, claimID: UUID) {}
+
         func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool {
             childSessionIDsByParent[parentSessionID]?.isEmpty == false
         }
@@ -6217,6 +6223,32 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.host.sendRequests.first?.candidate.sessionID, lane.sessionID)
         let inbound = await fixture.authority.links(forTarget: lane.sessionID)
         XCTAssertEqual(inbound.items.count, 1)
+    }
+
+    func testCreatedLaneCanRetireAfterFirstTaskTurn() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        let lane = prepareCreatedLane(fixture)
+        stageReadyTarget(fixture)
+
+        let created = await createLane(
+            fixture,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "create-then-retire", message: "Run the first turn")
+        )
+        XCTAssertEqual(created.result, .created)
+        XCTAssertEqual(created.firstTask, .delivered)
+        XCTAssertEqual(fixture.host.sendRequests.first?.candidate.sessionID, lane.sessionID)
+
+        let retired = await fixture.bridge.retireLane(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: lane.sessionID
+        )
+        XCTAssertEqual(retired, .retired(sessionID: lane.sessionID))
+        let inbound = await fixture.authority.links(forTarget: lane.sessionID)
+        XCTAssertTrue(inbound.items.isEmpty)
+        XCTAssertFalse(fixture.host.candidates.contains(where: { $0.sessionID == lane.sessionID }))
     }
 
     func testLaneFirstTaskRetainsPreStopFenceAcrossLinkEstablishment() async throws {
