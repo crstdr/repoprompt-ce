@@ -1107,6 +1107,33 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ]))
     }
 
+    func testIdleManagedPollReportsTheGrantWithoutAPendingInteraction() async throws {
+        let managed = try await makeReadReleaseFixture()
+        defer { managed.tearDown() }
+        managed.host.pendingInteractionInspection = .none
+        let managedPoll = try await Self.executeObject(managed.service, args: [
+            "op": .string("poll"), "session_id": .string(managed.target.sessionID.uuidString)
+        ])
+        let snapshot = try XCTUnwrap(managedPoll["snapshot"]?.objectValue)
+        XCTAssertEqual(snapshot["status"], .string("idle"))
+        XCTAssertEqual(snapshot["idle_for_send"], .bool(true))
+        XCTAssertEqual(snapshot["has_pending_interaction"], .bool(false))
+        // Management follows the grant, not whether its inspection contains a prompt.
+        XCTAssertEqual(managedPoll["managed"], .bool(true))
+        XCTAssertNil(managedPoll["pending_interaction"])
+        XCTAssertNil(managedPoll["respond_hint"])
+
+        let watchOnly = try await makeReadReleaseFixture(restricted: true)
+        defer { watchOnly.tearDown() }
+        watchOnly.host.pendingInteractionInspection = .none
+        let watchOnlyPoll = try await Self.executeObject(watchOnly.service, args: [
+            "op": .string("poll"), "session_id": .string(watchOnly.target.sessionID.uuidString)
+        ])
+        XCTAssertEqual(watchOnlyPoll["managed"], .bool(false))
+        XCTAssertNil(watchOnlyPoll["pending_interaction"])
+        XCTAssertNil(watchOnlyPoll["respond_hint"])
+    }
+
     func testManagedLinkInspectsAnswersAndSteersAndReportsTheGrant() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
