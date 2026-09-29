@@ -165,20 +165,27 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
 
     // MARK: - Support
 
-    func testOnlyClaudeCodeAndCodexWithAProviderConversationAreSupported() throws {
+    func testOnlyClaudeCodeAndCodexWithAProviderConversationAreSupported() async throws {
         for agent in AgentProviderKind.allCases {
             let fixture = try makeFixture(agent: agent)
             let expected: AgentSessionLinkCompactSupport = switch agent {
             case .claudeCode: .claudeCode
             case .codexExec: .codex
+            case .devin, .grokBuild, .antigravity:
+                // A remembered ACP conversation with no live session yet is retryable, not
+                // incapable: one ordinary turn brings the provider session and its command
+                // advertisement up.
+                .noProviderSession
             default: .notSupported
             }
-            XCTAssertEqual(fixture.viewModel.agentSessionLinkCompactSupport(for: fixture.session), expected, "\(agent)")
+            let support = await fixture.viewModel.agentSessionLinkCompactSupport(for: fixture.session)
+            XCTAssertEqual(support, expected, "\(agent)")
         }
         for agent in [AgentProviderKind.claudeCode, .codexExec] {
             let fixture = try makeFixture(agent: agent, providerConversation: false)
+            let support = await fixture.viewModel.agentSessionLinkCompactSupport(for: fixture.session)
             XCTAssertEqual(
-                fixture.viewModel.agentSessionLinkCompactSupport(for: fixture.session),
+                support,
                 .noProviderSession,
                 "\(agent) with nothing to compact"
             )
@@ -197,6 +204,10 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             return XCTFail("Expected an accepted compaction, got \(outcome)")
         }
         XCTAssertEqual(delivery.deliveryState, .runStarted)
+        XCTAssertFalse(
+            delivery.compactionRunsInBackground,
+            "Claude compacts inside the turn it was sent on; there is no background work to cancel"
+        )
         XCTAssertEqual(fixture.session.items.count, before + 1)
         let row = try XCTUnwrap(fixture.session.items.last)
         XCTAssertEqual(row.id, delivery.targetItemID)
@@ -224,10 +235,12 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertFalse(options.isLaneUpdate)
         XCTAssertEqual(command.providerText, "/compact", "Fixed text: the conversation binding never reaches the provider")
         for agent in AgentProviderKind.allCases {
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = agent
             XCTAssertEqual(
-                AgentModeRunService.dispatchesProviderControlCommands(agent),
+                AgentModeRunService.dispatchesProviderControlCommand(command, for: session),
                 agent == .claudeCode,
-                "\(agent)"
+                "\(agent) without a live advertising ACP session"
             )
         }
     }
@@ -260,7 +273,9 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
     func testUnsupportedOrConversationlessTargetsAreRefusedBeforeAnythingIsRecorded() async throws {
         for (agent, conversation, expected) in [
             (AgentProviderKind.claudeCodeGLM, true, AgentSessionLinkSendFailure.notSupported),
-            (.devin, true, .notSupported),
+            // A stored Devin conversation with no live provider session (e.g. right after a
+            // relaunch) is retryable: it is not yet knowable whether the provider compacts.
+            (.devin, true, .noProviderSession),
             (.claudeCode, false, .noProviderSession),
             (.codexExec, false, .noProviderSession)
         ] {

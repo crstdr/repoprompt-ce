@@ -1802,7 +1802,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         - `read`: page the redacted user-visible transcript; reuse `next_cursor` and re-anchor on `cursor_reset`.
         - `send`: deliver an attributed message when `idle_for_send: true`, or queue one with `delivery: "when_sendable"`.
         - `cancel_pending_send`: withdraw your queued message by its `idempotency_key` before delivery.
-        - `compact`: request native context compaction of one `idle_for_send: true` target; takes no text and needs a new `idempotency_key`. Claude Code and Codex only. `accepted` means started, not finished; `not_started` retains the request/key. Observe with poll/wait; context count is unknown until new usage. Never bypass a prompt or substitute a send asking it to compact.
+        - `compact`: request native context compaction of one `idle_for_send: true` target; takes no text and needs a new `idempotency_key`. Claude Code/Codex, or live ACP advertising `/compact` (not OpenCode/Cursor). `accepted` means started, not finished; `not_started` retains the request/key. Observe with poll/wait; context count is unknown until new usage. Never bypass a prompt or substitute a send asking it to compact.
         - `set_waiting_on`: declare or clear your own external dependency; no target ID. Compaction does not clear it.
         - `snooze_auto_wake`: pause routine status-triggered wake admission for one lane, not collection or delivery; exact attention may bypass its snooze.
         - `request_attention`: send a fixed, attributed signal through an exact inbound link; acceptance does not promise a wake or action.

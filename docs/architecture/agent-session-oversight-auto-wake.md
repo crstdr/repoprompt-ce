@@ -434,7 +434,24 @@ instead of a user row, and it dispatches a RepoPrompt-constructed command
 `thread/compact/start`, and Claude Code receives exactly `/compact` through its ordinary run
 pipeline with every decoration (handoff, oversight supplement, instruction packaging, effort)
 skipped and no interrupt of an in-flight turn. No caller text ever reaches the provider. Every other
-runtime returns `not_supported` rather than a message asking the model to compact itself.
+unsupported runtime returns `not_supported` rather than a message asking the model to compact itself.
+
+ACP uses an undecorated `session/prompt` only for a live Devin, Grok Build, or Antigravity
+session that advertises `compact` for its exact conversation. Each `available_commands_update`
+replaces its controller snapshot; opening or retiring the session clears it. A missing live
+session or unobserved command list is retryable `no_provider_session`; an observed list that lacks
+`compact` is `not_supported`. OpenCode user commands and Cursor never qualify. A command never
+starts/replaces a controller or applies model/mode configuration. The controller rechecks idle state,
+conversation, advertisement, and the **current** request's compatibility immediately before the
+write, including Devin's launched permission mode. An unsent refusal retains a usable controller;
+a retired one is detached and shut down. Busy is not retired.
+
+ACP context count becomes unknown at dispatch: new occupancy may vouch for it again, but this
+command's billed prompt count cannot. A proven no-send restores the withdrawn vouch only if no
+newer occupancy replaced it. Instant silent completion may mean background work, so it adds a
+fixed transcript hint; the ACP receipt cautions that another prompt may cancel that work and to
+wait ~60–90 seconds. This is guidance, not completion proof, a cooldown, or new admission policy.
+Duplicate receipts retain that metadata.
 
 A failed last run is not a readiness blocker, so a target that died on context length is admissible;
 any interaction or `awaiting_user` is `target_not_idle`. `accepted` means started, not completed: completion is
