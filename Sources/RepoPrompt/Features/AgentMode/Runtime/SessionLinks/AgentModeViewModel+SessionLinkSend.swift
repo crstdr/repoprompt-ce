@@ -179,7 +179,7 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .blocked(failure == .endpointInvalidated ? .endpointPostReadiness : failure)
         }
-        guard let workspaceID = workspaceManager?.activeWorkspace?.id else {
+        guard let workspaceID = workspaceManager?.activeWorkspaceID else {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointMissingWorkspace)
         }
@@ -272,7 +272,7 @@ extension AgentModeViewModel {
               dispatchLiveness.permitsDelivery,
               composerSubmitClaimIsCurrent(claim),
               stopFence.permitsStart(of: liveSession),
-              workspaceManager?.activeWorkspace?.id == candidate.workspaceID
+              workspaceManager?.activeWorkspaceID == candidate.workspaceID
         else {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
