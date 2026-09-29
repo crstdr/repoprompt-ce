@@ -62,6 +62,7 @@ struct AgentSessionLaneCreateReceipt: Equatable {
     let firstTask: FirstTask
     let laneCount: Int
     var duplicate = false
+    var firstTaskReason: String?
 
     static func refused(_ reason: Reason, laneCount: Int = 0) -> Self {
         Self(
@@ -111,9 +112,36 @@ enum AgentSessionLaneRetireOutcome: Equatable {
         case notRetirable = "not_retirable"
         case managementNotGranted = "management_not_granted"
         case laneInUse = "lane_in_use"
+        case laneInUseBindings = "lane_in_use_bindings"
+        case laneInUseChildren = "lane_in_use_children"
+        case laneInUseDiskChild = "lane_in_use_disk_child"
+        case laneInUseInboundCount = "lane_in_use_in_count"
+        case laneInUseInboundLink = "lane_in_use_in_link"
+        case laneInUseInboundGeneration = "lane_in_use_in_gen"
+        case laneInUseOutbound = "lane_in_use_outbound"
+        case laneInUsePending = "lane_in_use_pending"
         case laneBusy = "lane_busy"
         case stopFailed = "stop_failed"
         case alreadyStopped = "already_stopped"
+
+        var wireReason: String {
+            subreason == nil ? rawValue : Reason.laneInUse.rawValue
+        }
+
+        var subreason: String? {
+            switch self {
+            case .laneInUse: "unknown"
+            case .laneInUseBindings: "bindings"
+            case .laneInUseChildren: "children"
+            case .laneInUseDiskChild: "disk_child"
+            case .laneInUseInboundCount: "in_count"
+            case .laneInUseInboundLink: "in_link"
+            case .laneInUseInboundGeneration: "in_gen"
+            case .laneInUseOutbound: "outbound"
+            case .laneInUsePending: "pending"
+            default: nil
+            }
+        }
     }
 
     case retired(sessionID: UUID)

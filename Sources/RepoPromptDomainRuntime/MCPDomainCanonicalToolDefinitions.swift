@@ -2210,7 +2210,44 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Additive refusal-code description; keep the prior lane contract as a frozen migration anchor.
+    private enum AgentSessionLinkRefusalSubreasonMigration {
+        static let description: String = {
+            let previous = AgentSessionLinkLaneOperationsMigration.description
+            precondition(previous.contains("**Trust and use rules**"))
+            return previous.replacingOccurrences(
+                of: "**Trust and use rules**",
+                with: "Endpoint and lane refusals may include short subreason codes.\n\n**Trust and use rules**"
+            )
+        }()
+
+        static func apply(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            if definition.description == description,
+               definition.inputSchema == AgentSessionLinkLaneOperationsMigration.inputSchema {
+                return definition
+            }
+            precondition(AgentSessionLinkLaneOperationsMigration.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: description,
+                inputSchema: definition.inputSchema,
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private static func canonicalizeAgentSessionLink(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        if definition.description == AgentSessionLinkRefusalSubreasonMigration.description,
+           definition.inputSchema == AgentSessionLinkLaneOperationsMigration.inputSchema {
+            return definition
+        }
+        return AgentSessionLinkRefusalSubreasonMigration.apply(canonicalizeAgentSessionLinkBeforeRefusalSubreason(definition))
+    }
+
+    private static func canonicalizeAgentSessionLinkBeforeRefusalSubreason(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
         if AgentSessionLinkLaneOperationsMigration.isCurrent(definition) { return definition }

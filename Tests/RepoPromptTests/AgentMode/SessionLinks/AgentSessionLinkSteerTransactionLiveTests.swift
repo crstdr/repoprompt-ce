@@ -365,7 +365,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
             }
         )
 
-        XCTAssertEqual(outcome, .blocked(.endpointInvalidated))
+        XCTAssertEqual(outcome, .blocked(.endpointPostTarget))
         XCTAssertTrue(fixture.session.items.isEmpty)
         XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
     }
