@@ -2507,7 +2507,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         await ensureCodexNativeSession(
             session: session,
             allowMissingRolloutFallback: false,
-            allowResumeTimeoutFallback: false
+            allowResumeTimeoutFallback: false,
+            forIdleNativeCompact: true
         )
         guard isStillAdmissible(),
               session.codexConversationID == expectedThreadID,
@@ -6374,6 +6375,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         deferPublicationUntilRouting: Bool = false,
         allowMissingRolloutFallback: Bool = true,
         allowResumeTimeoutFallback: Bool = true,
+        forIdleNativeCompact: Bool = false,
         deferReconnectForCurrentActiveTurn: Bool = false,
         preserveExistingRunID: Bool = false,
         skipResumeWhenNoPriorCodexHistory: Bool = false,
@@ -6433,6 +6435,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     deferPublicationUntilRouting: deferPublicationUntilRouting,
                     allowMissingRolloutFallback: allowMissingRolloutFallback,
                     allowResumeTimeoutFallback: allowResumeTimeoutFallback,
+                    forIdleNativeCompact: forIdleNativeCompact,
                     skipResumeWhenNoPriorCodexHistory: false,
                     semanticRunState: semanticRunState,
                     startupClaimToken: claimToken
@@ -6734,13 +6737,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 deferPublicationUntilRouting: deferPublicationUntilRouting,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback,
+                forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
                 startupClaimToken: claimToken
             )
             return
         }
+        // Native compact resumes an exact idle thread only to issue a control-plane request. It
+        // cannot satisfy the managed bootstrap's active-turn readiness predicate until after resume.
+        // The next ordinary model turn still establishes its own routed tool policy.
         let shouldInstallPolicy = shouldManageCodexTooling
+            && !forIdleNativeCompact
             && shouldBootstrapSessionInitialization
             && (!policyAlreadyInstalled || !deferPublicationUntilRouting)
             && requiresTransportStart
