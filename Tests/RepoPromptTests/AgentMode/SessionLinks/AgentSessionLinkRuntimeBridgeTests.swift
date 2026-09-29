@@ -25,8 +25,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )?
         var laneProvenance: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
         var hiddenBindingsBySessionID: [UUID: Int] = [:]
-        var childSessionIDsByParent: [UUID: Set<UUID>] = [:]
-        var persistedChildSessionIDsByParent: [UUID: Set<UUID>] = [:]
+        var activeChildSessionIDsByParent: [UUID: Set<UUID>] = [:]
+        var persistedActiveChildSessionIDsByParent: [UUID: Set<UUID>] = [:]
         var retirePreflightAllowed = true
         var retireCommitAllowed = true
         var beforeRetireCommit: (() async -> Void)?
@@ -88,12 +88,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         func agentSessionLinkReleaseLaneRetirement(endpoint: DomainAgentSessionLinkEndpointIdentity, claimID: UUID) {}
 
-        func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool {
-            childSessionIDsByParent[parentSessionID]?.isEmpty == false
+        func agentSessionLinkHasActiveChildSessions(parentSessionID: UUID) -> Bool {
+            activeChildSessionIDsByParent[parentSessionID]?.isEmpty == false
         }
 
-        func agentSessionLinkHasPersistedChildSessions(parentSessionID: UUID) async -> Bool {
-            persistedChildSessionIDsByParent[parentSessionID]?.isEmpty == false
+        func agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: UUID) async -> Bool {
+            persistedActiveChildSessionIDsByParent[parentSessionID]?.isEmpty == false
         }
 
         var snapshotOverrides: [UUID: DomainAgentSessionObservationSnapshot] = [:]
@@ -6667,11 +6667,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertFalse(fixture.host.candidates.contains(fixture.target))
     }
 
-    func testLaneRetirementRefusesLaneWithChildSession() async throws {
+    func testLaneRetirementRefusesLaneWithRunningChildSession() async throws {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
-        fixture.host.childSessionIDsByParent[fixture.target.sessionID] = [UUID()]
+        fixture.host.activeChildSessionIDsByParent[fixture.target.sessionID] = [UUID()]
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let outcome = await fixture.bridge.retireLane(
             observerEndpoint: fixture.observer.domainEndpoint,
@@ -6682,11 +6682,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(inbound.items.count, 1)
     }
 
-    func testLaneRetirementRefusesUnindexedPersistedChild() async throws {
+    func testLaneRetirementRefusesUnindexedPersistedActiveChild() async throws {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
-        fixture.host.persistedChildSessionIDsByParent[fixture.target.sessionID] = [UUID()]
+        fixture.host.persistedActiveChildSessionIDsByParent[fixture.target.sessionID] = [UUID()]
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let outcome = await fixture.bridge.retireLane(
             observerEndpoint: fixture.observer.domainEndpoint,

@@ -18,9 +18,38 @@ extension AgentModeViewModel {
             }
     }
 
-    func agentSessionLinkHasChildSessions(parentSessionID: UUID) -> Bool {
-        sessions.values.contains { $0.parentSessionID == parentSessionID }
-            || ownerValidatedSessionIndex.values.contains { $0.parentSessionID == parentSessionID }
+    func agentSessionLinkChildRetirementRecords() -> [AgentSessionLaneChildRetirementRecord] {
+        let loadedSessionIDs = Set(sessions.values.filter(\.hasLoadedPersistedState).compactMap(\.activeAgentSessionID))
+        var records = ownerValidatedSessionIndex.values.filter { !loadedSessionIDs.contains($0.id) }.map { entry in
+            AgentSessionLaneChildRetirementRecord(
+                sessionID: entry.id, parentSessionID: entry.parentSessionID,
+                blocksRetirement: entry.lastRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))?.isActive ?? true
+            )
+        }
+        for session in sessions.values {
+            guard let sessionID = session.activeAgentSessionID else { continue }
+            let indexed = ownerValidatedSessionIndex[sessionID]
+            records.append(.init(
+                sessionID: sessionID,
+                parentSessionID: session.hasLoadedPersistedState
+                    ? session.parentSessionID : session.parentSessionID ?? indexed?.parentSessionID,
+                blocksRetirement: !agentSessionLinkLaneSessionIsQuiescent(session)
+            ))
+        }
+        return records
+    }
+
+    private func agentSessionLinkLaneSessionIsQuiescent(_ session: TabSession) -> Bool {
+        !session.runState.isActive
+            && session.waitingPrompt == nil
+            && Self.pendingInteractionKind(for: session) == nil
+            && !session.isComposerSubmissionInFlight
+            && !session.mcpFollowUpRunPending
+            && !session.terminalCommitInProgress
+            && session.pendingInstructions.isEmpty
+            && session.pendingACPSteeringInstructions.isEmpty
+            && session.pendingClaudeSteeringInstructions.isEmpty
+            && session.oversight.pendingAutoWake == nil
     }
 
     enum MCPOversightLaneCreationOutcome: Equatable {
@@ -204,7 +233,9 @@ extension AgentModeViewModel {
     func agentSessionLinkRetireLane(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         commit: Bool,
-        isStillRetirable: @escaping @MainActor () -> Bool
+        isStillRetirable: @escaping @MainActor () -> Bool,
+        descendantSessionIDs: Set<UUID> = [],
+        didStash: @MainActor (Set<UUID>) -> Void = { _ in }
     ) async -> Bool {
         let canRetire: @MainActor () -> Bool = { [weak self] in
             guard let self,
@@ -212,26 +243,23 @@ extension AgentModeViewModel {
                   agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
                   let session = session(for: endpoint.tabID, createIfNeeded: false),
                   session.activeAgentSessionID == endpoint.sessionID,
-                  !session.runState.isActive,
-                  session.waitingPrompt == nil,
-                  Self.pendingInteractionKind(for: session) == nil,
-                  !session.isComposerSubmissionInFlight,
-                  !session.mcpFollowUpRunPending,
-                  !session.terminalCommitInProgress,
-                  session.pendingInstructions.isEmpty,
-                  session.pendingACPSteeringInstructions.isEmpty,
-                  session.pendingClaudeSteeringInstructions.isEmpty,
-                  session.oversight.pendingAutoWake == nil
+                  agentSessionLinkLaneSessionIsQuiescent(session),
+                  !AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(
+                      of: endpoint.sessionID, in: agentSessionLinkChildRetirementRecords()
+                  )
             else { return false }
             return true
         }
         guard canRetire(), let promptManager else { return false }
         guard commit else { return true }
+        let subtreeTabIDs = Set(promptManager.currentComposeTabs.compactMap { tab in
+            tab.activeAgentSessionID.map { descendantSessionIDs.contains($0) } == true ? tab.id : nil
+        }).union([endpoint.tabID])
         let report = await promptManager.stashComposeTabs(
-            withIDs: [endpoint.tabID],
+            withIDs: subtreeTabIDs,
             isMutationContextCurrent: canRetire,
             postPreflightValidation: canRetire,
-            expandCascade: false
+            expandCascade: true
         )
         guard report.rejections.isEmpty,
               report.removedComposeTabIDs.contains(endpoint.tabID),
@@ -240,6 +268,7 @@ extension AgentModeViewModel {
               }) == true,
               let workspaceManager
         else { return false }
+        didStash(report.removedComposeTabIDs)
         // The retirement activation claim stays held by the bridge until this canonical save
         // settles, so another window cannot reload the pre-stash binding in the meantime.
         let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
