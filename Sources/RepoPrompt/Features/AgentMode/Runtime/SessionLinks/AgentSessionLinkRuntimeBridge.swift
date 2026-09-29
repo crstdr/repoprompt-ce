@@ -96,6 +96,14 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> DomainAgentSessionObservationSnapshot
 
+    /// Batch-refreshes durable child metadata without doing a registry scan for each target.
+    func agentSessionLinkRefreshSubagentCensus(
+        for candidates: [AgentSessionLinkEndpointCandidate]
+    ) async
+
+    /// Removes one committed deletion from every live board cache before tab teardown finishes.
+    func agentSessionLinkForgetDeletedSubagent(_ sessionID: UUID)
+
     /// Status/activity-only projection for one exact live candidate.
     ///
     /// Reads only the run-state, pending-interaction, and canonical activity fields. It must never materialize, scan, or
@@ -306,6 +314,8 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// dispatch. Returning a value outcome keeps the bridge free of view-model types.
     ///
     /// - Parameter liveness: host-backed probe re-read at every fence the transaction crosses.
+    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence?
+
     func agentSessionLinkPerformSend(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,
@@ -335,6 +345,16 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         liveness: @escaping AgentSessionLinkSendLivenessProbe,
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome
+
+    /// Stops the exact selected run or pending start under a Manage lease.
+    func agentSessionLinkPerformStop(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkStopRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        queueHasCommittedDrain: @escaping @MainActor () -> Bool,
+        withdrawInbound: @escaping @MainActor () -> Bool,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkStopTransactionOutcome
 
     /// Redacted, observer-restricted view of one exact live target's current pending interaction.
     ///
@@ -405,6 +425,17 @@ extension AgentSessionLinkEndpointHost {
         .blocked(.notSupported)
     }
 
+    func agentSessionLinkRefreshSubagentCensus(
+        for _: [AgentSessionLinkEndpointCandidate]
+    ) async {}
+
+    func agentSessionLinkForgetDeletedSubagent(_: UUID) {}
+
+    func agentSessionLinkStartStopFence(for _: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+        // A host without a live session cannot admit a queued send; reject before enqueuing.
+        nil
+    }
+
     /// Fail-closed management defaults: a host that does not model interactions or steering exposes
     /// none, answers none, and steers nothing.
     func agentSessionLinkPerformSteer(
@@ -413,6 +444,17 @@ extension AgentSessionLinkEndpointHost {
         liveness _: @escaping AgentSessionLinkSendLivenessProbe,
         commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome {
+        .blocked(.endpointInvalidated)
+    }
+
+    func agentSessionLinkPerformStop(
+        to _: AgentSessionLinkEndpointCandidate,
+        request _: AgentSessionLinkStopRequest,
+        liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+        queueHasCommittedDrain _: @escaping @MainActor () -> Bool,
+        withdrawInbound _: @escaping @MainActor () -> Bool,
+        commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkStopTransactionOutcome {
         .blocked(.endpointInvalidated)
     }
 
@@ -997,7 +1039,9 @@ final class AgentSessionLinkRuntimeBridge {
         // metadata cleanup, the next batch file, or view-model teardown while this UUID's grants are
         // still live and its saved rows still on disk.
         AgentSessionDeletionRegistry.shared.commitObserver = { [weak self] sessionID in
-            await self?.handleCommittedSessionDeletion(sessionID)
+            guard let self else { return }
+            await handleCommittedSessionDeletion(sessionID)
+            self.host?.agentSessionLinkForgetDeletedSubagent(sessionID)
         }
         AgentSessionDeletionRegistry.shared.changeObserver = { [weak self] in
             self?.noteCandidateReadinessChanged()
@@ -3447,15 +3491,19 @@ final class AgentSessionLinkRuntimeBridge {
     ///
     /// Sequence allocation happens before the actor hop, so ordering is decided by MainActor order
     /// rather than by task scheduling; the authority's high-water rule is the second line of defence.
-    private func publishTargetSnapshot(forTargetSession sessionID: UUID) {
+    private func publishTargetSnapshot(
+        forTargetSession sessionID: UUID,
+        validatedCandidate: AgentSessionLinkEndpointCandidate? = nil
+    ) {
         guard let chain = chains[sessionID], let host else { return }
         let endpoint = chain.endpoint
         // Resolved by exact incarnation, never by session UUID. A UUID lookup that demands a unique
         // match reports "ambiguous" the moment a second live incarnation of this UUID opens, which
         // would revoke this still-valid grant as `.targetIdentityDrift`; a lookup that tolerated
         // ambiguity would publish some other incarnation's state under this grant.
-        guard let candidate = host.agentSessionLinkCandidates()
-            .first(where: { $0.domainEndpoint == endpoint })
+        guard let candidate = validatedCandidate ?? host.agentSessionLinkCandidates()
+            .first(where: { $0.domainEndpoint == endpoint }),
+            candidate.domainEndpoint == endpoint
         else {
             // Identity drift: revoke rather than publish state for a different incarnation.
             removeChain(forTargetSession: sessionID, matching: endpoint)
@@ -5236,6 +5284,26 @@ final class AgentSessionLinkRuntimeBridge {
         return grant.capabilities.contains(.manage)
     }
 
+    /// Loads durable child metadata once for the batch, then publishes the resulting target
+    /// snapshots before a poll or wait reads the authority. One live-candidate map serves all rows.
+    func refreshLaneBoardCensus(for targets: [AuthorizedTarget]) async {
+        guard let host, !targets.isEmpty else { return }
+        await host.agentSessionLinkRefreshSubagentCensus(for: targets.map(\.candidate))
+        let candidatesByEndpoint = Dictionary(
+            host.agentSessionLinkCandidates().map { ($0.domainEndpoint, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        for target in targets {
+            publishTargetSnapshot(
+                forTargetSession: target.lease.target.sessionID,
+                validatedCandidate: candidatesByEndpoint[target.candidate.domainEndpoint]
+            )
+        }
+        for target in targets {
+            await chains[target.lease.target.sessionID]?.tail?.value
+        }
+    }
+
     func targetState(
         for lease: DomainAgentSessionLinkLease
     ) async -> DomainAgentSessionLinkTargetState? {
@@ -5340,6 +5408,13 @@ final class AgentSessionLinkRuntimeBridge {
         case workflowUnavailable(reference: String)
     }
 
+    enum StopOutcome: Equatable {
+        case receipt(DomainAgentSessionLinkStopReceipt)
+        case blocked(AgentSessionLinkSendFailure)
+        case indeterminate
+        case rejected(SendRejection)
+    }
+
     /// How the one-shot workflow for one delivery is supplied.
     private enum SendWorkflowInput {
         /// An immediate send: the caller's reference, resolved only after the ledger has answered.
@@ -5435,6 +5510,7 @@ final class AgentSessionLinkRuntimeBridge {
         messageDigest: String,
         workflow workflowInput: SendWorkflowInput,
         commitFence: SendCommitFence?,
+        startStopFence: AgentRunStartStopFence? = nil,
         delivery: DeliveryKind = .attributedSend
     ) async -> SendOutcome {
         guard let host else { return .rejected(.denied) }
@@ -5503,7 +5579,7 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
 
-        let request = AgentSessionLinkSendRequest(
+        var request = AgentSessionLinkSendRequest(
             linkID: target.lease.linkID,
             linkGeneration: target.lease.linkGeneration,
             // The exact granted incarnation, not its session UUID. The transaction crosses two awaits
@@ -5515,6 +5591,7 @@ final class AgentSessionLinkRuntimeBridge {
             workflow: workflow,
             framing: delivery == .managedSteer ? .management : .coordination
         )
+        request.startStopFence = startStopFence
         // Re-read at every fence the transaction crosses. It is deliberately pure endpoint/window
         // liveness and never consults the authority: after the commit fence, manual revocation is
         // intentionally allowed to lose, so link liveness must not gate the post-persistence recheck.
@@ -5689,6 +5766,83 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
+    // MARK: - Overseer Stop
+
+    func stop(target: AuthorizedTarget, idempotencyKey: String) async -> StopOutcome {
+        guard let host else { return .rejected(.denied) }
+        guard let observer = host.agentSessionLinkCandidates()
+            .first(where: { $0.domainEndpoint == target.lease.observer })
+        else {
+            await invalidate(endpoint: target.lease.observer, reason: .observerIdentityDrift)
+            return .rejected(.denied)
+        }
+        let reservation: DomainAgentSessionLinkSendReservation
+        switch await authority.beginStop(lease: target.lease, idempotencyKey: idempotencyKey) {
+        case let .reserved(value): reservation = value
+        case let .duplicate(receipt): return .receipt(receipt)
+        case .inProgress: return .rejected(.sendAlreadyInProgress)
+        case .indeterminate: return .indeterminate
+        case .conflict: return .rejected(.idempotencyConflict)
+        case .inFlightLimitReached: return .rejected(.deliveryLedgerFull)
+        case .retainedOutcomeLimitReached: return .rejected(.deliveryLedgerExhausted)
+        case let .rejected(error):
+            return .rejected(error == .runtimeShuttingDown ? .shuttingDown : .denied)
+        }
+        if Task.isCancelled {
+            await authority.abandonSend(reservation: reservation)
+            notePendingSendLedgerSettled(on: target.lease.reference)
+            return .blocked(.targetBusy)
+        }
+        let request = AgentSessionLinkStopRequest(
+            requestID: reservation.id,
+            linkID: target.lease.linkID,
+            linkGeneration: target.lease.linkGeneration,
+            observerEndpoint: target.lease.observer,
+            observerDisplayName: DomainAgentSessionLinkTextBudget.normalized(
+                observer.resolvedDisplayName,
+                maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
+            )
+        )
+        let targetEndpoint = target.lease.target
+        let liveness: AgentSessionLinkSendLivenessProbe = { [weak self] in
+            guard let self, let host = self.host else { return .unavailable }
+            return host.agentSessionLinkSendLiveness(
+                observer: request.observerEndpoint, target: targetEndpoint
+            )
+        }
+        let authority = authority
+        let outcome = await host.agentSessionLinkPerformStop(
+            to: target.candidate,
+            request: request,
+            liveness: liveness,
+            queueHasCommittedDrain: { [weak self] in
+                self?.hasCommittedInboundPendingSend(to: targetEndpoint) ?? true
+            },
+            withdrawInbound: { [weak self] in
+                self?.withdrawCancellableInboundPendingSends(to: targetEndpoint) ?? false
+            },
+            commitAuthorization: {
+                guard !Task.isCancelled else { return .unknownReservation }
+                return await AgentSessionLinkSendCommitOutcome(authority.commitSendAuthorization(
+                    reservation: reservation,
+                    linkGeneration: reservation.linkGeneration,
+                    requiresManagement: true
+                ))
+            }
+        )
+        switch outcome {
+        case let .settled(receipt):
+            await authority.completeStop(reservation: reservation, receipt: receipt)
+            publishTargetSnapshot(forTargetSession: targetEndpoint.sessionID)
+            notePendingSendLedgerSettled(on: target.lease.reference)
+            return .receipt(receipt)
+        case let .blocked(failure):
+            await authority.abandonSend(reservation: reservation)
+            notePendingSendLedgerSettled(on: target.lease.reference)
+            return .blocked(failure)
+        }
+    }
+
     // MARK: - One pending send per link generation
 
     /// What a queue admission or cancellation produced.
@@ -5827,11 +5981,16 @@ final class AgentSessionLinkRuntimeBridge {
         // Atomic on the main actor: the old entry stops existing and the new one starts in the same
         // synchronous step, so no drain can ever observe a slot that is momentarily empty or doubly
         // occupied. A drain already suspended on the old revision compares out at its next fence.
+        guard let startStopFence = host.agentSessionLinkStartStopFence(for: target.candidate) else {
+            return .send(.blocked(.endpointInvalidated))
+        }
         let entry = AgentSessionLinkPendingSend(
             revision: UUID(),
             reference: reference,
             observerEndpoint: target.lease.observer,
             targetSessionID: target.lease.target.sessionID,
+            targetEndpoint: target.lease.target,
+            startStopFence: startStopFence,
             message: message,
             idempotencyKey: idempotencyKey,
             requestDigest: digest,
@@ -5882,6 +6041,35 @@ final class AgentSessionLinkRuntimeBridge {
         // stops being current with it.
         pendingSendResultsByReference.removeValue(forKey: reference)
         return .result(.cancelled)
+    }
+
+    /// A committed inbound drain cannot be withdrawn and must win before Stop admission.
+    func hasCommittedInboundPendingSend(to targetEndpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        pendingSendsByReference.values.contains {
+            $0.addresses(targetEndpoint) && !$0.phase.isCancellable
+        }
+    }
+
+    /// Synchronous post-fence arbitration for one exact target incarnation.
+    /// A committed drain is past the withdrawal cutoff, so the caller must refuse Stop instead.
+    @discardableResult
+    func withdrawCancellableInboundPendingSends(
+        to targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        requiringNoCommittedDrain: Bool = true
+    ) -> Bool {
+        let matching = pendingSendsByReference.filter { $0.value.addresses(targetEndpoint) }
+        if requiringNoCommittedDrain, matching.values.contains(where: { !$0.phase.isCancellable }) {
+            return false
+        }
+        for (reference, entry) in matching where entry.phase.isCancellable {
+            clearPendingSend(
+                reference: reference,
+                revision: entry.revision,
+                idempotencyKey: entry.idempotencyKey,
+                retaining: .failed(.targetStopped)
+            )
+        }
+        return true
     }
 
     /// This link's observer-facing queue state.
@@ -5989,7 +6177,8 @@ final class AgentSessionLinkRuntimeBridge {
                 didCommit: { [weak self] in
                     self?.notePendingSendCommitted(reference: reference, revision: revision)
                 }
-            )
+            ),
+            startStopFence: entry.startStopFence
         )
         settlePendingSend(
             reference: reference,
@@ -6089,8 +6278,8 @@ final class AgentSessionLinkRuntimeBridge {
             case .notSupported, .noProviderSession:
                 assertionFailure("A queued send cannot produce a compaction-only outcome.")
                 clear(.failed(failure))
-            case .managementRevoked, .targetAwaitingInteraction, .targetBusy, .steerUnavailable,
-                 .steerNotAccepted, .steerUnconfirmed:
+            case .managementRevoked, .targetAwaitingInteraction, .targetBusy, .targetStopped,
+                 .steerUnavailable, .steerNotAccepted, .steerUnconfirmed:
                 // Steer-only outcomes: a queued `send` never produces them. Settle rather than loop.
                 clear(.failed(failure))
             case .endpointInvalidated, .linkRevoked, .shuttingDown:

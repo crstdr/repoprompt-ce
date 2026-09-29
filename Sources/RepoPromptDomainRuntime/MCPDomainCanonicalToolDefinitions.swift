@@ -1941,6 +1941,68 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Final additive projection only; historical migration anchors remain frozen.
+    private enum AgentSessionLinkStopMigration {
+        static let stopBullet = "- `stop`: [manage] cancel the target's current run — equivalent to its user pressing Stop. Requires a new `idempotency_key`. Dismisses pending prompts and withdraws queued inbound sends; never deletes the session or ends oversight."
+
+        static let description: String = {
+            let previous = AgentSessionLinkTokenEfficiencyMigration.description
+            precondition(previous.components(separatedBy: " | respond | steer\n").count == 2)
+            precondition(previous.contains("Only a current exact grant with `manage` permits pending-prompt disclosure, `respond`, or `steer`"))
+            precondition(previous.contains("each new send or steer"))
+            return previous
+                .replacingOccurrences(
+                    of: "Only a current exact grant with `manage` permits pending-prompt disclosure, `respond`, or `steer`",
+                    with: "Only a current exact grant with `manage` permits pending-prompt disclosure, `respond`, `steer`, or `stop`"
+                )
+                .replacingOccurrences(of: " | respond | steer\n", with: " | respond | steer | stop\n")
+                .replacingOccurrences(
+                    of: "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering.",
+                    with: "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering. ACP live steering is supported.\n\(stopBullet)"
+                )
+                .replacingOccurrences(of: "each new send or steer", with: "each new send, steer, or stop")
+        }()
+
+        static let inputSchema: Value = {
+            guard case var .object(schema) = AgentSessionLinkTokenEfficiencyMigration.inputSchema,
+                  case var .object(properties)? = schema["properties"],
+                  case var .object(op)? = properties["op"],
+                  case var .array(operations)? = op["enum"],
+                  case var .object(sessionID)? = properties["session_id"],
+                  case var .object(key)? = properties["idempotency_key"],
+                  case let .string(summary)? = schema["description"]
+            else { preconditionFailure("agent_session_link stop migration requires prior final schema") }
+            operations.append(.string("stop"))
+            op["enum"] = .array(operations)
+            properties["op"] = .object(op)
+            sessionID["description"] = .string("[poll, wait, read, send, cancel_pending_send, compact, snooze_auto_wake, respond, steer, stop] Target UUID; exclusive with session_ids.")
+            properties["session_id"] = .object(sessionID)
+            key["description"] = .string("[send, cancel_pending_send, steer, compact, stop] New per operation; reuse only for the same request. Max 200 UTF-8 bytes.")
+            properties["idempotency_key"] = .object(key)
+            schema["properties"] = .object(properties)
+            schema["description"] = .string(summary.replacingOccurrences(
+                of: "steer: session_id, message, idempotency_key",
+                with: "steer: session_id, message, idempotency_key\nstop: session_id, idempotency_key"
+            ))
+            return .object(schema)
+        }()
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description && definition.inputSchema == inputSchema
+        }
+
+        static func apply(_ previous: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkTokenEfficiencyMigration.isCurrent(previous))
+            return MCPDomainToolDefinition(
+                name: previous.name,
+                description: description,
+                inputSchema: inputSchema,
+                annotations: previous.annotations,
+                isEnabledByDefault: previous.isEnabledByDefault
+            )
+        }
+    }
+
     private enum AgentSessionLinkAutonomyContractState: String {
         case historicalIncomingOnly
         case historicalAutomatic
@@ -2048,12 +2110,13 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
+        if AgentSessionLinkStopMigration.isCurrent(definition) { return definition }
         if AgentSessionLinkTokenEfficiencyMigration.isCurrent(definition) {
-            return definition
+            return AgentSessionLinkStopMigration.apply(definition)
         }
-        return applyAgentSessionLinkTokenEfficiency(
+        return AgentSessionLinkStopMigration.apply(applyAgentSessionLinkTokenEfficiency(
             canonicalizeAgentSessionLinkBeforeTokenEfficiency(definition)
-        )
+        ))
     }
 
     private static func canonicalizeAgentSessionLinkBeforeTokenEfficiency(

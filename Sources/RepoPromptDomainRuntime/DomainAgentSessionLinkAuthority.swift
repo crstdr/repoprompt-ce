@@ -152,15 +152,22 @@ package actor DomainAgentSessionLinkAuthority {
         let idempotencyKey: String
     }
 
+    private enum RetainedReceipt {
+        case send(DomainAgentSessionLinkSendReceipt)
+        case stop(DomainAgentSessionLinkStopReceipt)
+    }
+
     private struct SendLedgerEntry {
         let reservation: DomainAgentSessionLinkSendReservation
         var isCommitted: Bool
-        var receipt: DomainAgentSessionLinkSendReceipt?
+        var receipt: RetainedReceipt?
         /// Terminal tombstone: the delivery's durable outcome could not be determined, so this key is
         /// permanently spent and has no receipt to replay.
         var isIndeterminate: Bool = false
 
-        var isSettled: Bool { receipt != nil || isIndeterminate }
+        var isSettled: Bool {
+            receipt != nil || isIndeterminate
+        }
     }
 
     // MARK: - State
@@ -223,7 +230,7 @@ package actor DomainAgentSessionLinkAuthority {
             observedTargetCount: targets.count,
             parkedWaiterCount: waiters.count,
             readCursorCount: links.values.reduce(0) { $0 + $1.readCursors.count },
-            inFlightSendCount: sendLedger.values.filter { !$0.isSettled }.count,
+            inFlightSendCount: sendLedger.values.count(where: { !$0.isSettled }),
             retainedSendOutcomeCount: sendLedger.values.filter(\.isSettled).count
         )
     }
@@ -610,7 +617,7 @@ package actor DomainAgentSessionLinkAuthority {
             inbound: inbound,
             outboundTargetEndpoints: outboundTargetEndpoints,
             inboundObserverEndpoints: inboundObserverEndpoints,
-            activeOutboundObserverEndpoints: Set(links.values.map { $0.grant.observer }),
+            activeOutboundObserverEndpoints: Set(links.values.map(\.grant.observer)),
             notices: recentRevocationNotices[endpoint] ?? []
         )
     }
@@ -762,7 +769,7 @@ package actor DomainAgentSessionLinkAuthority {
 
         guard !liveRecords.isEmpty else { return .denied }
         guard liveRecords.count == 1 else {
-            let allCandidateIDs = Set(liveRecords.map { $0.grant.observer.sessionID })
+            let allCandidateIDs = Set(liveRecords.map(\.grant.observer.sessionID))
                 .sorted { $0.uuidString < $1.uuidString }
             let candidateIDs = Array(allCandidateIDs.prefix(Self.requestAttentionObserverCandidateLimit))
             return .ambiguous(
@@ -927,6 +934,7 @@ package actor DomainAgentSessionLinkAuthority {
             displayName: incoming.displayName,
             providerDisplayName: incoming.providerDisplayName,
             status: incoming.status,
+            board: incoming.board,
             idleForSend: incoming.idleForSend,
             idleSince: idleSince,
             waitingOn: incoming.waitingOn,
@@ -1346,14 +1354,17 @@ package actor DomainAgentSessionLinkAuthority {
             guard existing.reservation.messageDigest == messageDigest else { return .conflict }
             // Checked before the receipt so a tombstone is never mistaken for an undelivered retry.
             if existing.isIndeterminate { return .indeterminate }
-            if let receipt = existing.receipt { return .duplicate(receipt.markedDuplicate()) }
+            if let receipt = existing.receipt {
+                guard case let .send(sendReceipt) = receipt else { return .conflict }
+                return .duplicate(sendReceipt.markedDuplicate())
+            }
             return .inProgress
         }
 
         // Reported separately: saturation clears on its own as sends settle, exhaustion does not clear
         // until a link generation is revoked or the runtime restarts. Collapsing them would tell a
         // caller to retry a rejection that can only ever be re-rejected.
-        let inFlight = sendLedger.values.filter { !$0.isSettled }.count
+        let inFlight = sendLedger.values.count(where: { !$0.isSettled })
         guard inFlight < Self.inFlightSendLimit else { return .inFlightLimitReached }
         let retained = sendLedger.values.filter(\.isSettled).count
         guard retained < Self.retainedSendOutcomeLimit else { return .retainedOutcomeLimitReached }
@@ -1371,6 +1382,67 @@ package actor DomainAgentSessionLinkAuthority {
         sendLedgerOrder.append(key)
         return .reserved(reservation)
     }
+
+    /// Reserves a Manage-gated stop in the same link-generation ledger used by send and steer.
+    package func beginStop(
+        lease: DomainAgentSessionLinkLease,
+        idempotencyKey: String
+    ) -> DomainAgentSessionLinkStopReservationDisposition {
+        guard lease.capability == .manage else { return .rejected(.capabilityDenied) }
+        switch beginSend(
+            lease: lease,
+            idempotencyKey: idempotencyKey,
+            messageDigest: Self.stopMessageDigest
+        ) {
+        case let .reserved(reservation): return .reserved(reservation)
+        case .duplicate: return .conflict
+        case .inProgress: return .inProgress
+        case .indeterminate: return .indeterminate
+        case .conflict:
+            let key = SendLedgerKey(
+                linkID: lease.linkID,
+                linkGeneration: lease.linkGeneration,
+                idempotencyKey: idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            if let entry = sendLedger[key],
+               entry.reservation.messageDigest == Self.stopMessageDigest,
+               case let .stop(receipt)? = entry.receipt
+            {
+                return .duplicate(receipt.markedDuplicate())
+            }
+            return .conflict
+        case .inFlightLimitReached: return .inFlightLimitReached
+        case .retainedOutcomeLimitReached: return .retainedOutcomeLimitReached
+        case let .rejected(error): return .rejected(error)
+        }
+    }
+
+    /// Retains a stop answer only for the original reservation and exact authorized target.
+    package func completeStop(
+        reservation: DomainAgentSessionLinkSendReservation,
+        receipt: DomainAgentSessionLinkStopReceipt
+    ) {
+        let key = ledgerKey(for: reservation)
+        guard var entry = sendLedger[key],
+              entry.reservation == reservation,
+              reservation.messageDigest == Self.stopMessageDigest,
+              receipt.requestID == reservation.id,
+              receipt.targetSessionID == reservation.targetSessionID,
+              entry.isCommitted,
+              !entry.isSettled
+        else { return }
+        entry.receipt = .stop(receipt)
+        guard links[reservation.linkID]?.grant.generation == reservation.linkGeneration else {
+            sendLedger.removeValue(forKey: key)
+            sendLedgerOrder.removeAll { $0 == key }
+            return
+        }
+        sendLedger[key] = entry
+    }
+
+    private static let stopMessageDigest = DomainContentDigest.sha256(
+        Data("agent_session_link.stop/v1".utf8)
+    )
 
     /// Non-mutating ledger lookup for one exact lease, key, and digest.
     ///
@@ -1405,7 +1477,10 @@ package actor DomainAgentSessionLinkAuthority {
         // Checked before the receipt for the same reason `beginSend` does it: a tombstone must never
         // be mistaken for an undelivered retry.
         if existing.isIndeterminate { return .indeterminate }
-        if let receipt = existing.receipt { return .duplicate(receipt.markedDuplicate()) }
+        if let receipt = existing.receipt {
+            guard case let .send(sendReceipt) = receipt else { return .conflict }
+            return .duplicate(sendReceipt.markedDuplicate())
+        }
         return .inProgress
     }
 
@@ -1468,8 +1543,10 @@ package actor DomainAgentSessionLinkAuthority {
         receipt: DomainAgentSessionLinkSendReceipt
     ) {
         let key = ledgerKey(for: reservation)
-        guard var entry = sendLedger[key], entry.reservation.id == reservation.id else { return }
-        entry.receipt = receipt
+        guard var entry = sendLedger[key], entry.reservation.id == reservation.id,
+              !entry.isSettled, entry.reservation.messageDigest != Self.stopMessageDigest
+        else { return }
+        entry.receipt = .send(receipt)
         guard links[reservation.linkID]?.grant.generation == reservation.linkGeneration else {
             sendLedger.removeValue(forKey: key)
             sendLedgerOrder.removeAll { $0 == key }
@@ -1521,7 +1598,10 @@ package actor DomainAgentSessionLinkAuthority {
     package func storedSendReceipt(
         reservation: DomainAgentSessionLinkSendReservation
     ) -> DomainAgentSessionLinkSendReceipt? {
-        sendLedger[ledgerKey(for: reservation)]?.receipt
+        guard case let .send(receipt)? = sendLedger[ledgerKey(for: reservation)]?.receipt else {
+            return nil
+        }
+        return receipt
     }
 
     private func ledgerKey(for reservation: DomainAgentSessionLinkSendReservation) -> SendLedgerKey {
