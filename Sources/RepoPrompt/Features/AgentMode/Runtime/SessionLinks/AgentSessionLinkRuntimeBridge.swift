@@ -5773,12 +5773,10 @@ final class AgentSessionLinkRuntimeBridge {
             framing: delivery == .managedSteer ? .management : .coordination
         )
         request.startStopFence = startStopFence
-        // Re-read at every fence the transaction crosses. It is deliberately pure endpoint/window
-        // liveness and never consults the authority: after the commit fence, manual revocation is
-        // intentionally allowed to lose, so link liveness must not gate the post-persistence recheck.
-        let liveness: AgentSessionLinkSendLivenessProbe = { [weak self] in
-            guard let self, let host = self.host else { return .unavailable }
-            return host.agentSessionLinkSendLiveness(
+        // Keep the host that supplied this exact candidate through the send transaction. The
+        // host itself still fences window teardown and both endpoint incarnations at every probe.
+        let liveness: AgentSessionLinkSendLivenessProbe = {
+            host.agentSessionLinkSendLiveness(
                 observer: request.observerEndpoint,
                 target: target.lease.target
             )
@@ -6163,7 +6161,7 @@ final class AgentSessionLinkRuntimeBridge {
         // synchronous step, so no drain can ever observe a slot that is momentarily empty or doubly
         // occupied. A drain already suspended on the old revision compares out at its next fence.
         guard let currentStopFence = host.agentSessionLinkStartStopFence(for: target.candidate) else {
-            return .send(.blocked(.endpointInvalidated))
+            return .send(.blocked(.endpointStopFence))
         }
         let startStopFence = startStopFence ?? currentStopFence
         guard startStopFence == currentStopFence else { return .send(.blocked(.targetStopped)) }
@@ -6467,7 +6465,15 @@ final class AgentSessionLinkRuntimeBridge {
                 // terminal in release so no background loop can form around one.
                 assertionFailure("A queued send cannot produce the compaction-only outcome \(failure).")
                 clear(.failed(failure))
-            case .endpointInvalidated, .linkRevoked, .shuttingDown:
+            case .endpointClaim:
+                // The local claim can disappear without losing the grant or either endpoint.
+                // Keep its terminal refusal visible in poll instead of dropping the diagnosis.
+                clear(.failed(failure))
+            case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
+                 .endpointTarget, .endpointWindow, .endpointWorkspace,
+                 .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
+                 .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
+                 .endpointPostWindow, .endpointPostReadiness, .linkRevoked, .shuttingDown:
                 // The link, an endpoint, or the process is gone, so there is no surviving `poll` a
                 // retained result could ever be read through. This also covers the cutoff refusal:
                 // the entry was already replaced or cancelled, and the guard below drops the write.
@@ -6889,18 +6895,21 @@ final class AgentSessionLinkRuntimeBridge {
         func receipt(
             _ linked: Bool,
             _ reason: AgentSessionLaneCreateReceipt.Reason?,
-            _ firstTask: AgentSessionLaneCreateReceipt.FirstTask = .none
+            _ firstTask: AgentSessionLaneCreateReceipt.FirstTask = .none,
+            _ firstTaskReason: String? = nil
         ) async -> AgentSessionLaneCreateReceipt {
             let candidates = host.agentSessionLinkCandidates()
             let matchingNames = candidates.filter { $0.sessionID == sessionID }
             let count = await linkedCreatedLaneIDs(creatorSessionID: observerEndpoint.sessionID).ids.count
-            return AgentSessionLaneCreateReceipt(
+            var value = AgentSessionLaneCreateReceipt(
                 result: saved && linked ? .created : .creationIncomplete,
                 sessionID: sessionID,
                 sessionName: matchingNames.count == 1 ? matchingNames[0].resolvedDisplayName : nil,
                 linked: linked,
                 reason: reason, firstTask: firstTask, laneCount: count
             )
+            value.firstTaskReason = firstTaskReason
+            return value
         }
         guard saved else { return await receipt(false, .saveFailed) }
         guard !isFrozenForTermination, !Task.isCancelled else {
@@ -6941,35 +6950,43 @@ final class AgentSessionLinkRuntimeBridge {
         case .failed, .rejected: return await receipt(false, isFrozenForTermination ? .shuttingDown : .addFailed)
         }
         guard let message = request.message else { return await receipt(true, nil) }
-        guard let firstTaskStopFence else { return await receipt(true, nil, .failed) }
-        guard !isFrozenForTermination,
-              case let .success(target) = await authorizeTarget(
-                  operation: .monitorSend,
-                  observerEndpoint: observerEndpoint,
-                  targetSessionID: sessionID
-              ), target.candidate.domainEndpoint == laneEndpoint
-        else { return await receipt(true, nil, .failed) }
-        let firstTask: AgentSessionLaneCreateReceipt.FirstTask = switch await send(
+        guard let firstTaskStopFence else { return await receipt(true, nil, .failed, "stop_fence") }
+        guard !isFrozenForTermination else { return await receipt(true, nil, .failed, "shutdown") }
+        guard case let .success(target) = await authorizeTarget(
+            operation: .monitorSend,
+            observerEndpoint: observerEndpoint,
+            targetSessionID: sessionID
+        ) else { return await receipt(true, nil, .failed, "authorize") }
+        guard !isFrozenForTermination else { return await receipt(true, nil, .failed, "shutdown") }
+        guard target.candidate.domainEndpoint == laneEndpoint else {
+            return await receipt(true, nil, .failed, "endpoint")
+        }
+        let (firstTask, firstTaskReason): (AgentSessionLaneCreateReceipt.FirstTask, String?) = switch await send(
             target: target,
             message: message,
             idempotencyKey: request.idempotencyKey,
             workflowReference: request.workflowReference,
             startStopFence: firstTaskStopFence
         ) {
-        case .receipt: .delivered
+        case .receipt: (.delivered, nil)
         case .blocked(.targetNotIdle), .blocked(.targetLoading):
             switch await queueSend(
                 target: target, message: message, idempotencyKey: request.idempotencyKey,
                 workflowReference: request.workflowReference, replacePending: false,
                 startStopFence: firstTaskStopFence
             ) {
-            case .queued: .queued
-            case .send(.receipt): .delivered
-            case .result, .send: .failed
+            case .queued: (.queued, nil)
+            case .send(.receipt): (.delivered, nil)
+            case let .send(.blocked(failure)): (.failed, failure.subreason ?? failure.wireResult)
+            case let .send(.rejected(rejection)): (.failed, rejection.rawValue)
+            case .send(.workflowUnavailable): (.failed, "workflow")
+            case let .result(result): (.failed, result.rawValue)
             }
-        case .blocked, .rejected, .workflowUnavailable: .failed
+        case let .blocked(failure): (.failed, failure.subreason ?? failure.wireResult)
+        case let .rejected(rejection): (.failed, rejection.rawValue)
+        case .workflowUnavailable: (.failed, "workflow")
         }
-        return await receipt(true, nil, firstTask)
+        return await receipt(true, nil, firstTask, firstTaskReason)
     }
 
     func retireLane(
@@ -7008,13 +7025,13 @@ final class AgentSessionLinkRuntimeBridge {
             await test_afterRetireAuthorizationBeforeFence?()
         #endif
         guard host.agentSessionLinkBindingCount(sessionID: targetSessionID) == 1 else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUse)
+            return .notRetired(sessionID: targetSessionID, reason: .laneInUseBindings)
         }
         guard !host.agentSessionLinkHasChildSessions(parentSessionID: targetSessionID) else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUse)
+            return .notRetired(sessionID: targetSessionID, reason: .laneInUseChildren)
         }
         guard await !(host.agentSessionLinkHasPersistedChildSessions(parentSessionID: targetSessionID))
-        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUse) }
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUseDiskChild) }
         // Install the fence before the relationship snapshot. New Adds in either direction now
         // fail at preflight, reservation, activation and caller completion.
         guard !isFrozenForTermination else {
@@ -7026,12 +7043,21 @@ final class AgentSessionLinkRuntimeBridge {
         retiringTargets.insert(endpoint)
         defer { retiringTargets.remove(endpoint) }
         let relationships = await authority.relationshipInventories(forSessionID: targetSessionID)
-        guard relationships.inbound.items.count == 1,
-              relationships.inbound.items[0].linkID == target.lease.linkID,
-              relationships.inbound.items[0].generation == target.lease.linkGeneration,
-              relationships.outbound.items.isEmpty,
-              pendingSendsByReference[target.lease.reference] == nil
-        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUse) }
+        guard relationships.inbound.items.count == 1 else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundCount)
+        }
+        guard relationships.inbound.items[0].linkID == target.lease.linkID else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundLink)
+        }
+        guard relationships.inbound.items[0].generation == target.lease.linkGeneration else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundGeneration)
+        }
+        guard relationships.outbound.items.isEmpty else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneInUseOutbound)
+        }
+        guard pendingSendsByReference[target.lease.reference] == nil else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneInUsePending)
+        }
         #if DEBUG
             await test_afterRetireRelationshipPrecheck?()
         #endif
