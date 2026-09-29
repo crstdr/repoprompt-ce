@@ -111,11 +111,39 @@ enum AgentSidebarRowTap {
 
 // MARK: - Agent Session Row
 
+enum AgentSessionCreatorBadgeCopy {
+    static let iconName = "rectangle.connected.to.line.below"
+
+    static func tooltip(for creatorLabel: String) -> String {
+        "Created by \(creatorLabel)"
+    }
+}
+
+private struct AgentSessionCreatorBadge: View {
+    let creatorLabel: String
+    let onOpen: () -> Void
+
+    var body: some View {
+        let tooltip = AgentSessionCreatorBadgeCopy.tooltip(for: creatorLabel)
+        Button(action: onOpen) {
+            Image(systemName: AgentSessionCreatorBadgeCopy.iconName)
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverTooltip(tooltip)
+        .accessibilityLabel(tooltip)
+    }
+}
+
 struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
     var isOverseer = false
     var createdByLabel: String?
+    var onOpenCreator: (() -> Void)?
     let isPinned: Bool
     let isMCPControlled: Bool
     let runState: AgentSessionRunState
@@ -767,11 +795,9 @@ struct AgentSessionRow: View {
                     }
 
                     if let creatorLabel = createdByLabel ?? sidebarOversightMenu?.createdByLabel {
-                        Text("Created by \(creatorLabel)")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .accessibilityLabel("Created by \(creatorLabel)")
+                        AgentSessionCreatorBadge(creatorLabel: creatorLabel) {
+                            onOpenCreator?()
+                        }
                     }
 
                     if isPinned {
@@ -1406,6 +1432,7 @@ struct AgentSessionRow: View {
 struct AgentStashedSessionRow: View {
     let stashed: StashedTab
     var createdByLabel: String?
+    var onOpenCreator: (() -> Void)?
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
@@ -1532,11 +1559,9 @@ struct AgentStashedSessionRow: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                     if let createdByLabel {
-                        Text("Created by \(createdByLabel)")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .accessibilityLabel("Created by \(createdByLabel)")
+                        AgentSessionCreatorBadge(creatorLabel: createdByLabel) {
+                            onOpenCreator?()
+                        }
                     }
                     if stashed.tab.isPinned {
                         Image(systemName: "pin.fill")
