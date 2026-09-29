@@ -41,6 +41,7 @@ final class AgentSessionLinkStopAuthorityTests: XCTestCase {
             displayName: "target",
             providerDisplayName: "test",
             status: .idle,
+            board: .empty,
             idleForSend: true,
             pendingInteractionKind: nil,
             latestVisibleAssistantPreview: nil,

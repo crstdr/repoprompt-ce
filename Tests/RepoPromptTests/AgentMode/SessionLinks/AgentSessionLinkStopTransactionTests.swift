@@ -142,19 +142,21 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
 
     func testManagedStopGateSuppressesPublishedSendReadiness() throws {
         let fixture = try makeFixture()
-        XCTAssertTrue(AgentModeViewModel.isIdleForSend(
-            session: fixture.session, candidate: fixture.candidate, status: .idle
-        ))
+        func snapshot() -> DomainAgentSessionObservationSnapshot {
+            AgentModeViewModel.observationSnapshot(
+                for: fixture.session, candidate: fixture.candidate, subagentCounts: (running: 0, finished: 0)
+            )
+        }
+        XCTAssertTrue(snapshot().idleForSend)
+        XCTAssertTrue(snapshot().board.sendBlockers.isEmpty)
         let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
         let stopID = UUID()
         XCTAssertTrue(fixture.session.stopState.claimManagedStop(id: stopID, binding: binding))
-        XCTAssertFalse(AgentModeViewModel.isIdleForSend(
-            session: fixture.session, candidate: fixture.candidate, status: .idle
-        ), "poll/wait must not report sendable while Stop owns the target")
+        XCTAssertFalse(snapshot().idleForSend, "poll/wait must not report sendable while Stop owns the target")
+        XCTAssertEqual(snapshot().board.sendBlockers, ["stop_in_progress"])
         XCTAssertTrue(fixture.session.stopState.releaseManagedStop(id: stopID, binding: binding))
-        XCTAssertTrue(AgentModeViewModel.isIdleForSend(
-            session: fixture.session, candidate: fixture.candidate, status: .idle
-        ))
+        XCTAssertTrue(snapshot().idleForSend)
+        XCTAssertTrue(snapshot().board.sendBlockers.isEmpty)
     }
 
     func testPendingStartWithdrawsWithoutSyntheticTerminalRun() async throws {

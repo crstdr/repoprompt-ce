@@ -52,6 +52,7 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
                 displayName: "Target",
                 providerDisplayName: "Codex CLI",
                 status: .running,
+                board: .empty,
                 idleForSend: false,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,
