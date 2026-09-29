@@ -11,10 +11,14 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         let selection: AgentSessionLanePolicy.RoleSelection
     }
 
-    private func withFixture(_ body: (Fixture) async throws -> Void) async throws {
+    private func withFixture(ephemeral: Bool = true, _ body: (Fixture) async throws -> Void) async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("lane-first-save-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let previousStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
+        if !ephemeral {
+            UserDefaults.standard.set(root.appendingPathComponent("storage").path, forKey: "GlobalCustomStorageURL")
+        }
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
@@ -24,13 +28,21 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
+            if !ephemeral {
+                await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+                if let previousStoragePath {
+                    UserDefaults.standard.set(previousStoragePath, forKey: "GlobalCustomStorageURL")
+                } else {
+                    UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+                }
+            }
             try? FileManager.default.removeItem(at: root)
         }
         do {
             await window.workspaceManager.awaitInitialized()
             let workspace = window.workspaceManager.createWorkspace(
                 name: "Lane first save \(UUID().uuidString.prefix(8))",
-                repoPaths: [root.path], ephemeral: true
+                repoPaths: [root.path], ephemeral: ephemeral
             )
             await window.workspaceManager.switchWorkspace(
                 to: workspace, saveState: false, reason: "laneFirstSaveTest"
@@ -46,6 +58,26 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             throw error
         }
         await cleanup()
+    }
+
+    private func withSecondRegisteredWindow(_ body: (WindowState) async throws -> Void) async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        do {
+            await window.workspaceManager.awaitInitialized()
+            try await body(window)
+        } catch {
+            window.beginClose()
+            await window.tearDown()
+            WindowStatesManager.shared.unregisterWindowState(window)
+            throw error
+        }
+        window.beginClose()
+        await window.tearDown()
+        WindowStatesManager.shared.unregisterWindowState(window)
     }
 
     func testDrivenFirstSaveWaitsForPreviouslyEnteredSaveAndPersistsProvenance() async throws {
@@ -210,6 +242,139 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
             )
             XCTAssertEqual(capturedLabel, AgentMonitorSessionIDFormatter.short(creatorID))
+        }
+    }
+
+    func testRetireBindingCountIgnoresInactiveWindowCopyButKeepsActivePeer() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let outcome = try await fixture.window.agentModeViewModel.mcpCreateOversightLane(
+                creatorSessionID: UUID(), sessionName: "Retirable lane",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
+            guard case let .created(sessionID, tabID, _) = outcome else {
+                return XCTFail("fresh lane did not establish its binding")
+            }
+            let viewModel = fixture.window.agentModeViewModel
+            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            let uniquelyBound = { WindowStatesManager.shared.agentSessionLinkBindingCount(sessionID: sessionID) == 1 }
+            XCTAssertTrue(uniquelyBound())
+            try await withSecondRegisteredWindow { second in
+                let originalWorkspace = try XCTUnwrap(second.workspaceManager.activeWorkspace)
+                let copy = try XCTUnwrap(second.workspaceManager.workspace(withID: fixture.workspaceID))
+                XCTAssertNotEqual(second.workspaceManager.activeWorkspaceID, fixture.workspaceID)
+                XCTAssertEqual(
+                    WindowStatesManager.shared.agentSessionLinkBindingCount(sessionID: sessionID), 1,
+                    "an inactive copy of the same workspace/tab is not a second binding"
+                )
+                await second.workspaceManager.switchWorkspace(
+                    to: copy, saveState: false, reason: "retireBindingCountTest"
+                )
+                XCTAssertEqual(
+                    WindowStatesManager.shared.agentSessionLinkBindingCount(sessionID: sessionID), 2,
+                    "an active peer window must still block retirement"
+                )
+                let blocked = await WindowStatesManager.shared.agentSessionLinkRetireLane(
+                    endpoint: endpoint, commit: false, isStillRetirable: uniquelyBound
+                )
+                XCTAssertFalse(blocked)
+                await second.workspaceManager.switchWorkspace(
+                    to: originalWorkspace, saveState: false, reason: "retireBindingCountTest"
+                )
+                XCTAssertTrue(uniquelyBound())
+                let claim = try XCTUnwrap(WindowStatesManager.shared.agentSessionLinkClaimLaneRetirement(endpoint: endpoint))
+                let retired = await WindowStatesManager.shared.agentSessionLinkRetireLane(
+                    endpoint: endpoint, commit: true, isStillRetirable: uniquelyBound
+                )
+                WindowStatesManager.shared.agentSessionLinkReleaseLaneRetirement(endpoint: endpoint, claimID: claim)
+                XCTAssertTrue(retired)
+                XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains(where: {
+                    $0.tab.id == tabID
+                }) == true)
+                XCTAssertFalse(second.workspaceManager.workspace(withID: fixture.workspaceID)?.composeTabs.contains(where: {
+                    $0.id == tabID
+                }) == true, "retirement must reconcile the inactive peer before activation")
+                let reopened = await second.workspaceManager.switchWorkspace(
+                    to: copy, saveState: false, reason: "retireBindingCountTest"
+                )
+                XCTAssertEqual(reopened, .switched)
+                XCTAssertEqual(second.workspaceManager.activeWorkspaceID, fixture.workspaceID)
+                XCTAssertFalse(second.workspaceManager.activeWorkspace?.composeTabs.contains(where: {
+                    $0.id == tabID
+                }) == true, "activating a stale catalog copy must reload the retired binding")
+            }
+        }
+    }
+
+    func testRetirementClaimFencesPendingAndNewWorkspaceActivations() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let outcome = try await fixture.window.agentModeViewModel.mcpCreateOversightLane(
+                creatorSessionID: UUID(), sessionName: "Activation-fenced lane",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
+            guard case let .created(_, tabID, _) = outcome else {
+                return XCTFail("fresh lane did not establish its binding")
+            }
+            let endpoint = try XCTUnwrap(fixture.window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            try await withSecondRegisteredWindow { second in
+                let originalWorkspace = try XCTUnwrap(second.workspaceManager.activeWorkspace)
+                let copy = try XCTUnwrap(second.workspaceManager.workspace(withID: fixture.workspaceID))
+                let activationLoaded = expectation(description: "peer loaded workspace before publication")
+                var releaseActivation: CheckedContinuation<Void, Never>?
+                second.workspaceManager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting { id in
+                    guard id == fixture.workspaceID else { return }
+                    await withCheckedContinuation { continuation in
+                        releaseActivation = continuation
+                        activationLoaded.fulfill()
+                    }
+                }
+                let switching = Task {
+                    await second.workspaceManager.switchWorkspace(
+                        to: copy, saveState: false, reason: "retirementActivationFenceTest"
+                    )
+                }
+                await fulfillment(of: [activationLoaded], timeout: 3)
+                XCTAssertNil(WindowStatesManager.shared.agentSessionLinkClaimLaneRetirement(endpoint: endpoint))
+                releaseActivation?.resume()
+                let firstSwitch = await switching.value
+                XCTAssertEqual(firstSwitch, .switched)
+                second.workspaceManager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting(nil)
+                XCTAssertEqual(WindowStatesManager.shared.agentSessionLinkBindingCount(sessionID: endpoint.sessionID), 2)
+
+                let switchedAway = await second.workspaceManager.switchWorkspace(
+                    to: originalWorkspace, saveState: false, reason: "retirementActivationFenceTest"
+                )
+                XCTAssertEqual(switchedAway, .switched)
+                let claim = try XCTUnwrap(WindowStatesManager.shared.agentSessionLinkClaimLaneRetirement(endpoint: endpoint))
+                let blocked = await second.workspaceManager.switchWorkspace(
+                    to: copy, saveState: false, reason: "retirementActivationFenceTest"
+                )
+                XCTAssertFalse(blocked.didSwitch)
+                WindowStatesManager.shared.agentSessionLinkReleaseLaneRetirement(endpoint: endpoint, claimID: claim)
+                let switchedAfterRelease = await second.workspaceManager.switchWorkspace(
+                    to: copy, saveState: false, reason: "retirementActivationFenceTest"
+                )
+                XCTAssertEqual(switchedAfterRelease, .switched)
+            }
+        }
+    }
+
+    func testRetireBindingCountKeepsEphemeralInactiveWindowCopy() async throws {
+        try await withFixture { fixture in
+            let outcome = try await fixture.window.agentModeViewModel.mcpCreateOversightLane(
+                creatorSessionID: UUID(), sessionName: "Ephemeral lane",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
+            guard case let .created(sessionID, _, _) = outcome else {
+                return XCTFail("fresh lane did not establish its binding")
+            }
+            try await withSecondRegisteredWindow { second in
+                let copy = try XCTUnwrap(fixture.window.workspaceManager.workspace(withID: fixture.workspaceID))
+                second.workspaceManager.workspaces.append(copy)
+                XCTAssertEqual(
+                    WindowStatesManager.shared.agentSessionLinkBindingCount(sessionID: sessionID), 2,
+                    "an ephemeral copy can reopen without a canonical reload and must block retirement"
+                )
+            }
         }
     }
 

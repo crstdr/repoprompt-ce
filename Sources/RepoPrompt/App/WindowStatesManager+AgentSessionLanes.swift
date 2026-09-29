@@ -2,6 +2,11 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
+private struct AgentSessionLaneBindingLocation: Hashable {
+    let workspaceID: UUID
+    let tabID: UUID
+}
+
 extension WindowStatesManager {
     func agentSessionLinkWasCreatedBy(sessionID: UUID, creatorSessionID: UUID) -> Bool {
         guard !isTerminating else { return false }
@@ -41,13 +46,51 @@ extension WindowStatesManager {
 
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int {
         guard !isTerminating else { return 0 }
-        return allWindows.filter { !$0.isClosing }.reduce(0) { count, window in
-            count + window.workspaceManager.workspaces.reduce(0) { workspaceCount, workspace in
-                workspaceCount + workspace.composeTabs.count(where: {
-                    $0.activeAgentSessionID == sessionID
-                })
+        var locations: Set<AgentSessionLaneBindingLocation> = []
+        var projectionOwners: [AgentSessionLaneBindingLocation: Set<Int>] = [:]
+        var activeOwners: [AgentSessionLaneBindingLocation: Set<Int>] = [:]
+        var ephemeralLocations: Set<AgentSessionLaneBindingLocation> = []
+        var duplicateWithinWindow = false
+        for window in allWindows where !window.isClosing {
+            var seenInWindow: Set<AgentSessionLaneBindingLocation> = []
+            for workspace in window.workspaceManager.workspaces {
+                for tab in workspace.composeTabs where tab.activeAgentSessionID == sessionID {
+                    let location = AgentSessionLaneBindingLocation(workspaceID: workspace.id, tabID: tab.id)
+                    if !seenInWindow.insert(location).inserted { duplicateWithinWindow = true }
+                    locations.insert(location)
+                    projectionOwners[location, default: []].insert(window.windowID)
+                    if workspace.isEphemeral { ephemeralLocations.insert(location) }
+                    if window.workspaceManager.activeWorkspaceID == workspace.id {
+                        activeOwners[location, default: []].insert(window.windowID)
+                    }
+                }
             }
         }
+        // A durable workspace is reloaded on activation, so its inactive catalog copies are not
+        // separate bindings. Ephemeral workspaces have no canonical disk copy: every other window
+        // can reopen its stale tab, and must still block retirement. A distinct location, second
+        // active owner, or duplicate entry within one window also fails closed.
+        let count = locations.reduce(0) { count, location in
+            let owners = ephemeralLocations.contains(location)
+                ? projectionOwners[location]?.count ?? 0
+                : activeOwners[location]?.count ?? 0
+            return count + max(owners, 1)
+        }
+        return duplicateWithinWindow ? max(count, 2) : count
+    }
+
+    func agentSessionLinkClaimLaneRetirement(endpoint: DomainAgentSessionLinkEndpointIdentity) -> UUID? {
+        guard !isTerminating,
+              let window = window(withID: endpoint.windowID),
+              !window.isClosing,
+              window.workspaceManager.activeWorkspace?.id == endpoint.workspaceID,
+              window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+        else { return nil }
+        return workspaceActivityCoordinator.claimLaneRetirement(workspaceID: endpoint.workspaceID)
+    }
+
+    func agentSessionLinkReleaseLaneRetirement(endpoint: DomainAgentSessionLinkEndpointIdentity, claimID: UUID) {
+        workspaceActivityCoordinator.releaseLaneRetirement(workspaceID: endpoint.workspaceID, claimID: claimID)
     }
 
     /// Route only to a registered, non-closing window whose requested workspace is already active.
@@ -92,11 +135,43 @@ extension WindowStatesManager {
               window.workspaceManager.activeWorkspaceID == endpoint.workspaceID,
               window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
         else { return false }
-        return await window.agentModeViewModel.agentSessionLinkRetireLane(
+        let retired = await window.agentModeViewModel.agentSessionLinkRetireLane(
             endpoint: endpoint,
             commit: commit,
             isStillRetirable: isStillRetirable
         )
+        guard retired else { return false }
+        guard commit else { return true }
+        guard let stashed = window.workspaceManager.activeWorkspace?.stashedTabs.first(where: {
+            $0.tab.id == endpoint.tabID
+        }) else { return false }
+
+        // The bridge still holds the workspace activation claim. Bring inactive catalogs into
+        // line with the saved stash before any peer can activate its old in-memory projection.
+        for peer in allWindows where peer !== window && !peer.isClosing {
+            let manager = peer.workspaceManager
+            var projected = manager.workspaces
+            var changed = false
+            for index in projected.indices where projected[index].id == endpoint.workspaceID {
+                guard let tabIndex = projected[index].composeTabs.firstIndex(where: {
+                    $0.id == endpoint.tabID && $0.activeAgentSessionID == endpoint.sessionID
+                }) else { continue }
+                projected[index].composeTabs.remove(at: tabIndex)
+                if let stashedIndex = projected[index].stashedTabs.firstIndex(where: {
+                    $0.tab.id == endpoint.tabID
+                }) {
+                    projected[index].stashedTabs[stashedIndex] = stashed
+                } else {
+                    projected[index].stashedTabs.append(stashed)
+                }
+                if projected[index].activeComposeTabID == endpoint.tabID {
+                    projected[index].activeComposeTabID = projected[index].composeTabs.first?.id
+                }
+                changed = true
+            }
+            if changed { manager.workspaces = projected }
+        }
+        return true
     }
 
     func agentSessionLinkLaneProvenance(
