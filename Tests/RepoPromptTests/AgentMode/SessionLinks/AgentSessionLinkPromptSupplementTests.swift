@@ -1178,7 +1178,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
 
     // MARK: Compaction
 
-    /// Revision 6 teaches `compact` as a newly permitted action, so it must say what gates it, and
+    /// Lane revision 11 teaches `compact` as a newly permitted action, so it must say what gates it, and
     /// both closing notices must forbid it alongside every other outbound operation.
     func testCompactIsTaughtWithItsGateAndForbiddenByBothClosingNotices() {
         let guidance = AgentSessionLinkPrompts.render(
@@ -1188,7 +1188,6 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         )
         XCTAssertTrue(guidance.contains("`compact`"))
         XCTAssertTrue(guidance.contains("idle_for_send: true"))
-        XCTAssertTrue(guidance.contains("not_supported"))
         for kind in [AgentSessionLinkPromptSupplementKind.revocation, .suspension] {
             let closing = AgentSessionLinkPrompts.render(
                 kind: kind,

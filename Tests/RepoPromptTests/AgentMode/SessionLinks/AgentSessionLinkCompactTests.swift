@@ -34,6 +34,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         agent: AgentProviderKind = .claudeCode,
         providerConversation: Bool = true,
         shouldManageCodexTooling: Bool = false,
+        codexResumeGate: TestReleaseFence? = nil,
         saverBehavior: LiveSendEventLog.SaverBehavior = .succeed
     ) throws -> Fixture {
         let events = LiveSendEventLog()
@@ -75,7 +76,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             shouldManageCodexTooling: shouldManageCodexTooling,
             codexControllerFactory: { _, _, _, _, _, _ in
                 events.record(.providerControllerCreated)
-                return LifecycleNoopCodexController(recorder: codexRecorder)
+                return LifecycleNoopCodexController(recorder: codexRecorder, resumeGate: codexResumeGate)
             },
             claudeControllerFactory: { _, _, _, _ in
                 events.record(.providerControllerCreated)
@@ -431,6 +432,60 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.codexRecorder.events.count(where: { $0 == "codex:compact" }), 1)
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:send"))
         XCTAssertEqual(fixture.session.codexConversationID, "lifecycle")
+    }
+
+    func testCancellationDuringCodexResumeWithholdsCompactionAfterExactThreadReturns() async throws {
+        let gate = TestReleaseFence(name: "compact Codex resume")
+        let fixture = try makeFixture(agent: .codexExec, shouldManageCodexTooling: true, codexResumeGate: gate)
+        fixture.session.codexConversationID = "lifecycle"
+        let operation = Task { await compact(fixture) }
+        defer {
+            operation.cancel()
+            gate.release()
+        }
+        guard await gate.waitUntilEntered() else { return }
+        XCTAssertEqual(fixture.session.items.last?.text, AgentChatItem.overseerCompactionRequestText)
+
+        operation.cancel()
+        gate.release()
+        let outcome = await operation.value
+
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("The durable request survives cancellation: \(outcome)")
+        }
+        XCTAssertEqual(fixture.session.codexConversationID, "lifecycle")
+        XCTAssertEqual(fixture.session.codexController?.hasActiveThread, true, "Resume still completed")
+        XCTAssertEqual(delivery.deliveryState, .persisted, "The cancelled caller must not dispatch")
+        XCTAssertFalse(fixture.codexRecorder.events.contains("codex:compact"))
+        XCTAssertFalse(fixture.codexRecorder.events.contains("codex:send"))
+        XCTAssertNil(fixture.session.codexPendingTurnKind)
+        XCTAssertFalse(fixture.session.isComposerSubmissionInFlight, "The claim is released")
+    }
+
+    func testWorkspaceChangeDuringCodexResumeWithholdsCompactionAfterExactThreadReturns() async throws {
+        let gate = TestReleaseFence(name: "compact Codex resume")
+        let fixture = try makeFixture(agent: .codexExec, shouldManageCodexTooling: true, codexResumeGate: gate)
+        fixture.session.codexConversationID = "lifecycle"
+        let operation = Task { await compact(fixture) }
+        defer {
+            operation.cancel()
+            gate.release()
+        }
+        guard await gate.waitUntilEntered() else { return }
+
+        fixture.manager.activeWorkspace = nil
+        gate.release()
+        let outcome = await operation.value
+
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("The durable request survives workspace drift: \(outcome)")
+        }
+        XCTAssertEqual(fixture.session.codexConversationID, "lifecycle")
+        XCTAssertEqual(fixture.session.codexController?.hasActiveThread, true, "Resume still completed")
+        XCTAssertEqual(delivery.deliveryState, .persisted)
+        XCTAssertFalse(fixture.codexRecorder.events.contains("codex:compact"))
+        XCTAssertNil(fixture.session.codexPendingTurnKind)
+        XCTAssertFalse(fixture.session.isComposerSubmissionInFlight, "The claim is released")
     }
 
     func testCodexCompactionStartsNativeThreadCompactionAndNeverSendsAMessage() async throws {

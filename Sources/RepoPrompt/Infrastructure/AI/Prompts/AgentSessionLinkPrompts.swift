@@ -62,7 +62,8 @@ enum AgentSessionLinkPrompts {
     /// Revision 11 adds send-gated native compaction, without changing management or wake admission.
     static let currentLaneGuidanceRevision: UInt64 = 11
     /// Version of active inventory wording, independent of membership and passive lane guidance.
-    static let currentInventoryGuidanceRevision: UInt64 = 5
+    /// Revision 6 leaves compaction outcome instructions in its just-in-time receipts.
+    static let currentInventoryGuidanceRevision: UInt64 = 6
     /// Emitted only beside a managed, respondable pending interaction.
     static let respondHint =
         "Use `respond` for this exact `interaction_id` under your user's instruction. If it changes, refresh with `poll` or `wait`; never auto-retry approval."
@@ -756,7 +757,7 @@ enum AgentSessionLinkPrompts {
         lines.append(contentsOf: [
             "Operations on listed outbound targets: `list` refreshes grants; `poll` snapshots status, readiness, and managed-only pending prompts; `wait` waits on a returned cursor for change, idle, or sendable without busy-polling; `read` pages the redacted transcript.",
             "`send` delivers an attributed message to an `idle_for_send: true` target or queues one with `delivery: \"when_sendable\"`; `cancel_pending_send` withdraws your queued message. Use a new `idempotency_key` for each new delivery and reuse it only for the same retry.",
-            "`compact` requests native context compaction of an `idle_for_send: true` target, with no text and a new `idempotency_key`. `accepted` means started, not completed; observe with poll/wait. `not_started` retains the request/key, `not_supported` means no native path, and `no_provider_session` needs an ordinary turn first. Never substitute a send or retry in a loop. Context count is unknown until new usage. High load supplies no task, and compaction never bypasses a prompt or clears `waiting_on`.",
+            "`compact` requests native context compaction of an `idle_for_send: true` target.",
             "`snooze_auto_wake` pauses only routine status-triggered admission on one lane, not collection or delivery. Exact purposeful attention may bypass its snooze. `set_waiting_on` is self-scoped; `request_attention` is an attributed inverse signal, not a reverse observer grant.",
             "Managed `poll`/`wait` may include a redacted `pending_interaction` beside the snapshot. `respond` applies only to its exact current `interaction_id`; manual-only prompts remain with the target's user. `steer` cannot bypass a pending prompt.",
             "A `read` may repeat an updated newest `item_id`; replace your prior copy rather than appending it.",
