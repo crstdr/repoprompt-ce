@@ -501,6 +501,7 @@ actor AgentSessionDataService {
             || session.itemCount != persistedSession.itemCount
             || session.transcriptProjectionCounts != persistedSession.transcriptProjectionCounts
             || session.lastUserMessageAt != persistedSession.lastUserMessageAt
+            || session.selfCompactNeedsRecoveryRewrite
         return NormalizedLoadedSession(
             runtimeSession: runtimeSession,
             persistedSessionToRewrite: needsRewrite ? persistedSession : nil
@@ -509,6 +510,20 @@ actor AgentSessionDataService {
 
     private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws {
         try await diskWriter.enqueueAndWait(data: data, url: fileURL.standardizedFileURL)
+    }
+
+    /// Keep the original bytes before a load repair drops an invalid optional record.
+    /// Failure aborts the load rather than silently destroying the only recovery copy.
+    private func preserveMalformedSelfCompactRecord(_ data: Data, from fileURL: URL) throws {
+        let directory = fileURL.deletingLastPathComponent().appendingPathComponent(".self-compact-recovery", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let backupURL = directory.appendingPathComponent("\(fileURL.lastPathComponent).\(UUID().uuidString).original")
+        try data.write(to: backupURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backupURL.path)
     }
 
     private func reconcileLoadedWorktreeMergeOperations(
@@ -1280,6 +1295,9 @@ actor AgentSessionDataService {
         do {
             let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
             let session = try decoder.decode(AgentSession.self, from: data)
+            if session.selfCompactPersistenceWarning {
+                try preserveMalformedSelfCompactRecord(data, from: fileURL)
+            }
             let normalized = normalizeLoadedSession(session, fileURL: fileURL)
             var runtimeSession = normalized.runtimeSession
             var persistedSessionToRewrite = normalized.persistedSessionToRewrite
@@ -1336,6 +1354,9 @@ actor AgentSessionDataService {
                header.lastUserMessageAt == nil || header.itemCount == nil || header.transcriptProjectionCounts == nil,
                let fullSession = try? decoder.decode(AgentSession.self, from: data)
             {
+                if fullSession.selfCompactPersistenceWarning {
+                    try preserveMalformedSelfCompactRecord(data, from: fileURL)
+                }
                 let normalized = normalizeLoadedSession(fullSession, fileURL: fileURL)
                 if let transcript = normalized.runtimeSession.transcript {
                     recoveredLastUserMessageAt = recoveredLastUserMessageAt ?? computeLastUserMessageAt(in: transcript)

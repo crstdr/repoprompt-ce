@@ -670,6 +670,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let workspaceFileContextStore: WorkspaceFileContextStore?
     weak var workspaceManager: WorkspaceManagerViewModel?
     private weak var mcpServer: MCPServerViewModel?
+
+    /// Narrow read-only drain probe for the self-compaction terminal worker.
+    func agentSelfCompactHasActiveMCPTools(runID: UUID) -> Bool {
+        mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
+    }
+
     private let dataService = AgentSessionDataService.shared
     private var sidebarPrioritizedIndexBuilder: SidebarPrioritizedIndexBuilder = { request in
         try await AgentSessionDataService.shared.buildPrioritizedSidebarIndex(request)
@@ -3223,6 +3229,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         mcpRemoveAgentRunOracleReviewContext(sessionID: sessionID, runID: runID)
                     }
                     return result
+                },
+                onSelfCompactTerminalSettled: { [weak self] session, revision, result, teardownSettled in
+                    self?.agentSelfCompactTerminalSettled(
+                        session: session,
+                        revision: revision,
+                        publication: result,
+                        teardownSettled: teardownSettled
+                    )
                 }
             ),
             continuation: .init(
@@ -5696,6 +5710,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             defersProviderLockUntilSend: agentSession.pendingHandoffDefersProviderLockUntilSend,
             isStagedForSend: false
         )
+        session.selfCompactState = agentSession.selfCompactState ?? .init()
+        session.selfCompactPersistenceWarning = agentSession.selfCompactPersistenceWarning
 
         codexCoordinator.restoreCodexMetadata(from: agentSession, session: session)
         switch session.selectedAgent {
@@ -15318,6 +15334,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
             pendingHandoffSourceItemID: session.pendingHandoff.sourceItemID,
             pendingHandoffDefersProviderLockUntilSend: session.pendingHandoff.defersProviderLockUntilSend,
+            selfCompactState: session.selfCompactState.active == nil && session.selfCompactState.latest == nil
+                ? nil : session.selfCompactState,
             isMCPOriginated: session.isMCPOriginated,
             worktreeBindings: session.worktreeBindings,
             worktreeMergeOperations: session.worktreeMergeOperations
@@ -16211,6 +16229,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     action: goalAction,
                     session: session
                 )
+                agentSelfCompactCancelForAcceptedLocalInput(session)
                 appendOptimisticGoalObjectiveUserBubbleIfNeeded(
                     action: goalAction,
                     session: session,
@@ -16276,6 +16295,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
             Self.logCodexDebug("[AgentModeVM][RunID] deferring send until hydration completes for tab \(tabID)")
+            agentSelfCompactCancelForAcceptedLocalInput(session)
             Task { [weak self] in
                 guard let self else { return }
                 await submitUserTurnAfterHydration(
@@ -16911,6 +16931,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             flushPendingAssistantDelta(session)
         }
 
+        // An accepted local or managed steer owns the boundary before its user row is published.
+        agentSelfCompactCancelForAcceptedLocalInput(session)
         let userItem = AgentChatItem.user(
             bubbleText,
             attachments: attachmentsToSend,
@@ -18599,6 +18621,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // A provider control command is exactly its fixed native text: prepending initial-thread
         // context would make it ordinary prose the provider no longer recognizes as a command.
         let initialMessageForRun = directStartOptions.providerControlCommand != nil
+            || directStartOptions.selfCompactDispatchID?.stage == .note
             ? augmentedInitialMessage
             : await buildInitialThreadMessageIfNeeded(
                 tabID: tabID,
@@ -18628,6 +18651,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexFallbackContext: preparedCodexFallbackContext,
             autoEffortSelection: autoEffortSelection,
             providerControlCommand: directStartOptions.providerControlCommand,
+            selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome
         )
     }

@@ -55,6 +55,8 @@ enum AgentSessionLinkDeliveryReadiness {
         /// another observer must not `send` into it any more than into an active run — otherwise the
         /// wake and the send race for the same terminal boundary.
         var pendingOversightAutoWake: Bool = false
+        /// An in-flight self-compaction owns the next provider boundary.
+        var pendingSelfCompact: Bool = false
 
         // Target interactions. Waiting states are never ready: answering one would be a different
         // capability than sending a new instruction, and `send` never gains it.
@@ -82,6 +84,7 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingACPSteeringCount: Int,
             pendingClaudeSteeringCount: Int,
             pendingOversightAutoWake: Bool = false,
+            pendingSelfCompact: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
             hasPendingUserInputRequest: Bool,
@@ -105,6 +108,7 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingACPSteeringCount = pendingACPSteeringCount
             self.pendingClaudeSteeringCount = pendingClaudeSteeringCount
             self.pendingOversightAutoWake = pendingOversightAutoWake
+            self.pendingSelfCompact = pendingSelfCompact
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser
             self.hasPendingUserInputRequest = hasPendingUserInputRequest
@@ -213,6 +217,7 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingACPSteeringCount > 0
             || snapshot.pendingClaudeSteeringCount > 0
             || snapshot.pendingOversightAutoWake
+            || snapshot.pendingSelfCompact
             || snapshot.hasWaitingPrompt
             || snapshot.hasPendingAskUser
             || snapshot.hasPendingUserInputRequest
