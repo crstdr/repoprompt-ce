@@ -38,7 +38,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(
             op["enum"]?.arrayValue?.compactMap(\.stringValue),
             [
-                "list", "poll", "wait", "read", "send", "cancel_pending_send",
+                "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact",
                 "set_waiting_on", "snooze_auto_wake", "request_attention",
                 "respond", "steer"
             ]
@@ -155,7 +155,8 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         }
         XCTAssertFalse(definition.description.contains("capability_notice"))
         XCTAssertFalse(definition.description.contains("get_interaction"))
-        XCTAssertFalse(definition.description.contains("compact"))
+        XCTAssertTrue(operations.contains("compact"))
+        XCTAssertTrue(definition.description.contains("compact"))
     }
 
     func testRequestAttentionIsAdmittedRatherThanClassifiedAsAnUnknownOperation() {

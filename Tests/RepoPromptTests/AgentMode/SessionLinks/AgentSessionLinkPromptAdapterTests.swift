@@ -2266,6 +2266,11 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private(set) var shutdownCount = 0
     private(set) var startOrResumeExistingSessionIDs: [String?] = []
     private var rejectResume = false
+    private var turnInFlight = false
+
+    func setTurnInFlight(_ value: Bool) {
+        turnInFlight = value
+    }
 
     func setRejectResume(_ value: Bool) {
         rejectResume = value
@@ -2283,7 +2288,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     var hasTurnInFlight: Bool {
-        false
+        turnInFlight
     }
 
     var events: AsyncStream<NativeAgentRuntimeEvent> {

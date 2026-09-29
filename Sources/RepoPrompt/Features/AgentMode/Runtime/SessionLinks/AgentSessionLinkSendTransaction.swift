@@ -63,6 +63,31 @@ struct AgentSessionLinkSendRequest: Equatable {
     }
 }
 
+/// Everything the target's MainActor needs to run one overseer-requested compaction, as a value.
+///
+/// Identity and attribution only: unlike a send it carries no caller text at all, because the
+/// provider command is fixed by RepoPrompt (`AgentProviderControlCommand.compact`).
+struct AgentSessionLinkCompactRequest: Equatable {
+    let linkID: UUID
+    let linkGeneration: UInt64
+    /// The exact granted observer incarnation; see `AgentSessionLinkSendRequest.observerEndpoint`.
+    let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    /// Observer name captured at request time, persisted with the attribution row.
+    let observerDisplayName: String?
+
+    var observerSessionID: UUID {
+        observerEndpoint.sessionID
+    }
+
+    var attribution: AgentCrossSessionAttribution {
+        AgentCrossSessionAttribution(
+            sourceSessionID: observerSessionID,
+            sourceName: observerDisplayName,
+            linkID: linkID
+        )
+    }
+}
+
 // MARK: - Liveness probe
 
 /// Host-answered liveness facts for one send, valid only at the instant they were read.
@@ -142,6 +167,10 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     /// row may or may not be on disk. The idempotency key is permanently spent.
     case persistenceIndeterminate = "persistence_indeterminate"
     case shuttingDown = "shutting_down"
+    /// Compaction only: no supported native command for this provider.
+    case notSupported = "not_supported"
+    /// Compaction only: no provider conversation is available yet.
+    case noProviderSession = "no_provider_session"
     /// A managed `steer` whose user management delegation was withdrawn before its commit fence.
     case managementRevoked = "management_revoked"
     /// A managed `steer` found the target holding a prompt. It must be answered first (`respond`),
@@ -179,7 +208,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
              .targetBusy, .steerUnavailable, .steerNotAccepted:
             true
         case .endpointInvalidated, .linkRevoked, .persistenceIndeterminate, .shuttingDown,
-             .managementRevoked, .steerUnconfirmed:
+             .managementRevoked, .steerUnconfirmed, .notSupported, .noProviderSession:
             false
         }
     }
@@ -207,6 +236,10 @@ enum AgentSessionLinkSendFailure: String, Equatable {
                 + "idempotency_key is spent. Read the session before sending anything again."
         case .shuttingDown:
             "RepoPrompt is shutting down."
+        case .notSupported:
+            "The overseen session's provider has no supported context compaction. Nothing was requested."
+        case .noProviderSession:
+            "The overseen session has no provider conversation to compact yet. Nothing was requested."
         case .managementRevoked:
             "This exact link no longer authorizes steering. Nothing was delivered. Refresh `list` "
                 + "before retrying; an old session ID or grant is not authority."
@@ -529,6 +562,18 @@ enum AgentSessionLinkMessageDigest {
     static func steerDigest(message: String) -> String {
         let canonical = "steer:\(message)"
         return SHA256.hash(data: Data(canonical.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    /// Request identity of an overseer compaction.
+    ///
+    /// A fixed pre-image that no send can produce (a send's pre-image always begins with a decimal
+    /// length prefix), so the two digests coincide only on a SHA-256 collision. A key reused across
+    /// `send` and `compact` is therefore an `idempotency_conflict`, never a replay of the other
+    /// operation's receipt.
+    static func compactDigest() -> String {
+        SHA256.hash(data: Data("agent_session_link.compact/v1".utf8))
             .map { String(format: "%02x", $0) }
             .joined()
     }

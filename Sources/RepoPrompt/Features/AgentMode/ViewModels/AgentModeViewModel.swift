@@ -18596,11 +18596,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff
             )
 
-        let initialMessageForRun = await buildInitialThreadMessageIfNeeded(
-            tabID: tabID,
-            session: session,
-            initialMessage: augmentedInitialMessage
-        )
+        // A provider control command is exactly its fixed native text: prepending initial-thread
+        // context would make it ordinary prose the provider no longer recognizes as a command.
+        let initialMessageForRun = directStartOptions.providerControlCommand != nil
+            ? augmentedInitialMessage
+            : await buildInitialThreadMessageIfNeeded(
+                tabID: tabID,
+                session: session,
+                initialMessage: augmentedInitialMessage
+            )
         guard periodicStartIsCurrent() else { return nil }
         let preparedCodexFallbackContext = codexFallbackContext.map { context in
             TabSession.CodexFallbackSubmissionContext(
@@ -18623,6 +18627,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             attachments: attachments,
             codexFallbackContext: preparedCodexFallbackContext,
             autoEffortSelection: autoEffortSelection,
+            providerControlCommand: directStartOptions.providerControlCommand,
             startOutcome: startOutcome
         )
     }

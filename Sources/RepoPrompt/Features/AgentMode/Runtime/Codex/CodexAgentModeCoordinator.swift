@@ -2410,22 +2410,85 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             try await controller.compactThread()
             return .succeeded("Requested Codex context compaction.")
         } catch {
-            resetTrackedCodexTurns(session)
-            if !session.codexFallbackQueue.isEmpty || session.codexFallbackDispatchInFlight != nil {
-                abandonCodexFallbackQueue(
-                    session: session,
-                    reason: "Codex queued follow-ups were cancelled because context compaction failed to start."
-                )
-            }
-            if let ownership = session.activeRunOwnership {
-                _ = session.endRunAttempt(ifCurrent: ownership, source: "codex.compaction.startFailed")
-            }
-            viewModel?.setAgentRunActive(session.tabID, isActive: false)
-            session.runState = .idle
-            setRunningStatus(nil, source: nil, session: session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.scheduleSave(for: session.tabID)
+            unwindFailedCodexCompactionStart(session)
             return .failed("Codex context compaction failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Restores the idle state a compaction that failed to start leaves behind. Shared by the local
+    /// `/compact` command and the overseer path so the two can never unwind differently.
+    private func unwindFailedCodexCompactionStart(_ session: AgentTabSession) {
+        resetTrackedCodexTurns(session)
+        if !session.codexFallbackQueue.isEmpty || session.codexFallbackDispatchInFlight != nil {
+            abandonCodexFallbackQueue(
+                session: session,
+                reason: "Codex queued follow-ups were cancelled because context compaction failed to start."
+            )
+        }
+        if let ownership = session.activeRunOwnership {
+            _ = session.endRunAttempt(ifCurrent: ownership, source: "codex.compaction.startFailed")
+        }
+        viewModel?.setAgentRunActive(session.tabID, isActive: false)
+        session.runState = .idle
+        setRunningStatus(nil, source: nil, session: session)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
+    }
+
+    /// How an overseer-requested Codex compaction ended at its provider boundary.
+    enum OversightCompactionStart: Equatable {
+        /// `thread/compact/start` was accepted; the compaction turn is running.
+        case started
+        /// Nothing was sent: the thread was unavailable, or admission no longer held after the
+        /// session was prepared.
+        case notStarted
+        /// The request was attempted and failed; the run state was unwound exactly as the local
+        /// `/compact` command unwinds it.
+        case startFailed(String)
+    }
+
+    /// Starts a native Codex compaction for an overseer-authorized, already-admitted target.
+    ///
+    /// The same core as the local `/compact` command, with one addition the local path does not need:
+    /// preparing the session can suspend (reconnect or resume), so `isStillAdmissible` is re-checked
+    /// after that suspension and immediately before the run is claimed. Nothing is sent when it no
+    /// longer holds. Never falls back to a fresh thread, and never sends a message.
+    func startOversightCompaction(
+        session: AgentTabSession,
+        expectedThreadID: String,
+        isStillAdmissible: () -> Bool
+    ) async -> OversightCompactionStart {
+        guard nativeSlashCommandAvailabilityMessage(.compact, session: session) == nil,
+              session.codexConversationID == expectedThreadID
+        else {
+            return .notStarted
+        }
+        if session.codexController == nil, hasPersistedCodexThreadMetadata(session) {
+            session.codexNeedsReconnect = true
+        }
+        // Never a fresh thread: compacting an empty replacement would report success while the
+        // conversation the overseer meant is no longer attached.
+        await ensureCodexNativeSession(
+            session: session,
+            allowMissingRolloutFallback: false,
+            allowResumeTimeoutFallback: false,
+            forIdleNativeCompact: true
+        )
+        guard isStillAdmissible(),
+              session.codexConversationID == expectedThreadID,
+              nativeSlashCommandAvailabilityMessage(.compact, session: session) == nil,
+              let controller = session.codexController,
+              controller.hasActiveThread
+        else {
+            return .notStarted
+        }
+        beginCodexCompaction(session)
+        do {
+            try await controller.compactThread()
+            return .started
+        } catch {
+            unwindFailedCodexCompactionStart(session)
+            return .startFailed(error.localizedDescription)
         }
     }
 
@@ -3969,7 +4032,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
-    private func hasKnownCodexThread(_ session: AgentTabSession) -> Bool {
+    func hasKnownCodexThread(_ session: AgentTabSession) -> Bool {
         if session.codexController?.hasActiveThread == true {
             return true
         }
@@ -6130,6 +6193,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         policyAlreadyInstalled: Bool = false,
         allowMissingRolloutFallback: Bool = true,
         allowResumeTimeoutFallback: Bool = true,
+        forIdleNativeCompact: Bool = false,
         deferReconnectForCurrentActiveTurn: Bool = false,
         preserveExistingRunID: Bool = false,
         skipResumeWhenNoPriorCodexHistory: Bool = false,
@@ -6165,6 +6229,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     policyAlreadyInstalled: false,
                     allowMissingRolloutFallback: allowMissingRolloutFallback,
                     allowResumeTimeoutFallback: allowResumeTimeoutFallback,
+                    forIdleNativeCompact: forIdleNativeCompact,
                     skipResumeWhenNoPriorCodexHistory: false,
                     semanticRunState: semanticRunState
                 )
@@ -6464,12 +6529,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 policyAlreadyInstalled: false,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback,
+                forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState
             )
             return
         }
+        // Exact idle compact resumes only for a control-plane request, not an active model turn.
+        // The next ordinary turn establishes its own routed tool policy.
         let shouldInstallPolicy = shouldManageCodexTooling
+            && !forIdleNativeCompact
             && shouldBootstrapSessionInitialization
             && !policyAlreadyInstalled
             && requiresTransportStart
@@ -6502,6 +6571,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 policyAlreadyInstalled: true,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback,
+                forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState
             )

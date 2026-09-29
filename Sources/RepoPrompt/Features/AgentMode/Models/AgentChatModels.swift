@@ -353,6 +353,30 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         )
     }
 
+    /// Fixed provider-replay text of an overseer compaction request row. It names no session and
+    /// carries no observer-derived bytes, because system rows are replayed verbatim to providers.
+    public static let overseerCompactionRequestText =
+        "Context compaction was requested by an overseeing session."
+
+    /// The visible provenance row for one overseer-requested context compaction.
+    ///
+    /// `.system`, never `.user`: RepoPrompt issued the provider command, not the target's user, and no
+    /// `/compact` user message is fabricated. The observer's identity travels only in the typed
+    /// `crossSessionAttribution`, which is local display metadata and never enters provider replay or
+    /// the cross-session `read` projection (that classifies `.user` rows only). The row records the
+    /// *request*; whether the compaction started or finished is told by the run's own rows.
+    public static func overseerCompactionRequest(
+        attribution: AgentCrossSessionAttribution,
+        sequenceIndex: Int
+    ) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: overseerCompactionRequestText,
+            sequenceIndex: sequenceIndex,
+            crossSessionAttribution: attribution
+        )
+    }
+
     public static func error(_ text: String, sequenceIndex: Int = 0) -> AgentChatItem {
         AgentChatItem(kind: .error, text: text, sequenceIndex: sequenceIndex)
     }

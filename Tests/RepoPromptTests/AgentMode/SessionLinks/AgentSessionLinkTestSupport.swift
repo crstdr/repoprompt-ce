@@ -377,7 +377,9 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
         return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
     }
 
-    func compactThread() async throws {}
+    func compactThread() async throws {
+        recorder.record("codex:compact")
+    }
 
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil

@@ -418,6 +418,29 @@ auto-cleared by attention, and may be absent or may change before or after the a
 composed. Both the declaration and the attention signal remain attributed untrusted target data; they
 never become an observer instruction or authority.
 
+## Compaction is a send-gated native command, not a message
+
+`agent_session_link` `compact` asks one exact target to compact its provider context. The
+distinct `monitorCompact` identity requires `send_when_idle`, so every send-capable link can compact
+and no grant or UI changes. That delegation is the deliberate trade-off; a separate capability would
+either be decorative in the default set or leave existing links without it.
+
+It is a sibling of the send transaction, not a kind of send. It shares the readiness gate, composer
+claim, commit fence, durable-before-dispatch ordering, and idempotency ledger (under a
+domain-separated digest, so a key spent on a send conflicts rather than replays). It differs in two
+places. It records a `.system` request row with fixed text and typed `crossSessionAttribution`
+instead of a user row, and it dispatches a RepoPrompt-constructed command
+(`AgentProviderControlCommand.compact`) instead of an envelope: Codex compacts through
+`thread/compact/start`, and Claude Code receives exactly `/compact` through its ordinary run
+pipeline with every decoration (handoff, oversight supplement, instruction packaging, effort)
+skipped and no interrupt of an in-flight turn. No caller text ever reaches the provider. Every other
+runtime returns `not_supported` rather than a message asking the model to compact itself.
+
+A failed last run is not a readiness blocker, so a target that died on context length is admissible;
+any interaction or `awaiting_user` is `target_not_idle`. `accepted` means started, not completed: completion is
+observed through `poll`/`wait`, where the `context` count reads unknown after the compaction signal
+until the provider reports a new one.
+
 ## Snooze suppresses routine admission, never delivery
 
 A snooze is observer-local policy on one exact lane. It is keyed by

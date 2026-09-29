@@ -400,6 +400,75 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(multiRow["snapshot"]?.objectValue?["context"], expected)
     }
 
+    // MARK: - compact
+
+    func testCompactAcceptsNoTextQueueOrMultiTargetFields() {
+        XCTAssertEqual(AgentSessionLinkMCPToolService.compactKeys, ["op", "session_id", "idempotency_key"])
+        for forbidden in ["message", "instructions", "session_ids", "delivery", "workflow_name"] {
+            XCTAssertFalse(AgentSessionLinkMCPToolService.compactKeys.contains(forbidden), forbidden)
+        }
+    }
+
+    func testCompactReceiptSaysAcceptedNeverCompleted() throws {
+        let receipt = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        )
+        let object = try XCTUnwrap(AgentSessionLinkResponseRenderer.compactReceiptValue(receipt).objectValue)
+        XCTAssertEqual(object["result"]?.stringValue, "accepted")
+        XCTAssertEqual(object["delivery_state"]?.stringValue, "run_started")
+        XCTAssertEqual(object["target_item_id"]?.stringValue, receipt.targetItemID)
+        XCTAssertEqual(object["duplicate"]?.boolValue, false)
+        XCTAssertNil(object["delivered"], "A compaction is not a delivered message")
+        XCTAssertEqual(object["accepted"]?.boolValue, true)
+        XCTAssertTrue(try XCTUnwrap(object["detail"]?.stringValue).contains("not confirmed"))
+
+        // A recorded request whose command never started must not read as accepted.
+        for state in [DomainAgentSessionLinkDeliveryState.persisted, .runStartFailed] {
+            let notStarted = DomainAgentSessionLinkSendReceipt(
+                targetSessionID: UUID(),
+                targetItemID: UUID().uuidString,
+                acceptedAt: Date(timeIntervalSince1970: 100),
+                deliveryState: state,
+                resultingRunState: "idle"
+            )
+            let rendered = try XCTUnwrap(AgentSessionLinkResponseRenderer.compactReceiptValue(notStarted).objectValue)
+            XCTAssertEqual(rendered["result"]?.stringValue, "not_started", "\(state)")
+            XCTAssertEqual(rendered["accepted"]?.boolValue, false, "\(state)")
+            XCTAssertTrue(try XCTUnwrap(rendered["detail"]?.stringValue).contains("new idempotency_key"))
+            XCTAssertEqual(rendered["retryable"]?.boolValue, false, "A same-key retry only replays this receipt")
+        }
+    }
+
+    func testCompactRefusalsUseTheSharedReadinessVocabularyAndHonestSupportResults() throws {
+        let sessionID = UUID()
+        for (failure, retryable) in [
+            (AgentSessionLinkSendFailure.targetNotIdle, true),
+            (.notSupported, false),
+            (.noProviderSession, false),
+            (.persistenceIndeterminate, false)
+        ] {
+            let object = try XCTUnwrap(
+                AgentSessionLinkResponseRenderer.compactBlockedValue(failure, targetSessionID: sessionID).objectValue
+            )
+            XCTAssertEqual(object["result"]?.stringValue, failure.rawValue)
+            XCTAssertEqual(object["accepted"]?.boolValue, false)
+            XCTAssertEqual(object["retryable"]?.boolValue, retryable, failure.rawValue)
+        }
+        XCTAssertEqual(AgentSessionLinkSendFailure.notSupported.rawValue, "not_supported")
+        XCTAssertEqual(AgentSessionLinkSendFailure.noProviderSession.rawValue, "no_provider_session")
+
+        let inProgress = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactRejectedValue(.sendAlreadyInProgress, targetSessionID: sessionID)
+                .objectValue
+        )
+        XCTAssertEqual(inProgress["result"]?.stringValue, "compaction_in_progress")
+        XCTAssertEqual(inProgress["retryable"]?.boolValue, true)
+    }
+
     func testMultiTargetWaitResponseKeepsRequestOrderAndSuccessorCursorsForEveryTarget() throws {
         let first = makeTargetState(status: .idle, pending: nil)
         let second = makeTargetState(status: .running, pending: nil)
@@ -1632,7 +1701,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         for op in [
-            "list", "poll", "wait", "read", "send", "cancel_pending_send", "set_waiting_on",
+            "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact", "set_waiting_on",
             "snooze_auto_wake", "request_attention", "respond"
         ] {
             XCTAssertTrue(

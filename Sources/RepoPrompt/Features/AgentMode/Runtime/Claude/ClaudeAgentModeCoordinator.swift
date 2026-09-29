@@ -999,7 +999,8 @@ final class ClaudeAgentModeCoordinator {
         attachments _: [AgentImageAttachment],
         intent: NativeSessionIntent,
         allowsCatalogRouteControllerRecovery: Bool,
-        autoEffortSelection: AutoEffortTurnSelection? = nil
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        providerControlCommand: AgentProviderControlCommand? = nil
     ) async -> NativeSendOutcome {
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         let auditTurnID = session.pendingTurnRuntimeAnchors.first?.userItemID
@@ -1010,6 +1011,48 @@ final class ClaudeAgentModeCoordinator {
         // controller is a transport retry of the *same* user turn, so every attempt must carry a
         // byte-equivalent oversight supplement rather than re-deciding per attempt.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
+        /// A control command acts only on the conversation it was admitted for and never interrupts.
+        /// A rebind, a fresh-start fallback after a failed resume (whose staged recovery handoff stays
+        /// for the next ordinary turn), or a turn in flight all refuse it.
+        func controlCommandRefusal(
+            _ command: AgentProviderControlCommand,
+            controller: any NativeAgentRuntimeControlling
+        ) async -> NativeSendOutcome? {
+            // The only suspension comes first; every identity fact is then checked synchronously, so
+            // nothing can rebind between this answer and the caller's next step.
+            let turnInFlight = await controller.hasTurnInFlight
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                return .superseded
+            }
+            // The admitted app-session incarnation: run preparation can suspend after the admitting
+            // transaction's last fence, and a rebind may keep the provider conversation.
+            guard session.persistentSessionBindingIdentity == command.expectedBinding,
+                  !session.bindingTransitionInProgress
+            else {
+                return recordSendFailure(
+                    "The session was rebound before the requested command could run, so it was not run.",
+                    session: session,
+                    intent: intent
+                )
+            }
+            guard session.providerSessionID == command.expectedProviderConversation else {
+                return recordSendFailure(
+                    "Claude could not resume the conversation the requested command was for, so it was not run.",
+                    session: session,
+                    intent: intent
+                )
+            }
+            guard !turnInFlight else {
+                return recordSendFailure(
+                    "Claude could not run the requested command because a provider turn is still in flight.",
+                    session: session,
+                    intent: intent
+                )
+            }
+            return nil
+        }
         /// The same refusal is reachable from three predicates that fail for different reasons and
         /// are indistinguishable in the UI, which cost a full diagnostic cycle. The bracketed code
         /// names the branch; it carries no identifiers or user content.
@@ -1032,12 +1075,32 @@ final class ClaudeAgentModeCoordinator {
                 return .superseded
             }
 
+            // A provider control command was admitted against an idle target for one conversation. A
+            // stale admission is refused here rather than interrupting work the overseer never had
+            // authority to stop.
+            if let providerControlCommand,
+               let refusal = await controlCommandRefusal(providerControlCommand, controller: controller)
+            {
+                return refusal
+            }
+
             if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
-                guard await interruptClaudeTurnIfNeeded(
-                    session: session,
-                    controller: controller,
-                    handler: handler
-                ) else {
+                if let providerControlCommand,
+                   let refusal = await controlCommandRefusal(providerControlCommand, controller: controller)
+                {
+                    return refusal
+                }
+                // A control command never interrupts: it proceeds only when nothing is in flight.
+                let turnIsClear = if providerControlCommand != nil {
+                    true
+                } else {
+                    await interruptClaudeTurnIfNeeded(
+                        session: session,
+                        controller: controller,
+                        handler: handler
+                    )
+                }
+                guard turnIsClear else {
                     guard intentIsCurrent(intent, for: session),
                           sessionOwnsClaudeController(controller, for: session)
                     else {
@@ -1079,11 +1142,22 @@ final class ClaudeAgentModeCoordinator {
                 )
             }
 
-            guard await interruptClaudeTurnIfNeeded(
-                session: session,
-                controller: controller,
-                handler: handler
-            ) else {
+            if let providerControlCommand,
+               let refusal = await controlCommandRefusal(providerControlCommand, controller: controller)
+            {
+                return refusal
+            }
+            // A control command never interrupts: it proceeds only when nothing is in flight.
+            let turnIsClear = if providerControlCommand != nil {
+                true
+            } else {
+                await interruptClaudeTurnIfNeeded(
+                    session: session,
+                    controller: controller,
+                    handler: handler
+                )
+            }
+            guard turnIsClear else {
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {
@@ -1114,7 +1188,11 @@ final class ClaudeAgentModeCoordinator {
                 return .superseded
             }
 
-            let catalogReadiness = await hostCapabilities.ensureAgentSessionLinkProviderInputCatalogReady(session)
+            // A control command carries no oversight supplement, so the catalog route that exists to
+            // protect supplement delivery is not required for it.
+            let catalogReadiness = providerControlCommand == nil
+                ? await hostCapabilities.ensureAgentSessionLinkProviderInputCatalogReady(session)
+                : .notRequired
             guard intentIsCurrent(intent, for: session),
                   sessionOwnsClaudeController(controller, for: session)
             else {
@@ -1220,7 +1298,9 @@ final class ClaudeAgentModeCoordinator {
                 }
                 hostCapabilities.scheduleSave(session)
             }
-            if let desiredEffort = autoEffort ?? (appliedAutoEffortByTabID[session.tabID] == nil ? nil : manualEffort) {
+            if providerControlCommand == nil,
+               let desiredEffort = autoEffort ?? (appliedAutoEffortByTabID[session.tabID] == nil ? nil : manualEffort)
+            {
                 do {
                     try await controller.applyModelAndEffort(
                         model: effectiveClaudeModel(for: session),
@@ -1289,6 +1369,44 @@ final class ClaudeAgentModeCoordinator {
                 {
                     return recordSendFailure(
                         routeVerificationFailure("effort-fence"),
+                        session: session,
+                        intent: intent
+                    )
+                }
+            }
+
+            // A provider control command is exactly its fixed native text: no staged handoff, oversight
+            // supplement, dispatch claim, instruction packaging, or audit — any of those would turn it
+            // into ordinary prose. The supplement it skips stays owed to the next ordinary turn.
+            if let providerControlCommand {
+                // The last check before the write: the controller has no atomic idle-send, so this
+                // narrows the window to the send call itself.
+                if let refusal = await controlCommandRefusal(providerControlCommand, controller: controller) {
+                    return refusal
+                }
+                do {
+                    let turnID = try await controller.sendUserMessage(providerControlCommand.providerText)
+                    guard intentIsCurrent(intent, for: session),
+                          sessionOwnsClaudeController(controller, for: session)
+                    else {
+                        if !sessionOwnsClaudeController(controller, for: session) {
+                            await controller.shutdown()
+                        }
+                        return .superseded
+                    }
+                    session.claudeExpectedTurnIDs.insert(turnID)
+                    return .sent
+                } catch {
+                    guard intentIsCurrent(intent, for: session),
+                          sessionOwnsClaudeController(controller, for: session)
+                    else {
+                        if !sessionOwnsClaudeController(controller, for: session) {
+                            await controller.shutdown()
+                        }
+                        return .superseded
+                    }
+                    return recordSendFailure(
+                        "Claude native command failed: \(error.localizedDescription)",
                         session: session,
                         intent: intent
                     )
