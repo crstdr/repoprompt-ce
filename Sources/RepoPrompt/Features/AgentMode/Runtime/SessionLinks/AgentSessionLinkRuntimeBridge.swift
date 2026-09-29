@@ -5987,9 +5987,10 @@ final class AgentSessionLinkRuntimeBridge {
             observerEndpoint: target.lease.observer,
             observerDisplayName: observer.resolvedDisplayName
         )
-        let liveness: AgentSessionLinkSendLivenessProbe = { [weak self] in
-            guard let self, let host = self.host else { return .unavailable }
-            return host.agentSessionLinkSendLiveness(
+        // Keep the host that supplied this candidate through the same persistence and provider
+        // suspensions as send. The host still re-proves both exact endpoints on every probe.
+        let liveness: AgentSessionLinkSendLivenessProbe = {
+            host.agentSessionLinkSendLiveness(
                 observer: request.observerEndpoint,
                 target: target.lease.target
             )

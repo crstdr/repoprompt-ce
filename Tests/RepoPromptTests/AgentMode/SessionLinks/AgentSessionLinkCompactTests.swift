@@ -57,6 +57,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
     private func makeFixture(
         agent: AgentProviderKind = .claudeCode,
         providerConversation: Bool = true,
+        shouldManageCodexTooling: Bool = false,
         saverBehavior: LiveSendEventLog.SaverBehavior = .succeed,
         firstSaveGate: FirstSaveGate? = nil,
         secondSaveGate: FirstSaveGate? = nil
@@ -97,6 +98,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
+            shouldManageCodexTooling: shouldManageCodexTooling,
             codexControllerFactory: { _, _, _, _, _, _ in
                 events.record(.providerControllerCreated)
                 return LifecycleNoopCodexController(recorder: codexRecorder)
@@ -738,6 +740,22 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         }
         XCTAssertEqual(delivery.deliveryState, .persisted, "Nothing was sent to the provider")
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:compact"))
+    }
+
+    func testIdleManagedCodexCompactionResumesExactThreadWithoutTurnBootstrap() async throws {
+        let fixture = try makeFixture(agent: .codexExec, shouldManageCodexTooling: true)
+        fixture.session.codexConversationID = "lifecycle"
+        XCTAssertNil(fixture.session.codexController, "Exercise idle controller restoration")
+
+        let outcome = await compact(fixture)
+
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("Expected an accepted Codex compaction, got \(outcome)")
+        }
+        XCTAssertEqual(delivery.deliveryState, .runStarted)
+        XCTAssertEqual(fixture.codexRecorder.events.count(where: { $0 == "codex:compact" }), 1)
+        XCTAssertFalse(fixture.codexRecorder.events.contains("codex:send"))
+        XCTAssertEqual(fixture.session.codexConversationID, "lifecycle")
     }
 
     func testCodexCompactionStartsNativeThreadCompactionAndNeverSendsAMessage() async throws {
