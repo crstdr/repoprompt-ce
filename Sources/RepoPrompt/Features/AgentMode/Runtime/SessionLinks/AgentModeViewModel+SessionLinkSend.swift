@@ -27,7 +27,8 @@ extension AgentModeViewModel {
         session: TabSession,
         endpointMatchesGrant: Bool,
         isClosing: Bool,
-        ignoresComposerSubmissionInFlight: Bool = false
+        ignoresComposerSubmissionInFlight: Bool = false,
+        ignoresSelfCompactRequestID: UUID? = nil
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
         AgentSessionLinkDeliveryReadiness.Snapshot(
             hasLoadedPersistedState: session.hasLoadedPersistedState,
@@ -46,6 +47,8 @@ extension AgentModeViewModel {
             pendingACPSteeringCount: session.pendingACPSteeringInstructions.count,
             pendingClaudeSteeringCount: session.pendingClaudeSteeringInstructions.count,
             pendingOversightAutoWake: session.oversight.pendingAutoWake != nil,
+            pendingSelfCompact: session.selfCompactState.blocksOverseerDelivery
+                && session.selfCompactState.active?.id != ignoresSelfCompactRequestID,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,

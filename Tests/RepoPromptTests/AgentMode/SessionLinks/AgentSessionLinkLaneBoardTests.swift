@@ -145,6 +145,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             ("pending_acp_steering_instructions", \.hasPendingACPSteeringInstructions, true),
             ("pending_claude_steering_instructions", \.hasPendingClaudeSteeringInstructions, true),
             ("pending_auto_wake", \.hasPendingAutoWake, true),
+            ("pending_self_compact", \.hasPendingSelfCompact, true),
             ("stop_in_progress", \.stopInProgress, true),
             ("candidate_closing", \.isCandidateClosing, true)
         ]
@@ -197,6 +198,24 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             running.board.sendBlockers,
             ["pending_instructions", "run_state_active", "status_not_idle"]
         )
+    }
+
+    func testSelfCompactHoldSharesBoardAndSendReadinessUntilNoteIsParked() {
+        let tabID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        let target = candidate(tabID: tabID)
+
+        for phase in AgentSelfCompactAttempt.Phase.allCases {
+            session.selfCompactState = AgentSelfCompactState(active: AgentSelfCompactAttempt(
+                idempotencyKey: "board-hold", note: "Continue the current task.", phase: phase
+            ))
+            let observed = snapshot(for: session, candidate: target)
+            let isParked = phase == .parked
+            XCTAssertEqual(observed.idleForSend, isParked, "\(phase)")
+            XCTAssertEqual(observed.board.sendBlockers, isParked ? [] : ["pending_self_compact"], "\(phase)")
+            XCTAssertTrue(session.selfCompactState.blocksAutomaticWake, "even a parked note belongs to the next ordinary send")
+        }
     }
 
     func testCensusMergesLiveIndexAndPersistedBySessionIDThenDropsCleanedUpChildren() {

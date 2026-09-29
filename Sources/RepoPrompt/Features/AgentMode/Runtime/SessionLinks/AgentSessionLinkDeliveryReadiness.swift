@@ -55,6 +55,8 @@ enum AgentSessionLinkDeliveryReadiness {
         /// another observer must not `send` into it any more than into an active run — otherwise the
         /// wake and the send race for the same terminal boundary.
         var pendingOversightAutoWake: Bool = false
+        /// An in-flight self-compaction owns the next provider boundary.
+        var pendingSelfCompact: Bool = false
         /// A binding-qualified managed stop owns this target until cleanup releases its gate.
         var stopInProgress: Bool = false
 
@@ -84,6 +86,7 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingACPSteeringCount: Int,
             pendingClaudeSteeringCount: Int,
             pendingOversightAutoWake: Bool = false,
+            pendingSelfCompact: Bool = false,
             stopInProgress: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
@@ -108,6 +111,7 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingACPSteeringCount = pendingACPSteeringCount
             self.pendingClaudeSteeringCount = pendingClaudeSteeringCount
             self.pendingOversightAutoWake = pendingOversightAutoWake
+            self.pendingSelfCompact = pendingSelfCompact
             self.stopInProgress = stopInProgress
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser
@@ -224,6 +228,7 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingACPSteeringCount > 0
             || snapshot.pendingClaudeSteeringCount > 0
             || snapshot.pendingOversightAutoWake
+            || snapshot.pendingSelfCompact
             || snapshot.stopInProgress
             || snapshot.hasWaitingPrompt
             || snapshot.hasPendingAskUser

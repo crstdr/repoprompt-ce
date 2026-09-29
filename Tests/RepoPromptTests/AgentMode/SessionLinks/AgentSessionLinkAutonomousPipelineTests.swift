@@ -748,6 +748,23 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         )
     }
 
+    func agentSessionLinkPerformCompact(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkCompactRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome {
+        guard let viewModel = viewModelsByWindowID[candidate.windowID] else {
+            return .blocked(.endpointInvalidated)
+        }
+        return await viewModel.agentSessionLinkPerformCompact(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            commitAuthorization: commitAuthorization
+        )
+    }
+
     /// The view model that currently owns this exact endpoint incarnation, or `nil`.
     ///
     /// Full incarnation match, exactly as production does: an in-place rebind keeps the tab and

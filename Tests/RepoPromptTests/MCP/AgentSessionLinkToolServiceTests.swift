@@ -441,6 +441,136 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(multiRow["snapshot"]?.objectValue?["context"], expected)
     }
 
+    // MARK: - compact
+
+    func testCompactAcceptsNoTextQueueOrMultiTargetFields() {
+        XCTAssertEqual(AgentSessionLinkMCPToolService.compactKeys, ["op", "session_id", "idempotency_key"])
+        for forbidden in ["message", "instructions", "session_ids", "delivery", "workflow_name"] {
+            XCTAssertFalse(AgentSessionLinkMCPToolService.compactKeys.contains(forbidden), forbidden)
+        }
+    }
+
+    func testCompactReceiptSaysAcceptedNeverCompleted() throws {
+        let receipt = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        )
+        let object = try XCTUnwrap(AgentSessionLinkResponseRenderer.compactReceiptValue(receipt).objectValue)
+        XCTAssertEqual(object["result"]?.stringValue, "accepted")
+        XCTAssertEqual(object["delivery_state"]?.stringValue, "run_started")
+        XCTAssertEqual(object["target_item_id"]?.stringValue, receipt.targetItemID)
+        XCTAssertEqual(object["duplicate"]?.boolValue, false)
+        XCTAssertNil(object["delivered"], "A compaction is not a delivered message")
+        XCTAssertEqual(object["accepted"]?.boolValue, true)
+        XCTAssertTrue(try XCTUnwrap(object["detail"]?.stringValue).contains("not confirmed"))
+
+        // A recorded request whose command never started must not read as accepted.
+        for state in [DomainAgentSessionLinkDeliveryState.persisted, .runStartFailed] {
+            let notStarted = DomainAgentSessionLinkSendReceipt(
+                targetSessionID: UUID(),
+                targetItemID: UUID().uuidString,
+                acceptedAt: Date(timeIntervalSince1970: 100),
+                deliveryState: state,
+                resultingRunState: "idle"
+            )
+            let rendered = try XCTUnwrap(AgentSessionLinkResponseRenderer.compactReceiptValue(notStarted).objectValue)
+            XCTAssertEqual(rendered["result"]?.stringValue, "not_started", "\(state)")
+            XCTAssertEqual(rendered["accepted"]?.boolValue, false, "\(state)")
+            XCTAssertTrue(try XCTUnwrap(rendered["detail"]?.stringValue).contains("new idempotency_key"))
+            XCTAssertEqual(rendered["retryable"]?.boolValue, false, "A same-key retry only replays this receipt")
+        }
+    }
+
+    /// ACP providers can treat `/compact` as fire-and-forget (Devin does): the prompt turn ends
+    /// instantly while the compaction keeps running in the background, where the session's next
+    /// prompt cancels it. A started ACP compaction must warn the overseer; other paths and
+    /// non-started receipts must not.
+    func testAStartedBackgroundCompactionReceiptWarnsAgainstAnEarlyNextSend() throws {
+        let background = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .runStarted,
+            resultingRunState: "running",
+            compactionRunsInBackground: true
+        )
+        let warned = try XCTUnwrap(AgentSessionLinkResponseRenderer.compactReceiptValue(background).objectValue)
+        let detail = try XCTUnwrap(warned["detail"]?.stringValue)
+        XCTAssertTrue(detail.contains("background"))
+        XCTAssertTrue(detail.contains("cancelled"), "The warning names the consequence")
+
+        let inTurn = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        )
+        let inTurnObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactReceiptValue(inTurn).objectValue
+        )
+        let inTurnDetail = try XCTUnwrap(inTurnObject["detail"]?.stringValue)
+        XCTAssertFalse(
+            inTurnDetail.contains("background"),
+            "Codex/Claude compactions run in the turn; the warning would be wrong there"
+        )
+
+        let withheld = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .persisted,
+            resultingRunState: "idle",
+            compactionRunsInBackground: true
+        )
+        let withheldObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactReceiptValue(withheld).objectValue
+        )
+        let withheldDetail = try XCTUnwrap(withheldObject["detail"]?.stringValue)
+        XCTAssertFalse(
+            withheldDetail.contains("background"),
+            "Nothing started, so nothing can still be running"
+        )
+    }
+
+    func testCompactRefusalsUseTheSharedReadinessVocabularyAndHonestSupportResults() throws {
+        let sessionID = UUID()
+        for (failure, retryable) in [
+            (AgentSessionLinkSendFailure.targetNotIdle, true),
+            (.notSupported, false),
+            (.noProviderSession, true),
+            (.persistenceIndeterminate, false)
+        ] {
+            let object = try XCTUnwrap(
+                AgentSessionLinkResponseRenderer.compactBlockedValue(failure, targetSessionID: sessionID).objectValue
+            )
+            XCTAssertEqual(object["result"]?.stringValue, failure.rawValue)
+            XCTAssertEqual(object["accepted"]?.boolValue, false)
+            XCTAssertEqual(object["retryable"]?.boolValue, retryable, failure.rawValue)
+        }
+        XCTAssertEqual(AgentSessionLinkSendFailure.notSupported.rawValue, "not_supported")
+        XCTAssertEqual(AgentSessionLinkSendFailure.noProviderSession.rawValue, "no_provider_session")
+        let noSession = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactBlockedValue(.noProviderSession, targetSessionID: sessionID)
+                .objectValue
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(noSession["detail"]?.stringValue)
+                .contains("run one turn"),
+            "A retryable no_provider_session tells the overseer how to make the session live"
+        )
+
+        let inProgress = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactRejectedValue(.sendAlreadyInProgress, targetSessionID: sessionID)
+                .objectValue
+        )
+        XCTAssertEqual(inProgress["result"]?.stringValue, "compaction_in_progress")
+        XCTAssertEqual(inProgress["retryable"]?.boolValue, true)
+    }
+
     // MARK: - stop
 
     func testStopRoutedServiceRequiresOneKeyAndRejectsEveryExtra() async throws {
@@ -1907,7 +2037,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         for op in [
-            "list", "poll", "wait", "read", "send", "cancel_pending_send", "set_waiting_on",
+            "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact", "set_waiting_on",
             "snooze_auto_wake", "request_attention", "respond", "steer", "stop", "create_lane", "retire_lane"
         ] {
             XCTAssertTrue(

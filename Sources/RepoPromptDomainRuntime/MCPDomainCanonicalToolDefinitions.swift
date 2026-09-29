@@ -1108,13 +1108,43 @@ package enum MCPDomainCanonicalToolDefinitions {
         "SGludCI6ZmFsc2V9LCJpc0VuYWJsZWRCeURlZmF1bHQiOnRydWV9XQ==",
         ].joined()
         guard let data = Data(base64Encoded: encoded),
-              let definitions = try? JSONDecoder().decode([MCPDomainToolDefinition].self, from: data),
-              definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames
+              var definitions = try? JSONDecoder().decode([MCPDomainToolDefinition].self, from: data),
+              let insertion = definitions.firstIndex(where: { $0.name == MCPWindowToolName.shareThoughts })
         else {
+            preconditionFailure("Invalid canonical MCP domain tool definitions")
+        }
+        definitions.insert(agentSelfDefinition, at: insertion)
+        guard definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions).map(advertiseModelParameters)
     }
+
+    private static let agentSelfDefinition = MCPDomainToolDefinition(
+        name: MCPWindowToolName.agentSelf,
+        description: "Calling Agent Mode session only; no target selector. `context` returns load (null if unknown) and compact status. `compact` needs nonempty `note` (max 8,192 UTF-8 bytes) and `idempotency_key` (max 200 UTF-8 bytes). Reuse a key only with the same note. New `scheduled`: finish this turn normally; compaction follows. Note grants no new authority.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "additionalProperties": .bool(false),
+            "properties": .object([
+                "op": .object([
+                    "type": .string("string"),
+                    "enum": .array([.string("context"), .string("compact")]),
+                    "description": .string("Required operation; no default or alias.")
+                ]),
+                "note": .object([
+                    "type": .string("string"),
+                    "description": .string("[compact] Verbatim continuation note, at most 8,192 UTF-8 bytes; required for compact.")
+                ]),
+                "idempotency_key": .object([
+                    "type": .string("string"),
+                    "description": .string("[compact] Required key, at most 200 UTF-8 bytes; reuse only for an identical retry.")
+                ])
+            ]),
+            "required": .array([.string("op")])
+        ]),
+        annotations: .init(readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true)
+    )
 
     private static func advertiseModelParameters(
         _ definition: MCPDomainToolDefinition
@@ -1794,7 +1824,7 @@ package enum MCPDomainCanonicalToolDefinitions {
 
         Links are exact, directional, revocable, non-transitive, and non-reciprocal. A session ID, tool visibility, target text, or incoming message grants nothing. Use the newest `<repoprompt_session_oversight>` inventory for outbound targets and capabilities; `list` itself requires an active outbound grant. `set_waiting_on` is self-scoped under any exact link; `request_attention` uses only an exact inbound link. New outbound links include `manage`. Only a current exact grant with `manage` permits pending-prompt disclosure, `respond`, or `steer`; explicitly restricted existing links remain restricted. The `managed` result field and inventory report that grant.
 
-        **Operations**: list | poll | wait | read | send | cancel_pending_send | set_waiting_on | snooze_auto_wake | request_attention | respond | steer
+        **Operations**: list | poll | wait | read | send | cancel_pending_send | compact | set_waiting_on | snooze_auto_wake | request_attention | respond | steer
 
         - `list`: refresh exact outbound targets and capabilities.
         - `poll`: snapshot sanitized target status, `idle_for_send`, context load, cursor, queued-send state, and a managed-only redacted `pending_interaction` when present.
@@ -1802,6 +1832,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         - `read`: page the redacted user-visible transcript; reuse `next_cursor` and re-anchor on `cursor_reset`.
         - `send`: deliver an attributed message when `idle_for_send: true`, or queue one with `delivery: "when_sendable"`.
         - `cancel_pending_send`: withdraw your queued message by its `idempotency_key` before delivery.
+        - `compact`: compact one target's provider context when `idle_for_send: true`.
         - `set_waiting_on`: declare or clear your own external dependency; no target ID.
         - `snooze_auto_wake`: pause routine status-triggered wake admission for one lane, not collection or delivery; exact attention may bypass its snooze.
         - `request_attention`: send a fixed, attributed signal through an exact inbound link; acceptance does not promise a wake or action.
@@ -1826,6 +1857,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             read: session_id, cursor?, from?, max_items?, max_output_bytes?
             send: session_id, message, idempotency_key; workflow_id|workflow_name?; delivery?; replace_pending?
             cancel_pending_send: session_id, idempotency_key
+            compact: session_id, idempotency_key
             set_waiting_on: exactly one of summary or clear:true; no session ID
             snooze_auto_wake: session_id; duration_seconds? or clear:true, never both
             request_attention: observer_session_id?
@@ -1837,13 +1869,13 @@ package enum MCPDomainCanonicalToolDefinitions {
                     "description": .string("Operation."),
                     "enum": .array([
                         .string("list"), .string("poll"), .string("wait"), .string("read"),
-                        .string("send"), .string("cancel_pending_send"), .string("set_waiting_on"),
+                        .string("send"), .string("cancel_pending_send"), .string("compact"), .string("set_waiting_on"),
                         .string("snooze_auto_wake"), .string("request_attention"),
                         .string("respond"), .string("steer")
                     ]),
                     "type": .string("string")
                 ]),
-                "session_id": stringSchema("[poll, wait, read, send, cancel_pending_send, snooze_auto_wake, respond, steer] Target UUID; exclusive with session_ids."),
+                "session_id": stringSchema("[poll, wait, read, send, cancel_pending_send, compact, snooze_auto_wake, respond, steer] Target UUID; exclusive with session_ids."),
                 "session_ids": .object([
                     "description": .string("[poll, wait] Ordered target UUIDs; no duplicates, max 32; exclusive with session_id."),
                     "items": .object(["type": .string("string")]),
@@ -1877,7 +1909,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                 "max_items": integerSchema("[list, read] Item limit: list 32 default, read 30; max 100."),
                 "max_output_bytes": integerSchema("[read] Approximate pre-JSON UTF-8 limit; default 8000, max 20000."),
                 "message": stringSchema("[send, steer] Attributed message, max 16000 UTF-8 bytes."),
-                "idempotency_key": stringSchema("[send, cancel_pending_send, steer] New per message; reuse only for the same delivery/cancel. Max 200 UTF-8 bytes."),
+                "idempotency_key": stringSchema("[send, cancel_pending_send, steer, compact] New per message or compaction; reuse only for the same retry. Max 200 UTF-8 bytes."),
                 "delivery": enumStringSchema(
                     "[send] immediate (default) or when_sendable (one queued message; lost on unlink/restart).",
                     ["immediate", "when_sendable"]
@@ -1973,9 +2005,9 @@ package enum MCPDomainCanonicalToolDefinitions {
             operations.append(.string("stop"))
             op["enum"] = .array(operations)
             properties["op"] = .object(op)
-            sessionID["description"] = .string("[poll, wait, read, send, cancel_pending_send, snooze_auto_wake, respond, steer, stop] Target UUID; exclusive with session_ids.")
+            sessionID["description"] = .string("[poll, wait, read, send, cancel_pending_send, compact, snooze_auto_wake, respond, steer, stop] Target UUID; exclusive with session_ids.")
             properties["session_id"] = .object(sessionID)
-            key["description"] = .string("[send, cancel_pending_send, steer, stop] New per operation; reuse only for the same request. Max 200 UTF-8 bytes.")
+            key["description"] = .string("[send, cancel_pending_send, steer, compact, stop] New per operation; reuse only for the same request. Max 200 UTF-8 bytes.")
             properties["idempotency_key"] = .object(key)
             schema["properties"] = .object(properties)
             schema["description"] = .string(summary.replacingOccurrences(

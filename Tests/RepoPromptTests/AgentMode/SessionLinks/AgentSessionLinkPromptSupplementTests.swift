@@ -418,7 +418,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertTrue(rendered.contains("bypass a prompt (answer or steer only where `manage` is granted)"))
         XCTAssertTrue(rendered.contains("Surface ambiguity or surprises"))
         XCTAssertTrue(rendered.contains("or impersonate the user"))
-        XCTAssertFalse(rendered.contains("Guidance revision 12 supersedes"))
+        XCTAssertFalse(rendered.contains("Guidance revision 13 supersedes"))
     }
 
     func testAttentionDeliveredWithWaitingOnAbsentChangedBeforeAndChangedAfterComposition() throws {
@@ -784,7 +784,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertLessThan(membershipIndex, statusIndex)
         XCTAssertEqual(rendered.passiveBatch?.entries.count, 1)
         XCTAssertEqual(rendered.passiveBatch?.includesUnattributedOverflow, false)
-        XCTAssertTrue(rendered.fragment.contains("Guidance revision 12 supersedes"))
+        XCTAssertTrue(rendered.fragment.contains("Guidance revision 13 supersedes"))
         XCTAssertTrue(rendered.fragment.contains("op=snooze_auto_wake"))
         XCTAssertTrue(rendered.fragment.contains("Exact purposeful attention may bypass master Auto-wake"))
         for clause in AgentSessionLinkPrompts.autonomyContract {
@@ -906,7 +906,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertTrue(rendered.contains("A snooze cannot enable Auto-wake, select a lane"))
         XCTAssertTrue(rendered.contains("waiting for its own user"))
         XCTAssertFalse(rendered.contains("effective deselection prevents every automatic wake"))
-        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 12)
+        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 13)
     }
 
     /// Revision 5 retains the retired caller-origin fence and attributed-untrusted attention rule
@@ -934,8 +934,8 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
 
         // The acknowledged revision recorded against a provider context may not stand for wording the
         // model was never shown, so the bump is part of the contract rather than bookkeeping.
-        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 12)
-        XCTAssertTrue(rendered.contains("guidance_revision=\"12\""))
+        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 13)
+        XCTAssertTrue(rendered.contains("guidance_revision=\"13\""))
         XCTAssertTrue(
             rendered.contains(
                 AgentSessionLinkMessageEnvelope.escaped(
@@ -943,7 +943,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
                 )
             )
         )
-        XCTAssertTrue(rendered.contains("Guidance revision 12 supersedes"))
+        XCTAssertTrue(rendered.contains("Guidance revision 13 supersedes"))
         XCTAssertTrue(rendered.contains("retired fresh-user transport restriction still does not apply"))
         XCTAssertTrue(rendered.contains("Exact purposeful attention may bypass master Auto-wake"))
         XCTAssertTrue(rendered.contains("lane&apos;s own toggle"))
@@ -1021,7 +1021,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         )
         XCTAssertTrue(rendered.contains("or impersonate the user"))
         // The full contract is owed once per provider context, not on every delivery.
-        XCTAssertFalse(rendered.contains("Guidance revision 12 supersedes"))
+        XCTAssertFalse(rendered.contains("Guidance revision 13 supersedes"))
         XCTAssertFalse(rendered.contains("Catalog visibility is not authority"))
     }
 
@@ -1173,6 +1173,28 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         )
         // Truncation must land on a Character boundary, never mid-scalar.
         XCTAssertTrue(long.hasPrefix(name))
+    }
+
+    // MARK: Compaction
+
+    /// Lane revision 12 teaches `compact` alongside managed Stop, so it must say what gates it, and
+    /// both closing notices must forbid it alongside every other outbound operation.
+    func testCompactIsTaughtWithItsGateAndForbiddenByBothClosingNotices() {
+        let guidance = AgentSessionLinkPrompts.render(
+            kind: .inventory,
+            inventory: inventory(revision: 7, items: [item("8B91C0E0-0000-0000-0000-00000000C0DE")]),
+            toolReference: "agent_session_link"
+        )
+        XCTAssertTrue(guidance.contains("`compact`"))
+        XCTAssertTrue(guidance.contains("idle_for_send: true"))
+        for kind in [AgentSessionLinkPromptSupplementKind.revocation, .suspension] {
+            let closing = AgentSessionLinkPrompts.render(
+                kind: kind,
+                inventory: inventory(revision: 7, items: []),
+                toolReference: "agent_session_link"
+            )
+            XCTAssertTrue(closing.contains("cancel_pending_send, compact, snooze_auto_wake, respond, or steer"), "\(kind)")
+        }
     }
 
     // MARK: Revocation
@@ -2530,7 +2552,7 @@ final class AgentSessionLinkPromptClaimStoreTests: XCTestCase {
             XCTAssertGreaterThan(deliveredCount, 0)
             if acceptedSubsetCount == 0 {
                 XCTAssertEqual(claimed.laneGuidanceMode, .full)
-                XCTAssertTrue(claimed.fragment.contains("Guidance revision 12 supersedes"))
+                XCTAssertTrue(claimed.fragment.contains("Guidance revision 13 supersedes"))
             } else {
                 XCTAssertEqual(claimed.laneGuidanceMode, .reminder)
                 XCTAssertTrue(claimed.fragment.contains("Lane update or attributed attention"))
