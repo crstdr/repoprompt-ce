@@ -431,6 +431,14 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     func agentSessionLinkPublishPersistencePresentation(
         _ presentation: AgentSessionOversightPersistencePresentation
     )
+
+    /// Passively loads the persisted state of the described compose tabs bound to these sessions.
+    ///
+    /// Used only by launch restoration for the endpoints of saved oversight pairs. A conforming host
+    /// must load in the background without selecting, focusing, or activating any tab or window, and
+    /// without starting or reconnecting any provider; readiness then re-enters restoration through
+    /// the ordinary candidate-readiness signal.
+    func agentSessionLinkRequestRestorationHydration(sessionIDs: Set<UUID>)
 }
 
 /// Defaults for the launch-restoration surface.
@@ -551,6 +559,8 @@ extension AgentSessionLinkEndpointHost {
     func agentSessionLinkPublishPersistencePresentation(
         _: AgentSessionOversightPersistencePresentation
     ) {}
+
+    func agentSessionLinkRequestRestorationHydration(sessionIDs _: Set<UUID>) {}
 
     /// Fail-closed defaults for the auto-wake setting.
     ///
@@ -7262,6 +7272,11 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
 
     func launchCoordinatorReportWarning(id: String, message: String) {
         reportPersistenceWarning(id: id, message: message)
+    }
+
+    func launchCoordinatorRequestHydration(sessionIDs: Set<UUID>) {
+        guard !isFrozenForTermination, !sessionIDs.isEmpty else { return }
+        host?.agentSessionLinkRequestRestorationHydration(sessionIDs: sessionIDs)
     }
 }
 

@@ -32,6 +32,7 @@ package enum MCPWindowToolName {
     package static let agentRun = "agent_run"
     package static let agentManage = "agent_manage"
     package static let agentSessionLink = "agent_session_link"
+    package static let agentSelf = "agent_self"
     package static let history = "history"
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
@@ -70,6 +71,7 @@ package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
     /// oversight grant never widens `agent_run` / `agent_manage`, and spawn provenance never creates
     /// an oversight link.
     case agentSessionLinkControl = "agent_session_link_control"
+    case agentSelfControl = "agent_self_control"
     case agentReasoningControl = "agent_reasoning_control"
     case fileContentEdit = "file_content_edit"
     case fileManagement = "file_management"
@@ -309,6 +311,10 @@ package enum MCPDomainToolCatalog {
                 "snooze_auto_wake", "request_attention", "respond", "steer", "stop",
                 "create_lane", "retire_lane"
             ],
+            normalization: .trimmedLowercased
+        )),
+        .init(name: MCPWindowToolName.agentSelf, scope: .window, capability: .agentSelfControl, admissionClass: .control, operationPolicy: .init(
+            operations: ["context", "compact"],
             normalization: .trimmedLowercased
         )),
         .init(name: MCPWindowToolName.shareThoughts, scope: .window, capability: .agentReasoningControl, admissionClass: .control),

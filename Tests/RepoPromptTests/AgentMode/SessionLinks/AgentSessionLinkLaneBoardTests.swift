@@ -147,6 +147,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             ("pending_auto_wake", \.hasPendingAutoWake, true),
             ("stop_in_progress", \.stopInProgress, true),
             ("compaction_settling", \.compactionSettling, true),
+            ("pending_self_compact", \.hasPendingSelfCompact, true),
             ("candidate_closing", \.isCandidateClosing, true)
         ]
         for (expected, keyPath, blockedValue) in cases {
@@ -198,6 +199,17 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             running.board.sendBlockers,
             ["pending_instructions", "run_state_active", "status_not_idle"]
         )
+
+        session.pendingInstructions = []
+        session.runState = .idle
+        var compact = session.selfCompactState
+        guard case .scheduled = compact.reserve(note: "resume here", idempotencyKey: "lane-board-compact") else {
+            return XCTFail("Expected self-compact reservation")
+        }
+        session.selfCompactState = compact
+        let compacting = snapshot(for: session, candidate: target)
+        XCTAssertFalse(compacting.idleForSend)
+        XCTAssertEqual(compacting.board.sendBlockers, ["pending_self_compact"])
     }
 
     func testManagedStopGateAppearsOnPublishedBoardAndClearsAfterRelease() {

@@ -140,6 +140,20 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertFalse(deferredFence.permitsStart(of: fixture.session))
     }
 
+    func testIdleStopWithdrawsDeferredSelfCompactDecisionWindow() async throws {
+        let fixture = try makeFixture()
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: "recover after stop", idempotencyKey: "idle-stop")
+        state.active?.phase = .acpSettling
+        fixture.session.selfCompactState = state
+        let stopped = await stop(fixture)
+        guard case let .settled(receipt) = stopped else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .notRunning)
+        XCTAssertNil(fixture.session.selfCompactState.active)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .cancelled)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.recoveryNote, "recover after stop")
+    }
+
     func testPendingStartWithdrawsWithoutSyntheticTerminalRun() async throws {
         let fixture = try makeFixture()
         fixture.session.runState = .completed

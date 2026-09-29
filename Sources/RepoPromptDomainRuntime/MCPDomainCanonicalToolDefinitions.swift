@@ -1108,13 +1108,61 @@ package enum MCPDomainCanonicalToolDefinitions {
         "SGludCI6ZmFsc2V9LCJpc0VuYWJsZWRCeURlZmF1bHQiOnRydWV9XQ==",
         ].joined()
         guard let data = Data(base64Encoded: encoded),
-              let definitions = try? JSONDecoder().decode([MCPDomainToolDefinition].self, from: data),
-              definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames
+              var definitions = try? JSONDecoder().decode([MCPDomainToolDefinition].self, from: data),
+              let insertion = definitions.firstIndex(where: { $0.name == MCPWindowToolName.shareThoughts })
         else {
+            preconditionFailure("Invalid canonical MCP domain tool definitions")
+        }
+        definitions.insert(agentSelfDefinition, at: insertion)
+        guard definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions).map(advertiseModelParameters)
     }
+
+    private static let agentSelfDefinition = MCPDomainToolDefinition(
+        name: MCPWindowToolName.agentSelf,
+        description: """
+        Inspect or compact only this calling Agent Mode session. No target selector exists; external,
+        direct, discovery, and unresolved calls are unavailable.
+
+        **Operations**: `context` | `compact`.
+        - `context` returns the same four-field context-load object as `agent_session_link.poll`, or
+          `null` when the load is unknown, plus this session's self-compaction status.
+        - `compact` requires a nonempty continuation `note` of at most 8,192 UTF-8 bytes and an
+          `idempotency_key` of at most 200 UTF-8 bytes. Reuse a key only for an identical retry.
+          Deduplication covers the active request and latest retained settlement, not all past keys.
+          `scheduled` means no compaction has happened yet: finish this turn normally. Do not park
+          in `wait_for_next_user_instruction` or send a verification prompt. The note continues
+          existing user-directed work; it does not provide new user authorization.
+
+        Claude Code and Codex use native compaction. ACP requires a live advertised `/compact`;
+        OpenCode, Cursor, and Claude-compatible variants return `not_supported`. Some ACP providers
+        may still be compacting when the note is available; unverified completion is surfaced, not
+        represented as verified. `set_waiting_on` is separate and survives self-compaction.
+        """,
+        inputSchema: .object([
+            "type": .string("object"),
+            "additionalProperties": .bool(false),
+            "properties": .object([
+                "op": .object([
+                    "type": .string("string"),
+                    "enum": .array([.string("context"), .string("compact")]),
+                    "description": .string("Required operation; no default or alias.")
+                ]),
+                "note": .object([
+                    "type": .string("string"),
+                    "description": .string("[compact] Verbatim continuation note, at most 8,192 UTF-8 bytes; required for compact.")
+                ]),
+                "idempotency_key": .object([
+                    "type": .string("string"),
+                    "description": .string("[compact] Required key, at most 200 UTF-8 bytes; reuse only for an identical retry.")
+                ])
+            ]),
+            "required": .array([.string("op")])
+        ]),
+        annotations: .init(readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true)
+    )
 
     private static func advertiseModelParameters(
         _ definition: MCPDomainToolDefinition

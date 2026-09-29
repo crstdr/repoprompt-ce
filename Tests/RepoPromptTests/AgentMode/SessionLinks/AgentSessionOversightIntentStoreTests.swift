@@ -159,6 +159,117 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
         XCTAssertEqual(repeatedMissing.source, .missing)
     }
 
+    // MARK: - Delegation
+
+    /// Existing upstream rows survive ordinary pair writes, but never create a relationship or
+    /// confer authority; removing the pair removes its compatibility row as well.
+    func testStoredDelegationRowsRoundTripAndAreDroppedWithTheirPair() async throws {
+        let managed = pair()
+        let plain = pair()
+        let document = AgentSessionOversightIntentDocument(
+            links: [managed, plain],
+            delegations: [
+                AgentSessionOversightDelegationRecord(
+                    observerSessionID: managed.observerSessionID,
+                    targetSessionID: managed.targetSessionID,
+                    manage: true,
+                    autoApprovePermissions: true
+                )
+            ]
+        )
+        try JSONEncoder().encode(document).write(to: fileURL, options: .atomic)
+
+        let first = makeStore()
+        guard case let .ready(initial) = await first.loadForLaunch() else {
+            return XCTFail("Expected a ready load")
+        }
+        XCTAssertEqual(initial.pairs, [managed, plain])
+        XCTAssertEqual(
+            initial.delegationByPair,
+            [managed: AgentSessionOversightDelegation(manage: true, autoApprovePermissions: true)]
+        )
+        let insert = await first.insert(pair()) // Force a normal write; the old row is preserved.
+        XCTAssertEqual(insert.outcome, .applied)
+
+        let relaunched = makeStore()
+        guard case let .ready(load) = await relaunched.loadForLaunch() else {
+            return XCTFail("Expected a ready load")
+        }
+        XCTAssertEqual(
+            load.delegationByPair,
+            [managed: AgentSessionOversightDelegation(manage: true, autoApprovePermissions: true)]
+        )
+        let plainDelegation = await relaunched.delegation(for: plain)
+        XCTAssertEqual(plainDelegation, .none)
+
+        let token = try XCTUnwrap(load.tokenByPair[managed])
+        let removal = await relaunched.remove(managed, ifCurrent: token)
+        XCTAssertEqual(removal.outcome, .applied)
+        let afterRemoval = await relaunched.delegation(for: managed)
+        XCTAssertEqual(afterRemoval, .none)
+
+        _ = await relaunched.insert(managed)
+        let afterReAdd = await relaunched.delegation(for: managed)
+        XCTAssertEqual(afterReAdd, .none)
+        let third = makeStore()
+        guard case let .ready(reloaded) = await third.loadForLaunch() else {
+            return XCTFail("Expected a ready load")
+        }
+        XCTAssertTrue(reloaded.delegationByPair.isEmpty)
+    }
+
+    /// Files written before delegation existed load unchanged, and a document with no delegation keeps
+    /// the original on-disk shape so an older build reads it exactly as before.
+    func testLegacyDocumentLoadsAndAnUndelegatedDocumentOmitsTheDelegationsKey() async throws {
+        let observer = UUID()
+        let target = UUID()
+        try writeRawDocument("""
+        {"version":1,"links":[{"observerSessionID":"\(observer.uuidString)","targetSessionID":"\(target.uuidString)"}]}
+        """)
+        let store = makeStore()
+        guard case let .ready(load) = await store.loadForLaunch() else {
+            return XCTFail("Expected a ready load")
+        }
+        let legacy = AgentSessionOversightIntent(observerSessionID: observer, targetSessionID: target)
+        XCTAssertEqual(load.source, .loaded)
+        XCTAssertEqual(load.pairs, [legacy])
+        XCTAssertTrue(load.delegationByPair.isEmpty)
+
+        _ = await store.insert(pair())
+        let written = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertFalse(written.contains("delegations"))
+
+        let persisted = try Data(contentsOf: fileURL)
+        let document = try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: persisted)
+        XCTAssertEqual(document.version, 1)
+        XCTAssertNil(document.delegations)
+    }
+
+    /// An orphan compatibility row has no saved relationship and is ignored.
+    func testOrphanDelegationRowsAreIgnoredOnLoad() async throws {
+        let saved = pair()
+        let orphan = pair()
+        let document = AgentSessionOversightIntentDocument(
+            links: [saved],
+            delegations: [
+                AgentSessionOversightDelegationRecord(
+                    observerSessionID: orphan.observerSessionID,
+                    targetSessionID: orphan.targetSessionID,
+                    manage: true,
+                    autoApprovePermissions: true
+                )
+            ]
+        )
+        try JSONEncoder().encode(document).write(to: fileURL, options: .atomic)
+
+        let store = makeStore()
+        guard case let .ready(load) = await store.loadForLaunch() else {
+            return XCTFail("Expected a ready load")
+        }
+        XCTAssertEqual(load.pairs, [saved])
+        XCTAssertTrue(load.delegationByPair.isEmpty)
+    }
+
     // MARK: - Insert / remove
 
     func testInsertIsIdempotentAndNeitherWritesNorAdvancesRevision() async throws {

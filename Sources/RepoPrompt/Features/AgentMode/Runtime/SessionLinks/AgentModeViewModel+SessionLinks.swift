@@ -172,6 +172,35 @@ extension AgentModeViewModel {
         }
     }
 
+    /// Loads, in the background, the persisted state of this window's compose tabs bound to one of
+    /// `sessionIDs`, so saved oversight pairs can be restored at launch.
+    ///
+    /// Passive by construction: `ensureSessionReady` with its default arguments only reads the
+    /// session payload from disk. It does not select the tab, focus the window, or start or reconnect
+    /// a provider. Tabs already hydrated or already loading are skipped (the load joins in-flight
+    /// work anyway).
+    func agentSessionLinkRequestRestorationHydration(sessionIDs: Set<UUID>) {
+        for descriptor in agentSessionLinkComposeTabDescriptors()
+            where sessionIDs.contains(descriptor.sessionID)
+        {
+            let tabID = descriptor.tabID
+            if let existing = sessions[tabID],
+               existing.hasLoadedPersistedState || existing.persistedLoadTask != nil
+            {
+                continue
+            }
+            Task { @MainActor [weak self] in
+                guard let self,
+                      // Re-read after the hop: the tab may have been closed or rebound meanwhile.
+                      agentSessionLinkComposeTabDescriptors().contains(where: {
+                          $0.tabID == tabID && $0.sessionID == descriptor.sessionID
+                      })
+                else { return }
+                _ = await ensureSessionReady(tabID: tabID)
+            }
+        }
+    }
+
     /// The exact live endpoint incarnation bound to one compose tab of this window.
     ///
     /// This is the single conversion used to turn server-owned connection routing
@@ -1290,6 +1319,7 @@ extension AgentModeViewModel {
         case pendingAutoWake = "pending_auto_wake"
         case stopInProgress = "stop_in_progress"
         case compactionSettling = "compaction_settling"
+        case pendingSelfCompact = "pending_self_compact"
         case candidateClosing = "candidate_closing"
     }
 
@@ -1311,6 +1341,7 @@ extension AgentModeViewModel {
         var hasPendingAutoWake: Bool
         var stopInProgress: Bool
         var compactionSettling: Bool
+        var hasPendingSelfCompact: Bool
         var isCandidateClosing: Bool
     }
 
@@ -1334,7 +1365,9 @@ extension AgentModeViewModel {
             hasPendingClaudeSteeringInstructions: !session.pendingClaudeSteeringInstructions.isEmpty,
             hasPendingAutoWake: session.oversight.pendingAutoWake != nil,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
-            compactionSettling: session.isACPCompactSettling(),
+            compactionSettling: session.isACPCompactSettling()
+                || session.selfCompactState.active?.phase == .acpSettling,
+            hasPendingSelfCompact: session.selfCompactState.blocksOverseerDelivery,
             isCandidateClosing: candidate.isClosing
         )
     }
@@ -1356,6 +1389,7 @@ extension AgentModeViewModel {
         if input.hasPendingAutoWake { blockers.append(.pendingAutoWake) }
         if input.stopInProgress { blockers.append(.stopInProgress) }
         if input.compactionSettling { blockers.append(.compactionSettling) }
+        if input.hasPendingSelfCompact { blockers.append(.pendingSelfCompact) }
         if input.isCandidateClosing { blockers.append(.candidateClosing) }
         return blockers.sorted { $0.rawValue < $1.rawValue }
     }

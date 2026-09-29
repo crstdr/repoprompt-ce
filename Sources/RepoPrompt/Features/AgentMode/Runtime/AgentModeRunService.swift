@@ -142,6 +142,17 @@ final class AgentModeRunService {
         )
     }
 
+    /// Claude and Codex use correlated completion. ACP self-compaction is admitted only for
+    /// runtimes whose advertised `compact` is a native command, and only after that support was
+    /// recorded on the attempt.
+    private static func allowsSelfCompactDispatch(_ session: AgentTabSession) -> Bool {
+        if session.selectedAgent == .codexExec || session.selectedAgent == .claudeCode {
+            return true
+        }
+        return AgentProviderControlCommand.acpRuntimeAdvertisesNativeCommands(session.selectedAgent)
+            && session.selfCompactState.active?.admittedSupport == .acpAdvertisedCommand
+    }
+
     @discardableResult
     func startRun(
         tabID: UUID,
@@ -152,6 +163,7 @@ final class AgentModeRunService {
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         stopFence: AgentRunStartStopFence? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
@@ -161,6 +173,18 @@ final class AgentModeRunService {
         }
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
         let selectedAgent = session.selectedAgent
+        if let selfCompactDispatchID {
+            guard session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
+                  selfCompactDispatchID.stage == .note
+                  ? session.selfCompactNoteDispatchIsCurrent(selfCompactDispatchID)
+                  : session.selfCompactCommandDispatchIsCurrent(selfCompactDispatchID),
+                  Self.allowsSelfCompactDispatch(session),
+                  (selfCompactDispatchID.stage == .compact) == (providerControlCommand != nil)
+            else {
+                startOutcome?.recordStartFailure(message: nil)
+                return nil
+            }
+        }
         // A control command is only ever routed to a runtime that dispatches it natively and
         // undecorated. Any other runtime would send it as ordinary prose, so it never starts at all.
         if let providerControlCommand,
@@ -191,7 +215,8 @@ final class AgentModeRunService {
                 attachments: attachments,
                 fallbackContext: codexFallbackContext,
                 autoEffortSelection: autoEffortSelection,
-                stopFence: stopFence
+                stopFence: stopFence,
+                selfCompactDispatchID: selfCompactDispatchID
             )
             startOutcome?.record(codexOutcome: outcome)
             return outcome
@@ -238,7 +263,8 @@ final class AgentModeRunService {
                 makeLease: makeLease,
                 autoEffortSelection: autoEffortSelection,
                 providerControlCommand: providerControlCommand,
-                stopFence: stopFence
+                stopFence: stopFence,
+                selfCompactDispatchID: selfCompactDispatchID
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
@@ -1203,8 +1229,8 @@ final class AgentModeRunService {
         )
     }
 
-    /// Synchronously retracts queued producers at managed-stop claim time. A naturally completed
-    /// run must not leave pre-stop follow-ups armed when its cleanup admission later fails.
+    /// Synchronously retracts queued producers at user-Stop preparation or managed-stop claim time.
+    /// A naturally completed run must not leave pre-stop follow-ups armed when cleanup later fails.
     func withdrawQueuedWorkForManagedStop(tabID: UUID, session: AgentTabSession) {
         session.claudeSteeringFlushTask?.cancel()
         session.claudeSteeringFlushTask = nil

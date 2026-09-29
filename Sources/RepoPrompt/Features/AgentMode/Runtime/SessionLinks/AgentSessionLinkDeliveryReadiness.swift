@@ -57,8 +57,10 @@ enum AgentSessionLinkDeliveryReadiness {
         var pendingOversightAutoWake: Bool = false
         /// A binding-qualified managed stop owns this target until cleanup releases its gate.
         var stopInProgress: Bool = false
-        /// A dispatched ACP compact command may still be settling inside the provider.
+        /// Either ACP settle clock means a managed prompt could interrupt provider compaction.
         var compactionSettling: Bool = false
+        /// An in-flight self-compaction owns the next provider boundary.
+        var pendingSelfCompact: Bool = false
 
         // Target interactions. Waiting states are never ready: answering one would be a different
         // capability than sending a new instruction, and `send` never gains it.
@@ -88,6 +90,7 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingOversightAutoWake: Bool = false,
             stopInProgress: Bool = false,
             compactionSettling: Bool = false,
+            pendingSelfCompact: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
             hasPendingUserInputRequest: Bool,
@@ -113,6 +116,7 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingOversightAutoWake = pendingOversightAutoWake
             self.stopInProgress = stopInProgress
             self.compactionSettling = compactionSettling
+            self.pendingSelfCompact = pendingSelfCompact
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser
             self.hasPendingUserInputRequest = hasPendingUserInputRequest
@@ -212,7 +216,9 @@ enum AgentSessionLinkDeliveryReadiness {
     /// Local user submissions keep their existing admission behavior.
     static func managedDeliveryFailure(snapshot: Snapshot) -> AgentSessionLinkSendFailure? {
         switch evaluate(snapshot: snapshot) {
-        case let .blocked(reason): AgentSessionLinkSendFailure(reason)
+        case .blocked(.endpointInvalidated): .endpointInvalidated
+        case .blocked(.targetLoading): .targetLoading
+        case .blocked(.targetNotIdle): snapshot.compactionSettling ? .compactionSettling : .targetNotIdle
         case .ready: snapshot.compactionSettling ? .compactionSettling : nil
         }
     }
@@ -231,6 +237,7 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingClaudeSteeringCount > 0
             || snapshot.pendingOversightAutoWake
             || snapshot.stopInProgress
+            || snapshot.pendingSelfCompact
             || snapshot.hasWaitingPrompt
             || snapshot.hasPendingAskUser
             || snapshot.hasPendingUserInputRequest

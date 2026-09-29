@@ -39,6 +39,7 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
             ("terminalCommitInProgress", \.terminalCommitInProgress),
             ("stopInProgress", \.stopInProgress),
             ("mcpFollowUpRunPending", \.mcpFollowUpRunPending),
+            ("pendingSelfCompact", \.pendingSelfCompact),
             ("isComposerSubmissionInFlight", \.isComposerSubmissionInFlight),
             ("isPreparingInitialWorktree", \.isPreparingInitialWorktree),
             ("isChangingExecutionLocation", \.isChangingExecutionLocation),
@@ -115,6 +116,12 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
             AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(snapshot: snapshot),
             .compactionSettling,
             "Managed send and compact use this stricter admission."
+        )
+        snapshot.pendingSelfCompact = true
+        XCTAssertEqual(
+            AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(snapshot: snapshot),
+            .compactionSettling,
+            "A self-compact settle reports the managed-only compaction hold, not generic busy."
         )
         snapshot.endpointMatchesGrant = false
         XCTAssertEqual(

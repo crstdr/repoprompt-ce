@@ -50,11 +50,9 @@ extension AgentModeViewModel {
         guard let binding = session.persistentSessionBindingIdentity else { return .blocked(.targetBusy) }
 
         if selection == .notRunning {
-            // Even an unmodeled deferred producer may hold a start fence.
-            session.stopState.invalidateScheduledStarts()
-            if session.oversight.pendingAutoWake != nil {
-                agentSessionLinkRetractAutoWakeForUserStop(session)
-            }
+            // No active run can still leave a deferred compact, note, or ACP follow-up producer.
+            // The shared preparation retracts those and invalidates their captured start fences.
+            prepareAgentRunCancellation(session: session, intent: .userStop)
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
                 result: .notRunning, stopRequested: false, audit: .notRequired,
@@ -114,7 +112,6 @@ extension AgentModeViewModel {
         }
         // Claim-time withdrawal is independent of whether the run still exists when cleanup starts.
         prepareAgentRunCancellation(session: session, intent: .userStop)
-        withdrawQueuedWorkForManagedStop(session: session)
         let claimedAdmission = AgentRunCancellationAdmission(
             scope: .activeRun, session: session, binding: binding,
             expectedOwnership: admission.expectedOwnership, expectedRunID: admission.expectedRunID,

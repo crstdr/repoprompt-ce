@@ -201,6 +201,22 @@ worktree-merge reviews, and secret input stay with the target's user. Auto-wake 
 are admission policy for observer turns, not permission authority. Provider-wide Claude and ACP
 permission preferences and MCP client permissions are separate controls, not oversight link choices.
 
+## Saved oversight restoration across relaunch
+
+After window restoration settles, a saved oversight pair can still wait on a described background
+compose tab whose session has not hydrated. The launch coordinator requests one passive load per
+waiting endpoint per launch, only after the restore barriers clear. The host uses
+`ensureSessionReady(tabID:)` without selecting or focusing a tab, activating a window, or starting or
+reconnecting a provider. Ordinary candidate-readiness signals then re-enter the restoration pass;
+both endpoints must still prove authoritative before a link is established. An undescribed,
+duplicate, deleting, or terminal endpoint is not hydrated to manufacture a grant.
+
+The version-1 intent document accepts optional `delegations` rows for compatibility with upstream
+files. In this lean fork those stored `manage` and `autoApprovePermissions` bits are **not consulted**
+when links are restored or explicitly re-added. Every new grant has the same managed default,
+and provider permissions still require an explicit response. Removing an intent also drops its
+stored row; no UI or runtime path writes a new delegation.
+
 ## Management is an authority-owned grant capability
 
 A new exact outbound link includes `.manage` by default. The user sees fixed Oversee disclosure at
@@ -261,7 +277,7 @@ operations and a retry replays the stored receipt.
 | Any pending prompt | Refused before the fence | `target_awaiting_interaction` |
 | Between states, idle but not yet send-ready, or settled during the fence | Refused; nothing staged and the key is released | `target_busy` |
 | A provider or state with no live steering | Refused before staging | `steer_unavailable` |
-| ACP compact settling after compact dispatch | Managed delivery waits for a context-vouch drop or the approximately 90-second deadline; the target user's own sends and steers remain ungated | `compaction_settling` (retryable) |
+| ACP compact settling after compact dispatch or during self-compact's post-terminal decision window | Managed delivery waits while either independent settle clock is active; the dispatch-relative marker and self-compact phase each clear by their own rules. The target user's own sends and steers remain ungated | `compaction_settling` (retryable) |
 
 The running routes go through the target's own `submitPreparedUserTurn`, so a steer reaches the
 provider exactly as a local composer message would. What they never touch is composer state: no
