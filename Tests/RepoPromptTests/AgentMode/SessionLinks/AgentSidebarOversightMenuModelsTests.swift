@@ -225,8 +225,17 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertEqual(
             AgentSidebarCreatorNavigation.uniqueRoute(for: creatorID, candidates: [route]), route
         )
+        let sameTabInAnotherWindow = AgentSessionDeepLinkRoute(
+            windowID: 2, workspaceID: route.workspaceID, tabID: route.tabID, sessionID: creatorID
+        )
+        XCTAssertEqual(AgentSidebarCreatorNavigation.uniqueRoute(
+            for: creatorID, candidates: [route, sameTabInAnotherWindow]
+        ), route)
+        let differentTab = AgentSessionDeepLinkRoute(
+            workspaceID: route.workspaceID, tabID: UUID(), sessionID: creatorID
+        )
         XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
-            for: creatorID, candidates: [route, route]
+            for: creatorID, candidates: [route, differentTab]
         ))
         XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
             for: UUID(), candidates: [route]

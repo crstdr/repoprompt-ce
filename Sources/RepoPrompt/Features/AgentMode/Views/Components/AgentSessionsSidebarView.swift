@@ -11,7 +11,10 @@ enum AgentSidebarCreatorNavigation {
         candidates: [AgentSessionDeepLinkRoute]
     ) -> AgentSessionDeepLinkRoute? {
         let matches = candidates.filter { $0.sessionID == creatorSessionID }
-        return matches.count == 1 ? matches[0] : nil
+        guard let first = matches.first,
+              matches.allSatisfy({ $0.workspaceID == first.workspaceID && $0.tabID == first.tabID })
+        else { return nil }
+        return first
     }
 
     static func openIfAvailable(_ creatorSessionID: UUID) async {
@@ -20,7 +23,7 @@ enum AgentSidebarCreatorNavigation {
             .flatMap { window -> [AgentSessionDeepLinkRoute] in
                 AgentNavigationHUDSnapshotBuilder.currentWindowSnapshot(windowState: window)
                     .items.compactMap { item in
-                        guard item.sessionID == creatorSessionID, !item.isArchived else { return nil }
+                        guard item.sessionID == creatorSessionID else { return nil }
                         return AgentSessionDeepLinkRoute(
                             windowID: item.windowID,
                             workspaceID: item.workspaceID,
@@ -582,20 +585,18 @@ struct AgentModeSessionsListView: View {
                                 }
                             }
 
-                        let creatorSessionID = session.sessionID.flatMap {
-                            agentModeVM.agentSessionLinkLaneCreatorSessionID(for: $0)
+                        let creator = session.sessionID.flatMap {
+                            agentModeVM.agentSessionLinkLaneCreator(for: $0)
                         }
 
                         AgentSessionRow(
                             title: session.title,
                             isActive: session.tabID == currentTabID,
                             isOverseer: isOverseer,
-                            createdByLabel: session.sessionID.flatMap {
-                                agentModeVM.agentSessionLinkLaneCreatorLabel(for: $0)
-                            },
+                            createdByLabel: creator?.label,
                             onOpenCreator: {
                                 guard let targetSessionID = session.sessionID,
-                                      let creatorSessionID,
+                                      let creatorSessionID = creator?.sessionID,
                                       agentModeVM.agentSessionLinkLaneCreatorSessionID(for: targetSessionID)
                                       == creatorSessionID
                                 else { return }
@@ -1539,17 +1540,15 @@ struct ArchivedSessionsList: View {
                     tabID: stashed.tab.id
                 )
                 let stashedSessionID = sessionIDByStashedTabID[stashed.id]
-                let creatorSessionID = stashedSessionID.flatMap {
-                    agentModeVM.agentSessionLinkLaneCreatorSessionID(for: $0)
+                let creator = stashedSessionID.flatMap {
+                    agentModeVM.agentSessionLinkLaneCreator(for: $0)
                 }
                 AgentStashedSessionRow(
                     stashed: stashed,
-                    createdByLabel: stashedSessionID.flatMap {
-                        agentModeVM.agentSessionLinkLaneCreatorLabel(for: $0)
-                    },
+                    createdByLabel: creator?.label,
                     onOpenCreator: {
                         guard let stashedSessionID,
-                              let creatorSessionID,
+                              let creatorSessionID = creator?.sessionID,
                               agentModeVM.agentSessionLinkLaneCreatorSessionID(for: stashedSessionID)
                               == creatorSessionID
                         else { return }
