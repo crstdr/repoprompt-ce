@@ -208,8 +208,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .shuttingDown:
             "RepoPrompt is shutting down."
         case .managementRevoked:
-            "Your user withdrew management of this session before the steer was authorized. "
-                + "Nothing was delivered. Without management you may only observe and send."
+            "This exact link no longer authorizes steering. Nothing was delivered. Refresh `list` "
+                + "before retrying; an old session ID or grant is not authority."
         case .targetAwaitingInteraction:
             "The overseen session is waiting on a prompt. Inspect it with managed poll or wait and answer "
                 + "it with respond, or leave it for the session's user if it is manual-only. Nothing "

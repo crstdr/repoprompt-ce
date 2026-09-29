@@ -17,7 +17,7 @@ defect in this subsystem.
 
 | Owner | Responsibility | Where |
 | --- | --- | --- |
-| Link authority | Grants, capabilities (including the user's management delegation), generations, cursors, revocation. Process-memory. | `DomainAgentSessionLinkAuthority` |
+| Link authority | Grants, capabilities (including default management), generations, cursors, revocation. Process-memory. | `DomainAgentSessionLinkAuthority` |
 | Passive reducer | The canonical observer-local queue: first-to-final coalescing of target status edges plus separate, non-lossy attention occurrences. Owns no authority and performs no delivery. | `AgentSessionLinkPassiveStatusNotices` |
 | Claim / receipt | The immutable rendered batch a provider was actually sent, including exact attention occurrence identities, and what that provider's acceptance therefore acknowledges. | `AgentSessionLinkPromptContext` |
 | Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentModeViewModel+SessionLinkAutoWake` |
@@ -72,8 +72,11 @@ grant-level `manage` capability (see *Management is an authority-owned grant cap
 overseer answer and steer its target for its own user, and the full block says outright that it
 supersedes earlier observe-only wording — including refusals the overseer itself gave on the
 strength of that wording. Revision 8 moves managed prompt inspection into redacted `poll`/`wait`
-results and retires `get_interaction`; both inventory guidance and passive-lane guidance are
-re-owed when their wording revision changes, even if link membership did not.
+results and retires `get_interaction`. Revision 9 makes new and restored links managed by default;
+existing restricted links remain restricted. Revisions 10 (passive lane) and 4 (inventory) keep
+model-facing text focused on authority and trust while leaving operation-specific recovery with
+its result. Both kinds of guidance are re-owed when their wording revision changes, even if link
+membership did not.
 
 ### Feedback loops are an accepted consequence
 
@@ -194,61 +197,30 @@ eligible observer to add nor an existing relationship to unlink. A row may legit
 sidebar eyes at once; their fill, color, placement, interaction, tooltip, and directional
 accessibility wording must remain distinct.
 
-## Auto-approval is an exact link choice, saved with its oversight pair
+## Management is the default exact-grant capability
 
-The observer dashboard can opt an individual outbound link into automatic acceptance of the target's
-**provider permission prompts**, or select/deselect all links that are active at the instant of the
-bulk action. Every link starts off. The live selection is keyed by the exact observer endpoint, target
-endpoint, and generation-qualified link reference. It is not an Auto-wake preference or a
-provider-wide permission mode. The user's choice is also recorded on the saved observer → target
-oversight intent (`agentSessionOversightLinks.json`, optional `delegations` rows), so an app relaunch
-— or an explicit re-add of a pair that is still saved — re-applies it to the fresh grant through the
-same eligibility-checked setter. Stop, lifecycle end (tab/window close, workspace switch, rebind), and
-session deletion remove the saved pair and its delegation together, so a later link starts on manual
-approval; bulk selection never opts in a future link.
+Every newly created oversight link includes `.manage` on its exact, directional, revocable grant.
+This applies equally to an interactive Add, a restored saved pair, and an explicit re-add of a
+still-saved pair. The dashboard has no Manage toggle: the link itself is the user's delegation to
+observe, answer one-time prompts, and steer under the observer's own user's instructions. There is
+also no oversight Auto-approve control or listener; provider permission prompts remain manual unless
+the managed overseer explicitly responds to a particular eligible request.
 
-At a newly observed provider prompt, the target checks the selected link against the current authority
-grant and both live endpoint candidates, then checks its own exact session incarnation and pending
-request again after the authority hop. The listener tracks only newly presented request IDs, not the
-whole pending inventory, and survives MCP-control teardown such as managed Codex logout while the
-target session remains live. The response accepts only that one provider request. ACP additionally
-requires a genuine one-time allow option; if none exists, its prompt stays manual without changing
-the ordinary manual option-selection path. The ordinary manual path remains in place when no exact
-link is selected. User questions, MCP elicitation, Codex
-hook reviews, app-owned apply-edits and worktree-merge reviews, GitHub/destructive approvals, and
-unrelated app permission controls never call this gate. A permission request already pending when the
-choice is enabled remains manual; the setting applies to new prompts. Saved Auto-wake target selection
-is never promoted into permission authority: only the user's own auto-approval toggle on that exact
-pair is saved, and it is re-applied only to a grant the user's saved relationship re-created.
+The durable oversight document stores only observer → target UUID pairs. Older documents with a
+`delegations` key decode safely because unknown fields are ignored; those values are never applied,
+and the next successful mutation rewrites the document without them. No saved management or
+permission-auto-approval choice can silently override the current grant default or manufacture a
+reverse link. Explicitly restricted in-memory grants remain restricted and are not upgraded by an
+idempotent reservation. Unlink revokes the exact grant and its issued leases; re-adding creates a
+fresh managed generation, not a resurrection of the old one.
 
-## Management is an authority-owned grant capability
-
-Auto-approval never lets the observer *agent* choose anything; it blindly accepts new provider
-permission prompts. **Management** is the user's delegation of one exact target session to the
-observer: the overseer may then act for the user in that session — inspect and answer its pending
-prompts and direct its runs — through managed `agent_session_link` `poll`/`wait`, `respond`,
-and `steer`. It is not a second authority. It is the `.manage` capability on the exact grant in
-`DomainAgentSessionLinkAuthority`, so `list` capabilities, `poll`'s `managed` field, the
-prompt inventory's `managed="true"` rows, the dashboard's **Manage** checkbox, and every management
-fence all read the same record.
-
-| Property | Rule |
-| --- | --- |
-| Default | Off. `DomainAgentSessionLinkCapability.version1` never contains `.manage`; existing links behave exactly as before |
-| Change | Only an explicit user action on one exact link generation (`setManagement`), in place: the link keeps its ID, generation, cursors, waiters, queued send, and Auto-wake lane |
-| Lifetime | Lives on the grant, and the user's choice is saved with the observer → target oversight intent. A relaunch (or re-add of a still-saved pair) re-applies it to the fresh grant via `setManagement`, re-proving eligibility. Stop, lifecycle end, and deletion remove the saved pair and its delegation, returning any later link to watch-only; a Handoff/Fork's fresh grants never inherit it |
-| Granting | Requires both exact endpoints live and eligible now |
-| Withdrawing | Allowed whenever the grant exists, and effective at the next fence of any operation already in flight |
-| Independence | Neither management nor auto-approval implies the other |
-
-`respond` and `steer` authorize `.monitorRespond` or `.monitorSteer`, each requiring `.manage`.
-`poll` and `wait` retain their watch-level operation grants but disclose prompt bodies only after a
-separate whole-batch exact-grant Manage fence and live-endpoint check. A watch-only link receives a structured `management_not_granted` result
-(the bridge first re-proves the plain watch grant, so an unlinked UUID still gets the
-indistinguishable denial). Withdrawal applies at the fence, not at the next call: `validate(lease:)`
-fails once `.manage` leaves the grant, and a steer's ledger commit uses
-`commitSendAuthorization(requiresManagement: true)`, which refuses with `managementRevoked` and
-releases the uncommitted reservation.
+`respond` and `steer` still require `.manage` at every exact-grant fence. Managed `poll` and `wait`
+retain their watch-level operation grant but disclose prompt bodies only after a separate whole-batch
+management fence and live-endpoint check. A restricted link can still `poll` or `wait` for status
+with `managed: false` and no prompt body; `respond` and `steer` return `management_not_granted`.
+An unlinked UUID still receives the indistinguishable denial. A steer's ledger
+commit still uses `commitSendAuthorization(requiresManagement: true)`, and revocation before the final
+fence releases the uncommitted reservation without delivery.
 
 ### Inspecting and answering prompts
 
@@ -306,56 +278,6 @@ never chains: if A manages B and B manages C, A's words give B no authority over
 `send` keeps the byte-identical `bounded_coordination` framing, which still tells a target to leave
 permission decisions and prompts to its user. The transcript row stores the raw words with the
 ordinary cross-session attribution badge.
-
-### Mid-session changes reach the running overseer
-
-Authority and awareness are separate, and only authority is synchronous. Granting or withdrawing
-management changes the grant inside `DomainAgentSessionLinkAuthority.setManagement`; every
-management fence reads that grant, so a withdrawal is effective at the next fence of an operation
-already in flight and nothing waits for the model to find out. The same actor turn advances the
-observer's link-set revision, publishes `capabilitiesChanged`, and records one
-`DomainAgentSessionLinkCapabilityNotice` for the exact observer endpoint and link generation. The
-bridge refreshes both endpoints' projections inline (the change feed is lossy), so the dashboard row,
-the target's "Manages this session" disclosure, and the observer's prompt inventory update together.
-
-The notice is then owed to the running model and is delivered by the first channel that reaches it,
-at most once per claim:
-
-| Channel | Providers | Behavior |
-| --- | --- | --- |
-| Parked `wait` | All | Every wait the exact observer endpoint has parked — on any of its links — ends in the same actor turn with `capabilities_changed` and successor cursors that consume no target change; the first woken wait claims the notice in that same actor turn, so no other channel can take it first |
-| Any `agent_session_link` result | All | The next structured result for that endpoint carries `capability_notice`, including refusals such as `management_not_granted`; a thrown error carries nothing and leaves it owed |
-| Running-turn push | Codex only | One native `turn/steer` into the exact authoritative user turn, carrying the RepoPrompt-authored `<repoprompt_session_oversight_capability_change authored_by="RepoPrompt" from_user="false">` notice, after the Codex dispatch gate and a final authority currency check. No fallback queue, no retry onto another turn, no run-state, auth-retry, claim, or composer change. Acceptance appends a `.system` provenance row that names no session |
-| Next accepted dispatch | All | The re-owed inventory block states current capabilities; accepting a claim whose inventory revision is at or past the notice's settles it |
-
-A Claude-native overseer is not pushed to: its only mid-turn input path interrupts the turn and
-replays it as a new prompt, which is exactly the unintended new turn this must not create. ACP has
-no non-interrupting input path either. An idle overseer has no model running to tell, and one waiting
-on a prompt or on its next instruction is never steered. Those states **defer explicitly**: the
-dashboard row reports how the overseer will learn ("told in its running turn", "told at its next
-oversight call or turn", "starts its next turn with the new capabilities") and never claims awareness
-a provider did not confirm. A push the provider refuses hands the notice back, but only if it is still
-the newest change recorded for that exact link generation (each link keeps a latest-sequence
-watermark, so an older notice stays dead even after a newer one was claimed elsewhere and the grant
-reads the same again) and no accepted inventory has already stated it (a per-endpoint
-acknowledged-revision watermark). A revoked or relinked link's notice is dropped rather than
-delivered. The dashboard waits at most a short bound for a push; a slower provider call is reported
-as in progress and settles on its own, restoring the notice if the turn does not take it. A steer
-that Codex accepts into the thread's successor turn is still delivery to the running model, and its
-lifecycle bookkeeping is reconciled exactly as for a user steer that lands on a successor turn. The notice names only the target of that exact grant, reaches only that observer
-endpoint, and never reaches the target, so it cannot chain.
-
-Every channel carries the same text (`AgentSessionLinkPrompts.capabilityChangeNoticeText`): it
-says it is RepoPrompt's and not the user's, that it replaces anything said earlier including the
-overseer's own refusals, and that it is not a task. The inventory block is additive per-turn
-context — the base system prompt is never replaced — and opens with a "Current capabilities" line;
-its guidance also explains the three mid-turn channels. Lane guidance revision 7 is unchanged.
-Within a turn already running, every `poll`, `list`, and management result also carries the current
-`managed` state.
-
-The audit trail is the observer's persisted tool call and result (`answered_by_session_id`,
-`steered_by_session_id`) plus, for steer, the attributed transcript row on the target. A
-target-side row for `respond` remains a follow-up.
 
 ## Target-centric sidebar management stays exact
 

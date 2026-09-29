@@ -290,7 +290,6 @@ final class AgentTabSession: ObservableObject {
     }
 
     var mcpStateObservationCancellable: AnyCancellable?
-    var permissionAutoApprovalCancellable: AnyCancellable?
     var mcpControlCleanupTask: Task<Void, Never>?
     var mcpControlActivationGeneration: UInt64 = 0
     var mcpFollowUpRunPendingUpdatedAt: Date?

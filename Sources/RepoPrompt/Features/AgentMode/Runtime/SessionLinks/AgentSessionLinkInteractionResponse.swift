@@ -4,12 +4,12 @@ import RepoPromptDomainRuntime
 
 // Value types for managed pending-interaction inspection through `poll`/`wait` and explicit
 // answers through `respond`. Observation first authorizes exact watch leases; a final whole-batch
-// authority check proves current Manage before the bridge reads prompt bodies. Restricted grants
-// receive no body. Respond instead obtains a Manage lease and revalidates it at its final authority
+// authority check proves the exact grant still has `.manage` before the bridge reads prompt bodies.
+// Restricted grants receive no body. Respond instead obtains a `.manage` lease and revalidates it at its final authority
 // hop, then compares the exact current interaction ID before synchronous submission.
 //
-// Nothing here answers anything automatically. Provider permission auto-approval is a separate,
-// independent opt-in that never reaches questions or elicitations.
+// Nothing here answers anything automatically; every eligible response is one explicit,
+// request-scoped action by the managed observer.
 
 /// Why a pending interaction can be inspected but only answered by the target's own user.
 enum AgentSessionLinkInteractionManualOnlyReason: String, Equatable {
@@ -99,7 +99,7 @@ struct AgentSessionLinkPendingInteractionInspection: Equatable {
     }
 
     static let instructionWaitNote =
-        "The session is waiting for its next instruction rather than asking a question. Give it that instruction with steer."
+        "This session is waiting for its next instruction, not asking a question. If your user's instruction calls for it, use `steer` to direct this managed session."
 
     /// The exact redacted object measured for the hard cap and, if it fits, emitted on the wire.
     func projectedObject() -> [String: Value]? {
