@@ -175,15 +175,22 @@ extension AgentModeViewModel {
         return agentSessionLinkLaneCreatorLabel(creatorID: creatorID)
     }
 
-    func agentSessionLinkLaneCreatorLabel(for sessionID: UUID) -> String? {
+    func agentSessionLinkLaneCreatorSessionID(for sessionID: UUID) -> UUID? {
         let live = sessions.values.first { $0.activeAgentSessionID == sessionID }
-        let creatorID = live?.createdByOverseerSessionID
+        return live?.createdByOverseerSessionID
             ?? (
                 live?.hasLoadedPersistedState == true
                     ? nil : ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID
             )
-        guard let creatorID else { return nil }
-        return agentSessionLinkLaneCreatorLabel(creatorID: creatorID)
+    }
+
+    func agentSessionLinkLaneCreator(for sessionID: UUID) -> (sessionID: UUID, label: String)? {
+        guard let creatorID = agentSessionLinkLaneCreatorSessionID(for: sessionID) else { return nil }
+        return (creatorID, agentSessionLinkLaneCreatorLabel(creatorID: creatorID))
+    }
+
+    func agentSessionLinkLaneCreatorLabel(for sessionID: UUID) -> String? {
+        agentSessionLinkLaneCreator(for: sessionID)?.label
     }
 
     private func agentSessionLinkLaneCreatorLabel(creatorID: UUID) -> String {
