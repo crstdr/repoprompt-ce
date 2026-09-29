@@ -250,12 +250,8 @@ struct AgentMonitorPopoverView: View {
                 Button("Oversee session") { submit() }
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                     .disabled(!props.canAdd || preview == nil || isWorking)
+                    .hoverTooltip(AgentMonitorOversightDisclosure.boundary, .top)
             }
-
-            Text(AgentMonitorOversightDisclosure.outbound)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
 
             if let reason = props.canAddReason {
                 if reason != AgentSessionLinkEndpointEligibility.roleDeniedReason {
@@ -759,10 +755,6 @@ struct AgentMonitorPopoverView: View {
     private var inboundSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             sectionHeader("Overseen by")
-            Text(AgentMonitorOversightDisclosure.inbound)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
             ForEach(props.inbound) { row in
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.down.left")
