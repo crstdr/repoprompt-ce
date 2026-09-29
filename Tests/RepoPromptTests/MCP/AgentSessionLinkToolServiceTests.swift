@@ -13,6 +13,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
     func testEachOperationDeclaresExactlyItsDocumentedFields() {
         XCTAssertEqual(AgentSessionLinkMCPToolService.listKeys, ["op", "cursor", "max_items"])
+        XCTAssertEqual(AgentSessionLinkMCPToolService.createLaneKeys, [
+            "op", "idempotency_key", "role", "session_name", "workspace", "message",
+            "workflow_id", "workflow_name"
+        ])
+        XCTAssertEqual(AgentSessionLinkMCPToolService.retireLaneKeys, ["op", "session_id"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.pollKeys, ["op", "session_id", "session_ids"])
         XCTAssertEqual(
             AgentSessionLinkMCPToolService.waitKeys,
@@ -595,6 +600,199 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertTrue("\(a)".contains("No active session link"))
         XCTAssertTrue("\(a)".contains("refresh `list` once"))
         XCTAssertTrue("\(AgentSessionLinkMCPToolService.unavailableError)".contains("not available for this session"))
+    }
+
+    func testLaneOperationsRejectUnknownKeysAndWorkflowWithoutMessage() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-1"),
+                "session_id": .string(fixture.target.sessionID.uuidString)
+            ])
+            XCTFail("Expected create_lane to reject a target override")
+        } catch {
+            XCTAssertTrue("\(error)".contains("does not support 'session_id'"))
+        }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("retire_lane"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "message": .string("override")
+            ])
+            XCTFail("Expected retire_lane to reject a message")
+        } catch {
+            XCTAssertTrue("\(error)".contains("does not support 'message'"))
+        }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-2"),
+                "workflow_name": .string("Review")
+            ])
+            XCTFail("Expected workflow without message to fail")
+        } catch {
+            XCTAssertTrue("\(error)".contains("workflow requires message"))
+        }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-bad-role"),
+                "role": .string("unsupported")
+            ])
+            XCTFail("Expected an unknown role to fail")
+        } catch {
+            let message = "\(error)"
+            XCTAssertTrue(message.contains("role must be one of"))
+            for role in AgentModelCatalog.TaskLabelKind.allCases {
+                XCTAssertTrue(message.contains(role.rawValue))
+            }
+        }
+        let list = try await Self.executeObject(fixture.service, args: ["op": .string("list")])
+        XCTAssertEqual(list["items"]?.arrayValue?.first?.objectValue?["created_by_you"], .bool(false))
+        fixture.host.laneCreatorByEndpoint[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        let creatorList = try await Self.executeObject(fixture.service, args: ["op": .string("list")])
+        XCTAssertEqual(creatorList["items"]?.arrayValue?.first?.objectValue?["created_by_you"], .bool(true))
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-3"),
+                "workspace": .string("not-a-workspace")
+            ])
+            XCTFail("Expected an unlinked caller to be denied before workspace resolution")
+        } catch {
+            XCTAssertTrue("\(error)".contains("not available for this session"))
+        }
+    }
+
+    func testCreateLaneServiceReplaysReceiptAndRejectsConflictingDigest() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lane-service-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        fixture.bridge.installIntentStore(AgentSessionOversightIntentStore(
+            fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+            backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
+            mode: .enabled
+        ))
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let args: [String: Value] = [
+            "op": .string("create_lane"),
+            "idempotency_key": .string("service-replay-1"),
+            "session_name": .string("Service lane"),
+            "workspace": .string(workspace.name)
+        ]
+
+        let first = try await Self.executeObject(fixture.service, args: args)
+        let workspaceIndex = try XCTUnwrap(fixture.window.workspaceManager.workspaces.firstIndex {
+            $0.id == workspace.id
+        })
+        fixture.window.workspaceManager.workspaces[workspaceIndex].name = "Renamed after creation"
+        let replay = try await Self.executeObject(fixture.service, args: args)
+        XCTAssertEqual(first["result"], .string("created"))
+        XCTAssertEqual(replay["session_id"], first["session_id"])
+        XCTAssertEqual(replay["duplicate"], .bool(true))
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+
+        var conflictArgs = args
+        conflictArgs["session_name"] = .string("Different lane")
+        let conflict = try await Self.executeObject(fixture.service, args: conflictArgs)
+        XCTAssertEqual(conflict["result"], .string("idempotency_conflict"))
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+    }
+
+    func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let byName = AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: workspace.name.uppercased(), callerWindow: fixture.window
+        )
+        let byID = AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: workspace.id.uuidString, callerWindow: fixture.window
+        )
+        XCTAssertEqual(byName?.windowID, fixture.window.windowID)
+        XCTAssertEqual(byName?.workspaceID, workspace.id)
+        XCTAssertEqual(byID?.windowID, fixture.window.windowID)
+        XCTAssertNil(AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: UUID().uuidString, callerWindow: fixture.window
+        ))
+        let candidates = [
+            AgentSessionLaneMCPToolService.Destination(
+                windowID: 4, workspaceID: workspace.id, workspaceName: workspace.name
+            ),
+            AgentSessionLaneMCPToolService.Destination(
+                windowID: 2, workspaceID: workspace.id, workspaceName: workspace.name
+            ),
+            AgentSessionLaneMCPToolService.Destination(
+                windowID: 8, workspaceID: UUID(), workspaceName: "Other"
+            )
+        ]
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: workspace.id.uuidString, callerWindowID: 4
+        )?.windowID, 4)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: workspace.name, callerWindowID: 8
+        )?.windowID, 2)
+        let ambiguousName = candidates + [AgentSessionLaneMCPToolService.Destination(
+            windowID: 9, workspaceID: UUID(), workspaceName: workspace.name
+        )]
+        XCTAssertNil(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: ambiguousName, workspaceSelector: workspace.name, callerWindowID: 4
+        ))
+        let uuidShapedName = UUID()
+        XCTAssertNil(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: [AgentSessionLaneMCPToolService.Destination(
+                windowID: 10, workspaceID: UUID(), workspaceName: uuidShapedName.uuidString
+            )], workspaceSelector: uuidShapedName.uuidString, callerWindowID: 10
+        ))
+    }
+
+    func testLaneWorkspaceDigestUsesExactlyDestinationNameEquivalence() {
+        let plain = AgentSessionLaneMCPToolService.Destination(
+            windowID: 1, workspaceID: UUID(), workspaceName: "Cafe"
+        )
+        let accented = AgentSessionLaneMCPToolService.Destination(
+            windowID: 2, workspaceID: UUID(), workspaceName: "Café"
+        )
+        let candidates = [plain, accented]
+        func request(_ selector: String) -> AgentSessionLaneCreateRequest {
+            AgentSessionLaneCreateRequest(
+                idempotencyKey: "same-key", role: "pair", sessionName: nil,
+                workspaceSelector: selector, message: nil, workflowReference: nil
+            )
+        }
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: "CAFE", callerWindowID: 2
+        )?.workspaceID, plain.workspaceID)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: "Café", callerWindowID: 1
+        )?.workspaceID, accented.workspaceID)
+        XCTAssertEqual(request("Cafe").digest, request("CAFE").digest)
+        let decomposed = "Cafe\u{301}"
+        XCTAssertEqual(request("Café").digest, request(decomposed).digest)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: decomposed, callerWindowID: 1
+        )?.workspaceID, accented.workspaceID)
+        XCTAssertNotEqual(request("Cafe").digest, request("Café").digest)
+    }
+
+    func testIncompleteLaneReceiptPointsToOrdinaryAddWithoutReallocating() {
+        let sessionID = UUID()
+        let receipt = AgentSessionLaneCreateReceipt(
+            result: .creationIncomplete, sessionID: sessionID, sessionName: "Retained lane",
+            linked: false, reason: .addFailed, firstTask: .none, laneCount: 1
+        )
+        let rendered = AgentSessionLaneMCPToolService.render(receipt).objectValue
+        XCTAssertEqual(rendered?["session_id"]?.stringValue, sessionID.uuidString)
+        XCTAssertTrue(rendered?["recovery_hint"]?.stringValue?.contains("ordinary add") == true)
+        XCTAssertTrue(rendered?["recovery_hint"]?.stringValue?.contains(sessionID.uuidString) == true)
     }
 
     /// The missing-op and unsupported-op errors teach the same operation list the schema advertises.
@@ -1710,7 +1908,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         defer { fixture.tearDown() }
         for op in [
             "list", "poll", "wait", "read", "send", "cancel_pending_send", "set_waiting_on",
-            "snooze_auto_wake", "request_attention", "respond"
+            "snooze_auto_wake", "request_attention", "respond", "steer", "stop", "create_lane", "retire_lane"
         ] {
             XCTAssertTrue(
                 AgentSessionLinkMCPToolService.supportedOperationsSentence.contains(op),
@@ -2206,6 +2404,48 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
 
         var candidates: [AgentSessionLinkEndpointCandidate] = []
+        var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
+        private(set) var laneCreationCount = 0
+
+        func agentSessionLinkCreateLane(
+            destinationWindowID: Int,
+            workspaceID: UUID,
+            creatorSessionID: UUID,
+            sessionName: String?,
+            selection _: AgentSessionLanePolicy.RoleSelection
+        ) async throws -> AgentSessionLaneHostCreationOutcome {
+            laneCreationCount += 1
+            var lane = AgentSessionLinkEndpointCandidate(
+                windowID: destinationWindowID,
+                workspaceID: workspaceID,
+                tabID: UUID(),
+                sessionID: UUID(),
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: 1,
+                isTopLevel: true,
+                hasLoadedPersistedState: true,
+                bindingTransitionInProgress: false,
+                isClosing: false,
+                isMCPControlled: false,
+                isMCPOriginated: false,
+                roleAllowsOutboundMonitoring: true,
+                displayName: sessionName ?? "Lane",
+                providerDisplayName: "Codex CLI",
+                locationLabel: "worktree/main"
+            )
+            let token = AgentSessionRestorationBindingToken(
+                bindingIdentity: AgentPersistentSessionBindingIdentity(
+                    tabID: lane.tabID, sessionID: lane.sessionID,
+                    generation: lane.persistentBindingGeneration!
+                ),
+                bindingTransitionGeneration: lane.bindingTransitionGeneration
+            )
+            lane.restorationReadiness = .authoritative(token, .freshBindingDurablyCreated)
+            candidates.append(lane)
+            laneCreatorByEndpoint[lane.domainEndpoint] = creatorSessionID
+            return .created(sessionID: lane.sessionID, tabID: lane.tabID, bindingToken: token)
+        }
+
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
         var waitingOn: DomainAgentSessionWaitingOn?
         var publishedPromptInventories:
@@ -2220,6 +2460,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
             candidates
+        }
+
+        func agentSessionLinkLaneProvenance(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity
+        ) -> UUID? {
+            laneCreatorByEndpoint[endpoint]
         }
 
         func agentSessionLinkObservationSnapshot(

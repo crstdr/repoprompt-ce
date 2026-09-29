@@ -229,7 +229,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 11 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 12 supersedes"))
         // The rule revision 10 restates: a context taught it may only observe — and that may have
         // refused its own user on that basis — is told outright what replaced it.
         XCTAssertTrue(reOwed.fragment.contains("including anything said earlier in this conversation"))

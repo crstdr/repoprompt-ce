@@ -560,6 +560,8 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
     /// authority rechecks the predicate at activation, in the same actor turn that would insert the
     /// new grant, so revoking the previous final link cannot race this precondition.
     package let requiresExistingOutboundLink: Bool
+    /// Lane creation must still have an exact direct relationship when this grant activates.
+    package let requiresExistingDirectLink: Bool
     /// Advisory hint that this reservation is currently expected to install target observation.
     ///
     /// This is **not** authoritative. A reservation elected here can still be abandoned or
@@ -579,6 +581,7 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
         target: DomainAgentSessionLinkEndpointIdentity,
         capabilities: Set<DomainAgentSessionLinkCapability>,
         requiresExistingOutboundLink: Bool,
+        requiresExistingDirectLink: Bool = false,
         provisionallyInstallsTargetObservation: Bool,
         reservedAtAuthorityRevision: UInt64
     ) {
@@ -588,6 +591,7 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
         self.target = target
         self.capabilities = capabilities
         self.requiresExistingOutboundLink = requiresExistingOutboundLink
+        self.requiresExistingDirectLink = requiresExistingDirectLink
         self.provisionallyInstallsTargetObservation = provisionallyInstallsTargetObservation
         self.reservedAtAuthorityRevision = reservedAtAuthorityRevision
     }
@@ -645,6 +649,7 @@ package enum DomainAgentSessionLinkReservationRejection: String, Equatable, Send
     case targetBindingUnresolved = "target_binding_unresolved"
     case reservationAlreadyPending = "reservation_already_pending"
     case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
+    case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
 package enum DomainAgentSessionLinkActivationDisposition: Equatable, Sendable {
@@ -668,6 +673,7 @@ package enum DomainAgentSessionLinkActivationRejection: String, Equatable, Senda
     case endpointDrift = "endpoint_drift"
     case snapshotSessionMismatch = "snapshot_session_mismatch"
     case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
+    case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
 package enum DomainAgentSessionLinkRevocationDisposition: Equatable, Sendable {
