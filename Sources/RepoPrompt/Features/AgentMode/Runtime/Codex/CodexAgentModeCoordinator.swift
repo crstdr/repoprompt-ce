@@ -3057,7 +3057,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func fallbackSubmissionContext(
         _ context: AgentTabSession.CodexFallbackSubmissionContext?,
         text: String,
-        images: [AgentImageAttachment]
+        images: [AgentImageAttachment],
+        stopFence: AgentRunStartStopFence
     ) -> AgentTabSession.CodexFallbackSubmissionContext {
         context ?? .init(
             queueID: UUID(),
@@ -3067,7 +3068,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             draftText: text,
             optimisticUserItemID: nil,
             origin: .manual,
-            dispatchTicket: nil
+            dispatchTicket: nil,
+            stopFence: stopFence
         )
     }
 
@@ -3094,15 +3096,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         autoEffortApplied: Bool,
         attachmentReservationID: UUID?,
         reason: CodexTurnFallbackDecision,
-        controller: any CodexSessionControlling
+        controller: any CodexSessionControlling,
+        stopFence: AgentRunStartStopFence
     ) -> NativeSendOutcome {
+        guard stopFence.permitsStart(of: session) else { return .stale(reason: "Codex queued fallback was invalidated by Stop.") }
         guard let threadID = session.codexConversationID,
               let runID = session.runID,
               let runAttemptID = session.activeRunAttemptID
         else {
             return .stale(reason: "Codex could not queue fallback delivery because its run lineage changed.")
         }
-        let submission = fallbackSubmissionContext(context, text: text, images: images)
+        let submission = fallbackSubmissionContext(context, text: text, images: images, stopFence: stopFence)
         if session.codexFallbackQueue.contains(where: { $0.id == submission.queueID })
             || session.codexFallbackDispatchInFlight?.id == submission.queueID
         {
@@ -3137,7 +3141,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             originRunAttemptID: runAttemptID,
             blockingTurn: recoverableCodexFallbackBlockingTurn(session: session),
             state: .queued,
-            monitoringDispatchContext: AgentSessionLinkDispatchContext(session: session, dispatchID: .codexFallback(queueID: submission.queueID))
+            monitoringDispatchContext: AgentSessionLinkDispatchContext(session: session, dispatchID: .codexFallback(queueID: submission.queueID)),
+            stopFence: submission.stopFence ?? stopFence
         )
         detachCodexFallbackAttachmentReservation(attachmentReservationID, session: session)
         session.codexFallbackQueue.append(entry)
@@ -3271,7 +3276,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
               ObjectIdentifier(controller) == head.originControllerInstanceID,
               session.codexControllerGeneration == head.originControllerGeneration,
               session.codexConversationID == head.originThreadID,
-              session.runID == head.originRunID
+              session.runID == head.originRunID,
+              head.stopFence?.permitsStart(of: session) ?? true
         else { return nil }
         if beginsSuccessorAttempt {
             guard !session.runState.isActive else { return nil }
@@ -6876,12 +6882,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         text: String,
         attachments: [AgentImageAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
+        stopFence: AgentRunStartStopFence? = nil,
         attachmentReservationID: UUID? = nil,
         policyAlreadyInstalled: Bool = false,
         terminalizeRejectedSend: Bool = true,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async -> NativeSendOutcome {
+        let effectiveStopFence = stopFence ?? fallbackContext?.stopFence ?? AgentRunStartStopFence(session: session)
+        guard effectiveStopFence.permitsStart(of: session) else { return .cancelled }
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
         let isSelfNote = selfCompactDispatchID?.stage == .note
         if isSelfNote {
@@ -7123,7 +7132,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
-                controller: controller
+                controller: controller,
+                stopFence: effectiveStopFence
             )
         }
 
@@ -7677,7 +7687,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
-                controller: controller
+                controller: controller,
+                stopFence: effectiveStopFence
             )
         } catch {
             if acquiredAgentSessionLinkPhysicalDispatch {
@@ -8618,7 +8629,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             providerBuffersAreDrained: { [weak self] in
                 self?.codexTerminalBuffersAreDrained(session) == true
             },
-            postCommit: { [weak self] in
+            postCommit: { [weak self] _, _ in
                 guard let self else { return }
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 // Computer-use settlement runs first on purpose: when it replaces the controller the

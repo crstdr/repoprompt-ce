@@ -118,6 +118,8 @@ struct AgentDirectRunStartOptions: Equatable {
     /// One dedicated continuation-note turn; never an ordinary user send or a fallback queue item.
     var selfCompactDispatchID: AgentSelfCompactionDispatchID?
 
+    /// Captured at producer scheduling time so a prior Stop cannot bless deferred work.
+    var stopFence: AgentRunStartStopFence?
     var skipsUserAugmentation: Bool {
         isLaneUpdate || periodicWakeID != nil || providerControlCommand != nil || selfCompactDispatchID != nil
     }
@@ -126,8 +128,15 @@ struct AgentDirectRunStartOptions: Equatable {
         laneUpdateWakeID != nil
     }
 
-    static func periodicWake(wakeID: UUID) -> AgentDirectRunStartOptions {
-        AgentDirectRunStartOptions(ignoresPendingHandoff: true, periodicWakeID: wakeID)
+    static func periodicWake(
+        wakeID: UUID,
+        stopFence: AgentRunStartStopFence? = nil
+    ) -> AgentDirectRunStartOptions {
+        AgentDirectRunStartOptions(
+            ignoresPendingHandoff: true,
+            periodicWakeID: wakeID,
+            stopFence: stopFence
+        )
     }
 
     static let `default` = AgentDirectRunStartOptions()
@@ -152,8 +161,15 @@ struct AgentDirectRunStartOptions: Equatable {
     }
 
     /// Options for one automatic lane-update follow-up.
-    static func laneUpdate(wakeID: UUID) -> AgentDirectRunStartOptions {
-        AgentDirectRunStartOptions(ignoresPendingHandoff: true, laneUpdateWakeID: wakeID)
+    static func laneUpdate(
+        wakeID: UUID,
+        stopFence: AgentRunStartStopFence? = nil
+    ) -> AgentDirectRunStartOptions {
+        AgentDirectRunStartOptions(
+            ignoresPendingHandoff: true,
+            laneUpdateWakeID: wakeID,
+            stopFence: stopFence
+        )
     }
 }
 

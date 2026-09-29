@@ -137,6 +137,9 @@ struct AgentSessionLinkMCPToolService {
         case "steer":
             try validateAllowedKeys(args, op: op, allowed: Self.steerKeys)
             return try await executeSteer(args: args)
+        case "stop":
+            try validateAllowedKeys(args, op: op, allowed: Self.stopKeys)
+            return try await executeStop(args: args)
         default:
             let retiredInteractionHint = op == "get_interaction"
                 ? " Use `poll` or `wait` on the exact target to inspect `pending_interaction`; use `respond` only when it is respondable."
@@ -152,7 +155,7 @@ struct AgentSessionLinkMCPToolService {
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
         "Use list, poll, wait, read, send, cancel_pending_send, compact, set_waiting_on, snooze_auto_wake, "
-            + "request_attention, respond, or steer."
+            + "request_attention, respond, steer, or stop."
 
     private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
         let endpoint = try await resolveCallerEndpointIdentity()
@@ -345,6 +348,89 @@ struct AgentSessionLinkMCPToolService {
         return .object(payload)
     }
 
+    /// One-shot managed Stop. The app-owned cleanup outlives a disconnected MCP waiter.
+    private func executeStop(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        let targetSessionID = try Self.parseSingleSessionID(args["session_id"], op: "stop")
+        guard let rawKey = AgentMCPToolHelpers.normalizedString(args["idempotency_key"]) else {
+            throw MCPError.invalidParams(
+                "agent_session_link stop requires idempotency_key. Use a new key for a new Stop request."
+            )
+        }
+        let idempotencyKey = try Self.boundedIdempotencyKey(rawKey)
+        let target: AgentSessionLinkRuntimeBridge.AuthorizedTarget
+        switch try await authorizeManaged(
+            operation: .monitorStop,
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        ) {
+        case let .authorized(value): target = value
+        case .managementNotGranted:
+            return AgentSessionLinkResponseRenderer.managementNotGrantedValue(targetSessionID: targetSessionID)
+        }
+        let metadata = await captureRequestMetadata()
+        return try await withHeartbeat(
+            metadata.connectionID, toolName, "stop", "Stopping overseen session run"
+        ) {
+            let outcome = await bridge.stop(target: target, idempotencyKey: idempotencyKey)
+            return try Self.stopOutcomeValue(outcome, targetSessionID: targetSessionID)
+        }
+    }
+
+    nonisolated static func stopOutcomeValue(
+        _ outcome: AgentSessionLinkRuntimeBridge.StopOutcome,
+        targetSessionID: UUID
+    ) throws -> Value {
+        switch outcome {
+        case let .receipt(receipt):
+            var payload: [String: Value] = [
+                "result": .string(receipt.result.rawValue),
+                "session_id": .string(receipt.targetSessionID.uuidString)
+            ]
+            if receipt.duplicate { payload["duplicate"] = .bool(true) }
+            if receipt.result == .stopFailed {
+                payload["reason"] = .string(receipt.failureReason?.rawValue ?? "cancellation_unconfirmed")
+            }
+            if receipt.teardownCompleted == false {
+                payload["warning"] = .string("Local teardown was not confirmed; inspect the target before sending more work.")
+            } else if receipt.auditStatus == .failed || receipt.auditStatus == .unknown {
+                payload["warning"] = .string("The stop attribution row may not have been saved.")
+            }
+            return .object(payload)
+        case let .blocked(failure):
+            switch failure {
+            case .endpointInvalidated, .linkRevoked, .managementRevoked:
+                throw Self.denialError(targetSessionID: targetSessionID)
+            case .shuttingDown:
+                throw MCPError.internalError("RepoPrompt is shutting down.")
+            default:
+                return .object([
+                    "result": .string("target_busy"),
+                    "session_id": .string(targetSessionID.uuidString),
+                    "reason": .string(failure.rawValue)
+                ])
+            }
+        case .indeterminate:
+            return .object([
+                "result": .string("stop_failed"),
+                "session_id": .string(targetSessionID.uuidString),
+                "reason": .string("cancellation_unconfirmed"),
+                "retryable": .bool(false)
+            ])
+        case let .rejected(rejection):
+            switch rejection {
+            case .denied: throw Self.denialError(targetSessionID: targetSessionID)
+            case .shuttingDown: throw MCPError.internalError("RepoPrompt is shutting down.")
+            case .idempotencyConflict, .sendAlreadyInProgress, .deliveryLedgerFull,
+                 .deliveryLedgerExhausted:
+                return .object([
+                    "result": .string(rejection.rawValue),
+                    "session_id": .string(targetSessionID.uuidString)
+                ])
+            }
+        }
+    }
+
     static func parseSingleSessionID(_ value: Value?, op: String) throws -> UUID {
         guard let raw = AgentMCPToolHelpers.normalizedString(value),
               let sessionID = UUID(uuidString: raw)
@@ -500,6 +586,8 @@ struct AgentSessionLinkMCPToolService {
             targetSessionIDs: request.sessionIDs
         )
 
+        await bridge.refreshLaneBoardCensus(for: targets)
+
         var states: [DomainAgentSessionLinkTargetState] = []
         var pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:]
         var snoozes: [UUID: AgentSessionLinkAutoWakeSnoozeProjection] = [:]
@@ -593,6 +681,7 @@ struct AgentSessionLinkMCPToolService {
             observerEndpoint: observerEndpoint,
             targetSessionIDs: request.sessionIDs
         )
+        await bridge.refreshLaneBoardCensus(for: targets)
         let waitRequests = targets.map { target in
             DomainAgentSessionLinkWaitRequest(
                 lease: target.lease,
@@ -1406,6 +1495,7 @@ struct AgentSessionLinkMCPToolService {
     /// Deliberately no workflow, delivery mode, or queue flag: a steer is one instruction delivered
     /// now, into whatever the target is doing, under its own current settings.
     static let steerKeys: Set<String> = ["op", "session_id", "message", "idempotency_key"]
+    static let stopKeys: Set<String> = ["op", "session_id", "idempotency_key"]
     // The caller still comes only from server-owned run routing. `observer_session_id` is a selector
     // over that caller's exact inbound grants, never a caller identity or an authority claim.
 
@@ -1487,7 +1577,7 @@ struct AgentSessionLinkMCPToolService {
 /// executor resumes it, and so response shapes can be asserted without a window.
 enum AgentSessionLinkResponseRenderer {
     static let managementNotGrantedMessage =
-        "This exact link does not grant management. You may observe and send when `idle_for_send` is true, but cannot inspect or answer this session's prompts or steer it. Leave its prompts for its own user."
+        "This exact link does not grant management. You may observe and send when `idle_for_send` is true, but cannot inspect or answer this session's prompts, steer it, or stop its run. Leave its prompts for its own user."
 
     static func managementNotGrantedValue(targetSessionID: UUID) -> Value {
         .object([
@@ -1629,6 +1719,7 @@ enum AgentSessionLinkResponseRenderer {
             "name": AgentMCPToolHelpers.stringOrNull(snapshot.displayName),
             "provider": AgentMCPToolHelpers.stringOrNull(snapshot.providerDisplayName),
             "status": .string(snapshot.status.rawValue),
+            "board": laneBoardValue(snapshot.board),
             "idle_for_send": .bool(snapshot.idleForSend),
             "idle_since": snapshot.idleSince.map { .string(AgentMCPToolHelpers.timestamp($0)) } ?? .null,
             "waiting_on": snapshot.waitingOn.map { waitingOn in
@@ -1649,6 +1740,23 @@ enum AgentSessionLinkResponseRenderer {
             "change_sequence": .int(Int(clamping: state.changeSequence)),
             "context": contextLoadValue(snapshot.context)
         ])
+    }
+
+    static func laneBoardValue(_ board: DomainAgentSessionLaneBoard) -> Value {
+        var payload: [String: Value] = ["run_outcome": .string(board.runOutcome.rawValue)]
+        if let failureReason = board.failureReason {
+            payload["failure_reason"] = .string(failureReason.rawValue)
+        }
+        if !board.sendBlockers.isEmpty {
+            payload["send_blockers"] = .array(board.sendBlockers.map(Value.string))
+        }
+        if board.subagentRunning > 0 || board.subagentFinished > 0 {
+            payload["subagents"] = .object([
+                "running": .int(board.subagentRunning),
+                "finished": .int(board.subagentFinished)
+            ])
+        }
+        return .object(payload)
     }
 
     /// Target-global context load, or `null` when unknown. Always present, so a caller can tell
@@ -1928,7 +2036,7 @@ enum AgentSessionLinkResponseRenderer {
                 + "unknown whether the request was recorded. No compaction was started and this "
                 + "idempotency_key is spent. Read the session before requesting again."
         case .endpointInvalidated, .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
-             .noProviderSession, .managementRevoked, .targetAwaitingInteraction, .targetBusy,
+             .noProviderSession, .managementRevoked, .targetAwaitingInteraction, .targetBusy, .targetStopped,
              .steerUnavailable, .steerNotAccepted, .steerUnconfirmed:
             failure.message
         }

@@ -104,7 +104,7 @@ enum MonitorSupplementAssertions {
             )
         }
         for instruction in session.pendingInstructions {
-            XCTAssertFalse(instruction.contains(AgentSessionLinkPrompts.envelopeTag), file: file, line: line)
+            XCTAssertFalse(instruction.providerText.contains(AgentSessionLinkPrompts.envelopeTag), file: file, line: line)
         }
         for instruction in session.pendingACPSteeringInstructions {
             XCTAssertFalse(

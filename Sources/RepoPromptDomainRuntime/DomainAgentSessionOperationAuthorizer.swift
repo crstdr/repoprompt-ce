@@ -37,6 +37,8 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     case monitorRespond = "agent_session_link.respond"
     /// Steers the target: injects an instruction into its active run or starts its next turn.
     case monitorSteer = "agent_session_link.steer"
+    /// Cancels one exact target's current run or pending start under a Manage grant.
+    case monitorStop = "agent_session_link.stop"
 
     package enum Family: String, Hashable, Sendable {
         /// Existing spawn-provenance control and read operations.
@@ -52,7 +54,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
              .manageResume, .manageStop, .manageCleanup:
             .sessionControl
         case .monitorList, .monitorPoll, .monitorWait, .monitorRead, .monitorSend, .monitorCompact,
-             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer:
+             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop:
             .monitor
         }
     }
@@ -64,7 +66,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
         case .monitorList:
             true
         case .monitorPoll, .monitorWait, .monitorRead, .monitorSend, .monitorCompact,
-             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer,
+             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
              .manageList, .manageGetLog, .manageExtractHandoff,
              .manageResume, .manageStop, .manageCleanup:
@@ -86,7 +88,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
             .read
         case .monitorSend, .monitorCompact:
             .sendWhenIdle
-        case .monitorRespond, .monitorSteer:
+        case .monitorRespond, .monitorSteer, .monitorStop:
             .manage
         case .monitorList,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
@@ -100,7 +102,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     package var mutatesTarget: Bool {
         switch self {
         case .runCancel, .runSteer, .runRespond, .manageResume, .manageStop, .manageCleanup, .monitorSend, .monitorCompact,
-             .monitorRespond, .monitorSteer:
+             .monitorRespond, .monitorSteer, .monitorStop:
             true
         case .runPoll, .runWait, .manageList, .manageGetLog, .manageExtractHandoff,
              .monitorList, .monitorPoll, .monitorWait, .monitorRead,
