@@ -76,6 +76,8 @@ extension AgentModeViewModel {
               session.runID == origin.runID,
               session.activeRunOwnership?.attemptID == origin.runAttemptID
         else { return .unavailable }
+        let stopFence = AgentRunStartStopFence(session: session)
+        guard stopFence.permitsStart(of: session) else { return .unavailable }
 
         var candidate = session.selfCompactState
         let reservation = candidate.reserve(note: note, idempotencyKey: idempotencyKey)
@@ -111,7 +113,8 @@ extension AgentModeViewModel {
         guard sessions[endpoint.tabID] === session,
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.runID == origin.runID,
-              session.activeRunOwnership?.attemptID == origin.runAttemptID
+              session.activeRunOwnership?.attemptID == origin.runAttemptID,
+              stopFence.permitsStart(of: session)
         else { return .unavailable }
         guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
             return .blocked(reason: "session_not_exclusive")
@@ -139,7 +142,25 @@ extension AgentModeViewModel {
             endpoint: endpoint, runID: origin.runID, runAttemptID: origin.runAttemptID,
             note: note, idempotencyKey: idempotencyKey, support: support
         ) else { return .blocked(reason: "busy") }
-        guard case let .scheduled(attempt) = accepted else {
+        let attempt: AgentSelfCompactAttempt
+        switch accepted {
+        case let .scheduled(scheduled):
+            attempt = scheduled
+        case let .duplicate(requestID):
+            guard session.selfCompactAdmissionPendingID != requestID else {
+                return .blocked(reason: "persistence_pending")
+            }
+            if session.selfCompactState.active?.id == requestID,
+               agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID)
+            {
+                return .blocked(reason: "session_not_exclusive")
+            }
+            return .duplicate(requestID: requestID, status: session.selfCompactState.status)
+        case .conflict:
+            return .blocked(reason: "idempotency_conflict")
+        case .alreadyPending:
+            return .blocked(reason: "compact_already_pending")
+        case .invalidNote, .invalidIdempotencyKey:
             return .blocked(reason: "busy")
         }
         session.selfCompactAdmissionPendingID = attempt.id
@@ -160,7 +181,8 @@ extension AgentModeViewModel {
         }
         guard sessions[endpoint.tabID] === session,
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              session.selfCompactState.active?.id == attempt.id
+              session.selfCompactState.active?.id == attempt.id,
+              stopFence.permitsStart(of: session)
         else { return .blocked(reason: "busy") }
         guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
             var state = session.selfCompactState
@@ -209,6 +231,22 @@ extension AgentModeViewModel {
                 vouchedTokenCount: session.vouchedContextCount?.tokens
             )
         }
+    }
+
+    /// Shared user-Stop preparation retracts scheduled command and note producers before any
+    /// terminal callback can schedule them. Recovery retains the note without replaying it.
+    func agentSelfCompactCancelForUserStop(_ session: TabSession) {
+        guard session.selfCompactState.active != nil else { return }
+        session.selfCompactNativeCompletion?.cancelRuntimeWork()
+        session.selfCompactNativeCompletion = nil
+        session.selfCompactDispatchIsCurrent = { false }
+        session.selfCompactACPCommandItemIDs = nil
+        var state = session.selfCompactState
+        guard state.cancelForUserStop() else { return }
+        session.selfCompactState = state
+        updateBindingsFromSession(session)
+        scheduleSave(for: session)
+        requestUIRefresh(tabID: session.tabID, urgent: true)
     }
 
     func agentSelfCompactCancelForAcceptedLocalInput(_ session: TabSession) {
@@ -290,7 +328,9 @@ extension AgentModeViewModel {
               target.expectedSourceAgentSessionID == owner.sessionID
         else { return false }
         session.selfCompactDispatchIsCurrent = { [weak self, weak session] in
-            guard let self, let session else { return false }
+            guard let self, let session,
+                  session.selfCompactState.active?.id == requestID
+            else { return false }
             return agentSelfCompactOwnerIsCurrent(owner, session: session)
         }
         let attempt = AgentComposerSubmitAttempt(
@@ -337,6 +377,7 @@ extension AgentModeViewModel {
             ? session.codexConversationID : session.providerSessionID
         state.active?.usedTokensBeforeCompact = session.vouchedContextCount?.tokens
         session.selfCompactState = state
+        session.selfCompactNativeCompletion?.cancelRuntimeWork()
         session.selfCompactNativeCompletion = agentSelfCompactNativeCompletion(for: session)
         let result = await agentSessionLinkDispatchNativeCompact(
             session: session,

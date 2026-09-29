@@ -439,12 +439,21 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
         XCTAssertNil(fixture.session.vouchedContextCount, "The count vouch is invalidated at dispatch")
         XCTAssertEqual(fixture.session.vouchedContextWindow?.tokens, 1000)
         XCTAssertFalse(fixture.session.contextCountVouchAwaitsOccupancyReport, "The suspension ends with the turn")
+        XCTAssertTrue(fixture.session.isACPCompactSettling(), "Background compaction may outlive the command turn")
 
         // The revision the command skipped is still owed to the next ordinary turn.
         fixture.session.runState = .idle
         await run(fixture, message: "acp follow-up")
         XCTAssertEqual(fixture.harness.acceptedClaims.count, 2)
         XCTAssertTrue(fixture.session.acpController === liveController)
+    }
+
+    func testUserTypedAdvertisedCompactAlsoStartsManagedSettleWindow() async throws {
+        let fixture = try makeFixture()
+        await run(fixture, message: "initial turn")
+        fixture.session.runState = .idle
+        await run(fixture, message: "/compact")
+        XCTAssertTrue(fixture.session.isACPCompactSettling())
     }
 
     /// Devin's `/compact` is fire-and-forget: the prompt answer returns immediately with an empty
@@ -879,6 +888,78 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
             .noProviderSession,
             "A live session whose command list was never observed is unproven, not incapable"
         )
+    }
+
+    func testManagedSendAndCompactWaitForACPCompactionSettlement() async throws {
+        let fixture = try makeFixture()
+        let controller = try await installLiveController(fixture)
+        fixture.session.beginACPCompactSettling(
+            providerSessionID: fixture.session.providerSessionID ?? "", controller: controller,
+            settleSeconds: 90, scheduleDeadline: false
+        )
+        let candidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidate(
+            tabID: fixture.tabID, sessionID: fixture.sessionID,
+            tabName: "ACP lane", isWindowClosing: false
+        ))
+        let send = await fixture.viewModel.agentSessionLinkPerformSend(
+            to: candidate,
+            request: AgentSessionLinkSendRequest(
+                linkID: UUID(), linkGeneration: 1, observerEndpoint: request.observerEndpoint,
+                observerDisplayName: "Planning", message: "do not interrupt compact", workflow: nil
+            ),
+            liveness: { Self.liveLiveness }, commitAuthorization: { .committed }
+        )
+        XCTAssertEqual(send, .blocked(.compactionSettling))
+        let compactOutcome = try await compact(fixture)
+        XCTAssertEqual(compactOutcome, .blocked(.compactionSettling))
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
+    }
+
+    func testSelfCompactDecisionWindowKeepsManagedCompactionGateAfterDispatchHoldClears() async throws {
+        let fixture = try makeFixture()
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: "resume", idempotencyKey: "settle")
+        state.active?.phase = .acpSettling
+        fixture.session.selfCompactState = state
+        XCTAssertFalse(fixture.session.isACPCompactSettling())
+        let snapshot = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            session: fixture.session, endpointMatchesGrant: true, isClosing: false
+        )
+        XCTAssertTrue(snapshot.compactionSettling)
+        XCTAssertEqual(
+            AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(snapshot: snapshot),
+            .compactionSettling
+        )
+        let candidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidate(
+            tabID: fixture.tabID, sessionID: fixture.sessionID,
+            tabName: "ACP lane", isWindowClosing: false
+        ))
+        let send = await fixture.viewModel.agentSessionLinkPerformSend(
+            to: candidate,
+            request: AgentSessionLinkSendRequest(
+                linkID: UUID(), linkGeneration: 1, observerEndpoint: request.observerEndpoint,
+                observerDisplayName: "Planning", message: "wait for compact", workflow: nil
+            ),
+            liveness: { Self.liveLiveness }, commitAuthorization: { .committed }
+        )
+        XCTAssertEqual(send, .blocked(.compactionSettling))
+    }
+
+    func testSupersededSelfCompactCannotIssueDeferredACPCommand() throws {
+        let fixture = try makeFixture()
+        var state = AgentSelfCompactState()
+        let scheduled = state.reserve(note: "resume", idempotencyKey: "deferred-command")
+        guard case let .scheduled(attempt) = scheduled else { return XCTFail("expected reservation") }
+        state.active?.phase = .dispatchingCompact
+        fixture.session.selfCompactState = state
+        fixture.session.selfCompactDispatchIsCurrent = { true }
+        let dispatchID = AgentSelfCompactionDispatchID(requestID: attempt.id, stage: .compact)
+        XCTAssertTrue(fixture.session.selfCompactCommandDispatchIsCurrent(dispatchID))
+        fixture.session.selfCompactState.active?.phase = .parked
+        XCTAssertFalse(fixture.session.selfCompactCommandDispatchIsCurrent(dispatchID))
+        XCTAssertTrue(fixture.session.selfCompactNoteDispatchIsCurrent(
+            .init(requestID: attempt.id, stage: .note)
+        ), "The ordinary input may still carry the parked note")
     }
 
     func testAnAcceptedCompactionRecordsTheRequestAndRunsOnlyOnTheLiveSession() async throws {

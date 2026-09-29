@@ -112,6 +112,26 @@ final class AgentSelfCompactStateTests: XCTestCase {
         }
     }
 
+    func testUserStopRetractsEveryDeferredPhaseAndPreservesAttemptAmbiguity() throws {
+        for phase in AgentSelfCompactAttempt.Phase.allCases {
+            var state = AgentSelfCompactState()
+            let attempt = try XCTUnwrap(state.reserve(note: "resume exactly", idempotencyKey: "stop").scheduledAttempt)
+            state.active?.phase = phase
+            state.active?.noteDispatchStarted = phase == .dispatchingNote
+            XCTAssertTrue(state.cancelForUserStop(), "\(phase)")
+            XCTAssertNil(state.active, "\(phase)")
+            XCTAssertEqual(state.latest?.requestID, attempt.id, "\(phase)")
+            XCTAssertEqual(state.latest?.recoveryNote, "resume exactly", "\(phase)")
+            XCTAssertEqual(state.latest?.outcome, phase == .dispatchingNote ? .deliveryUnknown : .cancelled, "\(phase)")
+            XCTAssertEqual(
+                state.latest?.noteDelivery,
+                phase == .dispatchingNote ? .deliveryUnknown : .notSent,
+                "\(phase)"
+            )
+            XCTAssertFalse(state.cancelForUserStop(), "\(phase)")
+        }
+    }
+
     func testMalformedOptionalRecordsDoNotDiscardSession() throws {
         let base = try JSONEncoder().encode(AgentSession(name: "Still here", autoEditEnabled: true))
         for malformed in [

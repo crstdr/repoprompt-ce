@@ -724,6 +724,13 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         )
     }
 
+    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+        guard let viewModel = viewModelsByWindowID[candidate.windowID],
+              let session = viewModel.agentSessionLinkLiveSession(matching: candidate)
+        else { return nil }
+        return AgentRunStartStopFence(session: session)
+    }
+
     func agentSessionLinkPerformSend(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,

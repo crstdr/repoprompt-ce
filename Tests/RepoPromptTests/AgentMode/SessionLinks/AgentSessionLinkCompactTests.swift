@@ -949,6 +949,56 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         return .init(requestID: id, stage: .note)
     }
 
+    func testLateClaudeFailureCannotSettleSuccessorParkedNote() async throws {
+        let oldController = MonitorFakeNativeController()
+        let nextController = MonitorFakeNativeController()
+        let (viewModel, session, _, _) = try makeViewModel(controller: oldController)
+        session.providerSessionID = "monitor-native-session"
+        let oldIntent = try intent(for: session)
+        await oldController.holdNextUserMessage()
+        let oldSend = Task { @MainActor in
+            await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: session, text: "old input", attachments: [], intent: oldIntent,
+                allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await oldController.waitForHeldUserMessage()
+
+        session.claudeController = nextController
+        session.installRunID(UUID())
+        let nextIntent = try intent(for: session)
+        let dispatchID = try armSelfNote(session: session, note: "successor note")
+        var state = session.selfCompactState
+        state.active?.phase = .parked
+        state.active?.compactTurnSucceeded = true
+        session.selfCompactState = state
+        await nextController.holdNextUserMessage()
+        let nextSend = Task { @MainActor in
+            await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: session, text: "successor input", attachments: [], intent: nextIntent,
+                allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await nextController.waitForHeldUserMessage()
+        XCTAssertEqual(session.selfCompactState.active?.id, dispatchID.requestID)
+        XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, true)
+
+        await oldController.releaseHeldUserMessage(throwing: true)
+        let oldOutcome = await oldSend.value
+        XCTAssertEqual(oldOutcome, .superseded)
+        XCTAssertEqual(session.selfCompactState.active?.id, dispatchID.requestID)
+        XCTAssertEqual(session.selfCompactState.active?.phase, .dispatchingNote)
+        XCTAssertNil(session.selfCompactState.latest)
+
+        await nextController.releaseHeldUserMessage()
+        let nextOutcome = await nextSend.value
+        XCTAssertEqual(nextOutcome, .sent)
+        XCTAssertNil(session.selfCompactState.active)
+        XCTAssertEqual(session.selfCompactState.latest?.outcome, .noteAccepted)
+        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .system && $0.text.contains("restored") }), 1)
+    }
+
     func testDedicatedClaudeNoteSendsExactFrameAndAcknowledgesAtProviderSeam() async throws {
         let controller = MonitorFakeNativeController()
         let (viewModel, session, _, _) = try makeViewModel(controller: controller)
@@ -1003,6 +1053,63 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         XCTAssertEqual(session.draftText, "unsent draft")
         XCTAssertEqual(session.selectedWorkflow, workflow)
         XCTAssertEqual(session.pendingImageAttachments, [attachment])
+    }
+
+    func testLocalSubmissionParksDedicatedClaudeNoteBeforeProviderDispatch() async throws {
+        let controller = MonitorFakeNativeController()
+        let (viewModel, session, _, tabID) = try makeViewModel(controller: controller)
+        session.providerSessionID = "monitor-native-session"
+        let commandIntent = try intent(for: session)
+        let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        let command = AgentProviderControlCommand.compact(
+            expectedBinding: binding, expectedProviderConversation: "monitor-native-session"
+        )
+        let commandOutcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: session, text: command.providerText, attachments: [], intent: commandIntent,
+            allowsCatalogRouteControllerRecovery: false, providerControlCommand: command
+        )
+        XCTAssertEqual(commandOutcome, .sent)
+        let runIntent = try intent(for: session)
+        let note = "continue after compaction"
+        let frame = AgentSelfCompactNoteEnvelope.frame(note)
+        let dispatchID = try armSelfNote(session: session, note: note)
+        session.selfCompactNativeCompletion = AgentSelfCompactNativeCompletionCoordinator(
+            load: { session.selfCompactState }, store: { session.selfCompactState = $0 },
+            isCurrentOwner: { _ in true }, dispatchNote: { _, _ in false }
+        )
+        defer { session.selfCompactNativeCompletion = nil }
+
+        await controller.holdNextTurnInFlightCheck()
+        let dedicatedSend = Task { @MainActor in
+            await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: session, text: frame, attachments: [], intent: runIntent,
+                allowsCatalogRouteControllerRecovery: false, selfCompactDispatchID: dispatchID
+            )
+        }
+        await controller.waitForHeldTurnInFlightCheck()
+        // A waiting run queues this accepted input instead of dispatching it while the dedicated
+        // sender is held. Submission still crosses the production local-input ownership boundary.
+        session.runState = .waitingForUser
+        XCTAssertEqual(viewModel.submitUserTurn(text: "accepted local turn", tabID: tabID), .submitted)
+        XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
+        XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, false)
+
+        await controller.releaseHeldTurnInFlightCheck()
+        let dedicatedOutcome = await dedicatedSend.value
+        let messagesAfterDedicatedSend = await controller.sentMessages
+        XCTAssertEqual(dedicatedOutcome, .superseded)
+        XCTAssertEqual(messagesAfterDedicatedSend, ["/compact"])
+        XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
+
+        let ordinaryOutcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: session, text: "accepted local turn", attachments: [], intent: runIntent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        XCTAssertEqual(ordinaryOutcome, .sent)
+        let sent = await controller.sentMessages
+        XCTAssertEqual(sent, ["/compact", frame + "\n\naccepted local turn"])
+        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+        XCTAssertNil(session.selfCompactState.active)
     }
 
     func testDedicatedClaudeNoteRefusesLateLostWriterAndReleasesTheHold() async throws {

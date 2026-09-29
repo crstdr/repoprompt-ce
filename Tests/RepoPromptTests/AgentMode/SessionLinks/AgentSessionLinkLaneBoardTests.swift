@@ -145,6 +145,8 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             ("pending_acp_steering_instructions", \.hasPendingACPSteeringInstructions, true),
             ("pending_claude_steering_instructions", \.hasPendingClaudeSteeringInstructions, true),
             ("pending_auto_wake", \.hasPendingAutoWake, true),
+            ("stop_in_progress", \.stopInProgress, true),
+            ("compaction_settling", \.compactionSettling, true),
             ("pending_self_compact", \.hasPendingSelfCompact, true),
             ("candidate_closing", \.isCandidateClosing, true)
         ]
@@ -208,6 +210,26 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         let compacting = snapshot(for: session, candidate: target)
         XCTAssertFalse(compacting.idleForSend)
         XCTAssertEqual(compacting.board.sendBlockers, ["pending_self_compact"])
+    }
+
+    func testManagedStopGateAppearsOnPublishedBoardAndClearsAfterRelease() {
+        let tabID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        let target = candidate(tabID: tabID)
+        let binding = AgentPersistentSessionBindingIdentity(tabID: tabID, sessionID: target.sessionID)
+        session.installPersistentSessionBinding(binding)
+        let stopID = UUID()
+
+        XCTAssertTrue(session.stopState.claimManagedStop(id: stopID, binding: binding))
+        let stopping = snapshot(for: session, candidate: target)
+        XCTAssertFalse(stopping.idleForSend)
+        XCTAssertEqual(stopping.board.sendBlockers, ["stop_in_progress"])
+
+        XCTAssertTrue(session.stopState.releaseManagedStop(id: stopID, binding: binding))
+        let released = snapshot(for: session, candidate: target)
+        XCTAssertTrue(released.idleForSend)
+        XCTAssertTrue(released.board.sendBlockers.isEmpty)
     }
 
     func testCensusMergesLiveIndexAndPersistedBySessionIDThenDropsCleanedUpChildren() {

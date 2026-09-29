@@ -157,6 +157,9 @@ struct AgentSessionLinkMCPToolService {
         case "steer":
             try validateAllowedKeys(args, op: op, allowed: Self.steerKeys)
             return try await executeSteer(args: args)
+        case "stop":
+            try validateAllowedKeys(args, op: op, allowed: Self.stopKeys)
+            return try await executeStop(args: args)
         case "create_lane":
             try validateAllowedKeys(args, op: op, allowed: Self.createLaneKeys)
             return try await executeCreateLane(args: args)
@@ -178,7 +181,7 @@ struct AgentSessionLinkMCPToolService {
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
         "Use list, poll, wait, read, send, cancel_pending_send, compact, set_waiting_on, snooze_auto_wake, "
-            + "request_attention, respond, steer, create_lane, or retire_lane."
+            + "request_attention, respond, steer, stop, create_lane, or retire_lane."
 
     private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
         let endpoint = try await resolveCallerEndpointIdentity()
@@ -369,6 +372,89 @@ struct AgentSessionLinkMCPToolService {
         payload["managed"] = await .bool(bridge.managementIsGranted(for: target.lease))
         payload["steered_by_session_id"] = .string(observerEndpoint.sessionID.uuidString)
         return .object(payload)
+    }
+
+    /// One-shot managed Stop. The app-owned cleanup outlives a disconnected MCP waiter.
+    private func executeStop(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        let targetSessionID = try Self.parseSingleSessionID(args["session_id"], op: "stop")
+        guard let rawKey = AgentMCPToolHelpers.normalizedString(args["idempotency_key"]) else {
+            throw MCPError.invalidParams(
+                "agent_session_link stop requires idempotency_key. Use a new key for a new Stop request."
+            )
+        }
+        let idempotencyKey = try Self.boundedIdempotencyKey(rawKey)
+        let target: AgentSessionLinkRuntimeBridge.AuthorizedTarget
+        switch try await authorizeManaged(
+            operation: .monitorStop,
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        ) {
+        case let .authorized(value): target = value
+        case .managementNotGranted:
+            return AgentSessionLinkResponseRenderer.managementNotGrantedValue(targetSessionID: targetSessionID)
+        }
+        let metadata = await captureRequestMetadata()
+        return try await withHeartbeat(
+            metadata.connectionID, toolName, "stop", "Stopping overseen session run"
+        ) {
+            let outcome = await bridge.stop(target: target, idempotencyKey: idempotencyKey)
+            return try Self.stopOutcomeValue(outcome, targetSessionID: targetSessionID)
+        }
+    }
+
+    nonisolated static func stopOutcomeValue(
+        _ outcome: AgentSessionLinkRuntimeBridge.StopOutcome,
+        targetSessionID: UUID
+    ) throws -> Value {
+        switch outcome {
+        case let .receipt(receipt):
+            var payload: [String: Value] = [
+                "result": .string(receipt.result.rawValue),
+                "session_id": .string(receipt.targetSessionID.uuidString)
+            ]
+            if receipt.duplicate { payload["duplicate"] = .bool(true) }
+            if receipt.result == .stopFailed {
+                payload["reason"] = .string(receipt.failureReason?.rawValue ?? "cancellation_unconfirmed")
+            }
+            if receipt.teardownCompleted == false {
+                payload["warning"] = .string("Local teardown was not confirmed; inspect the target before sending more work.")
+            } else if receipt.auditStatus == .failed || receipt.auditStatus == .unknown {
+                payload["warning"] = .string("The stop attribution row may not have been saved.")
+            }
+            return .object(payload)
+        case let .blocked(failure):
+            switch failure {
+            case .endpointInvalidated, .linkRevoked, .managementRevoked:
+                throw Self.denialError(targetSessionID: targetSessionID)
+            case .shuttingDown:
+                throw MCPError.internalError("RepoPrompt is shutting down.")
+            default:
+                return .object([
+                    "result": .string("target_busy"),
+                    "session_id": .string(targetSessionID.uuidString),
+                    "reason": .string(failure.rawValue)
+                ])
+            }
+        case .indeterminate:
+            return .object([
+                "result": .string("stop_failed"),
+                "session_id": .string(targetSessionID.uuidString),
+                "reason": .string("cancellation_unconfirmed"),
+                "retryable": .bool(false)
+            ])
+        case let .rejected(rejection):
+            switch rejection {
+            case .denied: throw Self.denialError(targetSessionID: targetSessionID)
+            case .shuttingDown: throw MCPError.internalError("RepoPrompt is shutting down.")
+            case .idempotencyConflict, .sendAlreadyInProgress, .deliveryLedgerFull,
+                 .deliveryLedgerExhausted:
+                return .object([
+                    "result": .string(rejection.rawValue),
+                    "session_id": .string(targetSessionID.uuidString)
+                ])
+            }
+        }
     }
 
     static func parseSingleSessionID(_ value: Value?, op: String) throws -> UUID {
@@ -1530,6 +1616,7 @@ struct AgentSessionLinkMCPToolService {
     /// Deliberately no workflow, delivery mode, or queue flag: a steer is one instruction delivered
     /// now, into whatever the target is doing, under its own current settings.
     static let steerKeys: Set<String> = ["op", "session_id", "message", "idempotency_key"]
+    static let stopKeys: Set<String> = ["op", "session_id", "idempotency_key"]
     static let createLaneKeys: Set<String> = [
         "op", "idempotency_key", "role", "session_name", "workspace", "message",
         "workflow_id", "workflow_name"
@@ -1616,7 +1703,7 @@ struct AgentSessionLinkMCPToolService {
 /// executor resumes it, and so response shapes can be asserted without a window.
 enum AgentSessionLinkResponseRenderer {
     static let managementNotGrantedMessage =
-        "Your user has not granted you management of this session, so you may observe it and send messages when it is idle, but not inspect or answer its prompts or steer it. Leave its prompts for its own user; a newly added oversight link includes Manage."
+        "Your user has not granted you management of this session, so you may observe it and send messages when it is idle, but not stop it, steer it, or inspect or answer its prompts. Leave its prompts for its own user; a newly added oversight link includes Manage."
 
     static func managementNotGrantedValue(targetSessionID: UUID) -> Value {
         .object([
@@ -2071,7 +2158,8 @@ enum AgentSessionLinkResponseRenderer {
                 + "idempotency_key is spent. Read the session before requesting again."
         case .endpointInvalidated, .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
              .noProviderSession, .managementRevoked, .targetAwaitingInteraction, .targetBusy,
-             .steerUnavailable, .steerNotAccepted, .steerUnconfirmed:
+             .steerUnavailable, .steerNotAccepted, .steerUnconfirmed, .targetStopped,
+             .compactionSettling:
             failure.message
         }
     }

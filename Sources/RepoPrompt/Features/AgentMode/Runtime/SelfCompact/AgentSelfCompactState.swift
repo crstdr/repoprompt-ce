@@ -251,10 +251,10 @@ struct AgentSelfCompactState: Codable, Equatable {
         return true
     }
 
-    mutating func noteWillAttempt(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+    mutating func noteWillAttempt(_ dispatchID: AgentSelfCompactionDispatchID, dedicated: Bool = false) -> Bool {
         guard dispatchID.stage == .note,
               active?.id == dispatchID.requestID,
-              active?.phase == .dispatchingNote || active?.phase == .parked,
+              active?.phase == .dispatchingNote || (!dedicated && active?.phase == .parked),
               active?.noteDispatchStarted == false
         else { return false }
         let wasParked = active?.phase == .parked
@@ -323,6 +323,19 @@ struct AgentSelfCompactState: Codable, Equatable {
             recoveryNote: outcome == .noteAccepted ? nil : active.note
         )
         self.active = nil
+    }
+
+    /// Stop invalidates every deferred self-compact producer. A note that reached the physical
+    /// attempt seam is ambiguous; never claim it was unsent or retry it automatically.
+    @discardableResult
+    mutating func cancelForUserStop() -> Bool {
+        guard let active else { return false }
+        if active.noteDispatchStarted {
+            settle(.deliveryUnknown, noteDelivery: .deliveryUnknown, completionVerified: false)
+        } else {
+            settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+        }
+        return true
     }
 
     /// Every persisted phase, including parked, is inert after a process restart.

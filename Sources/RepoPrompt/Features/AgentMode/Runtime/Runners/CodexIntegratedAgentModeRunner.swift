@@ -23,14 +23,17 @@ final class CodexIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
+        stopFence: AgentRunStartStopFence? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
+        guard stopFence?.permitsStart(of: session) ?? true else { return .cancelled }
         let ownership: AgentRunOwnership
         let createdOwnership: Bool
         if let activeOwnership = session.activeRunOwnership {
             ownership = activeOwnership
             createdOwnership = false
         } else {
+            guard stopFence?.permitsStart(of: session) ?? true else { return .cancelled }
             ownership = session.beginRunAttempt(source: "codex")
             createdOwnership = true
             session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
@@ -49,6 +52,7 @@ final class CodexIntegratedAgentModeRunner {
             #if DEBUG || EDIT_FLOW_PERF
                 EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable, codexTurnMCPServerEnableState)
             #endif
+            guard stopFence?.permitsStart(of: session) ?? true else { return .cancelled }
             let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
             let execution = await CodexIntegratedRunExecutionAdapter.execute {
                 guard mcpServerReady else {
@@ -59,6 +63,7 @@ final class CodexIntegratedAgentModeRunner {
                     text: initialMessageForRun,
                     attachments: attachments,
                     fallbackContext: fallbackContext,
+                    stopFence: stopFence,
                     attachmentReservationID: attachmentReservationID,
                     terminalizeRejectedSend: createdOwnership,
                     autoEffortSelection: autoEffortSelection,

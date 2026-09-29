@@ -31,9 +31,13 @@ enum AgentSelfCompactParkedPrefix {
     }
 
     @MainActor
-    static func markAttempted(_ dispatchID: AgentSelfCompactionDispatchID, session: AgentTabSession) -> Bool {
+    static func markAttempted(
+        _ dispatchID: AgentSelfCompactionDispatchID,
+        session: AgentTabSession,
+        dedicated: Bool = false
+    ) -> Bool {
         var state = session.selfCompactState
-        guard state.noteWillAttempt(dispatchID) else { return false }
+        guard state.noteWillAttempt(dispatchID, dedicated: dedicated) else { return false }
         session.selfCompactState = state
         return true
     }

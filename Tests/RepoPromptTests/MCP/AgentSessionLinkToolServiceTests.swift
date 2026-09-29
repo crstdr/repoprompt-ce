@@ -59,6 +59,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ] {
             XCTAssertTrue(keys.isDisjoint(with: ["workflow_id", "workflow_name"]))
         }
+        XCTAssertEqual(AgentSessionLinkMCPToolService.stopKeys, ["op", "session_id", "idempotency_key"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.setWaitingOnKeys, ["op", "summary", "clear"])
         XCTAssertEqual(
             AgentSessionLinkMCPToolService.snoozeAutoWakeKeys,
@@ -438,6 +439,47 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         )
         let multiRow = try XCTUnwrap(multiWait["targets"]?.arrayValue?.first?.objectValue)
         XCTAssertEqual(multiRow["snapshot"]?.objectValue?["context"], expected)
+    }
+
+    // MARK: - stop
+
+    func testStopRoutedServiceRequiresOneKeyAndRejectsEveryExtra() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let targetID = fixture.target.sessionID.uuidString
+        for extra in ["session_ids", "message", "reason", "workflow_id", "delivery", "run_id"] {
+            do {
+                _ = try await fixture.service.execute(args: [
+                    "op": .string("stop"),
+                    "session_id": .string(targetID),
+                    "idempotency_key": .string("stop-key"),
+                    extra: .null
+                ])
+                XCTFail("Stop must reject even null \(extra)")
+            } catch {}
+        }
+        let invalidRequests: [[String: Value]] = [
+            ["op": .string("stop"), "session_id": .string(targetID)],
+            ["op": .string("stop"), "session_ids": .array([.string(targetID)]), "idempotency_key": .string("key")],
+            ["op": .string("stop"), "session_id": .string("not-a-uuid"), "idempotency_key": .string("key")]
+        ]
+        for args in invalidRequests {
+            do { _ = try await fixture.service.execute(args: args)
+                XCTFail("Malformed Stop accepted")
+            } catch {}
+        }
+        do {
+            _ = try await Self.executeObject(fixture.service, args: [
+                "op": .string("stop"), "session_id": .string(targetID),
+                "idempotency_key": .string("routed-stop")
+            ])
+            XCTFail("A stale target must use the same denial as a missing link")
+        } catch let error as MCPError {
+            let expected = AgentSessionLinkMCPToolService.denialError(
+                targetSessionID: fixture.target.sessionID
+            )
+            XCTAssertEqual("\(error)", "\(expected)")
+        }
     }
 
     // MARK: - compact
@@ -1984,6 +2026,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(steered["result"], .string("management_not_granted"))
         XCTAssertEqual(steered["managed"], .bool(false))
         XCTAssertEqual(steered["applied"], .bool(false))
+        let stopped = try await Self.executeObject(fixture.service, args: [
+            "op": .string("stop"),
+            "session_id": sessionID,
+            "idempotency_key": .string("restricted-stop")
+        ])
+        XCTAssertEqual(stopped["result"], .string("management_not_granted"))
         XCTAssertTrue(fixture.host.respondRequests.isEmpty)
         XCTAssertTrue(fixture.host.respondAuthorizations.isEmpty)
         XCTAssertTrue(fixture.host.steerRequests.isEmpty)
@@ -2201,6 +2249,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             rawTargetSessionID: second.sessionID.uuidString
         ) else { return XCTFail("Expected a second link") }
         fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let targetSession = AgentModeViewModel.TabSession(tabID: fixture.target.tabID)
+        targetSession.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(
+            tabID: fixture.target.tabID, sessionID: fixture.target.sessionID
+        ))
+        fixture.host.startStopSessions[fixture.target.sessionID] = targetSession
         let queued = try await Self.executeObject(fixture.service, args: [
             "op": .string("send"),
             "session_id": .string(fixture.target.sessionID.uuidString),
@@ -2565,6 +2618,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 bindingTransitionGeneration: 1
             ),
             targetSessionID: sessionID,
+            targetEndpoint: DomainAgentSessionLinkEndpointIdentity(
+                windowID: 2,
+                workspaceID: UUID(),
+                tabID: UUID(),
+                sessionID: sessionID,
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: 1
+            ),
             message: "first line\nsecond\u{7} line",
             idempotencyKey: "key-1",
             requestDigest: "digest",
@@ -2674,6 +2735,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(busy["delivered"], .bool(false))
         XCTAssertEqual(busy["retryable"], .bool(true))
 
+        guard case let .object(settling) = AgentSessionLinkResponseRenderer.sendBlockedValue(
+            .compactionSettling,
+            targetSessionID: sessionID
+        ) else { return XCTFail("Expected settle refusal") }
+        XCTAssertEqual(settling["result"], .string("compaction_settling"))
+        XCTAssertEqual(settling["delivered"], .bool(false))
+        XCTAssertEqual(settling["retryable"], .bool(true))
+
         guard case let .object(revoked) = AgentSessionLinkResponseRenderer.sendBlockedValue(
             .linkRevoked,
             targetSessionID: sessionID
@@ -2731,6 +2800,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     /// and bridge, not to re-test the bridge.
     private final class ReadReleaseHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
+        /// Queued-send tests opt in to a live session; endpoint-only fixtures stay fail-closed.
+        var startStopSessions: [UUID: AgentModeViewModel.TabSession] = [:]
         var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
         private(set) var laneCreationCount = 0
 
@@ -2787,6 +2858,13 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
             candidates
+        }
+
+        func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+            guard let session = startStopSessions[candidate.sessionID], session.tabID == candidate.tabID else {
+                return nil
+            }
+            return AgentRunStartStopFence(session: session)
         }
 
         func agentSessionLinkLaneProvenance(

@@ -115,6 +115,9 @@ struct AgentDirectRunStartOptions: Equatable {
     /// effort packaging, because any of those would turn a native command into inert prose.
     var providerControlCommand: AgentProviderControlCommand?
 
+    /// Captured at producer scheduling time so a prior Stop cannot bless deferred work.
+    var stopFence: AgentRunStartStopFence?
+
     /// One dedicated continuation-note turn; never an ordinary user send or a fallback queue item.
     var selfCompactDispatchID: AgentSelfCompactionDispatchID?
 
@@ -126,8 +129,15 @@ struct AgentDirectRunStartOptions: Equatable {
         laneUpdateWakeID != nil
     }
 
-    static func periodicWake(wakeID: UUID) -> AgentDirectRunStartOptions {
-        AgentDirectRunStartOptions(ignoresPendingHandoff: true, periodicWakeID: wakeID)
+    static func periodicWake(
+        wakeID: UUID,
+        stopFence: AgentRunStartStopFence? = nil
+    ) -> AgentDirectRunStartOptions {
+        AgentDirectRunStartOptions(
+            ignoresPendingHandoff: true,
+            periodicWakeID: wakeID,
+            stopFence: stopFence
+        )
     }
 
     static let `default` = AgentDirectRunStartOptions()
@@ -136,10 +146,14 @@ struct AgentDirectRunStartOptions: Equatable {
     static let crossSessionDelivery = AgentDirectRunStartOptions(ignoresPendingHandoff: true)
 
     /// Options for one overseer-requested provider control command.
-    static func providerControl(_ command: AgentProviderControlCommand) -> AgentDirectRunStartOptions {
+    static func providerControl(
+        _ command: AgentProviderControlCommand,
+        stopFence: AgentRunStartStopFence? = nil
+    ) -> AgentDirectRunStartOptions {
         AgentDirectRunStartOptions(
             ignoresPendingHandoff: true,
             providerControlCommand: command,
+            stopFence: stopFence,
             selfCompactDispatchID: command.selfCompactDispatchID
         )
     }
@@ -152,8 +166,15 @@ struct AgentDirectRunStartOptions: Equatable {
     }
 
     /// Options for one automatic lane-update follow-up.
-    static func laneUpdate(wakeID: UUID) -> AgentDirectRunStartOptions {
-        AgentDirectRunStartOptions(ignoresPendingHandoff: true, laneUpdateWakeID: wakeID)
+    static func laneUpdate(
+        wakeID: UUID,
+        stopFence: AgentRunStartStopFence? = nil
+    ) -> AgentDirectRunStartOptions {
+        AgentDirectRunStartOptions(
+            ignoresPendingHandoff: true,
+            laneUpdateWakeID: wakeID,
+            stopFence: stopFence
+        )
     }
 }
 

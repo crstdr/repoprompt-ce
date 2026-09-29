@@ -1400,7 +1400,7 @@ final class ClaudeAgentModeCoordinator {
                           active?.id == dispatchID.requestID,
                           active?.compactRunID == intent.runID,
                           active?.phase == .dispatchingCompact || active?.phase == .awaitingCompactTurn,
-                          session.selfCompactDispatchIsCurrent?() != false
+                          session.selfCompactCommandDispatchIsCurrent(dispatchID)
                     else { return .superseded }
                 }
                 // The last check before the write: the controller has no atomic idle-send, so this
@@ -1408,8 +1408,8 @@ final class ClaudeAgentModeCoordinator {
                 if let refusal = await controlCommandRefusal(providerControlCommand, controller: controller) {
                     return refusal
                 }
-                if providerControlCommand.selfCompactDispatchID != nil,
-                   session.selfCompactDispatchIsCurrent?() == false
+                if let dispatchID = providerControlCommand.selfCompactDispatchID,
+                   !session.selfCompactCommandDispatchIsCurrent(dispatchID)
                 {
                     return .superseded
                 }
@@ -1455,7 +1455,7 @@ final class ClaudeAgentModeCoordinator {
                       session.selfCompactNoteDispatchIsCurrent(dispatchID)
                 else { return .superseded }
                 var state = session.selfCompactState
-                guard state.noteWillAttempt(dispatchID) else { return .superseded }
+                guard state.noteWillAttempt(dispatchID, dedicated: true) else { return .superseded }
                 session.selfCompactState = state
                 hostCapabilities.scheduleSave(session)
                 do {
@@ -1485,6 +1485,7 @@ final class ClaudeAgentModeCoordinator {
                 }
             }
 
+            var attemptedParkedNoteID: AgentSelfCompactionDispatchID?
             do {
                 let outboundText = hostCapabilities.prependPendingHandoff(text, session)
                 var selfCompactState = session.selfCompactState
@@ -1533,6 +1534,7 @@ final class ClaudeAgentModeCoordinator {
                     var state = session.selfCompactState
                     guard state.noteWillAttempt(parked.dispatchID) else { return .superseded }
                     session.selfCompactState = state
+                    attemptedParkedNoteID = parked.dispatchID
                     hostCapabilities.scheduleSave(session)
                 }
                 let turnID = try await controller.sendUserMessage(providerBoundText)
@@ -1572,12 +1574,9 @@ final class ClaudeAgentModeCoordinator {
                 session.claudeExpectedTurnIDs.insert(turnID)
                 return .sent
             } catch {
-                if let parked = session.selfCompactState.active.flatMap({ attempt -> AgentSelfCompactionDispatchID? in
-                    attempt.noteWasPrepended == true && attempt.noteDispatchStarted
-                        ? .init(requestID: attempt.id, stage: .note) : nil
-                }) {
+                if let attemptedParkedNoteID {
                     var state = session.selfCompactState
-                    _ = state.noteTransportFailed(parked)
+                    _ = state.noteTransportFailed(attemptedParkedNoteID)
                     session.selfCompactState = state
                     hostCapabilities.scheduleSave(session)
                 }

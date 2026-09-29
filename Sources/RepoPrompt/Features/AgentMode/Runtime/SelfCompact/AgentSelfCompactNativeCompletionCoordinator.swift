@@ -24,6 +24,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
     private var holdTask: Task<Void, Never>?
     private var noteTask: Task<Void, Never>?
     private var compactBoundAt: [UUID: ContinuousClock.Instant] = [:]
+    private var acpCommandPromptDurations: [UUID: Duration] = [:]
     private var acpTeardownSettled: (@MainActor () -> Bool)?
 
     init(
@@ -75,6 +76,13 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         return true
     }
 
+    /// Command-call duration excludes controller setup and terminal publication. Those delays
+    /// cannot decide whether an ACP slash command had the fire-and-forget shape.
+    func recordACPCommandPromptDuration(requestID: UUID, duration: Duration) {
+        guard load().active?.id == requestID else { return }
+        acpCommandPromptDurations[requestID] = duration
+    }
+
     /// The ACP row baseline is consumed only for this accepted command turn. An unrelated,
     /// duplicate, or rejected publication must leave it available for the real terminal.
     func acceptsCompactTerminal(
@@ -105,7 +113,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
               attempt.compactRunID == revision.expectedRunID,
               attempt.compactRunAttemptID == revision.ownership.attemptID
         else { return }
-        guard case .accepted(successorEpoch: nil) = publication else {
+        guard case .accepted = publication else {
             if case .rejected = publication { return }
             deadlineTask?.cancel()
             state.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
@@ -118,7 +126,16 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             store(state)
             return
         }
-        guard revision.successorKind == nil else {
+        guard revision.successorKind == nil, publication.successorEpoch == nil else {
+            // An accepted successor owns the next input. Carry the note there rather than
+            // manufacturing a competing maintenance turn or demoting it to recovery only.
+            state.active?.compactTurnSucceeded = revision.terminalState == .completed
+            if attempt.admittedSupport == .acpAdvertisedCommand {
+                state.active?.acpCompletionUnverified = AgentSelfCompactInstantReturn.isVouchedDrop(
+                    before: attempt.usedTokensBeforeCompact,
+                    current: vouchedTokenCount
+                ) ? nil : true
+            }
             state.active?.phase = .parked
             store(state)
             return
@@ -237,7 +254,8 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             return
         }
         let instant = AgentSelfCompactInstantReturn.isInstantReturn(
-            elapsed: elapsedSinceCompactBind(requestID),
+            elapsed: acpCommandPromptDurations.removeValue(forKey: requestID)
+                ?? elapsedSinceCompactBind(requestID),
             assistantOrToolRowCount: assistantOrToolRowCount
         )
         guard instant else {

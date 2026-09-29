@@ -116,6 +116,7 @@ extension AgentModeViewModel {
         guard let session = agentSessionLinkLiveSession(matching: candidate) else {
             return .blocked(.endpointInvalidated)
         }
+        let stopFence = AgentRunStartStopFence(session: session)
         let admissionLiveness = liveness()
         guard admissionLiveness.permitsDelivery else {
             return .blocked(.endpointInvalidated)
@@ -123,15 +124,14 @@ extension AgentModeViewModel {
 
         // 2. Pure readiness admission, then provider support. Readiness first, so a busy or waiting
         //    target reads `target_not_idle` regardless of its provider.
-        let admission = AgentSessionLinkDeliveryReadiness.evaluate(
+        if let failure = AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: admissionLiveness.targetEndpointIsLive,
                 isClosing: admissionLiveness.targetWindowIsClosing
             )
-        )
-        if case let .blocked(reason) = admission {
-            return .blocked(AgentSessionLinkSendFailure(reason))
+        ) {
+            return .blocked(failure)
         }
         if Self.agentSessionLinkCompactHasQueuedProviderWork(session) {
             return .blocked(.targetNotIdle)
@@ -189,22 +189,22 @@ extension AgentModeViewModel {
         let postCommitLiveness = liveness()
         guard agentSessionLinkLiveSession(matching: candidate) === liveSession,
               postCommitLiveness.permitsDelivery,
+              stopFence.permitsStart(of: liveSession),
               composerSubmitClaimIsCurrent(claim)
         else {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointInvalidated)
         }
-        let postCommitAdmission = AgentSessionLinkDeliveryReadiness.evaluate(
+        if let failure = AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: postCommitLiveness.targetEndpointIsLive,
                 isClosing: postCommitLiveness.targetWindowIsClosing,
                 ignoresComposerSubmissionInFlight: true
             )
-        )
-        if case let .blocked(reason) = postCommitAdmission {
+        ) {
             releaseComposerSubmitClaim(claim)
-            return .blocked(AgentSessionLinkSendFailure(reason))
+            return .blocked(failure)
         }
         if Self.agentSessionLinkCompactHasQueuedProviderWork(liveSession) {
             releaseComposerSubmitClaim(claim)
@@ -264,21 +264,21 @@ extension AgentModeViewModel {
               agentSessionLinkLiveSession(matching: candidate) === liveSession,
               dispatchLiveness.permitsDelivery,
               composerSubmitClaimIsCurrent(claim),
+              stopFence.permitsStart(of: liveSession),
               workspaceManager?.activeWorkspace?.id == candidate.workspaceID,
               dispatchSupport == support
         else {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
-        let dispatchAdmission = AgentSessionLinkDeliveryReadiness.evaluate(
+        if AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,
                 isClosing: dispatchLiveness.targetWindowIsClosing,
                 ignoresComposerSubmissionInFlight: true
             )
-        )
-        if case .blocked = dispatchAdmission {
+        ) != nil {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
@@ -302,6 +302,7 @@ extension AgentModeViewModel {
                       agentSessionLinkLiveSession(matching: candidate) === liveSession,
                       current.permitsDelivery,
                       composerSubmitClaimIsCurrent(claim),
+                      stopFence.permitsStart(of: liveSession),
                       workspaceManager?.activeWorkspace?.id == candidate.workspaceID
                 else { return false }
                 return AgentSessionLinkDeliveryReadiness.evaluate(
@@ -312,7 +313,8 @@ extension AgentModeViewModel {
                         ignoresComposerSubmissionInFlight: true
                     )
                 ) == .ready && !Self.agentSessionLinkCompactHasQueuedProviderWork(liveSession)
-            }
+            },
+            stopFence: stopFence
         )
         if dispatch == .notStarted {
             releaseComposerSubmitClaim(claim)
@@ -337,9 +339,12 @@ extension AgentModeViewModel {
         tabID: UUID,
         support: AgentSessionLinkCompactSupport,
         isStillAdmissible: @escaping @MainActor () -> Bool,
-        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        stopFence: AgentRunStartStopFence? = nil
     ) async -> AgentNativeCompactDispatchResult {
-        guard isStillAdmissible(), await agentSessionLinkCompactSupport(for: session) == support,
+        guard stopFence?.permitsStart(of: session) ?? true,
+              isStillAdmissible(), await agentSessionLinkCompactSupport(for: session) == support,
+              stopFence?.permitsStart(of: session) ?? true,
               isStillAdmissible()
         else { return .notStarted }
         switch support {
@@ -351,7 +356,7 @@ extension AgentModeViewModel {
                 selfCompactDispatchID: selfCompactDispatchID,
                 isStillAdmissible: { [weak self] in
                     guard let self else { return false }
-                    return isStillAdmissible()
+                    return (stopFence?.permitsStart(of: session) ?? true) && isStillAdmissible()
                 }
             )
             switch start {
@@ -373,7 +378,7 @@ extension AgentModeViewModel {
             _ = await startAgentRun(
                 tabID: tabID,
                 initialMessage: command.providerText,
-                directStartOptions: .providerControl(command),
+                directStartOptions: .providerControl(command, stopFence: stopFence),
                 startOutcome: recorder
             )
             return recorder.outcome.didStart ? .started : .startFailed

@@ -62,6 +62,17 @@ final class AgentTabSession: ObservableObject {
     }
 
     @Published var runningStatusText: String? = nil
+    /// Ephemeral cancellation generation and managed-stop gate; never persisted.
+    var stopState = AgentRunStopState() {
+        didSet {
+            if oldValue.cancellationGeneration != stopState.cancellationGeneration
+                || oldValue.activeManagedStopID != stopState.activeManagedStopID
+            {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
     var activeAgentRunStartedAt: Date?
 
     /// Last Jev effort choice submitted for this tab, plus a transient in-flight indication.
@@ -322,8 +333,26 @@ final class AgentTabSession: ObservableObject {
     /// when MCP control is active, `.userConfigured` otherwise.
     var permissionProfile: AgentModeViewModel.AgentPermissionProfile = .userConfigured
 
+    typealias PendingInstruction = AgentRunPendingInstruction
+
+    /// An ACP fallback handed to the scheduled-start task but not yet accepted by a provider.
+    /// Stop owns every queued local recovery payload until that start is accepted or withdrawn.
+    struct ScheduledACPFollowUp {
+        struct QueuedInstruction {
+            let instruction: PendingInstruction
+            let stopFence: AgentRunStartStopFence
+        }
+
+        let id: UUID
+        let instruction: PendingInstruction
+        let stopFence: AgentRunStartStopFence
+        var queuedInstructions: [QueuedInstruction] = []
+    }
+
+    var scheduledACPFollowUp: ScheduledACPFollowUp?
+
     /// Instruction queue for when user sends while agent is not waiting (shared across all runners)
-    var pendingInstructions: [String] = [] {
+    var pendingInstructions: [PendingInstruction] = [] {
         didSet {
             if oldValue.count != pendingInstructions.count {
                 noteMonitorObservationInputsChanged()
@@ -367,6 +396,13 @@ final class AgentTabSession: ObservableObject {
     var claudeSteeringFlushTask: Task<Void, Never>?
 
     /// ACP steering queue — carries text accepted for serialized live steering.
+    struct ACPSteeringManagedContext {
+        let sink: AgentSessionLinkManagedSteerSink
+        let attributedItemID: UUID
+        let candidate: AgentSessionLinkEndpointCandidate
+        let attribution: AgentCrossSessionAttribution
+    }
+
     struct ACPSteeringInstruction: Identifiable {
         let id: UUID
         /// The ACP process run this steering message was queued against.
@@ -386,6 +422,30 @@ final class AgentTabSession: ObservableObject {
         /// The optimistic user bubble we appended (for potential removal on failure).
         let optimisticUserItemID: UUID?
         let createdAt: Date
+        var managed: ACPSteeringManagedContext?
+    }
+
+    /// Lifecycle disposal withdraws only rows from the exact binding that accepted the steer.
+    /// A queued-follow-up receipt is already settled and no longer lives in this steering queue.
+    func settlePendingManagedACPSteeringAsNotAccepted() {
+        for instruction in pendingACPSteeringInstructions {
+            guard let managed = instruction.managed else { continue }
+            let candidate = managed.candidate
+            if tabID == candidate.tabID,
+               activeAgentSessionID == candidate.sessionID,
+               persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration,
+               bindingTransitionGeneration == candidate.bindingTransitionGeneration,
+               let index = items.firstIndex(where: {
+                   $0.id == managed.attributedItemID
+                       && $0.crossSessionAttribution == managed.attribution
+               })
+            {
+                _ = removeItem(at: index)
+            }
+            managed.sink.resolve(.notAccepted(
+                message: "The ACP steer was withdrawn before the provider accepted it."
+            ))
+        }
     }
 
     var pendingACPSteeringInstructions: [ACPSteeringInstruction] = [] {
@@ -398,6 +458,8 @@ final class AgentTabSession: ObservableObject {
 
     /// Task that drains `pendingACPSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
     var acpSteeringFlushTask: Task<Void, Never>?
+    /// Identifies the owner so a cancelled old flush cannot clear a successor task on unwind.
+    var acpSteeringFlushID: UUID?
 
     /// Number of upcoming turnCompleted events that should be treated as intermediate
     /// because we successfully queued a follow-up prompt during the same run.
@@ -549,6 +611,7 @@ final class AgentTabSession: ObservableObject {
         let optimisticUserItemID: UUID?
         let origin: CodexFallbackOrigin
         let dispatchTicket: UInt64?
+        var stopFence: AgentRunStartStopFence?
     }
 
     struct CodexFallbackBlockingTurn: Equatable {
@@ -595,6 +658,7 @@ final class AgentTabSession: ObservableObject {
         var blockingTurn: CodexFallbackBlockingTurn?
         var state: CodexFallbackQueueState
         var monitoringDispatchContext: AgentSessionLinkDispatchContext?
+        var stopFence: AgentRunStartStopFence?
     }
 
     var codexPendingTurnKind: CodexTurnKind?
@@ -691,6 +755,7 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
+                clearACPCompactSettling()
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
@@ -778,8 +843,13 @@ final class AgentTabSession: ObservableObject {
     var attachmentsPendingProviderConsumptionCleanup: [AgentImageAttachment] = []
     var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
 
-    // Provider session ID for resumption (e.g., Claude CLI session_id)
-    var providerSessionID: String?
+    /// Provider session ID for resumption (e.g., Claude CLI session_id)
+    var providerSessionID: String? {
+        didSet {
+            if providerSessionID != oldValue { clearACPCompactSettling() }
+        }
+    }
+
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
     var automationTurnAudit: [AgentAutomationTurnAudit] = []
@@ -912,6 +982,74 @@ final class AgentTabSession: ObservableObject {
 
     var acpOccupancyReportThisTurn: ContextOccupancyEpoch?
 
+    /// A compact command may finish its RepoPrompt turn before the provider finishes compacting.
+    /// Runtime-only and qualified by both controller and provider conversation.
+    struct ACPCompactSettlingMarker {
+        let providerSessionID: String
+        let controllerID: ObjectIdentifier
+        let dispatchedAt: Date
+        let deadline: Date
+        let priorUsedTokens: Int?
+    }
+
+    private(set) var acpCompactSettling: ACPCompactSettlingMarker?
+    private var acpCompactSettleDeadlineTask: Task<Void, Never>?
+    nonisolated static let acpCompactSettleSeconds: TimeInterval = 90
+
+    func beginACPCompactSettling(
+        providerSessionID: String,
+        controller: ACPAgentSessionController,
+        now: Date = Date(),
+        settleSeconds: TimeInterval = AgentTabSession.acpCompactSettleSeconds,
+        scheduleDeadline: Bool = true
+    ) {
+        guard selectedAgent.acpProviderID != nil,
+              acpController === controller,
+              self.providerSessionID == providerSessionID
+        else { return }
+        let marker = ACPCompactSettlingMarker(
+            providerSessionID: providerSessionID,
+            controllerID: ObjectIdentifier(controller),
+            dispatchedAt: now,
+            deadline: now.addingTimeInterval(settleSeconds),
+            priorUsedTokens: contextUsageSnapshot?.used
+        )
+        acpCompactSettleDeadlineTask?.cancel()
+        acpCompactSettling = marker
+        noteMonitorObservationInputsChanged()
+        guard scheduleDeadline else { return }
+        acpCompactSettleDeadlineTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, settleSeconds) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            _ = self?.isACPCompactSettling(now: Date())
+        }
+    }
+
+    func clearACPCompactSettling(
+        providerSessionID: String? = nil,
+        controller: ACPAgentSessionController? = nil
+    ) {
+        guard let marker = acpCompactSettling else { return }
+        if let providerSessionID, marker.providerSessionID != providerSessionID { return }
+        if let controller, marker.controllerID != ObjectIdentifier(controller) { return }
+        acpCompactSettleDeadlineTask?.cancel()
+        acpCompactSettleDeadlineTask = nil
+        acpCompactSettling = nil
+        noteMonitorObservationInputsChanged()
+    }
+
+    func isACPCompactSettling(now: Date = Date()) -> Bool {
+        guard let marker = acpCompactSettling else { return false }
+        guard now < marker.deadline,
+              providerSessionID == marker.providerSessionID,
+              acpController.map(ObjectIdentifier.init) == marker.controllerID
+        else {
+            clearACPCompactSettling()
+            return false
+        }
+        return true
+    }
+
     /// Bumped by every write to `vouchedContextCount`, including a withdrawal that leaves it `nil`, so
     /// a restore can prove no report touched the count since it was withdrawn.
     private var contextCountVouchRevision: UInt64 = 0
@@ -991,6 +1129,18 @@ final class AgentTabSession: ObservableObject {
                     : nil
             }
         }
+        // A post-dispatch ACP occupancy report clears the settling hold only when it vouches
+        // a drop below the count captured at dispatch. An unchanged/billed count is not proof.
+        if reportsOccupancy,
+           let contextUsedTokens,
+           let marker = acpCompactSettling,
+           let priorUsedTokens = marker.priorUsedTokens,
+           contextUsedTokens < priorUsedTokens,
+           vouchedContextCount?.tokens == contextUsedTokens,
+           isACPCompactSettling()
+        {
+            clearACPCompactSettling()
+        }
     }
 
     var codexNeedsReconnect: Bool = false
@@ -1057,7 +1207,12 @@ final class AgentTabSession: ObservableObject {
     }
 
     var claudeController: (any NativeAgentRuntimeControlling)?
-    var acpController: ACPAgentSessionController?
+    var acpController: ACPAgentSessionController? {
+        didSet {
+            if acpController !== oldValue { clearACPCompactSettling() }
+        }
+    }
+
     var codexEventTask: Task<Void, Never>?
     var codexEventTaskRunID: UUID?
     var codexLastEventAt: Date?
@@ -1119,6 +1274,16 @@ final class AgentTabSession: ObservableObject {
     /// Runtime-only owner/exclusivity fence, rechecked at provider-bound send seams after startup awaits.
     /// A restored attempt has no executable fence and cannot resume dispatch.
     var selfCompactDispatchIsCurrent: (@MainActor () -> Bool)?
+
+    @MainActor
+    func selfCompactCommandDispatchIsCurrent(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+        guard dispatchID.stage == .compact,
+              let active = selfCompactState.active,
+              active.id == dispatchID.requestID,
+              active.phase == .dispatchingCompact || active.phase == .awaitingCompactTurn
+        else { return false }
+        return selfCompactDispatchIsCurrent?() != false
+    }
 
     @MainActor
     func selfCompactNoteDispatchIsCurrent(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
@@ -1253,6 +1418,7 @@ final class AgentTabSession: ObservableObject {
         claudeSteeringFlushTask = nil
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
+        acpSteeringFlushID = nil
         clearClaudeReasoningStatus(clearDisplayedStatus: true)
         assistantDeltaFlushTask?.cancel()
         assistantDeltaFlushTask = nil

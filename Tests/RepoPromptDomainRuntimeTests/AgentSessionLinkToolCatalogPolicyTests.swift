@@ -40,7 +40,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             [
                 "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact",
                 "set_waiting_on", "snooze_auto_wake", "request_attention",
-                "respond", "steer", "create_lane", "retire_lane"
+                "respond", "steer", "stop", "create_lane", "retire_lane"
             ]
         )
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
@@ -118,7 +118,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     func testManagementOperationsAreAdmittedAndAdvertisedWithTheirManageGate() throws {
-        for operation in ["respond", "steer"] {
+        for operation in ["respond", "steer", "stop"] {
             XCTAssertEqual(
                 MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(operation)),
                 MCPDomainToolOperationIdentity(canonicalTool: toolName, normalizedOperation: operation)
@@ -139,6 +139,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             "respond: session_id, interaction_id; response?, answers?, skip?, content?, meta?"
         ))
         XCTAssertTrue(schemaDescription.contains("steer: session_id, message, idempotency_key"))
+        XCTAssertTrue(schemaDescription.contains("stop: session_id, idempotency_key"))
         let operations = try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue)
             .compactMap(\.stringValue)
         XCTAssertTrue(operations.contains("steer"))
@@ -153,18 +154,19 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         for invariant in [
             "New links include `manage` by default",
             "an existing live grant retains its actual capabilities",
-            "`respond` and `steer` require `manage`",
+            "`respond`, `steer`, and `stop` require `manage`",
             "managed-only redacted `pending_interaction` when present",
             "exact current `interaction_id` only with a permitted one-time choice",
             "pending result supplies `respond_hint`",
             "manual-only prompts belong to the target's user",
             "On mismatch, refresh with `poll` or `wait`",
             "pending prompts block steering",
+            "never deletes the session or ends oversight",
             "Without `manage`, leave its prompts for its user"
         ] {
             XCTAssertTrue(definition.description.contains(invariant), invariant)
         }
-        XCTAssertLessThan(definition.description.count, 4_300)
+        XCTAssertLessThan(definition.description.count, 4_800)
         XCTAssertFalse(definition.description.contains("questions take `answers`"))
         XCTAssertFalse(definition.description.contains("Never answer, approve, deny"))
         XCTAssertFalse(definition.description.contains("Answer prompts"))
