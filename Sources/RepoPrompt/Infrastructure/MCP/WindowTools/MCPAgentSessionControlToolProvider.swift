@@ -27,11 +27,13 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
     }
 
     private func agentSelfTool() -> Tool {
-        runtime.tool(
+        guard let definition = MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentSelf) else {
+            preconditionFailure("Missing canonical agent_self definition")
+        }
+        return runtime.tool(
             name: MCPWindowToolName.agentSelf,
             freshnessPolicy: .none,
-            description: MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentSelf)?.description
-                ?? "Inspect or compact only this calling Agent Mode session.",
+            description: definition.description,
             annotations: .init(
                 readOnlyHint: false, destructiveHint: true,
                 idempotentHint: false, openWorldHint: true
