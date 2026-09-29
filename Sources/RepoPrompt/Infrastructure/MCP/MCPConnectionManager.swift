@@ -3543,7 +3543,8 @@ actor ServerNetworkManager {
     func isRunRouteAuthoritativelyCommitted(
         runID: UUID,
         windowID: Int,
-        tabID: UUID?
+        tabID: UUID?,
+        expectedAgentPID: pid_t? = nil
     ) async -> Bool {
         let connectionID = await MainActor.run { () -> UUID? in
             guard let window = WindowStatesManager.shared.window(withID: windowID),
@@ -3564,6 +3565,11 @@ actor ServerNetworkManager {
                   tabID: tabID
               )
         else { return false }
+        if let expectedAgentPID {
+            guard let observedPeerPID = actorSnapshot.observedPeerPID,
+                  isAncestor(expectedPIDs: [expectedAgentPID], ofPid: pid_t(observedPeerPID))
+            else { return false }
+        }
 
         let mappingIsStillCurrent = await MainActor.run {
             guard let window = WindowStatesManager.shared.window(withID: windowID) else {
@@ -3816,6 +3822,7 @@ actor ServerNetworkManager {
         let isRunAdmitted: Bool
         let connectionLifecycleGeneration: UInt64?
         let connectionIdentity: ObjectIdentifier?
+        let observedPeerPID: Int?
         let connectionIsBeingRemoved: Bool
         let lifecycleIsCurrent: Bool
         let executionWatchdogIsTerminal: Bool
@@ -3841,6 +3848,7 @@ actor ServerNetworkManager {
             isRunAdmitted: admittedPolicyRunIDs.contains(runID),
             connectionLifecycleGeneration: connectionLifecycleGenerationByID[connectionID],
             connectionIdentity: connection.map { ObjectIdentifier($0 as AnyObject) },
+            observedPeerPID: bootstrapObservedPeerPIDByConnectionID[connectionID],
             connectionIsBeingRemoved: connectionsBeingRemoved.contains(connectionID),
             lifecycleIsCurrent: connectionLifecycleGenerationByID[connectionID].map(isCurrentLifecycle) ?? false,
             executionWatchdogIsTerminal: executionWatchdogTerminalConnections.contains(connectionID),
@@ -10214,6 +10222,14 @@ actor ServerNetworkManager {
                     }
                 }
                 connectionStats.removeValue(forKey: connectionID)
+            }
+
+            func debugSetObservedPeerPIDForTesting(_ peerPID: Int?, connectionID: UUID) {
+                if let peerPID {
+                    bootstrapObservedPeerPIDByConnectionID[connectionID] = peerPID
+                } else {
+                    bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: connectionID)
+                }
             }
 
             func debugDirectAdmissionStateForTesting(connectionID: UUID) -> DebugDirectAdmissionState {

@@ -124,6 +124,7 @@ enum CodexTurnInterruptError: Error, LocalizedError, Equatable {
 protocol CodexSessionControlling: AnyObject {
     var hasActiveThread: Bool { get }
     var currentSessionReference: CodexNativeSessionController.SessionRef? { get }
+    func routingProcessID() async -> pid_t?
     var events: AsyncStream<CodexNativeSessionController.Event> { get }
 
     func ensureEventsStreamReady()
@@ -191,6 +192,10 @@ protocol CodexSessionControlling: AnyObject {
 
 extension CodexSessionControlling {
     var currentSessionReference: CodexNativeSessionController.SessionRef? {
+        nil
+    }
+
+    func routingProcessID() async -> pid_t? {
         nil
     }
 
@@ -868,6 +873,10 @@ final class CodexNativeSessionController {
         threadID?.isEmpty == false
     }
 
+    func routingProcessID() async -> pid_t? {
+        await client.activeExpectedAgentPID(for: runID)
+    }
+
     var currentSessionReference: SessionRef? {
         activeSessionReference
     }
@@ -1174,7 +1183,8 @@ final class CodexNativeSessionController {
 
     private static func isMissingFreshThreadResumeError(
         _ error: Error,
-        threadID: String
+        threadID: String,
+        rolloutPath: String?
     ) -> Bool {
         guard case let CodexAppServerClient.ClientError.requestFailed(failure) = error,
               failure.method == "thread/resume",
@@ -1189,6 +1199,10 @@ final class CodexNativeSessionController {
         return normalized == "no rollout found for thread id \(normalizedThreadID)"
             || normalized == "thread not found: \(normalizedThreadID)"
             || normalized == "thread not loaded: \(normalizedThreadID)"
+            || CodexAppServerClient.isMissingRolloutPathResolutionMessage(
+                failure.message,
+                expectedRolloutPath: rolloutPath
+            )
     }
 
     private func prepareHookTrustThreadBindingRestoration() async throws -> ThreadSnapshot {
@@ -1237,7 +1251,11 @@ final class CodexNativeSessionController {
             )
         } catch {
             guard binding.existing == nil,
-                  Self.isMissingFreshThreadResumeError(error, threadID: priorThreadID)
+                  Self.isMissingFreshThreadResumeError(
+                      error,
+                      threadID: priorThreadID,
+                      rolloutPath: priorReference.rolloutPath
+                  )
             else {
                 throw error
             }

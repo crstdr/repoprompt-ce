@@ -26,6 +26,50 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
 
     // MARK: - Connection-manager level
 
+    func testAuthoritativeRouteOwnerRequiresTrustedPeerDescendant() async throws {
+        #if DEBUG
+            let observer = try await makeRoutedObserver()
+            try await assertRouteAndCatalogReady(observer, "baseline")
+            let manager = observer.manager
+
+            await manager.debugSetObservedPeerPIDForTesting(Int(getpid()), connectionID: observer.connectionID)
+            let owned = await manager.isRunRouteAuthoritativelyCommitted(
+                runID: observer.runID,
+                windowID: observer.window.windowID,
+                tabID: observer.tabID,
+                expectedAgentPID: getpid()
+            )
+            XCTAssertTrue(owned)
+
+            let unrelated = await manager.isRunRouteAuthoritativelyCommitted(
+                runID: observer.runID,
+                windowID: observer.window.windowID,
+                tabID: observer.tabID,
+                expectedAgentPID: pid_t(Int32.max)
+            )
+            XCTAssertFalse(unrelated, "another process must not authorize the inherited route")
+
+            let wrongTab = await manager.isRunRouteAuthoritativelyCommitted(
+                runID: observer.runID,
+                windowID: observer.window.windowID,
+                tabID: UUID(),
+                expectedAgentPID: getpid()
+            )
+            XCTAssertFalse(wrongTab)
+
+            await manager.debugSetObservedPeerPIDForTesting(nil, connectionID: observer.connectionID)
+            let unverified = await manager.isRunRouteAuthoritativelyCommitted(
+                runID: observer.runID,
+                windowID: observer.window.windowID,
+                tabID: observer.tabID,
+                expectedAgentPID: getpid()
+            )
+            XCTAssertFalse(unverified, "missing trusted peer identity must fail closed")
+        #else
+            throw XCTSkip("Requires DEBUG MCP routing fixtures.")
+        #endif
+    }
+
     func testCancelledReusedRunAttemptAfterRelistKeepsCommittedRouteAndReadyCatalog() async throws {
         #if DEBUG
             let observer = try await makeRoutedObserver()
