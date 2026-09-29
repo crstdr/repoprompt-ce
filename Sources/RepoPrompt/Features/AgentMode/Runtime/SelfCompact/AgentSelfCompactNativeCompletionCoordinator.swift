@@ -130,6 +130,12 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             // An accepted successor owns the next input. Carry the note there rather than
             // manufacturing a competing maintenance turn or demoting it to recovery only.
             state.active?.compactTurnSucceeded = revision.terminalState == .completed
+            if attempt.admittedSupport == .acpAdvertisedCommand {
+                state.active?.acpCompletionUnverified = AgentSelfCompactInstantReturn.isVouchedDrop(
+                    before: attempt.usedTokensBeforeCompact,
+                    current: vouchedTokenCount
+                ) ? nil : true
+            }
             state.active?.phase = .parked
             store(state)
             return

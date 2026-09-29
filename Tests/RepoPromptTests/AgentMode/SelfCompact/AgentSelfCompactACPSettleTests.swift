@@ -280,6 +280,32 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         await successor.finish()
     }
 
+    func testAcceptedSuccessorCarriesUnverifiedACPNoteWithoutClaimingCompaction() async throws {
+        let fake = Fake()
+        let coordinator = fake.coordinator()
+        fake.bind(coordinator, tokensBefore: 100)
+        let successor = DomainAgentRunTurnEpoch(
+            sessionID: fake.owner.sessionID, activationID: UUID(), registrationGeneration: 1,
+            id: UUID(), ordinal: 2, continuityGeneration: 1, transitionKind: .steering
+        )
+        fake.settle(
+            coordinator, rows: 0, vouch: nil, successor: .steering,
+            publication: .accepted(successorEpoch: successor)
+        )
+
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+        XCTAssertEqual(fake.state.active?.acpCompletionUnverified, true)
+        XCTAssertEqual(fake.dispatchCount, 0)
+        let parked = try XCTUnwrap(fake.state.parkedNote)
+        XCTAssertEqual(parked.frame, AgentSelfCompactNoteEnvelope.frame(note))
+        XCTAssertTrue(fake.state.noteWillAttempt(parked.dispatchID))
+        XCTAssertTrue(fake.state.noteAccepted(parked.dispatchID))
+        XCTAssertEqual(fake.state.latest?.outcome, .completionUnverified)
+        XCTAssertEqual(fake.state.latest?.noteDelivery, .prepended)
+        XCTAssertEqual(fake.state.latest?.completionVerified, false)
+        await fake.finish()
+    }
+
     func testCancelDuringHoldDoesNotParkOrDispatchWhenTheSleeperResumes() async {
         let fake = Fake()
         let coordinator = fake.coordinator()
@@ -413,6 +439,86 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         gate.release()
         await session.agentTask?.value
         XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime"])
+        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+    }
+
+    func testLocalSubmissionParksDedicatedACPNoteDuringControllerPreparation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SelfCompactACPPrepareRace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let scriptURL = try AgentSessionLinkACPServerScript.write(to: directory)
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: scriptURL.path)
+        let harness = AgentSessionLinkRunnerHarness(
+            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            acpProviderFactory: { _, _ in provider },
+            workspacePath: directory.path
+        )
+        let tabID = UUID()
+        harness.host.test_setCurrentTabIDOverride(tabID)
+        let session = harness.host.session(for: tabID)
+        session.selectedAgent = .openCode
+        session.hasLoadedPersistedState = true
+        let runner = ACPIntegratedAgentModeRunner(
+            hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
+            toolTrackingHooks: .noOp, providerFactory: { _, _ in provider },
+            controllerFactory: { provider, request in
+                try ACPAgentSessionController(provider: provider, runRequest: request)
+            }
+        )
+        let request = ACPRunRequest(
+            agentKind: .openCode, modelString: nil, workspacePath: directory.path,
+            resumeSessionID: nil, attachments: [], taskLabelKind: nil
+        )
+        await runner.startRun(
+            tabID: tabID, session: session,
+            initialUserMessage: "prime", initialMessageForRun: "prime", attachments: [],
+            runRequest: request, makeLease: { harness.makeLease(runID: $0, tabID: tabID) }
+        )
+        await session.agentTask?.value
+        XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime"])
+
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: note, idempotencyKey: "post-carry-race")
+        state.active?.phase = .dispatchingNote
+        session.selfCompactState = state
+        session.selfCompactNativeCompletion = AgentSelfCompactNativeCompletionCoordinator(
+            load: { session.selfCompactState }, store: { session.selfCompactState = $0 },
+            isCurrentOwner: { _ in true }, dispatchNote: { _, _ in false }
+        )
+        defer { session.selfCompactNativeCompletion = nil }
+        let frame = AgentSelfCompactNoteEnvelope.frame(note)
+        let dispatchID = try XCTUnwrap(AgentSelfCompactParkedPrefix.preparedDedicatedNoteID(frame, session: session))
+        let controller = try XCTUnwrap(session.acpController)
+        await controller.test_holdNextTurnPreparation()
+        session.runState = .idle
+        await runner.startRun(
+            tabID: tabID, session: session,
+            initialUserMessage: frame, initialMessageForRun: frame, attachments: [],
+            runRequest: request, makeLease: { harness.makeLease(runID: $0, tabID: tabID) }
+        )
+        let dedicatedTask = session.agentTask
+        await controller.test_waitForNextTurnPreparationEntry()
+        XCTAssertEqual(harness.host.submitUserTurn(text: "accepted local turn", tabID: tabID), .submitted)
+        XCTAssertEqual(session.selfCompactState.active?.id, dispatchID.requestID)
+        XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
+
+        await controller.test_releaseNextTurnPreparation()
+        await dedicatedTask?.value
+        XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime"])
+        XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
+
+        // The direct-runner fixture does not drive the host's follow-up queue. Dispatch its
+        // accepted ordinary text through the same runner after the stale dedicated turn exits.
+        session.runState = .idle
+        await runner.startRun(
+            tabID: tabID, session: session,
+            initialUserMessage: "accepted local turn", initialMessageForRun: "accepted local turn",
+            attachments: [], runRequest: request,
+            makeLease: { harness.makeLease(runID: $0, tabID: tabID) }
+        )
+        await session.agentTask?.value
+        XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime", frame + "\n\naccepted local turn"])
         XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
     }
 

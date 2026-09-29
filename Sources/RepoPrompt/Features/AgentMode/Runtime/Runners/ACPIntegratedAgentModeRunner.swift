@@ -718,7 +718,9 @@ final class ACPIntegratedAgentModeRunner {
         }
         if let dispatchID = carry.dispatchID {
             guard session.selfCompactNoteDispatchIsCurrent(dispatchID),
-                  AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session)
+                  AgentSelfCompactParkedPrefix.markAttempted(
+                      dispatchID, session: session, dedicated: carry.exactNote
+                  )
             else {
                 // The failed claim does not own an attempt marker to clear.
                 if !carry.exactNote {
@@ -1210,7 +1212,9 @@ final class ACPIntegratedAgentModeRunner {
         }
         if let dispatchID = carry.dispatchID {
             guard session.selfCompactNoteDispatchIsCurrent(dispatchID),
-                  AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session)
+                  AgentSelfCompactParkedPrefix.markAttempted(
+                      dispatchID, session: session, dedicated: carry.exactNote
+                  )
             else {
                 // Another sender may already own this note's one-shot attempt. A stale dedicated
                 // sender has no marker to clear and must not re-park an ordinary in-flight send.

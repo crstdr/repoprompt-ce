@@ -251,10 +251,10 @@ struct AgentSelfCompactState: Codable, Equatable {
         return true
     }
 
-    mutating func noteWillAttempt(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+    mutating func noteWillAttempt(_ dispatchID: AgentSelfCompactionDispatchID, dedicated: Bool = false) -> Bool {
         guard dispatchID.stage == .note,
               active?.id == dispatchID.requestID,
-              active?.phase == .dispatchingNote || active?.phase == .parked,
+              active?.phase == .dispatchingNote || (!dedicated && active?.phase == .parked),
               active?.noteDispatchStarted == false
         else { return false }
         let wasParked = active?.phase == .parked

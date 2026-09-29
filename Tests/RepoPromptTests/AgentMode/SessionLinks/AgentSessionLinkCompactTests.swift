@@ -949,6 +949,56 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         return .init(requestID: id, stage: .note)
     }
 
+    func testLateClaudeFailureCannotSettleSuccessorParkedNote() async throws {
+        let oldController = MonitorFakeNativeController()
+        let nextController = MonitorFakeNativeController()
+        let (viewModel, session, _, _) = try makeViewModel(controller: oldController)
+        session.providerSessionID = "monitor-native-session"
+        let oldIntent = try intent(for: session)
+        await oldController.holdNextUserMessage()
+        let oldSend = Task { @MainActor in
+            await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: session, text: "old input", attachments: [], intent: oldIntent,
+                allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await oldController.waitForHeldUserMessage()
+
+        session.claudeController = nextController
+        session.installRunID(UUID())
+        let nextIntent = try intent(for: session)
+        let dispatchID = try armSelfNote(session: session, note: "successor note")
+        var state = session.selfCompactState
+        state.active?.phase = .parked
+        state.active?.compactTurnSucceeded = true
+        session.selfCompactState = state
+        await nextController.holdNextUserMessage()
+        let nextSend = Task { @MainActor in
+            await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: session, text: "successor input", attachments: [], intent: nextIntent,
+                allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await nextController.waitForHeldUserMessage()
+        XCTAssertEqual(session.selfCompactState.active?.id, dispatchID.requestID)
+        XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, true)
+
+        await oldController.releaseHeldUserMessage(throwing: true)
+        let oldOutcome = await oldSend.value
+        XCTAssertEqual(oldOutcome, .superseded)
+        XCTAssertEqual(session.selfCompactState.active?.id, dispatchID.requestID)
+        XCTAssertEqual(session.selfCompactState.active?.phase, .dispatchingNote)
+        XCTAssertNil(session.selfCompactState.latest)
+
+        await nextController.releaseHeldUserMessage()
+        let nextOutcome = await nextSend.value
+        XCTAssertEqual(nextOutcome, .sent)
+        XCTAssertNil(session.selfCompactState.active)
+        XCTAssertEqual(session.selfCompactState.latest?.outcome, .noteAccepted)
+        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .system && $0.text.contains("restored") }), 1)
+    }
+
     func testDedicatedClaudeNoteSendsExactFrameAndAcknowledgesAtProviderSeam() async throws {
         let controller = MonitorFakeNativeController()
         let (viewModel, session, _, _) = try makeViewModel(controller: controller)

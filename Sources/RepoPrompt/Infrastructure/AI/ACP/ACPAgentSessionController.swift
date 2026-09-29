@@ -489,6 +489,10 @@ actor ACPAgentSessionController {
 
     #if DEBUG
         private var testRejectNextTurnPreparation = false
+        private var testHoldNextTurnPreparation = false
+        private var testNextTurnPreparationEntered = false
+        private var testNextTurnPreparationEntryWaiter: CheckedContinuation<Void, Never>?
+        private var testNextTurnPreparationGate: CheckedContinuation<Void, Never>?
         private var testHoldNextSteeringInterrupt = false
         private var testSteeringInterruptEntered = false
         private var testSteeringInterruptEntryWaiter: CheckedContinuation<Void, Never>?
@@ -496,6 +500,21 @@ actor ACPAgentSessionController {
 
         func test_rejectNextTurnPreparation() {
             testRejectNextTurnPreparation = true
+        }
+
+        func test_holdNextTurnPreparation() {
+            testHoldNextTurnPreparation = true
+            testNextTurnPreparationEntered = false
+        }
+
+        func test_waitForNextTurnPreparationEntry() async {
+            if testNextTurnPreparationEntered { return }
+            await withCheckedContinuation { testNextTurnPreparationEntryWaiter = $0 }
+        }
+
+        func test_releaseNextTurnPreparation() {
+            testNextTurnPreparationGate?.resume()
+            testNextTurnPreparationGate = nil
         }
 
         func test_holdNextSteeringInterrupt() {
@@ -515,8 +534,15 @@ actor ACPAgentSessionController {
     #endif
 
     @discardableResult
-    func prepareForNextTurn() -> Bool {
+    func prepareForNextTurn() async -> Bool {
         #if DEBUG
+            if testHoldNextTurnPreparation {
+                testHoldNextTurnPreparation = false
+                testNextTurnPreparationEntered = true
+                testNextTurnPreparationEntryWaiter?.resume()
+                testNextTurnPreparationEntryWaiter = nil
+                await withCheckedContinuation { testNextTurnPreparationGate = $0 }
+            }
             if testRejectNextTurnPreparation {
                 testRejectNextTurnPreparation = false
                 return false
