@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/// Test-only guard linked into RepoPromptTests.
+/// Test-only guard linked into RepoPromptTests and RepoPromptMCPCoreTests.
 ///
 /// A constructor in this target runs when the test bundle is loaded, before any XCTest code. It
 /// refuses to continue unless the process runs inside the isolated sandbox created by
