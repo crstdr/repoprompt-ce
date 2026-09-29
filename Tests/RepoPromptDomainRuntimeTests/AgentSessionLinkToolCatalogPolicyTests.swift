@@ -40,7 +40,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             [
                 "list", "poll", "wait", "read", "send", "cancel_pending_send",
                 "set_waiting_on", "snooze_auto_wake", "request_attention",
-                "respond", "steer"
+                "respond", "steer", "stop"
             ]
         )
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
@@ -118,7 +118,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     func testManagementOperationsAreAdmittedAndAdvertisedWithTheirManageGate() throws {
-        for operation in ["respond", "steer"] {
+        for operation in ["respond", "steer", "stop"] {
             XCTAssertEqual(
                 MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(operation)),
                 MCPDomainToolOperationIdentity(canonicalTool: toolName, normalizedOperation: operation)
@@ -139,12 +139,13 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             "respond: session_id, interaction_id; response?, answers?, skip?, content?, meta?"
         ))
         XCTAssertTrue(schemaDescription.contains("steer: session_id, message, idempotency_key"))
+        XCTAssertTrue(schemaDescription.contains("stop: session_id, idempotency_key"))
         let operations = try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue)
             .compactMap(\.stringValue)
         XCTAssertTrue(operations.contains("steer"))
         for invariant in [
             "New outbound links include `manage`",
-            "Only a current exact grant with `manage` permits pending-prompt disclosure, `respond`, or `steer`",
+            "Only a current exact grant with `manage` permits pending-prompt disclosure, `respond`, `steer`, or `stop`",
             "managed-only redacted `pending_interaction`",
             "only when its pending result is respondable",
             "Manual-only prompts belong to the target's user",
@@ -768,7 +769,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             "Do not invent work from an update",
             "continue existing required work and stop only when none remains",
             "Surface ambiguity or surprises to your user",
-            "Only a current exact grant with `manage` permits pending-prompt disclosure, `respond`, or `steer`",
+            "Only a current exact grant with `manage` permits pending-prompt disclosure, `respond`, `steer`, or `stop`",
             "never route around a prompt with `send`, a workflow, or another session",
             "Never impersonate the user"
         ] {

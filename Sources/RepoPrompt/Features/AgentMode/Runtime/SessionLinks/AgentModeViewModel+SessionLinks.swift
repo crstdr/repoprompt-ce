@@ -1159,6 +1159,7 @@ extension AgentModeViewModel {
             && session.pendingACPSteeringInstructions.isEmpty
             && session.pendingClaudeSteeringInstructions.isEmpty
             && session.oversight.pendingAutoWake == nil
+            && !session.stopState.isStopping(binding: session.persistentSessionBindingIdentity)
             && !candidate.isClosing
     }
 

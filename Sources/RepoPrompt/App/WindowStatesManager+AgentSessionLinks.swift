@@ -314,6 +314,14 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     /// transaction runs on that window's `AgentModeViewModel`, and a terminating manager or closing
     /// window must refuse before any target state is touched. Nothing here focuses or activates the
     /// window.
+    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+        guard !isTerminating,
+              let window = window(withID: candidate.windowID), !window.isClosing,
+              let session = window.agentModeViewModel.agentSessionLinkLiveSession(matching: candidate)
+        else { return nil }
+        return AgentRunStartStopFence(session: session)
+    }
+
     func agentSessionLinkPerformSend(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,
@@ -350,6 +358,29 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
             to: candidate,
             request: request,
             liveness: liveness,
+            commitAuthorization: commitAuthorization
+        )
+    }
+
+    /// Routes Stop without focusing or activating the target window.
+    func agentSessionLinkPerformStop(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkStopRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        queueHasCommittedDrain: @escaping @MainActor () -> Bool,
+        withdrawInbound: @escaping @MainActor () -> Bool,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkStopTransactionOutcome {
+        guard !isTerminating else { return .blocked(.shuttingDown) }
+        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+            return .blocked(.endpointInvalidated)
+        }
+        return await window.agentModeViewModel.agentSessionLinkPerformStop(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            queueHasCommittedDrain: queueHasCommittedDrain,
+            withdrawInbound: withdrawInbound,
             commitAuthorization: commitAuthorization
         )
     }

@@ -54,6 +54,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ] {
             XCTAssertTrue(keys.isDisjoint(with: ["workflow_id", "workflow_name"]))
         }
+        XCTAssertEqual(AgentSessionLinkMCPToolService.stopKeys, ["op", "session_id", "idempotency_key"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.setWaitingOnKeys, ["op", "summary", "clear"])
         XCTAssertEqual(
             AgentSessionLinkMCPToolService.snoozeAutoWakeKeys,
@@ -398,6 +399,47 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         )
         let multiRow = try XCTUnwrap(multiWait["targets"]?.arrayValue?.first?.objectValue)
         XCTAssertEqual(multiRow["snapshot"]?.objectValue?["context"], expected)
+    }
+
+    // MARK: - stop
+
+    func testStopRoutedServiceRequiresOneKeyAndRejectsEveryExtra() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let targetID = fixture.target.sessionID.uuidString
+        for extra in ["session_ids", "message", "reason", "workflow_id", "delivery", "run_id"] {
+            do {
+                _ = try await fixture.service.execute(args: [
+                    "op": .string("stop"),
+                    "session_id": .string(targetID),
+                    "idempotency_key": .string("stop-key"),
+                    extra: .null
+                ])
+                XCTFail("Stop must reject even null \(extra)")
+            } catch {}
+        }
+        let invalidRequests: [[String: Value]] = [
+            ["op": .string("stop"), "session_id": .string(targetID)],
+            ["op": .string("stop"), "session_ids": .array([.string(targetID)]), "idempotency_key": .string("key")],
+            ["op": .string("stop"), "session_id": .string("not-a-uuid"), "idempotency_key": .string("key")]
+        ]
+        for args in invalidRequests {
+            do { _ = try await fixture.service.execute(args: args)
+                XCTFail("Malformed Stop accepted")
+            } catch {}
+        }
+        do {
+            _ = try await Self.executeObject(fixture.service, args: [
+                "op": .string("stop"), "session_id": .string(targetID),
+                "idempotency_key": .string("routed-stop")
+            ])
+            XCTFail("A stale target must use the same denial as a missing link")
+        } catch let error as MCPError {
+            let expected = AgentSessionLinkMCPToolService.denialError(
+                targetSessionID: fixture.target.sessionID
+            )
+            XCTAssertEqual("\(error)", "\(expected)")
+        }
     }
 
     func testMultiTargetWaitResponseKeepsRequestOrderAndSuccessorCursorsForEveryTarget() throws {
@@ -1949,6 +1991,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 bindingTransitionGeneration: 1
             ),
             targetSessionID: sessionID,
+            targetEndpoint: DomainAgentSessionLinkEndpointIdentity(
+                windowID: 2,
+                workspaceID: UUID(),
+                tabID: UUID(),
+                sessionID: sessionID,
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: 1
+            ),
             message: "first line\nsecond\u{7} line",
             idempotencyKey: "key-1",
             requestDigest: "digest",
@@ -2114,6 +2164,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     /// this fixture exists to drive the tool service's release decision against a **real** authority
     /// and bridge, not to re-test the bridge.
     private final class ReadReleaseHost: AgentSessionLinkEndpointHost {
+        private let fenceSession = AgentTabSession(tabID: UUID())
+
+        func agentSessionLinkStartStopFence(for _: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+            AgentRunStartStopFence(session: fenceSession)
+        }
+
         var candidates: [AgentSessionLinkEndpointCandidate] = []
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
         var waitingOn: DomainAgentSessionWaitingOn?
