@@ -7775,7 +7775,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                 throw CancellationError()
                             }
                             var state = session.selfCompactState
-                            guard state.noteWillAttempt(noteDispatchID) else {
+                            guard state.noteWillAttempt(noteDispatchID, dedicated: isSelfNote) else {
                                 throw CancellationError()
                             }
                             session.selfCompactState = state

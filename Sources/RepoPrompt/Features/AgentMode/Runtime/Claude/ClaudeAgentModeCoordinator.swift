@@ -1455,7 +1455,7 @@ final class ClaudeAgentModeCoordinator {
                       session.selfCompactNoteDispatchIsCurrent(dispatchID)
                 else { return .superseded }
                 var state = session.selfCompactState
-                guard state.noteWillAttempt(dispatchID) else { return .superseded }
+                guard state.noteWillAttempt(dispatchID, dedicated: true) else { return .superseded }
                 session.selfCompactState = state
                 hostCapabilities.scheduleSave(session)
                 do {
