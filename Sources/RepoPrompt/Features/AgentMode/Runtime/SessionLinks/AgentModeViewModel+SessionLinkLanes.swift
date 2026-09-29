@@ -226,10 +226,19 @@ extension AgentModeViewModel {
             postPreflightValidation: canRetire,
             expandCascade: false
         )
-        return report.rejections.isEmpty
-            && report.removedComposeTabIDs.contains(endpoint.tabID)
-            && workspaceManager?.activeWorkspace?.stashedTabs.contains(where: {
-                $0.tab.id == endpoint.tabID
-            }) == true
+        guard report.rejections.isEmpty,
+              report.removedComposeTabIDs.contains(endpoint.tabID),
+              workspaceManager?.activeWorkspace?.stashedTabs.contains(where: {
+                  $0.tab.id == endpoint.tabID
+              }) == true,
+              let workspaceManager
+        else { return false }
+        // The retirement activation claim stays held by the bridge until this canonical save
+        // settles, so another window cannot reload the pre-stash binding in the meantime.
+        let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
+            workspaceID: endpoint.workspaceID,
+            source: WorkspaceSaveSource("oversightLaneRetirement")
+        )
+        return persistence.acceptedForLifecycleAdmission
     }
 }

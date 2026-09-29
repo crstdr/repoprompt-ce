@@ -88,8 +88,12 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// All live compose-tab/session bindings across every non-closing window.
     func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate]
 
-    /// Count compose-tab bindings in every workspace, including inactive ones, without hydration.
+    /// Count independent compose-tab bindings without hydration.
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int
+
+    /// Fence workspace activation while an exact lane retirement may stash its binding.
+    func agentSessionLinkClaimLaneRetirement(endpoint: DomainAgentSessionLinkEndpointIdentity) -> UUID?
+    func agentSessionLinkReleaseLaneRetirement(endpoint: DomainAgentSessionLinkEndpointIdentity, claimID: UUID)
 
     func agentSessionLinkCreateLane(
         destinationWindowID: Int,
@@ -448,6 +452,12 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkClaimLaneRetirement(endpoint _: DomainAgentSessionLinkEndpointIdentity) -> UUID? {
+        nil
+    }
+
+    func agentSessionLinkReleaseLaneRetirement(endpoint _: DomainAgentSessionLinkEndpointIdentity, claimID _: UUID) {}
+
     func agentSessionLinkStartStopFence(for _: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
         // A host without a live session cannot admit a queued send; reject before enqueuing.
         nil
@@ -7024,6 +7034,10 @@ final class AgentSessionLinkRuntimeBridge {
         #if DEBUG
             await test_afterRetireAuthorizationBeforeFence?()
         #endif
+        guard let retirementClaim = host.agentSessionLinkClaimLaneRetirement(endpoint: endpoint) else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneInUseBindings)
+        }
+        defer { host.agentSessionLinkReleaseLaneRetirement(endpoint: endpoint, claimID: retirementClaim) }
         guard host.agentSessionLinkBindingCount(sessionID: targetSessionID) == 1 else {
             return .notRetired(sessionID: targetSessionID, reason: .laneInUseBindings)
         }
