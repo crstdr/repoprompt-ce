@@ -109,6 +109,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPrompt",
         "RepoPromptApp",
         "RepoPromptMCP",
+        "RepoPromptMCPCore",
         "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
@@ -122,6 +123,9 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptRegexCoreTests",
         "RepoPromptCodeMapCoreTests",
         "RepoPromptTests",
+        "RepoPromptMCPCoreTests",
+        "RepoPromptTestSupport",
+        "RepoPromptTestSandboxPreflight",
     )
     for name in required_targets:
         if name not in targets:
@@ -138,15 +142,6 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp"
     ]:
         raise GeneratorError("Target 'RepoPrompt' must depend only on 'RepoPromptApp'")
-    repo_prompt_unsafe_flags = [
-        setting.get("kind", {}).get("unsafeFlags", {}).get("_0", [])
-        for setting in repo_prompt.get("settings", [])
-    ]
-    if any("-import-objc-header" in flags for flags in repo_prompt_unsafe_flags):
-        raise GeneratorError(
-            "Target 'RepoPrompt' must not own the RepoPromptApp Objective-C bridging header"
-        )
-
     repo_prompt_app = targets["RepoPromptApp"]
     if repo_prompt_app.get("type") != "regular":
         raise GeneratorError("Target 'RepoPromptApp' must remain an internal library target")
@@ -159,17 +154,43 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
-        "RepoPromptMCP",
+        "RepoPromptMCPCore",
         "RepoPromptShared",
         "RepoPromptTestSandboxPreflight",
+        "RepoPromptTestSupport",
     }
     repo_prompt_tests = targets["RepoPromptTests"]
     if set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies:
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptApp, RepoPromptCodeMapCore, "
-            "RepoPromptDomainRuntime, RepoPromptMCP, RepoPromptShared, and "
-            "RepoPromptTestSandboxPreflight"
+            "RepoPromptDomainRuntime, RepoPromptMCPCore, RepoPromptShared, "
+            "RepoPromptTestSupport, and RepoPromptTestSandboxPreflight"
         )
+
+    core_tests = targets["RepoPromptMCPCoreTests"]
+    if core_tests.get("type") != "test" or core_tests.get("path") != "Tests/RepoPromptMCPCoreTests":
+        raise GeneratorError("RepoPromptMCPCoreTests must remain the MCP core test target")
+    expected_core_test_dependencies = {
+        "RepoPromptTestSandboxPreflight",
+        "RepoPromptMCPCore",
+        "RepoPromptDomainRuntime",
+        "RepoPromptShared",
+        "RepoPromptTestSupport",
+    }
+    if set(_by_name_dependencies(core_tests)) != expected_core_test_dependencies:
+        raise GeneratorError(
+            "RepoPromptMCPCoreTests must depend on RepoPromptMCPCore, RepoPromptDomainRuntime, "
+            "RepoPromptShared, RepoPromptTestSupport, and RepoPromptTestSandboxPreflight"
+        )
+
+    for target_name, expected_type, expected_path in (
+        ("RepoPromptMCPCore", "regular", "Sources/RepoPromptMCPCore"),
+        ("RepoPromptTestSupport", "regular", "Tests/RepoPromptTestSupport"),
+        ("RepoPromptTestSandboxPreflight", "regular", "Tests/RepoPromptTestSandboxPreflight"),
+    ):
+        target = targets[target_name]
+        if target.get("type") != expected_type or target.get("path") != expected_path:
+            raise GeneratorError(f"{target_name} must retain {expected_path} as a {expected_type} target")
 
     domain_runtime = targets["RepoPromptDomainRuntime"]
     if domain_runtime.get("type") != "regular":
@@ -202,22 +223,14 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     if _by_name_dependencies(repo_prompt_app).count("RepoPromptDomainRuntime") != 1:
         raise GeneratorError("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
 
-    unsafe_flags: list[list[str]] = []
-    for setting in repo_prompt_app.get("settings", []):
-        value = setting.get("kind", {}).get("unsafeFlags", {}).get("_0")
-        if isinstance(value, list):
-            unsafe_flags.append(value)
-    expected_header = repo_root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h"
-    if not any(
-        len(flags) == 3
-        and flags[0] == "-import-objc-header"
-        and Path(flags[1]) == expected_header
-        and flags[2] == "-disable-bridging-pch"
-        for flags in unsafe_flags
-    ):
-        raise GeneratorError(
-            "RepoPromptApp must own the Objective-C bridging-header unsafe flags"
-        )
+    for target in targets.values():
+        for setting in target.get("settings", []):
+            flags = setting.get("kind", {}).get("unsafeFlags", {}).get("_0", [])
+            if isinstance(flags, list) and "-import-objc-header" in flags:
+                raise GeneratorError(
+                    f"Target '{target.get('name')}' must not import an Objective-C bridging header; "
+                    "expose C declarations through a C target module instead"
+                )
 
     expected_resources = {("Fixtures", True), ("Goldens", True)}
     test_targets_with_codemap_resources = []
@@ -577,10 +590,9 @@ This directory is disposable. Regenerate it with `make xcode-generate`; do not e
   `REPOPROMPT_XCODE_TEST_FILTER` before building to run a focused filter.
 
 The root Swift package reference provides source browsing and indexing. Its native Xcode
-test action is not the supported test workflow because Xcode does not expose the
-`RepoPromptMCP` executable dependency as an importable test module. The vendored Sparkle
-XCFramework also declares an omitted dSYMs directory; this generator deliberately does
-not mutate `Vendor/` to compensate. Use the convenience schemes above.
+test action is not the supported test workflow because conductor owns the sandboxed
+test environment the root suites require. The vendored Sparkle dSYMs are present
+and verified by repository guardrails; use the convenience schemes above.
 
 Xcode does not expand project macros reliably for every external runnable field. The
 generated app scheme records the current worktree root as the working directory and the
