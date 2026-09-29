@@ -425,7 +425,11 @@ struct AgentSessionLinkMCPToolService {
             return .object(payload)
         case let .blocked(failure):
             switch failure {
-            case .endpointInvalidated, .linkRevoked, .managementRevoked:
+            case .endpointInvalidated, .endpointHost, .endpointSession, .endpointObserver,
+                 .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
+                 .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
+                 .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
+                 .endpointPostWindow, .endpointPostReadiness, .linkRevoked, .managementRevoked:
                 throw Self.denialError(targetSessionID: targetSessionID)
             case .shuttingDown:
                 throw MCPError.internalError("RepoPrompt is shutting down.")
@@ -433,7 +437,7 @@ struct AgentSessionLinkMCPToolService {
                 return .object([
                     "result": .string("target_busy"),
                     "session_id": .string(targetSessionID.uuidString),
-                    "reason": .string(failure.rawValue)
+                    "reason": .string(failure.wireResult)
                 ])
             }
         case .indeterminate:
@@ -2133,12 +2137,13 @@ enum AgentSessionLinkResponseRenderer {
         targetSessionID: UUID
     ) -> Value {
         var payload: [String: Value] = [
-            "result": .string(failure.rawValue),
+            "result": .string(failure.wireResult),
             "session_id": .string(targetSessionID.uuidString),
             "accepted": .bool(false),
             "retryable": .bool(failure.isRetryable),
             "detail": .string(compactFailureDetail(failure))
         ]
+        if let subreason = failure.subreason { payload["subreason"] = .string(subreason) }
         if failure.isDeliveryIndeterminate {
             payload["accepted_unknown"] = .bool(true)
         }
@@ -2156,7 +2161,12 @@ enum AgentSessionLinkResponseRenderer {
             "The overseen session could not be saved and the rollback could not be confirmed, so it is "
                 + "unknown whether the request was recorded. No compaction was started and this "
                 + "idempotency_key is spent. Read the session before requesting again."
-        case .endpointInvalidated, .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
+        case .endpointInvalidated, .endpointHost, .endpointSession, .endpointObserver,
+             .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
+             .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
+             .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
+             .endpointPostWindow, .endpointPostReadiness,
+             .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
              .noProviderSession, .managementRevoked, .targetAwaitingInteraction, .targetBusy,
              .steerUnavailable, .steerNotAccepted, .steerUnconfirmed, .targetStopped,
              .compactionSettling:
@@ -2194,12 +2204,13 @@ enum AgentSessionLinkResponseRenderer {
         targetSessionID: UUID
     ) -> Value {
         var payload: [String: Value] = [
-            "result": .string(failure.rawValue),
+            "result": .string(failure.wireResult),
             "session_id": .string(targetSessionID.uuidString),
             "delivered": .bool(false),
             "retryable": .bool(failure.isRetryable),
             "detail": .string(failure.message)
         ]
+        if let subreason = failure.subreason { payload["subreason"] = .string(subreason) }
         if failure.isDeliveryIndeterminate {
             // `delivered` stays the conservative `false` — no receipt exists — while this flag
             // carries the fact the observer must act on: the row may nonetheless be on disk, so it

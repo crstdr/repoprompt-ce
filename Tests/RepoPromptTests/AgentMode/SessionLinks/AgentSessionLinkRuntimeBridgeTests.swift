@@ -4391,9 +4391,27 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         fixture.host.providesStartStopFence = false
 
         let outcome = await queueSend(fixture)
-        XCTAssertEqual(outcome, .send(.blocked(.endpointInvalidated)))
+        XCTAssertEqual(outcome, .send(.blocked(.endpointStopFence)))
         let projection = await pendingSend(fixture)
         XCTAssertNil(projection?.pending)
+    }
+
+    func testQueuedClaimFailureRemainsVisibleAfterDeferredDrain() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        let queued = await queueSend(fixture)
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+
+        fixture.host.invokesSendCommit = true
+        fixture.host.sendOutcome = .blocked(.endpointClaim)
+        await publishTargetActivity(fixture, status: .idle, activity: 2000)
+        await settleDrains { await (self.pendingSend(fixture))?.lastResult != nil }
+
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
+        XCTAssertEqual(projection?.lastResult?.outcome, .failed(.endpointClaim))
+        XCTAssertEqual(fixture.host.sendCommitOutcomes.last, .committed)
     }
 
     func testStopWithdrawalRetainsTargetStoppedOnlyForTheExactTargetEndpoint() async {
@@ -6185,6 +6203,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         XCTAssertEqual(receipt.result, .created)
         XCTAssertEqual(receipt.firstTask, .failed)
+        XCTAssertEqual(receipt.firstTaskReason, "target_stopped")
         XCTAssertTrue(receipt.linked)
         XCTAssertTrue(fixture.host.sendRequests.isEmpty, "The stale creation task must not reach a provider")
     }
@@ -6592,7 +6611,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseChildren))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 1)
     }
@@ -6607,7 +6626,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseDiskChild))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 1)
     }
@@ -6678,7 +6697,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(inUse, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(inUse, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseInboundCount))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 2)
     }
@@ -6705,7 +6724,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(ambiguous, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(ambiguous, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseBindings))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 1)
     }
@@ -6720,7 +6739,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseBindings))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 1)
     }
@@ -6839,7 +6858,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             completed.fulfill()
         }
         await fulfillment(of: [completed], timeout: 3)
-        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseInboundLink))
         XCTAssertTrue(fixture.host.candidates.contains(fixture.target))
         let replacementReference = await linkReference(fixture)
         let replacement = try XCTUnwrap(replacementReference)

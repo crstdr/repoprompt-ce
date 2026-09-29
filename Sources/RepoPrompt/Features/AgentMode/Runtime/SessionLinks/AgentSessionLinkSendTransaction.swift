@@ -161,6 +161,21 @@ enum AgentSessionLinkSendCommitOutcome: Equatable {
 /// Why a send settled without delivering. Raw values are the wire-stable `result` strings.
 enum AgentSessionLinkSendFailure: String, Equatable {
     case endpointInvalidated = "endpoint_invalidated"
+    case endpointHost = "endpoint_host"
+    case endpointSession = "endpoint_session"
+    case endpointObserver = "endpoint_observer"
+    case endpointTarget = "endpoint_target"
+    case endpointWindow = "endpoint_window"
+    case endpointClaim = "endpoint_claim"
+    case endpointWorkspace = "endpoint_workspace"
+    case endpointMissingWorkspace = "endpoint_missing_workspace"
+    case endpointReadiness = "endpoint_readiness"
+    case endpointStopFence = "endpoint_stop_fence"
+    case endpointPostSession = "endpoint_post_session"
+    case endpointPostObserver = "endpoint_post_observer"
+    case endpointPostTarget = "endpoint_post_target"
+    case endpointPostWindow = "endpoint_post_window"
+    case endpointPostReadiness = "endpoint_post_readiness"
     case targetLoading = "target_loading"
     case targetNotIdle = "target_not_idle"
     case linkRevoked = "link_revoked"
@@ -204,6 +219,44 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         }
     }
 
+    /// The primary wire result stays stable while a refusal identifies its exact failed fence.
+    var wireResult: String {
+        subreason == nil ? rawValue : AgentSessionLinkSendFailure.endpointInvalidated.rawValue
+    }
+
+    /// Present only on endpoint refusals. These values are intentionally short for MCP responses.
+    var subreason: String? {
+        switch self {
+        case .endpointInvalidated: "unknown"
+        case .endpointHost: "host"
+        case .endpointSession: "session"
+        case .endpointObserver: "observer"
+        case .endpointTarget: "target"
+        case .endpointWindow: "window"
+        case .endpointClaim: "claim"
+        case .endpointWorkspace: "workspace"
+        case .endpointMissingWorkspace: "missing_ws"
+        case .endpointReadiness: "readiness"
+        case .endpointStopFence: "stop_fence"
+        case .endpointPostSession: "post_session"
+        case .endpointPostObserver: "post_observer"
+        case .endpointPostTarget: "post_target"
+        case .endpointPostWindow: "post_window"
+        case .endpointPostReadiness: "post_ready"
+        default: nil
+        }
+    }
+
+    static func invalidated(_ liveness: AgentSessionLinkSendLiveness, postCommit: Bool = false) -> Self {
+        if !liveness.observerEndpointIsLive, !liveness.targetEndpointIsLive, liveness.targetWindowIsClosing {
+            return .endpointHost
+        }
+        if liveness.targetWindowIsClosing { return postCommit ? .endpointPostWindow : .endpointWindow }
+        if !liveness.observerEndpointIsLive { return postCommit ? .endpointPostObserver : .endpointObserver }
+        if !liveness.targetEndpointIsLive { return postCommit ? .endpointPostTarget : .endpointTarget }
+        return .endpointInvalidated
+    }
+
     /// Whether polling and retrying with the *same* idempotency key is the right next move.
     ///
     /// A revoked link and an invalidated endpoint are permanent for this grant; the rest describe a
@@ -216,8 +269,13 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .targetLoading, .targetNotIdle, .persistenceFailed, .targetAwaitingInteraction,
              .targetBusy, .compactionSettling, .steerUnavailable, .steerNotAccepted, .noProviderSession:
             true
-        case .endpointInvalidated, .linkRevoked, .persistenceIndeterminate, .shuttingDown,
-             .managementRevoked, .steerUnconfirmed, .notSupported, .targetStopped:
+        case .endpointInvalidated, .endpointHost, .endpointSession, .endpointObserver,
+             .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
+             .endpointMissingWorkspace,
+             .endpointReadiness, .endpointStopFence, .endpointPostSession, .endpointPostObserver,
+             .endpointPostTarget, .endpointPostWindow, .endpointPostReadiness,
+             .linkRevoked, .persistenceIndeterminate,
+             .shuttingDown, .managementRevoked, .steerUnconfirmed, .notSupported, .targetStopped:
             false
         }
     }
@@ -229,7 +287,11 @@ enum AgentSessionLinkSendFailure: String, Equatable {
 
     var message: String {
         switch self {
-        case .endpointInvalidated:
+        case .endpointInvalidated, .endpointHost, .endpointSession, .endpointObserver,
+             .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
+             .endpointMissingWorkspace,
+             .endpointReadiness, .endpointStopFence, .endpointPostSession, .endpointPostObserver,
+             .endpointPostTarget, .endpointPostWindow, .endpointPostReadiness:
             "The overseen session is no longer available at the exact endpoint this link was granted for."
         case .targetLoading:
             "The overseen session is still loading. Poll it and try again."
