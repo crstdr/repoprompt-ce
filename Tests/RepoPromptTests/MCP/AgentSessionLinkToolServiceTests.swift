@@ -931,6 +931,24 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertTrue(rendered?["recovery_hint"]?.stringValue?.contains(sessionID.uuidString) == true)
     }
 
+    func testLaneRefusalsExposeOnlyShortFailureSubreasons() {
+        let sessionID = UUID()
+        var receipt = AgentSessionLaneCreateReceipt(
+            result: .created, sessionID: sessionID, sessionName: "Lane",
+            linked: true, reason: nil, firstTask: .failed, laneCount: 1
+        )
+        receipt.firstTaskReason = "claim"
+        let created = AgentSessionLaneMCPToolService.render(receipt).objectValue
+        XCTAssertEqual(created?["first_task"], .string("failed"))
+        XCTAssertEqual(created?["first_task_subreason"], .string("claim"))
+
+        let retired = AgentSessionLaneMCPToolService.render(
+            .notRetired(sessionID: sessionID, reason: .laneInUsePending)
+        ).objectValue
+        XCTAssertEqual(retired?["reason"], .string("lane_in_use"))
+        XCTAssertEqual(retired?["subreason"], .string("pending"))
+    }
+
     /// The missing-op and unsupported-op errors teach the same operation list the schema advertises.
     func testSetWaitingOnIsSelfScopedAndRequiresExactlyOneMutation() async throws {
         let fixture = try await makeReadReleaseFixture()
@@ -2734,6 +2752,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(busy["result"], .string("target_not_idle"))
         XCTAssertEqual(busy["delivered"], .bool(false))
         XCTAssertEqual(busy["retryable"], .bool(true))
+        XCTAssertNil(busy["subreason"])
+
+        let endpoint = AgentSessionLinkResponseRenderer.sendBlockedValue(
+            .endpointClaim, targetSessionID: sessionID
+        ).objectValue
+        XCTAssertEqual(endpoint?["result"], .string("endpoint_invalidated"))
+        XCTAssertEqual(endpoint?["subreason"], .string("claim"))
+        XCTAssertEqual(endpoint?["retryable"], .bool(false))
 
         guard case let .object(settling) = AgentSessionLinkResponseRenderer.sendBlockedValue(
             .compactionSettling,

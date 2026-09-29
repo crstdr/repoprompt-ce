@@ -127,6 +127,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         /// When true the fake invokes the commit fence exactly as the real host does.
         var invokesSendCommit = true
+        var readsLivenessAfterCommit = false
         /// Runs after the reservation exists but before the commit fence, so a test can land a
         /// revocation exactly in the window the fence is designed to arbitrate.
         var beforeSendCommit: (() async -> Void)?
@@ -337,6 +338,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 await afterSendCommit?()
                 guard commit == .committed else {
                     return .blocked(commit == .shuttingDown ? .shuttingDown : .linkRevoked)
+                }
+                if readsLivenessAfterCommit {
+                    let postCommitLiveness = liveness()
+                    sendLivenessReadings.append(postCommitLiveness)
+                    if !postCommitLiveness.permitsDelivery {
+                        return .blocked(.invalidated(postCommitLiveness, postCommit: true))
+                    }
                 }
             }
             return sendOutcome
@@ -3807,6 +3815,32 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(request.attribution.linkID, target.lease.linkID)
     }
 
+    func testInFlightSendUsesItsValidatedHostAcrossAttachmentRefresh() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageReadyTarget(fixture)
+        fixture.host.readsLivenessAfterCommit = true
+        let replacement = FakeEndpointHost()
+        replacement.targetWindowIsClosing = true
+        fixture.host.afterSendCommit = { [bridge = fixture.bridge] in
+            bridge.attach(host: replacement)
+        }
+
+        let resolvedTarget = await authorizedSendTarget(fixture)
+        let target = try XCTUnwrap(resolvedTarget)
+        let outcome = await fixture.bridge.send(
+            target: target,
+            message: "continue",
+            idempotencyKey: "host-refresh"
+        )
+
+        guard case .receipt = outcome else {
+            return XCTFail("An unchanged exact endpoint must survive host attachment refresh: \(outcome)")
+        }
+        XCTAssertEqual(fixture.host.sendLivenessReadings.count, 2)
+        XCTAssertTrue(fixture.host.sendLivenessReadings.allSatisfy(\.permitsDelivery))
+    }
+
     func testDeliveredSendRetainsAStableReceiptAndReplaysItForADuplicateRetry() async throws {
         let fixture = makeFixture()
         _ = await addLink(fixture)
@@ -4391,9 +4425,27 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         fixture.host.providesStartStopFence = false
 
         let outcome = await queueSend(fixture)
-        XCTAssertEqual(outcome, .send(.blocked(.endpointInvalidated)))
+        XCTAssertEqual(outcome, .send(.blocked(.endpointStopFence)))
         let projection = await pendingSend(fixture)
         XCTAssertNil(projection?.pending)
+    }
+
+    func testQueuedClaimFailureRemainsVisibleAfterDeferredDrain() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        let queued = await queueSend(fixture)
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+
+        fixture.host.invokesSendCommit = true
+        fixture.host.sendOutcome = .blocked(.endpointClaim)
+        await publishTargetActivity(fixture, status: .idle, activity: 2000)
+        await settleDrains { await (self.pendingSend(fixture))?.lastResult != nil }
+
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
+        XCTAssertEqual(projection?.lastResult?.outcome, .failed(.endpointClaim))
+        XCTAssertEqual(fixture.host.sendCommitOutcomes.last, .committed)
     }
 
     func testStopWithdrawalRetainsTargetStoppedOnlyForTheExactTargetEndpoint() async {
@@ -6185,6 +6237,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         XCTAssertEqual(receipt.result, .created)
         XCTAssertEqual(receipt.firstTask, .failed)
+        XCTAssertEqual(receipt.firstTaskReason, "target_stopped")
         XCTAssertTrue(receipt.linked)
         XCTAssertTrue(fixture.host.sendRequests.isEmpty, "The stale creation task must not reach a provider")
     }
@@ -6592,7 +6645,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseChildren))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 1)
     }
@@ -6607,7 +6660,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseDiskChild))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 1)
     }
@@ -6678,7 +6731,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(inUse, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(inUse, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseInboundCount))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 2)
     }
@@ -6705,7 +6758,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(ambiguous, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(ambiguous, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseBindings))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 1)
     }
@@ -6720,7 +6773,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseBindings))
         let inbound = await fixture.authority.links(forTarget: fixture.target.sessionID)
         XCTAssertEqual(inbound.items.count, 1)
     }
@@ -6839,7 +6892,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             completed.fulfill()
         }
         await fulfillment(of: [completed], timeout: 3)
-        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUse))
+        XCTAssertEqual(outcome, .notRetired(sessionID: fixture.target.sessionID, reason: .laneInUseInboundLink))
         XCTAssertTrue(fixture.host.candidates.contains(fixture.target))
         let replacementReference = await linkReference(fixture)
         let replacement = try XCTUnwrap(replacementReference)

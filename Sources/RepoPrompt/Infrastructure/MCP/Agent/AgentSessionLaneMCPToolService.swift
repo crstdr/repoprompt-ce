@@ -72,6 +72,9 @@ enum AgentSessionLaneMCPToolService {
             "lanes": .string("\(receipt.laneCount)/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)"),
             "duplicate": .bool(receipt.duplicate)
         ]
+        if receipt.firstTask == .failed, let reason = receipt.firstTaskReason {
+            fields["first_task_subreason"] = .string(reason)
+        }
         if let sessionID = receipt.sessionID { fields["session_id"] = .string(sessionID.uuidString) }
         if let sessionName = receipt.sessionName { fields["session_name"] = .string(sessionName) }
         if !receipt.linked, let reason = receipt.reason {
@@ -88,15 +91,17 @@ enum AgentSessionLaneMCPToolService {
     static func render(_ outcome: AgentSessionLaneRetireOutcome) -> Value {
         switch outcome {
         case let .retired(sessionID):
-            .object(["result": .string("retired"), "session_id": .string(sessionID.uuidString)])
+            return .object(["result": .string("retired"), "session_id": .string(sessionID.uuidString)])
         case let .notRetired(sessionID, reason):
-            .object([
+            var fields: [String: Value] = [
                 "result": .string("not_retired"),
                 "session_id": .string(sessionID.uuidString),
-                "reason": .string(reason.rawValue)
-            ])
+                "reason": .string(reason.wireReason)
+            ]
+            if let subreason = reason.subreason { fields["subreason"] = .string(subreason) }
+            return .object(fields)
         case let .unlinkedNotStashed(sessionID):
-            .object([
+            return .object([
                 "result": .string("unlinked_not_stashed"),
                 "session_id": .string(sessionID.uuidString)
             ])
