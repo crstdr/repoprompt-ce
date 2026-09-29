@@ -34,7 +34,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
             AgentComposerDraftRestorationReducer.apply(
                 operation,
                 to: "D",
-                lastAppliedRestorationEventID: nil
+                acknowledgedSequence: 0
             ),
             "C\nB\nD"
         )
@@ -50,17 +50,20 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
             message: "Failed start",
             strategy: .prependAlways
         )
-        let firstEvent = try XCTUnwrap(viewModel.draftRestorationEvent)
-        let firstOperation = try XCTUnwrap(firstEvent.operation)
+        let firstOperation = try XCTUnwrap(viewModel.draftRestorationEvent?.operation)
         let firstEditorText = AgentComposerDraftRestorationReducer.apply(
             firstOperation,
             to: "D",
-            lastAppliedRestorationEventID: nil
+            acknowledgedSequence: 0
         )
         XCTAssertEqual(firstEditorText, "B\nD")
 
         let editedText = firstEditorText + "\nnew typing"
-        viewModel.storeDraftText(for: tabID, editedText)
+        viewModel.storeDraftText(
+            for: tabID,
+            editedText,
+            acknowledgingThrough: firstOperation.fragments.last?.sequence ?? 0
+        )
         viewModel.restoreComposerDraft(
             tabID: tabID,
             text: "C",
@@ -72,7 +75,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
             AgentComposerDraftRestorationReducer.apply(
                 finalOperation,
                 to: editedText,
-                lastAppliedRestorationEventID: firstEvent.id
+                acknowledgedSequence: firstOperation.fragments.last?.sequence ?? 0
             ),
             "C\nB\nD\nnew typing"
         )
@@ -83,12 +86,11 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
         let tabID = UUID()
         viewModel.storeDraftText(for: tabID, "D")
         viewModel.restoreComposerDraft(tabID: tabID, text: "A", message: "", strategy: .prependAlways)
-        let firstEvent = try XCTUnwrap(viewModel.draftRestorationEvent)
-        let firstOperation = try XCTUnwrap(firstEvent.operation)
+        let firstOperation = try XCTUnwrap(viewModel.draftRestorationEvent?.operation)
         let firstEditorText = AgentComposerDraftRestorationReducer.apply(
             firstOperation,
             to: "D",
-            lastAppliedRestorationEventID: nil
+            acknowledgedSequence: 0
         )
         viewModel.restoreComposerDraft(tabID: tabID, text: "B", message: "", strategy: .prependAlways)
         viewModel.restoreComposerDraft(tabID: tabID, text: "C", message: "", strategy: .prependAlways)
@@ -98,10 +100,90 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
             AgentComposerDraftRestorationReducer.apply(
                 finalOperation,
                 to: firstEditorText,
-                lastAppliedRestorationEventID: firstEvent.id
+                acknowledgedSequence: firstOperation.fragments.last?.sequence ?? 0
             ),
             "C\nB\nA\nD"
         )
+    }
+
+    func testInterleavedTabsRetainEachTabsUnconsumedFragments() throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let otherTabID = UUID()
+        viewModel.storeDraftText(for: tabID, "D")
+
+        viewModel.restoreComposerDraft(tabID: tabID, text: "A", message: "", strategy: .prependAlways)
+        viewModel.restoreComposerDraft(tabID: otherTabID, text: "X", message: "", strategy: .prependAlways)
+        viewModel.restoreComposerDraft(tabID: tabID, text: "B", message: "", strategy: .prependAlways)
+
+        let operation = try XCTUnwrap(viewModel.draftRestorationEvent?.operation)
+        XCTAssertEqual(operation.fragments.map(\.text), ["A", "B"])
+        let editorText = AgentComposerDraftRestorationReducer.apply(
+            operation,
+            to: "D",
+            acknowledgedSequence: 0
+        )
+        XCTAssertEqual(editorText, "B\nA\nD")
+        viewModel.storeDraftText(
+            for: tabID,
+            editorText,
+            acknowledgingThrough: operation.fragments.last?.sequence ?? 0
+        )
+        XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "B\nA\nD")
+        XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
+        XCTAssertEqual(viewModel.draftRestorationLedger.tabs[otherTabID]?.pendingFragments.map(\.text), ["X"])
+    }
+
+    func testStaleEditorStorePreservesRecoveryPendingAtTabSwitch() {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.storeDraftText(for: tabID, "D")
+        viewModel.restoreComposerDraft(tabID: tabID, text: "A", message: "", strategy: .prependAlways)
+
+        // The old editor value is stored as the tab changes before it sees A.
+        viewModel.storeDraftText(for: tabID, "D", acknowledgingThrough: 0)
+        XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "A\nD")
+        let snapshot = viewModel.loadDraftSnapshotForComposer(for: tabID)
+        XCTAssertEqual(snapshot.text, "A\nD")
+        XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
+    }
+
+    func testLoadedSnapshotAndDeletionDoNotResurrectAcknowledgedRecovery() throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.restoreComposerDraft(tabID: tabID, text: "A", message: "", strategy: .prependAlways)
+        let oldOperation = try XCTUnwrap(viewModel.draftRestorationEvent?.operation)
+        let snapshot = viewModel.loadDraftSnapshotForComposer(for: tabID)
+        XCTAssertEqual(snapshot.text, "A")
+        XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
+
+        viewModel.storeDraftText(for: tabID, "", acknowledgingThrough: snapshot.restorationSequence)
+        XCTAssertEqual(
+            AgentComposerDraftRestorationReducer.apply(
+                oldOperation,
+                to: "",
+                acknowledgedSequence: snapshot.restorationSequence
+            ),
+            ""
+        )
+        viewModel.restoreComposerDraft(tabID: tabID, text: "B", message: "", strategy: .prependAlways)
+        viewModel.restoreComposerDraft(tabID: tabID, text: "C", message: "", strategy: .prependAlways)
+
+        let operation = try XCTUnwrap(viewModel.draftRestorationEvent?.operation)
+        XCTAssertEqual(operation.fragments.map(\.text), ["B", "C"])
+        let editorText = AgentComposerDraftRestorationReducer.apply(
+            operation,
+            to: "",
+            acknowledgedSequence: snapshot.restorationSequence
+        )
+        XCTAssertEqual(editorText, "C\nB")
+        viewModel.storeDraftText(
+            for: tabID,
+            editorText,
+            acknowledgingThrough: operation.fragments.last?.sequence ?? 0
+        )
+        XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "C\nB")
+        XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
     }
 
     private func makeViewModel() -> AgentModeViewModel {

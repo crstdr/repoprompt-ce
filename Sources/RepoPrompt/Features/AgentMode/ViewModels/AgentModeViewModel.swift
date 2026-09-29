@@ -929,6 +929,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var tabDraftText: [UUID: String] = [:]
+    var draftRestorationLedger = AgentComposerDraftRestorationLedger()
     private var cancellables = Set<AnyCancellable>()
     private let listeners = ListenerRegistry()
     private(set) var isAgentModeActive = false
@@ -14352,6 +14353,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabsWithActiveAgentRun.removeAll()
         mcpControlledTabIDs.removeAll()
         tabDraftText.removeAll()
+        draftRestorationLedger.removeAll()
         sidebarObservedRunStateByTabID.removeAll()
         workspaceSwitchProvider.scheduleBackgroundCleanup(
             targets: cleanupTargets,
@@ -15129,6 +15131,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             {
                 removeSessionIndex(forTabID: tabID)
                 tabDraftText.removeValue(forKey: tabID)
+                draftRestorationLedger.remove(tabID: tabID)
                 sessionIndexStore.removeSortDate(forTabID: tabID)
             }
             #if DEBUG
@@ -21690,6 +21693,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removeSessionIndex(forTabID: tabID)
         }
         tabDraftText.removeValue(forKey: tabID)
+        draftRestorationLedger.remove(tabID: tabID)
         sessions.removeValue(forKey: tabID)
         tabsWithActiveAgentRun.remove(tabID)
         mcpControlledTabIDs.remove(tabID)

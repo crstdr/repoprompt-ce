@@ -12,13 +12,9 @@ extension AgentModeViewModel {
         strategy: AgentModeRunService.DraftRestorationStrategy,
         operation: AgentComposerDraftRestorationOperation? = nil
     ) {
-        // A later queued recovery can arrive before SwiftUI applies the previous event.
-        // Compose against the session-owned draft now, and carry the fragment history so
-        // the UI can apply only recoveries it has not already consumed.
+        // Compose against the session-owned draft now. The per-tab ledger retains
+        // fragments until that tab's composer applies them or loads this snapshot.
         let eventID = UUID()
-        let previousFragments = draftRestorationEvent.flatMap { event in
-            event.tabID == tabID ? event.operation?.fragments : nil
-        } ?? []
         let restoredText: String
         let restoredStrategy: AgentModeRunService.DraftRestorationStrategy
         let baseOperation: AgentComposerDraftRestorationOperation?
@@ -42,12 +38,10 @@ extension AgentModeViewModel {
                 rejectedDraftText: operation.rejectedDraftText,
                 draftTextBeforeRestoration: operation.draftTextBeforeRestoration,
                 composedDraftText: operation.composedDraftText,
-                fragments: previousFragments + [
-                    .init(eventID: eventID, text: operation.rejectedDraftText)
-                ]
+                fragments: draftRestorationLedger.append(tabID: tabID, text: operation.rejectedDraftText)
             )
         }
-        storeDraftText(for: tabID, restoredText)
+        writeDraftText(for: tabID, restoredText)
         draftRestorationEvent = DraftRestorationEvent(
             id: eventID,
             tabID: tabID,
@@ -133,8 +127,31 @@ extension AgentModeViewModel {
         )
     }
 
-    /// Store draft text for a tab
-    func storeDraftText(for tabID: UUID, _ text: String) {
+    /// Store an editor draft. Only the caller's applied sequence is acknowledged;
+    /// still-pending fragments are composed into storage so a tab switch cannot
+    /// overwrite a recovery that has not reached the editor yet.
+    func storeDraftText(for tabID: UUID, _ text: String, acknowledgingThrough sequence: UInt64 = 0) {
+        draftRestorationLedger.acknowledge(tabID: tabID, through: sequence)
+        let pending = draftRestorationLedger.tabs[tabID]?.pendingFragments ?? []
+        let storedText = pending.reduce(text) { result, fragment in
+            AgentComposerDraftRestorationReducer.compose(restoredText: fragment.text, above: result)
+        }
+        let storedSequence = pending.last?.sequence ?? sequence
+        draftRestorationLedger.markStoredDraft(tabID: tabID, through: storedSequence)
+        writeDraftText(for: tabID, storedText)
+    }
+
+    /// Loading the stored text acknowledges exactly the fragments included in it.
+    func loadDraftSnapshotForComposer(for tabID: UUID) -> AgentComposerDraftSnapshot {
+        let snapshot = AgentComposerDraftSnapshot(
+            text: retrieveDraftText(for: tabID),
+            restorationSequence: draftRestorationLedger.tabs[tabID]?.storedDraftSequence ?? 0
+        )
+        draftRestorationLedger.acknowledge(tabID: tabID, through: snapshot.restorationSequence)
+        return snapshot
+    }
+
+    private func writeDraftText(for tabID: UUID, _ text: String) {
         let previousStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
         if let session = session(for: tabID, createIfNeeded: false) {
             guard session.draftText != text else { return }
