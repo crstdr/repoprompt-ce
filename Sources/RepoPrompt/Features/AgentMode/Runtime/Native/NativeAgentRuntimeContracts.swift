@@ -45,6 +45,8 @@ struct NativeAgentRuntimeConfigurationFailure: Error, LocalizedError {
 }
 
 extension NativeAgentRuntimeControlling {
+    /// Runtimes must implement failure-token ownership to support conditional fallback.
+    /// A legacy Void update alone cannot authorize restoring a failed turn's configuration.
     func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> Bool {
         guard replacingFailure == nil else { return false }
         try await applyModelAndEffort(model: model, effortLevel: effortLevel)

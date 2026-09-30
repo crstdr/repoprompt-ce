@@ -29,6 +29,12 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
             lines.append(line)
         }
 
+        func line(at index: Int) -> Data? {
+            lock.lock()
+            defer { lock.unlock() }
+            return lines.indices.contains(index) ? lines[index] : nil
+        }
+
         var count: Int {
             lock.lock()
             defer { lock.unlock() }
@@ -122,12 +128,12 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
     }
 
     @MainActor
-    func testCurrentAutoFailureRestoresManualEffortAndDelivers() async {
+    func testCurrentAutoFailureRestoresManualEffortAndDelivers() async throws {
         let controller = controller()
         let controls = Writes()
         let writes = Writes()
         await controller.test_installConfigurationTransport(controlRequest: { request in
-            controls.append(Data())
+            try controls.append(JSONSerialization.data(withJSONObject: request))
             if (request["settings"] as? [String: Any])?["effortLevel"] as? String == "low" {
                 throw NativeAgentRuntimeControllerError.invalidControlResponse("Auto rejected")
             }
@@ -147,6 +153,11 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         XCTAssertEqual(outcome, .sent)
         XCTAssertEqual(controls.count, 2)
         XCTAssertEqual(writes.count, 1)
+        let restoredRequest = try XCTUnwrap(controls.line(at: 1))
+        let request = try XCTUnwrap(JSONSerialization.jsonObject(with: restoredRequest) as? [String: Any])
+        let settings = try XCTUnwrap(request["settings"] as? [String: Any])
+        XCTAssertEqual(settings["model"] as? String, session.selectedModelRaw)
+        XCTAssertEqual(settings["effortLevel"] as? String, "high")
     }
 
     func testFailureTokenCannotBeReusedAfterFallbackOrTransportReplacement() async throws {
