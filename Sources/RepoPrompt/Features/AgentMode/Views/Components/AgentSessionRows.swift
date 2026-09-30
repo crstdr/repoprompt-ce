@@ -257,7 +257,6 @@ struct AgentSessionRow: View {
 
         let direction: Direction
         let rowEndpoint: DomainAgentSessionLinkEndpointIdentity
-        let rowSessionID: UUID
         let rowDisplayName: String
         let id = UUID()
     }
@@ -446,7 +445,7 @@ struct AgentSessionRow: View {
         if !menu.linkedObservers.isEmpty || menu.createdByLabel != nil {
             Divider()
             ForEach(menu.linkedObservers) { option in
-                Button(AgentOversightUICopy.openLabel(option.displayName)) {
+                Button(AgentOversightUICopy.openLabel(option.menuLabel)) {
                     openLinkedSession(option.peerEndpoint)
                 }
                 .accessibilityHint(option.fullIdentityDescription)
@@ -786,7 +785,6 @@ struct AgentSessionRow: View {
         oversightSessionIDSheet = OversightIDSheetRequest(
             direction: direction,
             rowEndpoint: menu.targetEndpoint,
-            rowSessionID: menu.targetSessionID,
             rowDisplayName: menu.targetDisplayName
         )
     }
@@ -798,8 +796,8 @@ struct AgentSessionRow: View {
         switch request.direction {
         case .chooseOverseer:
             AgentOversightSessionIDSheet(
-                title: AgentOversightUICopy.inboundSessionIDSheetTitle(
-                    target: request.rowDisplayName
+                title: AgentOversightUICopy.sessionIDSheetTitle(
+                    rowName: request.rowDisplayName
                 ),
                 fieldAccessibilityLabel: AgentOversightUICopy
                     .overseerSessionIDFieldAccessibilityLabel,
@@ -821,7 +819,7 @@ struct AgentSessionRow: View {
         case .chooseTarget:
             AgentOversightSessionIDSheet(
                 title: AgentOversightUICopy.sessionIDSheetTitle(
-                    observer: request.rowDisplayName
+                    rowName: request.rowDisplayName
                 ),
                 fieldAccessibilityLabel: AgentOversightUICopy.sessionIDFieldAccessibilityLabel,
                 submitLabel: AgentOversightUICopy.overseeSessionButton,
@@ -1139,11 +1137,14 @@ struct AgentSessionRow: View {
         }
     }
 
-    /// The always-visible overseen/provenance mark. Clicking opens the Oversee-by lane menu —
-    /// the same menu model as the hover affordance and the context submenu.
+    /// The always-visible overseen/provenance mark. When mutations are allowed, clicking opens the
+    /// Oversee-by lane menu — the same menu model as the hover affordance and the context submenu.
+    /// Otherwise it stays a passive state marker so it can never offer a mutation the row forbids.
+    @ViewBuilder
     private func overseenMark(
         menu: AgentSidebarOversightMenuProps,
-        tooltip: String
+        tooltip: String,
+        interactive: Bool
     ) -> some View {
         let kind = oversightMarkKind(menu: menu)
         let color: Color = switch kind {
@@ -1155,25 +1156,39 @@ struct AgentSessionRow: View {
         case .createdUnlinked:
             .orange.opacity(0.45)
         }
-        return Menu {
-            sidebarOversightMenuContent(menu)
-        } label: {
-            HStack(spacing: 1) {
-                Image(systemName: AgentOversightUICopy.relationshipMarkIcon)
-                    .font(.system(size: 10))
-                if menu.inboundObserverNames.count > 1 {
-                    Text("\(menu.inboundObserverNames.count)")
-                        .font(.system(size: 8, weight: .semibold))
-                }
+        if interactive {
+            Menu {
+                sidebarOversightMenuContent(menu)
+            } label: {
+                overseenMarkGlyph(menu: menu, color: color)
             }
-            .foregroundStyle(color)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .hoverTooltip(tooltip)
+            .accessibilityLabel(tooltip)
+            .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+        } else {
+            overseenMarkGlyph(menu: menu, color: color)
+                .fixedSize()
+                .hoverTooltip(tooltip)
+                .accessibilityLabel(tooltip)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .hoverTooltip(tooltip)
-        .accessibilityLabel(tooltip)
-        .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+    }
+
+    private func overseenMarkGlyph(
+        menu: AgentSidebarOversightMenuProps,
+        color: Color
+    ) -> some View {
+        HStack(spacing: 1) {
+            Image(systemName: AgentOversightUICopy.relationshipMarkIcon)
+                .font(.system(size: 10))
+            if menu.inboundObserverNames.count > 1 {
+                Text("\(menu.inboundObserverNames.count)")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+        }
+        .foregroundStyle(color)
     }
 
     @ViewBuilder
@@ -1249,7 +1264,13 @@ struct AgentSessionRow: View {
                     if let sidebarOversightMenu,
                        let markTooltip = oversightMarkTooltip(menu: sidebarOversightMenu)
                     {
-                        overseenMark(menu: sidebarOversightMenu, tooltip: markTooltip)
+                        overseenMark(
+                            menu: sidebarOversightMenu,
+                            tooltip: markTooltip,
+                            interactive: allowsDirectMutations
+                                && onAddSidebarOversight != nil
+                                && onStopSidebarOversight != nil
+                        )
                     }
 
                     if isPinned {
@@ -1489,6 +1510,7 @@ struct AgentSessionRow: View {
             guard !isEnabled else { return }
             showDeleteConfirmation = false
             showRenameAlert = false
+            oversightSessionIDSheet = nil
         }
     }
 

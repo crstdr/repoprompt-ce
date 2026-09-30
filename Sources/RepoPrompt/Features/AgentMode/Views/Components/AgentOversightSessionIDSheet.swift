@@ -172,6 +172,8 @@ struct AgentOversightSessionIDSheet: View {
         let trimmed = identifierText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !isWorking, !trimmed.isEmpty else { return }
         isWorking = true
+        // Invalidate any in-flight text-resolution so it cannot clobber the submit outcome.
+        resolutionGeneration &+= 1
         Task { @MainActor in
             // Re-resolve at submit time so the accepted dialog and the Add both see the same
             // exact endpoint; the peer captured earlier may have been superseded while open.

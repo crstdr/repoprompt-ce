@@ -1589,9 +1589,6 @@ struct AgentMonitorResolvedPreview: Equatable {
     let providerDisplayName: String?
     let locationLabel: String?
     let status: AgentMonitorLinkStatus
-    /// Exact resolved incarnation. The link-confirmation gate and the exact Add overload use it
-    /// so a rebind between preview and acceptance cannot silently retarget the request.
-    let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
 
     var shortID: String {
         AgentMonitorSessionIDFormatter.short(sessionID)

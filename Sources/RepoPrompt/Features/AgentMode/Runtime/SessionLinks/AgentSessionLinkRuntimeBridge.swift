@@ -7173,8 +7173,7 @@ final class AgentSessionLinkRuntimeBridge {
                 status: targetPresentation(
                     for: candidate,
                     exactEndpoint: candidate.domainEndpoint
-                ).status,
-                targetEndpoint: candidate.domainEndpoint
+                ).status
             )
         }
     }
@@ -7220,6 +7219,14 @@ final class AgentSessionLinkRuntimeBridge {
             roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
         ) {
             return .failure(AgentOversightResolutionMessage(message: reason))
+        }
+        // Already linked this direction is a resolution answer, not a confirm-then-no-op: the same
+        // check the outbound resolver performs with `existingOutboundTargetIDs`.
+        let inventory = await authority.links(forObserverEndpoint: candidate.domainEndpoint)
+        if inventory.items.contains(where: { $0.targetSessionID == excludingTargetSessionID }) {
+            return .failure(AgentOversightResolutionMessage(
+                message: AgentOversightUICopy.alreadyLinkedInDirection
+            ))
         }
         guard await authority.hasActiveOutboundLink(observerEndpoint: candidate.domainEndpoint) else {
             return .failure(AgentOversightResolutionMessage(

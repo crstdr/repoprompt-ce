@@ -89,14 +89,11 @@ enum AgentOversightUICopy {
 
     // MARK: - Session-ID sheet
 
-    static func sessionIDSheetTitle(observer: String) -> String {
-        "Choose a session for \"\(observer)\" to oversee"
-    }
-
-    // TODO(copy-approval): inbound-direction sheet title — not in the approved copy set.
-    // Flagged in the PR description for Cristian.
-    static func inboundSessionIDSheetTitle(target: String) -> String {
-        "Choose a session to oversee \"\(target)\""
+    /// One approved template names the row by its role — `{target}` on the inbound sheet
+    /// (the session picking who oversees it) and `{observer}` on the outbound sheet — which is the
+    /// same literal string carrying the row's display name either way.
+    static func sessionIDSheetTitle(rowName: String) -> String {
+        "Choose a session for \"\(rowName)\" to oversee"
     }
 
     static let sessionIDFieldPlaceholder = "Session ID"
@@ -108,7 +105,7 @@ enum AgentOversightUICopy {
     static let overseeSessionButton = "Oversee session"
     static let cancelButton = "Cancel"
 
-    // TODO(copy-approval): neutral already-linked message for the inbound sheet.
+    // TODO(copy-approval): neutral already-linked message for the inbound resolver.
     // The shared resolver's `.alreadyMonitoring` message reads "You're already
     // overseeing this session.", which is wrong when the pasted session is the observer.
     static let alreadyLinkedInDirection = "These sessions are already linked in this direction."

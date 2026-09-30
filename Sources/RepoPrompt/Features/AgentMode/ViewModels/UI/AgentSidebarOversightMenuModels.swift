@@ -342,8 +342,8 @@ enum AgentSidebarOversightMenuProjection {
             linkedTargets.append(Seed(
                 peerEndpoint: linkedTargetEndpoint,
                 peerSessionID: linkedTargetEndpoint.sessionID,
-                displayName: item.displayName
-                    ?? targetPeer?.resolvedDisplayName
+                displayName: targetPeer?.resolvedDisplayName
+                    ?? item.displayName
                     ?? AgentMonitorSessionIDFormatter.short(linkedTargetEndpoint.sessionID),
                 providerDisplayName: normalizedProvider(targetPeer?.providerDisplayName),
                 locationLabel: targetPeer?.locationLabel,

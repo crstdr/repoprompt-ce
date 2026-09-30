@@ -16,7 +16,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
 
     private func candidate(
         windowID: Int,
-        workspaceID: UUID = id("10000000-0000-0000-0000-000000000001"),
+        workspaceID: UUID = UUID(uuidString: "10000000-0000-0000-0000-000000000001")!,
         tabID: UUID = UUID(),
         sessionID: UUID = UUID(),
         bindingID: UUID? = UUID(uuidString: "10000000-0000-0000-0000-000000000002")!,
@@ -506,6 +506,32 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertTrue(full.contains(pathological.workspaceID.uuidString))
         XCTAssertTrue(try full.contains(XCTUnwrap(pathological.persistentBindingGeneration?.uuidString)))
         XCTAssertEqual(Set(menu.availableObservers.map(\.menuLabel)).count, menu.availableObservers.count)
+    }
+
+    func testCreatorNavigationRequiresOneLiveMatchingRoute() {
+        let creatorID = UUID()
+        let route = AgentSessionDeepLinkRoute(
+            workspaceID: UUID(), tabID: UUID(), sessionID: creatorID
+        )
+        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(for: creatorID, candidates: []))
+        XCTAssertEqual(
+            AgentSidebarCreatorNavigation.uniqueRoute(for: creatorID, candidates: [route]), route
+        )
+        let sameTabInAnotherWindow = AgentSessionDeepLinkRoute(
+            windowID: 2, workspaceID: route.workspaceID, tabID: route.tabID, sessionID: creatorID
+        )
+        XCTAssertEqual(AgentSidebarCreatorNavigation.uniqueRoute(
+            for: creatorID, candidates: [route, sameTabInAnotherWindow]
+        ), route)
+        let differentTab = AgentSessionDeepLinkRoute(
+            workspaceID: route.workspaceID, tabID: UUID(), sessionID: creatorID
+        )
+        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
+            for: creatorID, candidates: [route, differentTab]
+        ))
+        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
+            for: UUID(), candidates: [route]
+        ))
     }
 
     func testActionKeysAreExactEndpointAndGenerationQualified() {
