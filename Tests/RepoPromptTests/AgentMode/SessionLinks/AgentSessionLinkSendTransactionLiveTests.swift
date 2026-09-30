@@ -495,6 +495,48 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
     }
 
+    /// Internal lifecycle cancellations (instruction timeout, location change, runtime shutdown)
+    /// fence the target's own deferred starts but never withdraw an overseer's queued send.
+    func testQueuedSendSurvivesInternalLifecycleCancellations() async throws {
+        let fixture = try makeFixture()
+        var request = makeRequest(message: "queued before an internal cancellation")
+        let queuedFence = AgentRunStartStopFence(session: fixture.session)
+        request.startStopFence = queuedFence
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .userStop, origin: .internalLifecycle
+        )
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .executionLocationChange, origin: .explicitStop
+        )
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .runtimeShutdown, origin: .internalLifecycle
+        )
+        XCTAssertFalse(queuedFence.permitsStart(of: fixture.session), "deferred starts stay fenced")
+        XCTAssertTrue(queuedFence.permitsQueuedDelivery(to: fixture.session))
+
+        let outcome = await send(fixture, request: request)
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("expected delivery after a non-Stop cancellation, got \(outcome)")
+        }
+        XCTAssertEqual(delivery.deliveryState, .runStarted)
+    }
+
+    func testQueuedSendIsWithdrawnAfterExplicitStop() async throws {
+        let fixture = try makeFixture()
+        var request = makeRequest(message: "queued before the user pressed Stop")
+        request.startStopFence = AgentRunStartStopFence(session: fixture.session)
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .userStop, origin: .explicitStop
+        )
+
+        let outcome = await send(fixture, request: request)
+        guard case .blocked(.targetStopped) = outcome else {
+            return XCTFail("expected target_stopped after an explicit Stop, got \(outcome)")
+        }
+        XCTAssertTrue(fixture.session.items.filter { $0.kind == .user }.isEmpty)
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
     func testEndpointDriftAfterTheCommitFenceAbortsBeforeMutating() async throws {
         let fixture = try makeFixture()
 

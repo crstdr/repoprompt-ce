@@ -220,6 +220,10 @@ fresh managed generation, not a resurrection of the old one.
 retain their watch-level operation grant but disclose prompt bodies only after a separate whole-batch
 management fence and live-endpoint check. A restricted link can still `poll` or `wait` for status
 with `managed: false` and no prompt body; `respond` and `steer` return `management_not_granted`.
+When that fence fails for a multi-target `wait` after a non-terminal wake, each target is re-fenced on
+its own (as terminal survivors already are): healthy siblings keep their rows, cursors, and prompts,
+and a sibling that failed its own fence releases nothing and is named in `unavailable_session_ids`.
+A single-target wait, or a batch with no survivor, is still denied.
 An unlinked UUID still receives the indistinguishable denial. A steer's ledger
 commit still uses `commitSendAuthorization(requiresManagement: true)`, and revocation before the final
 fence releases the uncommitted reservation without delivery.
@@ -238,7 +242,9 @@ submits without suspending. Approvals and permissions accept only `accept` (this
 `decline`, or `cancel`. Session-wide and exec-policy-amending approvals, Codex project-hook trust,
 app-owned worktree-merge reviews, and user-input requests containing a secret field are visible but
 `manual_only`. ACP permissions use only a genuine one-time allow option for accept and a one-time
-reject for decline. A wait for the session's next instruction is not a prompt `respond` answers;
+reject (otherwise `cancelled`) for decline. When the provider offers no genuine one-time allow
+option, `poll`/`wait` omit `accept` and `respond` refuses only accept (`manual_only`,
+`no_one_time_allow_option`); decline and cancel stay available. A wait for the session's next instruction is not a prompt `respond` answers;
 the managed pending-interaction note says to deliver that instruction with `steer`.
 
 ### Steering
