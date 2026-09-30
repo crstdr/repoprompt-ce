@@ -7188,7 +7188,7 @@ final class AgentSessionLinkRuntimeBridge {
     func resolveSidebarOverseerCandidate(
         rawSessionID: String,
         excludingTargetSessionID: UUID
-    ) async -> Result<AgentSessionLinkEndpointCandidate, AgentOversightResolutionMessage> {
+    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
         guard let host else {
             return .failure(AgentOversightResolutionMessage(message: Self.unavailableMessage))
         }
@@ -7214,26 +7214,24 @@ final class AgentSessionLinkRuntimeBridge {
             ))
         }
         let candidate = matches[0]
+        // An already-linked pair resolves as done before eligibility is even consulted: the sheet
+        // closes silently rather than showing confirm-then-no-op or a transient eligibility error.
+        let inventory = await authority.links(forObserverEndpoint: candidate.domainEndpoint)
+        if inventory.items.contains(where: { $0.targetSessionID == excludingTargetSessionID }) {
+            return .success(.alreadyLinked)
+        }
         if let reason = AgentSessionLinkEndpointEligibility.addDisabledReason(
             candidate.eligibilityInput,
             roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
         ) {
             return .failure(AgentOversightResolutionMessage(message: reason))
         }
-        // Already linked this direction is a resolution answer, not a confirm-then-no-op: the same
-        // check the outbound resolver performs with `existingOutboundTargetIDs`.
-        let inventory = await authority.links(forObserverEndpoint: candidate.domainEndpoint)
-        if inventory.items.contains(where: { $0.targetSessionID == excludingTargetSessionID }) {
-            return .failure(AgentOversightResolutionMessage(
-                message: AgentOversightUICopy.alreadyLinkedInDirection
-            ))
-        }
         guard await authority.hasActiveOutboundLink(observerEndpoint: candidate.domainEndpoint) else {
             return .failure(AgentOversightResolutionMessage(
                 message: Self.existingOverseerRequiredMessage
             ))
         }
-        return .success(candidate)
+        return .success(.candidate(candidate))
     }
 
     /// UI-only display name for one exact live endpoint, used by the link-confirmation dialog so it

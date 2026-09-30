@@ -981,7 +981,7 @@ extension AgentModeViewModel {
     func resolveSidebarOverseerCandidate(
         rawSessionID: String,
         excludingTargetSessionID: UUID
-    ) async -> Result<AgentSessionLinkEndpointCandidate, AgentOversightResolutionMessage> {
+    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
         await AgentSessionLinkRuntimeBridge.shared.resolveSidebarOverseerCandidate(
             rawSessionID: rawSessionID,
             excludingTargetSessionID: excludingTargetSessionID
@@ -989,21 +989,30 @@ extension AgentModeViewModel {
     }
 
     /// Pasted-ID resolution for the sidebar's outbound `Session ID…` sheet (choose a prospective
-    /// target for this row-as-observer). Reuses the composer pill's resolver verbatim.
+    /// target for this row-as-observer). Reuses the composer pill's resolver, except that an
+    /// already-linked pair resolves to `.alreadyLinked` — the sheet closes silently rather than
+    /// showing the "You're already overseeing this session." error.
     func resolveSidebarTargetCandidate(
         rawSessionID: String,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
-    ) -> Result<AgentSessionLinkEndpointCandidate, AgentOversightResolutionMessage> {
+    ) -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
         let existingTargetIDs = Set(
             monitorPillPropsByEndpoint[observerEndpoint]?.outbound.map(\.targetSessionID) ?? []
         )
-        return AgentSessionLinkRuntimeBridge.shared
+        switch AgentSessionLinkRuntimeBridge.shared
             .resolveTargetCandidate(
                 observerSessionID: observerEndpoint.sessionID,
                 rawTargetSessionID: rawSessionID,
                 existingOutboundTargetIDs: existingTargetIDs
             )
-            .mapError { AgentOversightResolutionMessage(message: $0.uiMessage) }
+        {
+        case let .success(candidate):
+            return .success(.candidate(candidate))
+        case .failure(.alreadyMonitoring):
+            return .success(.alreadyLinked)
+        case let .failure(failure):
+            return .failure(AgentOversightResolutionMessage(message: failure.uiMessage))
+        }
     }
 
     /// Overlays this observer's own Auto-wake policy onto the authoritative link rows.

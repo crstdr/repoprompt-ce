@@ -78,6 +78,23 @@ enum AgentOversightUICopy {
         "Unlink \"\(displayName)\""
     }
 
+    /// VoiceOver value of the Oversee menu (approved: "Overseeing {N}; {M} available").
+    static func overseeMenuAccessibilityValue(
+        overseeingCount: Int,
+        availableCount: Int
+    ) -> String {
+        "Overseeing \(overseeingCount); \(availableCount) available"
+    }
+
+    /// VoiceOver value of the Oversee-by menu — mirrors the approved Oversee value.
+    /// TODO(copy-approval): derived phrasing, pending sign-off.
+    static func overseeByMenuAccessibilityValue(
+        overseenByCount: Int,
+        availableCount: Int
+    ) -> String {
+        "Overseen by \(overseenByCount); \(availableCount) available"
+    }
+
     /// Unified capitalization for every "Copy Session ID" surface.
     static let copySessionIDTitle = "Copy Session ID"
 
@@ -89,26 +106,26 @@ enum AgentOversightUICopy {
 
     // MARK: - Session-ID sheet
 
-    /// One approved template names the row by its role — `{target}` on the inbound sheet
-    /// (the session picking who oversees it) and `{observer}` on the outbound sheet — which is the
-    /// same literal string carrying the row's display name either way.
-    static func sessionIDSheetTitle(rowName: String) -> String {
-        "Choose a session for \"\(rowName)\" to oversee"
+    /// Outbound sheet (the row picks what it oversees): the row is `{observer}`.
+    static func sessionIDSheetTitle(observer: String) -> String {
+        "Choose a session for \"\(observer)\" to oversee"
+    }
+
+    /// Inbound sheet (the row picks who oversees it): the row is `{session}`.
+    static func inboundSessionIDSheetTitle(session: String) -> String {
+        "Choose an overseer for \"\(session)\""
     }
 
     static let sessionIDFieldPlaceholder = "Session ID"
     static let sessionIDFieldAccessibilityLabel = "Session ID to oversee"
-    // TODO(copy-approval): inbound field label — not in the approved copy set.
+    /// Approved VoiceOver label for the inbound (choose-an-overseer) field.
     static let overseerSessionIDFieldAccessibilityLabel = "Overseer Session ID"
     static let pasteFromClipboard = "Paste from Clipboard"
     static let pasteFromClipboardHint = "Pastes a copied session ID"
     static let overseeSessionButton = "Oversee session"
+    /// Inbound submit: the pasted session becomes an overseer of this row.
+    static let addOverseerButton = "Add overseer"
     static let cancelButton = "Cancel"
-
-    // TODO(copy-approval): neutral already-linked message for the inbound resolver.
-    // The shared resolver's `.alreadyMonitoring` message reads "You're already
-    // overseeing this session.", which is wrong when the pasted session is the observer.
-    static let alreadyLinkedInDirection = "These sessions are already linked in this direction."
 
     // MARK: - Confirmation dialog
 
@@ -132,11 +149,10 @@ enum AgentOversightUICopy {
     static let confirmationCancelButton = "Cancel"
     static let confirmationSuppressionCheckbox = "Don’t ask again"
 
-    /// Shown when the exact endpoints captured before the dialog no longer resolve.
-    static let confirmationStaleSelection =
-        "The selected sessions changed. Choose them again before creating oversight."
+    /// Shown when the endpoints or menu options captured before a confirm/submit no longer
+    /// resolve — the sole stale-state error for every oversight surface.
+    static let staleSelectionMessage = "Sessions changed. Please choose again."
 
-    // TODO(copy-approval): generic fallback when no resolver is wired — not in the approved
-    // copy set. Unreachable when the Session-ID item is wired with resolvers.
+    /// Approved fallback when no resolver is wired (unreachable in the current wiring).
     static let oversightUnavailableMessage = "Oversight is unavailable right now."
 }

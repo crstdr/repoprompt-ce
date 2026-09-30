@@ -158,6 +158,13 @@ struct AgentOversightResolutionMessage: Error, Equatable {
     let message: String
 }
 
+/// Resolution outcome for the sidebar Session-ID sheets. `.alreadyLinked` means the pair is
+/// already linked in this direction: the sheet closes silently — no dialog, no message.
+enum AgentOversightSessionIDResolution: Equatable {
+    case candidate(AgentSessionLinkEndpointCandidate)
+    case alreadyLinked
+}
+
 /// Result of one exact sidebar relationship action.
 enum AgentSidebarOversightActionOutcome: Equatable {
     case changed

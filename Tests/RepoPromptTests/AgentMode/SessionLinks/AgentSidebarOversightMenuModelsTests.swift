@@ -443,6 +443,29 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertEqual(AgentOversightUICopy.confirmationAllowButton, "Allow oversight")
     }
 
+    /// Approved 2026-09-30 copy decisions for the Session-ID sheets and stale/menu strings.
+    func testSheetAndStaleCopyMatchesApproval() {
+        XCTAssertEqual(
+            AgentOversightUICopy.sessionIDSheetTitle(observer: "Lane A"),
+            "Choose a session for \"Lane A\" to oversee"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.inboundSessionIDSheetTitle(session: "Lane A"),
+            "Choose an overseer for \"Lane A\""
+        )
+        XCTAssertEqual(AgentOversightUICopy.addOverseerButton, "Add overseer")
+        XCTAssertEqual(AgentOversightUICopy.overseeSessionButton, "Oversee session")
+        XCTAssertEqual(AgentOversightUICopy.staleSelectionMessage, "Sessions changed. Please choose again.")
+        XCTAssertEqual(
+            AgentOversightUICopy.overseeMenuAccessibilityValue(overseeingCount: 2, availableCount: 3),
+            "Overseeing 2; 3 available"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.overseeByMenuAccessibilityValue(overseenByCount: 1, availableCount: 4),
+            "Overseen by 1; 4 available"
+        )
+    }
+
     func testCollisionLabelsWidenThroughSessionWindowTabAndFullExactIdentity() throws {
         let target = candidate(windowID: 99, displayName: "Target")
         let sessionA = id("AAAA0000-0000-0000-0000-00000000AAAA")

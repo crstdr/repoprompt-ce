@@ -586,7 +586,7 @@ struct AgentModeSessionsListView: View {
                             }
                         // Hoisted into locals so the row's long memberwise call stays inside the
                         // type-checker's time budget.
-                        let resolveOverseerCandidate: (@MainActor (String) async -> Result<AgentSessionLinkEndpointCandidate, AgentOversightResolutionMessage>)? = {
+                        let resolveOverseerCandidate: (@MainActor (String) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)? = {
                             raw in
                             guard let rowSessionID = session.sessionID else {
                                 return .failure(AgentOversightResolutionMessage(
@@ -598,11 +598,11 @@ struct AgentModeSessionsListView: View {
                                 excludingTargetSessionID: rowSessionID
                             )
                         }
-                        let resolveTargetCandidate: (@MainActor (String) async -> Result<AgentSessionLinkEndpointCandidate, AgentOversightResolutionMessage>)? = {
+                        let resolveTargetCandidate: (@MainActor (String) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)? = {
                             raw in
                             guard let endpoint = sidebarOversightTargetEndpointResolver?() else {
                                 return .failure(AgentOversightResolutionMessage(
-                                    message: AgentOversightUICopy.confirmationStaleSelection
+                                    message: AgentOversightUICopy.staleSelectionMessage
                                 ))
                             }
                             return agentModeVM.resolveSidebarTargetCandidate(

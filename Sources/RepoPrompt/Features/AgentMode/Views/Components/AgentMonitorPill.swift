@@ -1439,7 +1439,14 @@ struct AgentMonitorPopoverView: View {
                 isWorking = false
                 if case let .failure(failure) = resolved {
                     preview = nil
-                    validationMessage = failure.uiMessage
+                    // Already linked in this direction is done — clear the field with no
+                    // error and no dialog, matching the sidebar Session-ID sheets.
+                    if failure == .alreadyMonitoring {
+                        identifierText = ""
+                        validationMessage = nil
+                    } else {
+                        validationMessage = failure.uiMessage
+                    }
                 }
                 return
             }

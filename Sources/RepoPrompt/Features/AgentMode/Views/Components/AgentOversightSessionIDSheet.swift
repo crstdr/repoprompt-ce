@@ -58,7 +58,11 @@ struct AgentOversightSessionIDSheet: View {
     let fieldAccessibilityLabel: String
     let submitLabel: String
     /// Pure, read-only resolution of the pasted text; never focuses or activates anything.
-    let resolve: @MainActor (String) async -> Result<ResolvedPeer, AgentOversightResolutionMessage>
+    /// `.alreadyLinked` is a successful silent no-op, not an error.
+    let resolve: @MainActor (String) async -> Result<
+        AgentOversightSessionIDResolution,
+        AgentOversightResolutionMessage
+    >
     /// Confirms and creates the link.
     let submit: @MainActor (ResolvedPeer) async -> AgentOversightSessionIDSubmitOutcome
     let onDismiss: () -> Void
@@ -158,8 +162,13 @@ struct AgentOversightSessionIDSheet: View {
             let result = await resolve(trimmed)
             guard resolutionGeneration == generation else { return }
             switch result {
-            case let .success(peer):
-                resolvedPeer = peer
+            case let .success(.candidate(candidate)):
+                resolvedPeer = ResolvedPeer(candidate: candidate)
+                validationMessage = nil
+            case .success(.alreadyLinked):
+                // Already linked in this direction: no preview and no message — submitting (or
+                // nothing) just completes the pair silently.
+                resolvedPeer = nil
                 validationMessage = nil
             case let .failure(error):
                 resolvedPeer = nil
@@ -179,8 +188,8 @@ struct AgentOversightSessionIDSheet: View {
             // exact endpoint; the peer captured earlier may have been superseded while open.
             let resolved = await resolve(trimmed)
             switch resolved {
-            case let .success(peer):
-                switch await submit(peer) {
+            case let .success(.candidate(candidate)):
+                switch await submit(ResolvedPeer(candidate: candidate)) {
                 case .succeeded:
                     isWorking = false
                     onDismiss()
@@ -191,6 +200,11 @@ struct AgentOversightSessionIDSheet: View {
                     validationMessage = message
                     resolvedPeer = nil
                 }
+            case .success(.alreadyLinked):
+                // Approved behavior: already linked in this direction is done — close silently.
+                isWorking = false
+                onDismiss()
+                return
             case let .failure(error):
                 resolvedPeer = nil
                 validationMessage = error.message

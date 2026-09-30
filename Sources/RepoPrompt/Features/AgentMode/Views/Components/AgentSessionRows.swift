@@ -212,10 +212,10 @@ struct AgentSessionRow: View {
     /// prospective overseer (existing-overseer rule); outbound resolves the prospective target.
     var resolveOverseerSessionIDCandidate: (@MainActor (
         String
-    ) async -> Result<AgentSessionLinkEndpointCandidate, AgentOversightResolutionMessage>)?
+    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)?
     var resolveTargetSessionIDCandidate: (@MainActor (
         String
-    ) async -> Result<AgentSessionLinkEndpointCandidate, AgentOversightResolutionMessage>)?
+    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)?
     /// Navigates to a linked peer's exact route (the `Open "{name}"` menu items).
     var onOpenLinkedSession: (@MainActor (AgentSessionDeepLinkRoute) -> Void)?
     let sessionIDCopyAction: AgentSidebarSessionIDCopyAction
@@ -382,8 +382,6 @@ struct AgentSessionRow: View {
         AgentOversightUICopy.copySessionIDTitle
     }
 
-    private static let staleAvailableOverseerMessage = "That Agent session is no longer available as an overseer."
-
     private var copySessionIDIconColor: Color {
         if showsCopiedFeedback { return .green }
         return isCopySessionIDHovered ? .accentColor : .secondary
@@ -405,20 +403,19 @@ struct AgentSessionRow: View {
     private func sidebarOversightMenuAccessibilityValue(
         _ menu: AgentSidebarOversightMenuProps
     ) -> String {
-        let linked = menu.linkedObservers.count
-        let available = menu.availableObservers.count
-        return "\(linked) current overseer\(linked == 1 ? "" : "s"); "
-            + "\(available) eligible Agent session\(available == 1 ? "" : "s")"
+        AgentOversightUICopy.overseeByMenuAccessibilityValue(
+            overseenByCount: menu.linkedObservers.count,
+            availableCount: menu.availableObservers.count
+        )
     }
 
-    // TODO(copy-approval): inverse-direction menu value — not in the approved copy set.
     private func sidebarOversightInverseMenuAccessibilityValue(
         _ menu: AgentSidebarOversightMenuProps
     ) -> String {
-        let linked = menu.linkedTargets.count
-        let available = menu.availableTargets.count
-        return "\(linked) linked session\(linked == 1 ? "" : "s"); "
-            + "\(available) session\(available == 1 ? "" : "s") to oversee"
+        AgentOversightUICopy.overseeMenuAccessibilityValue(
+            overseeingCount: menu.linkedTargets.count,
+            availableCount: menu.availableTargets.count
+        )
     }
 
     /// Builds the Oversee-by lane menu items from the supplied value rather than resolving them
@@ -638,7 +635,7 @@ struct AgentSessionRow: View {
         else {
             sidebarOversightBusyKeys.remove(key)
             setSynchronousSidebarOversightFailure(
-                Self.staleAvailableOverseerMessage,
+                AgentOversightUICopy.staleSelectionMessage,
                 revision: revision,
                 targetEndpoint: menu.targetEndpoint
             )
@@ -694,7 +691,7 @@ struct AgentSessionRow: View {
         else {
             sidebarOversightBusyKeys.remove(key)
             setSynchronousSidebarOversightFailure(
-                AgentOversightUICopy.confirmationStaleSelection,
+                AgentOversightUICopy.staleSelectionMessage,
                 revision: revision,
                 targetEndpoint: menu.targetEndpoint
             )
@@ -796,12 +793,12 @@ struct AgentSessionRow: View {
         switch request.direction {
         case .chooseOverseer:
             AgentOversightSessionIDSheet(
-                title: AgentOversightUICopy.sessionIDSheetTitle(
-                    rowName: request.rowDisplayName
+                title: AgentOversightUICopy.inboundSessionIDSheetTitle(
+                    session: request.rowDisplayName
                 ),
                 fieldAccessibilityLabel: AgentOversightUICopy
                     .overseerSessionIDFieldAccessibilityLabel,
-                submitLabel: AgentOversightUICopy.overseeSessionButton,
+                submitLabel: AgentOversightUICopy.addOverseerButton,
                 resolve: { raw in
                     guard let resolveOverseerSessionIDCandidate else {
                         return .failure(AgentOversightResolutionMessage(
@@ -809,7 +806,6 @@ struct AgentSessionRow: View {
                         ))
                     }
                     return await resolveOverseerSessionIDCandidate(raw)
-                        .map(AgentOversightSessionIDSheet.ResolvedPeer.init(candidate:))
                 },
                 submit: { peer in
                     await submitOversightSessionID(peer, direction: .chooseOverseer, request: request)
@@ -819,7 +815,7 @@ struct AgentSessionRow: View {
         case .chooseTarget:
             AgentOversightSessionIDSheet(
                 title: AgentOversightUICopy.sessionIDSheetTitle(
-                    rowName: request.rowDisplayName
+                    observer: request.rowDisplayName
                 ),
                 fieldAccessibilityLabel: AgentOversightUICopy.sessionIDFieldAccessibilityLabel,
                 submitLabel: AgentOversightUICopy.overseeSessionButton,
@@ -830,7 +826,6 @@ struct AgentSessionRow: View {
                         ))
                     }
                     return await resolveTargetSessionIDCandidate(raw)
-                        .map(AgentOversightSessionIDSheet.ResolvedPeer.init(candidate:))
                 },
                 submit: { peer in
                     await submitOversightSessionID(peer, direction: .chooseTarget, request: request)
@@ -849,7 +844,7 @@ struct AgentSessionRow: View {
         request: OversightIDSheetRequest
     ) async -> AgentOversightSessionIDSubmitOutcome {
         guard resolveSidebarOversightTargetEndpoint?() == request.rowEndpoint else {
-            return .failed(AgentOversightUICopy.confirmationStaleSelection)
+            return .failed(AgentOversightUICopy.staleSelectionMessage)
         }
         let confirmed: Bool
         let outcome: AgentSidebarOversightActionOutcome
@@ -862,7 +857,7 @@ struct AgentSessionRow: View {
             )
             guard confirmed else { return .cancelled }
             guard let onAddSidebarOversight else {
-                return .failed(Self.staleAvailableOverseerMessage)
+                return .failed(AgentOversightUICopy.staleSelectionMessage)
             }
             outcome = await onAddSidebarOversight(peer.endpoint, request.rowEndpoint)
         case .chooseTarget:
@@ -873,7 +868,7 @@ struct AgentSessionRow: View {
             )
             guard confirmed else { return .cancelled }
             guard let onAddOutboundOversight else {
-                return .failed(AgentOversightUICopy.confirmationStaleSelection)
+                return .failed(AgentOversightUICopy.staleSelectionMessage)
             }
             outcome = await onAddOutboundOversight(request.rowEndpoint, peer.endpoint)
         }
