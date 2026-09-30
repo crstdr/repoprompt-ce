@@ -985,6 +985,8 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     private let authority: DomainAgentSessionLinkAuthority
+    private var localInputGenerations: [DomainAgentSessionLinkEndpointIdentity: UInt64] = [:]
+    private var localInputReleaseTasks: [DomainAgentSessionLinkEndpointIdentity: Task<Void, Never>] = [:]
     private weak var host: AgentSessionLinkEndpointHost?
     /// Durable oversight intent, installed by app composition.
     ///
@@ -5616,14 +5618,40 @@ final class AgentSessionLinkRuntimeBridge {
         await authority.targetState(for: lease)
     }
 
+    func captureWaitInput(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> DomainAgentSessionLinkWaitInput {
+        .init(endpoint: endpoint, generation: localInputGenerations[endpoint, default: 0])
+    }
+
+    /// Called synchronously at composer acceptance, before any host steering drain can start.
+    @discardableResult
+    func acceptLocalInput(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> Task<Void, Never> {
+        let generation = localInputGenerations[endpoint, default: 0] + 1
+        localInputGenerations[endpoint] = generation
+        let previous = localInputReleaseTasks[endpoint]
+        let authority = authority
+        let task = Task {
+            await previous?.value
+            await authority.acceptLocalInput(.init(endpoint: endpoint, generation: generation))
+        }
+        localInputReleaseTasks[endpoint] = task
+        return task
+    }
+
     /// Bounded, event-driven wait. The authority owns one-waiter admission and atomic multi-target
     /// slot reservation; this is a pure forward so the service never holds the authority itself.
     func wait(
         requests: [DomainAgentSessionLinkWaitRequest],
         until predicate: DomainAgentSessionLinkWaitPredicate,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        observerInput: DomainAgentSessionLinkWaitInput? = nil
     ) async -> DomainAgentSessionLinkWaitResult {
-        await authority.wait(requests: requests, until: predicate, timeoutSeconds: timeoutSeconds)
+        if let observerInput {
+            // A post-acceptance request must not overtake the already-installed actor forwarding.
+            await localInputReleaseTasks[observerInput.endpoint]?.value
+        }
+        return await authority.wait(
+            requests: requests, until: predicate, timeoutSeconds: timeoutSeconds, observerInput: observerInput
+        )
     }
 
     func openReadCursor(

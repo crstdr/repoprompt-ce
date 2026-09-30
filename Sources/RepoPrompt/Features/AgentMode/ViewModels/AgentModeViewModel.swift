@@ -17292,6 +17292,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
+        if managedTurn == nil, !session.isMCPInstructionDispatchInProgress,
+           let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID)
+        {
+            session.observerWaitRelease = (
+                session.runID, session.activeRunAttemptID,
+                AgentSessionLinkRuntimeBridge.shared.acceptLocalInput(for: endpoint)
+            )
+        }
         managedTurn?.sink.noteAppended(itemID: userItem.id)
         let routerConfiguration = modelRouterSettingsStore.modelRouterConfiguration()
         let defaultRouterAudit = AgentAutomationTurnAudit.Feature(

@@ -9,6 +9,54 @@ import XCTest
 /// freshly fenced managed poll/wait may carry a redacted pending interaction.
 @MainActor
 final class AgentSessionLinkToolServiceTests: XCTestCase {
+    func testWaitTimeoutIsWaitSpecificAndBounded() throws {
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.resolvedWaitTimeoutSeconds(nil), 60)
+        for seconds in [0.0, 0.5, 60.0] {
+            XCTAssertEqual(try AgentSessionLinkMCPToolService.resolvedWaitTimeoutSeconds(.double(seconds)), seconds)
+        }
+        for seconds in [-1.0, 60.01, 120.0, 86400.0] {
+            XCTAssertThrowsError(try AgentSessionLinkMCPToolService.resolvedWaitTimeoutSeconds(.double(seconds)))
+        }
+        XCTAssertEqual(try AgentMCPToolHelpers.parseTimeoutSeconds(.int(86400)), 86400)
+    }
+
+    func testDelayedOldWaitReturnsLocalInputMetadataAndNewWaitStillWorks() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        var delayed = fixture.service
+        let oldInput = fixture.bridge.captureWaitInput(for: fixture.observer.domainEndpoint)
+        delayed.captureWaitInput = { oldInput }
+        let release = fixture.bridge.acceptLocalInput(for: fixture.observer.domainEndpoint)
+        await release.value
+        let args: [String: Value] = [
+            "op": .string("wait"), "session_id": .string(fixture.target.sessionID.uuidString),
+            "timeout_seconds": .int(0)
+        ]
+        let old = try await Self.executeObject(delayed, args: args)
+        XCTAssertEqual(old["result"]?.stringValue, "cancelled")
+        XCTAssertEqual(old["_meta"]?.objectValue?["wake_reason"]?.stringValue, "local_user_input")
+        let current = try await Self.executeObject(fixture.service, args: args)
+        XCTAssertEqual(current["result"]?.stringValue, "timeout")
+        XCTAssertNil(current["_meta"]?.objectValue?["wake_reason"])
+    }
+
+    func testWaitRejectsCapturedEndpointReplacement() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        var service = fixture.service
+        service.captureWaitInput = { .init(endpoint: fixture.target.domainEndpoint, generation: 0) }
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("wait"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "timeout_seconds": .int(0)
+            ])
+            XCTFail("A later route must not borrow the captured endpoint")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("Observer route changed"))
+        }
+    }
+
     // MARK: - Strict allowed keys
 
     func testEachOperationDeclaresExactlyItsDocumentedFields() {
@@ -3164,6 +3212,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 resolveObserverEndpoint: { _, _ in endpoint },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
                 resolveModelObserverEndpoint: { _ in endpoint },
+                captureWaitInput: { bridge.captureWaitInput(for: endpoint) },
                 bridge: bridge
             )
         }
@@ -3302,6 +3351,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             resolveObserverEndpoint: { _, _ in observerEndpoint },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
             resolveModelObserverEndpoint: { _ in observerEndpoint },
+            captureWaitInput: { bridge.captureWaitInput(for: observerEndpoint) },
             bridge: bridge
         )
         return ReadReleaseFixture(
