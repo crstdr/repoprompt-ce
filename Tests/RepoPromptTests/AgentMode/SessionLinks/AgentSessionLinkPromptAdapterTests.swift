@@ -2343,32 +2343,9 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private var rejectResume = false
     private var turnInFlight = false
     private var failSendAfterRecord = false
-    private var holdNextSend = false
-    private var heldSendEntered = false
-    private var heldSendEntryWaiter: CheckedContinuation<Void, Never>?
-    private var heldSendGate: CheckedContinuation<Void, Never>?
-    private var holdNextInFlightCheck = false
-    private var heldInFlightCheckEntered = false
-    private var heldInFlightCheckEntryWaiter: CheckedContinuation<Void, Never>?
-    private var heldInFlightCheckGate: CheckedContinuation<Void, Never>?
 
     func setTurnInFlight(_ value: Bool) {
         turnInFlight = value
-    }
-
-    func holdNextTurnInFlightCheck() {
-        holdNextInFlightCheck = true
-        heldInFlightCheckEntered = false
-    }
-
-    func waitForHeldTurnInFlightCheck() async {
-        if heldInFlightCheckEntered { return }
-        await withCheckedContinuation { heldInFlightCheckEntryWaiter = $0 }
-    }
-
-    func releaseHeldTurnInFlightCheck() {
-        heldInFlightCheckGate?.resume()
-        heldInFlightCheckGate = nil
     }
 
     func setRejectResume(_ value: Bool) {
@@ -2377,22 +2354,6 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
 
     func setFailSendAfterRecord(_ value: Bool) {
         failSendAfterRecord = value
-    }
-
-    func holdNextUserMessage() {
-        holdNextSend = true
-        heldSendEntered = false
-    }
-
-    func waitForHeldUserMessage() async {
-        if heldSendEntered { return }
-        await withCheckedContinuation { heldSendEntryWaiter = $0 }
-    }
-
-    func releaseHeldUserMessage(throwing: Bool = false) {
-        failSendAfterRecord = throwing
-        heldSendGate?.resume()
-        heldSendGate = nil
     }
 
     private var stream: AsyncStream<NativeAgentRuntimeEvent>?
@@ -2407,16 +2368,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     var hasTurnInFlight: Bool {
-        get async {
-            if holdNextInFlightCheck {
-                holdNextInFlightCheck = false
-                heldInFlightCheckEntered = true
-                heldInFlightCheckEntryWaiter?.resume()
-                heldInFlightCheckEntryWaiter = nil
-                await withCheckedContinuation { heldInFlightCheckGate = $0 }
-            }
-            return turnInFlight
-        }
+        turnInFlight
     }
 
     var events: AsyncStream<NativeAgentRuntimeEvent> {
@@ -2459,14 +2411,6 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
 
     func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
         try configuration.validate(proof)
-        if holdNextSend {
-            holdNextSend = false
-            heldSendEntered = true
-            heldSendEntryWaiter?.resume()
-            heldSendEntryWaiter = nil
-            await withCheckedContinuation { heldSendGate = $0 }
-        }
-        try configuration.validate(proof)
         sentMessages.append(text)
         if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
         return UUID()
@@ -2474,13 +2418,6 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
-        if holdNextSend {
-            holdNextSend = false
-            heldSendEntered = true
-            heldSendEntryWaiter?.resume()
-            heldSendEntryWaiter = nil
-            await withCheckedContinuation { heldSendGate = $0 }
-        }
         if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
         return UUID()
     }

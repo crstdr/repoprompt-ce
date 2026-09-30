@@ -118,7 +118,7 @@ extension AgentModeViewModel {
     }
 
     private func agentSessionLinkModelReadiness(_ session: TabSession) -> AgentSessionLinkSendFailure? {
-        AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
+        AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: true, isClosing: false
         ))
     }

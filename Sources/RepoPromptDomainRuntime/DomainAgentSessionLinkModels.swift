@@ -219,7 +219,7 @@ package struct DomainAgentSessionContextLoad: Hashable, Sendable {
 }
 
 /// Derived target state for passive oversight. Blocker names are internal and opaque on the wire;
-/// only an empty versus non-empty list is contractual. Counts are zero until the census is wired.
+/// only an empty versus non-empty list is contractual. Counts come from the target view model's child census.
 package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
     package enum RunOutcome: String, Hashable, Sendable {
         case none
@@ -393,8 +393,7 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
 /// Deterministically ordered inventory for one endpoint.
 package struct DomainAgentSessionLinkInventory: Hashable, Sendable {
     package let sessionID: UUID
-    /// Advances when this observer's outbound grant membership changes. An existing grant's
-    /// capability set is fixed; full-link revocation removes it from the inventory.
+    /// Advances only when this observer's grant membership changes.
     package let linkSetRevision: UInt64
     package let authorityRevision: UInt64
     package let items: [DomainAgentSessionLinkInventoryItem]
@@ -997,8 +996,8 @@ package enum DomainAgentSessionLinkSendCommitDisposition: Equatable, Sendable {
     /// The authorization linearization fence was won before manual revocation.
     case committed
     case linkRevoked
-    /// A live grant lacks Manage at the final fence (for example, an existing restricted grant).
-    /// Full-link revocation is `linkRevoked`; neither case delivers the message.
+    /// The delivery required the user's management delegation, and the user withdrew it before the
+    /// fence. The link itself may still be active; nothing was delivered.
     case managementRevoked
     case unknownReservation
     case shuttingDown

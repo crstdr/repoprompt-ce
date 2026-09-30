@@ -372,7 +372,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// cancels it.
     public static let acpBackgroundCompactionNoteText =
         "The provider accepted the compaction; it may still be running in the background — sending "
-            + "a message to this session in the next ~60–90 s can cancel it."
+            + "a message to this session in the next ~60–90 s can cancel it. Overseer messages and "
+            + "automatic wakes are held until then."
 
     /// The visible provenance row for one overseer-requested context compaction.
     ///
@@ -388,25 +389,6 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         AgentChatItem(
             kind: .system,
             text: overseerCompactionRequestText,
-            sequenceIndex: sequenceIndex,
-            crossSessionAttribution: attribution
-        )
-    }
-
-    /// Provider-replay-safe fact row: the overseer's name remains typed display metadata only.
-    public static let overseerRunStoppedText = "Run stopped by an overseeing session."
-
-    public static func overseerRunStopped(
-        stopID: UUID,
-        stoppedAt: Date,
-        attribution: AgentCrossSessionAttribution,
-        sequenceIndex: Int
-    ) -> AgentChatItem {
-        AgentChatItem(
-            id: stopID,
-            timestamp: stoppedAt,
-            kind: .system,
-            text: overseerRunStoppedText,
             sequenceIndex: sequenceIndex,
             crossSessionAttribution: attribution
         )
@@ -439,7 +421,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         )
     }
 
-    /// Fixed replay-safe text for an ACP settle that never saw a vouched context drop.
+    /// Fixed replay-safe text for unverified completion: an ACP settle that never saw a vouched
+    /// context drop, or a native command that outlived its deadline.
     /// The continuation note is not interpolated here; it stays parked for the next ordinary send.
     public static func selfCompactionCompletionUnverified(sequenceIndex: Int) -> AgentChatItem {
         AgentChatItem(
@@ -455,6 +438,25 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             kind: .system,
             text: "A continuation note from before compaction was restored to this session.",
             sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Provider-replay-safe fact row: the overseer's name remains typed display metadata only.
+    public static let overseerRunStoppedText = "Run stopped by an overseeing session."
+
+    public static func overseerRunStopped(
+        stopID: UUID,
+        stoppedAt: Date,
+        attribution: AgentCrossSessionAttribution,
+        sequenceIndex: Int
+    ) -> AgentChatItem {
+        AgentChatItem(
+            id: stopID,
+            timestamp: stoppedAt,
+            kind: .system,
+            text: overseerRunStoppedText,
+            sequenceIndex: sequenceIndex,
+            crossSessionAttribution: attribution
         )
     }
 

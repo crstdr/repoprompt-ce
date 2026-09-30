@@ -108,28 +108,6 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertEqual(Readiness.evaluate(snapshot: closing), .blocked(.endpointInvalidated))
     }
 
-    func testCompactSettlingDoesNotBlockOrdinarySendReadiness() {
-        var snapshot = AgentSessionLinkDeliveryReadiness.Snapshot.ready
-        snapshot.compactionSettling = true
-        XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: snapshot), .ready)
-        XCTAssertEqual(
-            AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(snapshot: snapshot),
-            .compactionSettling,
-            "Managed send and compact use this stricter admission."
-        )
-        snapshot.pendingSelfCompact = true
-        XCTAssertEqual(
-            AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(snapshot: snapshot),
-            .compactionSettling,
-            "A self-compact settle reports the managed-only compaction hold, not generic busy."
-        )
-        snapshot.endpointMatchesGrant = false
-        XCTAssertEqual(
-            AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(snapshot: snapshot),
-            .endpointInvalidated
-        )
-    }
-
     func testHydrationAndRebindingAreRetryableRatherThanNotIdle() {
         var loading = Snapshot.ready
         loading.hasLoadedPersistedState = false

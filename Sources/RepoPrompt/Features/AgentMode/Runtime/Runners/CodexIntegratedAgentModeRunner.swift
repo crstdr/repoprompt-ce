@@ -23,8 +23,8 @@ final class CodexIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
-        stopFence: AgentRunStartStopFence? = nil,
-        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        stopFence: AgentRunStartStopFence? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         guard stopFence?.permitsStart(of: session) ?? true else { return .cancelled }
         let ownership: AgentRunOwnership

@@ -30,21 +30,6 @@ final class AgentRunCancellationOutcomeTests: XCTestCase {
     }
 
     @MainActor
-    func testDeferredCompactOptionsRetainPreStopFence() {
-        let session = AgentTabSession(tabID: UUID())
-        let binding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID())
-        session.installPersistentSessionBinding(binding)
-        let fence = AgentRunStartStopFence(session: session)
-        let command = AgentProviderControlCommand.compact(
-            expectedBinding: binding, expectedProviderConversation: "provider-session"
-        )
-        let options = AgentDirectRunStartOptions.providerControl(command, stopFence: fence)
-        XCTAssertTrue(options.stopFence?.permitsStart(of: session) == true)
-        session.stopState.invalidateScheduledStarts()
-        XCTAssertFalse(options.stopFence?.permitsStart(of: session) == true)
-    }
-
-    @MainActor
     func testStopGateCanOnlyBeReleasedByItsOwnBindingAndRequest() {
         var state = AgentRunStopState()
         let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID())

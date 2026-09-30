@@ -2,6 +2,7 @@ import Foundation
 
 /// Request-correlated native completion and one-shot continuation. The injectable clock makes
 /// the 300-second native deadline and the 90-second ACP settle testable without wall-clock waits.
+/// Either expiring parks the note as unverified; neither sends it.
 ///
 /// ACP completion is best-effort. A completed command turn, however long it took, is not verified
 /// compaction. Only a vouched context drop is, and a settle timeout parks the note instead of
@@ -24,7 +25,6 @@ final class AgentSelfCompactNativeCompletionCoordinator {
     private var holdTask: Task<Void, Never>?
     private var noteTask: Task<Void, Never>?
     private var compactBoundAt: [UUID: ContinuousClock.Instant] = [:]
-    private var acpCommandPromptDurations: [UUID: Duration] = [:]
     private var acpTeardownSettled: (@MainActor () -> Bool)?
 
     init(
@@ -69,18 +69,15 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             if let owner = current.active?.owner, !isCurrentOwner(owner) {
                 current.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             } else {
-                current.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
+                // A slow native compaction may still finish. Like an unverified ACP turn, keep the
+                // continuation parked for the next ordinary send rather than dropping it into
+                // recovery; a late command terminal no longer matches and never sends it.
+                current.active?.acpCompletionUnverified = true
+                current.active?.phase = .parked
             }
             store(current)
         }
         return true
-    }
-
-    /// Command-call duration excludes controller setup and terminal publication. Those delays
-    /// cannot decide whether an ACP slash command had the fire-and-forget shape.
-    func recordACPCommandPromptDuration(requestID: UUID, duration: Duration) {
-        guard load().active?.id == requestID else { return }
-        acpCommandPromptDurations[requestID] = duration
     }
 
     /// The ACP row baseline is consumed only for this accepted command turn. An unrelated,
@@ -113,7 +110,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
               attempt.compactRunID == revision.expectedRunID,
               attempt.compactRunAttemptID == revision.ownership.attemptID
         else { return }
-        guard case .accepted = publication else {
+        guard case .accepted(successorEpoch: nil) = publication else {
             if case .rejected = publication { return }
             deadlineTask?.cancel()
             state.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
@@ -126,16 +123,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             store(state)
             return
         }
-        guard revision.successorKind == nil, publication.successorEpoch == nil else {
-            // An accepted successor owns the next input. Carry the note there rather than
-            // manufacturing a competing maintenance turn or demoting it to recovery only.
-            state.active?.compactTurnSucceeded = revision.terminalState == .completed
-            if attempt.admittedSupport == .acpAdvertisedCommand {
-                state.active?.acpCompletionUnverified = AgentSelfCompactInstantReturn.isVouchedDrop(
-                    before: attempt.usedTokensBeforeCompact,
-                    current: vouchedTokenCount
-                ) ? nil : true
-            }
+        guard revision.successorKind == nil else {
             state.active?.phase = .parked
             store(state)
             return
@@ -254,8 +242,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             return
         }
         let instant = AgentSelfCompactInstantReturn.isInstantReturn(
-            elapsed: acpCommandPromptDurations.removeValue(forKey: requestID)
-                ?? elapsedSinceCompactBind(requestID),
+            elapsed: elapsedSinceCompactBind(requestID),
             assistantOrToolRowCount: assistantOrToolRowCount
         )
         guard instant else {

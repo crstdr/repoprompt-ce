@@ -446,25 +446,6 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         )
     }
 
-    /// Routes compaction to the exact owning window without focusing or activating it.
-    func agentSessionLinkPerformCompact(
-        to candidate: AgentSessionLinkEndpointCandidate,
-        request: AgentSessionLinkCompactRequest,
-        liveness: @escaping AgentSessionLinkSendLivenessProbe,
-        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
-    ) async -> AgentSessionLinkSendTransactionOutcome {
-        guard !isTerminating else { return .blocked(.shuttingDown) }
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .blocked(.endpointHost)
-        }
-        return await window.agentModeViewModel.agentSessionLinkPerformCompact(
-            to: candidate,
-            request: request,
-            liveness: liveness,
-            commitAuthorization: commitAuthorization
-        )
-    }
-
     /// Routes a read-only interaction inspection to the exact owning window. Never focuses it.
     func agentSessionLinkPendingInteraction(
         for candidate: AgentSessionLinkEndpointCandidate
@@ -490,6 +471,26 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
             for: candidate,
             request: request,
             authorize: authorize
+        )
+    }
+
+    /// Routes the compaction transaction to the exact owning window, with the same terminating and
+    /// closing refusals as a send. Nothing here focuses or activates the window.
+    func agentSessionLinkPerformCompact(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkCompactRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome {
+        guard !isTerminating else { return .blocked(.shuttingDown) }
+        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+            return .blocked(.endpointHost)
+        }
+        return await window.agentModeViewModel.agentSessionLinkPerformCompact(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            commitAuthorization: commitAuthorization
         )
     }
 

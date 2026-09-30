@@ -907,9 +907,9 @@ package actor DomainAgentSessionLinkAuthority {
         return nil
     }
 
-    /// Atomically fences an observer-local batch before any pending prompt is projected. Every
-    /// watch lease must still be exact; only grants carrying Manage may disclose prompt bodies.
-    /// A revoked member denies the whole batch rather than releasing a sibling's prompt.
+    /// Fences an observer-local batch before pending prompt disclosure. Every observation lease
+    /// must still be exact; only grants with Manage may reveal a prompt body. A revoked member
+    /// denies the whole batch rather than releasing a surviving sibling's prompt.
     package func managedObservationTargetsIfValid(
         leases: [DomainAgentSessionLinkLease]
     ) -> Set<UUID>? {
@@ -1428,7 +1428,7 @@ package actor DomainAgentSessionLinkAuthority {
         return .reserved(reservation)
     }
 
-    /// Reserves a Manage-gated stop in the same link-generation ledger used by send and compact.
+    /// Reserves a Manage-gated stop in the same link-generation ledger used by send and steer.
     package func beginStop(
         lease: DomainAgentSessionLinkLease,
         idempotencyKey: String
@@ -1541,9 +1541,9 @@ package actor DomainAgentSessionLinkAuthority {
     /// that wins first is allowed to settle even if manual Stop follows; lifecycle invalidation may
     /// still abort it later because the endpoint no longer exists.
     ///
-    /// `requiresManagement` also checks Manage on the exact live grant. An existing restricted grant
-    /// is refused with nothing delivered and its uncommitted reservation released for retry. A
-    /// full-link revocation is reported separately by the link-liveness check above.
+    /// `requiresManagement` makes the user's management delegation part of the same fence: a managed
+    /// delivery whose delegation was withdrawn before this point is refused with nothing delivered,
+    /// and its uncommitted reservation is released so the key may be retried.
     package func commitSendAuthorization(
         reservation: DomainAgentSessionLinkSendReservation,
         linkGeneration: UInt64,
