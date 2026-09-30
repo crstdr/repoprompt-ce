@@ -77,8 +77,8 @@ final class ClaudeIntegratedAgentModeRunner {
         makeLease: (_ runID: UUID) -> MCPBootstrapLease,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
-        stopFence: AgentRunStartStopFence? = nil,
-        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        stopFence: AgentRunStartStopFence? = nil
     ) async {
         guard stopFence?.permitsStart(of: session) ?? true else { return }
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)

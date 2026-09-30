@@ -53,6 +53,10 @@ final class ACPIntegratedAgentModeRunner {
     /// misreports the outcome.
     private static let acpFireAndForgetCommandWindow: TimeInterval = 5
 
+    /// How long a fire-and-forget ACP compaction is protected from a cancelling next prompt: the top
+    /// of the provider's observed ~60–90 s background span.
+    static let acpBackgroundCompactionSettleDuration: TimeInterval = 90
+
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
@@ -225,8 +229,7 @@ final class ACPIntegratedAgentModeRunner {
                 command: providerControlCommand,
                 runRequest: runRequest,
                 attachmentReservationID: attachmentReservationID,
-                makeLease: makeLease,
-                stopFence: stopFence
+                makeLease: makeLease
             )
             return
         }
@@ -421,8 +424,7 @@ final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         attachmentReservationID: UUID?,
         providerControlCommand: AgentProviderControlCommand?,
-        makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
-        stopFence: AgentRunStartStopFence? = nil
+        makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease
     ) {
         let runAttemptID = ownership.attemptID
         let deferredLease = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
@@ -466,8 +468,7 @@ final class ACPIntegratedAgentModeRunner {
                     deferredLease: deferredLease,
                     attachmentReservationID: attachmentReservationID,
                     providerControlCommand: providerControlCommand,
-                    leaseDisposition: leaseDisposition,
-                    stopFence: stopFence
+                    leaseDisposition: leaseDisposition
                 )
             } onCancel: {}
         }
@@ -482,8 +483,7 @@ final class ACPIntegratedAgentModeRunner {
         command: AgentProviderControlCommand,
         runRequest: ACPRunRequest,
         attachmentReservationID: UUID?,
-        makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
-        stopFence: AgentRunStartStopFence? = nil
+        makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease
     ) async {
         let runAttemptID = ownership.attemptID
         let displayName = runRequest.agentKind.displayName
@@ -533,7 +533,7 @@ final class ACPIntegratedAgentModeRunner {
         // Bind before handing the run to a task. Preparation can refuse before the command's
         // physical send seam; its terminal publication must still identify and settle this attempt.
         if let dispatchID = command.selfCompactDispatchID, dispatchID.stage == .compact {
-            guard session.selfCompactCommandDispatchIsCurrent(dispatchID),
+            guard session.selfCompactDispatchIsCurrent?() != false,
                   session.selfCompactNativeCompletion?.bindCompact(
                       dispatchID, runID: runID, runAttemptID: runAttemptID
                   ) == true
@@ -558,8 +558,7 @@ final class ACPIntegratedAgentModeRunner {
             runRequest: runRequest,
             attachmentReservationID: attachmentReservationID,
             providerControlCommand: command,
-            makeLease: makeLease,
-            stopFence: stopFence
+            makeLease: makeLease
         )
     }
 
@@ -718,9 +717,7 @@ final class ACPIntegratedAgentModeRunner {
         }
         if let dispatchID = carry.dispatchID {
             guard session.selfCompactNoteDispatchIsCurrent(dispatchID),
-                  AgentSelfCompactParkedPrefix.markAttempted(
-                      dispatchID, session: session, dedicated: carry.exactNote
-                  )
+                  AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session)
             else {
                 // The failed claim does not own an attempt marker to clear.
                 if !carry.exactNote {
@@ -1000,8 +997,7 @@ final class ACPIntegratedAgentModeRunner {
         deferredLease: MCPBootstrapLease?,
         attachmentReservationID: UUID?,
         providerControlCommand: AgentProviderControlCommand? = nil,
-        leaseDisposition: ProviderControlLeaseDisposition? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        leaseDisposition: ProviderControlLeaseDisposition? = nil
     ) async {
         let classification = await Self.executeTransientOperation {
             var reachedPromptTurn = false
@@ -1062,8 +1058,7 @@ final class ACPIntegratedAgentModeRunner {
                     attachmentReservationID: attachmentReservationID,
                     prepareControllerForNextTurn: true,
                     dedicatedNoteID: dedicatedNoteID,
-                    providerControlCommand: providerControlCommand,
-                    stopFence: stopFence
+                    providerControlCommand: providerControlCommand
                 )
             } catch is CancellationError {
                 throw CancellationError()
@@ -1097,8 +1092,7 @@ final class ACPIntegratedAgentModeRunner {
         attachmentReservationID: UUID?,
         prepareControllerForNextTurn: Bool,
         dedicatedNoteID: AgentSelfCompactionDispatchID? = nil,
-        providerControlCommand: AgentProviderControlCommand? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        providerControlCommand: AgentProviderControlCommand? = nil
     ) async -> TransientOperationResult {
         if let providerControlCommand {
             return await runProviderControlCommandTurn(
@@ -1107,8 +1101,7 @@ final class ACPIntegratedAgentModeRunner {
                 runAttemptID: runAttemptID,
                 command: providerControlCommand,
                 controller: controller,
-                runRequest: runRequest,
-                stopFence: stopFence
+                runRequest: runRequest
             )
         }
         log("prompt turn begin prepare=\(prepareControllerForNextTurn)", runID: runID)
@@ -1212,9 +1205,7 @@ final class ACPIntegratedAgentModeRunner {
         }
         if let dispatchID = carry.dispatchID {
             guard session.selfCompactNoteDispatchIsCurrent(dispatchID),
-                  AgentSelfCompactParkedPrefix.markAttempted(
-                      dispatchID, session: session, dedicated: carry.exactNote
-                  )
+                  AgentSelfCompactParkedPrefix.markAttempted(dispatchID, session: session)
             else {
                 // Another sender may already own this note's one-shot attempt. A stale dedicated
                 // sender has no marker to clear and must not re-park an ordinary in-flight send.
@@ -1229,15 +1220,6 @@ final class ACPIntegratedAgentModeRunner {
             hooks.persistence.scheduleSave(session)
         }
 
-        // A locally typed advertised /compact is still an ordinary user turn, but providers such
-        // as Devin may continue compacting after that turn reports completion. Only managed
-        // deliveries consult this marker; local sends and steers remain free to proceed.
-        if initialMessageForRun.trimmingCharacters(in: .whitespacesAndNewlines) == "/compact",
-           let providerSessionID = session.providerSessionID,
-           controller.advertisesCommand("compact", inProviderSession: providerSessionID)
-        {
-            session.beginACPCompactSettling(providerSessionID: providerSessionID, controller: controller)
-        }
         do {
             log("controller.prompt begin", runID: runID)
             try await controller.prompt(promptMessage, request: runRequest)
@@ -1309,8 +1291,7 @@ final class ACPIntegratedAgentModeRunner {
         runAttemptID: UUID,
         command: AgentProviderControlCommand,
         controller: ACPAgentSessionController,
-        runRequest: ACPRunRequest,
-        stopFence: AgentRunStartStopFence? = nil
+        runRequest: ACPRunRequest
     ) async -> TransientOperationResult {
         let displayName = runRequest.agentKind.displayName
         log("provider control command turn begin kind=\(command.kind.rawValue)", runID: runID)
@@ -1342,9 +1323,7 @@ final class ACPIntegratedAgentModeRunner {
 
         // This run attempt and the admitted app-session incarnation and provider conversation, after
         // every await above. A cancelled or superseded attempt must never reach the write.
-        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID),
-              stopFence?.permitsStart(of: session) ?? true
-        else {
+        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else {
             await abandonConsumer()
             return .superseded
         }
@@ -1363,7 +1342,7 @@ final class ACPIntegratedAgentModeRunner {
         guard session.persistentSessionBindingIdentity == command.expectedBinding,
               !session.bindingTransitionInProgress,
               session.providerSessionID == command.expectedProviderConversation,
-              command.selfCompactDispatchID.map(session.selfCompactCommandDispatchIsCurrent) ?? true
+              command.selfCompactDispatchID == nil || session.selfCompactDispatchIsCurrent?() != false
         else {
             await abandonConsumer()
             return .refusedBeforeSend(
@@ -1375,10 +1354,6 @@ final class ACPIntegratedAgentModeRunner {
         // signal, so only a later occupancy report (`usage_update`) may vouch for a count again; this
         // turn's billed prompt count cannot. The suspension ends on every exit from here.
         let withdrawnVouch = session.beginCompactionContextCountSuspension()
-        session.beginACPCompactSettling(
-            providerSessionID: command.expectedProviderConversation,
-            controller: controller
-        )
         defer { session.endCompactionContextCountSuspension() }
         // An ACP slash command can be fire-and-forget (Devin `/compact`): the provider ends the
         // turn instantly with no output while it keeps compacting in the background, where the
@@ -1389,8 +1364,8 @@ final class ACPIntegratedAgentModeRunner {
         let transcriptItemsAtDispatch = session.items.count
         do {
             log("controller.promptAdvertisedCommand begin", runID: runID)
-            if let dispatchID = command.selfCompactDispatchID, dispatchID.stage == .compact {
-                guard session.selfCompactCommandDispatchIsCurrent(dispatchID) else {
+            if command.selfCompactDispatchID?.stage == .compact {
+                guard session.selfCompactDispatchIsCurrent?() != false else {
                     await abandonConsumer()
                     session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
                     return .refusedBeforeSend(
@@ -1399,47 +1374,23 @@ final class ACPIntegratedAgentModeRunner {
                 }
                 session.selfCompactACPCommandItemIDs = Set(session.items.map(\.id))
             }
-            guard stopFence?.permitsStart(of: session) ?? true else {
-                await abandonConsumer()
-                session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
-                session.clearACPCompactSettling(
-                    providerSessionID: command.expectedProviderConversation,
-                    controller: controller
-                )
-                return .cancelled
-            }
-            let promptStartedAt = ContinuousClock.now
             try await controller.promptAdvertisedCommand(
                 command.kind.rawValue,
                 expectedSessionID: command.expectedProviderConversation,
                 request: runRequest
             )
-            if let dispatchID = command.selfCompactDispatchID, dispatchID.stage == .compact {
-                session.selfCompactNativeCompletion?.recordACPCommandPromptDuration(
-                    requestID: dispatchID.requestID,
-                    duration: promptStartedAt.duration(to: ContinuousClock.now)
-                )
-            }
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
         } catch let refusal as ACPAgentSessionController.ProviderCommandRefusal {
             // Nothing was sent, so the count still describes the context.
             await abandonConsumer()
             session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
-            session.clearACPCompactSettling(
-                providerSessionID: command.expectedProviderConversation,
-                controller: controller
-            )
             log("provider control command refused: \(refusal.reason)", runID: runID)
             let errorText = "\(displayName) did not run the requested command: \(refusal.reason)"
             return refusal.sessionIsUsable ? .refusedBeforeSend(errorText: errorText) : .failed(errorText: errorText)
         } catch is ACPAgentSessionController.ProviderCommandCancelledBeforeSend {
             await abandonConsumer()
             session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
-            session.clearACPCompactSettling(
-                providerSessionID: command.expectedProviderConversation,
-                controller: controller
-            )
             return .cancelled
         } catch is CancellationError {
             await abandonConsumer()
@@ -1470,6 +1421,9 @@ final class ACPIntegratedAgentModeRunner {
                 text: AgentChatItem.acpBackgroundCompactionNoteText,
                 sequenceIndex: session.nextSequenceIndex
             ))
+            // Enforced, not only advised: overseer sends and compactions, parked `when_sendable`
+            // sends, and automatic wakes all see this session as not idle until the span ends.
+            session.beginACPBackgroundCompactionSettle(duration: Self.acpBackgroundCompactionSettleDuration)
             toolTrackingHooks.requestUIRefresh(session.tabID, false)
             toolTrackingHooks.scheduleSave(session.tabID)
         }

@@ -251,7 +251,7 @@ struct AgentSession: Codable, Identifiable {
     var selfCompactState: AgentSelfCompactState?
     /// Runtime-only: the decoded record was invalid and its original file needs preservation.
     var selfCompactPersistenceWarning = false
-    /// Runtime-only: cold reconciliation should be persisted after the source is safe to rewrite.
+    /// Runtime-only: decode-time reconciliation should be persisted after the source is safe to rewrite.
     var selfCompactNeedsRecoveryRewrite = false
 
     init(
@@ -466,7 +466,9 @@ struct AgentSession: Codable, Identifiable {
         if container.contains(.selfCompactState), try !(container.decodeNil(forKey: .selfCompactState)) {
             do {
                 var restored = try container.decode(AgentSelfCompactState.self, forKey: .selfCompactState)
-                selfCompactNeedsRecoveryRewrite = restored.reconcileColdLaunch()
+                // Every decode, including an in-process reload, reconciles: a decoded attempt has no
+                // live worker, so it becomes explicit recovery rather than resumable work.
+                selfCompactNeedsRecoveryRewrite = restored.reconcileDecodedRecord()
                 selfCompactState = restored
             } catch {
                 // An optional maintenance record must not make the whole session unreadable.

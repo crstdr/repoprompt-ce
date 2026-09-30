@@ -135,22 +135,6 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         }
     }
 
-    func testSlowSetupDoesNotTurnAnInstantACPCommandIntoAnUnverifiedPark() async throws {
-        let fake = Fake()
-        let coordinator = fake.coordinator()
-        fake.bind(coordinator)
-        let requestID = try XCTUnwrap(fake.state.active?.id)
-        fake.advance(.seconds(5)) // Controller setup happened before the provider command.
-        coordinator.recordACPCommandPromptDuration(requestID: requestID, duration: .milliseconds(10))
-        fake.settle(coordinator, rows: 0, vouch: nil)
-        XCTAssertEqual(fake.state.active?.phase, .acpSettling)
-        coordinator.noteVouchedContextCount(50)
-        await drain()
-        XCTAssertEqual(fake.state.latest?.outcome, .noteAccepted)
-        XCTAssertEqual(fake.dispatchCount, 1)
-        await fake.finish()
-    }
-
     func testMissingBindInstantIsNotVerified() async {
         let fake = Fake()
         let coordinator = fake.coordinator()
@@ -265,45 +249,11 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         let successor = Fake()
         let successorCoordinator = successor.coordinator()
         successor.bind(successorCoordinator)
-        let epoch = DomainAgentRunTurnEpoch(
-            sessionID: successor.owner.sessionID, activationID: UUID(), registrationGeneration: 1,
-            id: UUID(), ordinal: 2, continuityGeneration: 1, transitionKind: .steering
-        )
-        successor.settle(
-            successorCoordinator, rows: 0, vouch: 1, successor: .steering,
-            publication: .accepted(successorEpoch: epoch)
-        )
+        successor.settle(successorCoordinator, rows: 0, vouch: 1, successor: .steering)
         XCTAssertEqual(successor.state.active?.phase, .parked)
         XCTAssertNil(successor.state.active?.acpCompletionUnverified)
-        XCTAssertEqual(successor.state.parkedNote?.frame, AgentSelfCompactNoteEnvelope.frame("alpha\nβeta"))
         XCTAssertEqual(successor.dispatchCount, 0)
         await successor.finish()
-    }
-
-    func testAcceptedSuccessorCarriesUnverifiedACPNoteWithoutClaimingCompaction() async throws {
-        let fake = Fake()
-        let coordinator = fake.coordinator()
-        fake.bind(coordinator, tokensBefore: 100)
-        let successor = DomainAgentRunTurnEpoch(
-            sessionID: fake.owner.sessionID, activationID: UUID(), registrationGeneration: 1,
-            id: UUID(), ordinal: 2, continuityGeneration: 1, transitionKind: .steering
-        )
-        fake.settle(
-            coordinator, rows: 0, vouch: nil, successor: .steering,
-            publication: .accepted(successorEpoch: successor)
-        )
-
-        XCTAssertEqual(fake.state.active?.phase, .parked)
-        XCTAssertEqual(fake.state.active?.acpCompletionUnverified, true)
-        XCTAssertEqual(fake.dispatchCount, 0)
-        let parked = try XCTUnwrap(fake.state.parkedNote)
-        XCTAssertEqual(parked.frame, AgentSelfCompactNoteEnvelope.frame(note))
-        XCTAssertTrue(fake.state.noteWillAttempt(parked.dispatchID))
-        XCTAssertTrue(fake.state.noteAccepted(parked.dispatchID))
-        XCTAssertEqual(fake.state.latest?.outcome, .completionUnverified)
-        XCTAssertEqual(fake.state.latest?.noteDelivery, .prepended)
-        XCTAssertEqual(fake.state.latest?.completionVerified, false)
-        await fake.finish()
     }
 
     func testCancelDuringHoldDoesNotParkOrDispatchWhenTheSleeperResumes() async {
@@ -326,7 +276,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             _ = state.reserve(note: note, idempotencyKey: "key-\(phase.rawValue)")
             state.active?.phase = phase
             state.active?.acpCompletionUnverified = true
-            XCTAssertTrue(state.reconcileColdLaunch(), phase.rawValue)
+            XCTAssertTrue(state.reconcileDecodedRecord(), phase.rawValue)
             XCTAssertNil(state.active)
             XCTAssertEqual(state.latest?.outcome, .recoveryRequired)
             XCTAssertEqual(state.latest?.completionVerified, false)
@@ -442,84 +392,38 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
     }
 
-    func testLocalSubmissionParksDedicatedACPNoteDuringControllerPreparation() async throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("SelfCompactACPPrepareRace-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let scriptURL = try AgentSessionLinkACPServerScript.write(to: directory)
-        let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: scriptURL.path)
-        let harness = AgentSessionLinkRunnerHarness(
-            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
-            acpProviderFactory: { _, _ in provider },
-            workspacePath: directory.path
-        )
-        let tabID = UUID()
-        harness.host.test_setCurrentTabIDOverride(tabID)
-        let session = harness.host.session(for: tabID)
-        session.selectedAgent = .openCode
+    func testOnlyAVerifiedOwnContinuationNotePassesTheACPBackgroundCompactionHold() {
+        let session = AgentTabSession(tabID: UUID())
         session.hasLoadedPersistedState = true
-        let runner = ACPIntegratedAgentModeRunner(
-            hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
-            toolTrackingHooks: .noOp, providerFactory: { _, _ in provider },
-            controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
-            }
+        session.beginACPBackgroundCompactionSettle(duration: 90)
+        defer { session.endACPBackgroundCompactionSettle() }
+        var attempt = AgentSelfCompactAttempt(
+            idempotencyKey: "background-hold", note: "Continue the current task.", phase: .noteDispatchPending
         )
-        let request = ACPRunRequest(
-            agentKind: .openCode, modelString: nil, workspacePath: directory.path,
-            resumeSessionID: nil, attachments: [], taskLabelKind: nil
-        )
-        await runner.startRun(
-            tabID: tabID, session: session,
-            initialUserMessage: "prime", initialMessageForRun: "prime", attachments: [],
-            runRequest: request, makeLease: { harness.makeLease(runID: $0, tabID: tabID) }
-        )
-        await session.agentTask?.value
-        XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime"])
+        func noteSnapshot(for requestID: UUID) -> AgentSessionLinkDeliveryReadiness.Snapshot {
+            session.selfCompactState = AgentSelfCompactState(active: attempt)
+            return AgentModeViewModel.agentSelfCompactNoteReadinessSnapshot(session: session, requestID: requestID)
+        }
 
-        var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "post-carry-race")
-        state.active?.phase = .dispatchingNote
-        session.selfCompactState = state
-        session.selfCompactNativeCompletion = AgentSelfCompactNativeCompletionCoordinator(
-            load: { session.selfCompactState }, store: { session.selfCompactState = $0 },
-            isCurrentOwner: { _ in true }, dispatchNote: { _, _ in false }
-        )
-        defer { session.selfCompactNativeCompletion = nil }
-        let frame = AgentSelfCompactNoteEnvelope.frame(note)
-        let dispatchID = try XCTUnwrap(AgentSelfCompactParkedPrefix.preparedDedicatedNoteID(frame, session: session))
-        let controller = try XCTUnwrap(session.acpController)
-        await controller.test_holdNextTurnPreparation()
-        session.runState = .idle
-        await runner.startRun(
-            tabID: tabID, session: session,
-            initialUserMessage: frame, initialMessageForRun: frame, attachments: [],
-            runRequest: request, makeLease: { harness.makeLease(runID: $0, tabID: tabID) }
-        )
-        let dedicatedTask = session.agentTask
-        await controller.test_waitForNextTurnPreparationEntry()
-        XCTAssertEqual(harness.host.submitUserTurn(text: "accepted local turn", tabID: tabID), .submitted)
-        XCTAssertEqual(session.selfCompactState.active?.id, dispatchID.requestID)
-        XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
+        // Unverified completion: the provider may still be compacting, so the note waits too.
+        XCTAssertTrue(noteSnapshot(for: attempt.id).backgroundCompactionSettling)
+        attempt.compactTurnSucceeded = true
+        attempt.acpCompletionUnverified = true
+        XCTAssertTrue(noteSnapshot(for: attempt.id).backgroundCompactionSettling)
 
-        await controller.test_releaseNextTurnPreparation()
-        await dedicatedTask?.value
-        XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime"])
-        XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
+        // Verified completion (vouched drop): this request's own note may start the next turn.
+        attempt.acpCompletionUnverified = nil
+        let verified = noteSnapshot(for: attempt.id)
+        XCTAssertFalse(verified.backgroundCompactionSettling)
+        XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: verified), .ready)
 
-        // The direct-runner fixture does not drive the host's follow-up queue. Dispatch its
-        // accepted ordinary text through the same runner after the stale dedicated turn exits.
-        session.runState = .idle
-        await runner.startRun(
-            tabID: tabID, session: session,
-            initialUserMessage: "accepted local turn", initialMessageForRun: "accepted local turn",
-            attachments: [], runRequest: request,
-            makeLease: { harness.makeLease(runID: $0, tabID: tabID) }
+        // Nobody else inherits the exemption: another request's note and ordinary overseer delivery.
+        XCTAssertTrue(noteSnapshot(for: UUID()).backgroundCompactionSettling)
+        let overseer = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
         )
-        await session.agentTask?.value
-        XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime", frame + "\n\naccepted local turn"])
-        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+        XCTAssertTrue(overseer.backgroundCompactionSettling)
+        XCTAssertNotEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: overseer), .ready)
     }
 
     func testStaleDedicatedACPNoteCannotReparkAnOrdinarySendInFlight() throws {

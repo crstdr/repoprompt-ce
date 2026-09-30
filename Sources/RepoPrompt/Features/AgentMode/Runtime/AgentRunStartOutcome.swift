@@ -115,12 +115,11 @@ struct AgentDirectRunStartOptions: Equatable {
     /// effort packaging, because any of those would turn a native command into inert prose.
     var providerControlCommand: AgentProviderControlCommand?
 
-    /// Captured at producer scheduling time so a prior Stop cannot bless deferred work.
-    var stopFence: AgentRunStartStopFence?
-
     /// One dedicated continuation-note turn; never an ordinary user send or a fallback queue item.
     var selfCompactDispatchID: AgentSelfCompactionDispatchID?
 
+    /// Captured at producer scheduling time so a prior Stop cannot bless deferred work.
+    var stopFence: AgentRunStartStopFence?
     var skipsUserAugmentation: Bool {
         isLaneUpdate || periodicWakeID != nil || providerControlCommand != nil || selfCompactDispatchID != nil
     }
@@ -146,14 +145,10 @@ struct AgentDirectRunStartOptions: Equatable {
     static let crossSessionDelivery = AgentDirectRunStartOptions(ignoresPendingHandoff: true)
 
     /// Options for one overseer-requested provider control command.
-    static func providerControl(
-        _ command: AgentProviderControlCommand,
-        stopFence: AgentRunStartStopFence? = nil
-    ) -> AgentDirectRunStartOptions {
+    static func providerControl(_ command: AgentProviderControlCommand) -> AgentDirectRunStartOptions {
         AgentDirectRunStartOptions(
             ignoresPendingHandoff: true,
             providerControlCommand: command,
-            stopFence: stopFence,
             selfCompactDispatchID: command.selfCompactDispatchID
         )
     }

@@ -847,8 +847,6 @@ struct AgentMessageBubble: View {
                 laneUpdateRow(laneUpdate)
             } else {
                 HStack(spacing: 6) {
-                    // An overseer compaction request carries its observer's attribution; the same
-                    // badge a delivered cross-session message shows says who asked for it.
                     if let attribution = item.crossSessionAttribution {
                         crossSessionAttributionBadge(attribution)
                     }

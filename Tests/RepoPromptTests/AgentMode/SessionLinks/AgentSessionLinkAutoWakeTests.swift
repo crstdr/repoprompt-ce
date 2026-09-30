@@ -176,10 +176,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     // MARK: - Guidance revision
 
-    /// A provider context that physically accepted an earlier revision is re-owed revision 8 in full.
-    /// Merely rendering or abandoning revision 8 does not advance the acknowledgement; only physical
+    /// A context that accepted either parallel revision-11 branch is re-owed revision 12 in full.
+    /// Merely rendering or abandoning revision 12 does not advance the acknowledgement; only physical
     /// acceptance earns the reminder, and a rebuilt context owes the full block again.
-    func testRevisionEightReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
+    func testRevisionTwelveReOwesCombinedGuidanceAndReminderIsAcceptanceGated() throws {
         let observerSessionID = UUID()
         let epoch = Self.epoch(observerSessionID: observerSessionID)
         let inventory = Self.inventory(observerSessionID: observerSessionID, revision: 1)
@@ -208,17 +208,17 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 observerEndpoint: passive.observerEndpoint,
                 receipt: passive.receipt,
                 includesUnattributedOverflow: passive.includesUnattributedOverflow,
-                guidanceRevision: 7,
+                guidanceRevision: 11,
                 displayAttribution: passive.displayAttribution
             ),
             laneGuidanceMode: first.laneGuidanceMode,
-            inventoryGuidanceRevision: first.inventoryGuidanceRevision,
+            inventoryGuidanceRevision: 6,
             fragment: first.fragment
         )
         store.accept(priorRevisionClaim)
         XCTAssertEqual(
             store.test_lastAcceptedLaneGuidanceRevision(observerSessionID: observerSessionID),
-            7
+            11
         )
 
         let reOwed = try XCTUnwrap(store.claim(
@@ -229,14 +229,18 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 10 supersedes"))
-        // The rule revision 8 changes: a context taught it may only observe — and that may have
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 13 supersedes"))
+        XCTAssertEqual(reOwed.inventoryGuidanceRevision, 8)
+        XCTAssertTrue(reOwed.fragment.contains("`compact`"))
+        XCTAssertTrue(reOwed.fragment.contains("`stop`"))
+        XCTAssertTrue(reOwed.fragment.contains("`create_lane`"))
+        XCTAssertTrue(reOwed.fragment.contains("`retire_lane`"))
+        // The rule revision 10 restates: a context taught it may only observe — and that may have
         // refused its own user on that basis — is told outright what replaced it.
         XCTAssertTrue(reOwed.fragment.contains("including anything said earlier in this conversation"))
         XCTAssertTrue(reOwed.fragment.contains("by RepoPrompt or by you"))
         XCTAssertTrue(reOwed.fragment.contains("being unable to steer it"))
         XCTAssertTrue(reOwed.fragment.contains("direct it with `steer`"))
-        XCTAssertTrue(reOwed.fragment.contains("compact` is permitted at watch level"))
         XCTAssertTrue(reOwed.fragment.contains("attributed attention request"))
         XCTAssertTrue(reOwed.fragment.contains("master Auto-wake"))
         XCTAssertTrue(reOwed.fragment.contains("lane&apos;s own toggle"))

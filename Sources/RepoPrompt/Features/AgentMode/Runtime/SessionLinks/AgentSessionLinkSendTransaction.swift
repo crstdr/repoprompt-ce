@@ -131,7 +131,7 @@ typealias AgentSessionLinkSendLivenessProbe = @MainActor () -> AgentSessionLinkS
 enum AgentSessionLinkSendCommitOutcome: Equatable {
     case committed
     case linkRevoked
-    /// A live grant lacks Manage at the final fence; full-link revocation is separate.
+    /// A managed delivery lost the user's management delegation before the fence.
     case managementRevoked
     case unknownReservation
     case shuttingDown
@@ -185,7 +185,12 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     /// row may or may not be on disk. The idempotency key is permanently spent.
     case persistenceIndeterminate = "persistence_indeterminate"
     case shuttingDown = "shutting_down"
-    /// A managed `steer` whose live grant lacks Manage at its commit fence.
+    /// Compaction only: no supported native command for this provider.
+    case notSupported = "not_supported"
+    /// Compaction only: no live provider session or observed command surface yet. Retryable after
+    /// an ordinary turn attaches the session; a remembered conversation alone is not live.
+    case noProviderSession = "no_provider_session"
+    /// A managed `steer` whose user management delegation was withdrawn before its commit fence.
     case managementRevoked = "management_revoked"
     /// A managed `steer` found the target holding a prompt. It must be answered first (`respond`),
     /// or by the target's user when it is manual-only; steering never routes around it.
@@ -195,8 +200,6 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     case targetBusy = "target_busy"
     /// A queued inbound send was withdrawn when its exact target endpoint was stopped.
     case targetStopped = "target_stopped"
-    /// A tracked ACP compact command may still be running in the background.
-    case compactionSettling = "compaction_settling"
     /// The target is running on a provider path that cannot take live steering. Nothing was
     /// delivered; the message can be queued with `send` and `delivery: "when_sendable"`.
     case steerUnavailable = "steer_unavailable"
@@ -205,12 +208,6 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     /// RepoPrompt could not learn whether the provider accepted the managed `steer`. The attributed
     /// row may still be in flight, so the key is spent and the target must be read before retrying.
     case steerUnconfirmed = "steer_unconfirmed"
-    /// Compaction only: the target's provider runtime has no verified native compaction path.
-    case notSupported = "not_supported"
-    /// Compaction only: this target has no live provider session to compact yet — no recorded
-    /// conversation, or a remembered one (e.g. right after a relaunch) whose provider process is
-    /// not live. Retryable: one ordinary turn brings the session and its command surface up.
-    case noProviderSession = "no_provider_session"
 
     init(_ reason: AgentSessionLinkDeliveryReadiness.BlockReason) {
         switch reason {
@@ -269,7 +266,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     var isRetryable: Bool {
         switch self {
         case .targetLoading, .targetNotIdle, .persistenceFailed, .targetAwaitingInteraction,
-             .targetBusy, .compactionSettling, .steerUnavailable, .steerNotAccepted, .noProviderSession:
+             .targetBusy, .steerUnavailable, .steerNotAccepted, .noProviderSession:
             true
         case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
              .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
@@ -309,11 +306,16 @@ enum AgentSessionLinkSendFailure: String, Equatable {
                 + "idempotency_key is spent. Read the session before sending anything again."
         case .shuttingDown:
             "RepoPrompt is shutting down."
+        case .notSupported:
+            "The overseen session's provider has no supported context compaction. Nothing was requested."
+        case .noProviderSession:
+            "The overseen session has no live provider session to compact yet; run one turn "
+                + "first, then retry. Nothing was requested."
         case .managementRevoked:
-            "This oversight link does not include management of this session. Nothing was delivered. "
-                + "You may still observe, send, and request native compaction under this link."
+            "This exact link no longer authorizes steering. Nothing was delivered. Refresh `list` "
+                + "before retrying; an old session ID or grant is not authority."
         case .targetAwaitingInteraction:
-            "The overseen session is waiting on a prompt. Refresh with poll or wait and answer "
+            "The overseen session is waiting on a prompt. Inspect it with managed poll or wait and answer "
                 + "it with respond, or leave it for the session's user if it is manual-only. Nothing "
                 + "was delivered."
         case .targetBusy:
@@ -321,9 +323,6 @@ enum AgentSessionLinkSendFailure: String, Equatable {
                 + "was delivered. Wait for a change and try again with the same idempotency_key."
         case .targetStopped:
             "The queued message was withdrawn because the target was stopped and was not delivered."
-        case .compactionSettling:
-            "The ACP provider may still be compacting in the background. Nothing was delivered. "
-                + "Wait for a context update or retry after the settle window with the same idempotency_key."
         case .steerUnavailable:
             "This session's provider cannot take live steering while it runs. Nothing was "
                 + "delivered. Steer again once it is idle, or queue a message with send and "
@@ -334,11 +333,6 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .steerUnconfirmed:
             "RepoPrompt could not confirm whether the provider accepted the steer. This "
                 + "idempotency_key is spent. Read the session before steering again."
-        case .notSupported:
-            "The overseen session's provider has no supported context compaction. Nothing was requested."
-        case .noProviderSession:
-            "The overseen session has no live provider session to compact yet; run one turn "
-                + "first, then retry. Nothing was requested."
         }
     }
 }
@@ -649,16 +643,21 @@ enum AgentSessionLinkMessageDigest {
             .joined()
     }
 
-    /// A stop request shares the send/steer/compact ledger but cannot collide with any of them.
-    static func stopDigest() -> String {
-        SHA256.hash(data: Data("agent_session_link.stop/v1".utf8))
+    /// Request identity of an overseer compaction.
+    ///
+    /// A fixed pre-image that no send can produce (a send's pre-image always begins with a decimal
+    /// length prefix), so the two digests coincide only on a SHA-256 collision. A key reused across
+    /// `send` and `compact` is therefore an `idempotency_conflict`, never a replay of the other
+    /// operation's receipt.
+    static func compactDigest() -> String {
+        SHA256.hash(data: Data("agent_session_link.compact/v1".utf8))
             .map { String(format: "%02x", $0) }
             .joined()
     }
 
-    /// A compact request shares the send/steer ledger, but has its own fixed digest domain.
-    static func compactDigest() -> String {
-        SHA256.hash(data: Data("agent_session_link.compact/v1".utf8))
+    /// A stop request shares the send/steer ledger but cannot collide with either.
+    static func stopDigest() -> String {
+        SHA256.hash(data: Data("agent_session_link.stop/v1".utf8))
             .map { String(format: "%02x", $0) }
             .joined()
     }

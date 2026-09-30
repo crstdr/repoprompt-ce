@@ -2,13 +2,13 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
-/// Target-side pending-interaction inspection and explicit response handling.
+/// Target-side half of the exact-link **Answer prompts** delegation.
 ///
-/// For `poll`/`wait`, the bridge proves observation leases and separately checks Manage before
-/// calling inspection. For `respond`, it authorizes Manage and supplies the final mutation fence.
-/// This layer owns which kinds and decisions an observer may choose, the interaction-ID
-/// compare-and-set, and synchronous submission after that fence. It reuses the exact parser behind
-/// `agent_run respond`, so an answer is accepted or refused with the same message on both surfaces.
+/// Runs on the *target's* view model. The bridge has already proved the exact outbound grant and the
+/// per-link delegation; this layer owns the interaction itself: which kinds and decisions an
+/// observer may choose, the interaction-ID compare-and-set, and a synchronous submission after the
+/// final authority check. It reuses the exact parser behind `agent_run respond`, so an answer is
+/// accepted or refused with the same message on both surfaces.
 @MainActor
 extension AgentModeViewModel {
     /// Approval decisions an observer may submit. Each one affects only the current request.
@@ -20,8 +20,14 @@ extension AgentModeViewModel {
         guard let session = agentSessionLinkLiveSession(matching: candidate),
               let interaction = mcpPendingInteraction(for: session)
         else { return .none }
+        if AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction) {
+            return .tooLarge(interaction)
+        }
         return AgentSessionLinkPendingInteractionInspection(
-            interaction: Self.overseerProjection(of: interaction),
+            interaction: Self.overseerProjection(
+                of: interaction,
+                withholdingApprovalDecisions: overseerWithheldApprovalDecisions(for: interaction, session: session)
+            ),
             manualOnlyReason: overseerManualOnlyReason(for: interaction, session: session)
         )
     }
@@ -36,12 +42,17 @@ extension AgentModeViewModel {
         guard interaction.id == request.interactionID else {
             return .interactionMismatch(currentInteractionID: interaction.id)
         }
+        if AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction) {
+            return .manualOnly(.tooLarge)
+        }
         let manualOnlyReason = overseerManualOnlyReason(for: interaction, session: session)
         let inspection = AgentSessionLinkPendingInteractionInspection(
-            interaction: Self.overseerProjection(of: interaction), manualOnlyReason: manualOnlyReason
+            interaction: Self.overseerProjection(
+                of: interaction,
+                withholdingApprovalDecisions: overseerWithheldApprovalDecisions(for: interaction, session: session)
+            ),
+            manualOnlyReason: manualOnlyReason
         )
-        // The hard disclosure cap takes precedence even for an already manual-only category:
-        // poll/wait return an ID-only too_large stub, so respond must report the same reason.
         if inspection.exceedsPromptLimit {
             return .manualOnly(.tooLarge)
         }
@@ -119,19 +130,39 @@ extension AgentModeViewModel {
             if session.pendingWorktreeMergeReview?.id == interaction.id {
                 return .worktreeMergeReview
             }
-            if let approval = session.pendingApproval,
-               approval.id == interaction.id,
-               case .acp = approval.requestID,
-               approval.overseerOneTimeAllowAvailable != true
-            {
-                return .noOneTimeAllowOption
-            }
+            // An ACP request without a genuine one-time allow option stays answerable: decline and
+            // cancel are still request-scoped. Only accept is withheld (see below).
             return nil
         case .userInput:
             return interaction.fields.contains(where: \.isSecret) ? .secretInput : nil
         case .question, .mcpElicitation:
             return nil
         }
+    }
+
+    /// Approval decisions an observer may not choose for this exact interaction, even though the
+    /// interaction itself is answerable.
+    ///
+    /// An ACP request whose provider offered no genuine one-time allow option cannot be accepted by
+    /// an observer (the only allow options would widen authority), but decline selects a one-time
+    /// reject or reports `cancelled`, and cancel reports `cancelled`, so both remain available.
+    func overseerWithheldApprovalDecisions(
+        for interaction: AgentRunMCPSnapshot.Interaction,
+        session: TabSession
+    ) -> Set<String> {
+        guard interaction.kind == .approval,
+              let approval = session.pendingApproval,
+              approval.id == interaction.id,
+              !Self.overseerMayAccept(approval)
+        else { return [] }
+        return ["accept"]
+    }
+
+    /// False only for an ACP request whose provider offered no genuine one-time allow option.
+    /// The controller rechecks the live request's options before sending anything.
+    static func overseerMayAccept(_ approval: AgentApprovalRequest) -> Bool {
+        guard case .acp = approval.requestID else { return true }
+        return approval.overseerOneTimeAllowAvailable == true
     }
 
     /// Session-wide and policy-amending approvals reach beyond the one request being answered.
@@ -178,13 +209,15 @@ extension AgentModeViewModel {
     /// Option labels stay verbatim because they are the values an answer must name; free text
     /// (titles, prompts, context, descriptions, details) passes through the oversight redactor.
     static func overseerProjection(
-        of interaction: AgentRunMCPSnapshot.Interaction
+        of interaction: AgentRunMCPSnapshot.Interaction,
+        withholdingApprovalDecisions withheld: Set<String> = []
     ) -> AgentRunMCPSnapshot.Interaction {
         typealias Interaction = AgentRunMCPSnapshot.Interaction
         let redact = { (text: String?) in text.map { AgentSessionLinkTextRedactor.redact($0) } }
         let options = interaction.options
             .filter { option in
-                interaction.kind != .approval || overseerApprovalDecisionLabels.contains(option.label)
+                interaction.kind != .approval
+                    || (overseerApprovalDecisionLabels.contains(option.label) && !withheld.contains(option.label))
             }
             .map { Interaction.Option(label: $0.label, description: redact($0.description)) }
         let fields = interaction.fields.map { field in
@@ -215,7 +248,7 @@ extension AgentModeViewModel {
             fields: fields,
             details: interaction.details.map {
                 Interaction.Detail(
-                    label: $0.label,
+                    label: AgentSessionLinkTextRedactor.redact($0.label),
                     value: AgentSessionLinkTextRedactor.redact($0.value),
                     isCode: $0.isCode
                 )
@@ -234,6 +267,11 @@ extension AgentModeViewModel {
         authorize: @escaping @MainActor @Sendable () async -> Bool,
         decisionLabel: String?
     ) async -> AgentSessionLinkInteractionResponseOutcome {
+        // Refuse accept before touching the provider when no genuine one-time allow option was
+        // offered. Decline and cancel still go through; the controller keeps them request-scoped.
+        if decision == .accept, !Self.overseerMayAccept(approval) {
+            return .manualOnly(.noOneTimeAllowOption)
+        }
         guard let controller = session.acpController else { return .unavailable }
         let approvalID = approval.id
         let result = await controller.respondToPermissionRequestForOverseer(
