@@ -45,7 +45,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             - `list`: refresh exact outbound targets and capabilities.
             - `poll`: snapshot sanitized target status, `idle_for_send`, context load, cursor, queued-send state, and a managed-only redacted `pending_interaction` when present.
-            - `wait`: wait on returned cursor(s) for change, idle, or sendable; managed-only pending interactions may be returned.
+            - `wait`: wait on returned cursor(s) for change, idle, or sendable; managed-only pending interactions may be returned. A multi-target result omits targets that became unavailable while waiting and lists them in `unavailable_session_ids`; refresh `list` before using them.
             - `read`: page the redacted user-visible transcript; reuse `next_cursor` and re-anchor on `cursor_reset`.
             - `send`: deliver an attributed message when `idle_for_send: true`, or queue one with `delivery: "when_sendable"`.
             - `cancel_pending_send`: withdraw your queued message by its `idempotency_key` before delivery.

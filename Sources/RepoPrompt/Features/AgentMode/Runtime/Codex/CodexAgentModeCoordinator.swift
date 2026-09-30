@@ -7352,7 +7352,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return nil
         }
 
-        var selfCompactSteerDefinitivelyRejected = false
         do {
             setRunningStatus("Sending message…", source: .transport, session: session, urgent: true)
             switch dispatchPlan {
@@ -7505,13 +7504,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     }
                 } catch let mismatch as CodexTurnSteerError {
                     if let parkedNote {
+                        // A definitive rejection re-parks the note; the ordinary fallback below then
+                        // carries it exactly once on its own start. An ambiguous one settles instead
+                        // of leaving the one-shot marker claimed forever.
                         var state = session.selfCompactState
                         if mismatch.definitivelyRejectsInput {
                             _ = state.noteDefinitivelyNotAttempted(parkedNote.dispatchID)
+                        } else {
+                            _ = state.noteTransportFailed(parkedNote.dispatchID)
                         }
                         session.selfCompactState = state
                         viewModel?.scheduleSave(for: session.tabID)
-                        selfCompactSteerDefinitivelyRejected = true
                         throw mismatch
                     }
                     guard case let .expectedTurnMismatch(expectedTurnID, actualTurnID, failure) = mismatch,
@@ -7645,9 +7648,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return .sent
         } catch let steerError as CodexTurnSteerError {
-            if selfCompactSteerDefinitivelyRejected {
-                return .preDispatchRejected(message: "Codex rejected the steer before receiving the parked continuation note.")
-            }
             if acquiredAgentSessionLinkPhysicalDispatch {
                 viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,

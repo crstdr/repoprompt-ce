@@ -1013,6 +1013,56 @@ final class AgentTabSession: ObservableObject {
         contextCountVouchAwaitsOccupancyReport = false
     }
 
+    /// When an ACP compaction that ended its turn instantly (fire-and-forget) stops being protected.
+    ///
+    /// Until then the provider may still be compacting in the background, where the session's next
+    /// prompt cancels the work. Delivery readiness, the published `idle_for_send`, and every
+    /// automatic wake treat the session as not idle for the whole span, so a parked `when_sendable`
+    /// send, another overseer, or an Auto-wake cannot start that cancelling turn. The session's own
+    /// user is never held. Every transition — including expiry — publishes an observation change,
+    /// which is what lets parked work resume the moment the hold lifts.
+    private(set) var acpBackgroundCompactionSettlesAt: Date? {
+        didSet {
+            if oldValue != acpBackgroundCompactionSettlesAt {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    private var acpBackgroundCompactionSettleTask: Task<Void, Never>?
+
+    /// True while a fire-and-forget ACP compaction may still be running in the provider's background.
+    var isSettlingACPBackgroundCompaction: Bool {
+        guard let deadline = acpBackgroundCompactionSettlesAt else { return false }
+        return deadline > Date()
+    }
+
+    /// Holds automatic and overseer deliveries off this session for `duration`, then lifts the hold
+    /// and publishes the change. A newer hold replaces an older one.
+    func beginACPBackgroundCompactionSettle(duration: TimeInterval) {
+        acpBackgroundCompactionSettleTask?.cancel()
+        let deadline = Date().addingTimeInterval(max(0, duration))
+        acpBackgroundCompactionSettlesAt = deadline
+        acpBackgroundCompactionSettleTask = Task { @MainActor [weak self] in
+            let nanoseconds = UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled,
+                  let self,
+                  acpBackgroundCompactionSettlesAt == deadline
+            else { return }
+            acpBackgroundCompactionSettleTask = nil
+            acpBackgroundCompactionSettlesAt = nil
+        }
+    }
+
+    /// Lifts the hold early: a new turn already started (and would have cancelled any background
+    /// compaction), so holding further protects nothing.
+    func endACPBackgroundCompactionSettle() {
+        acpBackgroundCompactionSettleTask?.cancel()
+        acpBackgroundCompactionSettleTask = nil
+        acpBackgroundCompactionSettlesAt = nil
+    }
+
     /// Restores a vouch withdrawn by a compaction that never reached the provider, but only if no
     /// usage report has vouched for or withdrawn the count since, and it still describes the stored
     /// count for the same provider.
@@ -1309,6 +1359,13 @@ final class AgentTabSession: ObservableObject {
     func cancelEphemeralRuntimeState() {
         selfCompactNativeCompletion?.cancelRuntimeWork()
         selfCompactNativeCompletion = nil
+        // Without its worker, an active request could never settle and would hold overseer delivery,
+        // Auto-wake, and managed Stop until relaunch. Settle or park it before the worker is gone.
+        var selfCompact = selfCompactState
+        if selfCompact.releaseForRuntimeTeardown() {
+            selfCompactState = selfCompact
+        }
+        selfCompactACPCommandItemIDs = nil
         derivedTranscriptRefreshTask?.cancel()
         derivedTranscriptRefreshTask = nil
         pendingDerivedTranscriptRefreshReason = nil

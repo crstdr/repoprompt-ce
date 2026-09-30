@@ -220,6 +220,10 @@ fresh managed generation, not a resurrection of the old one.
 retain their watch-level operation grant but disclose prompt bodies only after a separate whole-batch
 management fence and live-endpoint check. A restricted link can still `poll` or `wait` for status
 with `managed: false` and no prompt body; `respond` and `steer` return `management_not_granted`.
+When that fence fails for a multi-target `wait` after a non-terminal wake, each target is re-fenced on
+its own (as terminal survivors already are): healthy siblings keep their rows, cursors, and prompts,
+and a sibling that failed its own fence releases nothing and is named in `unavailable_session_ids`.
+A single-target wait, or a batch with no survivor, is still denied.
 An unlinked UUID still receives the indistinguishable denial. A steer's ledger
 commit still uses `commitSendAuthorization(requiresManagement: true)`, and revocation before the final
 fence releases the uncommitted reservation without delivery.
@@ -238,7 +242,9 @@ submits without suspending. Approvals and permissions accept only `accept` (this
 `decline`, or `cancel`. Session-wide and exec-policy-amending approvals, Codex project-hook trust,
 app-owned worktree-merge reviews, and user-input requests containing a secret field are visible but
 `manual_only`. ACP permissions use only a genuine one-time allow option for accept and a one-time
-reject for decline. A wait for the session's next instruction is not a prompt `respond` answers;
+reject (otherwise `cancelled`) for decline. When the provider offers no genuine one-time allow
+option, `poll`/`wait` omit `accept` and `respond` refuses only accept (`manual_only`,
+`no_one_time_allow_option`); decline and cancel stay available. A wait for the session's next instruction is not a prompt `respond` answers;
 the managed pending-interaction note says to deliver that instruction with `steer`.
 
 ### Steering
@@ -457,10 +463,15 @@ a retired one is detached and shut down. Busy is not retired.
 
 ACP context count becomes unknown at dispatch: new occupancy may vouch for it again, but this
 command's billed prompt count cannot. A proven no-send restores the withdrawn vouch only if no
-newer occupancy replaced it. Instant silent completion may mean background work, so it adds a
-fixed transcript hint; the ACP receipt cautions that another prompt may cancel that work and to
-wait ~60–90 seconds. This is guidance, not completion proof, a cooldown, or new admission policy.
-Duplicate receipts retain that metadata.
+newer occupancy replaced it. Instant silent completion may mean background work that the
+session's next prompt would cancel, so it adds a fixed transcript hint and starts a 90-second
+settle hold (`AgentTabSession.beginACPBackgroundCompactionSettle`). While it lasts, delivery
+readiness is `target_not_idle` — refusing `send`, `compact`, and parked `when_sendable` drains —
+Auto-wake and periodic wakes are not admitted, and `poll` reports `idle_for_send: false` with
+`send_blockers: ["background_compaction_settling"]`. Expiry publishes a readiness change, so parked
+work resumes without polling; any new run start (the session's own user is never held) ends the
+hold early. It is a cancellation guard, not completion proof. Duplicate receipts retain the
+background metadata.
 
 A failed last run is not a readiness blocker, so a target that died on context length is admissible;
 any interaction or `awaiting_user` is `target_not_idle`. `accepted` means started, not completed: completion is

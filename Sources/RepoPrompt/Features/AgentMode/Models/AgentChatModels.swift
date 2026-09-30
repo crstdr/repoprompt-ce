@@ -372,7 +372,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// cancels it.
     public static let acpBackgroundCompactionNoteText =
         "The provider accepted the compaction; it may still be running in the background — sending "
-            + "a message to this session in the next ~60–90 s can cancel it."
+            + "a message to this session in the next ~60–90 s can cancel it. Overseer messages and "
+            + "automatic wakes are held until then."
 
     /// The visible provenance row for one overseer-requested context compaction.
     ///
@@ -420,7 +421,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         )
     }
 
-    /// Fixed replay-safe text for an ACP settle that never saw a vouched context drop.
+    /// Fixed replay-safe text for unverified completion: an ACP settle that never saw a vouched
+    /// context drop, or a native command that outlived its deadline.
     /// The continuation note is not interpolated here; it stays parked for the next ordinary send.
     public static func selfCompactionCompletionUnverified(sequenceIndex: Int) -> AgentChatItem {
         AgentChatItem(
