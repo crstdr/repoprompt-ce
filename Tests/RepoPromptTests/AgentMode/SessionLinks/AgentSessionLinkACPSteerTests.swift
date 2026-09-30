@@ -756,6 +756,12 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         let fixture = try await makeFixture()
         let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.session.tabID))
         let bridge = AgentSessionLinkRuntimeBridge.shared
+        // This suite builds a synthetic window. Publish its live endpoint to the shared bridge
+        // so ordinary stale-endpoint sweeps cannot retire the generation during provider awaits.
+        let host = LiveWindowEndpointHost()
+        host.register(fixture.viewModel, windowID: 1)
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
         let before = bridge.captureWaitInput(for: endpoint)
         fixture.viewModel.test_beforeACPToolIdleWait = {
             XCTAssertGreaterThan(bridge.captureWaitInput(for: endpoint).generation, before.generation)
@@ -777,6 +783,12 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         let fixture = try await makeFixture()
         let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.session.tabID))
         let bridge = AgentSessionLinkRuntimeBridge.shared
+        // This suite builds a synthetic window. Publish its live endpoint to the shared bridge
+        // so ordinary stale-endpoint sweeps cannot retire the generation during provider awaits.
+        let host = LiveWindowEndpointHost()
+        host.register(fixture.viewModel, windowID: 1)
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
         let before = bridge.captureWaitInput(for: endpoint)
         await fixture.viewModel.submitUserTurnAfterHydration(
             tabID: fixture.session.tabID, originalSession: fixture.session,
