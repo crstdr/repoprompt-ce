@@ -183,6 +183,7 @@ final actor ClaudeNativeProcessSessionController {
     #if DEBUG
         private var configurationTestControlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])?
         private var configurationTestWrite: (@Sendable (Data) throws -> Void)?
+        private var configurationTestBeforeApplicationErrorReturn: (@Sendable () async -> Void)?
         private var configurationTestBeforeProofSend: (@Sendable () async -> Void)?
     #endif
     private var activeLaunchEnvironmentSignature: LaunchEnvironmentSignature?
@@ -452,13 +453,47 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
-        _ = try await applyModelAndEffortWithProof(model: model, effortLevel: effortLevel)
+        do {
+            _ = try await applyModelAndEffortWithProof(model: model, effortLevel: effortLevel)
+        } catch let failure as NativeAgentRuntimeConfigurationFailure {
+            // Live picker updates retain the existing, unwrapped error contract.
+            throw failure.underlyingError
+        }
+    }
+
+    func applyModelAndEffortForTurn(
+        model: String?, effortLevel: ClaudeCodeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?
+    ) async throws -> Bool {
+        switch try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure) {
+        case .applied: true
+        case .superseded: false
+        case .notReady: hasActiveSession && !isShuttingDown
+        }
     }
 
     func applyModelAndEffortWithProof(
         model: String?,
         effortLevel: ClaudeCodeEffortLevel?
     ) async throws -> NativeAgentRuntimeConfigurationApplication {
+        try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: nil)
+    }
+
+    func applyModelAndEffortWithProof(
+        model: String?, effortLevel: ClaudeCodeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure
+    ) async throws -> NativeAgentRuntimeConfigurationApplication {
+        try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure)
+    }
+
+    private func applyConfiguration(
+        model: String?, effortLevel: ClaudeCodeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?
+    ) async throws -> NativeAgentRuntimeConfigurationApplication {
+        if let failure = replacingFailure {
+            guard failure.lifetime == configurationLifetime,
+                  failure.intentGeneration == latestFlagSettingsIntentGeneration,
+                  failure.requestGeneration == flagSettingsRequestGeneration
+            else { return .superseded }
+        }
+        // No suspension between failure-token validation and consuming its intent.
         let selection = ConfigurationSelection(
             model: model,
             effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
@@ -526,7 +561,14 @@ final actor ClaudeNativeProcessSessionController {
                   intentGeneration == latestFlagSettingsIntentGeneration,
                   requestGeneration == flagSettingsRequestGeneration
             else { return .superseded }
-            throw error
+            let failure = NativeAgentRuntimeConfigurationFailure(
+                underlyingError: error, lifetime: lifetime,
+                intentGeneration: intentGeneration, requestGeneration: requestGeneration
+            )
+            #if DEBUG
+                await configurationTestBeforeApplicationErrorReturn?()
+            #endif
+            throw failure
         }
     }
 
@@ -1798,7 +1840,7 @@ final actor ClaudeNativeProcessSessionController {
     #if DEBUG
         /// In-memory transport for deterministic control-ACK/write races; never starts a provider.
         func test_installConfigurationTransport(
-            initialized: Bool,
+            initialized: Bool = true,
             controlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])? = { _ in [:] },
             write: @escaping @Sendable (Data) throws -> Void
         ) {
@@ -1815,6 +1857,10 @@ final actor ClaudeNativeProcessSessionController {
             sessionID = "application-proof-session"
             configurationTestControlRequest = controlRequest
             configurationTestWrite = write
+        }
+
+        func test_setBeforeApplicationErrorReturn(_ action: @escaping @Sendable () async -> Void) {
+            configurationTestBeforeApplicationErrorReturn = action
         }
 
         /// Pauses at controller entry, before the non-suspending proof-check/write segment.

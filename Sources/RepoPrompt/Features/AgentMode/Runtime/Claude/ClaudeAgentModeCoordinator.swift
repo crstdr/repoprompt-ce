@@ -1347,7 +1347,8 @@ final class ClaudeAgentModeCoordinator {
                     // Only optional Auto may fall back, and only for the same still-current model.
                     // Application failure is not a missing conversation or fresh-start recovery.
                     guard configurationIsCurrent() else { return .superseded }
-                    if case NativeAgentRuntimeControllerError.liveModelSwitchRequiresRestart = error {
+                    let applicationError = (error as? NativeAgentRuntimeConfigurationFailure)?.underlyingError ?? error
+                    if case NativeAgentRuntimeControllerError.liveModelSwitchRequiresRestart = applicationError {
                         await recycleClaudeControllerForLaunchSettingsChange(
                             session: session, existingController: controller, runtimeVariantChanged: false
                         )
@@ -1356,7 +1357,7 @@ final class ClaudeAgentModeCoordinator {
                         handler = toolHandler(for: session)
                         continue
                     }
-                    guard autoEffort != nil else {
+                    guard autoEffort != nil, let failure = error as? NativeAgentRuntimeConfigurationFailure else {
                         return recordSendFailure(
                             "Claude could not apply model and effort before sending: \(error.localizedDescription)",
                             session: session,
@@ -1366,7 +1367,8 @@ final class ClaudeAgentModeCoordinator {
                     do {
                         application = try await controller.applyModelAndEffortWithProof(
                             model: selectedModel,
-                            effortLevel: manualEffort
+                            effortLevel: manualEffort,
+                            replacingFailure: failure
                         )
                         appliedAutoEffort = nil
                     } catch {

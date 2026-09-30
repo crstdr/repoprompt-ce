@@ -353,7 +353,11 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         do {
             _ = try await controller.applyModelAndEffortWithProof(model: "B", effortLevel: .high)
             XCTFail("Expected rejection")
-        } catch ResolverError.unsupportedModel {}
+        } catch let failure as NativeAgentRuntimeConfigurationFailure {
+            guard case ResolverError.unsupportedModel = failure.underlyingError else {
+                return XCTFail("Unexpected underlying application error: \(failure.underlyingError)")
+            }
+        }
         do {
             try await controller.applyModelAndEffort(model: "B", effortLevel: .high)
             XCTFail("Legacy updates must still expose their original error")
@@ -743,7 +747,11 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 do {
                     _ = try await application.value
                     XCTFail("A production error response cannot certify application")
-                } catch NativeAgentRuntimeControllerError.invalidControlResponse {}
+                } catch let failure as NativeAgentRuntimeConfigurationFailure {
+                    guard case NativeAgentRuntimeControllerError.invalidControlResponse = failure.underlyingError else {
+                        return XCTFail("Unexpected underlying ACK error: \(failure.underlyingError)")
+                    }
+                }
                 XCTAssertEqual(writes.count, 1, "Only the settings request was written")
             } else {
                 guard case let .applied(proof) = try await application.value else { return XCTFail("Missing ACK proof") }
