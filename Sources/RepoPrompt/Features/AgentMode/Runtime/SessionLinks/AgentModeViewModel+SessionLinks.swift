@@ -221,7 +221,8 @@ extension AgentModeViewModel {
         tabID: UUID,
         sessionID: UUID,
         tabName: String,
-        isWindowClosing: Bool
+        isWindowClosing: Bool,
+        includeLocation: Bool = true
     ) -> AgentSessionLinkEndpointCandidate? {
         guard let session = sessions[tabID],
               let identity = agentSessionLifecycleIdentity(tabID: tabID, expectedSessionID: sessionID),
@@ -229,10 +230,26 @@ extension AgentModeViewModel {
         else {
             return nil
         }
+        return agentSessionLinkCandidate(
+            session: session, identity: identity, tabName: tabName,
+            providerDisplayName: session.selectedAgent.displayName,
+            isWindowClosing: isWindowClosing, includeLocation: includeLocation
+        )
+    }
+
+    func agentSessionLinkCandidate(
+        session: TabSession,
+        identity: AgentSessionLifecycleAuthority.Identity,
+        tabName: String,
+        providerDisplayName: String,
+        isWindowClosing: Bool,
+        includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        guard let sessionID = identity.sessionID else { return nil }
         return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: identity.workspaceID,
-            tabID: tabID,
+            tabID: identity.tabID,
             sessionID: sessionID,
             persistentBindingGeneration: identity.persistentBindingGeneration,
             bindingTransitionGeneration: identity.bindingTransitionGeneration,
@@ -251,13 +268,13 @@ extension AgentModeViewModel {
                 taskLabelKind: session.mcpControlContext?.taskLabelKind
             ),
             displayName: tabName,
-            providerDisplayName: session.selectedAgent.displayName,
+            providerDisplayName: providerDisplayName,
             // Resolved here, in the endpoint's own window, because only this window knows both its
             // worktree bindings and its workspace. UI only; never enters an agent-facing payload.
-            locationLabel: AgentMonitorLocationLabelFormatter.label(
-                worktreeLabel: primaryExecutionWorktreeIndicator(forTabID: tabID)?.label,
+            locationLabel: includeLocation ? AgentMonitorLocationLabelFormatter.label(
+                worktreeLabel: primaryExecutionWorktreeIndicator(forTabID: identity.tabID)?.label,
                 workspaceName: workspaceManager?.workspace(withID: identity.workspaceID)?.name
-            ),
+            ) : nil,
             // Qualified here, in the endpoint's own window, against the binding state read in this
             // same MainActor pass. A proof left over from a superseded binding degrades to pending
             // rather than travelling on the candidate as authoritative.
@@ -345,18 +362,23 @@ extension AgentModeViewModel {
 
     /// Refresh durable child metadata once for a poll/wait batch. The synchronous snapshot path
     /// reads only the already-merged parent lookup and never scans the registry per target.
+    ///
+    /// Runs on every `poll`/`wait`, so it reads only the cached metadata index (one index-file read on
+    /// a cold cache) and never backfills or reconciles session files on this hot path.
     func agentSessionLinkRefreshSubagentCensus(for workspace: WorkspaceModel) async {
         agentSessionLinkSubagentRefreshGeneration &+= 1
         let generation = agentSessionLinkSubagentRefreshGeneration
-        let persisted = try? await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace)
+        let persisted = await agentSessionLinkPersistedSubagentMetaLoader(workspace)
         guard !Task.isCancelled,
               generation == agentSessionLinkSubagentRefreshGeneration,
               workspaceManager?.activeWorkspace?.id == workspace.id
         else { return }
-        // A metadata read failure must not leave the prior durable census looking current.
-        // Live and owner-validated index entries still provide a bounded fallback.
+        // An unavailable index keeps the last good list instead of flapping `finished` counts (and
+        // the change cursor) on a transient read failure. A list from another workspace is already
+        // excluded by the rebuild's workspace gate, and committed deletions are filtered on rebuild.
+        guard let persisted else { return }
         agentSessionLinkPersistedSubagentWorkspaceID = workspace.id
-        agentSessionLinkPersistedSubagentMeta = persisted ?? []
+        agentSessionLinkPersistedSubagentMeta = persisted
         rebuildAgentSessionLinkSubagentCensus()
     }
 
@@ -659,7 +681,7 @@ extension AgentModeViewModel {
 
     /// Passive board state from the target's own run, before `linkStatus` flattens terminal runs.
     /// Subagent counts are supplied by the caller so this projection remains independent of the
-    /// view model's session collection; the census is wired separately.
+    /// view model's session collection; the caller reads them from `agentSessionLinkSubagentCensus`.
     static func laneBoard(
         for session: TabSession,
         blockers: [SendBlocker],
@@ -1385,9 +1407,9 @@ extension AgentModeViewModel {
         case pendingACPSteeringInstructions = "pending_acp_steering_instructions"
         case pendingClaudeSteeringInstructions = "pending_claude_steering_instructions"
         case pendingAutoWake = "pending_auto_wake"
-        case stopInProgress = "stop_in_progress"
-        case compactionSettling = "compaction_settling"
         case pendingSelfCompact = "pending_self_compact"
+        case stopInProgress = "stop_in_progress"
+        case backgroundCompactionSettling = "background_compaction_settling"
         case candidateClosing = "candidate_closing"
     }
 
@@ -1407,9 +1429,9 @@ extension AgentModeViewModel {
         var hasPendingACPSteeringInstructions: Bool
         var hasPendingClaudeSteeringInstructions: Bool
         var hasPendingAutoWake: Bool
-        var stopInProgress: Bool
-        var compactionSettling: Bool
         var hasPendingSelfCompact: Bool
+        var stopInProgress: Bool
+        var backgroundCompactionSettling = false
         var isCandidateClosing: Bool
     }
 
@@ -1432,10 +1454,9 @@ extension AgentModeViewModel {
             hasPendingACPSteeringInstructions: !session.pendingACPSteeringInstructions.isEmpty,
             hasPendingClaudeSteeringInstructions: !session.pendingClaudeSteeringInstructions.isEmpty,
             hasPendingAutoWake: session.oversight.pendingAutoWake != nil,
-            stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
-            compactionSettling: session.isACPCompactSettling()
-                || session.selfCompactState.active?.phase == .acpSettling,
             hasPendingSelfCompact: session.selfCompactState.blocksOverseerDelivery,
+            stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
+            backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
             isCandidateClosing: candidate.isClosing
         )
     }
@@ -1455,9 +1476,9 @@ extension AgentModeViewModel {
         if input.hasPendingACPSteeringInstructions { blockers.append(.pendingACPSteeringInstructions) }
         if input.hasPendingClaudeSteeringInstructions { blockers.append(.pendingClaudeSteeringInstructions) }
         if input.hasPendingAutoWake { blockers.append(.pendingAutoWake) }
-        if input.stopInProgress { blockers.append(.stopInProgress) }
-        if input.compactionSettling { blockers.append(.compactionSettling) }
         if input.hasPendingSelfCompact { blockers.append(.pendingSelfCompact) }
+        if input.stopInProgress { blockers.append(.stopInProgress) }
+        if input.backgroundCompactionSettling { blockers.append(.backgroundCompactionSettling) }
         if input.isCandidateClosing { blockers.append(.candidateClosing) }
         return blockers.sorted { $0.rawValue < $1.rawValue }
     }

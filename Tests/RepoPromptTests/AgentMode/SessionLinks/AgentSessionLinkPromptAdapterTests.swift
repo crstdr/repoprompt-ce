@@ -1819,7 +1819,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     pendingReadiness.removeFirst()
                 },
                 hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in
-                    pendingFinalRoutePresence.removeFirst()
+                    // Route state persists through the additional post-configuration proof fence.
+                    pendingFinalRoutePresence.isEmpty ? finalRoutePresence.last == true : pendingFinalRoutePresence.removeFirst()
                 },
                 decorateAgentSessionLinkPrompt: { text, _, _ in
                     .init(text: text, claim: nil, mustAbortDispatch: false)
@@ -2335,38 +2336,16 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 // MARK: - Non-Codex fakes
 
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
+    private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
     private(set) var shutdownCount = 0
     private(set) var startOrResumeExistingSessionIDs: [String?] = []
     private var rejectResume = false
     private var turnInFlight = false
     private var failSendAfterRecord = false
-    private var holdNextSend = false
-    private var heldSendEntered = false
-    private var heldSendEntryWaiter: CheckedContinuation<Void, Never>?
-    private var heldSendGate: CheckedContinuation<Void, Never>?
-    private var holdNextInFlightCheck = false
-    private var heldInFlightCheckEntered = false
-    private var heldInFlightCheckEntryWaiter: CheckedContinuation<Void, Never>?
-    private var heldInFlightCheckGate: CheckedContinuation<Void, Never>?
 
     func setTurnInFlight(_ value: Bool) {
         turnInFlight = value
-    }
-
-    func holdNextTurnInFlightCheck() {
-        holdNextInFlightCheck = true
-        heldInFlightCheckEntered = false
-    }
-
-    func waitForHeldTurnInFlightCheck() async {
-        if heldInFlightCheckEntered { return }
-        await withCheckedContinuation { heldInFlightCheckEntryWaiter = $0 }
-    }
-
-    func releaseHeldTurnInFlightCheck() {
-        heldInFlightCheckGate?.resume()
-        heldInFlightCheckGate = nil
     }
 
     func setRejectResume(_ value: Bool) {
@@ -2375,22 +2354,6 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
 
     func setFailSendAfterRecord(_ value: Bool) {
         failSendAfterRecord = value
-    }
-
-    func holdNextUserMessage() {
-        holdNextSend = true
-        heldSendEntered = false
-    }
-
-    func waitForHeldUserMessage() async {
-        if heldSendEntered { return }
-        await withCheckedContinuation { heldSendEntryWaiter = $0 }
-    }
-
-    func releaseHeldUserMessage(throwing: Bool = false) {
-        failSendAfterRecord = throwing
-        heldSendGate?.resume()
-        heldSendGate = nil
     }
 
     private var stream: AsyncStream<NativeAgentRuntimeEvent>?
@@ -2405,16 +2368,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     var hasTurnInFlight: Bool {
-        get async {
-            if holdNextInFlightCheck {
-                holdNextInFlightCheck = false
-                heldInFlightCheckEntered = true
-                heldInFlightCheckEntryWaiter?.resume()
-                heldInFlightCheckEntryWaiter = nil
-                await withCheckedContinuation { heldInFlightCheckGate = $0 }
-            }
-            return turnInFlight
-        }
+        turnInFlight
     }
 
     var events: AsyncStream<NativeAgentRuntimeEvent> {
@@ -2437,6 +2391,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         effortLevel _: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
+        configuration.replaceProcess()
         startOrResumeExistingSessionIDs.append(existingSessionID)
         if rejectResume, existingSessionID != nil { throw NativeAgentRuntimeControllerError.processNotRunning }
         return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
@@ -2446,17 +2401,23 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         NativeAgentRuntimeSessionRef(sessionID: "monitor-native-session")
     }
 
-    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {}
+    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {
+        _ = configuration.apply()
+    }
+
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        configuration.apply()
+    }
+
+    func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try configuration.validate(proof)
+        sentMessages.append(text)
+        if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
+        return UUID()
+    }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
-        if holdNextSend {
-            holdNextSend = false
-            heldSendEntered = true
-            heldSendEntryWaiter?.resume()
-            heldSendEntryWaiter = nil
-            await withCheckedContinuation { heldSendGate = $0 }
-        }
         if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
         return UUID()
     }
@@ -2466,6 +2427,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func shutdown() async {
+        configuration.replaceProcess()
         shutdownCount += 1
         continuation?.finish()
     }

@@ -15,6 +15,28 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     private final class FakeEndpointHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
+        var beforeModelFence: (() async -> Void)?
+        var afterModelFence: (() async -> Void)?
+        var modelMutationCount = 0
+
+        func agentSessionLinkModelCandidate(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionLinkEndpointCandidate? {
+            candidates.first { $0.domainEndpoint == endpoint }
+        }
+
+        func agentSessionLinkPerformSetModel(
+            to _: AgentSessionLinkEndpointCandidate, modelID: String,
+            liveness: @escaping AgentSessionLinkSendLivenessProbe,
+            reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkModelOutcome {
+            await beforeModelFence?()
+            let commit = await reauthorize()
+            guard commit == .committed else { return .blocked(commit.refusal) }
+            await afterModelFence?()
+            guard liveness().permitsDelivery else { return .blocked(.endpointInvalidated) }
+            modelMutationCount += 1
+            return .accepted(.init(modelID: modelID, modelRaw: "test", reasoningEffortRaw: nil, changed: true))
+        }
+
         var laneCandidate: AgentSessionLinkEndpointCandidate?
         var laneCreationOutcome: AgentSessionLaneHostCreationOutcome?
         var laneCreationCount = 0
@@ -125,10 +147,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         private let fenceSession = AgentTabSession(tabID: UUID())
         func agentSessionLinkStartStopFence(for _: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
             providesStartStopFence ? AgentRunStartStopFence(session: fenceSession) : nil
-        }
-
-        func invalidateStartStopFence() {
-            fenceSession.stopState.invalidateScheduledStarts()
         }
 
         /// When true the fake invokes the commit fence exactly as the real host does.
@@ -332,9 +350,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             liveness: @escaping AgentSessionLinkSendLivenessProbe,
             commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
         ) async -> AgentSessionLinkSendTransactionOutcome {
-            if let stopFence = request.startStopFence, !stopFence.permitsStart(of: fenceSession) {
-                return .blocked(.targetStopped)
-            }
             sendRequests.append((candidate, request))
             sendLivenessReadings.append(liveness())
             await beforeSendCommit?()
@@ -356,7 +371,28 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             return sendOutcome
         }
 
+        var compactRequests: [(AgentSessionLinkEndpointCandidate, AgentSessionLinkCompactRequest)] = []
+        var compactOutcome: AgentSessionLinkSendTransactionOutcome = .blocked(.targetNotIdle)
+
+        func agentSessionLinkPerformCompact(
+            to candidate: AgentSessionLinkEndpointCandidate,
+            request: AgentSessionLinkCompactRequest,
+            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+            commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkSendTransactionOutcome {
+            compactRequests.append((candidate, request))
+            if invokesSendCommit {
+                let commit = await commitAuthorization()
+                sendCommitOutcomes.append(commit)
+                guard commit == .committed else {
+                    return .blocked(commit == .shuttingDown ? .shuttingDown : .linkRevoked)
+                }
+            }
+            return compactOutcome
+        }
+
         var stopRequests: [(AgentSessionLinkEndpointCandidate, AgentSessionLinkStopRequest)] = []
+        var routeStopToInteractionViewModel = false
         var stopResult: DomainAgentSessionLinkStopReceipt.Result = .notRunning
         var stopTeardownCompleted: Bool?
         var currentStopRunID: UUID?
@@ -375,6 +411,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             let admissionLiveness = liveness()
             stopLivenessReadings.append(admissionLiveness)
             guard admissionLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
+            if routeStopToInteractionViewModel, let interactionViewModel {
+                return await interactionViewModel.agentSessionLinkPerformStop(
+                    to: candidate, request: request, liveness: liveness,
+                    queueHasCommittedDrain: queueHasCommittedDrain,
+                    withdrawInbound: withdrawInbound, commitAuthorization: commitAuthorization
+                )
+            }
             await beforeSendCommit?()
             let commit = await commitAuthorization()
             sendCommitOutcomes.append(commit)
@@ -394,26 +437,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 auditStatus: .notRequired,
                 settledAt: Date(timeIntervalSince1970: 2000)
             ))
-        }
-
-        var compactRequests: [(AgentSessionLinkEndpointCandidate, AgentSessionLinkCompactRequest)] = []
-        var compactOutcome: AgentSessionLinkSendTransactionOutcome = .blocked(.targetNotIdle)
-
-        func agentSessionLinkPerformCompact(
-            to candidate: AgentSessionLinkEndpointCandidate,
-            request: AgentSessionLinkCompactRequest,
-            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
-            commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
-        ) async -> AgentSessionLinkSendTransactionOutcome {
-            compactRequests.append((candidate, request))
-            if invokesSendCommit {
-                let commit = await commitAuthorization()
-                sendCommitOutcomes.append(commit)
-                guard commit == .committed else {
-                    return .blocked(commit == .shuttingDown ? .shuttingDown : .linkRevoked)
-                }
-            }
-            return compactOutcome
         }
 
         /// Every snooze call the bridge actually admitted, so a test can prove a denial never reached
@@ -778,55 +801,66 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         return failure
     }
 
-    func testNewLinkIsManagedAndRelinkRetiresItsLease() async throws {
+    func testManagedPromptProjectionRedactsDetailLabelsButPreservesChoiceLabels() {
+        let interaction = AgentRunMCPSnapshot.Interaction(
+            id: UUID(), kind: .question, responseType: .decision,
+            title: "api_key=private-title", prompt: "Choose", context: nil,
+            allowsMultiple: nil,
+            options: [.init(label: "continue", description: "token=private-description")],
+            fields: [],
+            details: [.init(label: "api_key=private-label", value: "secret=private-value", isCode: false)]
+        )
+        let projected = AgentModeViewModel.overseerProjection(of: interaction)
+        XCTAssertEqual(projected.options.map(\.label), ["continue"])
+        XCTAssertFalse(projected.title?.contains("private-title") ?? false)
+        XCTAssertFalse(projected.options.first?.description?.contains("private-description") ?? false)
+        XCTAssertFalse(projected.details.first?.label.contains("private-label") ?? false)
+        XCTAssertFalse(projected.details.first?.value.contains("private-value") ?? false)
+    }
+
+    func testTerminalWaitSurvivorFreezeAfterAuthorityHopReleasesNoState() async throws {
         let fixture = makeFixture()
-        guard case .added = await addLink(fixture),
-              let reference = await linkReference(fixture)
-        else { return XCTFail("Expected an active link") }
-        let observer = fixture.observer.domainEndpoint
-        let target = fixture.target.domainEndpoint
-
-        let authorized = try await authorizedTarget(
+        guard case .added = await addLink(fixture) else { return XCTFail("Expected an active link") }
+        let target = try await authorizedTarget(
             fixture.bridge,
-            operation: .monitorPoll,
+            operation: .monitorWait,
             observer: fixture.observer,
             target: fixture.target
         )
-        XCTAssertEqual(authorized.lease.capability, .poll)
-        let inspections = await fixture.bridge.pendingInteractionsForObservation(leases: [authorized.lease])
-        XCTAssertEqual(inspections?[fixture.target.sessionID], AgentSessionLinkPendingInteractionInspection.none)
-        let granted = await fixture.bridge.managementIsGranted(for: authorized.lease)
-        XCTAssertTrue(granted)
-        let inventory = try XCTUnwrap(fixture.host.publishedPromptInventories[fixture.observer.sessionID])
-        XCTAssertEqual(inventory.items.first?.capabilityNames.contains("manage"), true)
+        let baseline = await fixture.bridge.terminalWaitSurvivingStates(leases: [target.lease])
+        XCTAssertEqual(baseline.map(\.sessionID), [fixture.target.sessionID])
 
-        let unlinked = await fixture.bridge.authorizeTarget(
-            operation: .monitorSteer,
-            observerEndpoint: observer,
-            targetSessionID: UUID()
+        fixture.bridge.test_afterTerminalWaitSurvivorAuthorityValidation = { [weak bridge = fixture.bridge] in
+            bridge?.freezeForTermination()
+        }
+        let afterFreeze = await fixture.bridge.terminalWaitSurvivingStates(leases: [target.lease])
+        XCTAssertTrue(fixture.bridge.isFrozenForShutdown)
+        XCTAssertTrue(afterFreeze.isEmpty, "Termination after authority validation must fence survivor release")
+    }
+
+    func testManagedPromptProjectionBoundsAuthorizationWhitespaceAndRawOversize() throws {
+        let whitespace = "Authorization:" + String(repeating: " ", count: 32 * 1024)
+        let interaction = AgentRunMCPSnapshot.Interaction(
+            id: UUID(), kind: .question, responseType: .text,
+            title: nil, prompt: whitespace, context: nil, allowsMultiple: nil,
+            options: [], fields: [], details: []
         )
-        XCTAssertEqual(authorizationFailure(unlinked), .denied, "an unlinked UUID has no management authority")
-        let stopped = await fixture.bridge.stopMonitorLink(
-            observerEndpoint: observer,
-            targetEndpoint: target,
-            expectedReference: reference
+        let start = ProcessInfo.processInfo.systemUptime
+        let projected = AgentModeViewModel.overseerProjection(of: interaction)
+        XCTAssertEqual(projected.prompt, whitespace)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 3)
+        XCTAssertFalse(AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction))
+
+        let oversized = AgentRunMCPSnapshot.Interaction(
+            id: interaction.id, kind: interaction.kind, responseType: interaction.responseType,
+            title: nil, prompt: String(repeating: "api_key=private-value ", count: 16 * 1024),
+            context: nil, allowsMultiple: nil, options: [], fields: [], details: []
         )
-        XCTAssertEqual(stopped, .stopped)
-        let retired = await fixture.bridge.managementIsGranted(for: authorized.lease)
-        XCTAssertFalse(retired, "revocation invalidates an issued managed lease")
-        guard case .added = await addLink(fixture),
-              let replacement = await linkReference(fixture)
-        else { return XCTFail("Expected a replacement link") }
-        XCTAssertNotEqual(replacement, reference)
-        let relinked = try await authorizedTarget(
-            fixture.bridge,
-            operation: .monitorRespond,
-            observer: fixture.observer,
-            target: fixture.target
-        )
-        XCTAssertEqual(relinked.lease.capability, .manage)
-        let staleGrant = await fixture.bridge.managementIsGranted(for: authorized.lease)
-        XCTAssertFalse(staleGrant)
+        XCTAssertTrue(AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(oversized))
+        let stub = try XCTUnwrap(AgentSessionLinkPendingInteractionInspection.tooLarge(oversized).projectedObject())
+        XCTAssertEqual(stub["manual_only_reason"], .string("too_large"))
+        XCTAssertEqual(stub["interaction_id"], .string(interaction.id.uuidString))
+        XCTAssertNil(stub["prompt"])
     }
 
     func testManagedRespondAnswersOnlyTheExactCurrentInteractionWithOneTimeDecisions() async throws {
@@ -876,7 +910,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
         let reference = DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
 
-        // An explicit answer may address a prompt that was already waiting.
+        // A new managed link may address a prompt that was already waiting.
         let approval = AgentApprovalRequest(
             requestID: .codex(.int(201)),
             method: "item/commandExecution/requestApproval",
@@ -892,10 +926,10 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observer: observer,
             target: target
         )
-        guard let inspections = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease]),
-              let inspection = inspections[target.sessionID],
+        let projected = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        guard let inspection = projected?[target.sessionID],
               let interaction = inspection.interaction
-        else { return XCTFail("Expected the pending approval to be visible on the managed link") }
+        else { return XCTFail("Expected the pending approval to be visible once enabled") }
         XCTAssertEqual(interaction.id, approval.id)
         XCTAssertEqual(interaction.kind, .approval)
         XCTAssertNil(inspection.manualOnlyReason)
@@ -988,6 +1022,93 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(authorizationFailure(afterStop), .denied)
     }
 
+    /// An ACP request with no genuine one-time allow option withholds only `accept` from an observer.
+    /// Decline (one-time reject or `cancelled`) and cancel stay request-scoped, so they stay answerable.
+    func testACPApprovalWithoutOneTimeAllowWithholdsOnlyAcceptFromObserver() async throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 98,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel,
+            tabID: tabID,
+            name: "ACP target"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let session = viewModel.session(for: tabID)
+        session.hasLoadedPersistedState = true
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
+            tabID: tabID,
+            sessionID: sessionID,
+            tabName: "Target",
+            isWindowClosing: false
+        ))
+        let observer = makeCandidate(windowID: 97, displayName: "Overseer")
+        let host = FakeEndpointHost()
+        host.candidates = [observer, target]
+        host.interactionViewModel = viewModel
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        guard case .added = await bridge.addMonitorLink(
+            observerSessionID: observer.sessionID,
+            rawTargetSessionID: target.sessionID.uuidString
+        ) else { return XCTFail("Expected an exact live link") }
+
+        func acpApproval(_ id: String, oneTimeAllowAvailable: Bool) -> AgentApprovalRequest {
+            AgentApprovalRequest(
+                requestID: .acp(id),
+                method: "session/request_permission",
+                kind: .commandExecution,
+                threadID: "acp-session",
+                turnID: "acp-session",
+                itemID: "tool-\(id)",
+                overseerOneTimeAllowAvailable: oneTimeAllowAvailable
+            )
+        }
+
+        let restricted = acpApproval("no-once", oneTimeAllowAvailable: false)
+        session.pendingApproval = restricted
+        let readTarget = try await authorizedTarget(bridge, operation: .monitorPoll, observer: observer, target: target)
+        let projected = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        let inspection = try XCTUnwrap(projected?[target.sessionID])
+        XCTAssertNil(inspection.manualOnlyReason, "decline and cancel keep the prompt answerable")
+        XCTAssertEqual(inspection.interaction?.options.map(\.label), ["decline", "cancel"])
+        let object = try XCTUnwrap(inspection.projectedObject())
+        XCTAssertEqual(object["respondable"], .bool(true))
+        XCTAssertEqual(object["manual_only_reason"], .null)
+
+        let sendTarget = try await authorizedTarget(bridge, operation: .monitorRespond, observer: observer, target: target)
+        let accept = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(restricted.id, ["response": .string("accept")])
+        )
+        XCTAssertEqual(accept, .responded(.manualOnly(.noOneTimeAllowOption)))
+        XCTAssertEqual(session.pendingApproval, restricted, "a refused accept applies nothing")
+        // Decline and cancel pass the observer policy and reach the ACP controller hop. This fixture
+        // has no live ACP process, so that hop reports `unavailable` rather than a manual-only refusal.
+        for decision in ["decline", "cancel"] {
+            let outcome = try await bridge.respondToInteraction(
+                target: sendTarget,
+                request: interactionRequest(restricted.id, ["response": .string(decision)])
+            )
+            XCTAssertEqual(outcome, .responded(.unavailable), "\(decision) must not be refused as manual-only")
+        }
+
+        let open = acpApproval("once", oneTimeAllowAvailable: true)
+        session.pendingApproval = open
+        let reprojected = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        XCTAssertEqual(reprojected?[target.sessionID]?.interaction?.options.map(\.label), ["accept", "decline", "cancel"])
+        XCTAssertNil(reprojected?[target.sessionID]?.manualOnlyReason)
+    }
+
     func testManagedRespondAnswersAMultipleChoiceQuestionAndKeepsSecretsAndHookTrustManual() async throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
@@ -1051,8 +1172,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observer: observer,
             target: target
         )
-        guard let inspections = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease]),
-              let inspection = inspections[target.sessionID],
+        let projected = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        guard let inspection = projected?[target.sessionID],
               let visible = inspection.interaction
         else { return XCTFail("Expected the pending question to be visible") }
         XCTAssertEqual(visible.kind, .question)
@@ -1095,26 +1216,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             details: []
         )
         XCTAssertEqual(viewModel.overseerManualOnlyReason(for: hook, session: session), .hookApproval)
-        let instruction = AgentRunMCPSnapshot.Interaction(
-            id: UUID(), kind: .instruction, responseType: .text, title: nil, prompt: nil,
-            context: nil, allowsMultiple: nil, options: [], fields: [], details: []
-        )
-        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: instruction, session: session), .instructionPrompt)
-        let acpApproval = AgentApprovalRequest(
-            requestID: .acp("request-1"), method: "session/request_permission", kind: .commandExecution,
-            threadID: "session", turnID: "turn", itemID: "tool",
-            overseerOneTimeAllowAvailable: false
-        )
-        session.pendingApproval = acpApproval
-        let acpInteraction = AgentRunMCPSnapshot.Interaction(
-            id: acpApproval.id, kind: .approval, responseType: .decision, title: nil, prompt: nil,
-            context: nil, allowsMultiple: nil, options: [], fields: [], details: []
-        )
-        XCTAssertEqual(
-            viewModel.overseerManualOnlyReason(for: acpInteraction, session: session),
-            .noOneTimeAllowOption
-        )
-        session.pendingApproval = nil
     }
 
     private func pollState(
@@ -3892,174 +3993,47 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
     }
 
-    // MARK: - Stop
-
-    func testInFlightStopUsesItsValidatedHostAcrossAttachmentRefresh() async throws {
-        enum Scenario: CaseIterable {
-            case stable, swapped, detachedAfterCommit, missingAtEntry, closing, rebound
-        }
-        for scenario in Scenario.allCases {
+    func testSetModelValidatesOriginalLeaseInsideHostHopWithoutCandidateSweep() async throws {
+        for revokeBeforeFence in [true, false] {
             let fixture = makeFixture()
-            defer { fixture.host.afterSendCommit = nil }
             _ = await addLink(fixture)
-            fixture.host.stopResult = .stopped
-            let runID = UUID()
-            fixture.host.currentStopRunID = runID
-            let authorized = await fixture.bridge.authorizeTarget(
-                operation: .monitorStop,
-                observerEndpoint: fixture.observer.domainEndpoint,
+            let resolved = await fixture.bridge.authorizeTarget(
+                operation: .monitorSetModel, observerEndpoint: fixture.observer.domainEndpoint,
                 targetSessionID: fixture.target.sessionID
             )
-            let target = try XCTUnwrap(authorized.success)
-            let replacement = FakeEndpointHost()
-            replacement.targetWindowIsClosing = true
-            switch scenario {
-            case .stable:
-                break
-            case .swapped:
-                fixture.host.afterSendCommit = { [bridge = fixture.bridge] in
-                    bridge.attach(host: replacement)
-                }
-            case .detachedAfterCommit:
-                fixture.host.afterSendCommit = { [bridge = fixture.bridge] in
-                    // The bridge's weak attachment becomes nil when this temporary host dies.
-                    bridge.attach(host: FakeEndpointHost())
-                }
-            case .missingAtEntry:
-                fixture.bridge.attach(host: FakeEndpointHost())
-            case .closing:
-                fixture.host.afterSendCommit = { fixture.host.targetWindowIsClosing = true }
-            case .rebound:
-                fixture.host.afterSendCommit = {
-                    fixture.host.candidates.removeAll { $0.domainEndpoint == fixture.target.domainEndpoint }
-                }
+            let target = try XCTUnwrap(resolved.success)
+            let referenceValue = await linkReference(fixture)
+            let reference = try XCTUnwrap(referenceValue)
+            let revoke: () async -> Void = {
+                _ = await fixture.authority.revoke(linkID: reference.linkID, generation: reference.generation, reason: .userRequested)
             }
-
-            let outcome = await fixture.bridge.stop(target: target, idempotencyKey: "host-refresh")
-            switch scenario {
-            case .stable, .swapped, .detachedAfterCommit:
-                guard case let .receipt(receipt) = outcome else {
-                    XCTFail("\(scenario): unchanged exact endpoints must survive attachment refresh: \(outcome)")
-                    continue
-                }
-                XCTAssertEqual(receipt.result, .stopped, "\(scenario)")
-                XCTAssertEqual(fixture.host.stoppedRunIDs, [runID], "\(scenario)")
-                XCTAssertEqual(fixture.host.stopLivenessReadings.count, 2, "\(scenario)")
-                XCTAssertTrue(fixture.host.stopLivenessReadings.allSatisfy(\.permitsDelivery), "\(scenario)")
-            case .missingAtEntry:
-                XCTAssertEqual(outcome, .rejected(.denied))
-                XCTAssertTrue(fixture.host.stopRequests.isEmpty)
-                XCTAssertTrue(fixture.host.stoppedRunIDs.isEmpty)
-            case .closing, .rebound:
-                XCTAssertEqual(outcome, .blocked(.endpointInvalidated), "\(scenario)")
-                XCTAssertEqual(fixture.host.stopLivenessReadings.count, 2, "\(scenario)")
-                XCTAssertTrue(fixture.host.stoppedRunIDs.isEmpty, "\(scenario)")
+            if revokeBeforeFence { fixture.host.beforeModelFence = revoke }
+            else { fixture.host.afterModelFence = revoke }
+            let reads = fixture.host.candidateReadCount
+            let result = await fixture.bridge.setModel(target: target, modelID: "claudeCode:test")
+            if revokeBeforeFence {
+                guard case .blocked(.linkRevoked) = result else { return XCTFail("Original lease must fail at final host hop") }
+            } else {
+                guard case .accepted = result else { return XCTFail("Already-authorized synchronous commit must settle") }
             }
-            XCTAssertTrue(replacement.stopRequests.isEmpty, "Never retarget Stop to the new attachment")
+            XCTAssertEqual(fixture.host.modelMutationCount, revokeBeforeFence ? 0 : 1)
+            XCTAssertEqual(fixture.host.candidateReadCount, reads, "set_model must use exact memory lookups, not sweep endpoints")
         }
     }
 
-    func testStopUsesOneTargetInvocationPerKeyAndReplaysStoredReceipt() async throws {
+    func testSetModelPostFenceEndpointReplacementCannotMutate() async throws {
         let fixture = makeFixture()
         _ = await addLink(fixture)
-        let authorized = await fixture.bridge.authorizeTarget(
-            operation: .monitorStop,
-            observerEndpoint: fixture.observer.domainEndpoint,
+        let resolved = await fixture.bridge.authorizeTarget(
+            operation: .monitorSetModel, observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: fixture.target.sessionID
         )
-        let target = try XCTUnwrap(authorized.success)
-        let first = await fixture.bridge.stop(target: target, idempotencyKey: "stop-once")
-        guard case let .receipt(receipt) = first else { return XCTFail("expected Stop receipt") }
-        XCTAssertEqual(receipt.result, .notRunning)
-        XCTAssertEqual(fixture.host.stopRequests.count, 1)
-        let replay = await fixture.bridge.stop(target: target, idempotencyKey: "stop-once")
-        guard case let .receipt(duplicate) = replay else { return XCTFail("expected duplicate receipt") }
-        XCTAssertTrue(duplicate.duplicate)
-        XCTAssertEqual(duplicate.requestID, receipt.requestID)
-        XCTAssertEqual(fixture.host.stopRequests.count, 1)
-        XCTAssertEqual(fixture.host.stopRequests.first?.1.observerDisplayName, "Planning")
-    }
-
-    func testTimedOutStopReceiptCannotRetargetASuccessorRunOnDuplicateKey() async throws {
-        let fixture = makeFixture()
-        _ = await addLink(fixture)
-        fixture.host.stopResult = .stopped
-        fixture.host.stopTeardownCompleted = false
-        let firstRunID = UUID()
-        fixture.host.currentStopRunID = firstRunID
-        let authorized = await fixture.bridge.authorizeTarget(
-            operation: .monitorStop,
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID
-        )
-        let target = try XCTUnwrap(authorized.success)
-        guard case let .receipt(first) = await fixture.bridge.stop(
-            target: target, idempotencyKey: "teardown-timeout"
-        ) else { return XCTFail("expected timeout receipt") }
-        XCTAssertEqual(first.result, .stopped)
-        XCTAssertEqual(first.teardownCompleted, false)
-
-        // The same endpoint now owns another run; replay must not invoke the host again.
-        let successorRunID = UUID()
-        fixture.host.currentStopRunID = successorRunID
-        fixture.host.stopTeardownCompleted = true
-        guard case let .receipt(replay) = await fixture.bridge.stop(
-            target: target, idempotencyKey: "teardown-timeout"
-        ) else { return XCTFail("expected retained receipt") }
-        XCTAssertTrue(replay.duplicate)
-        XCTAssertEqual(replay.requestID, first.requestID)
-        XCTAssertEqual(replay.teardownCompleted, false)
-        XCTAssertEqual(fixture.host.stopRequests.count, 1)
-        XCTAssertEqual(fixture.host.stoppedRunIDs, [firstRunID])
-        XCTAssertNotEqual(fixture.host.stoppedRunIDs.last, successorRunID)
-    }
-
-    func testStopRevokedBeforeAuthorityFenceNeverMutatesTarget() async throws {
-        let fixture = makeFixture()
-        _ = await addLink(fixture)
-        let authorized = await fixture.bridge.authorizeTarget(
-            operation: .monitorStop,
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID
-        )
-        let target = try XCTUnwrap(authorized.success)
-        let currentReference = await linkReference(fixture)
-        let reference = try XCTUnwrap(currentReference)
-        fixture.host.beforeSendCommit = {
-            _ = await fixture.bridge.stopMonitorLink(
-                observerEndpoint: fixture.observer.domainEndpoint,
-                targetEndpoint: fixture.target.domainEndpoint,
-                expectedReference: reference
-            )
+        let target = try XCTUnwrap(resolved.success)
+        fixture.host.afterModelFence = { fixture.host.candidates.removeAll { $0.sessionID == fixture.target.sessionID } }
+        guard case .blocked(.endpointInvalidated) = await fixture.bridge.setModel(target: target, modelID: "claudeCode:test") else {
+            return XCTFail("Endpoint lost during the final hop must fail closed")
         }
-        let result = await fixture.bridge.stop(target: target, idempotencyKey: "revoked-stop")
-        XCTAssertEqual(result, .blocked(.linkRevoked))
-        XCTAssertEqual(fixture.host.sendCommitOutcomes, [.linkRevoked])
-    }
-
-    func testStopRevokedAfterAuthorityFenceStillSettlesAdmittedRequest() async throws {
-        let fixture = makeFixture()
-        _ = await addLink(fixture)
-        let authorized = await fixture.bridge.authorizeTarget(
-            operation: .monitorStop,
-            observerEndpoint: fixture.observer.domainEndpoint,
-            targetSessionID: fixture.target.sessionID
-        )
-        let target = try XCTUnwrap(authorized.success)
-        let currentReference = await linkReference(fixture)
-        let reference = try XCTUnwrap(currentReference)
-        fixture.host.afterSendCommit = {
-            _ = await fixture.authority.revoke(
-                linkID: reference.linkID,
-                generation: reference.generation,
-                reason: .userRequested
-            )
-        }
-        let result = await fixture.bridge.stop(target: target, idempotencyKey: "revoke-after-fence")
-        guard case let .receipt(receipt) = result else { return XCTFail("committed Stop should finish") }
-        XCTAssertEqual(receipt.result, .notRunning)
-        XCTAssertEqual(fixture.host.sendCommitOutcomes, [.committed])
-        XCTAssertEqual(fixture.host.stopRequests.count, 1)
+        XCTAssertEqual(fixture.host.modelMutationCount, 0)
     }
 
     // MARK: - Compaction
@@ -4287,6 +4261,233 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(replay.duplicate)
         XCTAssertEqual(replay.deliveryState, .runStartFailed)
         XCTAssertEqual(fixture.host.sendRequests.count, 1)
+    }
+
+    // MARK: - Stop
+
+    func testInFlightStopUsesItsValidatedHostAcrossAttachmentRefresh() async throws {
+        enum Scenario: CaseIterable {
+            case stable, swapped, detachedAfterCommit, missingAtEntry, closing, rebound
+        }
+        for scenario in Scenario.allCases {
+            let fixture = makeFixture()
+            defer { fixture.host.afterSendCommit = nil }
+            _ = await addLink(fixture)
+            fixture.host.stopResult = .stopped
+            let runID = UUID()
+            fixture.host.currentStopRunID = runID
+            let authorized = await fixture.bridge.authorizeTarget(
+                operation: .monitorStop,
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetSessionID: fixture.target.sessionID
+            )
+            let target = try XCTUnwrap(authorized.success)
+            let replacement = FakeEndpointHost()
+            replacement.targetWindowIsClosing = true
+            switch scenario {
+            case .stable:
+                break
+            case .swapped:
+                fixture.host.afterSendCommit = { [bridge = fixture.bridge] in
+                    bridge.attach(host: replacement)
+                }
+            case .detachedAfterCommit:
+                fixture.host.afterSendCommit = { [bridge = fixture.bridge] in
+                    bridge.attach(host: FakeEndpointHost())
+                }
+            case .missingAtEntry:
+                fixture.bridge.attach(host: FakeEndpointHost())
+            case .closing:
+                fixture.host.afterSendCommit = { fixture.host.targetWindowIsClosing = true }
+            case .rebound:
+                fixture.host.afterSendCommit = {
+                    fixture.host.candidates.removeAll { $0.domainEndpoint == fixture.target.domainEndpoint }
+                }
+            }
+
+            let outcome = await fixture.bridge.stop(target: target, idempotencyKey: "host-refresh")
+            switch scenario {
+            case .stable, .swapped, .detachedAfterCommit:
+                guard case let .receipt(receipt) = outcome else {
+                    XCTFail("\(scenario): unchanged exact endpoints must survive attachment refresh: \(outcome)")
+                    continue
+                }
+                XCTAssertEqual(receipt.result, .stopped, "\(scenario)")
+                XCTAssertEqual(fixture.host.stoppedRunIDs, [runID], "\(scenario)")
+                XCTAssertEqual(fixture.host.stopLivenessReadings.count, 2, "\(scenario)")
+                XCTAssertTrue(fixture.host.stopLivenessReadings.allSatisfy(\.permitsDelivery), "\(scenario)")
+            case .missingAtEntry:
+                XCTAssertEqual(outcome, .rejected(.denied))
+                XCTAssertTrue(fixture.host.stopRequests.isEmpty)
+                XCTAssertTrue(fixture.host.stoppedRunIDs.isEmpty)
+            case .closing, .rebound:
+                XCTAssertEqual(outcome, .blocked(.endpointInvalidated), "\(scenario)")
+                XCTAssertEqual(fixture.host.stopLivenessReadings.count, 2, "\(scenario)")
+                XCTAssertTrue(fixture.host.stoppedRunIDs.isEmpty, "\(scenario)")
+            }
+            XCTAssertTrue(replacement.stopRequests.isEmpty, "Never retarget Stop to the new attachment")
+        }
+    }
+
+    func testStopUsesOneTargetInvocationPerKeyAndReplaysStoredReceipt() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let authorized = await fixture.bridge.authorizeTarget(
+            operation: .monitorStop,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(authorized.success)
+        let first = await fixture.bridge.stop(target: target, idempotencyKey: "stop-once")
+        guard case let .receipt(receipt) = first else { return XCTFail("expected Stop receipt") }
+        XCTAssertEqual(receipt.result, .notRunning)
+        XCTAssertEqual(fixture.host.stopRequests.count, 1)
+        let replay = await fixture.bridge.stop(target: target, idempotencyKey: "stop-once")
+        guard case let .receipt(duplicate) = replay else { return XCTFail("expected duplicate receipt") }
+        XCTAssertTrue(duplicate.duplicate)
+        XCTAssertEqual(duplicate.requestID, receipt.requestID)
+        XCTAssertEqual(fixture.host.stopRequests.count, 1)
+        XCTAssertEqual(fixture.host.stopRequests.first?.1.observerDisplayName, "Planning")
+    }
+
+    func testTimedOutStopReceiptCannotRetargetASuccessorRunOnDuplicateKey() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        fixture.host.stopResult = .stopped
+        fixture.host.stopTeardownCompleted = false
+        let firstRunID = UUID()
+        fixture.host.currentStopRunID = firstRunID
+        let authorized = await fixture.bridge.authorizeTarget(
+            operation: .monitorStop,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(authorized.success)
+        guard case let .receipt(first) = await fixture.bridge.stop(
+            target: target, idempotencyKey: "teardown-timeout"
+        ) else { return XCTFail("expected timeout receipt") }
+        XCTAssertEqual(first.result, .stopped)
+        XCTAssertEqual(first.teardownCompleted, false)
+
+        // The same endpoint now owns another run; replay must not invoke the host again.
+        let successorRunID = UUID()
+        fixture.host.currentStopRunID = successorRunID
+        fixture.host.stopTeardownCompleted = true
+        guard case let .receipt(replay) = await fixture.bridge.stop(
+            target: target, idempotencyKey: "teardown-timeout"
+        ) else { return XCTFail("expected retained receipt") }
+        XCTAssertTrue(replay.duplicate)
+        XCTAssertEqual(replay.requestID, first.requestID)
+        XCTAssertEqual(replay.teardownCompleted, false)
+        XCTAssertEqual(fixture.host.stopRequests.count, 1)
+        XCTAssertEqual(fixture.host.stoppedRunIDs, [firstRunID])
+        XCTAssertNotEqual(fixture.host.stoppedRunIDs.last, successorRunID)
+    }
+
+    func testStopRevokedBeforeAuthorityFenceNeverMutatesTarget() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let authorized = await fixture.bridge.authorizeTarget(
+            operation: .monitorStop,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(authorized.success)
+        let currentReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(currentReference)
+        fixture.host.beforeSendCommit = {
+            _ = await fixture.bridge.stopMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: fixture.target.domainEndpoint,
+                expectedReference: reference
+            )
+        }
+        let result = await fixture.bridge.stop(target: target, idempotencyKey: "revoked-stop")
+        XCTAssertEqual(result, .blocked(.linkRevoked))
+        XCTAssertEqual(fixture.host.sendCommitOutcomes, [.linkRevoked])
+    }
+
+    func testStopRevokedAfterAuthorityFenceStillSettlesAdmittedRequest() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let authorized = await fixture.bridge.authorizeTarget(
+            operation: .monitorStop,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(authorized.success)
+        let currentReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(currentReference)
+        fixture.host.afterSendCommit = {
+            _ = await fixture.authority.revoke(
+                linkID: reference.linkID,
+                generation: reference.generation,
+                reason: .userRequested
+            )
+        }
+        let result = await fixture.bridge.stop(target: target, idempotencyKey: "revoke-after-fence")
+        guard case let .receipt(receipt) = result else { return XCTFail("committed Stop should finish") }
+        XCTAssertEqual(receipt.result, .notRunning)
+        XCTAssertEqual(fixture.host.sendCommitOutcomes, [.committed])
+        XCTAssertEqual(fixture.host.stopRequests.count, 1)
+    }
+
+    func testIdleStopImmediatelyWithdrawsQueuedInboundSend() async throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 92,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: tabID, name: "Idle Stop target"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
+            tabID: tabID, sessionID: sessionID, tabName: "Target", isWindowClosing: false
+        ))
+        let observer = makeCandidate(windowID: 91, displayName: "Overseer")
+        let host = FakeEndpointHost()
+        host.candidates = [observer, target]
+        host.interactionViewModel = viewModel
+        host.routeStopToInteractionViewModel = true
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        let fixture = Fixture(
+            authority: AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority,
+            host: host, bridge: bridge, observer: observer, target: target,
+            advertisement: ToolAdvertisementRecorder()
+        )
+        guard case .added = await addLink(fixture) else { return XCTFail("Expected exact link") }
+        stageBusyTarget(fixture)
+        let queued = await queueSend(fixture)
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+        let pendingBeforeStop = await pendingSend(fixture)
+        XCTAssertNotNil(pendingBeforeStop?.pending)
+
+        let authorized = await bridge.authorizeTarget(
+            operation: .monitorStop,
+            observerEndpoint: observer.domainEndpoint,
+            targetSessionID: target.sessionID
+        )
+        let stopTarget = try XCTUnwrap(authorized.success)
+        guard case let .receipt(receipt) = await bridge.stop(
+            target: stopTarget, idempotencyKey: "idle-stop-withdraw"
+        ) else { return XCTFail("Expected idle Stop receipt") }
+        XCTAssertEqual(receipt.result, .notRunning)
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending, "Idle Stop must withdraw the queued send before returning")
+        XCTAssertEqual(projection?.lastResult?.outcome, .failed(.targetStopped))
+        XCTAssertEqual(host.sendRequests.count, 1, "Stop must not dispatch queued text")
     }
 
     // MARK: - Per-message workflow
@@ -6344,7 +6545,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let lane = prepareCreatedLane(fixture)
         stageReadyTarget(fixture)
-
         let created = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
@@ -6353,7 +6553,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(created.result, .created)
         XCTAssertEqual(created.firstTask, .delivered)
         XCTAssertEqual(fixture.host.sendRequests.first?.candidate.sessionID, lane.sessionID)
-
         let retired = await fixture.bridge.retireLane(
             observerEndpoint: fixture.observer.domainEndpoint,
             targetSessionID: lane.sessionID
@@ -6362,29 +6561,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let inbound = await fixture.authority.links(forTarget: lane.sessionID)
         XCTAssertTrue(inbound.items.isEmpty)
         XCTAssertFalse(fixture.host.candidates.contains(where: { $0.sessionID == lane.sessionID }))
-    }
-
-    func testLaneFirstTaskRetainsPreStopFenceAcrossLinkEstablishment() async throws {
-        let fixture = makeFixture()
-        try installLaneIntentStore(fixture)
-        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        let lane = prepareCreatedLane(fixture)
-        stageReadyTarget(fixture)
-        fixture.bridge.test_afterAddInsertionBeforeEstablishment = { pair in
-            guard pair.targetSessionID == lane.sessionID else { return }
-            fixture.host.invalidateStartStopFence()
-        }
-
-        let receipt = await createLane(
-            fixture,
-            observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "stopped-before-first-task", message: "Do not restart")
-        )
-        XCTAssertEqual(receipt.result, .created)
-        XCTAssertEqual(receipt.firstTask, .failed)
-        XCTAssertEqual(receipt.firstTaskReason, "target_stopped")
-        XCTAssertTrue(receipt.linked)
-        XCTAssertTrue(fixture.host.sendRequests.isEmpty, "The stale creation task must not reach a provider")
     }
 
     func testLaneFreezeDuringDurableCreationKeepsSessionButNeverAdds() async throws {

@@ -183,6 +183,14 @@ package actor DomainAgentSessionLinkAuthority {
     private var isShutDown = false
 
     private var links: [UUID: LinkRecord] = [:]
+    private struct AuthorizationKey: Hashable {
+        let observer: DomainAgentSessionLinkEndpointIdentity
+        let targetSessionID: UUID
+    }
+    // Derived at activation/revocation, never discovered during authorization. A duplicate pair
+    // fails closed until ordinary lifecycle removal resolves it.
+    private var authorizationLinks: [AuthorizationKey: Set<UUID>] = [:]
+    private var outboundLinksByEndpoint: [DomainAgentSessionLinkEndpointIdentity: Set<UUID>] = [:]
     private var pendingReservations: [UUID: DomainAgentSessionLinkPendingReservation] = [:]
     private var targets: [UUID: TargetRecord] = [:]
     /// Monotonic per-target-session change sequence that survives target record replacement.
@@ -410,6 +418,8 @@ package actor DomainAgentSessionLinkAuthority {
             capabilities: reservation.capabilities
         )
         links[grant.id] = LinkRecord(grant: grant, activationAuthorityRevision: revision)
+        authorizationLinks[AuthorizationKey(observer: grant.observer, targetSessionID: grant.target.sessionID), default: []].insert(grant.id)
+        outboundLinksByEndpoint[grant.observer, default: []].insert(grant.id)
 
         // The installer role belongs to the activation that actually creates the target record, not
         // to whichever reservation was provisionally elected. An elected reservation can be abandoned
@@ -673,13 +683,16 @@ package actor DomainAgentSessionLinkAuthority {
     package func hasActiveOutboundLink(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        links.values.contains { $0.grant.observer == observerEndpoint }
+        guard let id = outboundLinksByEndpoint[observerEndpoint]?.first,
+              let record = links[id] else { return false }
+        return record.grant.observer == observerEndpoint
     }
 
     package func hasActiveLink(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
-        links.values.contains { record in
-            record.grant.observer == endpoint || record.grant.target == endpoint
-        }
+        if hasActiveOutboundLink(observerEndpoint: endpoint) { return true }
+        guard let target = targets[endpoint.sessionID], target.endpoint == endpoint,
+              let id = target.inboundLinkIDs.first, let record = links[id] else { return false }
+        return record.grant.target == endpoint
     }
 
     /// Authorizes the fixed inverse attention signal from one exact target endpoint.
@@ -835,9 +848,10 @@ package actor DomainAgentSessionLinkAuthority {
         else {
             return .failure(.capabilityDenied)
         }
-        guard let record = links.values.first(where: {
-            $0.grant.observer == observerEndpoint && $0.grant.target.sessionID == targetSessionID
-        }) else {
+        let key = AuthorizationKey(observer: observerEndpoint, targetSessionID: targetSessionID)
+        guard let ids = authorizationLinks[key], ids.count == 1, let id = ids.first,
+              let record = links[id], record.grant.observer == observerEndpoint,
+              record.grant.target.sessionID == targetSessionID else {
             return .failure(.noActiveLink)
         }
         guard record.grant.capabilities.contains(capability) else {
@@ -893,9 +907,9 @@ package actor DomainAgentSessionLinkAuthority {
         return nil
     }
 
-    /// Atomically fences an observer-local batch before any pending prompt is projected. Every
-    /// watch lease must still be exact; only grants carrying Manage may disclose prompt bodies.
-    /// A revoked member denies the whole batch rather than releasing a sibling's prompt.
+    /// Fences an observer-local batch before pending prompt disclosure. Every observation lease
+    /// must still be exact; only grants with Manage may reveal a prompt body. A revoked member
+    /// denies the whole batch rather than releasing a surviving sibling's prompt.
     package func managedObservationTargetsIfValid(
         leases: [DomainAgentSessionLinkLease]
     ) -> Set<UUID>? {
@@ -1414,7 +1428,7 @@ package actor DomainAgentSessionLinkAuthority {
         return .reserved(reservation)
     }
 
-    /// Reserves a Manage-gated stop in the same link-generation ledger used by send and compact.
+    /// Reserves a Manage-gated stop in the same link-generation ledger used by send and steer.
     package func beginStop(
         lease: DomainAgentSessionLinkLease,
         idempotencyKey: String
@@ -1527,9 +1541,9 @@ package actor DomainAgentSessionLinkAuthority {
     /// that wins first is allowed to settle even if manual Stop follows; lifecycle invalidation may
     /// still abort it later because the endpoint no longer exists.
     ///
-    /// `requiresManagement` also checks Manage on the exact live grant. An existing restricted grant
-    /// is refused with nothing delivered and its uncommitted reservation released for retry. A
-    /// full-link revocation is reported separately by the link-liveness check above.
+    /// `requiresManagement` makes the user's management delegation part of the same fence: a managed
+    /// delivery whose delegation was withdrawn before this point is refused with nothing delivered,
+    /// and its uncommitted reservation is released so the key may be retried.
     package func commitSendAuthorization(
         reservation: DomainAgentSessionLinkSendReservation,
         linkGeneration: UInt64,
@@ -1764,7 +1778,14 @@ package actor DomainAgentSessionLinkAuthority {
 
         for linkID in linkIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
             guard let record = links.removeValue(forKey: linkID) else { continue }
+            let key = AuthorizationKey(observer: record.grant.observer, targetSessionID: record.grant.target.sessionID)
+            authorizationLinks[key]?.remove(linkID)
+            if authorizationLinks[key]?.isEmpty == true { authorizationLinks.removeValue(forKey: key) }
             let grant = record.grant
+            outboundLinksByEndpoint[grant.observer]?.remove(linkID)
+            if outboundLinksByEndpoint[grant.observer]?.isEmpty == true {
+                outboundLinksByEndpoint.removeValue(forKey: grant.observer)
+            }
             touchedObservers.insert(grant.observer.sessionID)
             touchedTargets.insert(grant.target.sessionID)
             // Captured before teardown so the last inbound revocation still names its target.
@@ -1904,6 +1925,8 @@ package actor DomainAgentSessionLinkAuthority {
         }
         isShutDown = true
         links.removeAll()
+        authorizationLinks.removeAll()
+        outboundLinksByEndpoint.removeAll()
         pendingReservations.removeAll()
         targets.removeAll()
         nextChangeSequenceBySession.removeAll()

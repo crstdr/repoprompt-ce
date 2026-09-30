@@ -47,11 +47,12 @@ extension AgentModeViewModel {
             pendingACPSteeringCount: session.pendingACPSteeringInstructions.count,
             pendingClaudeSteeringCount: session.pendingClaudeSteeringInstructions.count,
             pendingOversightAutoWake: session.oversight.pendingAutoWake != nil,
-            stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
-            compactionSettling: session.isACPCompactSettling()
-                || session.selfCompactState.active?.phase == .acpSettling,
             pendingSelfCompact: session.selfCompactState.blocksOverseerDelivery
                 && session.selfCompactState.active?.id != ignoresSelfCompactRequestID,
+            selfCompactBlocksManagedStop: session.selfCompactState.blocksManagedStop
+                && session.selfCompactState.active?.id != ignoresSelfCompactRequestID,
+            stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
+            backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,
             hasPendingUserInputRequest: session.pendingUserInputRequest != nil,
@@ -97,7 +98,13 @@ extension AgentModeViewModel {
         guard let session = agentSessionLinkLiveSession(matching: candidate) else {
             return .blocked(.endpointSession)
         }
-        let stopFence = request.startStopFence ?? AgentRunStartStopFence(session: session)
+        // A queued send is withdrawn only by an explicit Stop since it was queued; internal
+        // lifecycle cancellations must not drop it. The transaction's own start fence is taken
+        // now, so a cancellation during the drain still downgrades dispatch to persisted-only.
+        if let queuedFence = request.startStopFence, !queuedFence.permitsQueuedDelivery(to: session) {
+            return .blocked(.targetStopped)
+        }
+        let stopFence = AgentRunStartStopFence(session: session)
         guard stopFence.permitsStart(of: session) else { return .blocked(.targetStopped) }
         let admissionLiveness = liveness()
         guard admissionLiveness.permitsDelivery else {
@@ -105,7 +112,7 @@ extension AgentModeViewModel {
         }
 
         // 2. Pure readiness admission.
-        if let failure = AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
+        if let failure = AgentSessionLinkDeliveryReadiness.failure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: admissionLiveness.targetEndpointIsLive,
@@ -168,7 +175,7 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointClaim)
         }
-        if let failure = AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
+        if let failure = AgentSessionLinkDeliveryReadiness.failure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: postCommitLiveness.targetEndpointIsLive,
@@ -277,7 +284,7 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
-        if AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(
+        if AgentSessionLinkDeliveryReadiness.failure(
             snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,

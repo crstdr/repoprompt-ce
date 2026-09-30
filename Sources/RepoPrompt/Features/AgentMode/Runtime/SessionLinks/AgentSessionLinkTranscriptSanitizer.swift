@@ -297,7 +297,7 @@ enum AgentSessionLinkTextRedactor {
     private static let rules: [Rule] = {
         let specs: [(pattern: String, template: String)] = [
             // `Authorization: Bearer …` / `Authorization: Basic …` headers in pasted logs.
-            (#"(?i)\b(authorization\s*[:=]\s*)(?:bearer|basic|token)?\s*\S+"#, "$1\(placeholder)"),
+            (#"(?i)\b(authorization\s*+[:=]\s*+)(?:(?:bearer|basic|token)\s*+)?\S+"#, "$1\(placeholder)"),
             // Bare credential schemes.
             (#"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"#, "$1 \(placeholder)"),
             // `api_key = "…"`, `OPENAI_TOKEN=…`, `secret=…`, `password: …`, and JSON field forms.

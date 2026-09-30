@@ -146,6 +146,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .monitorWait: .wait,
             .monitorRead: .read,
             .monitorSend: .sendWhenIdle,
+            .monitorCompact: .sendWhenIdle,
             // Observer-local admission policy, so it needs the read grant it already holds over the
             // lane and nothing stronger.
             .monitorSnoozeAutoWake: .poll,
@@ -153,10 +154,8 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .monitorRespond: .manage,
             .monitorSteer: .manage,
             .monitorStop: .manage,
-            .monitorRetireLane: .manage,
-            // A compaction starts a provider turn on an idle target exactly as a send does, so it
-            // needs the send grant and nothing new.
-            .monitorCompact: .sendWhenIdle
+            .monitorSetModel: .manage,
+            .monitorRetireLane: .manage
         ]
         for operation in targetBearingMonitorOperations {
             guard let capability = expected[operation] else {
@@ -242,7 +241,8 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             "a targetless operation must not demand an arbitrary target's capability"
         )
         for operation in DomainAgentSessionTargetOperation.allCases
-            where operation != .monitorList && operation != .monitorCreateLane {
+            where operation != .monitorList && operation != .monitorCreateLane
+        {
             XCTAssertFalse(operation.isObserverScoped, "\(operation.rawValue)")
         }
     }
@@ -338,14 +338,18 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
                 "agent_session_link.list", "agent_session_link.poll", "agent_session_link.wait",
                 "agent_session_link.read", "agent_session_link.send",
                 "agent_session_link.create_lane", "agent_session_link.retire_lane",
-                "agent_session_link.snooze_auto_wake",
+                "agent_session_link.snooze_auto_wake", "agent_session_link.compact",
                 "agent_session_link.respond",
-                "agent_session_link.steer", "agent_session_link.stop", "agent_session_link.compact"
+"agent_session_link.steer", "agent_session_link.stop", "agent_session_link.set_model"
             ]
         )
         for operation in sessionControlOperations where operation.requiredMonitorCapability != nil {
             XCTFail("control operations must never carry an oversight capability: \(operation.rawValue)")
         }
+        XCTAssertTrue(DomainAgentSessionTargetOperation.monitorCompact.mutatesTarget)
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorCompact.isObserverScoped)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorCompact.requiredMonitorCapability, .sendWhenIdle)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorCompact.family, .monitor)
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorSend.mutatesTarget)
         XCTAssertFalse(DomainAgentSessionTargetOperation.monitorRead.mutatesTarget)
         XCTAssertFalse(DomainAgentSessionTargetOperation.monitorPoll.isObserverScoped)
@@ -377,15 +381,10 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             DomainAgentSessionLinkCapability.managed,
             DomainAgentSessionLinkCapability.version1.union([.manage])
         )
-        // Compaction mutates the target's provider context, is target-scoped, and borrows the send
-        // grant rather than introducing a new capability.
+        // Managed Stop mutates one exact target under the Manage grant.
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorStop.mutatesTarget)
         XCTAssertFalse(DomainAgentSessionTargetOperation.monitorStop.isObserverScoped)
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorStop.requiredMonitorCapability, .manage)
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorStop.family, .monitor)
-        XCTAssertTrue(DomainAgentSessionTargetOperation.monitorCompact.mutatesTarget)
-        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorCompact.isObserverScoped)
-        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorCompact.requiredMonitorCapability, .sendWhenIdle)
-        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorCompact.family, .monitor)
     }
 }

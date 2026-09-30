@@ -2,8 +2,7 @@ import Foundation
 @testable import RepoPromptDomainRuntime
 import XCTest
 
-/// The default managed grant and the still-valid restricted internal grant use the same exact-link
-/// authority. Changing the creation default must not promote an existing in-memory lease.
+/// New grants are managed, while exact-grant fences still reject restricted and revoked links.
 final class DomainAgentSessionLinkManagementTests: XCTestCase {
     private enum FixtureError: Error {
         case reservationFailed
@@ -41,11 +40,7 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
         restrictedCapabilities: Set<DomainAgentSessionLinkCapability>? = nil
     ) async throws -> DomainAgentSessionLinkGrant {
         let disposition: DomainAgentSessionLinkReservationDisposition = if let restrictedCapabilities {
-            await authority.reserveLink(
-                observer: observer,
-                target: target,
-                capabilities: restrictedCapabilities
-            )
+            await authority.reserveLink(observer: observer, target: target, capabilities: restrictedCapabilities)
         } else {
             await authority.reserveLink(observer: observer, target: target)
         }
@@ -70,35 +65,32 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
         return activated.grant
     }
 
-    func testAtomicObservationBatchSeparatesManagedAndRestrictedGrantsAndDeniesRevocation() async throws {
+    func testSetModelOriginalManageLeaseCannotSurviveRevokeRelinkOrAuthorizeWatchOnly() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint(windowID: 1)
-        let managedTarget = makeEndpoint(windowID: 2)
-        let restrictedTarget = makeEndpoint(windowID: 3)
-        _ = try await activateLink(authority, observer: observer, target: managedTarget)
-        let restricted = try await activateLink(
-            authority, observer: observer, target: restrictedTarget,
+        let target = makeEndpoint(windowID: 2)
+        let grant = try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: .monitorSetModel, observerEndpoint: observer, targetSessionID: target.sessionID
+        ).get()
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorSetModel.family, .monitor)
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorSetModel.isObserverScoped)
+        XCTAssertTrue(DomainAgentSessionTargetOperation.monitorSetModel.mutatesTarget)
+        let initial = await authority.validate(lease: lease)
+        XCTAssertNil(initial)
+        _ = await authority.revoke(linkID: grant.id, generation: grant.generation, reason: .userRequested)
+        _ = try await activateLink(
+            authority,
+            observer: observer,
+            target: target,
             restrictedCapabilities: DomainAgentSessionLinkCapability.version1
         )
-        let managedLease = try await authority.authorize(
-            operation: .monitorPoll, observerEndpoint: observer,
-            targetSessionID: managedTarget.sessionID
-        ).get()
-        let restrictedLease = try await authority.authorize(
-            operation: .monitorPoll, observerEndpoint: observer,
-            targetSessionID: restrictedTarget.sessionID
-        ).get()
-        let before = await authority.managedObservationTargetsIfValid(
-            leases: [managedLease, restrictedLease]
+        let stale = await authority.validate(lease: lease)
+        XCTAssertNotNil(stale)
+        let restricted = await authority.authorize(
+            operation: .monitorSetModel, observerEndpoint: observer, targetSessionID: target.sessionID
         )
-        XCTAssertEqual(before, [managedTarget.sessionID])
-        _ = await authority.revoke(
-            linkID: restricted.id, generation: restricted.generation, reason: .userRequested
-        )
-        let after = await authority.managedObservationTargetsIfValid(
-            leases: [managedLease, restrictedLease]
-        )
-        XCTAssertNil(after, "one revoked member must withhold the managed sibling's prompt")
+        XCTAssertEqual(restricted, .failure(.capabilityDenied))
     }
 
     func testNewGrantsStartManagedAndKeepWatchOperationsAvailable() async throws {
@@ -108,7 +100,7 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
         let grant = try await activateLink(authority, observer: observer, target: target)
 
         XCTAssertEqual(grant.capabilities, DomainAgentSessionLinkCapability.managed)
-        for operation in [DomainAgentSessionTargetOperation.monitorRespond, .monitorSteer] {
+        for operation in [DomainAgentSessionTargetOperation.monitorRespond, .monitorSteer, .monitorSetModel] {
             let lease = try await authority.authorize(
                 operation: operation,
                 observerEndpoint: observer,
@@ -116,12 +108,12 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
             ).get()
             XCTAssertEqual(lease.capability, .manage, operation.rawValue)
         }
-        let compact = try await authority.authorize(
-            operation: .monitorCompact,
+        let watchLease = try await authority.authorize(
+            operation: .monitorPoll,
             observerEndpoint: observer,
             targetSessionID: target.sessionID
         ).get()
-        XCTAssertEqual(compact.capability, .sendWhenIdle, "compact remains watch-level")
+        XCTAssertEqual(watchLease.capability, .poll)
         let inventory = await authority.links(forObserverEndpoint: observer)
         XCTAssertEqual(inventory.items.first?.capabilityNames, ["manage", "poll", "read", "send_when_idle", "wait"])
     }
@@ -142,19 +134,13 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
             observerEndpoint: observer,
             targetSessionID: target.sessionID
         )
-        guard case let .failure(denial) = denied else { return XCTFail("Restricted grant authorized respond") }
-        XCTAssertEqual(denial, .capabilityDenied)
-        let compact = try await authority.authorize(
-            operation: .monitorCompact,
-            observerEndpoint: observer,
-            targetSessionID: target.sessionID
-        ).get()
-        XCTAssertEqual(compact.capability, .sendWhenIdle)
+        guard case let .failure(reason) = denied else { return XCTFail("Restricted grant authorized respond") }
+        XCTAssertEqual(reason, .capabilityDenied)
 
         let repeated = await authority.reserveLink(observer: observer, target: target)
         guard case let .existing(existing) = repeated else { return XCTFail("Expected existing grant") }
         XCTAssertEqual(existing.id, grant.id)
-        XCTAssertEqual(existing.capabilities, DomainAgentSessionLinkCapability.version1, "no live upgrade of an existing lease")
+        XCTAssertEqual(existing.capabilities, DomainAgentSessionLinkCapability.version1)
     }
 
     func testManagedAuthorityRequiresExactObserverAndFreshGeneration() async throws {
@@ -173,17 +159,15 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
             observerEndpoint: otherObserver,
             targetSessionID: target.sessionID
         )
-        guard case .failure = foreign else {
-            return XCTFail("UUID knowledge is not an exact direct grant")
-        }
+        guard case .failure = foreign else { return XCTFail("UUID knowledge is not an exact direct grant") }
 
         _ = await authority.revoke(linkID: grant.id, generation: grant.generation, reason: .userRequested)
         let revokedLeaseError = await authority.validate(lease: lease)
-        XCTAssertNotNil(revokedLeaseError, "revocation invalidates issued leases")
+        XCTAssertNotNil(revokedLeaseError, "Revocation invalidates issued leases")
         let replacement = try await activateLink(authority, observer: observer, target: target)
         XCTAssertNotEqual(replacement.id, grant.id)
-        XCTAssertEqual(replacement.capabilities, DomainAgentSessionLinkCapability.managed, "a new generation receives the new default")
+        XCTAssertEqual(replacement.capabilities, DomainAgentSessionLinkCapability.managed)
         let staleLeaseError = await authority.validate(lease: lease)
-        XCTAssertNotNil(staleLeaseError, "a stale generation cannot resurrect")
+        XCTAssertNotNil(staleLeaseError, "A stale generation cannot resurrect")
     }
 }

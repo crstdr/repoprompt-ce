@@ -375,6 +375,34 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
 
     // MARK: - Management delegation
 
+    func agentSessionLinkModelAvailability(windowID: Int) -> AgentModelCatalog.AvailabilityContext {
+        guard let window = modelRoutingWindow(withID: windowID) else { return .none }
+        return window.apiSettingsViewModel.agentAvailability
+    }
+
+    func agentSessionLinkModelCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkEndpointCandidate? {
+        guard let window = modelRoutingWindow(withID: endpoint.windowID) else { return nil }
+        return window.agentModeViewModel.agentSessionLinkModelCandidate(for: endpoint)
+    }
+
+    func agentSessionLinkPerformSetModel(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        modelID: String,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkModelOutcome {
+        guard !isTerminating else { return .blocked(.shuttingDown) }
+        guard let window = modelRoutingWindow(withID: candidate.windowID) else {
+            return .blocked(.endpointHost)
+        }
+        return await window.agentModeViewModel.agentSessionLinkPerformSetModel(
+            to: candidate, modelID: modelID, liveness: liveness,
+            availability: { window.apiSettingsViewModel.agentAvailability }, reauthorize: reauthorize
+        )
+    }
+
     /// Routes one managed steer to the exact owning window, refusing during teardown before any
     /// target state is touched. Nothing here focuses or activates the window.
     func agentSessionLinkPerformSteer(
@@ -418,25 +446,6 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         )
     }
 
-    /// Routes compaction to the exact owning window without focusing or activating it.
-    func agentSessionLinkPerformCompact(
-        to candidate: AgentSessionLinkEndpointCandidate,
-        request: AgentSessionLinkCompactRequest,
-        liveness: @escaping AgentSessionLinkSendLivenessProbe,
-        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
-    ) async -> AgentSessionLinkSendTransactionOutcome {
-        guard !isTerminating else { return .blocked(.shuttingDown) }
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .blocked(.endpointHost)
-        }
-        return await window.agentModeViewModel.agentSessionLinkPerformCompact(
-            to: candidate,
-            request: request,
-            liveness: liveness,
-            commitAuthorization: commitAuthorization
-        )
-    }
-
     /// Routes a read-only interaction inspection to the exact owning window. Never focuses it.
     func agentSessionLinkPendingInteraction(
         for candidate: AgentSessionLinkEndpointCandidate
@@ -462,6 +471,26 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
             for: candidate,
             request: request,
             authorize: authorize
+        )
+    }
+
+    /// Routes the compaction transaction to the exact owning window, with the same terminating and
+    /// closing refusals as a send. Nothing here focuses or activates the window.
+    func agentSessionLinkPerformCompact(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkCompactRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome {
+        guard !isTerminating else { return .blocked(.shuttingDown) }
+        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+            return .blocked(.endpointHost)
+        }
+        return await window.agentModeViewModel.agentSessionLinkPerformCompact(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            commitAuthorization: commitAuthorization
         )
     }
 

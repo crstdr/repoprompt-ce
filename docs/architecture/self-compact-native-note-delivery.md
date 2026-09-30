@@ -1,12 +1,10 @@
 # Native self-compaction continuation boundary
 
-The `feat/self-compact` branch exposes the self-only `agent_self` MCP tool and supports native Claude, Codex, and advertised ACP compaction. The tool cannot name another session; only the calling run attempt may reserve a request.
+Agent Mode exposes the self-only `agent_self` MCP tool and supports native Claude, Codex, and advertised ACP compaction. The tool cannot name another session; only the calling run attempt may reserve a request.
 
 Claude and Codex command turns are correlated to the request ID and originating provider run attempt before the compact RPC. Only a successful terminal completion of that exact Claude command turn, or a successful correlated Codex `.compact` turn, permits a dedicated continuation-note turn. A session-owned 300-second monotonic deadline settles missing completion as `completion_unverified`; a late event cannot restart delivery. The deadline uses an injected sleeper in tests.
 
 The note turn carries a fixed provenance envelope and the validated note body verbatim (at most 8,192 UTF-8 bytes). The note is never placed in a provider-replayed `.system` row. It bypasses user augmentation, initial-thread context, staged handoff, oversight supplements, composer attachments, and workflow selection. Its immutable `{requestID, stage}` identity reaches the final provider submission. A successful Claude `sendUserMessage` return or Codex direct `turn/start` receipt is acceptance; an error after entering transport is `delivery_unknown` and is never retried automatically. A definitive non-attempt may park the note for the next ordinary input; that input consumes it only at its own physical acceptance seam. Codex notes cannot enter the queued-fallback or fresh-thread paths.
-
-ACP keeps two independent settle clocks: the dispatch-relative `acpCompactSettling` marker protects provider-side background compaction, while self-compaction's post-instant-return `.acpSettling` phase decides whether to deliver or park its note. Managed cross-session delivery reports `compaction_settling` while either is active; local sends and steers are not gated by them.
 
 An ordinary input accepted after compact dispatch may supersede the maintenance sequence and carry the parked note. This is a deliberately narrower guarantee than automatic continuation: the input can interrupt a compact command, but RepoPrompt does not manufacture a second competing prompt. A stale binding cancels rather than sending into a replacement incarnation. Restored attempts remain passive recovery data.
 

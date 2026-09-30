@@ -490,6 +490,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var agentSessionLinkPersistedSubagentWorkspaceID: UUID?
     var agentSessionLinkSubagentRefreshGeneration: UInt64 = 0
     var agentSessionLinkChildRunSubscriptions: [UUID: AnyCancellable] = [:]
+
+    /// Cache-first durable child metadata for the lane-board census: the in-memory metadata index, or
+    /// one index-file read on a cold cache. Never backfills or reconciles; `nil` means unavailable.
+    /// Replaceable in tests.
+    var agentSessionLinkPersistedSubagentMetaLoader: @MainActor (WorkspaceModel) async -> [AgentSessionMeta]? = { workspace in
+        guard let result = try? await AgentSessionDataService.shared.fastMetadataRecordsIfAvailable(for: workspace)
+        else { return nil }
+        return result.records.map { $0.agentSessionMeta() }
+    }
+
     let agentSessionLinkSubagentCensusChanged = PassthroughSubject<Set<UUID>, Never>()
 
     private var provisionalParentSessionIDBySessionID: [UUID: UUID] = [:]
@@ -747,7 +757,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
 
-    private var isRestoringState = false
+    var isRestoringState = false
     private var activeUISyncSuppressionDepth = 0
     private var isActiveUISyncSuppressed: Bool {
         activeUISyncSuppressionDepth > 0
@@ -3304,8 +3314,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     await self?.signalMCPInstructionDelivered(for: session)
                 }
             ),
-            prepareForCancellation: { [weak self] session, intent in
-                self?.prepareAgentRunCancellation(session: session, intent: intent)
+            prepareForCancellation: { [weak self] session, intent, origin in
+                self?.prepareAgentRunCancellation(session: session, intent: intent, origin: origin)
             }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
@@ -4353,7 +4363,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         if session.runState.isActive {
                             await cancelAgentRun(
                                 tabID: session.tabID,
-                                completion: .terminalTeardownCompleted
+                                completion: .terminalTeardownCompleted,
+                                origin: .internalLifecycle
                             )
                         }
                         await session.disposeProviderIfPresent()
@@ -4401,7 +4412,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cancelPendingInstruction(for: session)
         await teardownMCPControl(for: session, cleanupSessionStore: true)
         if session.runState.isActive {
-            await cancelAgentRun(tabID: session.tabID)
+            await cancelAgentRun(tabID: session.tabID, origin: .internalLifecycle)
         }
         await cleanupACPStateForDeletedSession(session)
         await session.disposeProviderIfPresent()
@@ -6312,7 +6323,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func handleObservedMCPStateChange(for session: TabSession) {
+    func handleObservedMCPStateChange(for session: TabSession) {
         guard !session.terminalCommitInProgress else { return }
         // Terminal waiter publication is owned exclusively by AgentRunTerminalCommitBarrier.
         // Legacy/special-purpose state changes without a canonical revision must not race it.
@@ -9362,9 +9373,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         session.selectedAgent = normalized.agent
         session.selectedModelRaw = normalized.modelRaw
-        if normalized.agent == .claudeCode {
-            // A reused MCP tab must not turn an earlier selection into an implicit
-            // Claude pin when this request did not specify an effort.
+        if normalized.agent.usesClaudeNativeRuntime {
+            // All native providers preserve an explicit pin and clear a previous/inherited pin
+            // when this request omits effort, symmetrically with the normalization exemption below.
             session.selectedReasoningEffortRaw = reasoningEffortRaw
         } else if let reasoningEffortRaw {
             session.selectedReasoningEffortRaw = reasoningEffortRaw
@@ -9375,8 +9386,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // MCP-controlled session (sub-agent or top-level).
         _ = refreshMCPPermissionProfileIfNeeded(for: session)
         // Codex normalization clears reasoning effort for every non-Codex provider.
-        // Claude MCP effort is a separate session pin and must survive configuration.
-        if session.selectedAgent != .claudeCode {
+        // Native MCP effort is a separate session pin and must survive configuration, including
+        // explicit overseer lane selections for compatible native agents.
+        if !session.selectedAgent.usesClaudeNativeRuntime {
             codexCoordinator.normalizeCodexSelectionForSession(
                 session,
                 preservingExplicitEffort: reasoningEffortRaw != nil
@@ -14335,7 +14347,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // mutations during the suspensions cannot invalidate it, and
         // cancelAgentRun(tabID:) re-resolves the live map by tab ID.
         for session in sessions.values where session.runState.isActive {
-            await cancelAgentRun(tabID: session.tabID)
+            await cancelAgentRun(tabID: session.tabID, origin: .internalLifecycle)
         }
         // Ownership-transfer slice: from finalize through scheduleBackgroundCleanup
         // this must stay one uninterrupted main-actor region with no await, so a
@@ -16489,7 +16501,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
             return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
         }
-        if session.stopState.isStopping(binding: session.persistentSessionBindingIdentity) {
+        if session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
+           !retireTimedOutManagedStopIfEligible(session)
+        {
             return .blocked(message: "Stopping this run…")
         }
         if session.selectedAgent == .codexExec, CodexManagedSessionFence.shared.isFenced {
@@ -16587,6 +16601,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
             Self.logCodexDebug("[AgentModeVM][RunID] deferring send until hydration completes for tab \(tabID)")
+            agentSelfCompactCancelForAcceptedLocalInput(session)
             let stopFence = AgentRunStartStopFence(session: session)
             let originalBinding = session.persistentSessionBindingIdentity
             Task { [weak self] in
@@ -17571,7 +17586,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         restoreIfStopped()
                         return
                     }
-                    await cancelAgentRun(tabID: tabID)
+                    await cancelAgentRun(tabID: tabID, origin: .internalLifecycle)
                     #if DEBUG
                         await test_afterClaudeAttachmentSelfCancel?()
                     #endif
@@ -19927,19 +19942,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Callers that destroy provider-owned infrastructure can explicitly await terminal teardown.
     func cancelAgentRun(
         tabID: UUID,
-        completion: AgentModeRunService.CancellationCompletion = .terminalPublished
+        completion: AgentModeRunService.CancellationCompletion = .terminalPublished,
+        origin: AgentModeRunService.CancellationOrigin = .explicitStop
     ) async {
         guard let session = sessions[tabID] else { return }
-        if !session.runState.isActive,
-           session.stopState.forceRetireUnclaimedStop(
-               binding: session.persistentSessionBindingIdentity,
-               runIsTerminal: session.runState.isTerminalForCommit
-           )
-        {
-            session.noteMonitorObservationInputsChanged()
-            requestUIRefresh(tabID: tabID, urgent: true)
-        }
-        await runService.cancelRun(tabID: tabID, session: session, completion: completion)
+        retireTimedOutManagedStopIfEligible(session)
+        await runService.cancelRun(tabID: tabID, session: session, completion: completion, origin: origin)
+    }
+
+    /// Releases a managed-Stop gate whose cleanup never started, or whose started teardown
+    /// outlived its deadline after the run already settled. Never retires an executing
+    /// cleanup inside its deadline. Shared by every local Stop surface and local submission,
+    /// because a settled run no longer shows a Stop control.
+    @discardableResult
+    func retireTimedOutManagedStopIfEligible(_ session: TabSession) -> Bool {
+        guard !session.runState.isActive,
+              session.stopState.forceRetireUnclaimedStop(
+                  binding: session.persistentSessionBindingIdentity,
+                  runIsTerminal: session.runState.isTerminalForCommit
+              )
+        else { return false }
+        session.noteMonitorObservationInputsChanged()
+        requestUIRefresh(tabID: session.tabID, urgent: true)
+        return true
     }
 
     /// Routes a managed Stop through the same user-Stop spine for the exact admitted object.
@@ -19955,6 +19980,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session: session,
             intent: .userStop,
             completion: .terminalTeardownCompleted,
+            origin: .explicitStop,
             admission: admission,
             outcomeRecorder: outcomeRecorder
         )
@@ -19993,12 +20019,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             resyncAfterRejectedCancelTarget(target)
             return false
         }
+        retireTimedOutManagedStopIfEligible(session)
         if let rejectionReason = cancelTargetRejectionReason(target, session: session) {
             logRejectedCancelTarget(target, session: session, reason: rejectionReason)
             resyncAfterRejectedCancelTarget(target)
             return false
         }
-        await runService.cancelRun(tabID: target.tabID, session: session, completion: completion)
+        await runService.cancelRun(
+            tabID: target.tabID, session: session, completion: completion, origin: .explicitStop
+        )
         return true
     }
 
@@ -20976,13 +21005,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func prepareAgentRunCancellation(
         session: TabSession,
-        intent: DomainAgentRunCancellationIntent
+        intent: DomainAgentRunCancellationIntent,
+        origin: AgentModeRunService.CancellationOrigin
     ) {
         cancelPendingInstruction(for: session)
+        // Every cancellation fences this session's own deferred starts.
         session.stopState.invalidateScheduledStarts()
-        guard intent == .userStop else { return }
-        agentSelfCompactCancelForUserStop(session)
-        withdrawQueuedWorkForManagedStop(session: session)
+        // Overseer-facing withdrawal belongs to an explicit user or managed Stop only.
+        guard intent == .userStop, origin == .explicitStop else { return }
+        session.stopState.invalidateQueuedDeliveries()
         session.mcpFollowUpRunPending = false
         agentSessionLinkRetractAutoWakeForUserStop(session)
         if let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID) {
