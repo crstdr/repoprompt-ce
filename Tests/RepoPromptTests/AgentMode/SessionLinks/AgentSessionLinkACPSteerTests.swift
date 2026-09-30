@@ -761,13 +761,32 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             XCTAssertGreaterThan(bridge.captureWaitInput(for: endpoint).generation, before.generation)
         }
         defer { fixture.viewModel.test_beforeACPToolIdleWait = nil }
+        // Another MCP dispatch can be awaiting its acknowledgement; this is still local input.
+        fixture.session.isMCPInstructionDispatchInProgress = true
         let submitted = fixture.viewModel.submitUserTurn(text: "accepted local input", tabID: fixture.session.tabID)
+        fixture.session.isMCPInstructionDispatchInProgress = false
         guard case .submitted = submitted else { return XCTFail("Expected accepted composer input") }
         let after = bridge.captureWaitInput(for: endpoint)
         XCTAssertEqual(after.generation, before.generation + 1)
         let outcome = await steer(fixture, request: request("managed input"))
         guard case .delivered = outcome else { return XCTFail("Expected delivered managed input") }
         XCTAssertEqual(bridge.captureWaitInput(for: endpoint), after)
+    }
+
+    func testDeferredMCPInputDoesNotBecomeLocalAfterItsDispatchScopeEnds() async throws {
+        let fixture = try await makeFixture()
+        let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.session.tabID))
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        let before = bridge.captureWaitInput(for: endpoint)
+        await fixture.viewModel.submitUserTurnAfterHydration(
+            tabID: fixture.session.tabID, originalSession: fixture.session,
+            originalBinding: fixture.session.persistentSessionBindingIdentity,
+            trimmedText: "deferred MCP input", attachmentsToSend: [], taggedFilesToSend: [],
+            activeWorkflow: nil, stopFence: AgentRunStartStopFence(session: fixture.session),
+            isLocalComposerInput: false
+        )
+        XCTAssertTrue(fixture.session.items.contains { $0.text == "deferred MCP input" })
+        XCTAssertEqual(bridge.captureWaitInput(for: endpoint), before)
     }
 
     func testInputAcceptedDuringReleaseBarrierMustAlsoFinishBeforeDrain() async throws {

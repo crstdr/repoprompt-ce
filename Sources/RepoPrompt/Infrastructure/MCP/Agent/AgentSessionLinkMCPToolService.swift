@@ -882,9 +882,13 @@ struct AgentSessionLinkMCPToolService {
             )
             if waitResult.interruptedByLocalInput {
                 let survivors = await bridge.terminalWaitSurvivingStates(leases: leases)
-                return AgentSessionLinkResponseRenderer.waitValue(
+                let rendered = AgentSessionLinkResponseRenderer.waitValue(
                     .init(outcome: .cancelled, targets: survivors, interruptedByLocalInput: true),
                     isSingle: isSingle
+                )
+                let survivingIDs = Set(survivors.map(\.sessionID))
+                return AgentSessionLinkResponseRenderer.addUnavailableWaitTargets(
+                    leases.map(\.target.sessionID).filter { !survivingIDs.contains($0) }, to: rendered
                 )
             }
             // A terminal outcome is the authority's answer to a lost lease or runtime. Do not

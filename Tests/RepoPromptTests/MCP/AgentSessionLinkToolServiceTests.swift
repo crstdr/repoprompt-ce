@@ -57,6 +57,41 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    func testWaitDoesNotUseSetModelOnlyRouting() {
+        XCTAssertFalse(ServerNetworkManager.isMemoryOnlyModelCall(
+            toolName: MCPWindowToolName.agentSessionLink, arguments: ["op": .string("wait")]
+        ))
+        XCTAssertTrue(ServerNetworkManager.isMemoryOnlyModelCall(
+            toolName: MCPWindowToolName.agentSessionLink, arguments: ["op": .string("set_model")]
+        ))
+    }
+
+    func testLocalInputCancelledAggregateNamesTargetLostAtSurvivorFence() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second")
+        fixture.host.candidates.append(second)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID, rawTargetSessionID: second.sessionID.uuidString
+        ) else { return XCTFail("Expected second link") }
+        var delayed = fixture.service
+        let old = fixture.bridge.captureWaitInput(for: fixture.observer.domainEndpoint)
+        delayed.captureWaitInput = { old }
+        await fixture.bridge.acceptLocalInput(for: fixture.observer.domainEndpoint).value
+        fixture.bridge.test_afterTerminalWaitSurvivorAuthorityValidation = {
+            fixture.host.candidates.removeAll { $0.domainEndpoint == second.domainEndpoint }
+        }
+        let result = try await Self.executeObject(delayed, args: [
+            "op": .string("wait"), "session_ids": .array([
+                .string(fixture.target.sessionID.uuidString), .string(second.sessionID.uuidString)
+            ]), "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(result["result"]?.stringValue, "cancelled")
+        XCTAssertEqual(result["targets"]?.arrayValue?.count, 1)
+        XCTAssertEqual(result["unavailable_session_ids"]?.arrayValue, [.string(second.sessionID.uuidString)])
+        XCTAssertEqual(result["_meta"]?.objectValue?["wake_reason"]?.stringValue, "local_user_input")
+    }
+
     // MARK: - Strict allowed keys
 
     func testEachOperationDeclaresExactlyItsDocumentedFields() {

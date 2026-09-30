@@ -3478,6 +3478,7 @@ final class AgentSessionLinkRuntimeBridge {
     ) async {
         let capturedBookkeeping = bookkeepingByReference
         let notices = await authority.invalidate(endpoint: endpoint, reason: reason)
+        await retireLocalInput(for: [endpoint])
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
         noteLifecycleEnded(sessionIDs: [endpoint.sessionID])
     }
@@ -3491,6 +3492,7 @@ final class AgentSessionLinkRuntimeBridge {
     func invalidateSession(_ sessionID: UUID, reason: DomainAgentSessionLinkRevocationReason) async {
         let capturedBookkeeping = bookkeepingByReference
         let notices = await authority.invalidateSession(sessionID: sessionID, reason: reason)
+        await retireLocalInput(for: localInputGenerations.keys.filter { $0.sessionID == sessionID })
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
         noteLifecycleEnded(sessionIDs: [sessionID])
     }
@@ -3498,6 +3500,7 @@ final class AgentSessionLinkRuntimeBridge {
     func invalidateWindow(_ windowID: Int, reason: DomainAgentSessionLinkRevocationReason) async {
         let capturedBookkeeping = bookkeepingByReference
         let notices = await authority.invalidateWindow(windowID: windowID, reason: reason)
+        await retireLocalInput(for: localInputGenerations.keys.filter { $0.windowID == windowID })
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
         noteLifecycleEnded(sessionIDs: Set(notices.flatMap { [$0.observerSessionID, $0.targetSessionID] }))
     }
@@ -3513,6 +3516,9 @@ final class AgentSessionLinkRuntimeBridge {
             windowID: windowID,
             reason: reason
         )
+        await retireLocalInput(for: localInputGenerations.keys.filter {
+            $0.workspaceID == workspaceID && (windowID == nil || $0.windowID == windowID)
+        })
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
         noteLifecycleEnded(sessionIDs: Set(notices.flatMap { [$0.observerSessionID, $0.targetSessionID] }))
     }
@@ -3541,7 +3547,7 @@ final class AgentSessionLinkRuntimeBridge {
     ) async {
         guard let host else { return }
         let live = Set(host.agentSessionLinkCandidates().map(\.domainEndpoint))
-        let affected = knownObserverEndpoints.union(knownTargetEndpoints).filter {
+        let affected = knownObserverEndpoints.union(knownTargetEndpoints).union(localInputGenerations.keys).filter {
             $0.windowID == windowID && $0.tabID == tabID && !live.contains($0)
         }
         guard !affected.isEmpty else {
@@ -3555,6 +3561,7 @@ final class AgentSessionLinkRuntimeBridge {
         var notices: [DomainAgentSessionLinkRevocationNotice] = []
         for endpoint in affected {
             notices += await authority.invalidate(endpoint: endpoint, reason: reason)
+            await retireLocalInput(for: [endpoint])
             knownObserverEndpoints.remove(endpoint)
             knownTargetEndpoints.remove(endpoint)
             removeChain(forTargetSession: endpoint.sessionID, matching: endpoint)
@@ -3577,7 +3584,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// particular advertisement invalidation, which used to reach these observers only through the
     /// lossy change feed, on exactly the lifecycle path that exists to repair stale state.
     private func sweepStaleEndpoints(liveCandidates: [AgentSessionLinkEndpointCandidate]) async {
-        guard !knownObserverEndpoints.isEmpty || !knownTargetEndpoints.isEmpty else { return }
+        guard !knownObserverEndpoints.isEmpty || !knownTargetEndpoints.isEmpty || !localInputGenerations.isEmpty else { return }
         let live = Set(liveCandidates.map(\.domainEndpoint))
         let capturedBookkeeping = bookkeepingByReference
         var notices: [DomainAgentSessionLinkRevocationNotice] = []
@@ -3600,6 +3607,7 @@ final class AgentSessionLinkRuntimeBridge {
             removeChain(forTargetSession: endpoint.sessionID, matching: endpoint)
         }
 
+        await retireLocalInput(for: localInputGenerations.keys.filter { !live.contains($0) })
         await reconcile(
             after: notices,
             capturedBookkeeping: capturedBookkeeping,
@@ -5618,6 +5626,22 @@ final class AgentSessionLinkRuntimeBridge {
         await authority.targetState(for: lease)
     }
 
+    /// Clear only genuinely gone incarnations after their input forwarding has settled.
+    private func retireLocalInput(for endpoints: [DomainAgentSessionLinkEndpointIdentity]) async {
+        for endpoint in endpoints {
+            while let forwarding = localInputReleaseTasks[endpoint] {
+                await forwarding.value
+            }
+            guard let generation = localInputGenerations[endpoint],
+                  host?.agentSessionLinkCandidates().contains(where: {
+                      $0.domainEndpoint == endpoint && !$0.isClosing
+                  }) != true,
+                  await authority.forgetLocalInput(.init(endpoint: endpoint, generation: generation)),
+                  localInputGenerations[endpoint] == generation else { continue }
+            localInputGenerations.removeValue(forKey: endpoint)
+        }
+    }
+
     func captureWaitInput(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> DomainAgentSessionLinkWaitInput {
         .init(endpoint: endpoint, generation: localInputGenerations[endpoint, default: 0])
     }
@@ -5629,9 +5653,12 @@ final class AgentSessionLinkRuntimeBridge {
         localInputGenerations[endpoint] = generation
         let previous = localInputReleaseTasks[endpoint]
         let authority = authority
-        let task = Task {
+        let task = Task { [weak self] in
             await previous?.value
             await authority.acceptLocalInput(.init(endpoint: endpoint, generation: generation))
+            if self?.localInputGenerations[endpoint] == generation {
+                self?.localInputReleaseTasks.removeValue(forKey: endpoint)
+            }
         }
         localInputReleaseTasks[endpoint] = task
         return task

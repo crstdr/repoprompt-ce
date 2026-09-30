@@ -1054,6 +1054,14 @@ package actor DomainAgentSessionLinkAuthority {
         }
     }
 
+    /// Lifecycle-only cleanup: an active grant or newer input keeps its generation fence.
+    package func forgetLocalInput(_ input: DomainAgentSessionLinkWaitInput) -> Bool {
+        guard localInputGenerations[input.endpoint] == input.generation,
+              outboundLinksByEndpoint[input.endpoint]?.isEmpty ?? true else { return false }
+        localInputGenerations.removeValue(forKey: input.endpoint)
+        return true
+    }
+
     private func wasInterrupted(_ input: DomainAgentSessionLinkWaitInput?) -> Bool {
         guard let input else { return false }
         return input.generation < localInputGenerations[input.endpoint, default: 0]
@@ -1169,12 +1177,6 @@ package actor DomainAgentSessionLinkAuthority {
                     return
                 }
                 // Re-check after the continuation hop: state may have advanced.
-                if wasInterrupted(observerInput) {
-                    continuation.resume(returning: DomainAgentSessionLinkWaitResult(
-                        outcome: .cancelled, targets: [], interruptedByLocalInput: true
-                    ))
-                    return
-                }
                 for registration in registrations {
                     guard let record = links[registration.reference.linkID],
                           record.grant.generation == registration.reference.generation
@@ -1192,6 +1194,12 @@ package actor DomainAgentSessionLinkAuthority {
                         ))
                         return
                     }
+                }
+                if wasInterrupted(observerInput) {
+                    continuation.resume(returning: DomainAgentSessionLinkWaitResult(
+                        outcome: .cancelled, targets: [], interruptedByLocalInput: true
+                    ))
+                    return
                 }
                 if let outcome = firstSatisfiedOutcome(registrations: registrations, predicate: predicate) {
                     continuation.resume(returning: waitResult(outcome: outcome, registrations: registrations))
