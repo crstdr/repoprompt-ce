@@ -4727,7 +4727,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// whole batch would discard the healthy siblings' cursors. Instead each target is re-fenced on
     /// its own, like `terminalWaitSurvivingStates`: survivors keep their rows and prompts, and a
     /// target that fails its own fence releases nothing. Returns `nil` only when no target survives
-    /// (or for a single target that fails), so the caller denies exactly as before.
+    /// (or for a single target that fails), or when the final survivor batch changes again.
     func pendingInteractionsForWaitObservation(
         leases: [DomainAgentSessionLinkLease]
     ) async -> (
@@ -4738,15 +4738,17 @@ final class AgentSessionLinkRuntimeBridge {
             return (inspections, Set(leases.map(\.target.sessionID)))
         }
         guard leases.count > 1, !isFrozenForTermination else { return nil }
-        var inspections: [UUID: AgentSessionLinkPendingInteractionInspection] = [:]
-        var surviving: Set<UUID> = []
+        var surviving: [DomainAgentSessionLinkLease] = []
         for lease in leases {
-            guard let own = await pendingInteractionsForObservation(leases: [lease]) else { continue }
-            inspections.merge(own) { _, fenced in fenced }
-            surviving.insert(lease.target.sessionID)
+            guard await pendingInteractionsForObservation(leases: [lease]) != nil else { continue }
+            surviving.append(lease)
         }
-        guard !surviving.isEmpty, !isFrozenForTermination else { return nil }
-        return (inspections, surviving)
+        // A later sibling's authority hop can invalidate an earlier survivor. Release only a fresh
+        // projection of the final whole-survivor batch, never the provisional per-target prompts.
+        guard !surviving.isEmpty,
+              let inspections = await pendingInteractionsForObservation(leases: surviving)
+        else { return nil }
+        return (inspections, Set(surviving.map(\.target.sessionID)))
     }
 
     /// Submits one explicit observer answer to the target's exact current interaction.
