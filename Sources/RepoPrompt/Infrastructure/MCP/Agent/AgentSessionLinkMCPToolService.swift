@@ -106,6 +106,8 @@ struct AgentSessionLinkMCPToolService {
             _ operation: @escaping HeartbeatOperation
         ) async throws -> Value
 
+    // Deliberately fail-closed by default: never fall back to the generic recovery resolver.
+    var resolveModelObserverEndpoint: (RequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity? = { _ in nil }
     var bridge: AgentSessionLinkRuntimeBridge = .shared
 
     // MARK: - Entry point
@@ -199,7 +201,12 @@ struct AgentSessionLinkMCPToolService {
     private func executeSetModel(args: [String: Value]) async throws -> Value {
         let sessionID = try Self.parseSingleSessionID(args["session_id"], op: "set_model")
         let modelID = try Self.parseModelID(args["model_id"])
-        let observer = try await resolveCallerEndpointIdentity()
+        let metadata = await captureRequestMetadata()
+        guard let observer = await resolveModelObserverEndpoint(metadata) else {
+            throw MCPError.invalidParams(
+                "set_model requires an already-installed current Agent Mode run route. No state was repaired or changed. Retry once; if unavailable, ask the user to restart this Agent Mode run."
+            )
+        }
         let target: AgentSessionLinkRuntimeBridge.AuthorizedTarget
         switch try await authorizeManaged(
             operation: .monitorSetModel, observerEndpoint: observer, targetSessionID: sessionID

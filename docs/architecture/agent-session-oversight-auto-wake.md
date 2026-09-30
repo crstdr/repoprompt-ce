@@ -40,6 +40,31 @@ a cold index tells the caller to refresh `agent_manage.list_agents` in the desti
 `create_lane` accepts either an explicit `model_id` using this same admission or the existing
 `role`/default path; specifying both is an error. Explicit selection never silently substitutes a role.
 
+The `set_model` transport and service caller resolvers read only already-installed connection/run/context maps.
+They refuse cold, pending, displaced, ambiguous, or terminal routes actionably instead of invoking generic
+run recovery (rehydration, binding, session creation, selection mirroring, or routing persistence). Explicit
+routing hints must match that exact installed route. Its original endpoint and routing/lifecycle generations
+travel with dispatch identity through the final provider-entry fences; a successor cannot replace the caller.
+Window and workspace-qualified tab indexes are derived by their existing owners on array mutation;
+authorization and catalog reachability use the existing link authority's derived pair/outbound indexes and
+inbound target membership. No call rebuilds an index or sweeps windows, workspaces, tabs, catalogs, or links.
+Dashboard close-safety projections are derived on dashboard replacement rather than rescanned during tool
+registration/completion. Generic operations retain their recovery behavior.
+
+This is a routing specialization, not a permission fast path. Early live-link visibility, restricted-tool/role
+policy, enabled-server checks, connection/resource admission, cancellation, catalog-generation ownership,
+domain connection-generation validation, and exact Manage authorization still run. The model-only domain
+security context deliberately grants **no** verified-process assurance, filesystem roots, or ephemeral mutation
+capabilities: this operation does not belong to the protected filesystem family and authorizes solely through
+its exact Manage lease. Thus no executable `lstat`, root canonicalization, or cold domain-registration repair
+is needed merely to construct unused filesystem authority. Generic security-context construction is unchanged.
+
+Model endpoint checks enforce the same observer eligibility and endpoint/deletion predicates as generic
+revalidation, but **deny without eager persistent cleanup**; normal lifecycle invalidation owns cleanup.
+These paths are decision-equivalent, not side-effect-equivalent. Transport-wide logging, per-run event
+observer delivery, and deferred ordinary save/dashboard/publication remain ordinary infrastructure costs;
+this is not a claim that the entire transport or its callbacks are O(1).
+
 Acceptance changes per-session model/effort and narrow active UI projections, schedules persistence
 and existing MCP publication, and leaves identities, provider sessions, ACP pins, draft, and staged
 handoff intact. It does not start/resume/apply/reset a provider; the next ordinary turn applies the

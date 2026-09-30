@@ -91,6 +91,56 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertEqual(fixture.session.saveRequestGeneration, saveGeneration + 1)
     }
 
+    func testModelTabIndexTracksNestedEditsReplacementAmbiguityAndActiveWorkspace() throws {
+        let fixture = try makeFixture()
+        let manager = fixture.manager
+        let workspaceID = fixture.candidate.workspaceID
+        let tabID = fixture.candidate.tabID
+        let original = try XCTUnwrap(manager.activeWorkspace)
+        XCTAssertEqual(manager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID)?.activeAgentSessionID, fixture.candidate.sessionID)
+        manager.workspaces[0].composeTabs.insert(ComposeTabState(id: UUID(), name: "Before"), at: 0)
+        XCTAssertEqual(manager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID)?.activeAgentSessionID, fixture.candidate.sessionID)
+        manager.workspaces[0].composeTabs.removeLast()
+        XCTAssertNil(manager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID))
+        manager.workspaces = [original]
+        manager.workspaces[0].composeTabs.append(original.composeTabs[0])
+        XCTAssertNil(manager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID), "Duplicate tabs are not last-wins")
+        manager.workspaces = [original, original]
+        XCTAssertNil(manager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID), "Duplicate workspaces are not last-wins")
+        manager.workspaces = [original]
+        XCTAssertNotNil(manager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID))
+        manager.activeWorkspace = nil
+        XCTAssertNil(manager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID), "An indexed inactive workspace is not a live model endpoint")
+        manager.activeWorkspace = original
+        XCTAssertNotNil(manager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID))
+    }
+
+    func testModelCandidatesUseConfigurationFreeProviderLabels() throws {
+        let fixture = try makeFixture()
+        for agent: AgentProviderKind in [.claudeCodeGLM, .kimiCode, .customClaudeCompatible] {
+            fixture.session.selectedAgent = agent
+            let candidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkModelCandidate(for: fixture.candidate.domainEndpoint))
+            XCTAssertEqual(candidate.providerDisplayName, agent.rawValue, "Model admission must not load a compatible backend's configured display name")
+            XCTAssertNil(candidate.locationLabel)
+            XCTAssertEqual(candidate.domainEndpoint, fixture.candidate.domainEndpoint)
+        }
+    }
+
+    func testSetModelRejectsIndexedBindingReplacementDuringFinalFence() async throws {
+        let fixture = try makeFixture()
+        let original = fixture.session.selectedModelRaw
+        let modelID = advertiseModel()
+        defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+        let result = await setModel(fixture, modelID: modelID) {
+            fixture.manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
+            return .committed
+        }
+        guard case .blocked(.endpointInvalidated) = result else { return XCTFail("Replaced binding must lose final fence") }
+        XCTAssertEqual(fixture.session.selectedModelRaw, original)
+        XCTAssertFalse(fixture.events.contains(.save))
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
     func testSetModelNoopStillRefusesBusyAndPostFenceReadinessLoss() async throws {
         let blockers: [(String, (AgentModeViewModel.TabSession) -> Void)] = [
             ("run", { $0.runState = .running }),

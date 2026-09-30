@@ -36,6 +36,42 @@ extension AgentSessionLinkEndpointHost {
 }
 
 extension AgentModeViewModel {
+    /// Workspace-qualified model routing never invokes the generic lifecycle discovery sweep.
+    func agentSessionLinkModelIdentity(
+        workspaceID: UUID, tabID: UUID, sessionID: UUID
+    ) -> AgentSessionLifecycleAuthority.Identity? {
+        guard let session = sessions[tabID], session.activeAgentSessionID == sessionID,
+              let tab = workspaceManager?.modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
+              tab.activeAgentSessionID == sessionID else { return nil }
+        return AgentSessionLifecycleAuthority.Identity(
+            workspaceID: workspaceID, tabID: tabID, sessionID: sessionID,
+            persistentBindingGeneration: session.persistentSessionBindingIdentity?.generation,
+            bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+    }
+
+    func agentSessionLinkModelCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkEndpointCandidate? {
+        guard let identity = agentSessionLinkModelIdentity(
+            workspaceID: endpoint.workspaceID, tabID: endpoint.tabID, sessionID: endpoint.sessionID
+        ), identity.monitorEndpoint(windowID: windowID) == endpoint,
+        let session = sessions[endpoint.tabID] else { return nil }
+        return agentSessionLinkCandidate(
+            session: session, identity: identity, tabName: "",
+            // Compatible-provider displayName reads backend configuration; no label is needed here.
+            providerDisplayName: session.selectedAgent.rawValue,
+            isWindowClosing: false, includeLocation: false
+        )
+    }
+
+    private func agentSessionLinkModelSession(matching candidate: AgentSessionLinkEndpointCandidate) -> TabSession? {
+        guard let identity = agentSessionLinkModelIdentity(
+            workspaceID: candidate.workspaceID, tabID: candidate.tabID, sessionID: candidate.sessionID
+        ), identity.monitorEndpoint(windowID: windowID) == candidate.domainEndpoint else { return nil }
+        return sessions[candidate.tabID]
+    }
+
     /// The target owns the final suspension. No hydration, provider calls, composer claim, or
     /// discovery occurs here. A concurrent send winning during reauthorization must defeat us.
     func agentSessionLinkPerformSetModel(
@@ -45,7 +81,7 @@ extension AgentModeViewModel {
         availability: @MainActor () -> AgentModelCatalog.AvailabilityContext,
         reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkModelOutcome {
-        guard let session = agentSessionLinkLiveSession(matching: candidate),
+        guard let session = agentSessionLinkModelSession(matching: candidate),
               liveness().permitsDelivery, !Task.isCancelled else { return .blocked(.endpointInvalidated) }
         if let failure = agentSessionLinkModelReadiness(session) { return .blocked(failure) }
         let admittedAvailability = availability()
@@ -62,8 +98,8 @@ extension AgentModeViewModel {
         // Last suspension above. Exact object, both endpoints, workspace, readiness, and original
         // full-ID membership are re-read synchronously before any configuration assignment.
         guard !Task.isCancelled, liveness().permitsDelivery,
-              agentSessionLinkLiveSession(matching: candidate) === session,
-              workspaceManager?.activeWorkspace?.id == candidate.workspaceID
+              agentSessionLinkModelSession(matching: candidate) === session,
+              workspaceManager?.activeWorkspaceID == candidate.workspaceID
         else {
             return .blocked(.endpointInvalidated)
         }

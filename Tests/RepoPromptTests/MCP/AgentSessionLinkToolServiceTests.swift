@@ -3295,6 +3295,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 requireTargetWindow: { window },
                 resolveObserverEndpoint: { _, _ in endpoint },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
+                resolveModelObserverEndpoint: { _ in endpoint },
                 bridge: bridge
             )
         }
@@ -3402,6 +3403,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             requireTargetWindow: { window },
             resolveObserverEndpoint: { _, _ in observerEndpoint },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
+            resolveModelObserverEndpoint: { _ in observerEndpoint },
             bridge: bridge
         )
         return ReadReleaseFixture(

@@ -376,20 +376,15 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     // MARK: - Management delegation
 
     func agentSessionLinkModelAvailability(windowID: Int) -> AgentModelCatalog.AvailabilityContext {
-        guard !isTerminating, let window = window(withID: windowID), !window.isClosing else { return .none }
+        guard let window = modelRoutingWindow(withID: windowID) else { return .none }
         return window.apiSettingsViewModel.agentAvailability
     }
 
     func agentSessionLinkModelCandidate(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionLinkEndpointCandidate? {
-        guard !isTerminating, let window = window(withID: endpoint.windowID), !window.isClosing,
-              window.workspaceManager.activeWorkspaceID == endpoint.workspaceID,
-              let candidate = window.agentModeViewModel.agentSessionLinkCandidate(
-                  tabID: endpoint.tabID, sessionID: endpoint.sessionID,
-                  tabName: "", isWindowClosing: false, includeLocation: false
-              ), candidate.domainEndpoint == endpoint else { return nil }
-        return candidate
+        guard let window = modelRoutingWindow(withID: endpoint.windowID) else { return nil }
+        return window.agentModeViewModel.agentSessionLinkModelCandidate(for: endpoint)
     }
 
     func agentSessionLinkPerformSetModel(
@@ -399,7 +394,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkModelOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+        guard let window = modelRoutingWindow(withID: candidate.windowID) else {
             return .blocked(.endpointHost)
         }
         return await window.agentModeViewModel.agentSessionLinkPerformSetModel(
