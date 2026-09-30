@@ -500,16 +500,12 @@ struct AgentSessionLinkMCPToolService {
         var states: [DomainAgentSessionLinkTargetState] = []
         var pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:]
         var snoozes: [UUID: AgentSessionLinkAutoWakeSnoozeProjection] = [:]
-        var managed: [UUID: Bool] = [:]
         states.reserveCapacity(targets.count)
         for target in targets {
             guard let state = await bridge.targetState(for: target.lease) else {
                 throw Self.error(for: .denied, targetSessionID: target.lease.target.sessionID)
             }
             states.append(state)
-            // Read from the exact grant this poll was authorized under, so a mid-session grant or
-            // withdrawal of management shows on the very next poll rather than the next turn.
-            managed[state.sessionID] = await bridge.managementIsGranted(for: target.lease)
             // Read through this caller's own lease, so the queue state one observer staged is
             // structurally unreachable from another observer of the same target.
             pendingSends[state.sessionID] = bridge.pendingSendProjection(for: target.lease)
@@ -539,9 +535,9 @@ struct AgentSessionLinkMCPToolService {
             if bridge.isFrozenForShutdown { throw MCPError.internalError("RepoPrompt is shutting down.") }
             throw Self.denialError(targetSessionID: request.isSingle ? request.sessionIDs.first : nil)
         }
-        for state in states {
-            managed[state.sessionID] = inspections[state.sessionID] != nil
-        }
+        // `managed` comes from the same final whole-batch fence that released the prompt bodies, so
+        // it always agrees with whether `pending_interaction` could appear for that target.
+        let managed = Set(inspections.keys)
 
         if request.isSingle, let state = states.first {
             var payload: [String: Value] = [
@@ -549,7 +545,7 @@ struct AgentSessionLinkMCPToolService {
                 "session_id": .string(state.sessionID.uuidString),
                 "snapshot": AgentSessionLinkResponseRenderer.snapshotValue(state),
                 "wait_cursor": .string(state.waitCursor),
-                "managed": .bool(managed[state.sessionID] ?? false),
+                "managed": .bool(managed.contains(state.sessionID)),
                 "auto_wake_snooze": AgentSessionLinkResponseRenderer
                     .autoWakeSnoozeValue(snoozes[state.sessionID])
             ]
@@ -568,7 +564,7 @@ struct AgentSessionLinkMCPToolService {
                     state,
                     pendingSend: pendingSends[state.sessionID] ?? .empty,
                     autoWakeSnooze: snoozes[state.sessionID],
-                    managed: managed[state.sessionID] ?? false
+                    managed: managed.contains(state.sessionID)
                 )
             })
         ]), inspections: inspections, isSingle: false)
@@ -636,20 +632,28 @@ struct AgentSessionLinkMCPToolService {
             // Read after the wait resumes, so a queued send that drained while parked reports
             // its terminal outcome rather than the entry it had on admission.
             let pendingSends = await bridge.pendingSendProjections(for: leases)
-            guard let inspections = await bridge.pendingInteractionsForObservation(leases: leases) else {
+            // A sibling that lost its lease or endpoint while parked is dropped on its own; the
+            // healthy siblings keep their fresh rows and cursors. Denial only when none survive.
+            guard let observation = await bridge.pendingInteractionsForWaitObservation(leases: leases) else {
                 if await bridge.isFrozenForShutdown { throw MCPError.internalError("RepoPrompt is shutting down.") }
                 throw Self.denialError(targetSessionID: isSingle ? leases.first?.target.sessionID : nil)
             }
-            return AgentSessionLinkResponseRenderer.addPendingInteractions(
+            let surviving = observation.survivingTargets
+            let unavailable = leases.map(\.target.sessionID).filter { !surviving.contains($0) }
+            let rendered = AgentSessionLinkResponseRenderer.addPendingInteractions(
                 to: AgentSessionLinkResponseRenderer.waitValue(
-                    waitResult,
+                    DomainAgentSessionLinkWaitResult(
+                        outcome: waitResult.outcome,
+                        targets: waitResult.targets.filter { surviving.contains($0.sessionID) }
+                    ),
                     pendingSends: pendingSends,
                     isSingle: isSingle,
-                    managedTargets: Set(inspections.keys)
+                    managedTargets: Set(observation.inspections.keys)
                 ),
-                inspections: inspections,
+                inspections: observation.inspections,
                 isSingle: isSingle
             )
+            return AgentSessionLinkResponseRenderer.addUnavailableWaitTargets(unavailable, to: rendered)
         }
     }
 
@@ -1901,6 +1905,21 @@ enum AgentSessionLinkResponseRenderer {
                 }
                 return entry
             })
+        }
+        return .object(payload)
+    }
+
+    /// Names the requested targets a multi-target wait dropped because their own lease or endpoint
+    /// stopped holding while parked. Their rows, cursors, and prompts are withheld; every ID here
+    /// was supplied and authorized by this caller at admission.
+    static func addUnavailableWaitTargets(_ sessionIDs: [UUID], to value: Value) -> Value {
+        guard !sessionIDs.isEmpty, case var .object(payload) = value else { return value }
+        payload["unavailable_session_ids"] = .array(sessionIDs.map { .string($0.uuidString) })
+        if payload["detail"] == nil {
+            payload["detail"] = .string(
+                "Oversight of \(sessionIDs.map(\.uuidString).joined(separator: ", ")) is no longer available; "
+                    + "its row and cursor were withheld. Refresh `list` for any remaining grants and capabilities."
+            )
         }
         return .object(payload)
     }

@@ -4413,6 +4413,35 @@ final class AgentSessionLinkRuntimeBridge {
         return inspections
     }
 
+    /// Multi-target wait variant of `pendingInteractionsForObservation`.
+    ///
+    /// A parked multi-target wait already holds fresh successor cursors for every target. If one
+    /// sibling's lease, endpoint, or eligibility stopped holding while it was parked, failing the
+    /// whole batch would discard the healthy siblings' cursors. Instead each target is re-fenced on
+    /// its own, like `terminalWaitSurvivingStates`: survivors keep their rows and prompts, and a
+    /// target that fails its own fence releases nothing. Returns `nil` only when no target survives
+    /// (or for a single target that fails), so the caller denies exactly as before.
+    func pendingInteractionsForWaitObservation(
+        leases: [DomainAgentSessionLinkLease]
+    ) async -> (
+        inspections: [UUID: AgentSessionLinkPendingInteractionInspection],
+        survivingTargets: Set<UUID>
+    )? {
+        if let inspections = await pendingInteractionsForObservation(leases: leases) {
+            return (inspections, Set(leases.map(\.target.sessionID)))
+        }
+        guard leases.count > 1, !isFrozenForTermination else { return nil }
+        var inspections: [UUID: AgentSessionLinkPendingInteractionInspection] = [:]
+        var surviving: Set<UUID> = []
+        for lease in leases {
+            guard let own = await pendingInteractionsForObservation(leases: [lease]) else { continue }
+            inspections.merge(own) { _, fenced in fenced }
+            surviving.insert(lease.target.sessionID)
+        }
+        guard !surviving.isEmpty, !isFrozenForTermination else { return nil }
+        return (inspections, surviving)
+    }
+
     /// Submits one explicit observer answer to the target's exact current interaction.
     ///
     /// The host validates the answer and compares the interaction ID, then calls `authorize` as the
