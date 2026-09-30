@@ -126,6 +126,33 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         }
     }
 
+    func testSetModelRejectsCrossAgentBeforeColdCatalogueAdmission() async throws {
+        let fixture = try makeFixture()
+        fixture.session.selectedAgent = .codexExec
+        AgentAdvertisedModelCatalog.shared.invalidate(.devin)
+        let originalModel = fixture.session.selectedModelRaw
+        let originalEffort = fixture.session.selectedReasoningEffortRaw
+        let saveGeneration = fixture.session.saveRequestGeneration
+        var fenceCount = 0
+        let result = await fixture.viewModel.agentSessionLinkPerformSetModel(
+            to: fixture.candidate, modelID: "devin:default",
+            liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
+            availability: { .init(devinAvailable: true) },
+            reauthorize: {
+                fenceCount += 1
+                return .committed
+            }
+        )
+        guard case let .invalid(message) = result else { return XCTFail("Expected same-agent refusal") }
+        XCTAssertEqual(message, "set_model cannot change agent kind (current: codexExec). Use agent_manage.list_agents for a same-agent model_id.")
+        XCTAssertEqual(fenceCount, 0)
+        XCTAssertEqual(fixture.session.selectedModelRaw, originalModel)
+        XCTAssertEqual(fixture.session.selectedReasoningEffortRaw, originalEffort)
+        XCTAssertEqual(fixture.session.saveRequestGeneration, saveGeneration)
+        XCTAssertFalse(fixture.events.contains(.save))
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
     func testSetModelRejectsIndexedBindingReplacementDuringFinalFence() async throws {
         let fixture = try makeFixture()
         let original = fixture.session.selectedModelRaw
