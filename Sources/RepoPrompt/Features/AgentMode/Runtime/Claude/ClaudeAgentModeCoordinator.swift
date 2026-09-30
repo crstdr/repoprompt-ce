@@ -860,8 +860,8 @@ final class ClaudeAgentModeCoordinator {
              .invalidControlResponse,
              .controlRequestTimedOut:
             return true
-        case .liveModelSwitchRequiresRestart, .configurationNotCurrent:
-            // Configuration refusals are not evidence of a missing conversation.
+        case .liveModelSwitchRequiresRestart, .configurationNotCurrent, .cancelledBeforeWrite:
+            // Configuration/pre-write refusals are not evidence of a missing conversation.
             return false
         }
     }
@@ -1501,6 +1501,13 @@ final class ClaudeAgentModeCoordinator {
             }
 
             var attemptedParkedNoteID: AgentSelfCompactionDispatchID?
+            func recordOrdinaryDispatchAttempt() {
+                guard let auditTurnID else { return }
+                session.updateAutomationAudit(turnID: auditTurnID) {
+                    $0.providerDispatchAttempted = true
+                }
+                hostCapabilities.scheduleSave(session)
+            }
             do {
                 let outboundText = hostCapabilities.prependPendingHandoff(text, session)
                 var selfCompactState = session.selfCompactState
@@ -1547,12 +1554,6 @@ final class ClaudeAgentModeCoordinator {
                     hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                     return .superseded
                 }
-                if let auditTurnID {
-                    session.updateAutomationAudit(turnID: auditTurnID) {
-                        $0.providerDispatchAttempted = true
-                    }
-                    hostCapabilities.scheduleSave(session)
-                }
                 if let parked {
                     var state = session.selfCompactState
                     guard state.noteWillAttempt(parked.dispatchID) else { return .superseded }
@@ -1561,6 +1562,7 @@ final class ClaudeAgentModeCoordinator {
                     hostCapabilities.scheduleSave(session)
                 }
                 let turnID = try await controller.sendUserMessage(providerBoundText, configuration: configurationProof)
+                recordOrdinaryDispatchAttempt()
                 if let parked {
                     var state = session.selfCompactState
                     if state.noteAccepted(parked.dispatchID) {
@@ -1596,7 +1598,29 @@ final class ClaudeAgentModeCoordinator {
                 }
                 session.claudeExpectedTurnIDs.insert(turnID)
                 return .sent
+            } catch NativeAgentRuntimeControllerError.configurationNotCurrent,
+                NativeAgentRuntimeControllerError.cancelledBeforeWrite
+            {
+                // The controller guarantees zero writes for these typed refusals. Undo only this
+                // note's attempt marker, never a replacement's state or a transport failure.
+                if let attemptedParkedNoteID {
+                    var state = session.selfCompactState
+                    if state.noteDefinitivelyNotAttempted(attemptedParkedNoteID) {
+                        session.selfCompactState = state
+                        hostCapabilities.scheduleSave(session)
+                    }
+                }
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                guard intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else { return .superseded }
+                return recordSendFailure(
+                    "Claude dispatch was cancelled or its configuration changed. No message was sent; retry the turn.",
+                    session: session,
+                    intent: intent
+                )
             } catch {
+                recordOrdinaryDispatchAttempt()
                 if let attemptedParkedNoteID {
                     var state = session.selfCompactState
                     _ = state.noteTransportFailed(attemptedParkedNoteID)

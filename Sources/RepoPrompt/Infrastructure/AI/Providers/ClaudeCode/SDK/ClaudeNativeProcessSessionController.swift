@@ -102,6 +102,8 @@ final actor ClaudeNativeProcessSessionController {
         case controlRequestTimedOut(requestID: String)
         case liveModelSwitchRequiresRestart
         case configurationNotCurrent
+        /// Cancellation observed at the proof-bearing send entry, before any user-message write.
+        case cancelledBeforeWrite
 
         var errorDescription: String? {
             switch self {
@@ -115,6 +117,8 @@ final actor ClaudeNativeProcessSessionController {
                 "Failed writing to Claude process stdin: \(message)"
             case let .controlRequestTimedOut(requestID):
                 "Claude control request timed out: \(requestID)"
+            case .cancelledBeforeWrite:
+                "Claude dispatch was cancelled before writing. No message was sent."
             case .configurationNotCurrent:
                 "Claude model configuration is not current. No message was sent; retry the turn."
             case .liveModelSwitchRequiresRestart:
@@ -171,7 +175,8 @@ final actor ClaudeNativeProcessSessionController {
     private var appliedConfigurationProof: NativeAgentRuntimeConfigurationProof?
     #if DEBUG
         private var configurationTestControlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])?
-        private var configurationTestWrite: (@Sendable (Data) -> Void)?
+        private var configurationTestWrite: (@Sendable (Data) throws -> Void)?
+        private var configurationTestBeforeProofSend: (@Sendable () async -> Void)?
     #endif
     private var activeLaunchEnvironmentSignature: LaunchEnvironmentSignature?
     private var flagSettingsRequestGeneration: UInt64 = 0
@@ -439,50 +444,62 @@ final actor ClaudeNativeProcessSessionController {
         let intentGeneration = latestFlagSettingsIntentGeneration
         let lifetime = configurationLifetime
         guard hasActiveSession, !isShuttingDown else { return .notReady }
-        let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
-        guard lifetime == configurationLifetime,
-              intentGeneration == latestFlagSettingsIntentGeneration
-        else { return .superseded }
-        guard hasActiveSession, !isShuttingDown else { return .notReady }
-        if liveFlagSettingsRequiresProcessRestart(for: resolved.launchEnvironment) {
-            writeRawEventLogRecord(kind: "session.flagSettingsDeferred", payload: [
-                "reason": "launch_environment_changed",
-                "model": model ?? NSNull()
-            ] as [String: Any])
-            throw ControllerError.liveModelSwitchRequiresRestart
-        }
-        storeFlagSettingsRequest(resolved.request)
+        do {
+            let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
+            guard lifetime == configurationLifetime,
+                  intentGeneration == latestFlagSettingsIntentGeneration
+            else { return .superseded }
+            guard hasActiveSession, !isShuttingDown else { return .notReady }
+            if liveFlagSettingsRequiresProcessRestart(for: resolved.launchEnvironment) {
+                writeRawEventLogRecord(kind: "session.flagSettingsDeferred", payload: [
+                    "reason": "launch_environment_changed",
+                    "model": model ?? NSNull()
+                ] as [String: Any])
+                throw ControllerError.liveModelSwitchRequiresRestart
+            }
+            storeFlagSettingsRequest(resolved.request)
 
-        guard isInitialized || hasCompletedInitialFlagSettings else {
-            writeRawEventLogRecord(kind: "session.flagSettingsPending", payload: [
-                "settings": resolved.request?["settings"] ?? NSNull()
-            ] as [String: Any])
-            return .notReady
+            guard isInitialized || hasCompletedInitialFlagSettings else {
+                writeRawEventLogRecord(kind: "session.flagSettingsPending", payload: [
+                    "settings": resolved.request?["settings"] ?? NSNull()
+                ] as [String: Any])
+                return .notReady
+            }
+            let requestGeneration = flagSettingsRequestGeneration
+            if let request = resolved.request {
+                let flagSettingsResult = try await sendControlRequest(request: request, timeoutSeconds: 5.0)
+                writeRawEventLogRecord(kind: "session.flagSettingsApplied", payload: [
+                    "settings": request["settings"] ?? NSNull(),
+                    "response": flagSettingsResult,
+                    "source": "live_update"
+                ] as [String: Any])
+            }
+            guard lifetime == configurationLifetime,
+                  intentGeneration == latestFlagSettingsIntentGeneration,
+                  requestGeneration == flagSettingsRequestGeneration
+            else { return .superseded }
+            guard hasActiveSession, isInitialized, !isShuttingDown else { return .notReady }
+            // A nil request proves only a ready no-override policy, not a reset to a concrete model.
+            let proof = NativeAgentRuntimeConfigurationProof(
+                lifetime: lifetime, intentGeneration: intentGeneration, requestGeneration: requestGeneration
+            )
+            appliedConfigurationProof = proof
+            return .applied(proof)
+        } catch {
+            // Resolver and ACK errors can arrive after a newer intent, even with identical
+            // values. Such an error cannot authorize the old turn's optional Auto fallback.
+            guard lifetime == configurationLifetime,
+                  intentGeneration == latestFlagSettingsIntentGeneration
+            else { return .superseded }
+            throw error
         }
-        let requestGeneration = flagSettingsRequestGeneration
-        if let request = resolved.request {
-            let flagSettingsResult = try await sendControlRequest(request: request, timeoutSeconds: 5.0)
-            writeRawEventLogRecord(kind: "session.flagSettingsApplied", payload: [
-                "settings": request["settings"] ?? NSNull(),
-                "response": flagSettingsResult,
-                "source": "live_update"
-            ] as [String: Any])
-        }
-        guard lifetime == configurationLifetime,
-              intentGeneration == latestFlagSettingsIntentGeneration,
-              requestGeneration == flagSettingsRequestGeneration
-        else { return .superseded }
-        guard hasActiveSession, isInitialized, !isShuttingDown else { return .notReady }
-        // A nil request proves only a ready no-override policy, not a reset to a concrete model.
-        let proof = NativeAgentRuntimeConfigurationProof(
-            lifetime: lifetime, intentGeneration: intentGeneration, requestGeneration: requestGeneration
-        )
-        appliedConfigurationProof = proof
-        return .applied(proof)
     }
 
     func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
-        try Task.checkCancellation()
+        #if DEBUG
+            await configurationTestBeforeProofSend?()
+        #endif
+        guard !Task.isCancelled else { throw ControllerError.cancelledBeforeWrite }
         guard hasActiveSession, isInitialized, !isShuttingDown,
               configuration == appliedConfigurationProof,
               configuration.lifetime == configurationLifetime,
@@ -855,7 +872,7 @@ final actor ClaudeNativeProcessSessionController {
                 return try await configurationTestControlRequest(request)
             }
         #endif
-        guard process != nil else {
+        guard hasActiveSession else {
             throw ControllerError.processNotRunning
         }
         let requestID = makeControlRequestID()
@@ -916,7 +933,7 @@ final actor ClaudeNativeProcessSessionController {
     private func sendLine(_ lineData: Data, shutdownOnFailure: Bool = true) throws {
         #if DEBUG
             if let configurationTestWrite {
-                configurationTestWrite(lineData)
+                try configurationTestWrite(lineData)
                 return
             }
         #endif
@@ -1732,8 +1749,8 @@ final actor ClaudeNativeProcessSessionController {
         /// In-memory transport for deterministic control-ACK/write races; never starts a provider.
         func test_installConfigurationTransport(
             initialized: Bool,
-            controlRequest: @escaping @Sendable ([String: Any]) async throws -> [String: Any] = { _ in [:] },
-            write: @escaping @Sendable (Data) -> Void
+            controlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])? = { _ in [:] },
+            write: @escaping @Sendable (Data) throws -> Void
         ) {
             precondition(process == nil)
             configurationLifetime = UUID()
@@ -1746,6 +1763,16 @@ final actor ClaudeNativeProcessSessionController {
             sessionID = "application-proof-session"
             configurationTestControlRequest = controlRequest
             configurationTestWrite = write
+        }
+
+        /// Pauses at controller entry, before the non-suspending proof-check/write segment.
+        func test_setBeforeConfigurationSend(_ beforeSend: @escaping @Sendable () async -> Void) {
+            configurationTestBeforeProofSend = beforeSend
+        }
+
+        /// Exercises the real codec, request correlation, and success/error continuation path.
+        func test_receiveConfigurationResponseLine(_ line: Data) async {
+            await handleLine(line)
         }
 
         func test_setConfigurationControlRequest(

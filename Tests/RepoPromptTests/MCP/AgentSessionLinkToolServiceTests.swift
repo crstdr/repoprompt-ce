@@ -894,7 +894,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 isPlaceholderDefault: false,
                 isProviderDefault: false
             )
-        ], for: .claudeCode)
+        ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
         defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
         var explicit = args
         explicit["workspace"] = .string(workspace.id.uuidString)

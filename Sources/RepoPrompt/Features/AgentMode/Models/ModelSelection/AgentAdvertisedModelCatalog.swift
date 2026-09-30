@@ -12,23 +12,37 @@ final class AgentAdvertisedModelCatalog: @unchecked Sendable {
     }
 
     private var optionsByAgent: [AgentProviderKind: [String: Entry]] = [:]
+    private var generationsByAgent: [AgentProviderKind: UInt64] = [:]
 
-    func record(_ options: [AgentModelOption], for agent: AgentProviderKind) {
+    /// Capture before reading any source snapshot, not after options have been built.
+    func productionGeneration(for agent: AgentProviderKind) -> UInt64 {
+        lock.withLock { generationsByAgent[agent, default: 0] }
+    }
+
+    @discardableResult
+    func record(_ options: [AgentModelOption], for agent: AgentProviderKind, generation: UInt64) -> Bool {
         // Decomposition belongs to the producer too: Codex's legacy parser can consult persisted
         // discovery for extended effort suffixes. Never invoke that default parser during admission.
         let index = options.reduce(into: [String: Entry]()) { index, option in
             let effort: String? = if agent == .codexExec {
                 CodexModelSpecifier(raw: option.rawValue).reasoningEffort?.rawValue
             } else if agent.usesClaudeTooling {
-                ClaudeModelSpecifier(raw: option.rawValue).effortLevel?.rawValue
+                ClaudeModelSpecifier(raw: option.rawValue).explicitEffortLevel?.rawValue
             } else { nil }
             index[option.rawValue] = Entry(option: option, reasoningEffortRaw: effort)
         }
-        lock.withLock { optionsByAgent[agent] = index }
+        return lock.withLock {
+            guard generationsByAgent[agent, default: 0] == generation else { return false }
+            optionsByAgent[agent] = index
+            return true
+        }
     }
 
     func invalidate(_ agent: AgentProviderKind) {
-        _ = lock.withLock { optionsByAgent.removeValue(forKey: agent) }
+        lock.withLock {
+            generationsByAgent[agent, default: 0] &+= 1
+            optionsByAgent.removeValue(forKey: agent)
+        }
     }
 
     func selection(

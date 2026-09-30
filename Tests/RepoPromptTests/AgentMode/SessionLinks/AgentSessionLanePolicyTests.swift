@@ -38,7 +38,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
             isPlaceholderDefault: false,
             isProviderDefault: false
         )
-        catalogue.record([dynamic], for: .codexExec)
+        catalogue.record([dynamic], for: .codexExec, generation: catalogue.productionGeneration(for: .codexExec))
         let selected = try catalogue.selection("codexExec:future-model-high", availability: availability)
         XCTAssertEqual(selected.storedModelRaw, "future-model-high")
         XCTAssertEqual(selected.reasoningEffortRaw, "high")
@@ -55,11 +55,77 @@ final class AgentSessionLanePolicyTests: XCTestCase {
             isPlaceholderDefault: false,
             isProviderDefault: false
         )
-        catalogue.record([colon], for: .openCode)
+        catalogue.record([colon], for: .openCode, generation: catalogue.productionGeneration(for: .openCode))
         XCTAssertEqual(
             try catalogue.selection("openCode:vendor:model:variant", availability: availability).storedModelRaw,
             "vendor:model:variant"
         )
+    }
+
+    func testNativeCataloguePreservesOnlyExplicitEffortAndInvalidatesPerAgent() throws {
+        let catalogue = AgentAdvertisedModelCatalog()
+        let availability = AgentModelCatalog.AvailabilityContext()
+        let generation = catalogue.productionGeneration(for: .claudeCode)
+        let options = ["claude-opus-5-5", "claude-opus-5-5:high"].map {
+            AgentModelOption(
+                rawValue: $0,
+                displayName: $0,
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            )
+        }
+        catalogue.invalidate(.codexExec)
+        XCTAssertTrue(catalogue.record(options, for: .claudeCode, generation: generation))
+        XCTAssertNil(try catalogue.selection("claudeCode:claude-opus-5-5", availability: availability).reasoningEffortRaw)
+        XCTAssertEqual(
+            try catalogue.selection("claudeCode:claude-opus-5-5:high", availability: availability).reasoningEffortRaw,
+            "high"
+        )
+    }
+
+    @MainActor
+    func testMCPCompatibleNativeConfigurationPreservesExplicitPinAndClearsNilPins() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lane-native-pin-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        defer {
+            WindowStatesManager.shared.unregisterWindowState(window)
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        }
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Compatible native pin", repoPaths: [root.path], ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "compatibleNativePinTests")
+        let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+        let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+        let viewModel = window.agentModeViewModel
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.isMCPOriginated = true
+        for agent in AgentProviderKind.allCases where agent.usesClaudeNativeRuntime && agent != .claudeCode {
+            try await viewModel.mcpConfigureSession(
+                tabID: tabID, agentRaw: agent.rawValue, modelRaw: "default", reasoningEffortRaw: "high"
+            )
+            XCTAssertEqual(session.selectedAgent, agent)
+            XCTAssertEqual(session.selectedReasoningEffortRaw, "high", agent.rawValue)
+            try await viewModel.mcpConfigureSession(
+                tabID: tabID, agentRaw: agent.rawValue, modelRaw: "default", reasoningEffortRaw: nil
+            )
+            XCTAssertNil(session.selectedReasoningEffortRaw, "Same-agent unpinned selection: \(agent.rawValue)")
+            session.selectedAgent = .codexExec
+            session.selectedReasoningEffortRaw = "xhigh"
+            try await viewModel.mcpConfigureSession(
+                tabID: tabID, agentRaw: agent.rawValue, modelRaw: "default", reasoningEffortRaw: nil
+            )
+            XCTAssertEqual(session.selectedAgent, agent)
+            XCTAssertNil(session.selectedReasoningEffortRaw, "Inherited provider pin: \(agent.rawValue)")
+        }
     }
 
     func testCreateLaneDigestDistinguishesExplicitModelFromRoleAndDefault() {

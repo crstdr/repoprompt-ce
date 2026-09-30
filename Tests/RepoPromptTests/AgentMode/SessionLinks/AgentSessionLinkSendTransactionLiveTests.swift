@@ -23,7 +23,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
                 isPlaceholderDefault: false,
                 isProviderDefault: false
             )
-        ], for: agent)
+        ], for: agent, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: agent))
         return AgentModelSelectionID(agentRaw: agent.rawValue, modelRaw: raw).rawValue
     }
 
@@ -71,6 +71,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertEqual(fixture.session.selectedReasoningEffortRaw, "high")
         XCTAssertEqual(fixture.viewModel.selectedModelRaw, fixture.session.selectedModelRaw)
         XCTAssertEqual(fixture.viewModel.ui.composer.props.selectedModelRaw, fixture.session.selectedModelRaw)
+        XCTAssertEqual(fixture.viewModel.ui.composer.props.selectedReasoningEffortDisplayName, "High")
         XCTAssertFalse(fixture.viewModel.isRestoringState)
         XCTAssertEqual(fixture.session.pendingHandoff, handoff)
         XCTAssertEqual(fixture.session.acpModelParameterSelections, pins)

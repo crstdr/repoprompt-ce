@@ -110,7 +110,7 @@ extension AgentModeViewModel {
                 props.selectedModelRaw = session.selectedModelRaw
                 props.selectedModelDisplayName = selection.option.displayName
                 props.selectedReasoningEffortRaw = session.selectedReasoningEffortRaw
-                props.selectedReasoningEffortDisplayName = selection.reasoningEffortRaw ?? ""
+                props.selectedReasoningEffortDisplayName = selectedReasoningEffortDisplayName
                 props.acpModelParameterControls = []
                 ui.composer.update(props)
             }
