@@ -10,6 +10,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         var providerBoundTexts: [String] = []
         var shouldStartNote = true
         var shouldAcceptNote = true
+        var noteTransportFailureGate: TestReleaseFence?
         var ownerIsCurrent = true
         var pendingSleeps: [CheckedContinuation<Void, Never>] = []
         var slept: [Duration] = []
@@ -41,6 +42,12 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
                     guard self.shouldStartNote else { return false }
                     self.state.active?.phase = .dispatchingNote
                     let dispatchID = AgentSelfCompactionDispatchID(requestID: requestID, stage: .note)
+                    if let failureGate = self.noteTransportFailureGate {
+                        XCTAssertTrue(self.state.noteWillAttempt(dispatchID))
+                        await failureGate.enterAndWait()
+                        XCTAssertTrue(self.state.noteTransportFailed(dispatchID))
+                        return false
+                    }
                     if self.shouldAcceptNote {
                         XCTAssertTrue(self.state.noteWillAttempt(dispatchID))
                         XCTAssertTrue(self.state.noteAccepted(dispatchID))
@@ -218,6 +225,54 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         XCTAssertEqual(fake.dispatchCount, 1)
         XCTAssertEqual(fake.state.active?.phase, .parked)
         XCTAssertEqual(fake.state.parkedNote?.frame, AgentSelfCompactNoteEnvelope.frame("alpha\nβeta"))
+    }
+
+    func testNoteTransportFailureAfterAttemptReleasesHoldsWithoutRetry() async throws {
+        let fake = Fake()
+        let gate = TestReleaseFence(name: "continuation transport attempted")
+        fake.noteTransportFailureGate = gate
+        let id = fake.arm()
+        let coordinator = fake.coordinator()
+        defer {
+            gate.release()
+            coordinator.cancelRuntimeWork()
+            fake.advanceDeadline()
+        }
+        XCTAssertTrue(coordinator.bindCompact(
+            .init(requestID: id, stage: .compact),
+            runID: fake.compactRunID, runAttemptID: fake.compactAttemptID
+        ))
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        guard await gate.waitUntilEntered(timeout: 3) else { return }
+        XCTAssertEqual(fake.state.active?.phase, .dispatchingNote)
+        XCTAssertEqual(fake.state.active?.noteDispatchStarted, true)
+        XCTAssertTrue(fake.state.blocksOverseerDelivery)
+        XCTAssertTrue(fake.state.blocksAutomaticWake)
+
+        gate.release()
+        try await AsyncTestWait.waitUntil("failed continuation settled") {
+            fake.state.active == nil
+        }
+        XCTAssertEqual(fake.state.latest?.requestID, id)
+        XCTAssertEqual(fake.state.latest?.outcome, .deliveryUnknown)
+        XCTAssertEqual(fake.state.latest?.noteDelivery, .deliveryUnknown)
+        XCTAssertEqual(fake.state.latest?.recoveryNote, "alpha\nβeta")
+        XCTAssertNil(fake.state.parkedNote)
+        XCTAssertFalse(fake.state.blocksOverseerDelivery)
+        XCTAssertFalse(fake.state.blocksAutomaticWake)
+
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        XCTAssertEqual(fake.dispatchCount, 1)
+        XCTAssertEqual(fake.state.reserve(note: "alpha\nβeta", idempotencyKey: "key", owner: fake.owner), .duplicate(id))
+        guard case .scheduled = fake.state.reserve(note: "next note", idempotencyKey: "next-key", owner: fake.owner) else {
+            return XCTFail("A settled transport failure must not block a new compaction request")
+        }
     }
 
     func testFailedAndCancelledCompactNeverSendNote() async {
