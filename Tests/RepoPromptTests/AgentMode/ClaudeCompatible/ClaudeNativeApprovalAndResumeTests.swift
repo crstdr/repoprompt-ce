@@ -101,30 +101,26 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     private actor ApplicationGate {
-        private var entry: CheckedContinuation<Void, Never>?
-        private var release: CheckedContinuation<Void, Never>?
-        private var entered = false
+        private let fence = TestReleaseFence(name: "native configuration application")
         private var hold = true
 
-        func waitUntilEntered() async {
-            if entered { return }
-            await withCheckedContinuation { entry = $0 }
+        func waitUntilEntered() async throws {
+            guard await fence.waitUntilEntered(timeout: 3) else {
+                fence.release()
+                throw CancellationError()
+            }
         }
 
         func respond() async -> [String: Any] {
             if hold {
                 hold = false
-                entered = true
-                entry?.resume()
-                entry = nil
-                await withCheckedContinuation { release = $0 }
+                await fence.enterAndWait()
             }
             return [:]
         }
 
-        func resume() {
-            release?.resume()
-            release = nil
+        nonisolated func resume() {
+            fence.release()
         }
     }
 
@@ -141,6 +137,12 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             lock.lock()
             defer { lock.unlock() }
             return lines.count
+        }
+
+        func line(at index: Int) -> Data? {
+            lock.lock()
+            defer { lock.unlock() }
+            return lines.indices.contains(index) ? lines[index] : nil
         }
     }
 
@@ -183,12 +185,15 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 initialized: true, controlRequest: { _ in await gate.respond() }, write: { writes.append($0) }
             )
             let first = Task { try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high) }
-            await gate.waitUntilEntered()
+            defer { first.cancel()
+                gate.resume()
+            }
+            try await gate.waitUntilEntered()
             var latest: NativeAgentRuntimeConfigurationApplication = .notReady
             for model in interveningModels {
                 latest = try await controller.applyModelAndEffortWithProof(model: model, effortLevel: .high)
             }
-            await gate.resume()
+            gate.resume()
             let superseded = try await first.value
             XCTAssertEqual(superseded, .superseded)
             XCTAssertEqual(writes.count, 0)
@@ -255,10 +260,13 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             write: { writes.append($0) }
         )
         let first = Task { try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high) }
-        await gate.waitUntilEntered()
+        defer { first.cancel()
+            gate.resume()
+        }
+        try await gate.waitUntilEntered()
         _ = try await controller.applyModelAndEffortWithProof(model: "B", effortLevel: .high)
         let latest = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high)
-        await gate.resume()
+        gate.resume()
         let stale = try await first.value
         XCTAssertEqual(stale, .superseded)
         XCTAssertEqual(controls.count, 2, "The delayed A intent must not write settings after B→A")
@@ -278,9 +286,12 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         let writes = WrittenLines()
         await controller.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
         let first = Task { try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .low) }
-        await gate.waitUntilEntered()
+        defer { first.cancel()
+            gate.resume()
+        }
+        try await gate.waitUntilEntered()
         _ = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .low)
-        await gate.resume()
+        gate.resume()
         let result = try await first.value
         XCTAssertEqual(result, .superseded, "Resolution failures must be generation-fenced too")
         XCTAssertEqual(writes.count, 0)
@@ -329,7 +340,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     @MainActor
-    func testOrdinarySendWaitsForModelAndEffortACKAndRejectsChangedModelWithSameEffort() async {
+    func testOrdinarySendWaitsForModelAndEffortACKAndRejectsChangedModelWithSameEffort() async throws {
         for changeModel in [false, true] {
             let controller = applicationController()
             let gate = ApplicationGate()
@@ -344,10 +355,13 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                     allowsCatalogRouteControllerRecovery: false
                 )
             }
-            await gate.waitUntilEntered()
+            defer { send.cancel()
+                gate.resume()
+            }
+            try await gate.waitUntilEntered()
             XCTAssertEqual(writes.count, 0, "An ordinary turn must await application even without Auto")
             if changeModel { session.selectedModelRaw = "claude-sonnet-4-6:high" }
-            await gate.resume()
+            gate.resume()
             let outcome = await send.value
             XCTAssertEqual(outcome, changeModel ? .superseded : .sent)
             XCTAssertEqual(writes.count, changeModel ? 0 : 1)
@@ -371,9 +385,12 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 allowsCatalogRouteControllerRecovery: false
             )
         }
-        await gate.waitUntilEntered()
+        defer { send.cancel()
+            gate.resume()
+        }
+        try await gate.waitUntilEntered()
         _ = try await controller.applyModelAndEffortWithProof(model: session.selectedModelRaw, effortLevel: .high)
-        await gate.resume()
+        gate.resume()
         let outcome = await send.value
         guard case .failed = outcome else { return XCTFail("Superseded application cannot release the prompt") }
         XCTAssertEqual(writes.count, 0)
@@ -485,14 +502,17 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                     allowsCatalogRouteControllerRecovery: false
                 )
             }
-            await gate.waitUntilEntered()
+            defer { send.cancel()
+                gate.resume()
+            }
+            try await gate.waitUntilEntered()
             XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, true)
             XCTAssertEqual(writes.count, 0)
             if invalidateProof {
                 _ = try await controller.applyModelAndEffortWithProof(model: session.selectedModelRaw, effortLevel: .high)
             }
             if cancelBeforeWrite { send.cancel() }
-            await gate.resume()
+            gate.resume()
             let outcome = await send.value
             guard case .failed = outcome else { return XCTFail("Expected send refusal/failure") }
             XCTAssertEqual(accepted, 0)
@@ -551,11 +571,14 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                     )
                 )
             }
-            await gate.waitUntilEntered()
+            defer { send.cancel()
+                gate.resume()
+            }
+            try await gate.waitUntilEntered()
             for model in interveningModels {
                 _ = try await controller.applyModelAndEffortWithProof(model: model, effortLevel: .high)
             }
-            await gate.resume()
+            gate.resume()
             let outcome = await send.value
             guard case .failed = outcome else { return XCTFail("Stale Auto error must refuse, not fall back and send") }
             XCTAssertEqual(controls.count, 1 + interveningModels.count, "No manual fallback from a superseded application")
@@ -564,26 +587,31 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         }
     }
 
-    func testProductionResolverAndControlResponseGateConfigurationProof() async throws {
-        let controller = ClaudeNativeProcessSessionController(
-            runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
-            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
-            environmentResolver: ClaudeCodeLaunchEnvironmentResolver(zaiKeyProvider: { nil }, backendSecretProvider: { _ in nil })
+    @MainActor
+    func testProductionFactoryAdapterAndControlResponseGateConfigurationProof() async throws {
+        let runtime = ClaudeAgentModeCoordinator.test_makeDefaultController(
+            runID: UUID(), tabID: UUID(), windowID: 1,
+            launchSettings: .init(
+                runtimeVariant: .standard, workspacePath: nil, permissionMode: nil,
+                allowNativeBashTool: nil, mcpStrictMode: nil
+            )
         )
-        let (frames, continuation) = AsyncStream<Data>.makeStream()
-        defer { continuation.finish() }
+        let adapter = try XCTUnwrap(runtime as? ClaudeCompatibleNativeSessionAdapter)
+        let underlying = await adapter.test_processController()
+        let controller = try XCTUnwrap(underlying, "The production factory must wrap the proof-capable process controller")
+        addTeardownBlock { await runtime.shutdown() }
         let writes = WrittenLines()
-        await controller.test_installConfigurationTransport(initialized: true, controlRequest: nil, write: {
-            writes.append($0)
-            continuation.yield($0)
-        })
-        var iterator = frames.makeAsyncIterator()
-        for reject in [true, false] {
+        await controller.test_installConfigurationTransport(initialized: true, controlRequest: nil, write: { writes.append($0) })
+        for (index, reject) in [true, false].enumerated() {
             let application = Task {
-                try await controller.applyModelAndEffortWithProof(model: "claude-opus-5-5:high", effortLevel: .low)
+                try await runtime.applyModelAndEffortWithProof(model: "claude-opus-5-5:high", effortLevel: .low)
             }
-            let frame = await iterator.next()
-            let request = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(frame)) as? [String: Any])
+            defer { application.cancel() }
+            try await AsyncTestWait.waitUntil("configuration request \(index) on production adapter wire") {
+                writes.count > index
+            }
+            let frame = try XCTUnwrap(writes.line(at: index))
+            let request = try XCTUnwrap(JSONSerialization.jsonObject(with: frame) as? [String: Any])
             XCTAssertEqual(request["type"] as? String, "control_request")
             let body = try XCTUnwrap(request["request"] as? [String: Any])
             XCTAssertEqual(body["subtype"] as? String, "apply_flag_settings")
@@ -605,9 +633,10 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 XCTAssertEqual(writes.count, 1, "Only the settings request was written")
             } else {
                 guard case let .applied(proof) = try await application.value else { return XCTFail("Missing ACK proof") }
-                _ = try await controller.sendUserMessage("ordinary", configuration: proof)
-                let userFrame = await iterator.next()
-                let user = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(userFrame)) as? [String: Any])
+                _ = try await runtime.sendUserMessage("ordinary", configuration: proof)
+                try await AsyncTestWait.waitUntil("user message on production adapter wire") { writes.count == 3 }
+                let userFrame = try XCTUnwrap(writes.line(at: 2))
+                let user = try XCTUnwrap(JSONSerialization.jsonObject(with: userFrame) as? [String: Any])
                 XCTAssertEqual(user["type"] as? String, "user")
                 XCTAssertEqual(writes.count, 3, "Two settings requests followed by one user write")
             }

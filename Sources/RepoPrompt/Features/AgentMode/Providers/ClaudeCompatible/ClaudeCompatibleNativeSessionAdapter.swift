@@ -21,6 +21,12 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         controller = controllerFactory()
     }
 
+    #if DEBUG
+        func test_processController() -> ClaudeNativeProcessSessionController? {
+            controller as? ClaudeNativeProcessSessionController
+        }
+    #endif
+
     var hasActiveSession: Bool {
         get async { await controller.hasActiveSession }
     }

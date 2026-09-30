@@ -439,6 +439,7 @@ final actor ClaudeNativeProcessSessionController {
         model: String?,
         effortLevel: ClaudeCodeEffortLevel?
     ) async throws -> NativeAgentRuntimeConfigurationApplication {
+        // Even legacy Void calls with no active process intentionally supersede prior proof.
         latestFlagSettingsIntentGeneration &+= 1
         appliedConfigurationProof = nil
         let intentGeneration = latestFlagSettingsIntentGeneration

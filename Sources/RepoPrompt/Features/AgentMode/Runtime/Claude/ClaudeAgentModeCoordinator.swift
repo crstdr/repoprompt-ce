@@ -679,6 +679,15 @@ final class ClaudeAgentModeCoordinator {
     }
 
     #if DEBUG
+        static func test_makeDefaultController(
+            runID: UUID,
+            tabID: UUID,
+            windowID: Int,
+            launchSettings: ControllerLaunchSettings
+        ) -> any NativeAgentRuntimeControlling {
+            makeDefaultController(runID: runID, tabID: tabID, windowID: windowID, launchSettings: launchSettings)
+        }
+
         func test_discardRuntimeState(for session: AgentTabSession) {
             session.claudeController = nil
             controllerLaunchSettingsByTabID.removeValue(forKey: session.tabID)
