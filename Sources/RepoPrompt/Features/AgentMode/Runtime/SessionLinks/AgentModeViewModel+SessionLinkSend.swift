@@ -92,7 +92,13 @@ extension AgentModeViewModel {
         guard let session = agentSessionLinkLiveSession(matching: candidate) else {
             return .blocked(.endpointInvalidated)
         }
-        let stopFence = request.startStopFence ?? AgentRunStartStopFence(session: session)
+        // A queued send is withdrawn only by an explicit Stop since it was queued; internal
+        // lifecycle cancellations must not drop it. The transaction's own start fence is taken
+        // now, so a cancellation during the drain still downgrades dispatch to persisted-only.
+        if let queuedFence = request.startStopFence, !queuedFence.permitsQueuedDelivery(to: session) {
+            return .blocked(.targetStopped)
+        }
+        let stopFence = AgentRunStartStopFence(session: session)
         guard stopFence.permitsStart(of: session) else { return .blocked(.targetStopped) }
         let admissionLiveness = liveness()
         guard admissionLiveness.permitsDelivery else {
