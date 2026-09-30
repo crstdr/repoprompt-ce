@@ -375,6 +375,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var stopTeardownCompleted: Bool?
         var currentStopRunID: UUID?
         var stoppedRunIDs: [UUID] = []
+        var stopLivenessReadings: [AgentSessionLinkSendLiveness] = []
 
         func agentSessionLinkPerformStop(
             to candidate: AgentSessionLinkEndpointCandidate,
@@ -392,11 +393,17 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                     withdrawInbound: withdrawInbound, commitAuthorization: commitAuthorization
                 )
             }
+            let admissionLiveness = liveness()
+            stopLivenessReadings.append(admissionLiveness)
+            guard admissionLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
             await beforeSendCommit?()
             let commit = await commitAuthorization()
             sendCommitOutcomes.append(commit)
             await afterSendCommit?()
             guard commit == .committed else { return .blocked(commit.refusal) }
+            let postCommitLiveness = liveness()
+            stopLivenessReadings.append(postCommitLiveness)
+            guard postCommitLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
             guard !queueHasCommittedDrain(), withdrawInbound() else { return .blocked(.targetBusy) }
             if let currentStopRunID { stoppedRunIDs.append(currentStopRunID) }
             return .settled(DomainAgentSessionLinkStopReceipt(
@@ -4192,6 +4199,71 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     }
 
     // MARK: - Stop
+
+    func testInFlightStopUsesItsValidatedHostAcrossAttachmentRefresh() async throws {
+        enum Scenario: CaseIterable {
+            case stable, swapped, detachedAfterCommit, missingAtEntry, closing, rebound
+        }
+        for scenario in Scenario.allCases {
+            let fixture = makeFixture()
+            defer { fixture.host.afterSendCommit = nil }
+            _ = await addLink(fixture)
+            fixture.host.stopResult = .stopped
+            let runID = UUID()
+            fixture.host.currentStopRunID = runID
+            let authorized = await fixture.bridge.authorizeTarget(
+                operation: .monitorStop,
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetSessionID: fixture.target.sessionID
+            )
+            let target = try XCTUnwrap(authorized.success)
+            let replacement = FakeEndpointHost()
+            replacement.targetWindowIsClosing = true
+            switch scenario {
+            case .stable:
+                break
+            case .swapped:
+                fixture.host.afterSendCommit = { [bridge = fixture.bridge] in
+                    bridge.attach(host: replacement)
+                }
+            case .detachedAfterCommit:
+                fixture.host.afterSendCommit = { [bridge = fixture.bridge] in
+                    // The bridge's weak attachment becomes nil when this temporary host dies.
+                    bridge.attach(host: FakeEndpointHost())
+                }
+            case .missingAtEntry:
+                fixture.bridge.attach(host: FakeEndpointHost())
+            case .closing:
+                fixture.host.afterSendCommit = { fixture.host.targetWindowIsClosing = true }
+            case .rebound:
+                fixture.host.afterSendCommit = {
+                    fixture.host.candidates.removeAll { $0.domainEndpoint == fixture.target.domainEndpoint }
+                }
+            }
+
+            let outcome = await fixture.bridge.stop(target: target, idempotencyKey: "host-refresh")
+            switch scenario {
+            case .stable, .swapped, .detachedAfterCommit:
+                guard case let .receipt(receipt) = outcome else {
+                    XCTFail("\(scenario): unchanged exact endpoints must survive attachment refresh: \(outcome)")
+                    continue
+                }
+                XCTAssertEqual(receipt.result, .stopped, "\(scenario)")
+                XCTAssertEqual(fixture.host.stoppedRunIDs, [runID], "\(scenario)")
+                XCTAssertEqual(fixture.host.stopLivenessReadings.count, 2, "\(scenario)")
+                XCTAssertTrue(fixture.host.stopLivenessReadings.allSatisfy(\.permitsDelivery), "\(scenario)")
+            case .missingAtEntry:
+                XCTAssertEqual(outcome, .rejected(.denied))
+                XCTAssertTrue(fixture.host.stopRequests.isEmpty)
+                XCTAssertTrue(fixture.host.stoppedRunIDs.isEmpty)
+            case .closing, .rebound:
+                XCTAssertEqual(outcome, .blocked(.endpointInvalidated), "\(scenario)")
+                XCTAssertEqual(fixture.host.stopLivenessReadings.count, 2, "\(scenario)")
+                XCTAssertTrue(fixture.host.stoppedRunIDs.isEmpty, "\(scenario)")
+            }
+            XCTAssertTrue(replacement.stopRequests.isEmpty, "Never retarget Stop to the new attachment")
+        }
+    }
 
     func testStopUsesOneTargetInvocationPerKeyAndReplaysStoredReceipt() async throws {
         let fixture = makeFixture()
