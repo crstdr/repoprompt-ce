@@ -372,7 +372,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// cancels it.
     public static let acpBackgroundCompactionNoteText =
         "The provider accepted the compaction; it may still be running in the background — sending "
-            + "a message to this session in the next ~60–90 s can cancel it."
+            + "a message to this session in the next ~60–90 s can cancel it. Overseer messages and "
+            + "automatic wakes are held until then."
 
     /// The visible provenance row for one overseer-requested context compaction.
     ///

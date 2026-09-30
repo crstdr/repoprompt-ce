@@ -1307,6 +1307,7 @@ extension AgentModeViewModel {
         case pendingAutoWake = "pending_auto_wake"
         case pendingSelfCompact = "pending_self_compact"
         case stopInProgress = "stop_in_progress"
+        case backgroundCompactionSettling = "background_compaction_settling"
         case candidateClosing = "candidate_closing"
     }
 
@@ -1328,6 +1329,7 @@ extension AgentModeViewModel {
         var hasPendingAutoWake: Bool
         var hasPendingSelfCompact: Bool
         var stopInProgress: Bool
+        var backgroundCompactionSettling = false
         var isCandidateClosing: Bool
     }
 
@@ -1352,6 +1354,7 @@ extension AgentModeViewModel {
             hasPendingAutoWake: session.oversight.pendingAutoWake != nil,
             hasPendingSelfCompact: session.selfCompactState.blocksOverseerDelivery,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
+            backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
             isCandidateClosing: candidate.isClosing
         )
     }
@@ -1373,6 +1376,7 @@ extension AgentModeViewModel {
         if input.hasPendingAutoWake { blockers.append(.pendingAutoWake) }
         if input.hasPendingSelfCompact { blockers.append(.pendingSelfCompact) }
         if input.stopInProgress { blockers.append(.stopInProgress) }
+        if input.backgroundCompactionSettling { blockers.append(.backgroundCompactionSettling) }
         if input.isCandidateClosing { blockers.append(.candidateClosing) }
         return blockers.sorted { $0.rawValue < $1.rawValue }
     }

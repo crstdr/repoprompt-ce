@@ -34,6 +34,14 @@ final class AgentModeRunService {
     typealias CancellationIntent = DomainAgentRunCancellationIntent
     typealias CancellationCompletion = DomainAgentRunCancellationCompletion
 
+    /// Who asked for a cancellation. Only an explicit user or managed Stop withdraws queued
+    /// cross-session work, retracts auto-wake, or invalidates queued inbound sends; internal
+    /// lifecycle cancellations (instruction timeout, attachment restart, teardown) do not.
+    enum CancellationOrigin: Equatable {
+        case explicitStop
+        case internalLifecycle
+    }
+
     /// Strategy for restoring draft text back to the composer.
     enum DraftRestorationStrategy: Equatable {
         /// Only restore if the composer is currently empty.
@@ -206,6 +214,12 @@ final class AgentModeRunService {
             startOutcome?.recordStartFailure(message: message)
             return selectedAgent == .codexExec ? .failed(message: message) : nil
         }
+
+        // Every path that reaches a provider from here is a new turn, and a new turn is exactly what
+        // cancels a background ACP compaction. Held deliveries never get here, so this is the
+        // session's own user (or its own queued work) choosing to proceed: the hold protects nothing
+        // any more.
+        session.endACPBackgroundCompactionSettle()
 
         if selectedAgent == .codexExec {
             let outcome = await codexRunner.startRun(
@@ -1282,7 +1296,7 @@ final class AgentModeRunService {
         admission: AgentRunCancellationAdmission
     ) -> Bool {
         guard admission.scope == .pendingStart, admission.claim(for: session) else { return false }
-        hooks.prepareForCancellation(session, .userStop)
+        hooks.prepareForCancellation(session, .userStop, .explicitStop)
         withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
         return true
     }
@@ -1292,6 +1306,7 @@ final class AgentModeRunService {
         session: AgentTabSession,
         intent: CancellationIntent = .userStop,
         completion: CancellationCompletion = .terminalPublished,
+        origin: CancellationOrigin = .internalLifecycle,
         admission: AgentRunCancellationAdmission? = nil,
         outcomeRecorder: AgentRunCancellationOutcomeRecorder? = nil
     ) async {
@@ -1300,13 +1315,13 @@ final class AgentModeRunService {
             guard admission.scope == .activeRun, admission.claim(for: session) else { return }
             outcomeRecorder?.recordCancellationInitiated()
         }
-        hooks.prepareForCancellation(session, intent)
+        hooks.prepareForCancellation(session, intent, origin)
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
             // A settled run can still carry deferred instructions. Local Stop must withdraw
             // them without manufacturing another terminal attempt.
-            if intent == .userStop {
+            if intent == .userStop, origin == .explicitStop {
                 withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
             }
             await terminalCommitBarrier.awaitTerminalPublication(

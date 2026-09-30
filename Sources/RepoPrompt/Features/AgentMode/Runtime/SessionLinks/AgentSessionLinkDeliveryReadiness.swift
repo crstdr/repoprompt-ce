@@ -63,6 +63,9 @@ enum AgentSessionLinkDeliveryReadiness {
         var selfCompactBlocksManagedStop: Bool = false
         /// A binding-qualified managed stop owns this target until cleanup releases its gate.
         var stopInProgress: Bool = false
+        /// A fire-and-forget ACP compaction may still be running in the provider's background, where
+        /// a new prompt would cancel it. Held off for its settle window like any other target work.
+        var backgroundCompactionSettling: Bool = false
 
         // Target interactions. Waiting states are never ready: answering one would be a different
         // capability than sending a new instruction, and `send` never gains it.
@@ -93,6 +96,7 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingSelfCompact: Bool = false,
             selfCompactBlocksManagedStop: Bool = false,
             stopInProgress: Bool = false,
+            backgroundCompactionSettling: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
             hasPendingUserInputRequest: Bool,
@@ -119,6 +123,7 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingSelfCompact = pendingSelfCompact
             self.selfCompactBlocksManagedStop = selfCompactBlocksManagedStop
             self.stopInProgress = stopInProgress
+            self.backgroundCompactionSettling = backgroundCompactionSettling
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser
             self.hasPendingUserInputRequest = hasPendingUserInputRequest
@@ -236,6 +241,7 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingOversightAutoWake
             || snapshot.pendingSelfCompact
             || snapshot.stopInProgress
+            || snapshot.backgroundCompactionSettling
             || snapshot.hasWaitingPrompt
             || snapshot.hasPendingAskUser
             || snapshot.hasPendingUserInputRequest
