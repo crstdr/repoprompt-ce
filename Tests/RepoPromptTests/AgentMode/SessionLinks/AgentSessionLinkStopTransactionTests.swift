@@ -344,15 +344,33 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(rendered.objectValue?["reason"]?.stringValue, "teardown_timeout")
         XCTAssertEqual(fixture.session.runState, .cancelled)
         let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+        XCTAssertEqual(fixture.session.stopState.activeManagedStopID, receipt.requestID)
         XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
         XCTAssertFalse(
             fixture.session.stopState.forceRetireUnclaimedStop(binding: binding),
             "deadline must not mark already-started teardown unclaimed"
         )
+        XCTAssertFalse(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
+        let overlappingStop = await stop(fixture)
+        XCTAssertEqual(overlappingStop, .blocked(.targetBusy), "executing cleanup must retain its fence")
         release.finish(())
         try await AsyncTestWait.waitUntil("late teardown releases the stop gate") {
-            !fixture.session.stopState.isStopping(binding: binding)
+            fixture.session.stopState.activeManagedStopID == nil
         }
+        XCTAssertNil(fixture.session.stopState.activeManagedStopBinding)
+        XCTAssertTrue(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
+        XCTAssertTrue(AgentModeViewModel.isIdleForSend(
+            session: fixture.session, candidate: fixture.candidate,
+            status: AgentModeViewModel.linkStatus(for: fixture.session, pendingInteraction: nil)
+        ))
+
+        fixture.session.mcpFollowUpRunPending = true
+        fixture.session.pendingInstructions = ["new work after timed-out Stop"]
+        guard case let .settled(nextReceipt) = await stop(fixture) else { return XCTFail("next Stop was wedged") }
+        XCTAssertEqual(nextReceipt.result, .stopped)
+        XCTAssertEqual(nextReceipt.resultingRunState, "pending_start_withdrawn")
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
     }
 
     func testSecondUserStopRetiresStartedTimedOutTeardownGate() async throws {
@@ -463,15 +481,26 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
         let wedgedID = UUID()
         XCTAssertTrue(fixture.session.stopState.claimManagedStop(id: wedgedID, binding: binding))
+        // Model the deadline winning before cleanup gets its first MainActor turn.
         fixture.session.stopState.markCleanupUnclaimedIfNeverStarted(id: wedgedID, binding: binding)
-        XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
+        XCTAssertEqual(fixture.session.stopState.activeManagedStopID, wedgedID)
+        XCTAssertFalse(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
         let foreignBinding = AgentPersistentSessionBindingIdentity(
             tabID: fixture.tabID, sessionID: UUID()
         )
         XCTAssertFalse(fixture.session.stopState.forceRetireUnclaimedStop(binding: foreignBinding))
         XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
         await fixture.viewModel.cancelAgentRun(tabID: fixture.tabID)
-        XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding))
+        XCTAssertNil(fixture.session.stopState.activeManagedStopID)
+        XCTAssertNil(fixture.session.stopState.activeManagedStopBinding)
+        XCTAssertTrue(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
+        fixture.session.mcpFollowUpRunPending = true
+        fixture.session.pendingInstructions = ["new work after never-started cleanup recovery"]
+        guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("next Stop was wedged") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.resultingRunState, "pending_start_withdrawn")
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
     }
 
     func testCleanupDeadlineNeverUnclaimsAnExecutingTeardown() throws {
