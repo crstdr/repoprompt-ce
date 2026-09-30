@@ -10290,6 +10290,14 @@ actor ServerNetworkManager {
                 connectionStats.removeValue(forKey: connectionID)
             }
 
+            func debugSetObservedPeerPIDForTesting(_ peerPID: Int?, connectionID: UUID) {
+                if let peerPID {
+                    bootstrapObservedPeerPIDByConnectionID[connectionID] = peerPID
+                } else {
+                    bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: connectionID)
+                }
+            }
+
             func debugDirectAdmissionStateForTesting(connectionID: UUID) -> DebugDirectAdmissionState {
                 DebugDirectAdmissionState(
                     pendingClientID: pendingConnections[connectionID],
