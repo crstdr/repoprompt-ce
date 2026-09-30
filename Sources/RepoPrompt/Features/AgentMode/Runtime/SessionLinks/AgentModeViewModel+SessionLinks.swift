@@ -912,7 +912,7 @@ extension AgentModeViewModel {
             for row in props.inbound {
                 consider(row.observerSessionID, createdAt: row.linkCreatedAt ?? .distantFuture)
             }
-            if props.isOverseer, let sessionID = props.endpoint?.sessionID ?? props.sessionID {
+            if let sessionID = props.endpoint?.sessionID ?? props.sessionID {
                 for row in props.outbound {
                     consider(sessionID, createdAt: row.linkCreatedAt ?? .distantFuture)
                 }

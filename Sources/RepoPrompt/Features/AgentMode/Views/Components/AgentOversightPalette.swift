@@ -12,7 +12,9 @@ import SwiftUI
 /// - No system hues that already carry meaning in the app: blue (accent/selection), purple
 ///   (Review, merge badges, Oracle), orange (MCP), teal, indigo, green (waiting/completed),
 ///   red (failed), cyan — and the merge badge's yellow. The remaining unclaimed hue territory is
-///   the magenta→rose band (~290°–350°) plus warm neutrals, so the palette lives there.
+///   the magenta→rose band (~295°–350°) plus warm neutrals, so the palette lives there. The
+///   pink-purple boundary slots stay ~25° warmer than `.systemPurple` (≈280°) and far less
+///   saturated, so no slot reads as the reserved purple.
 /// - Adjacent slots alternate lightness so neighbouring groups stay distinguishable even where
 ///   hues sit close together.
 /// - Each slot has explicit light- and dark-mode variants; both are contrast-checked in tests
@@ -32,9 +34,9 @@ enum AgentOversightPalette {
     private static let entries: [Entry] = [
         Entry(name: "magenta", light: rgb(0xB0308C), dark: rgb(0xEF83CC)),
         Entry(name: "wine", light: rgb(0x9A3550), dark: rgb(0xE08B9C)),
-        Entry(name: "orchid", light: rgb(0x9E55A4), dark: rgb(0xCD93DA)),
+        Entry(name: "orchid", light: rgb(0xA1549B), dark: rgb(0xD27ECB)),
         Entry(name: "rose", light: rgb(0xC4427E), dark: rgb(0xF49AC1)),
-        Entry(name: "mulberry", light: rgb(0x7E5680), dark: rgb(0xC49BCB)),
+        Entry(name: "mulberry", light: rgb(0x865A83), dark: rgb(0xCB8FB8)),
         Entry(name: "raspberry", light: rgb(0xB52660), dark: rgb(0xF2698F)),
         Entry(name: "cocoa", light: rgb(0x8C6A50), dark: rgb(0xCBA98E)),
         Entry(name: "fuchsia", light: rgb(0xC027A2), dark: rgb(0xED6FCE)),

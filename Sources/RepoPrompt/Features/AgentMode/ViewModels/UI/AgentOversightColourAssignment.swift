@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptDomainRuntime
 
 /// A sidebar row's oversight roles, derived from the published link projection.
 ///
@@ -95,9 +94,9 @@ final class AgentOversightColourAllocator {
         AgentOversightPalette.slotCount
     }
 
-    /// The overseer's slot, allocating the lowest free one on first sight. An allocating read is
-    /// safe: reconcile assigns in link order, and a read that arrives earlier lands on the same
-    /// lowest-free decision it would have made anyway.
+    /// The overseer's slot, allocating the lowest free one on first sight. Every published
+    /// projection passes through `reconcile` before the change notification, so readers always
+    /// see a settled map; the allocating read exists only as a defensive pre-reconcile fallback.
     @discardableResult
     func slot(for overseerSessionID: UUID) -> Int {
         if let existing = slotsByOverseerID[overseerSessionID] { return existing }
