@@ -162,6 +162,12 @@ final actor ClaudeNativeProcessSessionController {
         configLease?.url
     }
 
+    #if DEBUG
+        private var configurationTestControlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])?
+        private var configurationTestWrite: (@Sendable (Data) throws -> Void)?
+        private var configurationTestBeforeApplicationErrorReturn: (@Sendable () async -> Void)?
+    #endif
+    private var configurationLifetime = UUID()
     private var initialFlagSettingsRequest: [String: Any]?
     private var latestFlagSettingsIntentGeneration: UInt64 = 0
     private var activeLaunchEnvironmentSignature: LaunchEnvironmentSignature?
@@ -231,7 +237,10 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     var hasActiveSession: Bool {
-        process != nil
+        #if DEBUG
+            if configurationTestWrite != nil { return true }
+        #endif
+        return process != nil
     }
 
     deinit {
@@ -381,7 +390,7 @@ final actor ClaudeNativeProcessSessionController {
         effortLevel: ClaudeCodeEffortLevel? = nil,
         systemPromptOverride: String? = nil
     ) async throws -> SessionRef {
-        if process != nil, isInitialized {
+        if hasActiveSession, isInitialized {
             return SessionRef(sessionID: sessionID)
         }
 
@@ -415,41 +424,78 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
-        guard process != nil else { return }
+        do {
+            _ = try await applyModelAndEffortForTurn(model: model, effortLevel: effortLevel, replacingFailure: nil)
+        } catch let failure as NativeAgentRuntimeConfigurationFailure {
+            // Live picker updates retain the existing, unwrapped error contract.
+            throw failure.underlyingError
+        }
+    }
 
+    func applyModelAndEffortForTurn(
+        model: String?,
+        effortLevel: ClaudeCodeEffortLevel?,
+        replacingFailure: NativeAgentRuntimeConfigurationFailure?
+    ) async throws -> Bool {
+        if let failure = replacingFailure {
+            guard failure.lifetime == configurationLifetime,
+                  failure.intentGeneration == latestFlagSettingsIntentGeneration,
+                  failure.requestGeneration == flagSettingsRequestGeneration
+            else { return false }
+        }
+        guard hasActiveSession, !isShuttingDown else { return false }
+        // No actor suspension between failure-token validation and consuming its intent.
         latestFlagSettingsIntentGeneration &+= 1
         let intentGeneration = latestFlagSettingsIntentGeneration
-        let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
-        guard intentGeneration == latestFlagSettingsIntentGeneration else { return }
-        if liveFlagSettingsRequiresProcessRestart(for: resolved.launchEnvironment) {
-            writeRawEventLogRecord(kind: "session.flagSettingsDeferred", payload: [
-                "reason": "launch_environment_changed",
-                "model": model ?? NSNull()
-            ] as [String: Any])
-            throw ControllerError.liveModelSwitchRequiresRestart
+        let lifetime = configurationLifetime
+        var requestGeneration = flagSettingsRequestGeneration
+        do {
+            let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
+            guard lifetime == configurationLifetime, intentGeneration == latestFlagSettingsIntentGeneration else { return false }
+            guard hasActiveSession, !isShuttingDown else { return false }
+            if liveFlagSettingsRequiresProcessRestart(for: resolved.launchEnvironment) {
+                writeRawEventLogRecord(kind: "session.flagSettingsDeferred", payload: [
+                    "reason": "launch_environment_changed", "model": model ?? NSNull()
+                ] as [String: Any])
+                throw ControllerError.liveModelSwitchRequiresRestart
+            }
+            storeFlagSettingsRequest(resolved.request)
+            requestGeneration = flagSettingsRequestGeneration
+            guard isInitialized || hasCompletedInitialFlagSettings else {
+                writeRawEventLogRecord(kind: "session.flagSettingsPending", payload: [
+                    "settings": resolved.request?["settings"] ?? NSNull()
+                ] as [String: Any])
+                return true // Preserve initialization's existing drain of the stored request.
+            }
+            if let request = resolved.request {
+                let result = try await sendControlRequest(request: request, timeoutSeconds: 5.0)
+                writeRawEventLogRecord(kind: "session.flagSettingsApplied", payload: [
+                    "settings": request["settings"] ?? NSNull(), "response": result, "source": "live_update"
+                ] as [String: Any])
+            }
+            return lifetime == configurationLifetime
+                && intentGeneration == latestFlagSettingsIntentGeneration
+                && requestGeneration == flagSettingsRequestGeneration
+                && hasActiveSession && !isShuttingDown
+        } catch {
+            guard lifetime == configurationLifetime,
+                  intentGeneration == latestFlagSettingsIntentGeneration,
+                  requestGeneration == flagSettingsRequestGeneration
+            else { return false }
+            let failure = NativeAgentRuntimeConfigurationFailure(
+                underlyingError: error, lifetime: lifetime,
+                intentGeneration: intentGeneration, requestGeneration: requestGeneration
+            )
+            #if DEBUG
+                await configurationTestBeforeApplicationErrorReturn?()
+            #endif
+            throw failure
         }
-        storeFlagSettingsRequest(resolved.request)
-
-        guard process != nil else { return }
-        guard isInitialized || hasCompletedInitialFlagSettings else {
-            writeRawEventLogRecord(kind: "session.flagSettingsPending", payload: [
-                "settings": resolved.request?["settings"] ?? NSNull()
-            ] as [String: Any])
-            return
-        }
-        guard let request = resolved.request else { return }
-
-        let flagSettingsResult = try await sendControlRequest(request: request, timeoutSeconds: 5.0)
-        writeRawEventLogRecord(kind: "session.flagSettingsApplied", payload: [
-            "settings": request["settings"] ?? NSNull(),
-            "response": flagSettingsResult,
-            "source": "live_update"
-        ] as [String: Any])
     }
 
     @discardableResult
     func sendUserMessage(_ text: String) async throws -> UUID {
-        guard process != nil else {
+        guard hasActiveSession else {
             throw ControllerError.processNotRunning
         }
         let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID)
@@ -518,6 +564,7 @@ final actor ClaudeNativeProcessSessionController {
     func shutdown() async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
+        configurationLifetime = UUID()
         writeRawEventLogRecord(kind: "session.shutdown")
 
         failPendingControlRequests(with: ControllerError.processNotRunning)
@@ -571,6 +618,7 @@ final actor ClaudeNativeProcessSessionController {
     ) async throws {
         guard process == nil else { return }
 
+        configurationLifetime = UUID()
         latestFlagSettingsIntentGeneration = 0
         flagSettingsRequestGeneration = 0
         hasCompletedInitialFlagSettings = false
@@ -795,6 +843,9 @@ final actor ClaudeNativeProcessSessionController {
         request: [String: Any],
         timeoutSeconds: TimeInterval? = nil
     ) async throws -> [String: Any] {
+        #if DEBUG
+            if let configurationTestControlRequest { return try await configurationTestControlRequest(request) }
+        #endif
         guard process != nil else {
             throw ControllerError.processNotRunning
         }
@@ -854,6 +905,11 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     private func sendLine(_ lineData: Data, shutdownOnFailure: Bool = true) throws {
+        #if DEBUG
+            if let configurationTestWrite { try configurationTestWrite(lineData)
+                return
+            }
+        #endif
         guard let process else {
             throw ControllerError.processNotRunning
         }
@@ -1663,6 +1719,26 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     #if DEBUG
+        func test_installConfigurationTransport(
+            controlRequest: @escaping @Sendable ([String: Any]) async throws -> [String: Any],
+            write: @escaping @Sendable (Data) throws -> Void
+        ) {
+            precondition(process == nil)
+            configurationLifetime = UUID()
+            latestFlagSettingsIntentGeneration = 0
+            flagSettingsRequestGeneration = 0
+            isShuttingDown = false
+            isInitialized = true
+            hasCompletedInitialFlagSettings = true
+            sessionID = "auto-fallback-session"
+            configurationTestControlRequest = controlRequest
+            configurationTestWrite = write
+        }
+
+        func test_setBeforeApplicationErrorReturn(_ action: @escaping @Sendable () async -> Void) {
+            configurationTestBeforeApplicationErrorReturn = action
+        }
+
         static func test_isRawEventFileLoggingEnabled() -> Bool {
             isRawEventFileLoggingEnabled()
         }
