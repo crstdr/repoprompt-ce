@@ -63,6 +63,14 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         try await controller.applyModelAndEffort(model: model, effortLevel: effortLevel)
     }
 
+    func applyModelAndEffortWithProof(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        try await controller.applyModelAndEffortWithProof(model: model, effortLevel: effortLevel)
+    }
+
+    func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try await controller.sendUserMessage(text, configuration: configuration)
+    }
+
     func sendUserMessage(_ text: String) async throws -> UUID {
         try await controller.sendUserMessage(text)
     }

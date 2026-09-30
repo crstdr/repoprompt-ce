@@ -860,7 +860,8 @@ final class ClaudeAgentModeCoordinator {
              .invalidControlResponse,
              .controlRequestTimedOut:
             return true
-        case .liveModelSwitchRequiresRestart:
+        case .liveModelSwitchRequiresRestart, .configurationNotCurrent:
+            // Configuration refusals are not evidence of a missing conversation.
             return false
         }
     }
@@ -1241,8 +1242,8 @@ final class ClaudeAgentModeCoordinator {
                 )
             }
 
-            // Validate launch settings before optional effort application below. That
-            // application can suspend, so its result is fenced again before dispatch.
+            // Validate launch settings before ordinary-turn configuration application below.
+            // Application can suspend, so the complete snapshot is fenced again before dispatch.
             if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
                 await recycleClaudeControllerForLaunchSettingsChange(
                     session: session,
@@ -1282,7 +1283,19 @@ final class ClaudeAgentModeCoordinator {
             if appliedAutoEffortByTabID[session.tabID]?.controllerID != controllerID {
                 appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
             }
+            let selectedProvider = session.selectedAgent
+            let selectedModelRaw = session.selectedModelRaw
+            let selectedModel = effectiveClaudeModel(for: session)
             let manualEffort = currentClaudeEffortLevel(for: session)
+            func configurationIsCurrent() -> Bool {
+                !Task.isCancelled
+                    && intentIsCurrent(intent, for: session)
+                    && sessionOwnsClaudeController(controller, for: session)
+                    && session.selectedAgent == selectedProvider
+                    && session.selectedModelRaw == selectedModelRaw
+                    && effectiveClaudeModel(for: session) == selectedModel
+                    && currentClaudeEffortLevel(for: session) == manualEffort
+            }
             let autoEffort: ClaudeCodeEffortLevel? = {
                 guard let autoEffortSelection,
                       autoEffortSelection.isCurrent(
@@ -1312,43 +1325,34 @@ final class ClaudeAgentModeCoordinator {
                 }
                 hostCapabilities.scheduleSave(session)
             }
-            if !isMaintenance,
-               let desiredEffort = autoEffort ?? (appliedAutoEffortByTabID[session.tabID] == nil ? nil : manualEffort)
-            {
+            var configurationProof: NativeAgentRuntimeConfigurationProof?
+            if !isMaintenance {
+                var appliedAutoEffort = autoEffort
+                let application: NativeAgentRuntimeConfigurationApplication
                 do {
-                    try await controller.applyModelAndEffort(
-                        model: effectiveClaudeModel(for: session),
-                        effortLevel: desiredEffort
+                    application = try await controller.applyModelAndEffortWithProof(
+                        model: selectedModel,
+                        effortLevel: autoEffort ?? manualEffort
                     )
-                    if autoEffort != nil {
-                        if let auditTurnID {
-                            session.updateAutomationAudit(turnID: auditTurnID) {
-                                $0.autoEffort.application = .controlAccepted
-                            }
-                            hostCapabilities.scheduleSave(session)
-                        }
-                        appliedAutoEffortByTabID[session.tabID] = (controllerID, desiredEffort)
-                    } else {
-                        appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
-                    }
                 } catch {
-                    // An optional Jev choice must not leave the controller at a prior override.
+                    // Only optional Auto may fall back, and only for the same still-current model.
+                    // Application failure is not a missing conversation or fresh-start recovery.
+                    guard configurationIsCurrent() else { return .superseded }
+                    guard autoEffort != nil else {
+                        return recordSendFailure(
+                            "Claude could not apply model and effort before sending: \(error.localizedDescription)",
+                            session: session,
+                            intent: intent
+                        )
+                    }
                     do {
-                        try await controller.applyModelAndEffort(
-                            model: effectiveClaudeModel(for: session),
+                        application = try await controller.applyModelAndEffortWithProof(
+                            model: selectedModel,
                             effortLevel: manualEffort
                         )
-                        appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
-                        if let auditTurnID {
-                            session.updateAutomationAudit(turnID: auditTurnID) {
-                                if $0.autoEffort.decision == .selected {
-                                    $0.autoEffort.application = .fallbackToManual
-                                    $0.autoEffort.fallbackApplied = true
-                                }
-                            }
-                            hostCapabilities.scheduleSave(session)
-                        }
+                        appliedAutoEffort = nil
                     } catch {
+                        guard configurationIsCurrent() else { return .superseded }
                         return recordSendFailure(
                             "Claude could not restore manual effort before sending: \(error.localizedDescription)",
                             session: session,
@@ -1356,36 +1360,47 @@ final class ClaudeAgentModeCoordinator {
                         )
                     }
                 }
-                guard intentIsCurrent(intent, for: session),
-                      sessionOwnsClaudeController(controller, for: session)
-                else { return .superseded }
-                // Applying flags suspends. Do not dispatch on a controller whose model,
-                // manual effort, or route changed while the setting was being applied.
-                guard currentClaudeEffortLevel(for: session) == manualEffort,
+                guard configurationIsCurrent(),
                       (autoEffort == nil || autoEffortSelection?.isCurrent(
                           provider: session.selectedAgent,
                           selectedModelRaw: session.selectedModelRaw,
                           manualEffortRaw: manualEffort.rawValue,
                           enabled: autoEffortEnabledProvider()
                       ) == true)
-                else {
+                else { return .superseded }
+                switch application {
+                case let .applied(proof):
+                    configurationProof = proof
+                case .superseded, .notReady:
                     return recordSendFailure(
-                        "Claude effort changed before sending. Retry the turn.",
+                        "Claude model configuration is not current or ready. No message was sent; retry the turn.",
                         session: session,
                         intent: intent
                     )
                 }
                 if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
-                    continue
+                    return .superseded
                 }
                 if requiresFinalRouteFence,
                    !hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
                 {
                     return recordSendFailure(
-                        routeVerificationFailure("effort-fence"),
+                        routeVerificationFailure("configuration-fence"),
                         session: session,
                         intent: intent
                     )
+                }
+                if let appliedAutoEffort {
+                    appliedAutoEffortByTabID[session.tabID] = (controllerID, appliedAutoEffort)
+                } else {
+                    appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
+                }
+                if let auditTurnID, autoEffort != nil {
+                    session.updateAutomationAudit(turnID: auditTurnID) {
+                        $0.autoEffort.application = appliedAutoEffort == nil ? .fallbackToManual : .controlAccepted
+                        $0.autoEffort.fallbackApplied = appliedAutoEffort == nil
+                    }
+                    hostCapabilities.scheduleSave(session)
                 }
             }
 
@@ -1524,6 +1539,14 @@ final class ClaudeAgentModeCoordinator {
                     monitoring.text,
                     instructions: instructions
                 )
+                guard let configurationProof,
+                      configurationIsCurrent(),
+                      !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session),
+                      !requiresFinalRouteFence || hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
+                else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
+                }
                 if let auditTurnID {
                     session.updateAutomationAudit(turnID: auditTurnID) {
                         $0.providerDispatchAttempted = true
@@ -1537,7 +1560,7 @@ final class ClaudeAgentModeCoordinator {
                     attemptedParkedNoteID = parked.dispatchID
                     hostCapabilities.scheduleSave(session)
                 }
-                let turnID = try await controller.sendUserMessage(providerBoundText)
+                let turnID = try await controller.sendUserMessage(providerBoundText, configuration: configurationProof)
                 if let parked {
                     var state = session.selfCompactState
                     if state.noteAccepted(parked.dispatchID) {
@@ -2118,6 +2141,11 @@ final class ClaudeAgentModeCoordinator {
             agentKind: agentKind,
             pinnedEffortRaw: pinnedEffortRaw,
             isMCPOriginated: isMCPOriginated
+        ) ?? validatedMCPPinnedEffort(
+            modelRaw: modelRaw,
+            agentKind: agentKind,
+            pinnedEffortRaw: ClaudeModelSpecifier(raw: modelRaw).explicitEffortLevel?.rawValue,
+            isMCPOriginated: true
         ) ?? stored
     }
 

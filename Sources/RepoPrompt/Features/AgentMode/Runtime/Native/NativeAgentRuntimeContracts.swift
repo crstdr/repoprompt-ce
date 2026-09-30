@@ -22,6 +22,10 @@ protocol NativeAgentRuntimeControlling: Actor {
     ) async throws -> NativeAgentRuntimeSessionRef
     func currentSessionRef() async -> NativeAgentRuntimeSessionRef
     func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws
+    /// Unlike the legacy live-update helper, this proves the complete requested configuration.
+    func applyModelAndEffortWithProof(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication
+    func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID
+    /// Maintenance commands intentionally do not require an ordinary-turn configuration proof.
     func sendUserMessage(_ text: String) async throws -> UUID
     /// Sends a reasoned interrupt request to the provider runtime.
     /// - Parameter reason: "interrupt" for steering (graceful), "cancel" for forceful stop.
@@ -31,7 +35,31 @@ protocol NativeAgentRuntimeControlling: Actor {
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
 }
 
+/// Ephemeral controller-owned receipt, never persisted or inferred from a Void update.
+/// The lifetime prevents reset generation counters from reviving an old process's receipt.
+struct NativeAgentRuntimeConfigurationProof: Equatable {
+    let lifetime: UUID
+    let intentGeneration: UInt64
+    let requestGeneration: UInt64
+}
+
+enum NativeAgentRuntimeConfigurationApplication: Equatable {
+    case applied(NativeAgentRuntimeConfigurationProof)
+    case superseded
+    case notReady
+}
+
 extension NativeAgentRuntimeControlling {
+    /// Fail closed for runtimes that have not implemented application proof. In particular,
+    /// an old no-op fake must not accidentally certify provider application.
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        .notReady
+    }
+
+    func sendUserMessage(_: String, configuration _: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        throw NativeAgentRuntimeControllerError.configurationNotCurrent
+    }
+
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
         .unsupported(message: "Native runtime has no local API for \(action.rawValue) cleanup of conversations.")
     }
