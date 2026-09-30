@@ -1826,6 +1826,7 @@ extension AgentModeViewModel {
             && session.pendingInstructions.isEmpty
             && session.pendingACPSteeringInstructions.isEmpty
             && session.pendingClaudeSteeringInstructions.isEmpty
+            && !session.isSettlingACPBackgroundCompaction
             && session.pendingAskUser == nil
             && session.pendingUserInputRequest == nil
             && session.pendingApproval == nil

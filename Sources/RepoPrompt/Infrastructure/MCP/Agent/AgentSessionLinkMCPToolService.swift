@@ -1987,8 +1987,11 @@ enum AgentSessionLinkResponseRenderer {
             + "a compaction started. Read the session before requesting again; a new request "
             + "needs a new idempotency_key."
         if started, receipt.compactionRunsInBackground {
-            detail += " This provider may run the compaction in the background: do not send to "
-                + "the session for ~60–90 s or the compaction can be cancelled."
+            detail += " This provider may keep compacting in the background after its turn ends, "
+                + "where a new prompt can get the compaction cancelled. If that turn ends with no output, "
+                + "RepoPrompt holds sends, compactions, and automatic wakes to the session for up to 90 s "
+                + "(poll lists send_blockers: background_compaction_settling); wait with "
+                + "until: \"sendable\" instead of retrying."
         }
         return .object([
             "result": .string(started ? "accepted" : "not_started"),

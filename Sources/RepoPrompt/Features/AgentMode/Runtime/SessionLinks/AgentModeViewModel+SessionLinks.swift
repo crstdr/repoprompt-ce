@@ -1306,6 +1306,7 @@ extension AgentModeViewModel {
         case pendingClaudeSteeringInstructions = "pending_claude_steering_instructions"
         case pendingAutoWake = "pending_auto_wake"
         case stopInProgress = "stop_in_progress"
+        case backgroundCompactionSettling = "background_compaction_settling"
         case candidateClosing = "candidate_closing"
     }
 
@@ -1326,6 +1327,7 @@ extension AgentModeViewModel {
         var hasPendingClaudeSteeringInstructions: Bool
         var hasPendingAutoWake: Bool
         var stopInProgress: Bool
+        var backgroundCompactionSettling = false
         var isCandidateClosing: Bool
     }
 
@@ -1349,6 +1351,7 @@ extension AgentModeViewModel {
             hasPendingClaudeSteeringInstructions: !session.pendingClaudeSteeringInstructions.isEmpty,
             hasPendingAutoWake: session.oversight.pendingAutoWake != nil,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
+            backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
             isCandidateClosing: candidate.isClosing
         )
     }
@@ -1369,6 +1372,7 @@ extension AgentModeViewModel {
         if input.hasPendingClaudeSteeringInstructions { blockers.append(.pendingClaudeSteeringInstructions) }
         if input.hasPendingAutoWake { blockers.append(.pendingAutoWake) }
         if input.stopInProgress { blockers.append(.stopInProgress) }
+        if input.backgroundCompactionSettling { blockers.append(.backgroundCompactionSettling) }
         if input.isCandidateClosing { blockers.append(.candidateClosing) }
         return blockers.sorted { $0.rawValue < $1.rawValue }
     }

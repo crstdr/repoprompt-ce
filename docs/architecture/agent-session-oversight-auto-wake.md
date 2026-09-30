@@ -454,10 +454,15 @@ a retired one is detached and shut down. Busy is not retired.
 
 ACP context count becomes unknown at dispatch: new occupancy may vouch for it again, but this
 command's billed prompt count cannot. A proven no-send restores the withdrawn vouch only if no
-newer occupancy replaced it. Instant silent completion may mean background work, so it adds a
-fixed transcript hint; the ACP receipt cautions that another prompt may cancel that work and to
-wait ~60–90 seconds. This is guidance, not completion proof, a cooldown, or new admission policy.
-Duplicate receipts retain that metadata.
+newer occupancy replaced it. Instant silent completion may mean background work that the
+session's next prompt would cancel, so it adds a fixed transcript hint and starts a 90-second
+settle hold (`AgentTabSession.beginACPBackgroundCompactionSettle`). While it lasts, delivery
+readiness is `target_not_idle` — refusing `send`, `compact`, and parked `when_sendable` drains —
+Auto-wake and periodic wakes are not admitted, and `poll` reports `idle_for_send: false` with
+`send_blockers: ["background_compaction_settling"]`. Expiry publishes a readiness change, so parked
+work resumes without polling; any new run start (the session's own user is never held) ends the
+hold early. It is a cancellation guard, not completion proof. Duplicate receipts retain the
+background metadata.
 
 A failed last run is not a readiness blocker, so a target that died on context length is admissible;
 any interaction or `awaiting_user` is `target_not_idle`. `accepted` means started, not completed: completion is

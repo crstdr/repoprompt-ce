@@ -183,6 +183,12 @@ final class AgentModeRunService {
             return selectedAgent == .codexExec ? .failed(message: message) : nil
         }
 
+        // Every path that reaches a provider from here is a new turn, and a new turn is exactly what
+        // cancels a background ACP compaction. Held deliveries never get here, so this is the
+        // session's own user (or its own queued work) choosing to proceed: the hold protects nothing
+        // any more.
+        session.endACPBackgroundCompactionSettle()
+
         if selectedAgent == .codexExec {
             let outcome = await codexRunner.startRun(
                 tabID: tabID,

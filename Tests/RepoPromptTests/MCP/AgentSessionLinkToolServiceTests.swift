@@ -496,6 +496,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let detail = try XCTUnwrap(warned["detail"]?.stringValue)
         XCTAssertTrue(detail.contains("background"))
         XCTAssertTrue(detail.contains("cancelled"), "The warning names the consequence")
+        XCTAssertTrue(
+            detail.contains("background_compaction_settling"),
+            "The receipt names the enforced hold poll reports, not just a caution"
+        )
 
         let inTurn = DomainAgentSessionLinkSendReceipt(
             targetSessionID: UUID(),
