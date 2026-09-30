@@ -881,9 +881,12 @@ struct AgentSessionLinkMCPToolService {
                 observerInput: observerInput
             )
             if waitResult.interruptedByLocalInput {
+                let pendingSends = await bridge.pendingSendProjections(for: leases)
+                // Keep the survivor proof as the last suspension before rendering.
                 let survivors = await bridge.terminalWaitSurvivingStates(leases: leases)
                 let rendered = AgentSessionLinkResponseRenderer.waitValue(
                     .init(outcome: .cancelled, targets: survivors, interruptedByLocalInput: true),
+                    pendingSends: pendingSends,
                     isSingle: isSingle
                 )
                 let survivingIDs = Set(survivors.map(\.sessionID))

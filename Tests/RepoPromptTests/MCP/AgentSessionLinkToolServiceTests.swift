@@ -40,6 +40,31 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertNil(current["_meta"]?.objectValue?["wake_reason"])
     }
 
+    func testLocalInputCancellationPreservesQueuedSendProjectionAndQueue() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let targetID = Value.string(fixture.target.sessionID.uuidString)
+        let queued = try await Self.executeObject(fixture.service, args: [
+            "op": .string("send"), "session_id": targetID,
+            "message": .string("review the diff"), "idempotency_key": .string("queued-key"),
+            "delivery": .string("when_sendable")
+        ])
+        XCTAssertEqual(queued["result"]?.stringValue, "queued")
+        var delayed = fixture.service
+        let old = fixture.bridge.captureWaitInput(for: fixture.observer.domainEndpoint)
+        delayed.captureWaitInput = { old }
+        await fixture.bridge.acceptLocalInput(for: fixture.observer.domainEndpoint).value
+        let interrupted = try await Self.executeObject(delayed, args: [
+            "op": .string("wait"), "session_id": targetID, "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(interrupted["result"]?.stringValue, "cancelled")
+        XCTAssertEqual(interrupted["pending_send"]?.objectValue?["idempotency_key"], .string("queued-key"))
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": targetID
+        ])
+        XCTAssertEqual(polled["pending_send"]?.objectValue?["idempotency_key"], .string("queued-key"))
+    }
+
     func testWaitRejectsCapturedEndpointReplacement() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
