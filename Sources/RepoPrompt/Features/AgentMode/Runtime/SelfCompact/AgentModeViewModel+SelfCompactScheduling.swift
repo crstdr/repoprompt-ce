@@ -187,6 +187,32 @@ extension AgentModeViewModel {
         }
     }
 
+    /// Readiness for this request's dedicated continuation note. The generic ACP background-compaction
+    /// hold exists so a new prompt cannot cancel a compaction that may still be running. A note is
+    /// dispatched only after this request's own compaction was verified (a correlated native success
+    /// or a vouched ACP context drop), so that hold no longer protects anything, and starting the
+    /// note ends it. Every other holder, including an unverified attempt, still waits it out.
+    static func agentSelfCompactNoteReadinessSnapshot(
+        session: TabSession,
+        requestID: UUID
+    ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
+        var snapshot = agentSessionLinkDeliveryReadinessSnapshot(
+            session: session,
+            endpointMatchesGrant: true,
+            isClosing: false,
+            ignoresComposerSubmissionInFlight: true,
+            ignoresSelfCompactRequestID: requestID
+        )
+        if let active = session.selfCompactState.active,
+           active.id == requestID,
+           active.compactTurnSucceeded == true,
+           active.acpCompletionUnverified != true
+        {
+            snapshot.backgroundCompactionSettling = false
+        }
+        return snapshot
+    }
+
     private func agentSelfCompactHasCompetingWriter(_ session: TabSession, sessionID: UUID) -> Bool {
         let sameWindowWriter = sessions.values.contains { other in
             other !== session && other.activeAgentSessionID == sessionID
@@ -430,13 +456,7 @@ extension AgentModeViewModel {
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }
             return AgentSessionLinkDeliveryReadiness.evaluate(
-                snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
-                    session: session,
-                    endpointMatchesGrant: true,
-                    isClosing: false,
-                    ignoresComposerSubmissionInFlight: true,
-                    ignoresSelfCompactRequestID: requestID
-                )
+                snapshot: Self.agentSelfCompactNoteReadinessSnapshot(session: session, requestID: requestID)
             ) == .ready
         }
         guard ready(), let note = session.selfCompactState.active?.note else { return false }

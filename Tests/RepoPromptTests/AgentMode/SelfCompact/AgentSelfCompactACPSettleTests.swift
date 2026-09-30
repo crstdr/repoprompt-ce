@@ -392,6 +392,40 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
     }
 
+    func testOnlyAVerifiedOwnContinuationNotePassesTheACPBackgroundCompactionHold() {
+        let session = AgentTabSession(tabID: UUID())
+        session.hasLoadedPersistedState = true
+        session.beginACPBackgroundCompactionSettle(duration: 90)
+        defer { session.endACPBackgroundCompactionSettle() }
+        var attempt = AgentSelfCompactAttempt(
+            idempotencyKey: "background-hold", note: "Continue the current task.", phase: .noteDispatchPending
+        )
+        func noteSnapshot(for requestID: UUID) -> AgentSessionLinkDeliveryReadiness.Snapshot {
+            session.selfCompactState = AgentSelfCompactState(active: attempt)
+            return AgentModeViewModel.agentSelfCompactNoteReadinessSnapshot(session: session, requestID: requestID)
+        }
+
+        // Unverified completion: the provider may still be compacting, so the note waits too.
+        XCTAssertTrue(noteSnapshot(for: attempt.id).backgroundCompactionSettling)
+        attempt.compactTurnSucceeded = true
+        attempt.acpCompletionUnverified = true
+        XCTAssertTrue(noteSnapshot(for: attempt.id).backgroundCompactionSettling)
+
+        // Verified completion (vouched drop): this request's own note may start the next turn.
+        attempt.acpCompletionUnverified = nil
+        let verified = noteSnapshot(for: attempt.id)
+        XCTAssertFalse(verified.backgroundCompactionSettling)
+        XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: verified), .ready)
+
+        // Nobody else inherits the exemption: another request's note and ordinary overseer delivery.
+        XCTAssertTrue(noteSnapshot(for: UUID()).backgroundCompactionSettling)
+        let overseer = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )
+        XCTAssertTrue(overseer.backgroundCompactionSettling)
+        XCTAssertNotEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: overseer), .ready)
+    }
+
     func testStaleDedicatedACPNoteCannotReparkAnOrdinarySendInFlight() throws {
         let session = AgentTabSession(tabID: UUID())
         var state = AgentSelfCompactState()
