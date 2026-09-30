@@ -501,6 +501,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let detail = try XCTUnwrap(warned["detail"]?.stringValue)
         XCTAssertTrue(detail.contains("background"))
         XCTAssertTrue(detail.contains("cancelled"), "The warning names the consequence")
+        XCTAssertTrue(
+            detail.contains("background_compaction_settling"),
+            "The receipt names the enforced hold poll reports, not just a caution"
+        )
 
         let inTurn = DomainAgentSessionLinkSendReceipt(
             targetSessionID: UUID(),
@@ -1523,6 +1527,33 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ]))
     }
 
+    func testIdleManagedPollReportsTheGrantWithoutAPendingInteraction() async throws {
+        let managed = try await makeReadReleaseFixture()
+        defer { managed.tearDown() }
+        managed.host.pendingInteractionInspection = .none
+        let managedPoll = try await Self.executeObject(managed.service, args: [
+            "op": .string("poll"), "session_id": .string(managed.target.sessionID.uuidString)
+        ])
+        let snapshot = try XCTUnwrap(managedPoll["snapshot"]?.objectValue)
+        XCTAssertEqual(snapshot["status"], .string("idle"))
+        XCTAssertEqual(snapshot["idle_for_send"], .bool(true))
+        XCTAssertEqual(snapshot["has_pending_interaction"], .bool(false))
+        // Management follows the grant, not whether its inspection contains a prompt.
+        XCTAssertEqual(managedPoll["managed"], .bool(true))
+        XCTAssertNil(managedPoll["pending_interaction"])
+        XCTAssertNil(managedPoll["respond_hint"])
+
+        let watchOnly = try await makeReadReleaseFixture(restricted: true)
+        defer { watchOnly.tearDown() }
+        watchOnly.host.pendingInteractionInspection = .none
+        let watchOnlyPoll = try await Self.executeObject(watchOnly.service, args: [
+            "op": .string("poll"), "session_id": .string(watchOnly.target.sessionID.uuidString)
+        ])
+        XCTAssertEqual(watchOnlyPoll["managed"], .bool(false))
+        XCTAssertNil(watchOnlyPoll["pending_interaction"])
+        XCTAssertNil(watchOnlyPoll["respond_hint"])
+    }
+
     func testManagedLinkInspectsAnswersAndSteersAndReportsTheGrant() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
@@ -2024,6 +2055,77 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(terminal["result"]?.stringValue, "revoked")
         XCTAssertEqual(terminal["triggered_session_id"], secondID)
         XCTAssertEqual(terminal["targets"]?.arrayValue?.count, 0)
+    }
+
+    /// A sibling that stops holding after a non-terminal wake is dropped on its own: the healthy
+    /// sibling keeps its fresh row, cursor, and prompt instead of the whole wait being denied.
+    func testMultiTargetWaitDropsOnlyTheSiblingThatFailsTheObservationFence() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second")
+        fixture.host.candidates.append(second)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            rawTargetSessionID: second.sessionID.uuidString
+        ) else { return XCTFail("expected second link") }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let firstID = Value.string(fixture.target.sessionID.uuidString)
+        let secondID = Value.string(second.sessionID.uuidString)
+        // Deletion of the second target lands after the whole-batch authority hop, so the batch
+        // fence fails. Each target is then re-fenced on its own.
+        var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
+        fixture.bridge.test_afterManagedObservationAuthorityValidation = {
+            guard deletionAttempt == nil else { return }
+            deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: second.sessionID)
+        }
+        defer {
+            fixture.bridge.test_afterManagedObservationAuthorityValidation = nil
+            if let deletionAttempt {
+                AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletionAttempt)
+            }
+        }
+
+        let result = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"), "session_ids": .array([firstID, secondID]), "timeout_seconds": .int(0)
+        ])
+        XCTAssertNotNil(deletionAttempt, "the authority-hop test seam must run")
+        let rows = try XCTUnwrap(result["targets"]?.arrayValue)
+        XCTAssertEqual(rows.count, 1, "the failing sibling's row and cursor are withheld")
+        let survivor = try XCTUnwrap(rows.first?.objectValue)
+        XCTAssertEqual(survivor["session_id"], firstID)
+        XCTAssertNotNil(survivor["wait_cursor"]?.stringValue)
+        XCTAssertEqual(survivor["managed"], .bool(true))
+        XCTAssertNotNil(survivor["pending_interaction"], "the healthy sibling still sees its prompt")
+        XCTAssertEqual(result["unavailable_session_ids"], .array([secondID]))
+        XCTAssertTrue(result["detail"]?.stringValue?.contains("Refresh `list`") == true)
+    }
+
+    func testSingleTargetWaitStillDeniesWhenItsObservationFenceFails() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
+        fixture.bridge.test_afterManagedObservationAuthorityValidation = {
+            guard deletionAttempt == nil else { return }
+            deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(
+                sessionID: fixture.target.sessionID
+            )
+        }
+        defer {
+            fixture.bridge.test_afterManagedObservationAuthorityValidation = nil
+            if let deletionAttempt {
+                AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletionAttempt)
+            }
+        }
+        do {
+            _ = try await Self.executeObject(fixture.service, args: [
+                "op": .string("wait"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "timeout_seconds": .int(0)
+            ])
+            XCTFail("a single target that fails its fence must still deny")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("No active session link"))
+        }
     }
 
     func testManagedWaitCarriesPendingInteractionOutsideSnapshot() async throws {

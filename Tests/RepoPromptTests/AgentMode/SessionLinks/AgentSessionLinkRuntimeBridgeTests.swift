@@ -985,6 +985,93 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(authorizationFailure(afterStop), .denied)
     }
 
+    /// An ACP request with no genuine one-time allow option withholds only `accept` from an observer.
+    /// Decline (one-time reject or `cancelled`) and cancel stay request-scoped, so they stay answerable.
+    func testACPApprovalWithoutOneTimeAllowWithholdsOnlyAcceptFromObserver() async throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 98,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel,
+            tabID: tabID,
+            name: "ACP target"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let session = viewModel.session(for: tabID)
+        session.hasLoadedPersistedState = true
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
+            tabID: tabID,
+            sessionID: sessionID,
+            tabName: "Target",
+            isWindowClosing: false
+        ))
+        let observer = makeCandidate(windowID: 97, displayName: "Overseer")
+        let host = FakeEndpointHost()
+        host.candidates = [observer, target]
+        host.interactionViewModel = viewModel
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        guard case .added = await bridge.addMonitorLink(
+            observerSessionID: observer.sessionID,
+            rawTargetSessionID: target.sessionID.uuidString
+        ) else { return XCTFail("Expected an exact live link") }
+
+        func acpApproval(_ id: String, oneTimeAllowAvailable: Bool) -> AgentApprovalRequest {
+            AgentApprovalRequest(
+                requestID: .acp(id),
+                method: "session/request_permission",
+                kind: .commandExecution,
+                threadID: "acp-session",
+                turnID: "acp-session",
+                itemID: "tool-\(id)",
+                overseerOneTimeAllowAvailable: oneTimeAllowAvailable
+            )
+        }
+
+        let restricted = acpApproval("no-once", oneTimeAllowAvailable: false)
+        session.pendingApproval = restricted
+        let readTarget = try await authorizedTarget(bridge, operation: .monitorPoll, observer: observer, target: target)
+        let projected = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        let inspection = try XCTUnwrap(projected?[target.sessionID])
+        XCTAssertNil(inspection.manualOnlyReason, "decline and cancel keep the prompt answerable")
+        XCTAssertEqual(inspection.interaction?.options.map(\.label), ["decline", "cancel"])
+        let object = try XCTUnwrap(inspection.projectedObject())
+        XCTAssertEqual(object["respondable"], .bool(true))
+        XCTAssertEqual(object["manual_only_reason"], .null)
+
+        let sendTarget = try await authorizedTarget(bridge, operation: .monitorRespond, observer: observer, target: target)
+        let accept = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(restricted.id, ["response": .string("accept")])
+        )
+        XCTAssertEqual(accept, .responded(.manualOnly(.noOneTimeAllowOption)))
+        XCTAssertEqual(session.pendingApproval, restricted, "a refused accept applies nothing")
+        // Decline and cancel pass the observer policy and reach the ACP controller hop. This fixture
+        // has no live ACP process, so that hop reports `unavailable` rather than a manual-only refusal.
+        for decision in ["decline", "cancel"] {
+            let outcome = try await bridge.respondToInteraction(
+                target: sendTarget,
+                request: interactionRequest(restricted.id, ["response": .string(decision)])
+            )
+            XCTAssertEqual(outcome, .responded(.unavailable), "\(decision) must not be refused as manual-only")
+        }
+
+        let open = acpApproval("once", oneTimeAllowAvailable: true)
+        session.pendingApproval = open
+        let reprojected = await bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        XCTAssertEqual(reprojected?[target.sessionID]?.interaction?.options.map(\.label), ["accept", "decline", "cancel"])
+        XCTAssertNil(reprojected?[target.sessionID]?.manualOnlyReason)
+    }
+
     func testManagedRespondAnswersAMultipleChoiceQuestionAndKeepsSecretsAndHookTrustManual() async throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(

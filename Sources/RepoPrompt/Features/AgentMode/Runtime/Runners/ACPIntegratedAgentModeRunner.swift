@@ -53,6 +53,10 @@ final class ACPIntegratedAgentModeRunner {
     /// misreports the outcome.
     private static let acpFireAndForgetCommandWindow: TimeInterval = 5
 
+    /// How long a fire-and-forget ACP compaction is protected from a cancelling next prompt: the top
+    /// of the provider's observed ~60–90 s background span.
+    static let acpBackgroundCompactionSettleDuration: TimeInterval = 90
+
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
@@ -1417,6 +1421,9 @@ final class ACPIntegratedAgentModeRunner {
                 text: AgentChatItem.acpBackgroundCompactionNoteText,
                 sequenceIndex: session.nextSequenceIndex
             ))
+            // Enforced, not only advised: overseer sends and compactions, parked `when_sendable`
+            // sends, and automatic wakes all see this session as not idle until the span ends.
+            session.beginACPBackgroundCompactionSettle(duration: Self.acpBackgroundCompactionSettleDuration)
             toolTrackingHooks.requestUIRefresh(session.tabID, false)
             toolTrackingHooks.scheduleSave(session.tabID)
         }
