@@ -1316,10 +1316,11 @@ final class ClaudeAgentModeCoordinator {
                let desiredEffort = autoEffort ?? (appliedAutoEffortByTabID[session.tabID] == nil ? nil : manualEffort)
             {
                 do {
-                    try await controller.applyModelAndEffort(
-                        model: effectiveClaudeModel(for: session),
-                        effortLevel: desiredEffort
-                    )
+                    guard try await controller.applyModelAndEffortForTurn(
+                        model: effectiveClaudeModel(for: session), effortLevel: desiredEffort, replacingFailure: nil
+                    ) else {
+                        return recordSendFailure("Claude effort application was superseded. No message was sent; retry the turn.", session: session, intent: intent)
+                    }
                     if autoEffort != nil {
                         if let auditTurnID {
                             session.updateAutomationAudit(turnID: auditTurnID) {
@@ -1332,12 +1333,17 @@ final class ClaudeAgentModeCoordinator {
                         appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
                     }
                 } catch {
-                    // An optional Jev choice must not leave the controller at a prior override.
+                    guard intentIsCurrent(intent, for: session), sessionOwnsClaudeController(controller, for: session) else { return .superseded }
+                    guard let failure = error as? NativeAgentRuntimeConfigurationFailure else {
+                        return recordSendFailure("Claude could not apply effort before sending: \(error.localizedDescription)", session: session, intent: intent)
+                    }
+                    // Restore only the failed intent, not a newer selection with identical values.
                     do {
-                        try await controller.applyModelAndEffort(
-                            model: effectiveClaudeModel(for: session),
-                            effortLevel: manualEffort
-                        )
+                        guard try await controller.applyModelAndEffortForTurn(
+                            model: effectiveClaudeModel(for: session), effortLevel: manualEffort, replacingFailure: failure
+                        ) else {
+                            return recordSendFailure("Claude effort fallback was superseded. No message was sent; retry the turn.", session: session, intent: intent)
+                        }
                         appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
                         if let auditTurnID {
                             session.updateAutomationAudit(turnID: auditTurnID) {

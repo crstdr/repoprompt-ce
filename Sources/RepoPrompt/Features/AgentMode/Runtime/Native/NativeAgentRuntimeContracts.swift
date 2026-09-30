@@ -22,6 +22,8 @@ protocol NativeAgentRuntimeControlling: Actor {
     ) async throws -> NativeAgentRuntimeSessionRef
     func currentSessionRef() async -> NativeAgentRuntimeSessionRef
     func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws
+    /// Turn-scoped Auto application; fallback consumes only a still-current failure token.
+    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> Bool
     func sendUserMessage(_ text: String) async throws -> UUID
     /// Sends a reasoned interrupt request to the provider runtime.
     /// - Parameter reason: "interrupt" for steering (graceful), "cancel" for forceful stop.
@@ -31,7 +33,24 @@ protocol NativeAgentRuntimeControlling: Actor {
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
 }
 
+/// Ephemeral failure authority for one controller lifetime/intent, never an application receipt.
+struct NativeAgentRuntimeConfigurationFailure: Error, LocalizedError {
+    let underlyingError: any Error
+    let lifetime: UUID
+    let intentGeneration: UInt64
+    let requestGeneration: UInt64
+    var errorDescription: String? {
+        underlyingError.localizedDescription
+    }
+}
+
 extension NativeAgentRuntimeControlling {
+    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> Bool {
+        guard replacingFailure == nil else { return false }
+        try await applyModelAndEffort(model: model, effortLevel: effortLevel)
+        return true
+    }
+
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
         .unsupported(message: "Native runtime has no local API for \(action.rawValue) cleanup of conversations.")
     }
