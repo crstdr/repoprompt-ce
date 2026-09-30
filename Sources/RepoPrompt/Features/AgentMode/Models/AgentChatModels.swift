@@ -420,7 +420,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         )
     }
 
-    /// Fixed replay-safe text for an ACP settle that never saw a vouched context drop.
+    /// Fixed replay-safe text for unverified completion: an ACP settle that never saw a vouched
+    /// context drop, or a native command that outlived its deadline.
     /// The continuation note is not interpolated here; it stays parked for the next ordinary send.
     public static func selfCompactionCompletionUnverified(sequenceIndex: Int) -> AgentChatItem {
         AgentChatItem(

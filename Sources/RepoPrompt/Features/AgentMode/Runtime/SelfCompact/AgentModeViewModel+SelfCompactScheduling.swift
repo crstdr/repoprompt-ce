@@ -79,25 +79,8 @@ extension AgentModeViewModel {
 
         var candidate = session.selfCompactState
         let reservation = candidate.reserve(note: note, idempotencyKey: idempotencyKey)
-        switch reservation {
-        case let .duplicate(requestID):
-            guard session.selfCompactAdmissionPendingID != requestID else {
-                return .blocked(reason: "persistence_pending")
-            }
-            if session.selfCompactState.active?.id == requestID,
-               agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID)
-            {
-                return .blocked(reason: "session_not_exclusive")
-            }
-            return .duplicate(requestID: requestID, status: session.selfCompactState.status)
-        case .conflict:
-            return .blocked(reason: "idempotency_conflict")
-        case .alreadyPending:
-            return .blocked(reason: "compact_already_pending")
-        case .invalidNote, .invalidIdempotencyKey:
-            return .blocked(reason: "busy") // Service validation rejects these before admission.
-        case .scheduled:
-            break
+        if let answer = agentSelfCompactUnscheduledAdmission(reservation, session: session, endpoint: endpoint) {
+            return answer
         }
 
         guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
@@ -139,9 +122,12 @@ extension AgentModeViewModel {
             endpoint: endpoint, runID: origin.runID, runAttemptID: origin.runAttemptID,
             note: note, idempotencyKey: idempotencyKey, support: support
         ) else { return .blocked(reason: "busy") }
-        guard case let .scheduled(attempt) = accepted else {
-            return .blocked(reason: "busy")
+        // A concurrent same-key call may have reserved while this one awaited provider support.
+        // Answer it exactly as the first check would have, not as a generic busy refusal.
+        if let answer = agentSelfCompactUnscheduledAdmission(accepted, session: session, endpoint: endpoint) {
+            return answer
         }
+        guard case let .scheduled(attempt) = accepted else { return .blocked(reason: "busy") }
         session.selfCompactAdmissionPendingID = attempt.id
         defer {
             if session.selfCompactAdmissionPendingID == attempt.id {
@@ -170,6 +156,35 @@ extension AgentModeViewModel {
             return .blocked(reason: "session_not_exclusive")
         }
         return .scheduled(session.selfCompactState.active ?? attempt)
+    }
+
+    /// The admission answer for every reservation that did not schedule a new request; nil only
+    /// for `.scheduled`, which the caller continues to persist.
+    private func agentSelfCompactUnscheduledAdmission(
+        _ reservation: AgentSelfCompactState.Reservation,
+        session: TabSession,
+        endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSelfMCPToolService.Admission? {
+        switch reservation {
+        case let .duplicate(requestID):
+            guard session.selfCompactAdmissionPendingID != requestID else {
+                return .blocked(reason: "persistence_pending")
+            }
+            if session.selfCompactState.active?.id == requestID,
+               agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID)
+            {
+                return .blocked(reason: "session_not_exclusive")
+            }
+            return .duplicate(requestID: requestID, status: session.selfCompactState.status)
+        case .conflict:
+            return .blocked(reason: "idempotency_conflict")
+        case .alreadyPending:
+            return .blocked(reason: "compact_already_pending")
+        case .invalidNote, .invalidIdempotencyKey:
+            return .blocked(reason: "busy") // Service validation rejects these before admission.
+        case .scheduled:
+            return nil
+        }
     }
 
     private func agentSelfCompactHasCompetingWriter(_ session: TabSession, sessionID: UUID) -> Bool {

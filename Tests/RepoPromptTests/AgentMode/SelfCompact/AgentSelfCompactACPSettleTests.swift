@@ -276,7 +276,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             _ = state.reserve(note: note, idempotencyKey: "key-\(phase.rawValue)")
             state.active?.phase = phase
             state.active?.acpCompletionUnverified = true
-            XCTAssertTrue(state.reconcileColdLaunch(), phase.rawValue)
+            XCTAssertTrue(state.reconcileDecodedRecord(), phase.rawValue)
             XCTAssertNil(state.active)
             XCTAssertEqual(state.latest?.outcome, .recoveryRequired)
             XCTAssertEqual(state.latest?.completionVerified, false)

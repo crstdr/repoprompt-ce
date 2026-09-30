@@ -147,6 +147,55 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.session.selfCompactState, parked)
     }
 
+    func testManagedStopEndsTheOriginatingTurnThatScheduledSelfCompaction() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        let ownership = fixture.session.beginRunAttempt(source: "self-compact-stop-test")
+        let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+        let owner = AgentSelfCompactOwner(
+            windowID: 1, workspaceID: UUID(), tabID: fixture.tabID, sessionID: binding.sessionID,
+            persistentBindingGeneration: binding.generation,
+            bindingTransitionGeneration: fixture.session.bindingTransitionGeneration,
+            runID: runID, runAttemptID: ownership.attemptID
+        )
+        fixture.session.selfCompactState = AgentSelfCompactState(active: AgentSelfCompactAttempt(
+            idempotencyKey: "stop-origin", note: "Continue the current task.", owner: owner
+        ))
+        XCTAssertTrue(fixture.session.selfCompactState.blocksOverseerDelivery)
+
+        guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("Stop was refused") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        // A non-completed originating terminal cancels the request instead of compacting.
+        try await AsyncTestWait.waitUntil("stopped origin cancels the scheduled request") {
+            fixture.session.selfCompactState.active == nil
+        }
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .cancelled)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.noteDelivery, .notSent)
+    }
+
+    func testManagedStopEndsAContinuationTurnWhoseNoteSendStarted() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "self-compact-note-stop-test")
+        var attempt = AgentSelfCompactAttempt(
+            idempotencyKey: "stop-note", note: "Continue the current task.", phase: .dispatchingNote
+        )
+        attempt.compactTurnSucceeded = true
+        attempt.noteDispatchStarted = true
+        let sent = AgentSelfCompactState(active: attempt)
+        fixture.session.selfCompactState = sent
+
+        guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("Stop was refused") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        // Stop never spends or rewrites the one-shot note; its provider seam settles it.
+        XCTAssertEqual(fixture.session.selfCompactState, sent)
+    }
+
     func testHeldWakeCannotDispatchAfterIdleStop() async throws {
         let fixture = try makeFixture()
         let heldFence = AgentRunStartStopFence(session: fixture.session)
@@ -761,9 +810,14 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         snapshot.stopInProgress = true
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .blocked(.targetBusy))
         snapshot.stopInProgress = false
+        // Overseer delivery holds do not refuse Stop by themselves; only an unsent RepoPrompt-owned
+        // self-compaction dispatch does.
         snapshot.pendingSelfCompact = true
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .activeRun)
+        snapshot.selfCompactBlocksManagedStop = true
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .blocked(.targetBusy))
         snapshot.pendingSelfCompact = false
+        snapshot.selfCompactBlocksManagedStop = false
         snapshot.hasLoadedPersistedState = false
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .blocked(.targetLoading))
         snapshot.endpointMatchesGrant = false

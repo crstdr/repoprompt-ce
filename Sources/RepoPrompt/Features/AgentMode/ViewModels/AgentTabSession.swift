@@ -1308,6 +1308,13 @@ final class AgentTabSession: ObservableObject {
     func cancelEphemeralRuntimeState() {
         selfCompactNativeCompletion?.cancelRuntimeWork()
         selfCompactNativeCompletion = nil
+        // Without its worker, an active request could never settle and would hold overseer delivery,
+        // Auto-wake, and managed Stop until relaunch. Settle or park it before the worker is gone.
+        var selfCompact = selfCompactState
+        if selfCompact.releaseForRuntimeTeardown() {
+            selfCompactState = selfCompact
+        }
+        selfCompactACPCommandItemIDs = nil
         derivedTranscriptRefreshTask?.cancel()
         derivedTranscriptRefreshTask = nil
         pendingDerivedTranscriptRefreshReason = nil

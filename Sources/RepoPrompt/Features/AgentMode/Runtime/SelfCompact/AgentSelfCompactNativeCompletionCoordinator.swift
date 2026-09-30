@@ -2,6 +2,7 @@ import Foundation
 
 /// Request-correlated native completion and one-shot continuation. The injectable clock makes
 /// the 300-second native deadline and the 90-second ACP settle testable without wall-clock waits.
+/// Either expiring parks the note as unverified; neither sends it.
 ///
 /// ACP completion is best-effort. A completed command turn, however long it took, is not verified
 /// compaction. Only a vouched context drop is, and a settle timeout parks the note instead of
@@ -68,7 +69,11 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             if let owner = current.active?.owner, !isCurrentOwner(owner) {
                 current.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             } else {
-                current.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
+                // A slow native compaction may still finish. Like an unverified ACP turn, keep the
+                // continuation parked for the next ordinary send rather than dropping it into
+                // recovery; a late command terminal no longer matches and never sends it.
+                current.active?.acpCompletionUnverified = true
+                current.active?.phase = .parked
             }
             store(current)
         }

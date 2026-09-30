@@ -295,7 +295,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         }
     }
 
-    func testDeadlineAndLateCompletionNeverSendNote() async {
+    func testDeadlineParksTheNoteUnverifiedAndLateCompletionNeverSendsIt() async {
         let fake = Fake()
         let id = fake.arm()
         let coordinator = fake.coordinator()
@@ -308,13 +308,50 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         XCTAssertEqual(fake.slept, [.seconds(300)])
         fake.advanceDeadline()
         await drain()
-        XCTAssertEqual(fake.state.latest?.outcome, .completionUnverified)
-        XCTAssertEqual(fake.state.latest?.recoveryNote, "alpha\nβeta")
+        // The continuation survives a slow native compaction, exactly like an unverified ACP turn.
+        XCTAssertNil(fake.state.latest)
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+        XCTAssertEqual(fake.state.active?.acpCompletionUnverified, true)
+        XCTAssertEqual(fake.state.parkedNote?.frame, AgentSelfCompactNoteEnvelope.frame("alpha\nβeta"))
+        XCTAssertEqual(fake.state.status?.outcome, .completionUnverified)
+        XCTAssertEqual(fake.state.status?.noteDelivery, .parked)
+        XCTAssertFalse(fake.state.blocksOverseerDelivery)
+        XCTAssertFalse(fake.state.blocksManagedStop)
+
         coordinator.compactTurnSettled(
             revision: fake.completeRevision(status: .completed),
             publication: .accepted(successorEpoch: nil), teardownSettled: { true }
         )
         await drain()
+        XCTAssertEqual(fake.dispatchCount, 0, "a late command terminal never manufactures a prompt")
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+
+        // Only the next ordinary send consumes it, once, still reporting unverified completion.
+        let noteID = AgentSelfCompactionDispatchID(requestID: id, stage: .note)
+        XCTAssertTrue(fake.state.noteWillAttempt(noteID))
+        XCTAssertTrue(fake.state.noteAccepted(noteID))
+        XCTAssertEqual(fake.state.latest?.outcome, .completionUnverified)
+        XCTAssertEqual(fake.state.latest?.noteDelivery, .prepended)
+        XCTAssertEqual(fake.state.latest?.completionVerified, false)
+        XCTAssertNil(fake.state.active)
+    }
+
+    func testDeadlineAfterOwnerLossStillCancelsInsteadOfParking() async {
+        let fake = Fake()
+        let id = fake.arm()
+        let coordinator = fake.coordinator()
+        XCTAssertTrue(coordinator.bindCompact(
+            .init(requestID: id, stage: .compact),
+            runID: fake.compactRunID,
+            runAttemptID: fake.compactAttemptID
+        ))
+        await drain()
+        fake.ownerIsCurrent = false
+        fake.advanceDeadline()
+        await drain()
+        XCTAssertNil(fake.state.active)
+        XCTAssertEqual(fake.state.latest?.outcome, .cancelled)
+        XCTAssertEqual(fake.state.latest?.noteDelivery, .notSent)
         XCTAssertEqual(fake.dispatchCount, 0)
     }
 

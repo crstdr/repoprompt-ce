@@ -49,6 +49,8 @@ extension AgentModeViewModel {
             pendingOversightAutoWake: session.oversight.pendingAutoWake != nil,
             pendingSelfCompact: session.selfCompactState.blocksOverseerDelivery
                 && session.selfCompactState.active?.id != ignoresSelfCompactRequestID,
+            selfCompactBlocksManagedStop: session.selfCompactState.blocksManagedStop
+                && session.selfCompactState.active?.id != ignoresSelfCompactRequestID,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,

@@ -3,6 +3,79 @@ import CryptoKit
 import XCTest
 
 final class AgentSelfCompactStateTests: XCTestCase {
+    private static let teardownNote = "Continue the current task."
+
+    private static func holding(
+        _ phase: AgentSelfCompactAttempt.Phase,
+        verified: Bool = false,
+        noteStarted: Bool = false
+    ) -> AgentSelfCompactState {
+        var attempt = AgentSelfCompactAttempt(idempotencyKey: "hold", note: teardownNote, phase: phase)
+        attempt.compactTurnSucceeded = verified ? true : nil
+        attempt.noteDispatchStarted = noteStarted
+        return AgentSelfCompactState(active: attempt)
+    }
+
+    func testManagedStopHoldCoversOnlyRepoPromptOwnedUnsentDispatch() {
+        let blocking: Set<AgentSelfCompactAttempt.Phase> = [
+            .compactDispatchPending, .dispatchingCompact, .awaitingCompactTurn, .acpSettling,
+            .awaitingNoteBoundary, .noteDispatchPending, .dispatchingNote
+        ]
+        for phase in AgentSelfCompactAttempt.Phase.allCases {
+            XCTAssertEqual(Self.holding(phase).blocksManagedStop, blocking.contains(phase), phase.rawValue)
+        }
+        // The caller's originating turn and every already-started note send stay stoppable, even
+        // though overseer delivery remains held until the note settles.
+        XCTAssertTrue(Self.holding(.scheduled).blocksOverseerDelivery)
+        let started = Self.holding(.dispatchingNote, verified: true, noteStarted: true)
+        XCTAssertFalse(started.blocksManagedStop)
+        XCTAssertTrue(started.blocksOverseerDelivery)
+        XCTAssertFalse(AgentSelfCompactState().blocksManagedStop)
+    }
+
+    @MainActor
+    func testRuntimeTeardownSettlesOrParksEveryWorkerOwnedHold() {
+        for phase in [AgentSelfCompactAttempt.Phase.scheduled, .compactDispatchPending] {
+            let session = AgentTabSession(tabID: UUID())
+            session.selfCompactState = Self.holding(phase)
+            session.cancelEphemeralRuntimeState()
+            XCTAssertNil(session.selfCompactState.active, phase.rawValue)
+            XCTAssertEqual(session.selfCompactState.latest?.outcome, .cancelled, phase.rawValue)
+            XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .notSent, phase.rawValue)
+            XCTAssertEqual(session.selfCompactState.latest?.recoveryNote, Self.teardownNote, phase.rawValue)
+            XCTAssertFalse(session.selfCompactState.blocksAutomaticWake, phase.rawValue)
+        }
+
+        let unproven: [AgentSelfCompactAttempt.Phase] = [.dispatchingCompact, .awaitingCompactTurn, .acpSettling]
+        let proven: [AgentSelfCompactAttempt.Phase] = [.awaitingNoteBoundary, .noteDispatchPending, .dispatchingNote]
+        for (phase, verified) in unproven.map({ ($0, false) }) + proven.map({ ($0, true) }) {
+            let session = AgentTabSession(tabID: UUID())
+            session.selfCompactState = Self.holding(phase, verified: verified)
+            session.selfCompactACPCommandItemIDs = [UUID()]
+            session.isDirty = false
+            session.cancelEphemeralRuntimeState()
+            let state = session.selfCompactState
+            XCTAssertNil(state.latest, phase.rawValue)
+            XCTAssertEqual(state.active?.phase, .parked, phase.rawValue)
+            XCTAssertEqual(state.active?.acpCompletionUnverified, verified ? nil : true, phase.rawValue)
+            XCTAssertEqual(state.parkedNote?.frame, AgentSelfCompactNoteEnvelope.frame(Self.teardownNote), phase.rawValue)
+            XCTAssertFalse(state.blocksOverseerDelivery, phase.rawValue)
+            XCTAssertFalse(state.blocksManagedStop, phase.rawValue)
+            XCTAssertNil(session.selfCompactNativeCompletion, phase.rawValue)
+            XCTAssertNil(session.selfCompactACPCommandItemIDs, phase.rawValue)
+            XCTAssertTrue(session.isDirty, phase.rawValue)
+        }
+
+        // A started send is owned by its provider seam, which always settles it; a parked note is
+        // already free of every hold except Auto-wake, which the next ordinary send clears.
+        for untouched in [Self.holding(.dispatchingNote, verified: true, noteStarted: true), Self.holding(.parked)] {
+            let session = AgentTabSession(tabID: UUID())
+            session.selfCompactState = untouched
+            session.cancelEphemeralRuntimeState()
+            XCTAssertEqual(session.selfCompactState, untouched)
+        }
+    }
+
     func testNotePolicyIsByteBoundedAndPreservesBody() {
         let exact = String(repeating: "x", count: 8192)
         XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: exact), .valid(byteCount: 8192))

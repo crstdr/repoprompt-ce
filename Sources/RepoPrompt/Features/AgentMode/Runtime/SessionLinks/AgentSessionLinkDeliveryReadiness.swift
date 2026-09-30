@@ -57,6 +57,10 @@ enum AgentSessionLinkDeliveryReadiness {
         var pendingOversightAutoWake: Bool = false
         /// An in-flight self-compaction owns the next provider boundary.
         var pendingSelfCompact: Bool = false
+        /// Narrower than `pendingSelfCompact`: RepoPrompt itself owns an unsent self-compaction
+        /// dispatch. Only this refuses managed Stop; the caller's originating turn, a parked note,
+        /// and a note whose send already started remain stoppable.
+        var selfCompactBlocksManagedStop: Bool = false
         /// A binding-qualified managed stop owns this target until cleanup releases its gate.
         var stopInProgress: Bool = false
 
@@ -87,6 +91,7 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingClaudeSteeringCount: Int,
             pendingOversightAutoWake: Bool = false,
             pendingSelfCompact: Bool = false,
+            selfCompactBlocksManagedStop: Bool = false,
             stopInProgress: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
@@ -112,6 +117,7 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingClaudeSteeringCount = pendingClaudeSteeringCount
             self.pendingOversightAutoWake = pendingOversightAutoWake
             self.pendingSelfCompact = pendingSelfCompact
+            self.selfCompactBlocksManagedStop = selfCompactBlocksManagedStop
             self.stopInProgress = stopInProgress
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser

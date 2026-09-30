@@ -54,7 +54,9 @@ struct AgentSelfCompactAttempt: Codable, Equatable {
     /// Vouched occupancy captured before the compact command withdrew it. Runtime evidence for an
     /// ACP drop check; a restored attempt never dispatches from this figure.
     var usedTokensBeforeCompact: Int?
-    /// Set when an ACP command turn ended without a vouched drop. The note stays parked.
+    /// Set when compaction completion could not be verified: an ACP command turn that ended without
+    /// a vouched drop, a native command that outlived its deadline, or runtime teardown before the
+    /// command turn settled. The note stays parked. The persisted key predates the native cases.
     var acpCompletionUnverified: Bool?
 
     init(
@@ -325,9 +327,11 @@ struct AgentSelfCompactState: Codable, Equatable {
         self.active = nil
     }
 
-    /// Every persisted phase, including parked, is inert after a process restart.
+    /// Every persisted phase, including parked, is inert once decoded. This runs on every decode of
+    /// a session record, including an in-process reload, not only on a cold launch: a decoded record
+    /// has no live worker, so it is never authority to resume dispatch.
     @discardableResult
-    mutating func reconcileColdLaunch(at date: Date = Date()) -> Bool {
+    mutating func reconcileDecodedRecord(at date: Date = Date()) -> Bool {
         guard let active else { return false }
         latest = .recoveryRequired(from: active, at: date)
         self.active = nil
@@ -342,6 +346,46 @@ struct AgentSelfCompactState: Codable, Equatable {
         else { return false }
         settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
         return true
+    }
+
+    /// Runtime teardown drops the completion worker. Release every hold that only that worker could
+    /// settle: a request that never reached the provider is cancelled, and an unsent note after a
+    /// started compact command is parked for the next ordinary send (unverified unless the command
+    /// turn was already proven). A note whose physical send already started is left to its sender,
+    /// which always settles it on acceptance or transport failure.
+    @discardableResult
+    mutating func releaseForRuntimeTeardown() -> Bool {
+        guard let attempt = active, !attempt.noteDispatchStarted else { return false }
+        switch attempt.phase {
+        case .parked:
+            return false
+        case .scheduled, .compactDispatchPending:
+            settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+        case .dispatchingCompact, .awaitingCompactTurn, .acpSettling,
+             .awaitingNoteBoundary, .noteDispatchPending, .dispatchingNote:
+            if attempt.compactTurnSucceeded != true || attempt.acpCompletionUnverified == true {
+                active?.acpCompletionUnverified = true
+            }
+            active?.phase = .parked
+        }
+        return true
+    }
+
+    /// Managed Stop yields to the self-compaction hold only while RepoPrompt itself owns an unsent
+    /// provider dispatch. The originating turn (`scheduled`) is the caller's own work, and a stop
+    /// ending it non-completed already cancels the request; a parked note or a note whose send has
+    /// started is ordinary provider work that Stop must be able to end.
+    var blocksManagedStop: Bool {
+        guard let active else { return false }
+        switch active.phase {
+        case .scheduled, .parked:
+            return false
+        case .dispatchingNote:
+            return !active.noteDispatchStarted
+        case .compactDispatchPending, .dispatchingCompact, .awaitingCompactTurn, .acpSettling,
+             .awaitingNoteBoundary, .noteDispatchPending:
+            return true
+        }
     }
 
     /// Overseer delivery stays blocked while compaction or its settle hold owns the next input.
