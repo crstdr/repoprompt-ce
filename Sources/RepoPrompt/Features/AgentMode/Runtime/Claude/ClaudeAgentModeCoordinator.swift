@@ -1347,7 +1347,16 @@ final class ClaudeAgentModeCoordinator {
                     // Only optional Auto may fall back, and only for the same still-current model.
                     // Application failure is not a missing conversation or fresh-start recovery.
                     guard configurationIsCurrent() else { return .superseded }
-                    guard autoEffort != nil, let failure = error as? NativeAgentRuntimeConfigurationFailure else {
+                    if case NativeAgentRuntimeControllerError.liveModelSwitchRequiresRestart = error {
+                        await recycleClaudeControllerForLaunchSettingsChange(
+                            session: session, existingController: controller, runtimeVariantChanged: false
+                        )
+                        guard intentIsCurrent(intent, for: session) else { return .superseded }
+                        await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
+                        handler = toolHandler(for: session)
+                        continue
+                    }
+                    guard autoEffort != nil else {
                         return recordSendFailure(
                             "Claude could not apply model and effort before sending: \(error.localizedDescription)",
                             session: session,
@@ -1357,8 +1366,7 @@ final class ClaudeAgentModeCoordinator {
                     do {
                         application = try await controller.applyModelAndEffortWithProof(
                             model: selectedModel,
-                            effortLevel: manualEffort,
-                            replacingFailure: failure
+                            effortLevel: manualEffort
                         )
                         appliedAutoEffort = nil
                     } catch {
@@ -1395,11 +1403,7 @@ final class ClaudeAgentModeCoordinator {
                     )
                 }
                 if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
-                    return recordSendFailure(
-                        "Claude launch settings changed while applying configuration. No message was sent; retry the turn.",
-                        session: session,
-                        intent: intent
-                    )
+                    continue
                 }
                 if requiresFinalRouteFence,
                    !hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)

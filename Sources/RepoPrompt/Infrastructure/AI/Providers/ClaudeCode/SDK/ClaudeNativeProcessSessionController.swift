@@ -169,7 +169,14 @@ final actor ClaudeNativeProcessSessionController {
         configLease?.url
     }
 
+    private struct ConfigurationSelection: Equatable {
+        let model: String?
+        let effortLevel: ClaudeCodeEffortLevel?
+    }
+
     private var initialFlagSettingsRequest: [String: Any]?
+    private var requestedConfiguration: ConfigurationSelection?
+    private var storedFlagSettingsIntentGeneration: UInt64 = 0
     private var latestFlagSettingsIntentGeneration: UInt64 = 0
     private var configurationLifetime = UUID()
     private var appliedConfigurationProof: NativeAgentRuntimeConfigurationProof?
@@ -177,7 +184,6 @@ final actor ClaudeNativeProcessSessionController {
         private var configurationTestControlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])?
         private var configurationTestWrite: (@Sendable (Data) throws -> Void)?
         private var configurationTestBeforeProofSend: (@Sendable () async -> Void)?
-        private var configurationTestAfterApplicationErrorClassification: (@Sendable () async -> Void)?
     #endif
     private var activeLaunchEnvironmentSignature: LaunchEnvironmentSignature?
     private var flagSettingsRequestGeneration: UInt64 = 0
@@ -403,6 +409,19 @@ final actor ClaudeNativeProcessSessionController {
             return SessionRef(sessionID: sessionID)
         }
 
+        #if DEBUG
+            // Keep the real start/initialize/flag pipeline while replacing only process launch.
+            if configurationTestWrite != nil {
+                let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
+                storeFlagSettingsRequest(resolved.request, selection: .init(
+                    model: model,
+                    effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
+                ))
+                try await initializeIfNeeded(systemPromptOverride: systemPromptOverride)
+                return SessionRef(sessionID: sessionID)
+            }
+        #endif
+
         ensureEventsStreamReady()
         isShuttingDown = false
         ensureRawEventLogFileReadyIfNeeded(sessionIDHint: existingSessionID ?? sessionID)
@@ -433,42 +452,26 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
-        do {
-            _ = try await applyModelAndEffortWithProof(model: model, effortLevel: effortLevel)
-        } catch let failure as NativeAgentRuntimeConfigurationFailure {
-            // Preserve the legacy live-update error contract; only ordinary turns need the token.
-            throw failure.underlyingError
-        }
+        _ = try await applyModelAndEffortWithProof(model: model, effortLevel: effortLevel)
     }
 
     func applyModelAndEffortWithProof(
         model: String?,
         effortLevel: ClaudeCodeEffortLevel?
     ) async throws -> NativeAgentRuntimeConfigurationApplication {
-        try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: nil)
-    }
-
-    func applyModelAndEffortWithProof(
-        model: String?,
-        effortLevel: ClaudeCodeEffortLevel?,
-        replacingFailure: NativeAgentRuntimeConfigurationFailure
-    ) async throws -> NativeAgentRuntimeConfigurationApplication {
-        try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure)
-    }
-
-    private func applyConfiguration(
-        model: String?,
-        effortLevel: ClaudeCodeEffortLevel?,
-        replacingFailure: NativeAgentRuntimeConfigurationFailure?
-    ) async throws -> NativeAgentRuntimeConfigurationApplication {
-        if let failure = replacingFailure {
-            guard failure.lifetime == configurationLifetime,
-                  failure.intentGeneration == latestFlagSettingsIntentGeneration,
-                  failure.requestGeneration == flagSettingsRequestGeneration
-            else { return .superseded }
+        let selection = ConfigurationSelection(
+            model: model,
+            effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
+        )
+        if hasActiveSession, isInitialized, !isShuttingDown,
+           requestedConfiguration == selection, let proof = appliedConfigurationProof,
+           proof.lifetime == configurationLifetime,
+           proof.intentGeneration == latestFlagSettingsIntentGeneration,
+           proof.requestGeneration == flagSettingsRequestGeneration
+        {
+            return .applied(proof)
         }
-        // No suspension between checking a failed intent and consuming it for fallback.
-        // Even legacy Void calls with no active process intentionally supersede prior proof.
+        // A changed desired configuration invalidates prior proof before resolution suspends.
         latestFlagSettingsIntentGeneration &+= 1
         appliedConfigurationProof = nil
         let intentGeneration = latestFlagSettingsIntentGeneration
@@ -488,7 +491,7 @@ final actor ClaudeNativeProcessSessionController {
                 ] as [String: Any])
                 throw ControllerError.liveModelSwitchRequiresRestart
             }
-            storeFlagSettingsRequest(resolved.request)
+            storeFlagSettingsRequest(resolved.request, selection: selection)
             requestGeneration = flagSettingsRequestGeneration
 
             guard isInitialized || hasCompletedInitialFlagSettings else {
@@ -523,14 +526,7 @@ final actor ClaudeNativeProcessSessionController {
                   intentGeneration == latestFlagSettingsIntentGeneration,
                   requestGeneration == flagSettingsRequestGeneration
             else { return .superseded }
-            let failure = NativeAgentRuntimeConfigurationFailure(
-                underlyingError: error, lifetime: lifetime,
-                intentGeneration: intentGeneration, requestGeneration: requestGeneration
-            )
-            #if DEBUG
-                await configurationTestAfterApplicationErrorClassification?()
-            #endif
-            throw failure
+            throw error
         }
     }
 
@@ -698,7 +694,10 @@ final actor ClaudeNativeProcessSessionController {
             logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : nil,
             preferredBasenames: [config.commandName]
         )
-        storeFlagSettingsRequest(resolvedFlags.request)
+        storeFlagSettingsRequest(resolvedFlags.request, selection: .init(
+            model: model,
+            effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
+        ))
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
         let arguments = buildArguments(
             existingSessionID: existingSessionID,
@@ -825,10 +824,20 @@ final actor ClaudeNativeProcessSessionController {
         return activeLaunchEnvironmentSignature != LaunchEnvironmentSignature(launchEnvironment)
     }
 
-    private func storeFlagSettingsRequest(_ request: [String: Any]?) {
+    private func storeFlagSettingsRequest(_ request: [String: Any]?, selection: ConfigurationSelection) {
+        requestedConfiguration = selection
+        storedFlagSettingsIntentGeneration = latestFlagSettingsIntentGeneration
         appliedConfigurationProof = nil
         flagSettingsRequestGeneration &+= 1
         initialFlagSettingsRequest = request
+    }
+
+    private func currentConfigurationProof() -> NativeAgentRuntimeConfigurationProof {
+        .init(
+            lifetime: configurationLifetime,
+            intentGeneration: storedFlagSettingsIntentGeneration,
+            requestGeneration: flagSettingsRequestGeneration
+        )
     }
 
     private func applyInitialFlagSettingsIfNeeded() async throws {
@@ -836,6 +845,7 @@ final actor ClaudeNativeProcessSessionController {
             let requestGeneration = flagSettingsRequestGeneration
             guard let request = initialFlagSettingsRequest else {
                 hasCompletedInitialFlagSettings = true
+                appliedConfigurationProof = currentConfigurationProof()
                 return
             }
             let flagSettingsResult = try await sendControlRequest(request: request)
@@ -845,6 +855,7 @@ final actor ClaudeNativeProcessSessionController {
             ] as [String: Any])
             guard flagSettingsRequestGeneration != requestGeneration else {
                 hasCompletedInitialFlagSettings = true
+                appliedConfigurationProof = currentConfigurationProof()
                 return
             }
         }
@@ -1796,6 +1807,8 @@ final actor ClaudeNativeProcessSessionController {
             latestFlagSettingsIntentGeneration = 0
             flagSettingsRequestGeneration = 0
             appliedConfigurationProof = nil
+            requestedConfiguration = nil
+            initialFlagSettingsRequest = nil
             isShuttingDown = false
             isInitialized = initialized
             hasCompletedInitialFlagSettings = initialized
@@ -1807,11 +1820,6 @@ final actor ClaudeNativeProcessSessionController {
         /// Pauses at controller entry, before the non-suspending proof-check/write segment.
         func test_setBeforeConfigurationSend(_ beforeSend: @escaping @Sendable () async -> Void) {
             configurationTestBeforeProofSend = beforeSend
-        }
-
-        /// Models an actor-hop delay after a failure passed its generation fence.
-        func test_setAfterApplicationErrorClassification(_ action: @escaping @Sendable () async -> Void) {
-            configurationTestAfterApplicationErrorClassification = action
         }
 
         /// Exercises the real codec, request correlation, and success/error continuation path.

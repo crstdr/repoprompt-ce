@@ -165,15 +165,61 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         let absent = try await controller.applyModelAndEffortWithProof(model: nil, effortLevel: nil)
         XCTAssertEqual(absent, .notReady)
         let writes = WrittenLines()
-        await controller.test_installConfigurationTransport(initialized: false, write: { writes.append($0) })
-        let pending = try await controller.applyModelAndEffortWithProof(model: nil, effortLevel: nil)
-        XCTAssertEqual(pending, .notReady)
-        XCTAssertEqual(writes.count, 0)
         await controller.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
         let ready = try await controller.applyModelAndEffortWithProof(model: nil, effortLevel: nil)
         guard case let .applied(proof) = ready else { return XCTFail("Ready no-override policy must be proven") }
         _ = try await controller.sendUserMessage("ordinary", configuration: proof)
         XCTAssertEqual(writes.count, 1)
+    }
+
+    func testUnchangedConfigurationReusesProofWithoutProviderIO() async throws {
+        let controller = applicationController()
+        let controls = WrittenLines()
+        let writes = WrittenLines()
+        await controller.test_installConfigurationTransport(initialized: true, controlRequest: { _ in
+            controls.append(Data())
+            return [:]
+        }, write: { writes.append($0) })
+        let first = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high)
+        let repeated = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high)
+        XCTAssertEqual(repeated, first, "Unchanged desired configuration must reuse its current proof")
+        XCTAssertEqual(controls.count, 1, "No provider round trip for an unchanged ordinary turn")
+        _ = try await controller.applyModelAndEffortWithProof(model: "B", effortLevel: .high)
+        _ = try await controller.applyModelAndEffortWithProof(model: "B", effortLevel: .low)
+        XCTAssertEqual(controls.count, 3, "Changed model and Auto effort each require application")
+        XCTAssertEqual(writes.count, 0)
+    }
+
+    @MainActor
+    func testFirstOrdinarySendWaitsForColdInitializationAndReusesLaunchProof() async throws {
+        let controller = applicationController()
+        let gate = ApplicationGate()
+        let controls = WrittenLines()
+        let writes = WrittenLines()
+        await controller.test_installConfigurationTransport(initialized: false, controlRequest: { request in
+            if request["subtype"] as? String == "initialize" { return await gate.respond() }
+            if request["subtype"] as? String == "apply_flag_settings" { controls.append(Data()) }
+            return [:]
+        }, write: { writes.append($0) })
+        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+        let send = Task {
+            await coordinator.sendClaudeNativeMessage(
+                session: session, text: "first ordinary turn", attachments: [], intent: intent,
+                allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        defer { send.cancel()
+            gate.resume()
+        }
+        // The ordinary send has entered production startOrResume, but initialize is still pending.
+        try await gate.waitUntilEntered()
+        XCTAssertEqual(writes.count, 0)
+        XCTAssertEqual(controls.count, 0)
+        gate.resume()
+        let outcome = await send.value
+        XCTAssertEqual(outcome, .sent, "The first turn must deliver without retry after initialization")
+        XCTAssertEqual(writes.count, 1)
+        XCTAssertEqual(controls.count, 1, "Reuse launch-time application; do not add a live-update round trip")
     }
 
     func testApplicationACKSupersessionCannotReleasePromptEvenForSameValueOrABA() async throws {
@@ -203,17 +249,17 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         }
     }
 
-    func testPhysicalWriteRejectsProofAfterSameValueIntentAndProcessReplacement() async throws {
+    func testPhysicalWriteRejectsProofAfterChangedIntentAndProcessReplacement() async throws {
         let controller = applicationController()
         let writes = WrittenLines()
         await controller.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
         guard case let .applied(first) = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high)
         else { return XCTFail("Missing initial proof") }
-        guard case let .applied(second) = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high)
+        guard case let .applied(second) = try await controller.applyModelAndEffortWithProof(model: "B", effortLevel: .high)
         else { return XCTFail("Missing replacement proof") }
         do {
             _ = try await controller.sendUserMessage("stale", configuration: first)
-            XCTFail("Same values do not make an older proof current")
+            XCTFail("Changed configuration must invalidate an older proof")
         } catch NativeAgentRuntimeControllerError.configurationNotCurrent {}
         await controller.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
         _ = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high)
@@ -307,9 +353,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         do {
             _ = try await controller.applyModelAndEffortWithProof(model: "B", effortLevel: .high)
             XCTFail("Expected rejection")
-        } catch let failure as NativeAgentRuntimeConfigurationFailure {
-            guard case ResolverError.unsupportedModel = failure.underlyingError else { return XCTFail("Original error must propagate") }
-        }
+        } catch ResolverError.unsupportedModel {}
         do {
             try await controller.applyModelAndEffort(model: "B", effortLevel: .high)
             XCTFail("Legacy updates must still expose their original error")
@@ -323,53 +367,19 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual(writes.count, 0)
     }
 
-    func testConditionalFallbackCannotReuseFailureAfterConsumptionOrProcessReplacement() async throws {
-        for replaceProcess in [false, true] {
-            let controller = applicationController()
-            let controls = WrittenLines()
-            let writes = WrittenLines()
-            await controller.test_installConfigurationTransport(initialized: true, controlRequest: { _ in
-                controls.append(Data())
-                throw ResolverError.unsupportedModel
-            }, write: { writes.append($0) })
-            var classifiedFailure: NativeAgentRuntimeConfigurationFailure?
-            do {
-                _ = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .low)
-                XCTFail("Expected classified failure")
-            } catch let failure as NativeAgentRuntimeConfigurationFailure {
-                classifiedFailure = failure
-            }
-            let failure = try XCTUnwrap(classifiedFailure)
-            let accept: @Sendable ([String: Any]) async throws -> [String: Any] = { _ in
-                controls.append(Data())
-                return [:]
-            }
-            let application: NativeAgentRuntimeConfigurationApplication
-            if replaceProcess {
-                await controller.test_installConfigurationTransport(initialized: true, controlRequest: accept, write: { writes.append($0) })
-                application = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high)
-            } else {
-                await controller.test_setConfigurationControlRequest(accept)
-                application = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high, replacingFailure: failure)
-            }
-            let stale = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high, replacingFailure: failure)
-            XCTAssertEqual(stale, .superseded)
-            XCTAssertEqual(controls.count, 2, "Stale failure tokens cannot issue settings requests")
-            XCTAssertEqual(writes.count, 0)
-            guard case let .applied(proof) = application else { return XCTFail("Missing current proof") }
-            _ = try await controller.sendUserMessage("current", configuration: proof)
-            XCTAssertEqual(writes.count, 1, "Rejecting fallback must leave current proof intact")
-        }
-    }
-
     @MainActor
     private func ordinaryTurnFixture(
-        controller: ClaudeNativeProcessSessionController
+        controller: ClaudeNativeProcessSessionController,
+        replacement: ClaudeNativeProcessSessionController? = nil
     ) -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
+        var creations = 0
         let coordinator = ClaudeAgentModeCoordinator(
             windowID: 1,
             workspacePathProvider: { _ in nil },
-            claudeControllerFactory: { _, _, _, _ in controller },
+            claudeControllerFactory: { _, _, _, _ in
+                creations += 1
+                return creations == 1 ? controller : (replacement ?? controller)
+            },
             autoEffortEnabledProvider: { true }
         )
         let session = AgentTabSession(tabID: UUID())
@@ -444,7 +454,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
 
     @MainActor
     func testOrdinaryApplicationFailurePreservesIdentityAndDoesNotPrompt() async {
-        for failure in [NativeAgentRuntimeControllerError.invalidControlResponse("rejected"), .liveModelSwitchRequiresRestart] {
+        for failure in [NativeAgentRuntimeControllerError.invalidControlResponse("rejected")] {
             let controller = applicationController()
             let writes = WrittenLines()
             await controller.test_installConfigurationTransport(
@@ -460,6 +470,29 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             XCTAssertEqual(session.providerSessionID, "application-proof-session")
             XCTAssertTrue(session.claudeController === controller)
         }
+    }
+
+    @MainActor
+    func testComposerModelSwitchRequiringRestartDeliversWithoutRetry() async {
+        let controller = applicationController()
+        let replacement = applicationController()
+        let writes = WrittenLines()
+        await controller.test_installConfigurationTransport(initialized: true, controlRequest: { _ in
+            throw NativeAgentRuntimeControllerError.liveModelSwitchRequiresRestart
+        }, write: { writes.append($0) })
+        await replacement.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
+        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller, replacement: replacement)
+        let ready = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
+        XCTAssertEqual(ready, .ready)
+        session.selectedModelRaw = "claude-sonnet-4-6:high"
+        let outcome = await coordinator.sendClaudeNativeMessage(
+            session: session, text: "ordinary after model switch", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(writes.count, 1)
+        XCTAssertTrue(session.claudeController === replacement)
+        XCTAssertEqual(session.providerSessionID, "application-proof-session")
     }
 
     private actor EffortRequests {
@@ -554,7 +587,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, true)
             XCTAssertEqual(writes.count, 0)
             if invalidateProof {
-                _ = try await controller.applyModelAndEffortWithProof(model: session.selectedModelRaw, effortLevel: .high)
+                _ = try await controller.applyModelAndEffortWithProof(model: "claude-sonnet-4-6:high", effortLevel: .high)
             }
             if cancelBeforeWrite { send.cancel() }
             gate.resume()
@@ -633,67 +666,16 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     @MainActor
-    func testClassifiedAutoErrorCannotFallbackAfterNewerIdenticalOrABAApplication() async throws {
-        for interveningModels in [["claude-opus-5-5:high"], ["claude-sonnet-4-6:high", "claude-opus-5-5:high"]] {
-            let controller = applicationController()
-            let gate = ApplicationGate()
-            let controls = WrittenLines()
-            let writes = WrittenLines()
-            await controller.test_installConfigurationTransport(initialized: true, controlRequest: { request in
-                controls.append(Data())
-                if (request["settings"] as? [String: Any])?["effortLevel"] as? String == "low" {
-                    throw NativeAgentRuntimeControllerError.invalidControlResponse("classified Auto rejection")
-                }
-                return [:]
-            }, write: { writes.append($0) })
-            // Unlike the pre-classification regression above, G1 has already passed
-            // the controller's catch fence when G2 (or B→A) supersedes it here.
-            await controller.test_setAfterApplicationErrorClassification { _ = await gate.respond() }
-            let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
-            let send = Task {
-                await coordinator.sendClaudeNativeMessage(
-                    session: session, text: "older ordinary turn", attachments: [], intent: intent,
-                    allowsCatalogRouteControllerRecovery: false,
-                    autoEffortSelection: .init(
-                        provider: .claudeCode, selectedModelRaw: session.selectedModelRaw,
-                        manualEffortRaw: "high", effortRaw: "low"
-                    )
-                )
-            }
-            defer {
-                send.cancel()
-                gate.resume()
-            }
-            try await gate.waitUntilEntered()
-            var latest: NativeAgentRuntimeConfigurationApplication = .notReady
-            for model in interveningModels {
-                latest = try await controller.applyModelAndEffortWithProof(model: model, effortLevel: .high)
-            }
-            gate.resume()
-            let outcome = await send.value
-            if case .failed = outcome {} else { XCTFail("Classified stale failure must not recertify the older prompt: \(outcome)") }
-            XCTAssertEqual(controls.count, 1 + interveningModels.count, "No fallback request after the failed intent was superseded")
-            XCTAssertEqual(writes.count, 0, "No user write from the older prompt")
-            XCTAssertEqual(session.providerSessionID, "application-proof-session")
-            guard case let .applied(proof) = latest else { return XCTFail("Missing newer application's proof") }
-            do {
-                _ = try await controller.sendUserMessage("newer turn", configuration: proof)
-            } catch {
-                XCTFail("Stale fallback invalidated the newer proof: \(error)")
-            }
-            XCTAssertEqual(writes.count, 1, "Refusing the stale fallback must preserve the newer proof")
-        }
-    }
-
-    @MainActor
-    func testLaunchSettingsChangeDuringApplicationFailsLoudlyWithoutWriting() async throws {
+    func testLaunchSettingsChangeDuringApplicationRelaunchesAndDelivers() async throws {
         let controller = applicationController()
         let gate = ApplicationGate()
         let writes = WrittenLines()
         await controller.test_installConfigurationTransport(
             initialized: true, controlRequest: { _ in await gate.respond() }, write: { writes.append($0) }
         )
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+        let replacement = applicationController()
+        await replacement.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
+        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller, replacement: replacement)
         let send = Task {
             await coordinator.sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
@@ -713,8 +695,9 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         ), for: session)
         gate.resume()
         let outcome = await send.value
-        guard case .failed = outcome else { return XCTFail("Still-current launch mismatch must fail loudly, not disappear: \(outcome)") }
-        XCTAssertEqual(writes.count, 0)
+        XCTAssertEqual(outcome, .sent, "A launch mismatch must relaunch and deliver without a user retry")
+        XCTAssertEqual(writes.count, 1)
+        XCTAssertTrue(session.claudeController === replacement)
         XCTAssertEqual(session.providerSessionID, "application-proof-session")
     }
 
@@ -733,16 +716,9 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         addTeardownBlock { await runtime.shutdown() }
         let writes = WrittenLines()
         await controller.test_installConfigurationTransport(initialized: true, controlRequest: nil, write: { writes.append($0) })
-        var classifiedFailure: NativeAgentRuntimeConfigurationFailure?
         for (index, reject) in [true, false].enumerated() {
-            let failure = classifiedFailure
             let application = Task {
-                if let failure {
-                    return try await runtime.applyModelAndEffortWithProof(
-                        model: "claude-opus-5-5:high", effortLevel: .low, replacingFailure: failure
-                    )
-                }
-                return try await runtime.applyModelAndEffortWithProof(model: "claude-opus-5-5:high", effortLevel: .low)
+                try await runtime.applyModelAndEffortWithProof(model: "claude-opus-5-5:high", effortLevel: .low)
             }
             defer { application.cancel() }
             try await AsyncTestWait.waitUntil("configuration request \(index) on production adapter wire") {
@@ -767,11 +743,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 do {
                     _ = try await application.value
                     XCTFail("A production error response cannot certify application")
-                } catch let failure as NativeAgentRuntimeConfigurationFailure {
-                    guard case NativeAgentRuntimeControllerError.invalidControlResponse = failure.underlyingError
-                    else { return XCTFail("Original control error must propagate") }
-                    classifiedFailure = failure
-                }
+                } catch NativeAgentRuntimeControllerError.invalidControlResponse {}
                 XCTAssertEqual(writes.count, 1, "Only the settings request was written")
             } else {
                 guard case let .applied(proof) = try await application.value else { return XCTFail("Missing ACK proof") }
