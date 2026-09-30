@@ -54,9 +54,12 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         )
     }
 
+    /// Builds projection inputs for a row. `linked` are inbound (the row is the target);
+    /// `linkedTargets` are outbound (the row is the observer).
     private func inputs(
         target: AgentSessionLinkEndpointCandidate,
         linked: [Linked] = [],
+        linkedTargets: [Linked] = [],
         activeOutboundObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
     ) -> DomainAgentSessionLinkEndpointProjectionInputs {
         let inboundItems = linked.map { relationship in
@@ -69,12 +72,22 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
                 capabilities: DomainAgentSessionLinkCapability.version1
             )
         }
+        let outboundItems = linkedTargets.map { relationship in
+            DomainAgentSessionLinkInventoryItem(
+                linkID: relationship.linkID,
+                generation: relationship.generation,
+                observerSessionID: target.sessionID,
+                targetSessionID: relationship.endpoint.sessionID,
+                displayName: nil,
+                capabilities: DomainAgentSessionLinkCapability.version1
+            )
+        }
         return DomainAgentSessionLinkEndpointProjectionInputs(
             outbound: DomainAgentSessionLinkInventory(
                 sessionID: target.sessionID,
-                linkSetRevision: 0,
+                linkSetRevision: UInt64(linkedTargets.count),
                 authorityRevision: 1,
-                items: []
+                items: outboundItems
             ),
             inbound: DomainAgentSessionLinkInventory(
                 sessionID: target.sessionID,
@@ -82,7 +95,9 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
                 authorityRevision: 1,
                 items: inboundItems
             ),
-            outboundTargetEndpoints: [:],
+            outboundTargetEndpoints: Dictionary(
+                uniqueKeysWithValues: linkedTargets.map { ($0.linkID, $0.endpoint) }
+            ),
             inboundObserverEndpoints: Dictionary(
                 uniqueKeysWithValues: linked.map { ($0.linkID, $0.endpoint) }
             ),
@@ -91,7 +106,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         )
     }
 
-    func testProjectionPartitionsAvailableAndRetainsUnavailableAndIneligibleLinkedObservers() throws {
+    func testProjectionPartitionsAvailableAndRetainsUnavailableAndIneligibleLinkedObservers() {
         let target = candidate(windowID: 10, displayName: "Target")
         let ineligibleLinked = candidate(
             windowID: 2,
@@ -109,7 +124,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             Linked(endpoint: ineligibleLinked.domainEndpoint, linkID: UUID(), generation: 2)
         ]
 
-        let menu = try XCTUnwrap(AgentSidebarOversightMenuProjection.make(
+        let menu = AgentSidebarOversightMenuProjection.make(
             target: target,
             inputs: inputs(
                 target: target,
@@ -119,7 +134,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
                 )
             ),
             candidates: [available, target, ineligibleLinked]
-        ))
+        )
 
         XCTAssertEqual(menu.targetEndpoint, target.domainEndpoint)
         XCTAssertEqual(menu.targetSessionID, target.sessionID)
@@ -127,8 +142,12 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertEqual(menu.linkedObservers.map(\.displayName), ["Éclair", AgentMonitorSessionIDFormatter.short(
             unavailableEndpoint.sessionID
         )])
-        XCTAssertEqual(menu.availableObservers.map(\.observerEndpoint), [available.domainEndpoint])
+        XCTAssertEqual(menu.availableObservers.map(\.peerEndpoint), [available.domainEndpoint])
         XCTAssertNil(menu.availableObservers.first?.providerDisplayName)
+        XCTAssertEqual(
+            menu.inboundObserverNames,
+            [AgentMonitorSessionIDFormatter.short(unavailableEndpoint.sessionID), "Éclair"]
+        )
         XCTAssertFalse(menu.isEmpty)
 
         guard case let .linked(ineligibleReference, ineligibleEligible) = menu.linkedObservers[0].relationship,
@@ -143,7 +162,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertTrue(menu.linkedObservers[1].fullIdentityDescription.contains(unavailableEndpoint.tabID.uuidString))
     }
 
-    func testAvailableProjectionRequiresActiveOverseerAndExcludesIneligibleSelfAndLinkedEndpoints() throws {
+    func testAvailableProjectionRequiresActiveOverseerAndExcludesIneligibleSelfAndLinkedEndpoints() {
         let target = candidate(windowID: 10, displayName: "Target")
         let linked = candidate(windowID: 2, displayName: "Linked")
         let eligibleOverseer = candidate(windowID: 3, displayName: "Eligible overseer")
@@ -163,7 +182,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         let relationship = Linked(endpoint: linked.domainEndpoint, linkID: UUID(), generation: 1)
         let activeOverseers = [sameSessionIncarnation, linked, eligibleOverseer] + ineligible
 
-        let menu = try XCTUnwrap(AgentSidebarOversightMenuProjection.make(
+        let menu = AgentSidebarOversightMenuProjection.make(
             target: target,
             inputs: inputs(
                 target: target,
@@ -177,90 +196,169 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
                 eligibleOverseer,
                 ordinaryEligibleLane
             ] + ineligible
-        ))
+        )
 
-        XCTAssertEqual(menu.linkedObservers.map(\.observerEndpoint), [linked.domainEndpoint])
-        XCTAssertEqual(menu.availableObservers.map(\.observerEndpoint), [eligibleOverseer.domainEndpoint])
+        XCTAssertEqual(menu.linkedObservers.map(\.peerEndpoint), [linked.domainEndpoint])
+        XCTAssertEqual(menu.availableObservers.map(\.peerEndpoint), [eligibleOverseer.domainEndpoint])
     }
 
-    func testEligibleTargetWithNoObserversProducesDiscoverableEmptyMenuButIneligibleTargetProducesNil() throws {
-        let target = candidate(windowID: 1, displayName: "Target")
-        let empty = try XCTUnwrap(AgentSidebarOversightMenuProjection.make(
+    /// Ordering contract: the row's own workspace cohort first, then folded name — flat across
+    /// linked and available observers in the inbound list.
+    func testInboundListOrdersOwnWorkspaceFirstThenName() {
+        let ownWorkspace = id("10000000-0000-0000-0000-000000000001")
+        let otherWorkspace = id("20000000-0000-0000-0000-000000000002")
+        let target = candidate(windowID: 10, workspaceID: ownWorkspace, displayName: "Target")
+        // In the row's workspace but sorts last by name; a linked observer elsewhere sorts first
+        // among the other-workspace group but still after every same-workspace option.
+        let linkedRemote = candidate(
+            windowID: 2,
+            workspaceID: otherWorkspace,
+            displayName: "AAA linked remote"
+        )
+        let availableLocal = candidate(windowID: 3, workspaceID: ownWorkspace, displayName: "Zeta local")
+        let availableRemote = candidate(
+            windowID: 4,
+            workspaceID: otherWorkspace,
+            displayName: "BBB remote"
+        )
+        let relationship = Linked(endpoint: linkedRemote.domainEndpoint, linkID: UUID(), generation: 3)
+
+        let menu = AgentSidebarOversightMenuProjection.make(
             target: target,
-            inputs: inputs(target: target),
-            candidates: [target]
-        ))
-        XCTAssertTrue(empty.isEmpty)
+            inputs: inputs(
+                target: target,
+                linked: [relationship],
+                activeOutboundObserverEndpoints: [
+                    linkedRemote.domainEndpoint,
+                    availableLocal.domainEndpoint,
+                    availableRemote.domainEndpoint
+                ]
+            ),
+            candidates: [target, linkedRemote, availableLocal, availableRemote]
+        )
 
-        let loading = candidate(
-            windowID: target.windowID,
-            workspaceID: target.workspaceID,
-            tabID: target.tabID,
-            sessionID: target.sessionID,
-            bindingID: target.persistentBindingGeneration,
+        XCTAssertEqual(
+            menu.observerOptions.map(\.displayName),
+            ["Zeta local", "AAA linked remote", "BBB remote"]
+        )
+        guard case .linked = menu.observerOptions[1].relationship else {
+            return XCTFail("expected the remote option to stay linked after sorting")
+        }
+    }
+
+    /// The inverse list keeps ticked (linked) targets first, then applies the same
+    /// own-workspace/name ordering inside each group.
+    func testOutboundListKeepsLinkedFirstThenWorkspaceThenName() {
+        let ownWorkspace = id("10000000-0000-0000-0000-000000000001")
+        let otherWorkspace = id("20000000-0000-0000-0000-000000000002")
+        let observer = candidate(windowID: 10, workspaceID: ownWorkspace, displayName: "Observer")
+        let linkedRemote = candidate(
+            windowID: 2,
+            workspaceID: otherWorkspace,
+            displayName: "Linked target"
+        )
+        let availableLocal = candidate(windowID: 3, workspaceID: ownWorkspace, displayName: "Alpha local")
+        let selfSession = candidate(windowID: 5, sessionID: observer.sessionID, displayName: "Self")
+        let ineligibleTarget = candidate(
+            windowID: 6,
             hasLoadedPersistedState: false,
-            displayName: target.displayName
+            displayName: "Loading target"
         )
-        XCTAssertNil(AgentSidebarOversightMenuProjection.make(
-            target: loading,
-            inputs: inputs(target: loading),
-            candidates: [loading]
-        ))
-    }
+        let relationship = Linked(endpoint: linkedRemote.domainEndpoint, linkID: UUID(), generation: 9)
 
-    func testCreatorBadgeUsesCompactIconAndRetainsFullCreatorTooltip() {
-        XCTAssertEqual(AgentSessionCreatorBadgeCopy.iconName, "rectangle.connected.to.line.below")
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: observer,
+            inputs: inputs(target: observer, linkedTargets: [relationship]),
+            candidates: [observer, linkedRemote, availableLocal, selfSession, ineligibleTarget]
+        )
+
         XCTAssertEqual(
-            AgentSessionCreatorBadgeCopy.tooltip(for: "RepoPrompt PM"),
-            "Created by RepoPrompt PM"
+            menu.targetOptions.map(\.peerEndpoint),
+            [linkedRemote.domainEndpoint, availableLocal.domainEndpoint]
         )
+        XCTAssertTrue(menu.isOverseer)
+        XCTAssertEqual(menu.outboundTargetNames, ["Linked target"])
+        XCTAssertNil(menu.observerIneligibleReason)
     }
 
-    func testCreatorNavigationRequiresOneLiveMatchingRoute() {
-        let creatorID = UUID()
-        let route = AgentSessionDeepLinkRoute(
-            workspaceID: UUID(), tabID: UUID(), sessionID: creatorID
+    /// An ineligible target keeps its menu with a greyed reason and retains linked observers for
+    /// unlinking; an ineligible observer gets the inverse reason and an empty available list.
+    func testIneligibleDirectionsSurfaceReasonsInsteadOfHidingMenus() {
+        let loadingRow = candidate(
+            windowID: 1,
+            hasLoadedPersistedState: false,
+            displayName: "Loading row"
         )
-        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(for: creatorID, candidates: []))
+        let overseer = candidate(windowID: 2, displayName: "Overseer")
+        let linked = Linked(endpoint: overseer.domainEndpoint, linkID: UUID(), generation: 4)
+
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: loadingRow,
+            inputs: inputs(target: loadingRow, linked: [linked]),
+            candidates: [loadingRow, overseer]
+        )
+
         XCTAssertEqual(
-            AgentSidebarCreatorNavigation.uniqueRoute(for: creatorID, candidates: [route]), route
+            menu.targetIneligibleReason,
+            AgentSessionLinkResolveFailure.loading.uiMessage
         )
-        let sameTabInAnotherWindow = AgentSessionDeepLinkRoute(
-            windowID: 2, workspaceID: route.workspaceID, tabID: route.tabID, sessionID: creatorID
+        XCTAssertTrue(menu.availableObservers.isEmpty)
+        // The linked observer stays reachable so the relationship remains unlinkable.
+        XCTAssertEqual(menu.linkedObservers.map(\.peerEndpoint), [overseer.domainEndpoint])
+        XCTAssertEqual(menu.inboundObserverNames, ["Overseer"])
+        XCTAssertTrue(menu.hasInbound)
+        // The same row cannot observe while still loading, either.
+        XCTAssertEqual(
+            menu.observerIneligibleReason,
+            AgentSessionLinkEndpointEligibility.addDisabledReason(
+                loadingRow.eligibilityInput,
+                roleAllowsOutboundMonitoring: loadingRow.roleAllowsOutboundMonitoring
+            )
         )
-        XCTAssertEqual(AgentSidebarCreatorNavigation.uniqueRoute(
-            for: creatorID, candidates: [route, sameTabInAnotherWindow]
-        ), route)
-        let differentTab = AgentSessionDeepLinkRoute(
-            workspaceID: route.workspaceID, tabID: UUID(), sessionID: creatorID
-        )
-        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
-            for: creatorID, candidates: [route, differentTab]
-        ))
-        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
-            for: UUID(), candidates: [route]
-        ))
+        XCTAssertTrue(menu.targetOptions.isEmpty)
     }
 
-    func testCreatorLabelSurvivesAnEmptyUnlinkedMenuWithoutChangingEligibility() throws {
+    func testCreatorBadgeCopyMovedToTheUnifiedCopyOwner() {
+        XCTAssertEqual(AgentOversightUICopy.relationshipMarkIcon, "rectangle.connected.to.line.below")
+        XCTAssertEqual(
+            AgentOversightUICopy.createdByUnlinkedTooltip(creator: "RepoPrompt PM"),
+            "Created by: RepoPrompt PM (unlinked)"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.createdAndOverseenTooltip(creator: "RepoPrompt PM"),
+            "Created and overseen by: RepoPrompt PM"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.createdByOverseenByTooltip(
+                creator: "RepoPrompt PM",
+                observerNames: ["RepoPrompt PM", "Second"]
+            ),
+            "Created by: RepoPrompt PM; overseen by: RepoPrompt PM, Second"
+        )
+    }
+
+    func testCreatorLabelSurvivesAnEmptyUnlinkedMenuWithoutChangingEligibility() {
         let target = candidate(windowID: 1, isMCPControlled: false, isMCPOriginated: false)
-        let menu = try XCTUnwrap(AgentSidebarOversightMenuProjection.make(
+        let menu = AgentSidebarOversightMenuProjection.make(
             target: target,
             inputs: inputs(target: target),
             candidates: [target],
-            createdByLabel: "Overseer"
-        ))
+            createdByLabel: "Overseer",
+            creatorSessionID: UUID()
+        )
         XCTAssertTrue(menu.isEmpty)
+        XCTAssertFalse(menu.hasInbound)
         XCTAssertEqual(menu.createdByLabel, "Overseer")
+        XCTAssertNotNil(menu.creatorSessionID)
         XCTAssertNil(AgentSidebarOversightMenuProjection.make(
             target: target,
             inputs: inputs(target: target),
             candidates: [target]
-        )?.createdByLabel)
+        ).createdByLabel)
         XCTAssertFalse(target.isMCPControlled)
     }
 
-    func testMenuLabelsPrefixLiveObserverLocationAndFallBackWhenUnavailable() throws {
+    func testMenuLabelsPrefixLiveObserverLocationAndFallBackWhenUnavailable() {
         let target = candidate(windowID: 10, displayName: "Target")
         let linked = candidate(
             windowID: 2,
@@ -282,7 +380,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             Linked(endpoint: unavailableEndpoint, linkID: UUID(), generation: 2)
         ]
 
-        let menu = try XCTUnwrap(AgentSidebarOversightMenuProjection.make(
+        let menu = AgentSidebarOversightMenuProjection.make(
             target: target,
             inputs: inputs(
                 target: target,
@@ -290,10 +388,10 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
                 activeOutboundObserverEndpoints: [linked.domainEndpoint, available.domainEndpoint]
             ),
             candidates: [target, linked, available]
-        ))
+        )
 
         XCTAssertEqual(
-            menu.linkedObservers.first { $0.observerEndpoint == linked.domainEndpoint }?.menuLabel,
+            menu.linkedObservers.first { $0.peerEndpoint == linked.domainEndpoint }?.menuLabel,
             "release-main: Existing overseer"
         )
         XCTAssertEqual(
@@ -301,23 +399,70 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             "kidfriendly-nova: Coordinate PIN-boundary design review"
         )
         XCTAssertEqual(
-            menu.linkedObservers.first { $0.observerEndpoint == unavailableEndpoint }?.menuLabel,
+            menu.linkedObservers.first { $0.peerEndpoint == unavailableEndpoint }?.menuLabel,
             AgentMonitorSessionIDFormatter.short(unavailableEndpoint.sessionID)
         )
     }
 
-    func testStopCopyDelimitsCompoundObserverLabelAndNamesOversight() {
+    func testUnlinkVoiceOverLabelQuotesThePeerName() {
         let observer = "release-main: Existing overseer"
         XCTAssertEqual(
-            AgentSidebarOversightMenuCopy.stopTitle(observerMenuLabel: observer),
-            "Stop oversight by “release-main: Existing overseer”"
+            AgentOversightUICopy.unlinkAccessibilityLabel(observer),
+            "Unlink \"release-main: Existing overseer\""
+        )
+    }
+
+    func testTooltipNameListsCapAtThreeWithPlusNMore() {
+        XCTAssertEqual(
+            AgentOversightUICopy.overseeingTooltip(targetNames: ["A"]),
+            "Overseeing: A"
         )
         XCTAssertEqual(
-            AgentSidebarOversightMenuCopy.stopAccessibilityLabel(
-                observerMenuLabel: observer,
-                targetDisplayName: "Target"
-            ),
-            "Stop oversight of Target by “release-main: Existing overseer”"
+            AgentOversightUICopy.overseenByTooltip(observerNames: ["A", "B", "C"]),
+            "Overseen by: A, B, C"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.overseenByTooltip(observerNames: ["A", "B", "C", "D", "E"]),
+            "Overseen by: A, B, C +2 more"
+        )
+    }
+
+    func testConfirmationCopyMatchesTheApprovedGrantShape() {
+        XCTAssertEqual(
+            AgentOversightUICopy.confirmationTitle(observer: "Overseer", target: "Lane"),
+            "Allow \"Overseer\" to oversee \"Lane\"?"
+        )
+        let body = AgentOversightUICopy.confirmationBody(observer: "Overseer", target: "Lane")
+        XCTAssertTrue(body.contains("“Overseer” will be able to:"))
+        XCTAssertTrue(body.contains("read Lane’s status and conversation"))
+        XCTAssertTrue(body.contains("send it instructions, steer it and stop its current run"))
+        XCTAssertTrue(body.contains("answer its questions and one-time approval requests"))
+        XCTAssertTrue(body.contains("compact its context, and be woken up by its updates"))
+        XCTAssertTrue(body.contains("You can unlink anytime."))
+        XCTAssertEqual(AgentOversightUICopy.confirmationSuppressionCheckbox, "Don’t ask again")
+        XCTAssertEqual(AgentOversightUICopy.confirmationAllowButton, "Allow oversight")
+    }
+
+    /// Approved 2026-09-30 copy decisions for the Session-ID sheets and stale/menu strings.
+    func testSheetAndStaleCopyMatchesApproval() {
+        XCTAssertEqual(
+            AgentOversightUICopy.sessionIDSheetTitle(observer: "Lane A"),
+            "Choose a session for \"Lane A\" to oversee"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.inboundSessionIDSheetTitle(session: "Lane A"),
+            "Choose an overseer for \"Lane A\""
+        )
+        XCTAssertEqual(AgentOversightUICopy.addOverseerButton, "Add overseer")
+        XCTAssertEqual(AgentOversightUICopy.overseeSessionButton, "Oversee session")
+        XCTAssertEqual(AgentOversightUICopy.staleSelectionMessage, "Sessions changed. Please choose again.")
+        XCTAssertEqual(
+            AgentOversightUICopy.overseeMenuAccessibilityValue(overseeingCount: 2, availableCount: 3),
+            "Overseeing 2; 3 available"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.overseeByMenuAccessibilityValue(overseenByCount: 1, availableCount: 4),
+            "Overseen by 1; 4 available"
         )
     }
 
@@ -363,16 +508,16 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             unique
         ]
 
-        let menu = try XCTUnwrap(AgentSidebarOversightMenuProjection.make(
+        let menu = AgentSidebarOversightMenuProjection.make(
             target: target,
             inputs: inputs(
                 target: target,
                 activeOutboundObserverEndpoints: Set(candidates.map(\.domainEndpoint))
             ),
             candidates: candidates
-        ))
+        )
         let byEndpoint = Dictionary(
-            uniqueKeysWithValues: menu.availableObservers.map { ($0.observerEndpoint, $0) }
+            uniqueKeysWithValues: menu.availableObservers.map { ($0.peerEndpoint, $0) }
         )
 
         XCTAssertEqual(byEndpoint[unique.domainEndpoint]?.menuLabel, "Unique")
@@ -384,6 +529,32 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertTrue(full.contains(pathological.workspaceID.uuidString))
         XCTAssertTrue(try full.contains(XCTUnwrap(pathological.persistentBindingGeneration?.uuidString)))
         XCTAssertEqual(Set(menu.availableObservers.map(\.menuLabel)).count, menu.availableObservers.count)
+    }
+
+    func testCreatorNavigationRequiresOneLiveMatchingRoute() {
+        let creatorID = UUID()
+        let route = AgentSessionDeepLinkRoute(
+            workspaceID: UUID(), tabID: UUID(), sessionID: creatorID
+        )
+        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(for: creatorID, candidates: []))
+        XCTAssertEqual(
+            AgentSidebarCreatorNavigation.uniqueRoute(for: creatorID, candidates: [route]), route
+        )
+        let sameTabInAnotherWindow = AgentSessionDeepLinkRoute(
+            windowID: 2, workspaceID: route.workspaceID, tabID: route.tabID, sessionID: creatorID
+        )
+        XCTAssertEqual(AgentSidebarCreatorNavigation.uniqueRoute(
+            for: creatorID, candidates: [route, sameTabInAnotherWindow]
+        ), route)
+        let differentTab = AgentSessionDeepLinkRoute(
+            workspaceID: route.workspaceID, tabID: UUID(), sessionID: creatorID
+        )
+        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
+            for: creatorID, candidates: [route, differentTab]
+        ))
+        XCTAssertNil(AgentSidebarCreatorNavigation.uniqueRoute(
+            for: UUID(), candidates: [route]
+        ))
     }
 
     func testActionKeysAreExactEndpointAndGenerationQualified() {

@@ -584,6 +584,32 @@ struct AgentModeSessionsListView: View {
                                     )
                                 }
                             }
+                        // Hoisted into locals so the row's long memberwise call stays inside the
+                        // type-checker's time budget.
+                        let resolveOverseerCandidate: (@MainActor (String) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)? = {
+                            raw in
+                            guard let rowSessionID = session.sessionID else {
+                                return .failure(AgentOversightResolutionMessage(
+                                    message: AgentOversightUICopy.oversightUnavailableMessage
+                                ))
+                            }
+                            return await agentModeVM.resolveSidebarOverseerCandidate(
+                                rawSessionID: raw,
+                                excludingTargetSessionID: rowSessionID
+                            )
+                        }
+                        let resolveTargetCandidate: (@MainActor (String) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)? = {
+                            raw in
+                            guard let endpoint = sidebarOversightTargetEndpointResolver?() else {
+                                return .failure(AgentOversightResolutionMessage(
+                                    message: AgentOversightUICopy.staleSelectionMessage
+                                ))
+                            }
+                            return agentModeVM.resolveSidebarTargetCandidate(
+                                rawSessionID: raw,
+                                observerEndpoint: endpoint
+                            )
+                        }
 
                         let creator = session.sessionID.flatMap {
                             agentModeVM.agentSessionLinkLaneCreator(for: $0)
@@ -593,7 +619,6 @@ struct AgentModeSessionsListView: View {
                             title: session.title,
                             isActive: session.tabID == currentTabID,
                             isOverseer: isOverseer,
-                            createdByLabel: creator?.label,
                             onOpenCreator: {
                                 guard let targetSessionID = session.sessionID,
                                       let creatorSessionID = creator?.sessionID,
@@ -686,6 +711,17 @@ struct AgentModeSessionsListView: View {
                                     targetEndpoint: targetEndpoint,
                                     expectedReference: reference
                                 )
+                            },
+                            onAddOutboundOversight: { observerEndpoint, targetEndpoint in
+                                await agentModeVM.addAgentOversightLink(
+                                    observerEndpoint: observerEndpoint,
+                                    targetEndpoint: targetEndpoint
+                                )
+                            },
+                            resolveOverseerSessionIDCandidate: resolveOverseerCandidate,
+                            resolveTargetSessionIDCandidate: resolveTargetCandidate,
+                            onOpenLinkedSession: { route in
+                                Task { await AppDeepLinkRouter.shared.route(agentSession: route) }
                             },
                             sessionIDCopyAction: .systemClipboard(sessionID: session.sessionID)
                         )
