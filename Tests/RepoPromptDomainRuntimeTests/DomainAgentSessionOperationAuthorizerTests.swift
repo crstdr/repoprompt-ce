@@ -243,8 +243,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             "a targetless operation must not demand an arbitrary target's capability"
         )
         for operation in DomainAgentSessionTargetOperation.allCases
-            where operation != .monitorList && operation != .monitorCreateLane
-        {
+            where operation != .monitorList && operation != .monitorCreateLane {
             XCTAssertFalse(operation.isObserverScoped, "\(operation.rawValue)")
         }
     }

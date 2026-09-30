@@ -1,16 +1,23 @@
 import Foundation
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class AgentSessionLanePolicyTests: XCTestCase {
     func testExplicitModelUsesAdvertisedFullIDWithoutRoleSubstitution() throws {
         let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true, grokBuildAvailable: true)
         // Use the production producer, not another list of accepted models.
-        for entry in AgentModelCatalog.discoveryAgents(availability: availability) where entry.available {
+        let entries = AgentModelCatalog.discoveryAgents(availability: availability)
+        defer {
+            for entry in entries {
+                AgentAdvertisedModelCatalog.shared.invalidate(entry.agent)
+            }
+        }
+        for entry in entries where entry.available {
             guard AgentModelCatalog.AgentSelectionSurface.headless.allows(entry.agent) else { continue }
             for model in entry.models {
                 for target in model.startTargets {
                     let selected = try AgentSessionLanePolicy.resolveModel(target.selectionID.rawValue, availability: availability)
+                    XCTAssertEqual(selected.role, .pair, "Explicit models keep the default selection label, not a permission grant")
                     XCTAssertEqual(selected.agentRaw, entry.agent.rawValue)
                     XCTAssertEqual(selected.modelRaw, target.modelRaw)
                     XCTAssertTrue(selected.modelParameterSelections.isEmpty)
@@ -23,6 +30,48 @@ final class AgentSessionLanePolicyTests: XCTestCase {
             AgentModelCatalog.resolveSelectionID("codexExec:unadvertised-future-model-high", availability: availability),
             "Legacy launch resolver remains permissive"
         )
+    }
+
+    func testACPResetInvalidatesProducerThatReadBeforeMemoryWasCleared() throws {
+        let registry = AgentACPModelRegistry.shared
+        let catalogue = AgentAdvertisedModelCatalog.shared
+        let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true)
+        registry.test_reset(providerID: .cursor)
+        defer { registry.test_reset(providerID: .cursor) }
+        let option = AgentModelOption(
+            rawValue: "reset-race-model", displayName: "Reset race", description: nil,
+            isPlaceholderDefault: false, isProviderDefault: false
+        )
+        for preserveStore in [false, true] {
+            XCTAssertTrue(registry.updateDiscoveredModels(
+                ACPDiscoveredSessionModels(options: [option], currentModelRaw: option.rawValue), for: .cursor
+            ))
+            var producerGeneration: UInt64 = 0
+            var producerOptions: [AgentModelOption] = []
+            let beforeClear = {
+                // Deterministically interleave a real producer after the first invalidation,
+                // while the old registry snapshot is still readable.
+                producerGeneration = catalogue.productionGeneration(for: .cursor)
+                producerOptions = AgentModelCatalog.options(for: .cursor, availability: availability)
+                XCTAssertTrue(producerOptions.contains { $0.rawValue == option.rawValue })
+                do {
+                    _ = try catalogue.selection("cursor:reset-race-model", availability: availability)
+                } catch {
+                    XCTFail("Interleaved producer should publish the still-readable snapshot: \(error)")
+                }
+            }
+            if preserveStore {
+                registry.test_clearMemoryPreservingStore(providerID: .cursor, beforeClearingMemory: beforeClear)
+            } else {
+                registry.test_reset(providerID: .cursor, beforeClearingMemory: beforeClear)
+            }
+            XCTAssertNil(registry.resolvedSnapshot(for: .cursor))
+            XCTAssertThrowsError(try catalogue.selection("cursor:reset-race-model", availability: availability))
+            XCTAssertFalse(
+                catalogue.record(producerOptions, for: .cursor, generation: producerGeneration),
+                "A paused producer must not republish the removed snapshot after reset"
+            )
+        }
     }
 
     func testMemoryOnlyAdmissionDoesNotDiscoverOrSubstituteMissingCatalogue() throws {

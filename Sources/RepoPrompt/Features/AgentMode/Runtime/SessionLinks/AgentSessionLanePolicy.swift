@@ -24,6 +24,8 @@ enum AgentSessionLanePolicy {
         guard AgentModelCatalog.AgentSelectionSurface.headless.allows(selection.agent) else {
             throw AgentAdvertisedModelCatalog.AdmissionError.unavailable
         }
+        // Default selection label only: lane creation consumes the model fields and creates
+        // an ordinary top-level session, without installing an MCP task role or permissions.
         return RoleSelection(
             role: .pair, agentRaw: selection.agent.rawValue,
             modelRaw: selection.storedModelRaw, reasoningEffortRaw: selection.reasoningEffortRaw,

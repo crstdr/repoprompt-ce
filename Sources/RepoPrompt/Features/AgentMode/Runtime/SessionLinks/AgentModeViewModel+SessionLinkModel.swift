@@ -140,6 +140,9 @@ extension AgentModeViewModel {
                 defer { isRestoringState = restoring }
                 selectedModelRaw = session.selectedModelRaw
                 selectedReasoningEffortRaw = session.selectedReasoningEffortRaw
+                // Deliberately defer permission/tool chrome to the next normal binding refresh
+                // (including local-turn acceptance): updatePermissionBindingState reads preferences.
+                // Runtime permission/launch checks read the session's new model, not this UI snapshot.
                 // Do not call makeComposerProps: it resolves parameter/worktree/catalogue state.
                 // Publish only selection, dropping old model-qualified controls (not their pins).
                 var props = ui.composer.props

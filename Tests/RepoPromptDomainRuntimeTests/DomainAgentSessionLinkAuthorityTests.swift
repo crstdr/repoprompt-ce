@@ -51,8 +51,8 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         displayName: String? = "Target",
         visibleRowCount: Int = 3,
         board: DomainAgentSessionLaneBoard = .empty,
-        // `nil` derives the ordinary case. Pass `false` for the state that motivates `until: sendable`:
-        // status-idle with no interaction, but still committing, queued, or preparing.
+        /// `nil` derives the ordinary case. Pass `false` for the state that motivates `until: sendable`:
+        /// status-idle with no interaction, but still committing, queued, or preparing.
         idleForSend: Bool? = nil
     ) -> DomainAgentSessionObservationSnapshot {
         DomainAgentSessionObservationSnapshot(
@@ -212,7 +212,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertNil(afterRevocation)
     }
 
-    func testSelfMonitorAndUnresolvedBindingsAreRejected() async {
+    func testSelfMonitorAndUnresolvedBindingsAreRejected() async throws {
         let authority = makeAuthority()
         let sessionID = UUID()
         let selfEndpoint = makeEndpoint(sessionID: sessionID)
@@ -292,7 +292,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(snapshot.observedTargetCount, 1)
     }
 
-    func testActivationRollsBackWhenTargetEndpointDrifted() async {
+    func testActivationRollsBackWhenTargetEndpointDrifted() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint()
         let target = makeEndpoint(windowID: 2)
@@ -316,7 +316,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(snapshot.activeLinkCount, 0)
     }
 
-    func testConcurrentReservationsForOneTargetElectExactlyOneFirstInboundInstaller() async {
+    func testConcurrentReservationsForOneTargetElectExactlyOneFirstInboundInstaller() async throws {
         let authority = makeAuthority()
         let target = makeEndpoint(windowID: 9)
         let observerA = makeEndpoint(windowID: 1)
@@ -380,7 +380,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertFalse(pendingC.provisionallyInstallsTargetObservation)
     }
 
-    func testInstallerRoleIsReElectedWhenTheElectedReservationIsAbandoned() async {
+    func testInstallerRoleIsReElectedWhenTheElectedReservationIsAbandoned() async throws {
         let authority = makeAuthority()
         let target = makeEndpoint(windowID: 9)
         let elected = await authority.reserveLink(observer: makeEndpoint(windowID: 1), target: target)
@@ -426,7 +426,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(observedTargets, 1)
     }
 
-    func testInstallerRoleIsReElectedWhenTheElectedObserverIsInvalidatedBeforeSiblingActivation() async {
+    func testInstallerRoleIsReElectedWhenTheElectedObserverIsInvalidatedBeforeSiblingActivation() async throws {
         let authority = makeAuthority()
         let target = makeEndpoint(windowID: 9)
         let electedObserver = makeEndpoint(windowID: 1)
@@ -1797,7 +1797,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let conflict = await authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil)
+                DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil),
             ],
             until: .change,
             timeoutSeconds: 30
@@ -1848,7 +1848,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         async let pending = authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil)
+                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil),
             ],
             until: .change,
             timeoutSeconds: 30
@@ -1867,7 +1867,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let reuse = await authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil)
+                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil),
             ],
             until: .change,
             timeoutSeconds: 0
@@ -1912,7 +1912,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let duplicated = await authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: lease, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: lease, cursor: nil)
+                DomainAgentSessionLinkWaitRequest(lease: lease, cursor: nil),
             ],
             until: .change,
             timeoutSeconds: 5
@@ -1934,7 +1934,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         var leases: [DomainAgentSessionLinkLease] = []
         for target in targets {
             try await activateLink(authority, observer: observer, target: target, status: .running)
-            try await leases.append(authority.authorize(
+            leases.append(try await authority.authorize(
                 operation: .monitorWait,
                 observerEndpoint: observer,
                 targetSessionID: target.sessionID
@@ -1987,7 +1987,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         async let pending = authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil)
+                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil),
             ],
             until: .change,
             timeoutSeconds: 30
