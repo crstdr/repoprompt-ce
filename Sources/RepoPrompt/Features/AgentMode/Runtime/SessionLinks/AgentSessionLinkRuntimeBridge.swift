@@ -5976,9 +5976,10 @@ final class AgentSessionLinkRuntimeBridge {
             )
         )
         let targetEndpoint = target.lease.target
-        let liveness: AgentSessionLinkSendLivenessProbe = { [weak self] in
-            guard let self, let host = self.host else { return .unavailable }
-            return host.agentSessionLinkSendLiveness(
+        // Keep the validated host across Stop's authorization suspension, just as for send.
+        // Its probe still re-proves both exact endpoints and the target window's closing state.
+        let liveness: AgentSessionLinkSendLivenessProbe = {
+            host.agentSessionLinkSendLiveness(
                 observer: request.observerEndpoint, target: targetEndpoint
             )
         }
