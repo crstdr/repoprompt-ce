@@ -3,6 +3,89 @@ import Foundation
 import XCTest
 
 final class AgentSessionLanePolicyTests: XCTestCase {
+    func testExplicitModelUsesAdvertisedFullIDWithoutRoleSubstitution() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true, grokBuildAvailable: true)
+        // Use the production producer, not another list of accepted models.
+        for entry in AgentModelCatalog.discoveryAgents(availability: availability) where entry.available {
+            guard AgentModelCatalog.AgentSelectionSurface.headless.allows(entry.agent) else { continue }
+            for model in entry.models {
+                for target in model.startTargets {
+                    let selected = try AgentSessionLanePolicy.resolveModel(target.selectionID.rawValue, availability: availability)
+                    XCTAssertEqual(selected.agentRaw, entry.agent.rawValue)
+                    XCTAssertEqual(selected.modelRaw, target.modelRaw)
+                    XCTAssertTrue(selected.modelParameterSelections.isEmpty)
+                }
+            }
+        }
+        XCTAssertThrowsError(try AgentSessionLanePolicy.resolveModel("pair", availability: availability))
+        XCTAssertThrowsError(try AgentSessionLanePolicy.resolveModel("codexExec:unadvertised-future-model-high", availability: availability))
+        XCTAssertNotNil(
+            AgentModelCatalog.resolveSelectionID("codexExec:unadvertised-future-model-high", availability: availability),
+            "Legacy launch resolver remains permissive"
+        )
+    }
+
+    func testMemoryOnlyAdmissionDoesNotDiscoverOrSubstituteMissingCatalogue() throws {
+        let catalogue = AgentAdvertisedModelCatalog()
+        let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true)
+        XCTAssertThrowsError(try catalogue.selection("cursor:auto", availability: availability)) { error in
+            XCTAssertEqual(error as? AgentAdvertisedModelCatalog.AdmissionError, .catalogueUnavailable)
+        }
+        let dynamic = AgentModelOption(
+            rawValue: "future-model-high",
+            displayName: "Future",
+            description: nil,
+            isPlaceholderDefault: false,
+            isProviderDefault: false
+        )
+        catalogue.record([dynamic], for: .codexExec)
+        let selected = try catalogue.selection("codexExec:future-model-high", availability: availability)
+        XCTAssertEqual(selected.storedModelRaw, "future-model-high")
+        XCTAssertEqual(selected.reasoningEffortRaw, "high")
+        XCTAssertThrowsError(try catalogue.selection("codexExec:future-model-low", availability: availability))
+        XCTAssertThrowsError(try catalogue.selection("codexExec:future-model-high", availability: .none))
+        catalogue.invalidate(.codexExec)
+        XCTAssertThrowsError(try catalogue.selection("codexExec:future-model-high", availability: availability)) { error in
+            XCTAssertEqual(error as? AgentAdvertisedModelCatalog.AdmissionError, .catalogueUnavailable)
+        }
+        let colon = AgentModelOption(
+            rawValue: "vendor:model:variant",
+            displayName: "Colon",
+            description: nil,
+            isPlaceholderDefault: false,
+            isProviderDefault: false
+        )
+        catalogue.record([colon], for: .openCode)
+        XCTAssertEqual(
+            try catalogue.selection("openCode:vendor:model:variant", availability: availability).storedModelRaw,
+            "vendor:model:variant"
+        )
+    }
+
+    func testCreateLaneDigestDistinguishesExplicitModelFromRoleAndDefault() {
+        let original = AgentSessionLaneCreateRequest(
+            idempotencyKey: "key",
+            role: nil,
+            sessionName: nil,
+            message: nil,
+            workflowReference: nil
+        )
+        let role = AgentSessionLaneCreateRequest(
+            idempotencyKey: "key",
+            role: "pair",
+            sessionName: nil,
+            message: nil,
+            workflowReference: nil
+        )
+        var explicit = original
+        explicit.modelID = "codexExec:gpt-5.4-high"
+        XCTAssertEqual(original.digest, role.digest, "Preserve default role retry identity")
+        XCTAssertNotEqual(original.digest, explicit.digest)
+        var changed = explicit
+        changed.modelID = "codexExec:gpt-5.4-low"
+        XCTAssertNotEqual(explicit.digest, changed.digest)
+    }
+
     @MainActor
     func testEveryRoleUsesItsEffectiveRoleDefaultAndMappedEffort() throws {
         let workspaceID = UUID()

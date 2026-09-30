@@ -357,6 +357,25 @@ enum AgentModelCatalog {
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
         includeClaudeEffortVariants: Bool = true
     ) -> [AgentModelOption] {
+        let result = uncachedOptions(
+            for: agentKind, availability: availability, codexDynamicModels: codexDynamicModels,
+            includeClaudeEffortVariants: includeClaudeEffortVariants
+        )
+        if includeClaudeEffortVariants,
+           agentKind != .codexExec || codexDynamicModels == nil,
+           isAgentAvailable(agentKind, availability: availability)
+        {
+            AgentAdvertisedModelCatalog.shared.record(result, for: agentKind)
+        }
+        return result
+    }
+
+    private static func uncachedOptions(
+        for agentKind: AgentProviderKind,
+        availability: AvailabilityContext,
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]?,
+        includeClaudeEffortVariants: Bool
+    ) -> [AgentModelOption] {
         guard isAgentAvailable(agentKind, availability: availability) else { return [] }
         if agentKind == .cursor {
             return CursorAIModelCatalog.options

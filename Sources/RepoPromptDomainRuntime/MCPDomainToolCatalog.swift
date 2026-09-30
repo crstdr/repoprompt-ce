@@ -43,13 +43,13 @@ package enum MCPWindowToolName {
     }
 }
 
-package enum MCPDomainToolScopeKind: String, CaseIterable, Sendable {
+package enum MCPDomainToolScopeKind: String, CaseIterable {
     case application
     case window
     case standalone
 }
 
-package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
+package enum MCPToolCapability: String, CaseIterable, Hashable {
     case conversationSend = "conversation_send"
     case conversationHelper = "conversation_helper"
     case conversationLog = "conversation_log"
@@ -86,7 +86,7 @@ package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
     }
 }
 
-package enum MCPToolAdmissionClass: String, CaseIterable, Sendable {
+package enum MCPToolAdmissionClass: String, CaseIterable {
     case exclusive
     case control
     case smallRead = "small_read"
@@ -95,13 +95,13 @@ package enum MCPToolAdmissionClass: String, CaseIterable, Sendable {
     case fileSearch = "file_search"
 }
 
-package enum MCPDomainToolOperationInput: Equatable, Sendable {
+package enum MCPDomainToolOperationInput: Equatable {
     case missing
     case value(String)
     case malformed
 }
 
-package struct MCPDomainToolOperationIdentity: Equatable, Hashable, Sendable {
+package struct MCPDomainToolOperationIdentity: Equatable, Hashable {
     package static let unknownToolName = "unknown"
     package static let unknownOperation = "unknown"
     package static let callOperation = "call"
@@ -120,25 +120,25 @@ package struct MCPDomainToolOperationIdentity: Equatable, Hashable, Sendable {
     )
 }
 
-package enum MCPDomainToolResourceLimitScope: String, Sendable {
+package enum MCPDomainToolResourceLimitScope: String {
     case application
     case window
     case repository
 }
 
-package struct MCPDomainToolConfiguredLimits: Equatable, Sendable {
+package struct MCPDomainToolConfiguredLimits: Equatable {
     package let connectionLane: Int
     package let resourceLease: Int?
     package let resourceScope: MCPDomainToolResourceLimitScope?
 }
 
-private enum MCPDomainToolOperationNormalization: Hashable, Sendable {
+private enum MCPDomainToolOperationNormalization: Hashable {
     case exact
     case lowercased
     case trimmedLowercased
 }
 
-private struct MCPDomainToolOperationPolicy: Hashable, Sendable {
+private struct MCPDomainToolOperationPolicy: Hashable {
     let argumentKey: String
     let canonicalOperationByInput: [String: String]
     let defaultOperation: String?
@@ -187,7 +187,7 @@ private struct MCPDomainToolOperationPolicy: Hashable, Sendable {
     }
 }
 
-package struct MCPDomainToolCatalogEntry: Hashable, Sendable {
+package struct MCPDomainToolCatalogEntry: Hashable {
     package let name: String
     package let scope: MCPDomainToolScopeKind
     package let capability: MCPToolCapability
@@ -309,7 +309,7 @@ package enum MCPDomainToolCatalog {
             operations: [
                 "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact", "set_waiting_on",
                 "snooze_auto_wake", "request_attention", "respond", "steer", "stop",
-                "create_lane", "retire_lane"
+                "create_lane", "retire_lane", "set_model"
             ],
             normalization: .trimmedLowercased
         )),

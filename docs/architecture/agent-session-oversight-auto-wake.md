@@ -24,6 +24,29 @@ defect in this subsystem.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
+## Configuration-only model selection
+
+`set_model(session_id, model_id)` requires the exact original **Manage** lease and a fully idle,
+loaded target of the same agent kind. The target owns the final authority hop; after it returns,
+endpoint identity, readiness, destination availability, and advertised membership are checked and
+configuration committed synchronously. A concurrent composer claim wins. Revocation/relink before
+that hop cannot substitute a new grant; later revocation does not undo an already admitted commit.
+Busy/loading/settling refusals are retryable, never queued. Even identical selections pass every gate.
+
+`AgentAdvertisedModelCatalog` indexes full compound IDs when ordinary catalogue producers run.
+Admission performs bounded memory lookups only: no persistence warming, full catalogue flattening,
+provider discovery, or legacy resolver fallback. Registry/backend changes invalidate the index;
+a cold index tells the caller to refresh `agent_manage.list_agents` in the destination window.
+`create_lane` accepts either an explicit `model_id` using this same admission or the existing
+`role`/default path; specifying both is an error. Explicit selection never silently substitutes a role.
+
+Acceptance changes per-session model/effort and narrow active UI projections, schedules persistence
+and existing MCP publication, and leaves identities, provider sessions, ACP pins, draft, and staged
+handoff intact. It does not start/resume/apply/reset a provider; the next ordinary turn applies the
+configuration. Native ordinary sends require a current configuration proof, independently owned by
+the native runtime. Default/auto selections do not promise a provider reset, and automatic effort
+routing may still choose effort for a later turn.
+
 ## Autonomy is grant-scoped and prompt-governed
 
 The user's exact direct grant is the whole structural delegation. Target-bearing observer operations

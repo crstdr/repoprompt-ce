@@ -1220,6 +1220,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
 
 /// A native runtime stub with an active session that records every provider-bound message.
 actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
+    private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
 
@@ -1248,14 +1249,27 @@ actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
         effortLevel _: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
-        NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "compact-recording")
+        configuration.replaceProcess()
+        return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "compact-recording")
     }
 
     func currentSessionRef() -> NativeAgentRuntimeSessionRef {
         NativeAgentRuntimeSessionRef(sessionID: "compact-recording")
     }
 
-    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {}
+    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {
+        _ = configuration.apply()
+    }
+
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        configuration.apply()
+    }
+
+    func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try configuration.validate(proof)
+        sentMessages.append(text)
+        return UUID()
+    }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
@@ -1266,6 +1280,9 @@ actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
         .noTurnInFlight
     }
 
-    func shutdown() {}
+    func shutdown() {
+        configuration.replaceProcess()
+    }
+
     func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) {}
 }

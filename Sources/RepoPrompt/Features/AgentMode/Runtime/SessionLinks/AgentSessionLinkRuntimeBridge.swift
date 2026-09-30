@@ -88,6 +88,20 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// All live compose-tab/session bindings across every non-closing window.
     func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate]
 
+    func agentSessionLinkModelAvailability(windowID: Int) -> AgentModelCatalog.AvailabilityContext
+
+    /// Exact memory-only lookup; must not sweep sessions or resolve execution locations.
+    func agentSessionLinkModelCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkEndpointCandidate?
+
+    func agentSessionLinkPerformSetModel(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        modelID: String,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkModelOutcome
+
     /// Count independent compose-tab bindings without hydration.
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int
 
@@ -5253,12 +5267,23 @@ final class AgentSessionLinkRuntimeBridge {
             lease = value
         case let .failure(error):
             if error == .capabilityDenied, operation.requiredMonitorCapability == .manage {
+                if operation == .monitorSetModel {
+                    guard case let .success(watch) = await authority.authorize(
+                        operation: .monitorPoll, observerEndpoint: observerEndpoint,
+                        targetSessionID: targetSessionID
+                    ), modelEndpoints(for: watch) != nil else { return .failure(.denied) }
+                    return .failure(.managementNotGranted)
+                }
                 return await managementNotGrantedOrDenied(
                     observerEndpoint: observerEndpoint,
                     targetSessionID: targetSessionID
                 )
             }
             return .failure(AuthorizationFailure(error))
+        }
+        if operation == .monitorSetModel {
+            guard let candidate = modelEndpoints(for: lease) else { return .failure(.denied) }
+            return .success(AuthorizedTarget(lease: lease, candidate: candidate))
         }
         guard let candidate = await revalidateEndpoints(for: lease) else {
             return .failure(.denied)
@@ -5866,6 +5891,51 @@ final class AgentSessionLinkRuntimeBridge {
             notePendingSendLedgerSettled(on: target.lease.reference)
             return .blocked(failure)
         }
+    }
+
+    // MARK: - Configuration-only model selection
+
+    private func modelEndpoints(for lease: DomainAgentSessionLinkLease) -> AgentSessionLinkEndpointCandidate? {
+        guard !isFrozenForTermination, !Task.isCancelled, let host,
+              let observer = host.agentSessionLinkModelCandidate(for: lease.observer),
+              let target = host.agentSessionLinkModelCandidate(for: lease.target),
+              observer.domainEndpoint == lease.observer, target.domainEndpoint == lease.target,
+              !observer.isClosing, !target.isClosing,
+              !observer.isDeletionInProgress, !target.isDeletionInProgress,
+              AgentSessionLinkEndpointEligibility.observerOperationEligibility(
+                  observer.eligibilityInput,
+                  roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
+              ) == .eligible
+        else { return nil }
+        return target
+    }
+
+    func setModel(target: AuthorizedTarget, modelID: String) async -> AgentSessionLinkModelOutcome {
+        guard let host, target.lease.capability == .manage,
+              modelEndpoints(for: target.lease) != nil else { return .blocked(.linkRevoked) }
+        // Retain the host and the ORIGINAL lease through routing. The only final authority hop
+        // occurs inside the target transaction; never reacquire a grant after revoke/relink.
+        return await host.agentSessionLinkPerformSetModel(
+            to: target.candidate, modelID: modelID,
+            liveness: { [self] in
+                let live = modelEndpoints(for: target.lease) != nil
+                return AgentSessionLinkSendLiveness(
+                    observerEndpointIsLive: live, targetEndpointIsLive: live,
+                    targetWindowIsClosing: isFrozenForTermination
+                )
+            },
+            reauthorize: { [self] in
+                guard !isFrozenForTermination, !Task.isCancelled else { return .shuttingDown }
+                let error = await authority.validate(lease: target.lease)
+                guard !isFrozenForTermination, !Task.isCancelled else { return .shuttingDown }
+                switch error {
+                case nil: return .committed
+                case .capabilityDenied?: return .managementRevoked
+                case .runtimeShuttingDown?: return .shuttingDown
+                default: return .linkRevoked
+                }
+            }
+        )
     }
 
     // MARK: - Overseer Stop
@@ -6813,12 +6883,19 @@ final class AgentSessionLinkRuntimeBridge {
         else { return .refused(.destinationUnavailable) }
         let selection: AgentSessionLanePolicy.RoleSelection
         do {
-            // Match create_session's cached ACP-model admission without a provider run.
-            await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
-            selection = try AgentSessionLanePolicy.resolveRole(
-                request.role, availability: .current, workspaceID: destination.workspaceID
-            )
-        } catch { return .refused(.roleUnavailable) }
+            if let modelID = request.modelID {
+                guard request.role == nil else { return .refused(.modelUnavailable) }
+                selection = try AgentSessionLanePolicy.resolveModel(
+                    modelID, availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID)
+                )
+            } else {
+                // Preserve the existing role/default behavior. Explicit selections never warm.
+                await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+                selection = try AgentSessionLanePolicy.resolveRole(
+                    request.role, availability: .current, workspaceID: destination.workspaceID
+                )
+            }
+        } catch { return .refused(request.modelID == nil ? .roleUnavailable : .modelUnavailable) }
         guard await authority.hasActiveLink(endpoint: observerEndpoint) else { return .refused(.denied) }
         // No suspension between this count and the reservation: admission is creator-scoped and
         // counts both active lanes and the pending allocations that have not linked yet.
@@ -6888,6 +6965,13 @@ final class AgentSessionLinkRuntimeBridge {
         }
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
         let creation: AgentSessionLaneHostCreationOutcome
+        do {
+            if let modelID = request.modelID {
+                guard try AgentSessionLanePolicy.resolveModel(
+                    modelID, availability: host.agentSessionLinkModelAvailability(windowID: destinationWindowID)
+                ) == selection else { return .refused(.modelUnavailable) }
+            }
+        } catch { return .refused(.modelUnavailable) }
         do {
             creation = try await host.agentSessionLinkCreateLane(
                 destinationWindowID: destinationWindowID,

@@ -16,6 +16,21 @@ enum AgentSessionLanePolicy {
         let modelParameterSelections: [ACPModelParameterSelection]
     }
 
+    static func resolveModel(
+        _ modelID: String,
+        availability: AgentModelCatalog.AvailabilityContext
+    ) throws -> RoleSelection {
+        let selection = try AgentAdvertisedModelCatalog.shared.selection(modelID, availability: availability)
+        guard AgentModelCatalog.AgentSelectionSurface.headless.allows(selection.agent) else {
+            throw AgentAdvertisedModelCatalog.AdmissionError.unavailable
+        }
+        return RoleSelection(
+            role: .pair, agentRaw: selection.agent.rawValue,
+            modelRaw: selection.storedModelRaw, reasoningEffortRaw: selection.reasoningEffortRaw,
+            modelParameterSelections: []
+        )
+    }
+
     @MainActor
     static func resolveRole(
         _ rawRole: String?,

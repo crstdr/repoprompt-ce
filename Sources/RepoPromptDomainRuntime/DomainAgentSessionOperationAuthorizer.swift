@@ -6,7 +6,7 @@ import Foundation
 /// `agent_session_link` operations use these identities to select a capability, but their actual
 /// generation-qualified authorization and lease come from `DomainAgentSessionLinkAuthority`.
 /// `monitorList` is the one targetless identity and uses `authorizeObserverScoped` below.
-package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, Sendable {
+package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable {
     case runPoll = "agent_run.poll"
     case runWait = "agent_run.wait"
     case runCancel = "agent_run.cancel"
@@ -39,6 +39,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     case monitorSteer = "agent_session_link.steer"
     /// Cancels one exact target's current run or pending start under a Manage grant.
     case monitorStop = "agent_session_link.stop"
+    case monitorSetModel = "agent_session_link.set_model"
     /// Overseer-requested provider context compaction of one exact, fully idle target.
     ///
     /// It needs the same grant as `send`: a RepoPrompt-constructed native compaction command starts
@@ -47,7 +48,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     /// mistake a compaction for a message.
     case monitorCompact = "agent_session_link.compact"
 
-    package enum Family: String, Hashable, Sendable {
+    package enum Family: String, Hashable {
         /// Existing spawn-provenance control and read operations.
         case sessionControl = "session_control"
         /// New user-granted oversight operations.
@@ -62,7 +63,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
             .sessionControl
         case .monitorList, .monitorCreateLane, .monitorRetireLane,
              .monitorPoll, .monitorWait, .monitorRead, .monitorSend,
-             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop, .monitorCompact:
+             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop, .monitorSetModel, .monitorCompact:
             .monitor
         }
     }
@@ -74,7 +75,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
         case .monitorList, .monitorCreateLane:
             true
         case .monitorRetireLane, .monitorPoll, .monitorWait, .monitorRead, .monitorSend,
-             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop, .monitorCompact,
+             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop, .monitorSetModel, .monitorCompact,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
              .manageList, .manageGetLog, .manageExtractHandoff,
              .manageResume, .manageStop, .manageCleanup:
@@ -96,7 +97,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
             .read
         case .monitorSend, .monitorCompact:
             .sendWhenIdle
-        case .monitorRespond, .monitorSteer, .monitorStop, .monitorRetireLane:
+        case .monitorRespond, .monitorSteer, .monitorStop, .monitorSetModel, .monitorRetireLane:
             .manage
         case .monitorList, .monitorCreateLane,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
@@ -110,7 +111,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     package var mutatesTarget: Bool {
         switch self {
         case .runCancel, .runSteer, .runRespond, .manageResume, .manageStop, .manageCleanup, .monitorSend,
-             .monitorRespond, .monitorSteer, .monitorStop, .monitorCompact,
+             .monitorRespond, .monitorSteer, .monitorStop, .monitorSetModel, .monitorCompact,
              .monitorRetireLane:
             true
         case .runPoll, .runWait, .manageList, .manageGetLog, .manageExtractHandoff,
@@ -125,7 +126,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
 ///
 /// It is derived from server-owned run routing (`RequestMetadata` → connection purpose → exact
 /// run-installed/handover/pending-run tab context), never from tool arguments.
-package enum DomainAgentSessionCallerIdentity: Hashable, Sendable {
+package enum DomainAgentSessionCallerIdentity: Hashable {
     /// A non-Agent principal operating through explicitly routed window control.
     case administrativePrincipal
     /// An Agent Mode run whose exact run-scoped session identity resolved.
@@ -152,7 +153,7 @@ package enum DomainAgentSessionCallerIdentity: Hashable, Sendable {
 ///
 /// `unknown` is used when provenance could not be established authoritatively; it never authorizes an
 /// Agent-origin caller.
-package enum DomainAgentSessionTargetProvenance: Hashable, Sendable {
+package enum DomainAgentSessionTargetProvenance: Hashable {
     case known(targetSessionID: UUID, parentSessionID: UUID?)
     case unknown(targetSessionID: UUID)
 
@@ -170,7 +171,7 @@ package enum DomainAgentSessionTargetProvenance: Hashable, Sendable {
 }
 
 /// An oversight grant presented by the link authority. Never accepted from tool arguments.
-package struct DomainAgentSessionMonitorGrantProof: Hashable, Sendable {
+package struct DomainAgentSessionMonitorGrantProof: Hashable {
     package let linkID: UUID
     package let generation: UInt64
     package let capability: DomainAgentSessionLinkCapability
@@ -202,7 +203,7 @@ package struct DomainAgentSessionMonitorGrantProof: Hashable, Sendable {
     }
 }
 
-package enum DomainAgentSessionAuthorityBasis: Hashable, Sendable {
+package enum DomainAgentSessionAuthorityBasis: Hashable {
     case administrativePrincipal
     case directSpawnProvenance(parentSessionID: UUID)
     case monitorGrant(linkID: UUID, generation: UInt64, capability: DomainAgentSessionLinkCapability)
@@ -212,7 +213,7 @@ package enum DomainAgentSessionAuthorityBasis: Hashable, Sendable {
 
 /// Denial reasons are diagnostic only. Callers must surface one indistinguishable user-facing message
 /// so an Agent-origin caller cannot probe whether an unauthorized UUID exists.
-package enum DomainAgentSessionAuthorizationDenial: String, Error, Equatable, Sendable {
+package enum DomainAgentSessionAuthorizationDenial: String, Error, Equatable {
     case callerRoutingUnresolved = "caller_routing_unresolved"
     case targetProvenanceUnknown = "target_provenance_unknown"
     case notDirectChild = "not_direct_child"
@@ -229,7 +230,7 @@ package enum DomainAgentSessionAuthorizationDenial: String, Error, Equatable, Se
     case noActiveLink = "no_active_link"
 }
 
-package enum DomainAgentSessionAuthorizationDecision: Equatable, Sendable {
+package enum DomainAgentSessionAuthorizationDecision: Equatable {
     case authorized(DomainAgentSessionAuthorityBasis)
     case denied(DomainAgentSessionAuthorizationDenial)
 
@@ -250,7 +251,7 @@ package enum DomainAgentSessionAuthorizationDecision: Equatable, Sendable {
 }
 
 /// Discovery scope for targetless enumeration operations such as `agent_manage.list_sessions`.
-package enum DomainAgentSessionDiscoveryScope: Hashable, Sendable {
+package enum DomainAgentSessionDiscoveryScope: Hashable {
     case unrestricted
     case directChildren(of: UUID)
     case none

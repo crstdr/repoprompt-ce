@@ -221,7 +221,8 @@ extension AgentModeViewModel {
         tabID: UUID,
         sessionID: UUID,
         tabName: String,
-        isWindowClosing: Bool
+        isWindowClosing: Bool,
+        includeLocation: Bool = true
     ) -> AgentSessionLinkEndpointCandidate? {
         guard let session = sessions[tabID],
               let identity = agentSessionLifecycleIdentity(tabID: tabID, expectedSessionID: sessionID),
@@ -254,10 +255,10 @@ extension AgentModeViewModel {
             providerDisplayName: session.selectedAgent.displayName,
             // Resolved here, in the endpoint's own window, because only this window knows both its
             // worktree bindings and its workspace. UI only; never enters an agent-facing payload.
-            locationLabel: AgentMonitorLocationLabelFormatter.label(
+            locationLabel: includeLocation ? AgentMonitorLocationLabelFormatter.label(
                 worktreeLabel: primaryExecutionWorktreeIndicator(forTabID: tabID)?.label,
                 workspaceName: workspaceManager?.workspace(withID: identity.workspaceID)?.name
-            ),
+            ) : nil,
             // Qualified here, in the endpoint's own window, against the binding state read in this
             // same MainActor pass. A proof left over from a superseded binding degrades to pending
             // rather than travelling on the candidate as authoritative.
