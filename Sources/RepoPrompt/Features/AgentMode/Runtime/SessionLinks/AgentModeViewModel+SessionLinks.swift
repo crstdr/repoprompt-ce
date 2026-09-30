@@ -915,7 +915,12 @@ extension AgentModeViewModel {
         else {
             return nil
         }
-        return menu
+        // The stored projection carries lifecycle-only eligibility; overlay the shared
+        // persistence blocker so the inverse menu's greyed reason matches the pill's Add reason.
+        return menu.withObserverIneligibleReason(
+            agentSessionLinkPersistencePresentation.addBlockerMessage
+                ?? menu.observerIneligibleReason
+        )
     }
 
     /// Exact current endpoint behind one active sidebar row, independent of whether its target menu
@@ -966,6 +971,69 @@ extension AgentModeViewModel {
             .alreadyInRequestedState
         case let .failed(message):
             .failed(message: message)
+        }
+    }
+
+    /// Inverse-direction add for the sidebar's "Make overseer of" / "Oversee" menu: the row
+    /// rendered by the sidebar is the *observer*. Uses the general exact-endpoint Add so the row
+    /// may acquire its first outbound link — the sidebar's existing-overseer precondition does
+    /// not apply to this direction.
+    func addAgentOversightLink(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> AgentSidebarOversightActionOutcome {
+        switch await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint
+        ) {
+        case .added:
+            .changed
+        case .alreadyLinked:
+            .alreadyInRequestedState
+        case let .failed(failure):
+            .failed(message: failure.uiMessage)
+        case let .rejected(message):
+            .failed(message: message)
+        }
+    }
+
+    /// Pasted-ID resolution for the sidebar's inbound `Session ID…` sheet (choose a prospective
+    /// overseer for this row). The bridge enforces the Oversee-by rule: the pasted session must
+    /// already hold an outbound link.
+    func resolveSidebarOverseerCandidate(
+        rawSessionID: String,
+        excludingTargetSessionID: UUID
+    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
+        await AgentSessionLinkRuntimeBridge.shared.resolveSidebarOverseerCandidate(
+            rawSessionID: rawSessionID,
+            excludingTargetSessionID: excludingTargetSessionID
+        )
+    }
+
+    /// Pasted-ID resolution for the sidebar's outbound `Session ID…` sheet (choose a prospective
+    /// target for this row-as-observer). Reuses the composer pill's resolver, except that an
+    /// already-linked pair resolves to `.alreadyLinked` — the sheet closes silently rather than
+    /// showing the "You're already overseeing this session." error.
+    func resolveSidebarTargetCandidate(
+        rawSessionID: String,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
+        let existingTargetIDs = Set(
+            monitorPillPropsByEndpoint[observerEndpoint]?.outbound.map(\.targetSessionID) ?? []
+        )
+        switch AgentSessionLinkRuntimeBridge.shared
+            .resolveTargetCandidate(
+                observerSessionID: observerEndpoint.sessionID,
+                rawTargetSessionID: rawSessionID,
+                existingOutboundTargetIDs: existingTargetIDs
+            )
+        {
+        case let .success(candidate):
+            return .success(.candidate(candidate))
+        case .failure(.alreadyMonitoring):
+            return .success(.alreadyLinked)
+        case let .failure(failure):
+            return .failure(AgentOversightResolutionMessage(message: failure.uiMessage))
         }
     }
 

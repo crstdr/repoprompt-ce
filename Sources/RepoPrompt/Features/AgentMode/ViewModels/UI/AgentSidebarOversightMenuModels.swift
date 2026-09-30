@@ -1,22 +1,30 @@
 import Foundation
 import RepoPromptDomainRuntime
 
-/// Exact, target-centric relationship choices rendered by one active Agent sidebar row.
+/// Exact two-direction relationship choices rendered by one active Agent sidebar row.
 ///
 /// This is a presentation projection only. It carries no closures and is never placed in prompt
 /// inventory, observation snapshots, passive status samples, or MCP responses.
+///
+/// The same value drives the Oversee-by mark menu, the hover affordance menu, and the
+/// context-menu submenus. `observerOptions` is the inbound direction (who oversees this row);
+/// `targetOptions` is the outbound direction (who this row oversees). Both carry linked
+/// entries even when the peer is temporarily missing or ineligible, so the user can always
+/// unlink a stale relationship.
 struct AgentSidebarOversightMenuProps: Equatable {
     enum Relationship: Equatable {
         case available
         case linked(
             reference: DomainAgentSessionLinkReference,
-            observerCurrentlyEligible: Bool
+            peerCurrentlyEligible: Bool
         )
     }
 
-    struct ObserverOption: Identifiable, Equatable {
-        let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
-        let observerSessionID: UUID
+    /// One exact peer incarnation in either direction. `peerEndpoint` is the other end of the
+    /// link: the observer for `observerOptions`, the target for `targetOptions`.
+    struct PeerOption: Identifiable, Equatable {
+        let peerEndpoint: DomainAgentSessionLinkEndpointIdentity
+        let peerSessionID: UUID
         let displayName: String
         let providerDisplayName: String?
         let menuLabel: String
@@ -24,15 +32,80 @@ struct AgentSidebarOversightMenuProps: Equatable {
         let relationship: Relationship
 
         var id: DomainAgentSessionLinkEndpointIdentity {
-            observerEndpoint
+            peerEndpoint
+        }
+
+        /// Compatibility spelling for the inbound direction (the peer is an observer).
+        var observerEndpoint: DomainAgentSessionLinkEndpointIdentity {
+            peerEndpoint
+        }
+
+        /// Compatibility spelling for the outbound direction (the peer is a target).
+        var targetEndpoint: DomainAgentSessionLinkEndpointIdentity {
+            peerEndpoint
         }
     }
 
+    init(
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID,
+        targetDisplayName: String,
+        observerOptions: [PeerOption],
+        createdByLabel: String? = nil,
+        targetOptions: [PeerOption] = [],
+        targetIneligibleReason: String? = nil,
+        observerIneligibleReason: String? = nil,
+        inboundObserverNames: [String] = [],
+        inboundObserverSessionIDs: [UUID] = [],
+        outboundTargetNames: [String] = [],
+        creatorSessionID: UUID? = nil
+    ) {
+        self.targetEndpoint = targetEndpoint
+        self.targetSessionID = targetSessionID
+        self.targetDisplayName = targetDisplayName
+        self.observerOptions = observerOptions
+        self.targetOptions = targetOptions
+        self.targetIneligibleReason = targetIneligibleReason
+        self.observerIneligibleReason = observerIneligibleReason
+        self.inboundObserverNames = inboundObserverNames
+        self.inboundObserverSessionIDs = inboundObserverSessionIDs
+        self.outboundTargetNames = outboundTargetNames
+        self.createdByLabel = createdByLabel
+        self.creatorSessionID = creatorSessionID
+    }
+
+    typealias ObserverOption = PeerOption
+    typealias TargetOption = PeerOption
+
+    /// The row's own exact endpoint. It is the *target* for `observerOptions` and the
+    /// *observer* for `targetOptions`.
     let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
     let targetSessionID: UUID
     let targetDisplayName: String
-    let observerOptions: [ObserverOption]
+
+    /// Oversee-by list: linked observers retained for unlinking, plus available candidates
+    /// that already hold an outbound link (the existing-overseer rule, enforced again at Add).
+    let observerOptions: [PeerOption]
+    /// Oversee list: linked targets retained for unlinking, plus eligible target candidates.
+    /// Empty when the row cannot currently observe (see `observerIneligibleReason`).
+    let targetOptions: [PeerOption]
+
+    /// Why the row cannot currently accept a new inbound link, or `nil` when it can.
+    /// Rendered greyed-out in the Oversee-by menu instead of hiding the menu.
+    let targetIneligibleReason: String?
+    /// Why the row cannot currently observe other sessions, or `nil` when it can. Includes
+    /// the persistence blocker (it wins over lifecycle eligibility, matching `canAddReason`).
+    var observerIneligibleReason: String?
+
+    /// Display names of the row's current overseers / targets, for the row mark tooltips.
+    /// Derived from the authority inventories, so they remain correct even when the menu
+    /// options are momentarily empty.
+    let inboundObserverNames: [String]
+    let inboundObserverSessionIDs: [UUID]
+    let outboundTargetNames: [String]
+
     var createdByLabel: String?
+    var creatorSessionID: UUID?
 
     var linkedObservers: [ObserverOption] {
         observerOptions.filter {
@@ -45,9 +118,51 @@ struct AgentSidebarOversightMenuProps: Equatable {
         observerOptions.filter { $0.relationship == .available }
     }
 
-    var isEmpty: Bool {
-        observerOptions.isEmpty
+    var linkedTargets: [TargetOption] {
+        targetOptions.filter {
+            if case .linked = $0.relationship { return true }
+            return false
+        }
     }
+
+    var availableTargets: [TargetOption] {
+        targetOptions.filter { $0.relationship == .available }
+    }
+
+    var hasInbound: Bool {
+        !linkedObservers.isEmpty || !inboundObserverNames.isEmpty
+    }
+
+    var isOverseer: Bool {
+        !outboundTargetNames.isEmpty
+    }
+
+    var isEmpty: Bool {
+        observerOptions.isEmpty && targetOptions.isEmpty
+    }
+
+    /// Returns a copy whose observer-eligibility reason has been overlaid, used by
+    /// `AgentMonitorPillProps.withPersistence` so the persistence blocker reaches the
+    /// sidebar's inverse menu with the same precedence it has on the pill's Add control.
+    func withObserverIneligibleReason(_ reason: String?) -> AgentSidebarOversightMenuProps {
+        guard reason != observerIneligibleReason else { return self }
+        var copy = self
+        copy.observerIneligibleReason = reason
+        return copy
+    }
+}
+
+/// User-facing failure text for the sidebar's pasted-ID resolvers. The resolvers speak plain
+/// message strings (existing resolver and eligibility copy); this wrapper lets `Result` carry them.
+struct AgentOversightResolutionMessage: Error, Equatable {
+    let message: String
+}
+
+/// Resolution outcome for the sidebar Session-ID sheets. `.alreadyLinked` means the pair is
+/// already linked in this direction: the sheet closes silently — no dialog, no message.
+enum AgentOversightSessionIDResolution: Equatable {
+    case candidate(AgentSessionLinkEndpointCandidate)
+    case alreadyLinked
 }
 
 /// Result of one exact sidebar relationship action.
@@ -59,20 +174,6 @@ enum AgentSidebarOversightActionOutcome: Equatable {
     var failureMessage: String? {
         guard case let .failed(message) = self else { return nil }
         return message
-    }
-}
-
-/// Copy for removing one target-scoped oversight relationship from the sidebar menu.
-enum AgentSidebarOversightMenuCopy {
-    static func stopTitle(observerMenuLabel: String) -> String {
-        "Stop oversight by “\(observerMenuLabel)”"
-    }
-
-    static func stopAccessibilityLabel(
-        observerMenuLabel: String,
-        targetDisplayName: String
-    ) -> String {
-        "Stop oversight of \(targetDisplayName) by “\(observerMenuLabel)”"
     }
 }
 
@@ -89,16 +190,22 @@ enum AgentSidebarOversightActionKey: Hashable {
     )
 }
 
-/// Pure construction of one target's menu from a single authority projection and live-candidate
-/// snapshot.
+/// Pure construction of one row's two-direction menu data from a single authority projection
+/// and live-candidate snapshot.
 ///
 /// Linked relationships are authority-owned and therefore survive a missing or newly-ineligible
-/// observer candidate. Available options intersect exact authority-owned outbound membership with a
-/// live-candidate presentation snapshot; the exact Add operation revalidates them before mutating.
+/// peer candidate. Available options intersect exact authority-owned membership with a
+/// live-candidate presentation snapshot; the exact Add operation revalidates them before
+/// mutating.
+///
+/// Ordering contract (approved 2026-09-30): in both directions the row's own workspace cohort
+/// sorts first, then the rest by folded display name; the outbound list additionally keeps its
+/// linked (ticked) entries first. Ineligible directions produce a greyed reason instead of a
+/// hidden menu.
 enum AgentSidebarOversightMenuProjection {
     private struct Seed {
-        let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
-        let observerSessionID: UUID
+        let peerEndpoint: DomainAgentSessionLinkEndpointIdentity
+        let peerSessionID: UUID
         let displayName: String
         let providerDisplayName: String?
         let locationLabel: String?
@@ -114,11 +221,11 @@ enum AgentSidebarOversightMenuProjection {
         }
 
         var fullIdentityDescription: String {
-            let binding = observerEndpoint.persistentBindingGeneration?.uuidString ?? "unresolved"
-            return "session \(observerSessionID.uuidString); window \(observerEndpoint.windowID); "
-                + "workspace \(observerEndpoint.workspaceID.uuidString); "
-                + "tab \(observerEndpoint.tabID.uuidString); binding \(binding); "
-                + "transition \(observerEndpoint.bindingTransitionGeneration)"
+            let binding = peerEndpoint.persistentBindingGeneration?.uuidString ?? "unresolved"
+            return "session \(peerSessionID.uuidString); window \(peerEndpoint.windowID); "
+                + "workspace \(peerEndpoint.workspaceID.uuidString); "
+                + "tab \(peerEndpoint.tabID.uuidString); binding \(binding); "
+                + "transition \(peerEndpoint.bindingTransitionGeneration)"
         }
     }
 
@@ -128,26 +235,37 @@ enum AgentSidebarOversightMenuProjection {
         target: AgentSessionLinkEndpointCandidate,
         inputs: DomainAgentSessionLinkEndpointProjectionInputs,
         candidates: [AgentSessionLinkEndpointCandidate],
-        createdByLabel: String? = nil
-    ) -> AgentSidebarOversightMenuProps? {
-        guard AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil else {
-            return nil
-        }
+        createdByLabel: String? = nil,
+        creatorSessionID: UUID? = nil
+    ) -> AgentSidebarOversightMenuProps {
+        let rowEndpoint = target.domainEndpoint
+        let rowWorkspaceID = target.workspaceID
+
+        // Both directions carry independent eligibility: a session can be a valid target while
+        // unable to observe (for example MCP-controlled), and vice versa.
+        let targetFailure = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target)
+        let observerReason = AgentSessionLinkEndpointEligibility.addDisabledReason(
+            target.eligibilityInput,
+            roleAllowsOutboundMonitoring: target.roleAllowsOutboundMonitoring
+        )
 
         let candidatesByEndpoint = Dictionary(
             candidates.map { ($0.domainEndpoint, $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        var linkedEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
-        var linked: [Seed] = []
-        linked.reserveCapacity(inputs.inbound.items.count)
+
+        // MARK: Inbound (who oversees this row)
+
+        var linkedObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
+        var linkedObservers: [Seed] = []
+        linkedObservers.reserveCapacity(inputs.inbound.items.count)
 
         for item in inputs.inbound.items {
             guard let observerEndpoint = inputs.inboundObserverEndpoints[item.linkID] else {
                 assertionFailure("Active inbound oversight link is missing its exact observer endpoint.")
                 continue
             }
-            guard linkedEndpoints.insert(observerEndpoint).inserted else {
+            guard linkedObserverEndpoints.insert(observerEndpoint).inserted else {
                 assertionFailure("Target projection contains duplicate links from one exact observer endpoint.")
                 continue
             }
@@ -161,9 +279,9 @@ enum AgentSidebarOversightMenuProjection {
                     roleAllowsOutboundMonitoring: $0.roleAllowsOutboundMonitoring
                 ) == nil
             } ?? false
-            linked.append(Seed(
-                observerEndpoint: observerEndpoint,
-                observerSessionID: observerEndpoint.sessionID,
+            linkedObservers.append(Seed(
+                peerEndpoint: observerEndpoint,
+                peerSessionID: observerEndpoint.sessionID,
                 displayName: observer?.resolvedDisplayName
                     ?? AgentMonitorSessionIDFormatter.short(observerEndpoint.sessionID),
                 providerDisplayName: normalizedProvider(observer?.providerDisplayName),
@@ -173,55 +291,168 @@ enum AgentSidebarOversightMenuProjection {
                         linkID: item.linkID,
                         generation: item.generation
                     ),
-                    observerCurrentlyEligible: observerCurrentlyEligible
+                    peerCurrentlyEligible: observerCurrentlyEligible
                 )
             ))
         }
 
-        var availableEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
-        var available: [Seed] = []
-        for observer in candidates {
-            let observerEndpoint = observer.domainEndpoint
-            guard observer.sessionID != target.sessionID,
-                  !linkedEndpoints.contains(observerEndpoint),
-                  availableEndpoints.insert(observerEndpoint).inserted,
-                  inputs.activeOutboundObserverEndpoints.contains(observerEndpoint),
-                  AgentSessionLinkEndpointEligibility.addDisabledReason(
-                      observer.eligibilityInput,
-                      roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-                  ) == nil
-            else {
+        var availableObservers: [Seed] = []
+        var availableObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
+        // New inbound links require an eligible target; a greyed reason replaces the list otherwise.
+        if targetFailure == nil {
+            for observer in candidates {
+                let observerEndpoint = observer.domainEndpoint
+                guard observer.sessionID != target.sessionID,
+                      !linkedObserverEndpoints.contains(observerEndpoint),
+                      availableObserverEndpoints.insert(observerEndpoint).inserted,
+                      inputs.activeOutboundObserverEndpoints.contains(observerEndpoint),
+                      AgentSessionLinkEndpointEligibility.addDisabledReason(
+                          observer.eligibilityInput,
+                          roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
+                      ) == nil
+                else {
+                    continue
+                }
+                availableObservers.append(Seed(
+                    peerEndpoint: observerEndpoint,
+                    peerSessionID: observer.sessionID,
+                    displayName: observer.resolvedDisplayName,
+                    providerDisplayName: normalizedProvider(observer.providerDisplayName),
+                    locationLabel: observer.locationLabel,
+                    relationship: .available
+                ))
+            }
+        }
+
+        // MARK: Outbound (who this row oversees)
+
+        var linkedTargetEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
+        var linkedTargets: [Seed] = []
+        linkedTargets.reserveCapacity(inputs.outbound.items.count)
+
+        for item in inputs.outbound.items {
+            guard let linkedTargetEndpoint = inputs.outboundTargetEndpoints[item.linkID] else {
+                assertionFailure("Active outbound oversight link is missing its exact target endpoint.")
                 continue
             }
-            available.append(Seed(
-                observerEndpoint: observerEndpoint,
-                observerSessionID: observer.sessionID,
-                displayName: observer.resolvedDisplayName,
-                providerDisplayName: normalizedProvider(observer.providerDisplayName),
-                locationLabel: observer.locationLabel,
-                relationship: .available
+            guard linkedTargetEndpoints.insert(linkedTargetEndpoint).inserted else {
+                assertionFailure("Observer projection contains duplicate links to one exact target endpoint.")
+                continue
+            }
+            if linkedTargetEndpoint.sessionID != item.targetSessionID {
+                assertionFailure("Outbound oversight inventory and exact target endpoint disagree.")
+            }
+            let targetPeer = candidatesByEndpoint[linkedTargetEndpoint]
+            let targetCurrentlyEligible = targetPeer.map {
+                AgentSessionLinkEndpointEligibility.targetResolveFailure(for: $0) == nil
+            } ?? false
+            linkedTargets.append(Seed(
+                peerEndpoint: linkedTargetEndpoint,
+                peerSessionID: linkedTargetEndpoint.sessionID,
+                displayName: targetPeer?.resolvedDisplayName
+                    ?? item.displayName
+                    ?? AgentMonitorSessionIDFormatter.short(linkedTargetEndpoint.sessionID),
+                providerDisplayName: normalizedProvider(targetPeer?.providerDisplayName),
+                locationLabel: targetPeer?.locationLabel,
+                relationship: .linked(
+                    reference: DomainAgentSessionLinkReference(
+                        linkID: item.linkID,
+                        generation: item.generation
+                    ),
+                    peerCurrentlyEligible: targetCurrentlyEligible
+                )
             ))
         }
 
-        let seeds = linked.sorted(by: orderedBefore) + available.sorted(by: orderedBefore)
-        let labels = collisionSafeLabels(for: seeds)
-        let options = seeds.map { seed in
-            AgentSidebarOversightMenuProps.ObserverOption(
-                observerEndpoint: seed.observerEndpoint,
-                observerSessionID: seed.observerSessionID,
+        var availableTargets: [Seed] = []
+        var availableTargetEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
+        // New outbound links require an eligible observer; a greyed reason replaces the list.
+        if observerReason == nil {
+            for peer in candidates {
+                let peerEndpoint = peer.domainEndpoint
+                guard peer.sessionID != target.sessionID,
+                      !linkedTargetEndpoints.contains(peerEndpoint),
+                      availableTargetEndpoints.insert(peerEndpoint).inserted,
+                      AgentSessionLinkEndpointEligibility.targetResolveFailure(for: peer) == nil
+                else {
+                    continue
+                }
+                availableTargets.append(Seed(
+                    peerEndpoint: peerEndpoint,
+                    peerSessionID: peer.sessionID,
+                    displayName: peer.resolvedDisplayName,
+                    providerDisplayName: normalizedProvider(peer.providerDisplayName),
+                    locationLabel: peer.locationLabel,
+                    relationship: .available
+                ))
+            }
+        }
+
+        // MARK: Ordering and labels
+
+        // Inbound: one flat checkmark list — own workspace first, then folded name.
+        let observerSeeds = (linkedObservers + availableObservers)
+            .sorted { orderedBefore($0, $1, currentWorkspaceID: rowWorkspaceID) }
+        // Outbound: ticked first, then own-workspace-first and folded name within each group.
+        let targetSeeds = linkedTargets.sorted {
+            orderedBefore($0, $1, currentWorkspaceID: rowWorkspaceID)
+        } + availableTargets.sorted {
+            orderedBefore($0, $1, currentWorkspaceID: rowWorkspaceID)
+        }
+
+        let observerLabels = collisionSafeLabels(for: observerSeeds)
+        let targetLabels = collisionSafeLabels(for: targetSeeds)
+
+        let observerOptions = observerSeeds.map { seed in
+            AgentSidebarOversightMenuProps.PeerOption(
+                peerEndpoint: seed.peerEndpoint,
+                peerSessionID: seed.peerSessionID,
                 displayName: seed.displayName,
                 providerDisplayName: seed.providerDisplayName,
-                menuLabel: labels[seed.observerEndpoint] ?? seed.baseMenuLabel,
+                menuLabel: observerLabels[seed.peerEndpoint] ?? seed.baseMenuLabel,
                 fullIdentityDescription: seed.fullIdentityDescription,
                 relationship: seed.relationship
             )
         }
+        let targetOptions = targetSeeds.map { seed in
+            AgentSidebarOversightMenuProps.PeerOption(
+                peerEndpoint: seed.peerEndpoint,
+                peerSessionID: seed.peerSessionID,
+                displayName: seed.displayName,
+                providerDisplayName: seed.providerDisplayName,
+                menuLabel: targetLabels[seed.peerEndpoint] ?? seed.baseMenuLabel,
+                fullIdentityDescription: seed.fullIdentityDescription,
+                relationship: seed.relationship
+            )
+        }
+
+        // Mark tooltips read names from the authority inventories, not from the option lists:
+        // a linked peer is always a tooltip name even when its live candidate disappeared.
+        let inboundNames = inputs.inbound.items.map { item in
+            inputs.inboundObserverEndpoints[item.linkID].flatMap {
+                candidatesByEndpoint[$0]?.resolvedDisplayName
+            } ?? item.displayName ?? AgentMonitorSessionIDFormatter.short(item.observerSessionID)
+        }
+        let inboundSessionIDs = inputs.inbound.items.map(\.observerSessionID)
+        let outboundNames = inputs.outbound.items.map { item in
+            inputs.outboundTargetEndpoints[item.linkID].flatMap {
+                candidatesByEndpoint[$0]?.resolvedDisplayName
+            } ?? item.displayName ?? AgentMonitorSessionIDFormatter.short(item.targetSessionID)
+        }
+
         return AgentSidebarOversightMenuProps(
-            targetEndpoint: target.domainEndpoint,
+            targetEndpoint: rowEndpoint,
             targetSessionID: target.sessionID,
             targetDisplayName: target.resolvedDisplayName,
-            observerOptions: options,
-            createdByLabel: createdByLabel
+            observerOptions: observerOptions,
+            createdByLabel: createdByLabel,
+            targetOptions: targetOptions,
+            targetIneligibleReason: targetFailure?.uiMessage,
+            observerIneligibleReason: observerReason,
+            inboundObserverNames: inboundNames,
+            inboundObserverSessionIDs: inboundSessionIDs,
+            outboundTargetNames: outboundNames,
+            creatorSessionID: creatorSessionID
         )
     }
 
@@ -234,31 +465,40 @@ enum AgentSidebarOversightMenuProjection {
         return provider
     }
 
-    private static func orderedBefore(_ lhs: Seed, _ rhs: Seed) -> Bool {
+    /// Own-workspace cohort first, then case/diacritic-insensitive name, then exact identity.
+    private static func orderedBefore(
+        _ lhs: Seed,
+        _ rhs: Seed,
+        currentWorkspaceID: UUID
+    ) -> Bool {
+        let lhsInWorkspace = lhs.peerEndpoint.workspaceID == currentWorkspaceID
+        let rhsInWorkspace = rhs.peerEndpoint.workspaceID == currentWorkspaceID
+        if lhsInWorkspace != rhsInWorkspace { return lhsInWorkspace }
+
         let lhsName = folded(lhs.displayName)
         let rhsName = folded(rhs.displayName)
         if lhsName != rhsName { return lhsName < rhsName }
 
-        let lhsSession = lhs.observerSessionID.uuidString
-        let rhsSession = rhs.observerSessionID.uuidString
+        let lhsSession = lhs.peerSessionID.uuidString
+        let rhsSession = rhs.peerSessionID.uuidString
         if lhsSession != rhsSession { return lhsSession < rhsSession }
-        if lhs.observerEndpoint.windowID != rhs.observerEndpoint.windowID {
-            return lhs.observerEndpoint.windowID < rhs.observerEndpoint.windowID
+        if lhs.peerEndpoint.windowID != rhs.peerEndpoint.windowID {
+            return lhs.peerEndpoint.windowID < rhs.peerEndpoint.windowID
         }
 
-        let lhsWorkspace = lhs.observerEndpoint.workspaceID.uuidString
-        let rhsWorkspace = rhs.observerEndpoint.workspaceID.uuidString
+        let lhsWorkspace = lhs.peerEndpoint.workspaceID.uuidString
+        let rhsWorkspace = rhs.peerEndpoint.workspaceID.uuidString
         if lhsWorkspace != rhsWorkspace { return lhsWorkspace < rhsWorkspace }
 
-        let lhsTab = lhs.observerEndpoint.tabID.uuidString
-        let rhsTab = rhs.observerEndpoint.tabID.uuidString
+        let lhsTab = lhs.peerEndpoint.tabID.uuidString
+        let rhsTab = rhs.peerEndpoint.tabID.uuidString
         if lhsTab != rhsTab { return lhsTab < rhsTab }
 
-        let lhsBinding = lhs.observerEndpoint.persistentBindingGeneration?.uuidString ?? ""
-        let rhsBinding = rhs.observerEndpoint.persistentBindingGeneration?.uuidString ?? ""
+        let lhsBinding = lhs.peerEndpoint.persistentBindingGeneration?.uuidString ?? ""
+        let rhsBinding = rhs.peerEndpoint.persistentBindingGeneration?.uuidString ?? ""
         if lhsBinding != rhsBinding { return lhsBinding < rhsBinding }
-        return lhs.observerEndpoint.bindingTransitionGeneration
-            < rhs.observerEndpoint.bindingTransitionGeneration
+        return lhs.peerEndpoint.bindingTransitionGeneration
+            < rhs.peerEndpoint.bindingTransitionGeneration
     }
 
     private static func folded(_ value: String) -> String {
@@ -273,19 +513,19 @@ enum AgentSidebarOversightMenuProjection {
         for seeds: [Seed]
     ) -> [DomainAgentSessionLinkEndpointIdentity: String] {
         var labels = Dictionary(
-            uniqueKeysWithValues: seeds.map { ($0.observerEndpoint, $0.baseMenuLabel) }
+            uniqueKeysWithValues: seeds.map { ($0.peerEndpoint, $0.baseMenuLabel) }
         )
         widenCollisions(in: &labels, seeds: seeds) { seed in
-            "\(seed.baseMenuLabel) (\(shortUUID(seed.observerSessionID)))"
+            "\(seed.baseMenuLabel) (\(shortUUID(seed.peerSessionID)))"
         }
         widenCollisions(in: &labels, seeds: seeds) { seed in
-            "\(seed.baseMenuLabel) (\(shortUUID(seed.observerSessionID)), "
-                + "window \(seed.observerEndpoint.windowID))"
+            "\(seed.baseMenuLabel) (\(shortUUID(seed.peerSessionID)), "
+                + "window \(seed.peerEndpoint.windowID))"
         }
         widenCollisions(in: &labels, seeds: seeds) { seed in
-            "\(seed.baseMenuLabel) (\(shortUUID(seed.observerSessionID)), "
-                + "window \(seed.observerEndpoint.windowID), "
-                + "tab \(shortUUID(seed.observerEndpoint.tabID)))"
+            "\(seed.baseMenuLabel) (\(shortUUID(seed.peerSessionID)), "
+                + "window \(seed.peerEndpoint.windowID), "
+                + "tab \(shortUUID(seed.peerEndpoint.tabID)))"
         }
         widenCollisions(in: &labels, seeds: seeds) { seed in
             "\(seed.baseMenuLabel) (\(seed.fullIdentityDescription))"
@@ -300,10 +540,10 @@ enum AgentSidebarOversightMenuProjection {
     ) {
         let counts = Dictionary(grouping: labels.values, by: { $0 }).mapValues(\.count)
         for seed in seeds {
-            guard let label = labels[seed.observerEndpoint], counts[label, default: 0] > 1 else {
+            guard let label = labels[seed.peerEndpoint], counts[label, default: 0] > 1 else {
                 continue
             }
-            labels[seed.observerEndpoint] = replacement(seed)
+            labels[seed.peerEndpoint] = replacement(seed)
         }
     }
 
