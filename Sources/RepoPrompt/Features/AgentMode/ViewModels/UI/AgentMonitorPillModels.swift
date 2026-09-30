@@ -260,7 +260,7 @@ enum AgentMonitorAutoWakeCopy {
     routine status and overflow remains governed by selection and snooze. To stop those routine wakes, \
     switch off and deselect or snooze the lane. To prevent purposeful attention from that link, \
     unlink it; revocation and all other safety and admission gates still apply. The setting applies \
-    to this session rather than to individual links. Off by default, and saved with this session even \
+    to this session rather than to individual links. On by default, and saved with this session even \
     when it oversees nothing.
     """
     static let accessibilityLabel = "Auto-wake on all updates"
@@ -1432,7 +1432,7 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: sidebarOversightMenu,
+            sidebarOversightMenu: sidebarOversightMenu?.withObserverIneligibleReason(reason),
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1463,7 +1463,7 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: sidebarOversightMenu,
+            sidebarOversightMenu: sidebarOversightMenu?.withObserverIneligibleReason(reason),
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1589,6 +1589,9 @@ struct AgentMonitorResolvedPreview: Equatable {
     let providerDisplayName: String?
     let locationLabel: String?
     let status: AgentMonitorLinkStatus
+    /// Exact resolved incarnation. The link-confirmation gate and the exact Add overload use it
+    /// so a rebind between preview and acceptance cannot silently retarget the request.
+    let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
 
     var shortID: String {
         AgentMonitorSessionIDFormatter.short(sessionID)

@@ -4020,7 +4020,8 @@ final class AgentSessionLinkRuntimeBridge {
                 target: candidate,
                 inputs: inputs,
                 candidates: candidates,
-                createdByLabel: host?.agentSessionLinkLaneCreatorLabel(for: endpoint)
+                createdByLabel: host?.agentSessionLinkLaneCreatorLabel(for: endpoint),
+                creatorSessionID: host?.agentSessionLinkLaneProvenance(for: endpoint)
             ),
             outbound: outbound,
             inbound: inbound,
@@ -7129,13 +7130,13 @@ final class AgentSessionLinkRuntimeBridge {
 
     // MARK: - Resolution preview
 
-    /// Builds the pre-authorization preview. Resolution never focuses, activates, or switches the
-    /// target window, and knowing a UUID still grants nothing.
-    func resolvePreview(
+    /// Resolves a pasted target UUID to its exact live candidate. Resolution never focuses,
+    /// activates, or switches the target window, and knowing a UUID still grants nothing.
+    func resolveTargetCandidate(
         observerSessionID: UUID?,
         rawTargetSessionID: String,
         existingOutboundTargetIDs: Set<UUID>
-    ) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure> {
+    ) -> Result<AgentSessionLinkEndpointCandidate, AgentSessionLinkResolveFailure> {
         guard let host else { return .failure(.notFound) }
         guard let targetSessionID = AgentSessionLinkEndpointResolver.parseSessionID(rawTargetSessionID) else {
             return .failure(.malformedIdentifier)
@@ -7149,6 +7150,20 @@ final class AgentSessionLinkRuntimeBridge {
         return AgentSessionLinkEndpointResolver.resolve(
             sessionID: targetSessionID,
             candidates: host.agentSessionLinkCandidates()
+        )
+    }
+
+    /// Builds the pre-authorization preview. Resolution never focuses, activates, or switches the
+    /// target window, and knowing a UUID still grants nothing.
+    func resolvePreview(
+        observerSessionID: UUID?,
+        rawTargetSessionID: String,
+        existingOutboundTargetIDs: Set<UUID>
+    ) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure> {
+        resolveTargetCandidate(
+            observerSessionID: observerSessionID,
+            rawTargetSessionID: rawTargetSessionID,
+            existingOutboundTargetIDs: existingOutboundTargetIDs
         ).map { candidate in
             AgentMonitorResolvedPreview(
                 sessionID: candidate.sessionID,
@@ -7158,9 +7173,70 @@ final class AgentSessionLinkRuntimeBridge {
                 status: targetPresentation(
                     for: candidate,
                     exactEndpoint: candidate.domainEndpoint
-                ).status
+                ).status,
+                targetEndpoint: candidate.domainEndpoint
             )
         }
+    }
+
+    /// Resolves a pasted Session ID for the *inbound* direction: the pasted session is the
+    /// prospective overseer of the row's target, and "Oversee by" only offers sessions that
+    /// already hold an outbound link. Returns user-facing message text on failure.
+    ///
+    /// Observer eligibility reuses `addDisabledReason` (child/MCP-controlled/MCP-originated and
+    /// role-policy sessions can never observe), then `hasActiveOutboundLink` applies the same
+    /// existing-overseer precondition `addSidebarMonitorLink` enforces at reservation.
+    func resolveSidebarOverseerCandidate(
+        rawSessionID: String,
+        excludingTargetSessionID: UUID
+    ) async -> Result<AgentSessionLinkEndpointCandidate, AgentOversightResolutionMessage> {
+        guard let host else {
+            return .failure(AgentOversightResolutionMessage(message: Self.unavailableMessage))
+        }
+        guard let sessionID = AgentSessionLinkEndpointResolver.parseSessionID(rawSessionID) else {
+            return .failure(AgentOversightResolutionMessage(
+                message: AgentSessionLinkResolveFailure.malformedIdentifier.uiMessage
+            ))
+        }
+        guard sessionID != excludingTargetSessionID else {
+            return .failure(AgentOversightResolutionMessage(
+                message: AgentSessionLinkResolveFailure.selfMonitor.uiMessage
+            ))
+        }
+        let matches = host.agentSessionLinkCandidates().filter { $0.sessionID == sessionID }
+        guard !matches.isEmpty else {
+            return .failure(AgentOversightResolutionMessage(
+                message: AgentSessionLinkResolveFailure.notFound.uiMessage
+            ))
+        }
+        guard matches.count == 1 else {
+            return .failure(AgentOversightResolutionMessage(
+                message: AgentSessionLinkResolveFailure.ambiguous.uiMessage
+            ))
+        }
+        let candidate = matches[0]
+        if let reason = AgentSessionLinkEndpointEligibility.addDisabledReason(
+            candidate.eligibilityInput,
+            roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+        ) {
+            return .failure(AgentOversightResolutionMessage(message: reason))
+        }
+        guard await authority.hasActiveOutboundLink(observerEndpoint: candidate.domainEndpoint) else {
+            return .failure(AgentOversightResolutionMessage(
+                message: Self.existingOverseerRequiredMessage
+            ))
+        }
+        return .success(candidate)
+    }
+
+    /// UI-only display name for one exact live endpoint, used by the link-confirmation dialog so it
+    /// can name the observer without routing through a session UUID.
+    func liveCandidateDisplayName(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> String? {
+        host?.agentSessionLinkCandidates()
+            .first(where: { $0.domainEndpoint == endpoint })?
+            .resolvedDisplayName
     }
 
     // MARK: - References

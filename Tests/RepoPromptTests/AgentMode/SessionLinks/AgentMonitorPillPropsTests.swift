@@ -214,7 +214,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
                 displayName: "Build API",
                 providerDisplayName: "Codex CLI",
                 locationLabel: "worktree/feature",
-                status: .running
+                status: .running,
+                targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: targetID)
             ).detailLine,
             "worktree/feature · Codex CLI"
         )
@@ -334,7 +335,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             displayName: "Build API",
             providerDisplayName: "Codex CLI",
             locationLabel: "repoprompt-ce (main)",
-            status: .awaitingUser
+            status: .awaitingUser,
+            targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: targetID)
         )
         XCTAssertEqual(preview.shortID, "8B91…E572")
         XCTAssertEqual(
@@ -348,7 +350,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
                 displayName: "Build API",
                 providerDisplayName: nil,
                 locationLabel: nil,
-                status: .idle
+                status: .idle,
+                targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: targetID)
             ).accessibilityLabel,
             "Resolved Build API, session \(targetID.uuidString), Idle"
         )
