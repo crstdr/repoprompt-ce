@@ -140,6 +140,23 @@ final class MCPStateSubscriptionTests: XCTestCase {
     }
 
     @MainActor
+    func testAlreadyCancelledToolIdleWaitDoesNotTakeIdleFastPath() async {
+        let server = makeServerViewModel(service: makeService())
+        let task = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await server.awaitNoActiveToolExecutions(runID: UUID())
+        }
+        do {
+            try await task.value
+            XCTFail("Already-cancelled idle waiter must throw")
+        } catch is CancellationError {
+            // The same guard also closes cancellation before continuation installation.
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    @MainActor
     private func makeServerViewModel(service: MCPService) -> MCPServerViewModel {
         let store = WorkspaceFileContextStore()
         let fileManager = WorkspaceFilesViewModel(workspaceFileContextStore: store)

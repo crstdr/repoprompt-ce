@@ -85,11 +85,13 @@ extension AgentModeViewModel {
               liveness().permitsDelivery, !Task.isCancelled else { return .blocked(.endpointInvalidated) }
         if let failure = agentSessionLinkModelReadiness(session) { return .blocked(failure) }
         let admittedAvailability = availability()
+        if let id = AgentModelSelectionID.parse(modelID), id.rawValue == modelID,
+           let agent = AgentProviderKind(rawValue: id.agentRaw), agent != session.selectedAgent
+        {
+            return .invalid("set_model cannot change agent kind (current: \(session.selectedAgent.rawValue)). Use agent_manage.list_agents for a same-agent model_id.")
+        }
         do {
-            let selection = try AgentAdvertisedModelCatalog.shared.selection(modelID, availability: admittedAvailability)
-            guard selection.agent == session.selectedAgent else {
-                return .invalid("set_model cannot change agent kind (current: \(session.selectedAgent.rawValue)). Use agent_manage.list_agents for a same-agent model_id.")
-            }
+            _ = try AgentAdvertisedModelCatalog.shared.selection(modelID, availability: admittedAvailability)
         } catch let error as AgentAdvertisedModelCatalog.AdmissionError { return .invalid(error.message) }
         catch { return .invalid("Model catalogue admission failed.") }
 
@@ -107,11 +109,13 @@ extension AgentModeViewModel {
         guard availability() == admittedAvailability else {
             return .invalid("Destination model availability changed. Refresh agent_manage.list_agents and retry.")
         }
+        if let id = AgentModelSelectionID.parse(modelID), id.rawValue == modelID,
+           let agent = AgentProviderKind(rawValue: id.agentRaw), agent != session.selectedAgent
+        {
+            return .invalid("The target agent changed. Refresh agent_manage.list_agents and choose a same-agent model_id.")
+        }
         do {
             let selection = try AgentAdvertisedModelCatalog.shared.selection(modelID, availability: admittedAvailability)
-            guard selection.agent == session.selectedAgent else {
-                return .invalid("The target agent changed. Refresh agent_manage.list_agents and choose a same-agent model_id.")
-            }
             return .accepted(agentSessionLinkCommitModel(selection, to: session))
         } catch let error as AgentAdvertisedModelCatalog.AdmissionError { return .invalid(error.message) }
         catch { return .invalid("Model catalogue admission failed.") }

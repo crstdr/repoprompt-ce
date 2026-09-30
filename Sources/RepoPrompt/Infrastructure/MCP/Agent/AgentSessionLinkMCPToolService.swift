@@ -70,6 +70,16 @@ struct AgentSessionLinkMCPToolService {
     """
 
     static let defaultWaitTimeoutSeconds: TimeInterval = 60
+    static func resolvedWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
+        do {
+            let seconds = try AgentMCPToolHelpers.parseTimeoutSeconds(value) ?? defaultWaitTimeoutSeconds
+            guard seconds <= defaultWaitTimeoutSeconds else { throw MCPError.invalidParams("") }
+            return seconds
+        } catch {
+            throw MCPError.invalidParams("timeout_seconds must be in 0...60 seconds.")
+        }
+    }
+
     static let listDefaultMaxItems = 32
     static let listMaximumMaxItems = 100
 
@@ -88,6 +98,7 @@ struct AgentSessionLinkMCPToolService {
 
     // Deliberately fail-closed by default: never fall back to the generic recovery resolver.
     var resolveModelObserverEndpoint: (RequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity? = { _ in nil }
+    var captureWaitInput: () -> DomainAgentSessionLinkWaitInput? = { AgentSessionLinkWaitCallOrigin.current }
     var bridge: AgentSessionLinkRuntimeBridge = .shared
 
     // MARK: - Entry point
@@ -829,12 +840,15 @@ struct AgentSessionLinkMCPToolService {
     // MARK: - wait
 
     private func executeWait(args: [String: Value]) async throws -> Value {
+        let timeoutSeconds = try Self.resolvedWaitTimeoutSeconds(args["timeout_seconds"])
+        let observerInput = captureWaitInput()
         let observerEndpoint = try await resolveCallerEndpointIdentity()
+        guard let observerInput, observerInput.endpoint == observerEndpoint else {
+            throw MCPError.invalidParams("Observer route changed. Retry wait from the current Agent session.")
+        }
         let metadata = await captureRequestMetadata()
         let request = try Self.parseTargets(args)
         let predicate = try Self.parsePredicate(args["until"])
-        let timeoutSeconds = try AgentMCPToolHelpers.parseTimeoutSeconds(args["timeout_seconds"])
-            ?? Self.defaultWaitTimeoutSeconds
         let cursorsBySessionID = try Self.parseWaitCursors(args, request: request)
 
         let targets = try await authorizeAll(
@@ -863,8 +877,23 @@ struct AgentSessionLinkMCPToolService {
             let waitResult = await bridge.wait(
                 requests: waitRequests,
                 until: predicate,
-                timeoutSeconds: timeoutSeconds
+                timeoutSeconds: timeoutSeconds,
+                observerInput: observerInput
             )
+            if waitResult.interruptedByLocalInput {
+                let pendingSends = await bridge.pendingSendProjections(for: leases)
+                // Keep the survivor proof as the last suspension before rendering.
+                let survivors = await bridge.terminalWaitSurvivingStates(leases: leases)
+                let rendered = AgentSessionLinkResponseRenderer.waitValue(
+                    .init(outcome: .cancelled, targets: survivors, interruptedByLocalInput: true),
+                    pendingSends: pendingSends,
+                    isSingle: isSingle
+                )
+                let survivingIDs = Set(survivors.map(\.sessionID))
+                return AgentSessionLinkResponseRenderer.addUnavailableWaitTargets(
+                    leases.map(\.target.sessionID).filter { !survivingIDs.contains($0) }, to: rendered
+                )
+            }
             // A terminal outcome is the authority's answer to a lost lease or runtime. Do not
             // replace it with a generic prompt-inspection denial or disclose a prompt from the
             // invalidated batch. Refresh surviving siblings' cursors and pending-send metadata.
@@ -2339,6 +2368,9 @@ enum AgentSessionLinkResponseRenderer {
         ]
         if let detail = waitDetail(result.outcome) {
             payload["detail"] = .string(detail)
+        }
+        if result.interruptedByLocalInput {
+            payload["_meta"] = .object(["wake_reason": .string("local_user_input")])
         }
         if isSingle {
             if let state = result.targets.first {
