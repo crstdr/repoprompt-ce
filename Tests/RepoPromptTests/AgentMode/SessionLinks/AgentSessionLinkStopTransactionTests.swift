@@ -142,19 +142,21 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
 
     func testManagedStopGateSuppressesPublishedSendReadiness() throws {
         let fixture = try makeFixture()
-        XCTAssertTrue(AgentModeViewModel.isIdleForSend(
-            session: fixture.session, candidate: fixture.candidate, status: .idle
-        ))
+        func snapshot() -> DomainAgentSessionObservationSnapshot {
+            AgentModeViewModel.observationSnapshot(
+                for: fixture.session, candidate: fixture.candidate, subagentCounts: (running: 0, finished: 0)
+            )
+        }
+        XCTAssertTrue(snapshot().idleForSend)
+        XCTAssertTrue(snapshot().board.sendBlockers.isEmpty)
         let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
         let stopID = UUID()
         XCTAssertTrue(fixture.session.stopState.claimManagedStop(id: stopID, binding: binding))
-        XCTAssertFalse(AgentModeViewModel.isIdleForSend(
-            session: fixture.session, candidate: fixture.candidate, status: .idle
-        ), "poll/wait must not report sendable while Stop owns the target")
+        XCTAssertFalse(snapshot().idleForSend, "poll/wait must not report sendable while Stop owns the target")
+        XCTAssertEqual(snapshot().board.sendBlockers, ["stop_in_progress"])
         XCTAssertTrue(fixture.session.stopState.releaseManagedStop(id: stopID, binding: binding))
-        XCTAssertTrue(AgentModeViewModel.isIdleForSend(
-            session: fixture.session, candidate: fixture.candidate, status: .idle
-        ))
+        XCTAssertTrue(snapshot().idleForSend)
+        XCTAssertTrue(snapshot().board.sendBlockers.isEmpty)
     }
 
     func testPendingStartWithdrawsWithoutSyntheticTerminalRun() async throws {
@@ -359,10 +361,10 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         }
         XCTAssertNil(fixture.session.stopState.activeManagedStopBinding)
         XCTAssertTrue(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
-        XCTAssertTrue(AgentModeViewModel.isIdleForSend(
+        XCTAssertTrue(AgentModeViewModel.sendBlockers(AgentModeViewModel.sendReadinessInputs(
             session: fixture.session, candidate: fixture.candidate,
             status: AgentModeViewModel.linkStatus(for: fixture.session, pendingInteraction: nil)
-        ))
+        )).isEmpty)
 
         fixture.session.mcpFollowUpRunPending = true
         fixture.session.pendingInstructions = ["new work after timed-out Stop"]
