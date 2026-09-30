@@ -1148,7 +1148,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         )
     }
 
-    func testRequestAttentionFailsClosedWithoutAnObserverReducerAndListDenialIsOutboundSpecific() async throws {
+    func testRequestAttentionReconcilesMissingObserverBaselineWithoutGrantingOutboundAuthority() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         let targetService = fixture.routedService(from: fixture.target.domainEndpoint)
@@ -1163,12 +1163,17 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             )
         }
 
+        let inverse = await fixture.authority.authorizeRequestAttention(
+            requesterEndpoint: fixture.target.domainEndpoint,
+            liveEndpoints: [fixture.observer.domainEndpoint, fixture.target.domainEndpoint]
+        )
+        let expectedReference = try inverse.get().reference
         let bridgeWithoutReducer = AgentSessionLinkRuntimeBridge(
             authority: fixture.authority,
             host: fixture.host,
             toolAdvertisementInvalidator: { _ in }
         )
-        let failClosedService = AgentSessionLinkMCPToolService(
+        let recoveringService = AgentSessionLinkMCPToolService(
             toolName: MCPWindowToolName.agentSessionLink,
             captureRequestMetadata: {
                 MCPServerViewModel.RequestMetadata(
@@ -1182,14 +1187,20 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             withHeartbeat: { _, _, _, _, operation in try await operation() },
             bridge: bridgeWithoutReducer
         )
+        let recovered: Value
         do {
-            _ = try await failClosedService.execute(args: [
+            recovered = try await recoveringService.execute(args: [
                 "op": .string("request_attention")
             ])
-            XCTFail("a live inverse grant without a baselined observer reducer must fail closed")
-        } catch let error as MCPError {
-            XCTAssertEqual("\(error)", "\(AgentSessionLinkMCPToolService.requestAttentionDeniedError)")
+        } catch {
+            return XCTFail("an exact live inverse grant should reconcile its baseline: \(error)")
         }
+        XCTAssertEqual(recovered.objectValue?["result"], .string("accepted"))
+        let attention = try XCTUnwrap(fixture.host.publishedPassiveNotices[fixture.observer.domainEndpoint])
+        XCTAssertEqual(attention.attentionRequests.map(\.targetSessionID), [fixture.target.sessionID])
+        XCTAssertEqual(attention.attentionRequests.first?.reference, expectedReference)
+        let reverseGrant = await fixture.authority.hasActiveOutboundLink(observerEndpoint: fixture.target.domainEndpoint)
+        XCTAssertFalse(reverseGrant, "reconciliation must not manufacture reverse authority")
 
         do {
             _ = try await targetService.execute(args: [

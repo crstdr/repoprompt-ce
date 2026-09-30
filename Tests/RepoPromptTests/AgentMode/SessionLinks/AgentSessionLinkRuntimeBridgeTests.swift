@@ -6275,6 +6275,47 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(inbound.items.count, 1)
     }
 
+    func testCreatedLaneFirstTaskCanRequestAttentionFromItsCrossWindowCreator() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        // The creator starts inbound-only: creation must establish its first outbound baseline.
+        let seed = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.target.sessionID,
+            rawTargetSessionID: fixture.observer.sessionID.uuidString
+        )
+        guard case .added = seed else { return XCTFail("seed link failed") }
+        XCTAssertNil(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+        let lane = prepareCreatedLane(fixture)
+        XCTAssertNotEqual(lane.windowID, fixture.observer.windowID)
+        XCTAssertNotEqual(lane.workspaceID, fixture.observer.workspaceID)
+        stageReadyTarget(fixture)
+        var attentionResult: AgentSessionLinkRuntimeBridge.AttentionRequestDisposition?
+        fixture.host.beforeSendCommit = {
+            attentionResult = await fixture.bridge.requestAttention(
+                targetEndpoint: lane.domainEndpoint,
+                observerSessionID: fixture.observer.sessionID
+            )
+        }
+        let created = await fixture.bridge.createLane(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "create-and-attend", message: "Do the first task")
+        ) {
+            (windowID: lane.windowID, workspaceID: lane.workspaceID)
+        }
+        XCTAssertEqual(created.result, .created)
+        XCTAssertEqual(created.firstTask, .delivered)
+        XCTAssertEqual(attentionResult, .accepted)
+        let notices = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+        XCTAssertEqual(notices.attentionRequests.map(\.targetSessionID), [lane.sessionID])
+        let inverse = await fixture.authority.authorizeRequestAttention(
+            requesterEndpoint: lane.domainEndpoint,
+            liveEndpoints: Set(fixture.host.candidates.map(\.domainEndpoint))
+        )
+        XCTAssertEqual(notices.attentionRequests.first?.reference, try inverse.get().reference)
+        let outbound = await fixture.authority.hasActiveOutboundLink(observerEndpoint: lane.domainEndpoint)
+        XCTAssertFalse(outbound, "attention does not create a reverse grant")
+    }
+
     func testCreatedLaneCanRetireAfterFirstTaskTurn() async throws {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)

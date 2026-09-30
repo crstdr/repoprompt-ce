@@ -204,7 +204,8 @@ final class MonitorInventoryPublisher {
                         runID: runID,
                         routeToken: routeToken,
                         projectionRevision: revision,
-                        hasAgentSessionLink: true
+                        hasAgentSessionLink: true,
+                        hasAnyActiveLink: true
                     ),
                     to: endpoint
                 )
@@ -1895,7 +1896,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     runID: runID,
                     routeToken: routeToken,
                     projectionRevision: 1,
-                    hasAgentSessionLink: true
+                    hasAgentSessionLink: true,
+                    hasAnyActiveLink: true
                 ),
                 to: endpoint
             )
@@ -1951,7 +1953,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     runID: runID,
                     routeToken: routeToken,
                     projectionRevision: 1,
-                    hasAgentSessionLink: true
+                    hasAgentSessionLink: true,
+                    hasAnyActiveLink: true
                 ),
                 to: endpoint
             )
@@ -2019,7 +2022,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 runID: runID,
                 routeToken: routeToken,
                 projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(readyProjection, to: endpoint)
             let published = await manager.debugPublishRunCatalogObservation(
@@ -2176,7 +2180,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 runID: runID,
                 routeToken: routeToken,
                 projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(readyProjection, to: endpoint)
             _ = await manager.debugPublishRunCatalogObservation(
@@ -2265,7 +2270,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 runID: runID,
                 routeToken: routeToken,
                 projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(expectedReady, to: endpoint)
             let ready = await manager.debugPublishRunCatalogObservation(
