@@ -177,6 +177,7 @@ final actor ClaudeNativeProcessSessionController {
         private var configurationTestControlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])?
         private var configurationTestWrite: (@Sendable (Data) throws -> Void)?
         private var configurationTestBeforeProofSend: (@Sendable () async -> Void)?
+        private var configurationTestAfterApplicationErrorClassification: (@Sendable () async -> Void)?
     #endif
     private var activeLaunchEnvironmentSignature: LaunchEnvironmentSignature?
     private var flagSettingsRequestGeneration: UInt64 = 0
@@ -432,18 +433,47 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
-        _ = try await applyModelAndEffortWithProof(model: model, effortLevel: effortLevel)
+        do {
+            _ = try await applyModelAndEffortWithProof(model: model, effortLevel: effortLevel)
+        } catch let failure as NativeAgentRuntimeConfigurationFailure {
+            // Preserve the legacy live-update error contract; only ordinary turns need the token.
+            throw failure.underlyingError
+        }
     }
 
     func applyModelAndEffortWithProof(
         model: String?,
         effortLevel: ClaudeCodeEffortLevel?
     ) async throws -> NativeAgentRuntimeConfigurationApplication {
+        try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: nil)
+    }
+
+    func applyModelAndEffortWithProof(
+        model: String?,
+        effortLevel: ClaudeCodeEffortLevel?,
+        replacingFailure: NativeAgentRuntimeConfigurationFailure
+    ) async throws -> NativeAgentRuntimeConfigurationApplication {
+        try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure)
+    }
+
+    private func applyConfiguration(
+        model: String?,
+        effortLevel: ClaudeCodeEffortLevel?,
+        replacingFailure: NativeAgentRuntimeConfigurationFailure?
+    ) async throws -> NativeAgentRuntimeConfigurationApplication {
+        if let failure = replacingFailure {
+            guard failure.lifetime == configurationLifetime,
+                  failure.intentGeneration == latestFlagSettingsIntentGeneration,
+                  failure.requestGeneration == flagSettingsRequestGeneration
+            else { return .superseded }
+        }
+        // No suspension between checking a failed intent and consuming it for fallback.
         // Even legacy Void calls with no active process intentionally supersede prior proof.
         latestFlagSettingsIntentGeneration &+= 1
         appliedConfigurationProof = nil
         let intentGeneration = latestFlagSettingsIntentGeneration
         let lifetime = configurationLifetime
+        var requestGeneration = flagSettingsRequestGeneration
         guard hasActiveSession, !isShuttingDown else { return .notReady }
         do {
             let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
@@ -459,6 +489,7 @@ final actor ClaudeNativeProcessSessionController {
                 throw ControllerError.liveModelSwitchRequiresRestart
             }
             storeFlagSettingsRequest(resolved.request)
+            requestGeneration = flagSettingsRequestGeneration
 
             guard isInitialized || hasCompletedInitialFlagSettings else {
                 writeRawEventLogRecord(kind: "session.flagSettingsPending", payload: [
@@ -466,7 +497,6 @@ final actor ClaudeNativeProcessSessionController {
                 ] as [String: Any])
                 return .notReady
             }
-            let requestGeneration = flagSettingsRequestGeneration
             if let request = resolved.request {
                 let flagSettingsResult = try await sendControlRequest(request: request, timeoutSeconds: 5.0)
                 writeRawEventLogRecord(kind: "session.flagSettingsApplied", payload: [
@@ -490,9 +520,17 @@ final actor ClaudeNativeProcessSessionController {
             // Resolver and ACK errors can arrive after a newer intent, even with identical
             // values. Such an error cannot authorize the old turn's optional Auto fallback.
             guard lifetime == configurationLifetime,
-                  intentGeneration == latestFlagSettingsIntentGeneration
+                  intentGeneration == latestFlagSettingsIntentGeneration,
+                  requestGeneration == flagSettingsRequestGeneration
             else { return .superseded }
-            throw error
+            let failure = NativeAgentRuntimeConfigurationFailure(
+                underlyingError: error, lifetime: lifetime,
+                intentGeneration: intentGeneration, requestGeneration: requestGeneration
+            )
+            #if DEBUG
+                await configurationTestAfterApplicationErrorClassification?()
+            #endif
+            throw failure
         }
     }
 
@@ -1769,6 +1807,11 @@ final actor ClaudeNativeProcessSessionController {
         /// Pauses at controller entry, before the non-suspending proof-check/write segment.
         func test_setBeforeConfigurationSend(_ beforeSend: @escaping @Sendable () async -> Void) {
             configurationTestBeforeProofSend = beforeSend
+        }
+
+        /// Models an actor-hop delay after a failure passed its generation fence.
+        func test_setAfterApplicationErrorClassification(_ action: @escaping @Sendable () async -> Void) {
+            configurationTestAfterApplicationErrorClassification = action
         }
 
         /// Exercises the real codec, request correlation, and success/error continuation path.

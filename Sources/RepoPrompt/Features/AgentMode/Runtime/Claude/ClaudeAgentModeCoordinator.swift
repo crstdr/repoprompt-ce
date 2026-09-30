@@ -1347,7 +1347,7 @@ final class ClaudeAgentModeCoordinator {
                     // Only optional Auto may fall back, and only for the same still-current model.
                     // Application failure is not a missing conversation or fresh-start recovery.
                     guard configurationIsCurrent() else { return .superseded }
-                    guard autoEffort != nil else {
+                    guard autoEffort != nil, let failure = error as? NativeAgentRuntimeConfigurationFailure else {
                         return recordSendFailure(
                             "Claude could not apply model and effort before sending: \(error.localizedDescription)",
                             session: session,
@@ -1357,7 +1357,8 @@ final class ClaudeAgentModeCoordinator {
                     do {
                         application = try await controller.applyModelAndEffortWithProof(
                             model: selectedModel,
-                            effortLevel: manualEffort
+                            effortLevel: manualEffort,
+                            replacingFailure: failure
                         )
                         appliedAutoEffort = nil
                     } catch {
@@ -1369,14 +1370,20 @@ final class ClaudeAgentModeCoordinator {
                         )
                     }
                 }
-                guard configurationIsCurrent(),
-                      (autoEffort == nil || autoEffortSelection?.isCurrent(
-                          provider: session.selectedAgent,
-                          selectedModelRaw: session.selectedModelRaw,
-                          manualEffortRaw: manualEffort.rawValue,
-                          enabled: autoEffortEnabledProvider()
-                      ) == true)
-                else { return .superseded }
+                guard configurationIsCurrent() else { return .superseded }
+                guard autoEffort == nil || autoEffortSelection?.isCurrent(
+                    provider: session.selectedAgent,
+                    selectedModelRaw: session.selectedModelRaw,
+                    manualEffortRaw: manualEffort.rawValue,
+                    enabled: autoEffortEnabledProvider()
+                ) == true
+                else {
+                    return recordSendFailure(
+                        "Claude effort selection changed while applying configuration. No message was sent; retry the turn.",
+                        session: session,
+                        intent: intent
+                    )
+                }
                 switch application {
                 case let .applied(proof):
                     configurationProof = proof
@@ -1388,7 +1395,11 @@ final class ClaudeAgentModeCoordinator {
                     )
                 }
                 if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
-                    return .superseded
+                    return recordSendFailure(
+                        "Claude launch settings changed while applying configuration. No message was sent; retry the turn.",
+                        session: session,
+                        intent: intent
+                    )
                 }
                 if requiresFinalRouteFence,
                    !hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)

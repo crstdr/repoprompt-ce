@@ -23,7 +23,10 @@ protocol NativeAgentRuntimeControlling: Actor {
     func currentSessionRef() async -> NativeAgentRuntimeSessionRef
     func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws
     /// Unlike the legacy live-update helper, this proves the complete requested configuration.
+    /// Current application errors carry NativeAgentRuntimeConfigurationFailure for conditional fallback.
     func applyModelAndEffortWithProof(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication
+    /// Begins fallback only if the failed application is still current, atomically consuming its intent.
+    func applyModelAndEffortWithProof(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure) async throws -> NativeAgentRuntimeConfigurationApplication
     func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID
     /// Maintenance commands intentionally do not require an ordinary-turn configuration proof.
     func sendUserMessage(_ text: String) async throws -> UUID
@@ -43,6 +46,19 @@ struct NativeAgentRuntimeConfigurationProof: Equatable {
     let requestGeneration: UInt64
 }
 
+/// A classified application error, not proof of application. Its identity authorizes at most
+/// one conditional fallback; intervening intents or process replacement revoke that authority.
+struct NativeAgentRuntimeConfigurationFailure: Error, LocalizedError {
+    let underlyingError: any Error
+    let lifetime: UUID
+    let intentGeneration: UInt64
+    let requestGeneration: UInt64
+
+    var errorDescription: String? {
+        underlyingError.localizedDescription
+    }
+}
+
 enum NativeAgentRuntimeConfigurationApplication: Equatable {
     case applied(NativeAgentRuntimeConfigurationProof)
     case superseded
@@ -54,6 +70,11 @@ extension NativeAgentRuntimeControlling {
     /// an old no-op fake must not accidentally certify provider application.
     func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
         .notReady
+    }
+
+    /// A runtime without atomic failure-token validation must not recertify an older turn.
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?, replacingFailure _: NativeAgentRuntimeConfigurationFailure) async throws -> NativeAgentRuntimeConfigurationApplication {
+        .superseded
     }
 
     func sendUserMessage(_: String, configuration _: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
