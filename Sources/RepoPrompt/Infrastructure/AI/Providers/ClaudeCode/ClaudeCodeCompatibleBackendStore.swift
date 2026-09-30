@@ -180,6 +180,9 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
         let encoder = JSONEncoder()
         guard let data = try? encoder.encode(configs) else { return }
         defaults.set(data, forKey: Self.configsDefaultsKey)
+        for agent in [AgentProviderKind.claudeCodeGLM, .kimiCode, .customClaudeCompatible] {
+            AgentAdvertisedModelCatalog.shared.invalidate(agent)
+        }
     }
 }
 

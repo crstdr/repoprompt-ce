@@ -14,7 +14,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     func testEachOperationDeclaresExactlyItsDocumentedFields() {
         XCTAssertEqual(AgentSessionLinkMCPToolService.listKeys, ["op", "cursor", "max_items"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.createLaneKeys, [
-            "op", "idempotency_key", "role", "session_name", "workspace", "message",
+            "op", "idempotency_key", "role", "model_id", "session_name", "workspace", "message",
             "workflow_id", "workflow_name"
         ])
         XCTAssertEqual(AgentSessionLinkMCPToolService.retireLaneKeys, ["op", "session_id"])
@@ -59,6 +59,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ] {
             XCTAssertTrue(keys.isDisjoint(with: ["workflow_id", "workflow_name"]))
         }
+        XCTAssertEqual(AgentSessionLinkMCPToolService.setModelKeys, ["op", "session_id", "model_id"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.stopKeys, ["op", "session_id", "idempotency_key"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.setWaitingOnKeys, ["op", "summary", "clear"])
         XCTAssertEqual(
@@ -101,6 +102,49 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertFalse(AgentSessionLinkMCPToolService.pollKeys.contains("timeout_seconds"))
         XCTAssertFalse(AgentSessionLinkMCPToolService.pollKeys.contains("cursor"))
         XCTAssertFalse(AgentSessionLinkMCPToolService.readKeys.contains("session_ids"))
+    }
+
+    func testSetModelWireRequiresExactIDAndReportsNextTurnOnly() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let args: [String: Value] = [
+            "op": .string("set_model"),
+            "session_id": .string(fixture.target.sessionID.uuidString),
+            "model_id": .string("claudeCode:sonnet:high")
+        ]
+        let result = try await Self.executeObject(fixture.service, args: args)
+        XCTAssertEqual(result["result"], .string("accepted"))
+        XCTAssertEqual(result["model_id"], args["model_id"])
+        XCTAssertEqual(result["applies_to"], .string("next_turn"))
+        XCTAssertEqual(result["persistence"], .string("scheduled"))
+        XCTAssertEqual(result["changed"], .bool(true))
+        for extra in ["role", "message", "delivery", "idempotency_key", "workflow_id", "model_parameters", "session_ids"] {
+            var invalid = args
+            invalid[extra] = .string("not allowed")
+            do { _ = try await fixture.service.execute(args: invalid)
+                XCTFail("Accepted \(extra)")
+            } catch let error as MCPError { guard case .invalidParams = error else { return XCTFail("\(error)") } }
+        }
+        for invalidID: Value? in [nil, .null, .bool(true), .string(""), .string("pair"), .string("unknown:model")] {
+            var invalid = args
+            invalid["model_id"] = invalidID
+            do { _ = try await fixture.service.execute(args: invalid)
+                XCTFail("Accepted malformed model_id")
+            } catch let error as MCPError { guard case .invalidParams = error else { return XCTFail("\(error)") } }
+        }
+        let ambiguous: [String: Value] = try [
+            "op": .string("create_lane"),
+            "idempotency_key": .string("ambiguous"),
+            "role": .string("pair"),
+            "model_id": XCTUnwrap(args["model_id"])
+        ]
+        do { _ = try await fixture.service.execute(args: ambiguous)
+            XCTFail("Accepted role and model_id")
+        } catch let error as MCPError {
+            guard case let .invalidParams(message) = error else { return XCTFail("\(error)") }
+            XCTAssertTrue(try XCTUnwrap(message).contains("not both"))
+        }
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
     }
 
     // MARK: - Target parsing
@@ -839,6 +883,33 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let conflict = try await Self.executeObject(fixture.service, args: conflictArgs)
         XCTAssertEqual(conflict["result"], .string("idempotency_conflict"))
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
+
+        AgentAdvertisedModelCatalog.shared.record([
+            AgentModelOption(
+                rawValue: "explicit-model:high",
+                displayName: "Explicit",
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            )
+        ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+        defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+        var explicit = args
+        explicit["workspace"] = .string(workspace.id.uuidString)
+        explicit["idempotency_key"] = .string("explicit-model")
+        explicit["model_id"] = .string("claudeCode:explicit-model:high")
+        let pinned = try await Self.executeObject(fixture.service, args: explicit)
+        XCTAssertEqual(pinned["result"], .string("created"))
+        XCTAssertEqual(fixture.host.lastLaneSelection?.agentRaw, "claudeCode")
+        XCTAssertEqual(fixture.host.lastLaneSelection?.modelRaw, "explicit-model:high")
+        XCTAssertEqual(fixture.host.lastLaneSelection?.reasoningEffortRaw, "high")
+        explicit["model_id"] = .string("claudeCode:explicit-model:low")
+        let modelConflict = try await Self.executeObject(fixture.service, args: explicit)
+        XCTAssertEqual(modelConflict["result"], .string("idempotency_conflict"))
+        explicit["idempotency_key"] = .string("unadvertised-model")
+        let unavailable = try await Self.executeObject(fixture.service, args: explicit)
+        XCTAssertEqual(unavailable["result"], .string("model_unavailable"))
+        XCTAssertEqual(fixture.host.laneCreationCount, 2)
     }
 
     func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
@@ -2753,15 +2824,21 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
         var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
         private(set) var laneCreationCount = 0
+        private(set) var lastLaneSelection: AgentSessionLanePolicy.RoleSelection?
+
+        func agentSessionLinkModelAvailability(windowID _: Int) -> AgentModelCatalog.AvailabilityContext {
+            .init()
+        }
 
         func agentSessionLinkCreateLane(
             destinationWindowID: Int,
             workspaceID: UUID,
             creatorSessionID: UUID,
             sessionName: String?,
-            selection _: AgentSessionLanePolicy.RoleSelection
+            selection: AgentSessionLanePolicy.RoleSelection
         ) async throws -> AgentSessionLaneHostCreationOutcome {
             laneCreationCount += 1
+            lastLaneSelection = selection
             var lane = AgentSessionLinkEndpointCandidate(
                 windowID: destinationWindowID,
                 workspaceID: workspaceID,
@@ -2807,6 +2884,21 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
             candidates
+        }
+
+        func agentSessionLinkModelCandidate(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionLinkEndpointCandidate? {
+            candidates.first { $0.domainEndpoint == endpoint }
+        }
+
+        func agentSessionLinkPerformSetModel(
+            to _: AgentSessionLinkEndpointCandidate, modelID: String,
+            liveness: @escaping AgentSessionLinkSendLivenessProbe,
+            reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkModelOutcome {
+            let result = await reauthorize()
+            guard result == .committed else { return .blocked(result.refusal) }
+            guard liveness().permitsDelivery else { return .blocked(.endpointInvalidated) }
+            return .accepted(.init(modelID: modelID, modelRaw: "sonnet:high", reasoningEffortRaw: "high", changed: true))
         }
 
         func agentSessionLinkLaneProvenance(
@@ -3071,6 +3163,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 requireTargetWindow: { window },
                 resolveObserverEndpoint: { _, _ in endpoint },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
+                resolveModelObserverEndpoint: { _ in endpoint },
                 bridge: bridge
             )
         }
@@ -3208,6 +3301,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             requireTargetWindow: { window },
             resolveObserverEndpoint: { _, _ in observerEndpoint },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
+            resolveModelObserverEndpoint: { _ in observerEndpoint },
             bridge: bridge
         )
         return ReadReleaseFixture(

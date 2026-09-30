@@ -1819,7 +1819,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     pendingReadiness.removeFirst()
                 },
                 hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in
-                    pendingFinalRoutePresence.removeFirst()
+                    // Route state persists through the additional post-configuration proof fence.
+                    pendingFinalRoutePresence.isEmpty ? finalRoutePresence.last == true : pendingFinalRoutePresence.removeFirst()
                 },
                 decorateAgentSessionLinkPrompt: { text, _, _ in
                     .init(text: text, claim: nil, mustAbortDispatch: false)
@@ -2335,6 +2336,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 // MARK: - Non-Codex fakes
 
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
+    private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
     private(set) var shutdownCount = 0
     private(set) var startOrResumeExistingSessionIDs: [String?] = []
@@ -2389,6 +2391,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         effortLevel _: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
+        configuration.replaceProcess()
         startOrResumeExistingSessionIDs.append(existingSessionID)
         if rejectResume, existingSessionID != nil { throw NativeAgentRuntimeControllerError.processNotRunning }
         return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
@@ -2398,7 +2401,20 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         NativeAgentRuntimeSessionRef(sessionID: "monitor-native-session")
     }
 
-    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {}
+    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {
+        _ = configuration.apply()
+    }
+
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        configuration.apply()
+    }
+
+    func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try configuration.validate(proof)
+        sentMessages.append(text)
+        if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
+        return UUID()
+    }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
@@ -2411,6 +2427,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func shutdown() async {
+        configuration.replaceProcess()
         shutdownCount += 1
         continuation?.finish()
     }

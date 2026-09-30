@@ -121,7 +121,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
                 }
                 XCTAssertEqual(controls.count, 1 + newerModels.count, "A stale failure cannot issue manual fallback settings")
                 XCTAssertEqual(writes.count, 0, "The older prompt must not dispatch")
-                XCTAssertEqual(session.providerSessionID, "auto-fallback-session")
+                XCTAssertEqual(session.providerSessionID, "application-proof-session")
                 XCTAssertTrue(session.claudeController === controller)
             }
         }

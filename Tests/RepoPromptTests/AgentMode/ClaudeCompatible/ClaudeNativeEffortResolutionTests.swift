@@ -57,7 +57,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             pinnedEffortRaw: extracted.effort,
             isMCPOriginated: false,
             stored: .high
-        ), .high)
+        ), .low)
         XCTAssertEqual(ClaudeAgentModeCoordinator.resolvedMCPPinnedEffort(
             modelRaw: "claude-opus-5-5",
             agentKind: .claudeCode,
@@ -77,6 +77,24 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             pinnedEffortRaw: "low",
             isMCPOriginated: false
         ))
+    }
+
+    @MainActor
+    func testEncodedManualEffortIsBaselineButValidMCPPinStillWins() {
+        XCTAssertEqual(ClaudeAgentModeCoordinator.resolvedMCPPinnedEffort(
+            modelRaw: "claude-opus-5-5:low",
+            agentKind: .claudeCode,
+            pinnedEffortRaw: "high",
+            isMCPOriginated: false,
+            stored: .high
+        ), .low)
+        XCTAssertEqual(ClaudeAgentModeCoordinator.resolvedMCPPinnedEffort(
+            modelRaw: "claude-opus-5-5:low",
+            agentKind: .claudeCode,
+            pinnedEffortRaw: "high",
+            isMCPOriginated: true,
+            stored: .medium
+        ), .high)
     }
 
     @MainActor
