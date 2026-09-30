@@ -11,14 +11,20 @@ import Foundation
 /// templates never decide authority — every action still revalidates exact endpoints through
 /// `AgentSessionLinkRuntimeBridge`.
 enum AgentOversightUICopy {
-    /// Shared glyph for every overseen/management affordance: the persistent overseen mark,
-    /// the provenance mark on an overseer-created lane, and the grey hover affordance.
-    static let relationshipMarkIcon = "rectangle.connected.to.line.below"
+    // MARK: - Mark glyphs (Fb iconography, approved 2026-09-30)
 
-    /// Purple eye mark meaning "this session oversees others". Non-clickable.
-    static let overseerIcon = "eye.fill"
+    /// Overseer role mark: a filled eye in this session's own group colour.
+    static let overseerMarkIcon = "eye.fill"
+    /// Overseen role mark: an eye outline in the (first) overseer's group colour.
+    static let overseenMarkIcon = "eye"
+    /// Both roles at once: the eye takes the row's own group colour, the ring its first
+    /// overseer's.
+    static let dualRoleMarkIcon = "eye.circle.fill"
+    /// Grey affordance on rows with no role, and the icon for the context-menu oversight entries.
+    /// An eye only ever means a role, so the management affordance uses a different glyph.
+    static let manageOversightIcon = "person.2.badge.gearshape"
 
-    // MARK: - Row mark tooltips (VoiceOver reads the same text)
+    // MARK: - Row mark tooltip (VoiceOver reads the same text)
 
     /// Renders at most three names, then a compact remainder: `A, B, C +2 more`.
     static func truncatedNameList(_ names: [String]) -> String {
@@ -28,30 +34,41 @@ enum AgentOversightUICopy {
         return "\(head) +\(remainder) more"
     }
 
-    static func overseeingTooltip(targetNames: [String]) -> String {
-        "Overseeing: \(truncatedNameList(targetNames))"
+    /// The mark's single combined line (approved 2026-09-30):
+    /// `Overseeing: A, B, C +N more · Overseen by: D, E · Created by: F`, with segments omitted
+    /// when empty. When the creator is the row's only overseer, the last two segments collapse to
+    /// `Created and overseen by: F`. Empty only when the row has no role and no provenance — callers
+    /// only invoke this for rows that render a mark.
+    static func oversightMarkTooltip(
+        overseeingNames: [String],
+        overseenByNames: [String],
+        creator: String?,
+        creatorIsSoleOverseer: Bool
+    ) -> String {
+        var segments: [String] = []
+        if !overseeingNames.isEmpty {
+            segments.append("Overseeing: \(truncatedNameList(overseeingNames))")
+        }
+        if creatorIsSoleOverseer, let creator {
+            segments.append("Created and overseen by: \(creator)")
+        } else {
+            if !overseenByNames.isEmpty {
+                segments.append("Overseen by: \(truncatedNameList(overseenByNames))")
+            }
+            if let creator {
+                segments.append("Created by: \(creator)")
+            }
+        }
+        return segments.joined(separator: " · ")
     }
 
-    static func overseenByTooltip(observerNames: [String]) -> String {
-        "Overseen by: \(truncatedNameList(observerNames))"
+    /// Stashed-row provenance: the creator-navigation button's label. Stashed lanes have no live
+    /// role, so this is the only place their origin still surfaces outside the menus.
+    static func createdByTooltip(creator: String) -> String {
+        "Created by: \(creator)"
     }
 
-    /// Created lane whose only active overseer is still its creator.
-    static func createdAndOverseenTooltip(creator: String) -> String {
-        "Created and overseen by: \(creator)"
-    }
-
-    /// Created lane with active inbound oversight beyond (or instead of) its creator.
-    static func createdByOverseenByTooltip(creator: String, observerNames: [String]) -> String {
-        "Created by: \(creator); overseen by: \(truncatedNameList(observerNames))"
-    }
-
-    /// Created lane whose inbound links are all gone. Provenance only.
-    static func createdByUnlinkedTooltip(creator: String) -> String {
-        "Created by: \(creator) (unlinked)"
-    }
-
-    /// Hover affordance on rows that currently have no inbound oversight.
+    /// Hover affordance on rows that currently have no oversight role.
     static let manageOversightTooltip = "Manage oversight"
 
     // MARK: - Menus
