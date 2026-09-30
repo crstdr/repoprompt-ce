@@ -3472,7 +3472,8 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
                     connectionLifecycleGeneration: 1
                 ),
                 projectionRevision: revision,
-                hasAgentSessionLink: hasAgentSessionLink
+                hasAgentSessionLink: hasAgentSessionLink,
+                hasAnyActiveLink: true
             ),
             to: endpoint
         )
@@ -4472,7 +4473,8 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
                 runID: oldRunID,
                 routeToken: oldRoute,
                 projectionRevision: 100,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             ),
             to: endpoint
         )
@@ -4489,7 +4491,8 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
                 connectionLifecycleGeneration: 1
             ),
             projectionRevision: 1,
-            hasAgentSessionLink: true
+            hasAgentSessionLink: true,
+            hasAnyActiveLink: true
         )
         fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(newProjection, to: endpoint)
 
@@ -4518,7 +4521,8 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
                 connectionLifecycleGeneration: 1
             ),
             projectionRevision: 1,
-            hasAgentSessionLink: true
+            hasAgentSessionLink: true,
+            hasAnyActiveLink: true
         )
         fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(current, to: endpoint)
 
@@ -4533,7 +4537,8 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
                     connectionLifecycleGeneration: 1
                 ),
                 projectionRevision: 200,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             ),
             to: endpoint
         )

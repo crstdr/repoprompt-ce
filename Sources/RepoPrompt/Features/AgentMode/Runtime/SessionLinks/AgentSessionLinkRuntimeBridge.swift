@@ -5067,6 +5067,12 @@ final class AgentSessionLinkRuntimeBridge {
             return Self.attentionDisposition(for: error, selectorWasOmitted: observerSessionID == nil)
         }
 
+        // An active inverse grant can precede this bridge's observer-local baseline publication.
+        // Reconcile through the ordinary authoritative owner, never synthesize a one-lane reducer
+        // from the attention call. Every endpoint, eligibility, revision and generation fence below
+        // still runs after this additional suspension before anything is enqueued.
+        await requestProjectionRefresh(.sessions([authorization.observer.sessionID]))
+        guard !isFrozenForTermination else { return .shuttingDown }
         guard let host else { return .denied }
         let registry = AgentSessionDeletionRegistry.shared
         if registry.isPermanentlyDeleted(sessionID: authorization.target.sessionID) {

@@ -4623,7 +4623,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                         connectionLifecycleGeneration: 1
                     ),
                     projectionRevision: 1,
-                    hasAgentSessionLink: true
+                    hasAgentSessionLink: true,
+                    hasAnyActiveLink: true
                 ),
                 to: endpoint
             )
@@ -4670,7 +4671,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 connectionLifecycleGeneration: 1
             ),
             projectionRevision: revision,
-            hasAgentSessionLink: hasAgentSessionLink
+            hasAgentSessionLink: hasAgentSessionLink,
+            hasAnyActiveLink: true
         )
         fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
         return projection
