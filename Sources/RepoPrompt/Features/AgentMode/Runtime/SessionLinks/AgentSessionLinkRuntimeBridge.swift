@@ -4009,6 +4009,7 @@ final class AgentSessionLinkRuntimeBridge {
                 generation: item.generation,
                 targetSessionID: item.targetSessionID,
                 targetEndpoint: targetEndpoint,
+                linkCreatedAt: item.createdAt,
                 displayName: item.displayName ?? target?.resolvedDisplayName
                     ?? AgentMonitorSessionIDFormatter.short(item.targetSessionID),
                 providerDisplayName: target?.providerDisplayName,
@@ -4020,7 +4021,7 @@ final class AgentSessionLinkRuntimeBridge {
             ))
         }
 
-        let inbound: [AgentMonitorPillProps.Inbound] = inputs.inbound.items.compactMap { item in
+        let inbound: [AgentMonitorPillProps.Inbound] = inputs.inbound.items.compactMap { item -> AgentMonitorPillProps.Inbound? in
             guard let observerEndpoint = inputs.inboundObserverEndpoints[item.linkID] else {
                 assertionFailure("Active inbound oversight link is missing its exact observer endpoint.")
                 return nil
@@ -4031,6 +4032,7 @@ final class AgentSessionLinkRuntimeBridge {
                 generation: item.generation,
                 observerSessionID: item.observerSessionID,
                 observerEndpoint: observerEndpoint,
+                linkCreatedAt: item.createdAt,
                 displayName: observer?.resolvedDisplayName
                     ?? AgentMonitorSessionIDFormatter.short(item.observerSessionID),
                 // UI only, exactly as on the outbound rows: the observing session's window is what

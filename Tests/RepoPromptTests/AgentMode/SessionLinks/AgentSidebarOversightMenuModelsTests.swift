@@ -8,6 +8,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         let endpoint: DomainAgentSessionLinkEndpointIdentity
         let linkID: UUID
         let generation: UInt64
+        var createdAt: Date?
     }
 
     private func id(_ value: String) -> UUID {
@@ -69,7 +70,8 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
                 observerSessionID: relationship.endpoint.sessionID,
                 targetSessionID: target.sessionID,
                 displayName: nil,
-                capabilities: DomainAgentSessionLinkCapability.version1
+                capabilities: DomainAgentSessionLinkCapability.version1,
+                createdAt: relationship.createdAt ?? Date(timeIntervalSince1970: 0)
             )
         }
         let outboundItems = linkedTargets.map { relationship in
@@ -79,7 +81,8 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
                 observerSessionID: target.sessionID,
                 targetSessionID: relationship.endpoint.sessionID,
                 displayName: nil,
-                capabilities: DomainAgentSessionLinkCapability.version1
+                capabilities: DomainAgentSessionLinkCapability.version1,
+                createdAt: relationship.createdAt ?? Date(timeIntervalSince1970: 0)
             )
         }
         return DomainAgentSessionLinkEndpointProjectionInputs(
@@ -318,22 +321,16 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertTrue(menu.targetOptions.isEmpty)
     }
 
-    func testCreatorBadgeCopyMovedToTheUnifiedCopyOwner() {
-        XCTAssertEqual(AgentOversightUICopy.relationshipMarkIcon, "rectangle.connected.to.line.below")
+    /// Fb iconography: one mark per row — a role eye — and a neutral management affordance.
+    /// The link/provenance mark is gone; creator origin lives in the combined tooltip only.
+    func testMarkGlyphCopyMovedToTheUnifiedCopyOwner() {
+        XCTAssertEqual(AgentOversightUICopy.overseerMarkIcon, "eye.fill")
+        XCTAssertEqual(AgentOversightUICopy.overseenMarkIcon, "eye")
+        XCTAssertEqual(AgentOversightUICopy.dualRoleMarkIcon, "eye.circle.fill")
+        XCTAssertEqual(AgentOversightUICopy.manageOversightIcon, "person.2.badge.gearshape")
         XCTAssertEqual(
-            AgentOversightUICopy.createdByUnlinkedTooltip(creator: "RepoPrompt PM"),
-            "Created by: RepoPrompt PM (unlinked)"
-        )
-        XCTAssertEqual(
-            AgentOversightUICopy.createdAndOverseenTooltip(creator: "RepoPrompt PM"),
-            "Created and overseen by: RepoPrompt PM"
-        )
-        XCTAssertEqual(
-            AgentOversightUICopy.createdByOverseenByTooltip(
-                creator: "RepoPrompt PM",
-                observerNames: ["RepoPrompt PM", "Second"]
-            ),
-            "Created by: RepoPrompt PM; overseen by: RepoPrompt PM, Second"
+            AgentOversightUICopy.createdByTooltip(creator: "RepoPrompt PM"),
+            "Created by: RepoPrompt PM"
         )
     }
 
@@ -412,18 +409,63 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         )
     }
 
-    func testTooltipNameListsCapAtThreeWithPlusNMore() {
+    /// Approved 2026-09-30 mark tooltip: one combined line, segments omitted when empty,
+    /// three names then "+N more".
+    func testMarkTooltipIsOneCombinedLineWithOptionalSegments() {
         XCTAssertEqual(
-            AgentOversightUICopy.overseeingTooltip(targetNames: ["A"]),
+            AgentOversightUICopy.oversightMarkTooltip(
+                overseeingNames: ["A", "B", "C", "D"],
+                overseenByNames: ["E", "F"],
+                creator: "G",
+                creatorIsSoleOverseer: false
+            ),
+            "Overseeing: A, B, C +1 more · Overseen by: E, F · Created by: G"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.oversightMarkTooltip(
+                overseeingNames: [],
+                overseenByNames: ["D", "E"],
+                creator: nil,
+                creatorIsSoleOverseer: false
+            ),
+            "Overseen by: D, E"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.oversightMarkTooltip(
+                overseeingNames: ["A"],
+                overseenByNames: [],
+                creator: nil,
+                creatorIsSoleOverseer: false
+            ),
             "Overseeing: A"
         )
+        // Creator as the only overseer collapses the inbound + provenance segments.
         XCTAssertEqual(
-            AgentOversightUICopy.overseenByTooltip(observerNames: ["A", "B", "C"]),
-            "Overseen by: A, B, C"
+            AgentOversightUICopy.oversightMarkTooltip(
+                overseeingNames: [],
+                overseenByNames: ["RepoPrompt PM"],
+                creator: "RepoPrompt PM",
+                creatorIsSoleOverseer: true
+            ),
+            "Created and overseen by: RepoPrompt PM"
         )
         XCTAssertEqual(
-            AgentOversightUICopy.overseenByTooltip(observerNames: ["A", "B", "C", "D", "E"]),
-            "Overseen by: A, B, C +2 more"
+            AgentOversightUICopy.oversightMarkTooltip(
+                overseeingNames: ["Lane"],
+                overseenByNames: ["RepoPrompt PM"],
+                creator: "RepoPrompt PM",
+                creatorIsSoleOverseer: true
+            ),
+            "Overseeing: Lane · Created and overseen by: RepoPrompt PM"
+        )
+        XCTAssertEqual(
+            AgentOversightUICopy.oversightMarkTooltip(
+                overseeingNames: [],
+                overseenByNames: ["Other"],
+                creator: "RepoPrompt PM",
+                creatorIsSoleOverseer: false
+            ),
+            "Overseen by: Other · Created by: RepoPrompt PM"
         )
     }
 
