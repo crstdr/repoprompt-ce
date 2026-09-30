@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -242,8 +243,8 @@ final class ACPAdvertisedCommandControllerTests: XCTestCase {
         XCTAssertFalse(fixture.controller.advertisesCommand("compact", inProviderSession: ACPCompactFixtures.sessionID))
     }
 
-    /// A resumed Devin session refuses any prompt whose request cannot apply its permission level
-    /// (#1029). The command is checked against the run's current request, like an ordinary prompt,
+    /// A resumed Devin session refuses any prompt whose request cannot apply its permission level.
+    /// The command is checked against the run's current request, like an ordinary prompt,
     /// not the one the session was opened with.
     func testAResumedDevinCommandIsCheckedAgainstTheCurrentRequest() async throws {
         let directory = try ACPCompactFixtures.makeTemporaryDirectory(tracking: &temporaryURLs)
@@ -287,6 +288,8 @@ final class ACPAdvertisedCommandControllerTests: XCTestCase {
         } catch let refusal as ACPAgentSessionController.ProviderCommandRefusal {
             XCTAssertTrue(refusal.sessionIsUsable)
         }
+        let reusable = await controller.hasReusableSession
+        XCTAssertTrue(reusable, "Refusal retains the live controller; it must not relaunch")
         XCTAssertEqual(try ACPCompactFixtures.loggedPrompts(at: promptLog), [], "Nothing was written")
 
         try await controller.promptAdvertisedCommand(
@@ -439,21 +442,12 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
         XCTAssertNil(fixture.session.vouchedContextCount, "The count vouch is invalidated at dispatch")
         XCTAssertEqual(fixture.session.vouchedContextWindow?.tokens, 1000)
         XCTAssertFalse(fixture.session.contextCountVouchAwaitsOccupancyReport, "The suspension ends with the turn")
-        XCTAssertTrue(fixture.session.isACPCompactSettling(), "Background compaction may outlive the command turn")
 
         // The revision the command skipped is still owed to the next ordinary turn.
         fixture.session.runState = .idle
         await run(fixture, message: "acp follow-up")
         XCTAssertEqual(fixture.harness.acceptedClaims.count, 2)
         XCTAssertTrue(fixture.session.acpController === liveController)
-    }
-
-    func testUserTypedAdvertisedCompactAlsoStartsManagedSettleWindow() async throws {
-        let fixture = try makeFixture()
-        await run(fixture, message: "initial turn")
-        fixture.session.runState = .idle
-        await run(fixture, message: "/compact")
-        XCTAssertTrue(fixture.session.isACPCompactSettling())
     }
 
     /// Devin's `/compact` is fire-and-forget: the prompt answer returns immediately with an empty
@@ -470,6 +464,7 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
                 .allSatisfy { !($0.kind == .system && $0.text.contains("background")) },
             "The note is scoped to provider control commands, not every instant-empty turn"
         )
+        XCTAssertFalse(fixture.session.isSettlingACPBackgroundCompaction, "Only a compaction command is held")
         fixture.session.runState = .idle
         let before = fixture.session.items.count
 
@@ -485,6 +480,26 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
             "One row names the unobservable background work instead of a silently empty turn"
         )
         XCTAssertTrue(notes.allSatisfy { $0.text.contains("cancel") })
+        XCTAssertTrue(
+            fixture.session.isSettlingACPBackgroundCompaction,
+            "The signature is enforced, not only described: the session is held while it settles"
+        )
+        XCTAssertEqual(
+            AgentSessionLinkDeliveryReadiness.evaluate(
+                snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+                    session: fixture.session,
+                    endpointMatchesGrant: true,
+                    isClosing: false
+                )
+            ),
+            .blocked(.targetNotIdle)
+        )
+
+        // The session's own next turn proceeds (its user is never held) and ends the hold, which
+        // that turn has made moot.
+        fixture.session.runState = .idle
+        await run(fixture, message: "acp follow-up")
+        XCTAssertFalse(fixture.session.isSettlingACPBackgroundCompaction)
     }
 
     func testSelfCompactPreparationRefusalAfterPipelineStartSettlesTheBoundAttempt() async throws {
@@ -890,78 +905,6 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         )
     }
 
-    func testManagedSendAndCompactWaitForACPCompactionSettlement() async throws {
-        let fixture = try makeFixture()
-        let controller = try await installLiveController(fixture)
-        fixture.session.beginACPCompactSettling(
-            providerSessionID: fixture.session.providerSessionID ?? "", controller: controller,
-            settleSeconds: 90, scheduleDeadline: false
-        )
-        let candidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidate(
-            tabID: fixture.tabID, sessionID: fixture.sessionID,
-            tabName: "ACP lane", isWindowClosing: false
-        ))
-        let send = await fixture.viewModel.agentSessionLinkPerformSend(
-            to: candidate,
-            request: AgentSessionLinkSendRequest(
-                linkID: UUID(), linkGeneration: 1, observerEndpoint: request.observerEndpoint,
-                observerDisplayName: "Planning", message: "do not interrupt compact", workflow: nil
-            ),
-            liveness: { Self.liveLiveness }, commitAuthorization: { .committed }
-        )
-        XCTAssertEqual(send, .blocked(.compactionSettling))
-        let compactOutcome = try await compact(fixture)
-        XCTAssertEqual(compactOutcome, .blocked(.compactionSettling))
-        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
-    }
-
-    func testSelfCompactDecisionWindowKeepsManagedCompactionGateAfterDispatchHoldClears() async throws {
-        let fixture = try makeFixture()
-        var state = AgentSelfCompactState()
-        _ = state.reserve(note: "resume", idempotencyKey: "settle")
-        state.active?.phase = .acpSettling
-        fixture.session.selfCompactState = state
-        XCTAssertFalse(fixture.session.isACPCompactSettling())
-        let snapshot = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
-            session: fixture.session, endpointMatchesGrant: true, isClosing: false
-        )
-        XCTAssertTrue(snapshot.compactionSettling)
-        XCTAssertEqual(
-            AgentSessionLinkDeliveryReadiness.managedDeliveryFailure(snapshot: snapshot),
-            .compactionSettling
-        )
-        let candidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidate(
-            tabID: fixture.tabID, sessionID: fixture.sessionID,
-            tabName: "ACP lane", isWindowClosing: false
-        ))
-        let send = await fixture.viewModel.agentSessionLinkPerformSend(
-            to: candidate,
-            request: AgentSessionLinkSendRequest(
-                linkID: UUID(), linkGeneration: 1, observerEndpoint: request.observerEndpoint,
-                observerDisplayName: "Planning", message: "wait for compact", workflow: nil
-            ),
-            liveness: { Self.liveLiveness }, commitAuthorization: { .committed }
-        )
-        XCTAssertEqual(send, .blocked(.compactionSettling))
-    }
-
-    func testSupersededSelfCompactCannotIssueDeferredACPCommand() throws {
-        let fixture = try makeFixture()
-        var state = AgentSelfCompactState()
-        let scheduled = state.reserve(note: "resume", idempotencyKey: "deferred-command")
-        guard case let .scheduled(attempt) = scheduled else { return XCTFail("expected reservation") }
-        state.active?.phase = .dispatchingCompact
-        fixture.session.selfCompactState = state
-        fixture.session.selfCompactDispatchIsCurrent = { true }
-        let dispatchID = AgentSelfCompactionDispatchID(requestID: attempt.id, stage: .compact)
-        XCTAssertTrue(fixture.session.selfCompactCommandDispatchIsCurrent(dispatchID))
-        fixture.session.selfCompactState.active?.phase = .parked
-        XCTAssertFalse(fixture.session.selfCompactCommandDispatchIsCurrent(dispatchID))
-        XCTAssertTrue(fixture.session.selfCompactNoteDispatchIsCurrent(
-            .init(requestID: attempt.id, stage: .note)
-        ), "The ordinary input may still carry the parked note")
-    }
-
     func testAnAcceptedCompactionRecordsTheRequestAndRunsOnlyOnTheLiveSession() async throws {
         let fixture = try makeFixture()
         let controller = try await installLiveController(fixture)
@@ -1090,5 +1033,134 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.session.vouchedContextCount?.tokens, 120, "The in-turn usage_update stands")
         fixture.session.endCompactionContextCountSuspension()
         XCTAssertFalse(fixture.session.contextCountVouchAwaitsOccupancyReport)
+    }
+}
+
+/// A fire-and-forget ACP compaction keeps running in the provider's background, where the session's
+/// next prompt cancels it. These prove the settle hold is enforced — not merely advised — on every
+/// admission surface that could start that cancelling turn, that `poll` names it, and that it lifts
+/// on its own (publishing the change parked work waits for) or when the session's own turn begins.
+@MainActor
+final class AgentSessionLinkACPBackgroundCompactionSettleTests: XCTestCase {
+    private func candidate(tabID: UUID) -> AgentSessionLinkEndpointCandidate {
+        AgentSessionLinkEndpointCandidate(
+            windowID: 1,
+            workspaceID: UUID(),
+            tabID: tabID,
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1,
+            isTopLevel: true,
+            hasLoadedPersistedState: true,
+            bindingTransitionInProgress: false,
+            isClosing: false,
+            isMCPControlled: false,
+            isMCPOriginated: false,
+            roleAllowsOutboundMonitoring: true,
+            displayName: "Worker",
+            providerDisplayName: "Devin",
+            locationLabel: nil
+        )
+    }
+
+    private func idleSession() -> AgentModeViewModel.TabSession {
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.hasLoadedPersistedState = true
+        return session
+    }
+
+    private func admission(_ session: AgentModeViewModel.TabSession) -> AgentSessionLinkDeliveryReadiness.Decision {
+        AgentSessionLinkDeliveryReadiness.evaluate(
+            snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+                session: session,
+                endpointMatchesGrant: true,
+                isClosing: false
+            )
+        )
+    }
+
+    func testTheSettleBlockerIsATargetNotIdleFactInThePureMatrix() {
+        var snapshot = AgentSessionLinkDeliveryReadiness.Snapshot.ready
+        XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: snapshot), .ready)
+        snapshot.backgroundCompactionSettling = true
+        XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: snapshot), .blocked(.targetNotIdle))
+
+        typealias Inputs = AgentModeViewModel.SendReadinessInputs
+        let session = idleSession()
+        var input: Inputs = AgentModeViewModel.sendReadinessInputs(
+            session: session,
+            candidate: candidate(tabID: session.tabID),
+            status: .idle
+        )
+        XCTAssertTrue(AgentModeViewModel.sendBlockers(input).isEmpty)
+        input.backgroundCompactionSettling = true
+        XCTAssertEqual(AgentModeViewModel.sendBlockers(input).map(\.rawValue), ["background_compaction_settling"])
+    }
+
+    func testASettlingSessionRefusesDeliveryAndWakesAndPollNamesTheHold() {
+        let session = idleSession()
+        let target = candidate(tabID: session.tabID)
+        XCTAssertEqual(admission(session), .ready)
+        XCTAssertTrue(AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(session))
+
+        session.beginACPBackgroundCompactionSettle(duration: 60)
+
+        XCTAssertTrue(session.isSettlingACPBackgroundCompaction)
+        XCTAssertEqual(
+            admission(session),
+            .blocked(.targetNotIdle),
+            "send, compact, and every parked when_sendable drain share this admission"
+        )
+        XCTAssertFalse(
+            AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(session),
+            "A periodic wake would start the very turn that cancels the compaction"
+        )
+        let observed = AgentModeViewModel.observationSnapshot(for: session, candidate: target, subagentCounts: (0, 0))
+        XCTAssertEqual(observed.status, .idle, "The run itself is over; only delivery is held")
+        XCTAssertFalse(observed.idleForSend, "until: sendable must not release a waiter into a refusal")
+        XCTAssertEqual(observed.board.sendBlockers, ["background_compaction_settling"])
+
+        session.endACPBackgroundCompactionSettle()
+        XCTAssertFalse(session.isSettlingACPBackgroundCompaction)
+        XCTAssertEqual(admission(session), .ready)
+        XCTAssertTrue(
+            AgentModeViewModel.observationSnapshot(for: session, candidate: target, subagentCounts: (0, 0)).idleForSend
+        )
+    }
+
+    func testTheHoldLiftsItselfAndPublishesTheReadinessChangeParkedWorkWaitsFor() async {
+        let session = idleSession()
+        var transitions: [Bool] = []
+        let lifted = expectation(description: "the expiry publishes a readiness change")
+        let subscription = session.monitorReadinessChangePublisher.sink { [weak session] in
+            guard let session else { return }
+            transitions.append(session.isSettlingACPBackgroundCompaction)
+            if session.acpBackgroundCompactionSettlesAt == nil { lifted.fulfill() }
+        }
+        defer { subscription.cancel() }
+
+        session.beginACPBackgroundCompactionSettle(duration: 0.05)
+        XCTAssertEqual(admission(session), .blocked(.targetNotIdle))
+
+        await fulfillment(of: [lifted], timeout: 5)
+        XCTAssertEqual(transitions, [true, false], "Both edges publish; the expiry edge is the one a parked drain needs")
+        XCTAssertFalse(session.isSettlingACPBackgroundCompaction)
+        XCTAssertEqual(admission(session), .ready)
+    }
+
+    func testANewerHoldReplacesAnOlderOneAndAnEarlyLiftCancelsTheExpiry() async throws {
+        let session = idleSession()
+        session.beginACPBackgroundCompactionSettle(duration: 0.05)
+        session.beginACPBackgroundCompactionSettle(duration: 60)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(session.isSettlingACPBackgroundCompaction, "The superseded short hold must not lift the newer one")
+
+        var signals = 0
+        let subscription = session.monitorReadinessChangePublisher.sink { signals += 1 }
+        defer { subscription.cancel() }
+        session.endACPBackgroundCompactionSettle()
+        session.endACPBackgroundCompactionSettle()
+        XCTAssertEqual(signals, 1, "Only the real transition publishes")
+        XCTAssertFalse(session.isSettlingACPBackgroundCompaction)
     }
 }

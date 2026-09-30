@@ -755,7 +755,6 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
-                clearACPCompactSettling()
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
@@ -844,11 +843,7 @@ final class AgentTabSession: ObservableObject {
     var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
 
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
-    var providerSessionID: String? {
-        didSet {
-            if providerSessionID != oldValue { clearACPCompactSettling() }
-        }
-    }
+    var providerSessionID: String?
 
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
@@ -982,74 +977,6 @@ final class AgentTabSession: ObservableObject {
 
     var acpOccupancyReportThisTurn: ContextOccupancyEpoch?
 
-    /// A compact command may finish its RepoPrompt turn before the provider finishes compacting.
-    /// Runtime-only and qualified by both controller and provider conversation.
-    struct ACPCompactSettlingMarker {
-        let providerSessionID: String
-        let controllerID: ObjectIdentifier
-        let dispatchedAt: Date
-        let deadline: Date
-        let priorUsedTokens: Int?
-    }
-
-    private(set) var acpCompactSettling: ACPCompactSettlingMarker?
-    private var acpCompactSettleDeadlineTask: Task<Void, Never>?
-    nonisolated static let acpCompactSettleSeconds: TimeInterval = 90
-
-    func beginACPCompactSettling(
-        providerSessionID: String,
-        controller: ACPAgentSessionController,
-        now: Date = Date(),
-        settleSeconds: TimeInterval = AgentTabSession.acpCompactSettleSeconds,
-        scheduleDeadline: Bool = true
-    ) {
-        guard selectedAgent.acpProviderID != nil,
-              acpController === controller,
-              self.providerSessionID == providerSessionID
-        else { return }
-        let marker = ACPCompactSettlingMarker(
-            providerSessionID: providerSessionID,
-            controllerID: ObjectIdentifier(controller),
-            dispatchedAt: now,
-            deadline: now.addingTimeInterval(settleSeconds),
-            priorUsedTokens: contextUsageSnapshot?.used
-        )
-        acpCompactSettleDeadlineTask?.cancel()
-        acpCompactSettling = marker
-        noteMonitorObservationInputsChanged()
-        guard scheduleDeadline else { return }
-        acpCompactSettleDeadlineTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, settleSeconds) * 1_000_000_000))
-            guard !Task.isCancelled else { return }
-            _ = self?.isACPCompactSettling(now: Date())
-        }
-    }
-
-    func clearACPCompactSettling(
-        providerSessionID: String? = nil,
-        controller: ACPAgentSessionController? = nil
-    ) {
-        guard let marker = acpCompactSettling else { return }
-        if let providerSessionID, marker.providerSessionID != providerSessionID { return }
-        if let controller, marker.controllerID != ObjectIdentifier(controller) { return }
-        acpCompactSettleDeadlineTask?.cancel()
-        acpCompactSettleDeadlineTask = nil
-        acpCompactSettling = nil
-        noteMonitorObservationInputsChanged()
-    }
-
-    func isACPCompactSettling(now: Date = Date()) -> Bool {
-        guard let marker = acpCompactSettling else { return false }
-        guard now < marker.deadline,
-              providerSessionID == marker.providerSessionID,
-              acpController.map(ObjectIdentifier.init) == marker.controllerID
-        else {
-            clearACPCompactSettling()
-            return false
-        }
-        return true
-    }
-
     /// Bumped by every write to `vouchedContextCount`, including a withdrawal that leaves it `nil`, so
     /// a restore can prove no report touched the count since it was withdrawn.
     private var contextCountVouchRevision: UInt64 = 0
@@ -1084,6 +1011,56 @@ final class AgentTabSession: ObservableObject {
 
     func endCompactionContextCountSuspension() {
         contextCountVouchAwaitsOccupancyReport = false
+    }
+
+    /// When an ACP compaction that ended its turn instantly (fire-and-forget) stops being protected.
+    ///
+    /// Until then the provider may still be compacting in the background, where the session's next
+    /// prompt cancels the work. Delivery readiness, the published `idle_for_send`, and every
+    /// automatic wake treat the session as not idle for the whole span, so a parked `when_sendable`
+    /// send, another overseer, or an Auto-wake cannot start that cancelling turn. The session's own
+    /// user is never held. Every transition — including expiry — publishes an observation change,
+    /// which is what lets parked work resume the moment the hold lifts.
+    private(set) var acpBackgroundCompactionSettlesAt: Date? {
+        didSet {
+            if oldValue != acpBackgroundCompactionSettlesAt {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    private var acpBackgroundCompactionSettleTask: Task<Void, Never>?
+
+    /// True while a fire-and-forget ACP compaction may still be running in the provider's background.
+    var isSettlingACPBackgroundCompaction: Bool {
+        guard let deadline = acpBackgroundCompactionSettlesAt else { return false }
+        return deadline > Date()
+    }
+
+    /// Holds automatic and overseer deliveries off this session for `duration`, then lifts the hold
+    /// and publishes the change. A newer hold replaces an older one.
+    func beginACPBackgroundCompactionSettle(duration: TimeInterval) {
+        acpBackgroundCompactionSettleTask?.cancel()
+        let deadline = Date().addingTimeInterval(max(0, duration))
+        acpBackgroundCompactionSettlesAt = deadline
+        acpBackgroundCompactionSettleTask = Task { @MainActor [weak self] in
+            let nanoseconds = UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled,
+                  let self,
+                  acpBackgroundCompactionSettlesAt == deadline
+            else { return }
+            acpBackgroundCompactionSettleTask = nil
+            acpBackgroundCompactionSettlesAt = nil
+        }
+    }
+
+    /// Lifts the hold early: a new turn already started (and would have cancelled any background
+    /// compaction), so holding further protects nothing.
+    func endACPBackgroundCompactionSettle() {
+        acpBackgroundCompactionSettleTask?.cancel()
+        acpBackgroundCompactionSettleTask = nil
+        acpBackgroundCompactionSettlesAt = nil
     }
 
     /// Restores a vouch withdrawn by a compaction that never reached the provider, but only if no
@@ -1128,18 +1105,6 @@ final class AgentTabSession: ObservableObject {
                     ? ContextUsageVouch(agent: selectedAgent, tokens: window)
                     : nil
             }
-        }
-        // A post-dispatch ACP occupancy report clears the settling hold only when it vouches
-        // a drop below the count captured at dispatch. An unchanged/billed count is not proof.
-        if reportsOccupancy,
-           let contextUsedTokens,
-           let marker = acpCompactSettling,
-           let priorUsedTokens = marker.priorUsedTokens,
-           contextUsedTokens < priorUsedTokens,
-           vouchedContextCount?.tokens == contextUsedTokens,
-           isACPCompactSettling()
-        {
-            clearACPCompactSettling()
         }
     }
 
@@ -1207,11 +1172,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     var claudeController: (any NativeAgentRuntimeControlling)?
-    var acpController: ACPAgentSessionController? {
-        didSet {
-            if acpController !== oldValue { clearACPCompactSettling() }
-        }
-    }
+    var acpController: ACPAgentSessionController?
 
     var codexEventTask: Task<Void, Never>?
     var codexEventTaskRunID: UUID?
@@ -1274,16 +1235,6 @@ final class AgentTabSession: ObservableObject {
     /// Runtime-only owner/exclusivity fence, rechecked at provider-bound send seams after startup awaits.
     /// A restored attempt has no executable fence and cannot resume dispatch.
     var selfCompactDispatchIsCurrent: (@MainActor () -> Bool)?
-
-    @MainActor
-    func selfCompactCommandDispatchIsCurrent(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
-        guard dispatchID.stage == .compact,
-              let active = selfCompactState.active,
-              active.id == dispatchID.requestID,
-              active.phase == .dispatchingCompact || active.phase == .awaitingCompactTurn
-        else { return false }
-        return selfCompactDispatchIsCurrent?() != false
-    }
 
     @MainActor
     func selfCompactNoteDispatchIsCurrent(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
@@ -1408,6 +1359,13 @@ final class AgentTabSession: ObservableObject {
     func cancelEphemeralRuntimeState() {
         selfCompactNativeCompletion?.cancelRuntimeWork()
         selfCompactNativeCompletion = nil
+        // Without its worker, an active request could never settle and would hold overseer delivery,
+        // Auto-wake, and managed Stop until relaunch. Settle or park it before the worker is gone.
+        var selfCompact = selfCompactState
+        if selfCompact.releaseForRuntimeTeardown() {
+            selfCompactState = selfCompact
+        }
+        selfCompactACPCommandItemIDs = nil
         derivedTranscriptRefreshTask?.cancel()
         derivedTranscriptRefreshTask = nil
         pendingDerivedTranscriptRefreshReason = nil

@@ -17,7 +17,7 @@ defect in this subsystem.
 
 | Owner | Responsibility | Where |
 | --- | --- | --- |
-| Link authority | Grants, capabilities (including the user's management delegation), generations, cursors, revocation. Process-memory. | `DomainAgentSessionLinkAuthority` |
+| Link authority | Grants, capabilities (including default management), generations, cursors, revocation. Process-memory. | `DomainAgentSessionLinkAuthority` |
 | Passive reducer | The canonical observer-local queue: first-to-final coalescing of target status edges plus separate, non-lossy attention occurrences. Owns no authority and performs no delivery. | `AgentSessionLinkPassiveStatusNotices` |
 | Claim / receipt | The immutable rendered batch a provider was actually sent, including exact attention occurrence identities, and what that provider's acceptance therefore acknowledges. | `AgentSessionLinkPromptContext` |
 | Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentModeViewModel+SessionLinkAutoWake` |
@@ -69,9 +69,16 @@ the next accepted passive batch in a context that has not accepted revision 5 ca
 later batches use the reminder, and an Auto-wake cannot physically dispatch while its required batch
 could not be rendered. No second persistence mechanism for guidance exists or is needed.
 
-Revision 7 introduced the grant-level `manage` capability; revision 8 added watch-level native
-`compact`. Current Add and restored-intent links include Manage by default. The full lane block
-supersedes earlier observe-only wording, including the observer’s own refusals made under it.
+Revision 7 changes what an exact outbound grant may confer rather than how it is admitted: the
+grant-level `manage` capability (see *Management is an authority-owned grant capability*) lets an
+overseer answer and steer its target for its own user, and the full block says outright that it
+supersedes earlier observe-only wording — including refusals the overseer itself gave on the
+strength of that wording. Revision 8 moves managed prompt inspection into redacted `poll`/`wait`
+results and retires `get_interaction`. Revision 9 makes new and restored links managed by default;
+existing restricted links remain restricted. Revisions 10 (passive lane) and 4 (inventory) keep
+model-facing text focused on authority and trust while leaving operation-specific recovery with
+its result. Both kinds of guidance are re-owed when their wording revision changes, even if link
+membership did not.
 
 ### Feedback loops are an accepted consequence
 
@@ -192,73 +199,53 @@ eligible observer to add nor an existing relationship to unlink. A row may legit
 sidebar eyes at once; their fill, color, placement, interaction, tooltip, and directional
 accessibility wording must remain distinct.
 
-## Permission prompts require an explicit response
+## Management is the default exact-grant capability
 
-An oversight link never auto-accepts the target's provider permission prompts. The observer may
-answer an eligible one-time prompt only through an explicit, interaction-ID-qualified `respond`
-operation under its exact current Manage grant. Persistent or session-wide approvals, hook trust,
-worktree-merge reviews, and secret input stay with the target's user. Auto-wake selection and snooze
-are admission policy for observer turns, not permission authority. Provider-wide Claude and ACP
-permission preferences and MCP client permissions are separate controls, not oversight link choices.
+Every newly created oversight link includes `.manage` on its exact, directional, revocable grant.
+This applies equally to an interactive Add, a restored saved pair, and an explicit re-add of a
+still-saved pair. The dashboard has no Manage toggle: the link itself is the user's delegation to
+observe, answer one-time prompts, and steer under the observer's own user's instructions. There is
+also no oversight Auto-approve control or listener; provider permission prompts remain manual unless
+the managed overseer explicitly responds to a particular eligible request.
 
-## Saved oversight restoration across relaunch
+The durable oversight document stores only observer → target UUID pairs. Older documents with a
+`delegations` key decode safely because unknown fields are ignored; those values are never applied,
+and the next successful mutation rewrites the document without them. No saved management or
+permission-auto-approval choice can silently override the current grant default or manufacture a
+reverse link. Explicitly restricted in-memory grants remain restricted and are not upgraded by an
+idempotent reservation. Unlink revokes the exact grant and its issued leases; re-adding creates a
+fresh managed generation, not a resurrection of the old one.
 
-After window restoration settles, a saved oversight pair can still wait on a described background
-compose tab whose session has not hydrated. The launch coordinator requests one passive load per
-waiting endpoint per launch, only after the restore barriers clear. The host uses
-`ensureSessionReady(tabID:)` without selecting or focusing a tab, activating a window, or starting or
-reconnecting a provider. Ordinary candidate-readiness signals then re-enter the restoration pass;
-both endpoints must still prove authoritative before a link is established. An undescribed,
-duplicate, deleting, or terminal endpoint is not hydrated to manufacture a grant.
-
-The version-1 intent document accepts optional `delegations` rows for compatibility with upstream
-files. In this lean fork those stored `manage` and `autoApprovePermissions` bits are **not consulted**
-when links are restored or explicitly re-added. Every new grant has the same managed default,
-and provider permissions still require an explicit response. Removing an intent also drops its
-stored row; no UI or runtime path writes a new delegation.
-
-## Management is an authority-owned grant capability
-
-A new exact outbound link includes `.manage` by default. The user sees fixed Oversee disclosure at
-Add; there is no Manage toggle or oversight Auto-approve control. This is an intentional grant
-expansion for newly added links and for durable oversight intents restored on launch. Already-live
-watch-only grants keep their actual capability set until re-created; there is no silent in-memory
-upgrade. `list` capabilities, `poll`/`wait`'s `managed` field, and prompt inventory rows report the
-authority-owned fact. `compact` remains watch-level under `send_when_idle`, not Manage.
-
-`respond` and `steer` still require `.manage` on the exact direct grant. The domain authorizer,
-generation-qualified lease, both live endpoint checks, and final operation fence remain in force;
-revoke, rebind, or replacement defeats stale work. Manage never implies automatic permission
-acceptance or authority over a target's other links. Provider-wide permission preferences are
-separate from oversight. Removing per-row Manage badges does not remove attribution: successful
-`respond` and `steer` results carry `answered_by_session_id` and `steered_by_session_id`,
-respectively. Delivered cross-session send, steer, and compact transcript rows retain typed
-source-session attribution and its visible badge. The badge identifies who acted; it is not a
-separate grant or proof of permission.
-
-The optional `managed` wire-attribute rename is deferred to preserve existing MCP consumers for
-no authority gain. An additional inbound badge is also deferred: the target-side management eye
-and attributed action rows already serve the chosen UI, without restoring per-row Manage badges.
-This cleanup leaves the defensive commit fences unchanged, so an extra mid-fence interleaving test
-is deferred to a future behavioral change. None of these presentation nits warrants expanding the
-always-on lean guidance.
+`respond` and `steer` still require `.manage` at every exact-grant fence. Managed `poll` and `wait`
+retain their watch-level operation grant but disclose prompt bodies only after a separate whole-batch
+management fence and live-endpoint check. A restricted link can still `poll` or `wait` for status
+with `managed: false` and no prompt body; `respond` and `steer` return `management_not_granted`.
+When that fence fails for a multi-target `wait` after a non-terminal wake, each target is re-fenced on
+its own (as terminal survivors already are): healthy siblings keep their rows, cursors, and prompts,
+and a sibling that failed its own fence releases nothing and is named in `unavailable_session_ids`.
+A single-target wait, or a batch with no survivor, is still denied.
+An unlinked UUID still receives the indistinguishable denial. A steer's ledger
+commit still uses `commitSendAuthorization(requiresManagement: true)`, and revocation before the final
+fence releases the uncommitted reservation without delivery.
 
 ### Inspecting and answering prompts
 
-A managed observer's `poll` or `wait` may return an observer-local redacted
-`pending_interaction` with the exact `interaction_id`, kind, and one-time choices. The short
-`respond_hint` appears only beside that object; it is absent for idle, omitted, or unauthorized
-entries. This detail is not put in passive snapshots, inventory, `read`, `list`, or unsolicited
-status messages. A single prompt above 64 KiB is non-respondable with `too_large`; a multi-target
-result caps aggregate detail around 20 KiB, omits whole objects, and tells the observer to poll
-those targets alone. Nothing truncates a prompt or option.
-
-`respond` uses the same parser as local `agent_run respond`, compares the current interaction ID
-before and after its final authority fence, and applies one eligible decision only. Persistent or
-session-wide approvals, hook trust, worktree-merge reviews, secret input, and unsupported one-time
-choices remain manual-only. A mismatch or resolved prompt applies nothing: refresh with `poll` or
-`wait`, never automatically retry approval. Waiting for the next instruction is not a permission
-prompt; an authorized `steer` can supply that instruction.
+Managed `poll` and `wait` may return the target's current pending approval, permission, MCP
+elicitation, or question beside the sanitized snapshot, with free text through the oversight redactor
+and one-time option labels verbatim. Restricted links never receive a prompt body; a single prompt
+over 64 KiB yields an ID-only `too_large` manual-only stub, and multi-target results omit whole
+prompts beyond their 20 KiB aggregate prompt budget. A `respond_hint` appears only with a respondable
+pending interaction. `respond` answers exactly one `interaction_id`: the target view model compares the ID, validates the answer
+with the parser behind `agent_run respond`, awaits the bridge's final fence (the management lease
+re-validated inside the authority, both live endpoints, deletion state), compares again, and
+submits without suspending. Approvals and permissions accept only `accept` (this request only),
+`decline`, or `cancel`. Session-wide and exec-policy-amending approvals, Codex project-hook trust,
+app-owned worktree-merge reviews, and user-input requests containing a secret field are visible but
+`manual_only`. ACP permissions use only a genuine one-time allow option for accept and a one-time
+reject (otherwise `cancelled`) for decline. When the provider offers no genuine one-time allow
+option, `poll`/`wait` omit `accept` and `respond` refuses only accept (`manual_only`,
+`no_one_time_allow_option`); decline and cancel stay available. A wait for the session's next instruction is not a prompt `respond` answers;
+the managed pending-interaction note says to deliver that instruction with `steer`.
 
 ### Steering
 
@@ -277,7 +264,6 @@ operations and a retry replays the stored receipt.
 | Any pending prompt | Refused before the fence | `target_awaiting_interaction` |
 | Between states, idle but not yet send-ready, or settled during the fence | Refused; nothing staged and the key is released | `target_busy` |
 | A provider or state with no live steering | Refused before staging | `steer_unavailable` |
-| ACP compact settling after compact dispatch or during self-compact's post-terminal decision window | Managed delivery waits while either independent settle clock is active; the dispatch-relative marker and self-compact phase each clear by their own rules. The target user's own sends and steers remain ungated | `compaction_settling` (retryable) |
 
 The running routes go through the target's own `submitPreparedUserTurn`, so a steer reaches the
 provider exactly as a local composer message would. What they never touch is composer state: no
@@ -304,22 +290,6 @@ never chains: if A manages B and B manages C, A's words give B no authority over
 `send` keeps the byte-identical `bounded_coordination` framing, which still tells a target to leave
 permission decisions and prompts to its user. The transcript row stores the raw words with the
 ordinary cross-session attribution badge.
-
-### Inventory guidance is re-owed independently of membership
-
-The active inventory keeps only the operation names, one-line use, and the common trust boundary.
-It does not carry an always-on answer walkthrough; the pending result supplies just-in-time
-`respond_hint`. `AgentSessionLinkPromptContext` records the accepted inventory-guidance revision
-(2 for the lean wording) separately from the link-set revision and passive lane-guidance revision.
-These are independent number spaces: inventory revision 2 does not precede or supersede lane
-revision 8, and neither number is a link-set generation. The inventory counter versions the
-operation/use wording owed with membership; the lane counter versions the full or reminder trust
-block owed with passive updates. New inventory wording re-owes an inventory at the next dispatch
-even when the exact grants are unchanged, and acceptance advances only the inventory-wording
-acknowledgement. It does not advance membership, fabricate a capability-change
-notice, or turn an empty inventory into a terminal/suspension notice. Failed, stale, or unaccepted
-claims do not acknowledge the new text. The supplement remains provider-only additive context,
-not a base-system-prompt or transcript mutation.
 
 ## Target-centric sidebar management stays exact
 
@@ -465,8 +435,7 @@ never become an observer instruction or authority.
 
 ## Compaction is a send-gated native command, not a message
 
-`agent_session_link` `compact` asks one exact target to compact its provider context. It is the
-second operation that reuses an existing capability (after `snooze_auto_wake` → `poll`): the
+`agent_session_link` `compact` asks one exact target to compact its provider context. The
 distinct `monitorCompact` identity requires `send_when_idle`, so every send-capable link can compact
 and no grant or UI changes. That delegation is the deliberate trade-off; a separate capability would
 either be decorative in the default set or leave existing links without it.
@@ -480,30 +449,32 @@ instead of a user row, and it dispatches a RepoPrompt-constructed command
 `thread/compact/start`, and Claude Code receives exactly `/compact` through its ordinary run
 pipeline with every decoration (handoff, oversight supplement, instruction packaging, effort)
 skipped and no interrupt of an in-flight turn. No caller text ever reaches the provider. Every other
-runtime returns `not_supported` rather than a message asking the model to compact itself.
+unsupported runtime returns `not_supported` rather than a message asking the model to compact itself.
 
-ACP is advertisement-driven and live-unverified. `ACPAgentSessionController` records each
-`available_commands_update` for the session that sent it, before load-replay suppression and
-normalization (which drop it), and forgets it when a session starts opening, the process exits or
-fails, a prompt fails, or the controller shuts down. A Devin, Grok Build, or Antigravity target is
-supported only while its live controller advertises `compact` for the target's own provider
-session. With no live provider session — after a relaunch, before the next turn, or while the
-controller is still opening — the result is the retryable `no_provider_session`; `not_supported`
-is reserved for a live session whose observed command list provably lacks `compact`. OpenCode
-advertises the user's own commands and skills, so an advertised `compact` there may not be native
-compaction; it and Cursor are never supported. The command reuses the live controller only (never a
-fresh or replacement one) and skips model/mode configuration. `promptAdvertisedCommand` checks that
-the session is open and idle, is the admitted one, and still advertises the command, in the same
-synchronous actor step as the write, then sends exactly one `/compact` text block without the
-provider's prompt builder. A refusal before the write fails the run but keeps the controller: nothing
-about that session changed. At dispatch the context count vouch is dropped, and for the rest of that
-turn only an occupancy report (`usage_update`) may vouch for a count again, never the turn's billed
-prompt count. That assumes an in-turn `usage_update` describes the context after compaction; a
-provider that reports occupancy before compacting and not after would leave the old count vouched
-until its next report. Only live traffic can settle this.
+ACP uses an undecorated `session/prompt` only for a live Devin, Grok Build, or Antigravity
+session that advertises `compact` for its exact conversation. Each `available_commands_update`
+replaces its controller snapshot; opening or retiring the session clears it. A missing live
+session or unobserved command list is retryable `no_provider_session`; an observed list that lacks
+`compact` is `not_supported`. OpenCode user commands and Cursor never qualify. A command never
+starts/replaces a controller or applies model/mode configuration. The controller rechecks idle state,
+conversation, advertisement, and the **current** request's compatibility immediately before the
+write, including Devin's launched permission mode. An unsent refusal retains a usable controller;
+a retired one is detached and shut down. Busy is not retired.
+
+ACP context count becomes unknown at dispatch: new occupancy may vouch for it again, but this
+command's billed prompt count cannot. A proven no-send restores the withdrawn vouch only if no
+newer occupancy replaced it. Instant silent completion may mean background work that the
+session's next prompt would cancel, so it adds a fixed transcript hint and starts a 90-second
+settle hold (`AgentTabSession.beginACPBackgroundCompactionSettle`). While it lasts, delivery
+readiness is `target_not_idle` — refusing `send`, `compact`, and parked `when_sendable` drains —
+Auto-wake and periodic wakes are not admitted, and `poll` reports `idle_for_send: false` with
+`send_blockers: ["background_compaction_settling"]`. Expiry publishes a readiness change, so parked
+work resumes without polling; any new run start (the session's own user is never held) ends the
+hold early. It is a cancellation guard, not completion proof. Duplicate receipts retain the
+background metadata.
 
 A failed last run is not a readiness blocker, so a target that died on context length is admissible;
-any interaction or `awaiting_user` is `target_not_idle`. `accepted` means requested: completion is
+any interaction or `awaiting_user` is `target_not_idle`. `accepted` means started, not completed: completion is
 observed through `poll`/`wait`, where the `context` count reads unknown after the compaction signal
 until the provider reports a new one.
 

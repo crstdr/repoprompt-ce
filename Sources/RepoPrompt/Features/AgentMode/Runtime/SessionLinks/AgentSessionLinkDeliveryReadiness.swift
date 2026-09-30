@@ -55,12 +55,17 @@ enum AgentSessionLinkDeliveryReadiness {
         /// another observer must not `send` into it any more than into an active run — otherwise the
         /// wake and the send race for the same terminal boundary.
         var pendingOversightAutoWake: Bool = false
-        /// A binding-qualified managed stop owns this target until cleanup releases its gate.
-        var stopInProgress: Bool = false
-        /// Either ACP settle clock means a managed prompt could interrupt provider compaction.
-        var compactionSettling: Bool = false
         /// An in-flight self-compaction owns the next provider boundary.
         var pendingSelfCompact: Bool = false
+        /// Narrower than `pendingSelfCompact`: RepoPrompt itself owns an unsent self-compaction
+        /// dispatch. Only this refuses managed Stop; the caller's originating turn, a parked note,
+        /// and a note whose send already started remain stoppable.
+        var selfCompactBlocksManagedStop: Bool = false
+        /// A binding-qualified managed stop owns this target until cleanup releases its gate.
+        var stopInProgress: Bool = false
+        /// A fire-and-forget ACP compaction may still be running in the provider's background, where
+        /// a new prompt would cancel it. Held off for its settle window like any other target work.
+        var backgroundCompactionSettling: Bool = false
 
         // Target interactions. Waiting states are never ready: answering one would be a different
         // capability than sending a new instruction, and `send` never gains it.
@@ -88,9 +93,10 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingACPSteeringCount: Int,
             pendingClaudeSteeringCount: Int,
             pendingOversightAutoWake: Bool = false,
-            stopInProgress: Bool = false,
-            compactionSettling: Bool = false,
             pendingSelfCompact: Bool = false,
+            selfCompactBlocksManagedStop: Bool = false,
+            stopInProgress: Bool = false,
+            backgroundCompactionSettling: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
             hasPendingUserInputRequest: Bool,
@@ -114,9 +120,10 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingACPSteeringCount = pendingACPSteeringCount
             self.pendingClaudeSteeringCount = pendingClaudeSteeringCount
             self.pendingOversightAutoWake = pendingOversightAutoWake
-            self.stopInProgress = stopInProgress
-            self.compactionSettling = compactionSettling
             self.pendingSelfCompact = pendingSelfCompact
+            self.selfCompactBlocksManagedStop = selfCompactBlocksManagedStop
+            self.stopInProgress = stopInProgress
+            self.backgroundCompactionSettling = backgroundCompactionSettling
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser
             self.hasPendingUserInputRequest = hasPendingUserInputRequest
@@ -212,14 +219,10 @@ enum AgentSessionLinkDeliveryReadiness {
         return .ready
     }
 
-    /// Managed deliveries must also respect the ACP background-compaction settle window.
-    /// Local user submissions keep their existing admission behavior.
-    static func managedDeliveryFailure(snapshot: Snapshot) -> AgentSessionLinkSendFailure? {
+    static func failure(snapshot: Snapshot) -> AgentSessionLinkSendFailure? {
         switch evaluate(snapshot: snapshot) {
-        case .blocked(.endpointInvalidated): .endpointInvalidated
-        case .blocked(.targetLoading): .targetLoading
-        case .blocked(.targetNotIdle): snapshot.compactionSettling ? .compactionSettling : .targetNotIdle
-        case .ready: snapshot.compactionSettling ? .compactionSettling : nil
+        case let .blocked(reason): AgentSessionLinkSendFailure(reason)
+        case .ready: nil
         }
     }
 
@@ -236,8 +239,9 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingACPSteeringCount > 0
             || snapshot.pendingClaudeSteeringCount > 0
             || snapshot.pendingOversightAutoWake
-            || snapshot.stopInProgress
             || snapshot.pendingSelfCompact
+            || snapshot.stopInProgress
+            || snapshot.backgroundCompactionSettling
             || snapshot.hasWaitingPrompt
             || snapshot.hasPendingAskUser
             || snapshot.hasPendingUserInputRequest

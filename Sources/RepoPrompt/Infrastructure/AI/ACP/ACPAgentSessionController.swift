@@ -489,10 +489,6 @@ actor ACPAgentSessionController {
 
     #if DEBUG
         private var testRejectNextTurnPreparation = false
-        private var testHoldNextTurnPreparation = false
-        private var testNextTurnPreparationEntered = false
-        private var testNextTurnPreparationEntryWaiter: CheckedContinuation<Void, Never>?
-        private var testNextTurnPreparationGate: CheckedContinuation<Void, Never>?
         private var testHoldNextSteeringInterrupt = false
         private var testSteeringInterruptEntered = false
         private var testSteeringInterruptEntryWaiter: CheckedContinuation<Void, Never>?
@@ -500,21 +496,6 @@ actor ACPAgentSessionController {
 
         func test_rejectNextTurnPreparation() {
             testRejectNextTurnPreparation = true
-        }
-
-        func test_holdNextTurnPreparation() {
-            testHoldNextTurnPreparation = true
-            testNextTurnPreparationEntered = false
-        }
-
-        func test_waitForNextTurnPreparationEntry() async {
-            if testNextTurnPreparationEntered { return }
-            await withCheckedContinuation { testNextTurnPreparationEntryWaiter = $0 }
-        }
-
-        func test_releaseNextTurnPreparation() {
-            testNextTurnPreparationGate?.resume()
-            testNextTurnPreparationGate = nil
         }
 
         func test_holdNextSteeringInterrupt() {
@@ -534,15 +515,8 @@ actor ACPAgentSessionController {
     #endif
 
     @discardableResult
-    func prepareForNextTurn() async -> Bool {
+    func prepareForNextTurn() -> Bool {
         #if DEBUG
-            if testHoldNextTurnPreparation {
-                testHoldNextTurnPreparation = false
-                testNextTurnPreparationEntered = true
-                testNextTurnPreparationEntryWaiter?.resume()
-                testNextTurnPreparationEntryWaiter = nil
-                await withCheckedContinuation { testNextTurnPreparationGate = $0 }
-            }
             if testRejectNextTurnPreparation {
                 testRejectNextTurnPreparation = false
                 return false
@@ -737,25 +711,16 @@ actor ACPAgentSessionController {
         try await submitPromptTurn(.message(message), sessionID: sessionID, overrideRunRequest: overrideRunRequest)
     }
 
-    /// Sends exactly `/<name>` as the whole prompt of a new turn in the idle session
-    /// `expectedSessionID`, and only while that session currently advertises the command.
-    ///
-    /// The prompt is a single text block built here, not by the provider, so no system prompt,
-    /// attachment, or provider framing can wrap it, and no model-parameter admission applies. Every
-    /// check runs synchronously on the actor immediately before the write — there is no suspension
-    /// between them and `session/prompt` leaving the process — so a refusal guarantees nothing was
-    /// sent. Turn completion, terminal events, and failure handling are `prompt`'s. `request` is the
-    /// run's current request, exactly as an ordinary prompt passes it, so request-level admission sees
-    /// the same current selections the target's next ordinary turn would.
+    /// Sends exactly `/<name>` to the idle session that still advertises it. The run's current
+    /// request must remain compatible with the live process and its resumed permission policy.
+    /// All checks and the prompt write run on this actor without an intervening suspension;
+    /// refusal writes nothing and retains a usable controller. No provider framing or model RPC.
     func promptAdvertisedCommand(
         _ name: String,
         expectedSessionID: String,
         request overrideRunRequest: ACPRunRequest? = nil
     ) async throws {
-        // The caller's run may have been cancelled during the hop onto this actor.
         guard !Task.isCancelled else { throw ProviderCommandCancelledBeforeSend() }
-        // `.promptRunning` passes this first guard on purpose: busy is not dead, and the second guard
-        // reports it as a usable session.
         guard state == .sessionOpen || state == .promptRunning, process != nil, let sessionID else {
             throw ProviderCommandRefusal(reason: "The provider session is no longer open.", sessionIsUsable: false)
         }
@@ -771,9 +736,14 @@ actor ACPAgentSessionController {
                 sessionIsUsable: true
             )
         }
-        // A resumed Devin session whose permission level cannot be applied refuses every prompt; the
-        // command is refused the same way, against the same current request, before anything is
-        // written.
+        guard isCompatibleWith(request: effectivePromptRunRequest(override: overrideRunRequest)) else {
+            throw ProviderCommandRefusal(
+                reason: "The current request is incompatible with the live provider process.",
+                sessionIsUsable: true
+            )
+        }
+        // The fork's Devin resume policy is stricter than process compatibility: a resumed
+        // conversation must not silently retain a higher permission level.
         do {
             try validateResumedSessionPermissionPolicy(effectivePromptRunRequest(override: overrideRunRequest))
         } catch {
@@ -829,7 +799,7 @@ actor ACPAgentSessionController {
                     )
                 }
             #endif
-            // A provider command is checked before the write in `promptAdvertisedCommand`.
+            // A provider command is admitted against the current request before the write above.
             if case .message = payload {
                 try validateResumedSessionPermissionPolicy(promptRequest)
                 try validatePromptModelParameterSelections(promptRequest)

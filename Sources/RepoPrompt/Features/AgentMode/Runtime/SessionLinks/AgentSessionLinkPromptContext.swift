@@ -390,7 +390,7 @@ enum AgentSessionLinkPromptSupplementDecision {
         lastAcceptedRevision: UInt64?,
         lastAcceptedHadLinks: Bool,
         possiblyDeliveredLinkRevision: UInt64? = nil,
-        acceptedInventoryGuidanceRevision: UInt64? = nil,
+        acceptedInventoryGuidanceRevision: UInt64? = AgentSessionLinkPrompts.currentInventoryGuidanceRevision,
         currentInventoryGuidanceRevision: UInt64 = AgentSessionLinkPrompts.currentInventoryGuidanceRevision
     ) -> AgentSessionLinkPromptSupplementKind? {
         // Already acknowledged for this exact membership and inventory-guidance state: later turns
