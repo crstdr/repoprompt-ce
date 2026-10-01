@@ -53,6 +53,10 @@ package final class MCPAgentRunStartExecutionScope: @unchecked Sendable {
         lock.withLock { state.phase }
     }
 
+    package var hasAcceptedDispatch: Bool {
+        lock.withLock { state.dispatch == .accepted }
+    }
+
     package var allowsFailureCleanup: Bool {
         lock.withLock { state.dispatch == .notAttempted || state.dispatch == .refused }
     }

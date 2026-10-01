@@ -136,10 +136,95 @@ import XCTest
                     $0.activeAgentSessionID == sessionID
                 } == true)
                 XCTAssertEqual(scope.recoveryMetadata()["dispatch_state"], .string(accepted ? "accepted" : "unknown"))
+                XCTAssertEqual(scope.phase, .returning)
             }
             let count = await recorder.count()
             XCTAssertEqual(count, 0)
-            XCTAssertEqual(fixture.window.agentModeViewModel.test_outstandingProvisionalMCPSessionTargetCount, 2)
+            XCTAssertEqual(fixture.window.agentModeViewModel.test_outstandingProvisionalMCPSessionTargetCount, 1)
+        }
+
+        func testLateTargetResolutionDiscardsOnlyUnsubmittedClaim() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            fixture.window.promptManager.setAgentAdmissionPersistenceReceiptHandlerForTesting { _, _ in
+                try? await clock.advanceWithoutSleepers(by: .seconds(150))
+            }
+            defer { fixture.window.promptManager.setAgentAdmissionPersistenceReceiptHandlerForTesting(nil) }
+            let recorder = AdmissionProviderRecorder(expectedCount: 0, blockProviders: false)
+            let service = makeAgentRunStartService(window: fixture.window, recorder: recorder)
+            do {
+                _ = try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await service.execute(args: ["op": .string("start"), "message": .string("Fixture instruction"), "detach": .bool(true)])
+                }
+                XCTFail("Late resolver admitted start")
+            } catch { XCTAssertTrue(error is CancellationError) }
+            XCTAssertEqual(fixture.window.agentModeViewModel.test_outstandingProvisionalMCPSessionTargetCount, 0)
+            XCTAssertNotNil(scope.recoveryMetadata()["session_id"])
+            let count = await recorder.count()
+            XCTAssertEqual(count, 0)
+        }
+
+        func testLateHeartbeatResultStillEndsWaitRegistrationExactlyOnce() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            var service = makeAgentRunStartService(window: fixture.window, recorder: recorder, afterHeartbeat: {
+                try await clock.advanceWithoutSleepers(by: .seconds(25))
+            })
+            service.testAfterTargetResolution = { target in
+                if let sessionID = target.sessionID {
+                    _ = try? await fixture.window.agentModeViewModel.mcpActivateControlContext(
+                        forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil, startPending: true
+                    )
+                }
+            }
+            let registration = AgentRunWaitScopeRegistration(token: UUID(), parentRunID: UUID())
+            var ended = 0
+            service.beginAgentRunWait = { _, _, _ in registration }
+            service.endAgentRunWait = { token, _ in
+                XCTAssertEqual(token, registration.token)
+                ended += 1
+            }
+            do {
+                _ = try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await service.execute(args: ["op": .string("start"), "message": .string("Fixture instruction"), "timeout": .int(1)])
+                }
+                XCTFail("Late heartbeat returned success")
+            } catch { XCTAssertTrue(error is CancellationError) }
+            XCTAssertEqual(ended, 1)
+        }
+
+        func testExpiredStartDoesNotAdmitFollowOnWaitRegistration() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            var service = makeAgentRunStartService(window: fixture.window, recorder: recorder, validateBeforeProviderDispatch: { _ in
+                try await clock.advanceWithoutSleepers(by: .seconds(150))
+            })
+            service.testAfterTargetResolution = { target in
+                if let sessionID = target.sessionID {
+                    _ = try? await fixture.window.agentModeViewModel.mcpActivateControlContext(
+                        forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil, startPending: true
+                    )
+                }
+            }
+            var registered = 0
+            service.beginAgentRunWait = { _, _, _ in registered += 1
+                return nil
+            }
+            do {
+                _ = try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await service.execute(args: ["op": .string("start"), "message": .string("Fixture instruction"), "timeout": .int(1)])
+                }
+                XCTFail("Expired start registered wait")
+            } catch { XCTAssertTrue(error is CancellationError) }
+            XCTAssertEqual(registered, 0)
         }
 
         func testSixOverlappingAgentRunStartsPersistUniqueIdentitiesAndDispatchProvidersExactlyOnce() async throws {
@@ -1823,7 +1908,8 @@ import XCTest
         private func makeAgentRunStartService(
             window: WindowState,
             recorder: AdmissionProviderRecorder,
-            validateBeforeProviderDispatch: ((AdmissionIdentityPair) async throws -> Void)? = nil
+            validateBeforeProviderDispatch: ((AdmissionIdentityPair) async throws -> Void)? = nil,
+            afterHeartbeat: (() async throws -> Void)? = nil
         ) -> AgentRunMCPToolService {
             var service = AgentRunMCPToolService(
                 toolName: MCPWindowToolName.agentRun,
@@ -1838,7 +1924,11 @@ import XCTest
                 resolveRequestedTabID: { _ in nil },
                 resolveSpawnParentSourceTabID: { _ in nil },
                 resolveSpawnParentSessionID: { _, _ in nil },
-                withHeartbeat: { _, _, _, _, operation in try await operation() },
+                withHeartbeat: { _, _, _, _, operation in
+                    let value = try await operation()
+                    try await afterHeartbeat?()
+                    return value
+                },
                 startRun: { target, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _, _ in
                     let sessionID = try XCTUnwrap(target.sessionID)
                     let pair = AdmissionIdentityPair(tabID: target.tabID, sessionID: sessionID)

@@ -12987,6 +12987,7 @@ actor ServerNetworkManager {
                 )
             }
             func finalizeToolResult(_ result: CallTool.Result) async -> CallTool.Result {
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
                 guard promptExportMutationObservation?.snapshot()?.state == .applied else {
                     return await finishRequestProgress(result)
                 }
@@ -14004,6 +14005,7 @@ actor ServerNetworkManager {
                                             await recordSynchronousSettlement(.success)
                                             return value
                                         } catch {
+                                            try? startScope.enterReturn()
                                             await recordSynchronousSettlement(MCPToolExecutionCancelledError.matches(error) ? .cancellation : .error)
                                             throw error
                                         }
@@ -15028,8 +15030,13 @@ actor ServerNetworkManager {
                 return CallTool.Result(content: [.text(text: "Server unavailable", annotations: nil, _meta: nil)], isError: true)
             }
             let canonicalName = Self.canonicalToolName(for: params.name)
+            let startArguments = canonicalName == MCPWindowToolName.agentRun
+                ? MCPToolArgsNormalizer.normalize(
+                    params: params.arguments, originalToolName: params.name, canonicalToolName: canonicalName
+                ).payload
+                : params.arguments ?? [:]
             guard MCPToolExecutionContractCatalog.isAgentRunStartCall(
-                toolName: canonicalName, arguments: params.arguments ?? [:]
+                toolName: canonicalName, arguments: startArguments
             ) else {
                 return await MCPAgentRunStartExecutionScope.$current.withValue(nil) { await requestBody(params) }
             }

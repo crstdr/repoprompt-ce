@@ -229,6 +229,7 @@ enum AgentExternalMCPRunStarter {
             #endif
             return StartOutcome(snapshot: snapshot, delivery: delivery)
         } catch {
+            try? startScope?.enterReturn()
             if startScope?.allowsFailureCleanup != false {
                 if let ownedContext {
                     _ = await agentModeVM.mcpDeactivateOwnedControlContext(

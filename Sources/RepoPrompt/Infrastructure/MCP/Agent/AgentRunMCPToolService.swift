@@ -628,9 +628,6 @@ struct AgentRunMCPToolService {
                 : effectiveParentWorktreeInheritance,
             expectedWorkspaceID: workspace.id
         )
-        if let sessionID = target.sessionID {
-            try startScope?.recordTarget(sessionID: sessionID, tabID: target.tabID)
-        }
         guard let targetSessionID = target.sessionID else {
             await discardStartTargetIfSafe(target, agentModeVM: agentModeVM, startScope: startScope)
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
@@ -678,6 +675,9 @@ struct AgentRunMCPToolService {
             bindings: [AgentSessionWorktreeBinding]
         )?
         do {
+            if let sessionID = target.sessionID {
+                try startScope?.recordTarget(sessionID: sessionID, tabID: target.tabID)
+            }
             #if DEBUG
                 await testAfterTargetResolution?(target)
             #endif
@@ -945,6 +945,10 @@ struct AgentRunMCPToolService {
                 }
             #endif
         } catch {
+            try? startScope?.enterReturn()
+            if startScope?.hasAcceptedDispatch == true {
+                agentModeVM.mcpAcceptSessionTarget(target)
+            }
             let providerFailureReason = if !providerDispatchAttempted {
                 lifecycleAdmissionAttempted
                     ? "lifecycle_identity_rejected"
@@ -1030,6 +1034,7 @@ struct AgentRunMCPToolService {
         agentModeVM: AgentModeViewModel,
         startScope: MCPAgentRunStartExecutionScope?
     ) async -> AgentModeViewModel.MCPSessionTargetDiscardResult {
+        try? startScope?.enterReturn()
         guard startScope?.allowsFailureCleanup != false else { return .retainedForRetry }
         return await agentModeVM.mcpDiscardSessionTarget(target)
     }
@@ -1578,6 +1583,7 @@ struct AgentRunMCPToolService {
         }
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
+        try startScope?.checkAdmission()
         let waitScopeRegistration = await beginAgentRunWait(metadata, [sessionID], timeoutSeconds)
         let completionBox = WaitScopeCompletionBox()
         let snapshot: Value
@@ -1697,6 +1703,7 @@ struct AgentRunMCPToolService {
                     }
                 }
             }
+            try startScope?.enterReturn()
         } catch {
             // Cleanup stays in the operation task; the enclosing watchdog never joins it.
             try? startScope?.enterReturn()
@@ -1729,7 +1736,6 @@ struct AgentRunMCPToolService {
             }
             throw error
         }
-        try startScope?.enterReturn()
         if let waitScopeRegistration {
             let completion = completionBox.get() ?? singleWaitScopeCompletion(from: snapshot, sessionID: sessionID)
             await endAgentRunWait(waitScopeRegistration.token, completion)

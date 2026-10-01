@@ -128,6 +128,41 @@ import XCTest
             }
         }
 
+        func testNormalizedStartClassificationOwnsScopeWithoutAffectingOtherOperations() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun) {
+                    .object(["has_start_scope": .bool(MCPAgentRunStartExecutionScope.current != nil)])
+                }
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    let start: [String: Any] = ["op": "  StArT  ", "message": "Fixture instruction", "detach": true, "_rawJSON": true]
+                    let json = try String(decoding: JSONSerialization.data(withJSONObject: start), as: UTF8.self)
+                    var cases: [([String: Any], Bool)] = [
+                        (start, true), (["args": start], true),
+                        (["args": json], true), (["agent_run": start], true)
+                    ]
+                    for op in ["wait", "poll", "steer", "not_an_operation"] {
+                        cases.append((["op": op, "_rawJSON": true], false))
+                    }
+                    cases.append((["_rawJSON": true], false))
+                    for (arguments, expected) in cases {
+                        let payload = try await Self.toolResultObject(endpoint.callTool(name: MCPWindowToolName.agentRun, arguments: arguments))
+                        XCTAssertEqual(payload["has_start_scope"] as? Bool, expected, "Unexpected classification for \(arguments.keys.sorted())")
+                    }
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testAgentRunDetachedStartReturnsCommitAwareRecoveryWithoutClosingTransport() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(

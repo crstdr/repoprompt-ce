@@ -9708,6 +9708,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         case let .accepted(claimed):
             registration = claimed
         case .unavailable, .alreadyActive:
+            try MCPAgentRunStartExecutionScope.current?.checkAdmission()
             registration = await AgentRunSessionStore.register(sessionID: sessionID)
         case .shuttingDown:
             throw MCPError.internalError(

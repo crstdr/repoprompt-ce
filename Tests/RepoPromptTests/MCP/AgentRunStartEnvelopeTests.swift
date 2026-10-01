@@ -104,6 +104,44 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
         await operationGate.release()
     }
 
+    func testDelayedGraceTaskStartupDoesNotRestartCapturedRemainingGrace() async throws {
+        let clock = MCPExportWatchdogManualClock()
+        let delayedClock = StartEnvelopeGraceSchedule()
+        let gate = StartEnvelopeGate()
+        let environment = MCPToolExecutionWatchdogEnvironment(
+            now: { delayedClock.now(fallback: clock.currentTime()) },
+            sleep: { try await clock.sleep(for: $0) },
+            beforeCleanupGraceTaskRegistration: { delayedClock.delayGraceTask() }
+        )
+        let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: environment)
+        let task = Task {
+            try await MCPToolExecutionWatchdog.execute(
+                deadline: .seconds(150), cancellationGrace: .seconds(5),
+                cleanupDisposition: .detachAndSettle, startScope: scope, environment: environment
+            ) {
+                try scope.enterReturn()
+                await gate.wait()
+                return 1
+            }
+        }
+        defer { task.cancel()
+            Task { await gate.release() }
+        }
+        try await clock.waitForSleeper(expected: .seconds(25))
+        try await clock.advanceSleeper(expected: .seconds(25))
+        // Grace calculation observes 29; its task first runs at 31, beyond the cap of 30.
+        // The timer must sleep zero, not restart the captured one-second remainder.
+        try await clock.waitForSleeper(expected: .zero)
+        try await clock.advanceSleeper(expected: .zero)
+        do {
+            _ = try await task.value
+            XCTFail("Expected detached return")
+        } catch {
+            XCTAssertEqual(error as? MCPToolExecutionWatchdogError, .executionDetached)
+        }
+        await gate.release()
+    }
+
     func testSemanticBudgetStartsAfterSetupAndLateTransitionsCannotExtendIt() async throws {
         let clock = MCPExportWatchdogManualClock()
         let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
@@ -286,5 +324,22 @@ private actor StartEnvelopeGate {
         let captured = waiting
         waiting.removeAll()
         captured.forEach { $0.resume() }
+    }
+}
+
+/// Advances only the scheduling reads: both readings share the same monotonic origin.
+private final class StartEnvelopeGraceSchedule: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remaining: [Duration] = []
+    private var last: Duration?
+    func delayGraceTask() {
+        lock.withLock { remaining = [.seconds(29), .seconds(31)] }
+    }
+
+    func now(fallback: Duration) -> Duration {
+        lock.withLock {
+            if !remaining.isEmpty { last = remaining.removeFirst() }
+            return last ?? fallback
+        }
     }
 }

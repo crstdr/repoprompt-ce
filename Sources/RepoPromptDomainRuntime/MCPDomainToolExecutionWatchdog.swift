@@ -457,10 +457,14 @@ package enum MCPToolExecutionWatchdog {
                         min(cancellationGrace, $0)
                     } ?? cancellationGrace
                     let graceWasCapped = effectiveCancellationGrace < cancellationGrace
+                    let graceDeadline = cancellationStart + effectiveCancellationGrace
                     let graceTask: Task<Void, Never>? = if effectiveCancellationGrace > .zero {
                         Task {
                             do {
-                                try await environment.sleep(effectiveCancellationGrace)
+                                let remaining = startScope == nil
+                                    ? effectiveCancellationGrace
+                                    : max(.zero, graceDeadline - environment.now())
+                                try await environment.sleep(remaining)
                                 guard !Task.isCancelled else { return }
                                 await environment.eventDidProduce(.cleanupGraceExpired)
                                 continuation.yield(.cleanupGraceExpired)
