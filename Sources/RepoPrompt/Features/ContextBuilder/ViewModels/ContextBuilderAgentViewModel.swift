@@ -2,6 +2,9 @@ import AppKit
 import Combine
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 import SwiftUI
 
 // AgentLogEntry and AgentLogEntryType are defined in Models/Agent/AgentLogModels.swift
@@ -138,6 +141,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         private static let maxLogEntries = 5
 
         let tabID: UUID
+        let perfRecorder: any AgentModePerfRecording
         @Published var agentLog: [AgentLogEntry]
         /// Total tool calls for the current run (tracked separately since agentLog is limited)
         @Published var toolCallCount: Int = 0
@@ -318,6 +322,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Generic N>1 post-discovery state and the task that must drain before replacement.
         var followUpOracleGroupState = ContextBuilderOracleGroupState()
         var followUpOracleGroupTask: Task<OracleGroupRuntime.Completion, Error>?
+        var followUpOracleGroupSupervision: ContextBuilderOracleGroupSupervision?
 
         /// Per-tab selected follow-up type for automatic analysis
         var selectedFollowUpType: ContextBuilderFollowUpType = .plan
@@ -326,8 +331,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         func beginRunAttempt(source: String) -> AgentRunOwnership {
             let ownership = runLifecycleTracker.begin(tabID: tabID, persistentSessionID: nil)
             #if DEBUG
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.started")
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.started.source.\(source)")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.started")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.started.source.\(source)")
             #endif
             return ownership
         }
@@ -349,7 +354,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             )
             #if DEBUG
                 if case let .rejected(reason) = result {
-                    AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
+                    perfRecorder.increment("contextBuilder.run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
                 }
             #endif
             return result
@@ -372,13 +377,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         private func recordRunAttemptEnded(source: String) {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.ended")
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.ended.source.\(source)")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.ended")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.ended.source.\(source)")
             #endif
         }
 
-        init(tabID: UUID) {
+        init(tabID: UUID, perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
             self.tabID = tabID
+            self.perfRecorder = perfRecorder
             agentLog = []
             agentRunState = .idle
             isAgentBusy = false
@@ -397,6 +403,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mcpWorkspaceID = nil
             followUpOracleSessionID = nil
             followUpOracleGroupTask = nil
+            followUpOracleGroupSupervision = nil
             pendingAskUser = nil
             askUserContinuation = nil
             pendingAskUserRunID = nil
@@ -430,6 +437,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Owns active and terminal-cleanup Context Builder attempts.
     private let runRegistry = ContextBuilderRunRegistry()
+
+    #if DEBUG
+        // One clock domain for source observations, admissions and the grouped poller.
+        var oracleGroupClockForTesting: (@MainActor @Sendable () -> TimeInterval)?
+        var oracleGroupSleepForTesting: (@MainActor @Sendable (TimeInterval) async throws -> Void)?
+    #endif
 
     #if DEBUG
         /// Opt-in, invocation-scoped counters for isolated tests and separately approved live diagnostics.
@@ -591,7 +604,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         func replaceSessionForTesting(tabID: UUID) {
-            sessions[tabID] = TabSession(tabID: tabID)
+            sessions[tabID] = TabSession(tabID: tabID, perfRecorder: perfRecorder)
         }
 
         func hasFollowUpOracleGroupTaskForTesting(tabID: UUID) -> Bool {
@@ -1052,6 +1065,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private let codexModelPollingService: CodexModelPollingService
+    private let perfRecorder: any AgentModePerfRecording
     private var hasPreparedForWindowClose = false
 
     // MARK: - Init / Deinit
@@ -1063,7 +1077,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         oracleViewModel: OracleViewModel,
         settingsManager: GlobalSettingsStore = .shared,
         providerFactory: ProviderFactory? = nil,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.promptManager = promptManager
         self.workspaceManager = workspaceManager
@@ -1071,6 +1086,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         self.oracleViewModel = oracleViewModel
         self.settingsManager = settingsManager
         self.codexModelPollingService = codexModelPollingService
+        self.perfRecorder = perfRecorder
         self.providerFactory = providerFactory ?? { agent, modelString, workspacePath, modelParameterSelections in
             AgentRuntimeProviderService.shared.makeProvider(
                 for: agent,
@@ -1514,7 +1530,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         if let existing = sessions[tabID] {
             return existing
         }
-        let newSession = TabSession(tabID: tabID)
+        let newSession = TabSession(tabID: tabID, perfRecorder: perfRecorder)
         sessions[tabID] = newSession
         return newSession
     }
@@ -2346,7 +2362,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
         #if DEBUG
             if !accepted {
-                AgentModePerfDiagnostics.increment(
+                perfRecorder.increment(
                     "contextBuilder.run.lifecycle.event.rejected",
                     tabID: record.tabID
                 )
@@ -2555,7 +2571,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         #if DEBUG
-            AgentModePerfDiagnostics.increment("contextBuilder.run.teardown.started", tabID: record.tabID)
+            perfRecorder.increment("contextBuilder.run.teardown.started", tabID: record.tabID)
         #endif
 
         let disposalTask = Task { @MainActor [record] in
@@ -2573,7 +2589,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard let self else { return }
             if runRegistry.removeAfterTeardown(record) {
                 #if DEBUG
-                    AgentModePerfDiagnostics.increment("contextBuilder.run.teardown.completed", tabID: record.tabID)
+                    perfRecorder.increment("contextBuilder.run.teardown.completed", tabID: record.tabID)
                     observeStartupBoundary(.teardown, record: record)
                     runTestHooks?.teardownCompleted?(record.runID)
                 #endif
@@ -3966,7 +3982,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             allowClarifyingQuestions: runBehavior.allowClarifyingQuestions,
             responseType: responseType,
             instructions: session.contextBuilderInstructions,
-            questionTimeoutSeconds: runBehavior.questionTimeoutSeconds
+            questionTimeoutSeconds: runBehavior.questionTimeoutSeconds,
+            restrictsReviewGitToExplicitReadOnly: Self.restrictsReviewGitToExplicitReadOnly(
+                workspaceContext: workspaceContext,
+                mcpConfiguration: mcpConfiguration
+            ),
+            reviewRootNames: workspaceContext?.reviewGitContext.displayContext.roots.map(\.logicalRootName) ?? []
         )
         debugLog("System prompt includes ask_user: \(systemPrompt.contains("ask_user"))")
         let userMessage = await buildAgentUserMessage(
@@ -3976,6 +3997,17 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 ?? mcpConfiguration?.nestedTabContext.frozenLookupContext
         )
         return AgentMessage(systemPrompt: systemPrompt, userMessage: userMessage)
+    }
+
+    /// Mirrors the precedence used when installing the nested discovery tab context, so the prompt
+    /// describes the same review-target state that `MCPContextBuilderGitReviewPolicy` enforces.
+    static func restrictsReviewGitToExplicitReadOnly(
+        workspaceContext: ContextBuilderWorkspaceContext?,
+        mcpConfiguration: ContextBuilderMCPRunConfiguration?
+    ) -> Bool {
+        let resolution = workspaceContext?.reviewTargetResolution
+            ?? mcpConfiguration?.nestedTabContext.contextBuilderReviewTargetResolution
+        return resolution?.restrictsGitToExplicitReadOnly ?? false
     }
 
     private func buildAgentUserMessage(
@@ -4835,16 +4867,18 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             return false
         }
         let task = session.followUpOracleGroupTask
-        let members = session.followUpOracleGroupState.invalidateAndTakeMembers()
+        let supervision = session.followUpOracleGroupSupervision
+        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
         let cleanupGeneration = session.followUpOracleGroupState.generation
+        supervision?.cancel()
         task?.cancel()
-        for member in members {
-            await oracleViewModel.cancelStreaming(in: member.sessionID)
-        }
+        // Each captured lane releases its exact stream/waiter before its task joins. Never
+        // look up whatever query a member session happens to host after this await.
         if let task { _ = await task.result }
         let stillOwnsCleanup = session.followUpOracleGroupState.generation == cleanupGeneration
         if stillOwnsCleanup {
             session.followUpOracleGroupTask = nil
+            session.followUpOracleGroupSupervision = nil
         }
         return stillOwnsCleanup
     }
@@ -4875,6 +4909,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             throw CancellationError()
         }
         let generation = session.followUpOracleGroupState.beginRun()
+        let supervision: ContextBuilderOracleGroupSupervision
+        #if DEBUG
+            supervision = ContextBuilderOracleGroupSupervision(
+                clock: oracleGroupClockForTesting ?? { ProcessInfo.processInfo.systemUptime },
+                sleep: oracleGroupSleepForTesting ?? { try await Task.sleep(for: .seconds($0)) }
+            )
+        #else
+            supervision = ContextBuilderOracleGroupSupervision()
+        #endif
+        session.followUpOracleGroupSupervision = supervision
         let groupPrompt = ContextBuilderFrozenOraclePack.prompt(for: mode, prompt: prompt)
         let oracleStore = AppDomainRuntimeComposition.shared.oracleConversationStore
 
@@ -5011,7 +5055,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     tabContext: tabContext,
                     frozenInput: frozenPack.input,
                     callbacks: callbacks,
-                    resolvedStartExecution: execution
+                    resolvedStartExecution: execution,
+                    contextBuilderSupervision: supervision
                 )
             }
             session.followUpOracleGroupTask = task
@@ -5019,16 +5064,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let completion = try await withTaskCancellationHandler {
                 try await task.value
             } onCancel: {
+                supervision.cancel()
                 task.cancel()
-                Task { @MainActor [weak self] in
-                    guard let self, let session = sessions[tabID],
-                          session.followUpOracleGroupState.generation == generation
-                    else { return }
-                    let members = session.followUpOracleGroupState.members
-                    for member in members {
-                        await oracleViewModel.cancelStreaming(in: member.sessionID)
-                    }
-                }
             }
             try requireCurrentOracleRun(session: session, generation: generation)
             let groupReply = ContextBuilderOracleGroupReply(result: completion.result)
@@ -6130,6 +6167,7 @@ extension ContextBuilderAgentViewModel.TabSession {
         )
         followUpOracleGroupState.finish(generation: generation)
         followUpOracleGroupTask = nil
+        followUpOracleGroupSupervision = nil
         return reply
     }
 

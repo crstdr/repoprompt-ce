@@ -1,15 +1,19 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
 import XCTest
 
 @MainActor
 final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
-    func testCanonicalInvalidationSettlesWaiterSkipsStaleApplyAndReclaimsLane() async {
+    private var authorityWorkspaceManager: WorkspaceManagerViewModel?
+
+    func testCanonicalInvalidationSettlesWaiterSkipsStaleApplyAndReclaimsLane() async throws {
+        let authority = try await makeAuthority()
         let gate = RecoveryCancellationIgnoringGate()
         let recorder = RecoveryInvocationRecorder()
         let probe = RecoveryDiagnosticEventProbe()
         let waiterRegistered = RecoveryMainActorSignal()
-        let key = contextKey()
+        let key = contextKey(authority: authority)
         var current: MCPReadFileAutoSelectionCoordinator.ContextKey? = key
         let coordinator = MCPReadFileAutoSelectionCoordinator(
             isContextCurrent: { $0 == current },
@@ -22,7 +26,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         )
         coordinator.setCanonicalApplyGateForTesting { await gate.enter() }
 
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), authority: authority, for: key))
         guard await gate.waitUntilEntered() else {
             await failWait("canonical worker to enter", gates: [gate])
             coordinator.invalidate(context: key)
@@ -48,7 +52,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         let countBeforeRelease = await recorder.canonicalCount()
         XCTAssertEqual(drainResult, .invalidated)
         XCTAssertEqual(countBeforeRelease, 0)
-        XCTAssertFalse(coordinator.enqueue(intent: .full(paths: ["/tmp/stale.swift"]), for: key))
+        XCTAssertFalse(coordinator.enqueue(intent: .full(paths: ["/tmp/stale.swift"]), authority: authority, for: key))
 
         await gate.release()
         guard await probe.waitFor(kind: .workerStopped, lane: .canonical) != nil else {
@@ -61,12 +65,13 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         assertFullyReclaimed(coordinator)
     }
 
-    func testCancellingCanonicalDrainReleasesWaiterWhilePhysicalWorkerContinues() async {
+    func testCancellingCanonicalDrainReleasesWaiterWhilePhysicalWorkerContinues() async throws {
+        let authority = try await makeAuthority()
         let gate = RecoveryCancellationIgnoringGate()
         let recorder = RecoveryInvocationRecorder()
         let probe = RecoveryDiagnosticEventProbe()
         let waiterRegistered = RecoveryMainActorSignal()
-        let key = contextKey()
+        let key = contextKey(authority: authority)
         let coordinator = MCPReadFileAutoSelectionCoordinator(
             isContextCurrent: { $0 == key },
             applyCanonical: { _, _ in
@@ -78,7 +83,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         )
         coordinator.setCanonicalApplyGateForTesting { await gate.enter() }
 
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), authority: authority, for: key))
         guard await gate.waitUntilEntered() else {
             await failWait("canonical worker to enter", gates: [gate])
             coordinator.invalidate(context: key)
@@ -118,11 +123,12 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         assertFullyReclaimed(coordinator)
     }
 
-    func testCancellingMirrorDrainReleasesWaiterAndDeadlineWhilePhysicalWorkerContinues() async {
+    func testCancellingMirrorDrainReleasesWaiterAndDeadlineWhilePhysicalWorkerContinues() async throws {
+        let authority = try await makeAuthority()
         let gate = RecoveryCancellationIgnoringGate()
         let recorder = RecoveryInvocationRecorder()
         let probe = RecoveryDiagnosticEventProbe()
-        let key = contextKey()
+        let key = contextKey(authority: authority)
         let coordinator = MCPReadFileAutoSelectionCoordinator(
             isContextCurrent: { $0 == key },
             applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
@@ -134,7 +140,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
             diagnosticObserver: { probe.record($0) }
         )
 
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), authority: authority, for: key))
         guard await gate.waitUntilEntered() else {
             await failWait("mirror worker to enter", gates: [gate])
             coordinator.invalidate(context: key)
@@ -172,10 +178,11 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         assertFullyReclaimed(coordinator)
     }
 
-    func testFinishDeadlineReturnsDeferredRejectsNewWorkAndReclaimsAfterPhysicalExit() async {
+    func testFinishDeadlineReturnsDeferredRejectsNewWorkAndReclaimsAfterPhysicalExit() async throws {
+        let authority = try await makeAuthority()
         let gate = RecoveryCancellationIgnoringGate()
         let probe = RecoveryDiagnosticEventProbe()
-        let key = contextKey()
+        let key = contextKey(authority: authority)
         let coordinator = MCPReadFileAutoSelectionCoordinator(
             isContextCurrent: { $0 == key },
             applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
@@ -187,7 +194,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
             mirrorWaitTimeout: .zero
         )
 
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), authority: authority, for: key))
         guard await gate.waitUntilEntered() else {
             await failWait("deadline mirror worker to enter", gates: [gate])
             coordinator.invalidate(context: key)
@@ -195,7 +202,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         }
         let finishResult = await coordinator.finish(context: key)
         XCTAssertEqual(finishResult, .deferred)
-        XCTAssertFalse(coordinator.enqueue(intent: .full(paths: ["/tmp/later.swift"]), for: key))
+        XCTAssertFalse(coordinator.enqueue(intent: .full(paths: ["/tmp/later.swift"]), authority: authority, for: key))
         let deferred = coordinator.debugSnapshot()
         XCTAssertEqual(deferred.mirrorWaiterCount, 0)
         XCTAssertEqual(deferred.liveMirrorDeadlineCount, 0)
@@ -211,7 +218,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         }
         assertFullyReclaimed(coordinator)
 
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/reopened.swift"]), for: key))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/reopened.swift"]), authority: authority, for: key))
         guard await probe.waitFor(kind: .workerStopped, lane: .mirror, occurrence: 2) != nil else {
             await failWait("reopened mirror worker exit")
             coordinator.invalidate(context: key)
@@ -223,15 +230,15 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         assertFullyReclaimed(coordinator)
     }
 
-    func testInvalidatingParkedMirrorOwnerPreservesSameTabSurvivorAndFencesLateExit() async {
+    func testInvalidatingParkedMirrorOwnerPreservesSameTabSurvivorAndFencesLateExit() async throws {
+        let authority = try await makeAuthority()
         let oldGate = RecoveryCancellationIgnoringGate()
         let replacementGate = RecoveryCancellationIgnoringGate()
         let recorder = RecoveryInvocationRecorder()
         let probe = RecoveryDiagnosticEventProbe()
         let tabID = UUID()
-        let workspaceID = UUID()
-        let old = contextKey(tabID: tabID, workspaceID: workspaceID, bindingGeneration: 1)
-        let replacement = contextKey(tabID: tabID, workspaceID: workspaceID, bindingGeneration: 2)
+        let old = contextKey(authority: authority, tabID: tabID, bindingGeneration: 1)
+        let replacement = contextKey(authority: authority, tabID: tabID, bindingGeneration: 2)
         var current: Set<MCPReadFileAutoSelectionCoordinator.ContextKey> = [old, replacement]
         let coordinator = MCPReadFileAutoSelectionCoordinator(
             isContextCurrent: { current.contains($0) },
@@ -248,7 +255,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
             diagnosticObserver: { probe.record($0) }
         )
 
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/old.swift"]), for: old))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/old.swift"]), authority: authority, for: old))
         guard await oldGate.waitUntilEntered() else {
             await failWait("retiring mirror worker to enter", gates: [oldGate, replacementGate])
             coordinator.invalidate(context: old)
@@ -266,7 +273,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
             return
         }
 
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/replacement.swift"]), for: replacement))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/replacement.swift"]), authority: authority, for: replacement))
         let replacementDrain = Task { @MainActor in
             await coordinator.drain(.mirroredSelectionAndMetrics, for: replacement)
         }
@@ -321,7 +328,8 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         assertFullyReclaimed(coordinator)
     }
 
-    func testLateMirrorDrainReceivesExactTerminalOutcome() async {
+    func testLateMirrorDrainReceivesExactTerminalOutcome() async throws {
+        let authority = try await makeAuthority()
         let cases: [(WorkspaceSelectionCoordinator.SelectionMirrorOutcome, MCPReadFileAutoSelectionCoordinator.DrainResult)] = [
             (.converged, .completed),
             (.deferred, .deferred),
@@ -331,7 +339,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
 
         for (mirrorOutcome, expectedDrain) in cases {
             let probe = RecoveryDiagnosticEventProbe()
-            let key = contextKey()
+            let key = contextKey(authority: authority)
             let coordinator = MCPReadFileAutoSelectionCoordinator(
                 isContextCurrent: { $0 == key },
                 applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
@@ -339,7 +347,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
                 diagnosticObserver: { probe.record($0) }
             )
 
-            XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+            XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), authority: authority, for: key))
             guard await probe.waitFor(kind: .workerStopped, lane: .mirror) != nil else {
                 await failWait("terminal-outcome mirror worker exit")
                 coordinator.invalidate(context: key)
@@ -352,13 +360,13 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         }
     }
 
-    func testLaterSameTabConvergenceUpgradesDeferredTicketAndPrunesObsoleteSettlement() async {
+    func testLaterSameTabConvergenceUpgradesDeferredTicketAndPrunesObsoleteSettlement() async throws {
+        let authority = try await makeAuthority()
         let recorder = RecoveryInvocationRecorder()
         let probe = RecoveryDiagnosticEventProbe()
         let tabID = UUID()
-        let workspaceID = UUID()
-        let earlier = contextKey(tabID: tabID, workspaceID: workspaceID, bindingGeneration: 1)
-        let later = contextKey(tabID: tabID, workspaceID: workspaceID, bindingGeneration: 2)
+        let earlier = contextKey(authority: authority, tabID: tabID, bindingGeneration: 1)
+        let later = contextKey(authority: authority, tabID: tabID, bindingGeneration: 2)
         var current: Set<MCPReadFileAutoSelectionCoordinator.ContextKey> = [earlier, later]
         let scripted: [WorkspaceSelectionCoordinator.SelectionMirrorOutcome] = [.deferred, .converged, .deferred]
         let coordinator = MCPReadFileAutoSelectionCoordinator(
@@ -371,7 +379,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
             diagnosticObserver: { probe.record($0) }
         )
 
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/earlier.swift"]), for: earlier))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/earlier.swift"]), authority: authority, for: earlier))
         guard await probe.waitFor(kind: .workerStopped, lane: .mirror, occurrence: 1) != nil else {
             await failWait("earlier mirror worker exit")
             coordinator.invalidate(context: earlier)
@@ -381,7 +389,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         let initialEarlierResult = await coordinator.drain(.mirroredSelectionAndMetrics, for: earlier)
         XCTAssertEqual(initialEarlierResult, .deferred)
 
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/later.swift"]), for: later))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/later.swift"]), authority: authority, for: later))
         guard await probe.waitFor(kind: .workerStopped, lane: .mirror, occurrence: 2) != nil else {
             await failWait("later mirror worker exit")
             coordinator.invalidate(context: earlier)
@@ -396,7 +404,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         // Once convergence upgrades the earlier ticket, retiring that owner makes its deferred range obsolete.
         current.remove(earlier)
         coordinator.invalidate(context: earlier)
-        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/newer.swift"]), for: later))
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/newer.swift"]), authority: authority, for: later))
         guard await probe.waitFor(kind: .workerStopped, lane: .mirror, occurrence: 3) != nil else {
             await failWait("newer mirror worker exit")
             coordinator.invalidate(context: later)
@@ -414,14 +422,55 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         assertFullyReclaimed(coordinator)
     }
 
+    /// Recovery tests replace file application with callbacks, but enqueue still receives
+    /// authority captured from a genuinely activated catalog rather than a fabricated ticket.
+    private func makeAuthority() async throws -> MCPServerViewModel.FrozenFileToolAuthority {
+        let files = WorkspaceFilesViewModel()
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let prompt = PromptViewModel(
+            fileManager: files,
+            apiSettingsViewModel: apiSettings,
+            windowID: -1,
+            settingsManager: WindowSettingsManager(windowID: -1)
+        )
+        let manager = WorkspaceManagerViewModel(
+            fileManager: files,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+        // Retain the catalog owner for the entire test, including paused physical workers.
+        authorityWorkspaceManager = manager
+        let source = WorkspaceModel(name: "Recovery source", repoPaths: [])
+        let target = WorkspaceModel(name: "Recovery authority", repoPaths: [])
+        manager.workspaces = [source, target]
+        manager.activeWorkspace = source
+        let result = await manager.switchWorkspace(to: target, saveState: false, reason: "recovery-authority-test")
+        XCTAssertTrue(result.didSwitch)
+        let snapshot = try await manager.awaitWorkspaceRootCatalogSnapshot(workspaceID: target.id, timeout: .seconds(5))
+        let authority = try await MCPServerViewModel.FrozenFileToolAuthority.capture(
+            lookupContext: .visibleWorkspace,
+            rootCatalogSnapshot: snapshot,
+            store: files.workspaceFileContextStore
+        )
+        try await authority.validate(workspaceManager: manager, store: files.workspaceFileContextStore)
+        return authority
+    }
+
     private func contextKey(
+        authority: MCPServerViewModel.FrozenFileToolAuthority,
         tabID: UUID = UUID(),
-        workspaceID: UUID = UUID(),
         bindingGeneration: UInt64 = 1
     ) -> MCPReadFileAutoSelectionCoordinator.ContextKey {
         MCPReadFileAutoSelectionCoordinator.ContextKey(
             windowID: 1,
-            workspaceID: workspaceID,
+            workspaceID: authority.rootCatalogSnapshot.workspaceID,
             tabID: tabID,
             route: .bound(connectionID: UUID(), runID: UUID()),
             bindingGeneration: bindingGeneration
@@ -434,7 +483,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) async {
-        XCTFail("Bounded yield guard expired while waiting for \(description)", file: file, line: line)
+        XCTFail("Hang guard expired after \(readAutoSelectionRecoveryHangGuardTimeout) while waiting for \(description)", file: file, line: line)
         for gate in gates {
             await gate.release()
         }
@@ -463,7 +512,8 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
 }
 
 /// Ordering remains continuation-driven; this bound only fails open when a regression would otherwise hang the suite.
-private let readAutoSelectionRecoveryHangGuardYieldLimit = 10000
+/// It is wall-clock time, not a `Task.yield()` count, because runner load can delay the awaited main-actor workers (#1100).
+private let readAutoSelectionRecoveryHangGuardTimeout: Duration = .seconds(30)
 
 private actor RecoveryCancellationIgnoringGate {
     private struct EnteredWaiter {
@@ -497,9 +547,10 @@ private actor RecoveryCancellationIgnoringGate {
                 }
                 enteredWaiters.append(EnteredWaiter(id: id, continuation: continuation))
                 enteredWaitGuards[id] = Task { [weak self] in
-                    for _ in 0 ..< readAutoSelectionRecoveryHangGuardYieldLimit {
-                        guard !Task.isCancelled else { return }
-                        await Task.yield()
+                    do {
+                        try await Task.sleep(for: readAutoSelectionRecoveryHangGuardTimeout)
+                    } catch {
+                        return
                     }
                     await self?.expireEnteredWaiter(id: id)
                 }
@@ -565,9 +616,10 @@ private final class RecoveryMainActorSignal {
                 }
                 waiters.append(Waiter(id: id, continuation: continuation))
                 waitGuards[id] = Task { @MainActor [weak self] in
-                    for _ in 0 ..< readAutoSelectionRecoveryHangGuardYieldLimit {
-                        guard !Task.isCancelled else { return }
-                        await Task.yield()
+                    do {
+                        try await Task.sleep(for: readAutoSelectionRecoveryHangGuardTimeout)
+                    } catch {
+                        return
                     }
                     self?.expireWaiter(id: id)
                 }
@@ -682,9 +734,10 @@ private final class RecoveryDiagnosticEventProbe: @unchecked Sendable {
                         continuation: continuation
                     ))
                     waitGuards[id] = Task { [weak self] in
-                        for _ in 0 ..< readAutoSelectionRecoveryHangGuardYieldLimit {
-                            guard !Task.isCancelled else { return }
-                            await Task.yield()
+                        do {
+                            try await Task.sleep(for: readAutoSelectionRecoveryHangGuardTimeout)
+                        } catch {
+                            return
                         }
                         self?.expireWaiter(id: id)
                     }

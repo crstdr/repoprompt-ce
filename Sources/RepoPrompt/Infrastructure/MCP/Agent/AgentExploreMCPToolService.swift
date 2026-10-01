@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptInstrumentation
 
 @MainActor
 struct AgentExploreMCPToolService {
@@ -8,6 +9,7 @@ struct AgentExploreMCPToolService {
     typealias StartRun = AgentRunMCPToolService.StartRun
 
     let toolName: String
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     let captureRequestMetadata: () async -> RequestMetadata
     let requireTargetWindow: () throws -> WindowState
     let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
@@ -36,7 +38,8 @@ struct AgentExploreMCPToolService {
             operationName: "agent_explore.start",
             vcsService: vcsService,
             gitTargetResolver: gitTargetResolver,
-            preBindingCommitObserver: preBindingCommitObserver
+            preBindingCommitObserver: preBindingCommitObserver,
+            startupPhaseEventSink: AppWorktreeStartupPhaseEventSink()
         )
     }
 
@@ -355,6 +358,7 @@ struct AgentExploreMCPToolService {
         )
         var selection = context.selection
         var routedReasoningEffortRaw: String?
+        var routerSelectedTarget = false
         do {
             if let routed = try await context.agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
@@ -367,8 +371,9 @@ struct AgentExploreMCPToolService {
                     modelParameterSelections: routed.modelParameters
                 )
                 routedReasoningEffortRaw = routed.reasoningEffortRaw
+                routerSelectedTarget = true
                 #if DEBUG
-                    AgentModePerfDiagnostics.event("modelRouter.subagent.selected", fields: [
+                    perfRecorder.event("modelRouter.subagent.selected", fields: [
                         "entryPoint": "agent_explore.start",
                         "provider": routed.agentRaw,
                         "model": routed.modelRaw,
@@ -401,7 +406,8 @@ struct AgentExploreMCPToolService {
             .explore,
             nil,
             nil,
-            nil
+            nil,
+            routerSelectedTarget
         )
         context.agentModeVM.mcpAcceptSessionTarget(target)
         return outcome

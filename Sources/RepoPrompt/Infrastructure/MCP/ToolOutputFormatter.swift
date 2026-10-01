@@ -6263,6 +6263,15 @@ extension ToolOutputFormatter {
         if let sessionID = object["session_id"]?.stringValue, !sessionID.isEmpty {
             lines.append("- Session: `\(sessionID)`")
         }
+        if rawOp == "set_session_pin", let pinned = object["pinned"]?.boolValue {
+            lines.append("- Pinned: **\(pinned ? "yes" : "no")**")
+            if let changed = object["changed"]?.boolValue {
+                lines.append("- Changed: \(changed ? "yes" : "no")")
+            }
+        }
+        if rawOp == "reorder_pinned_sessions", let ids = object["session_ids"]?.arrayValue {
+            lines.append("- Pinned order: \(ids.compactMap(\.stringValue).joined(separator: ", "))")
+        }
         if let workflowName = object["workflow_name"]?.stringValue, !workflowName.isEmpty {
             lines.append("- Workflow: `\(workflowName)`")
         }
@@ -6337,8 +6346,12 @@ extension ToolOutputFormatter {
                     // Extract base: everything after "agentRaw:" minus an explicit or supported effort suffix.
                     let afterColon = modelID.contains(":") ? String(modelID[modelID.index(after: modelID.firstIndex(of: ":")!)...]) : modelID
                     let agentPrefix = modelID.contains(":") ? String(modelID[...modelID.firstIndex(of: ":")!]) : ""
-                    let groupingEffort = agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
-                    let base = agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
+                    // Devin effort IDs are grouped by their catalog family, not by suffix parsing.
+                    let devinEntry = agentPrefix == "devin:" ? DevinModelCatalog.current.entry(matching: afterColon) : nil
+                    let groupingEffort = devinEntry.map { $0.thinking?.choiceRaw }
+                        ?? agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
+                    let base = devinEntry.map { $0.thinking == nil ? afterColon : $0.familyID }
+                        ?? agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
                     let familyKey = agentPrefix + base
 
                     if let groupingEffort, seen.contains(familyKey) {
@@ -6351,7 +6364,7 @@ extension ToolOutputFormatter {
                     } else if let groupingEffort, !seen.contains(familyKey) {
                         // New family with efforts
                         seen.insert(familyKey)
-                        let baseName = agentListFamilyDisplayName(
+                        let baseName = devinEntry?.familyDisplayName ?? agentListFamilyDisplayName(
                             modelName,
                             modelID: afterColon,
                             groupingEffort: groupingEffort
@@ -6415,6 +6428,9 @@ extension ToolOutputFormatter {
                 }
                 if !state.isEmpty { parts.append(state) }
                 if !agent.isEmpty { parts.append(agent) }
+                if rawOp == "list_pinned_sessions", let order = session["pinned_order"]?.intValue {
+                    parts.append("manual rank \(order)")
+                }
                 if let parameters = agentObject?["model_parameters"]?.arrayValue {
                     let selected = parameters.compactMap { parameter -> String? in
                         guard let object = parameter.objectValue,

@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptWorkspaceCore
 
 /// Explicit app-process physical capability adapters used by domain-owned tool bindings.
 /// Presentation and AppKit interactions remain on MainActor; schema, policy, and catalog
@@ -18,6 +19,12 @@ enum MCPAppFileReadResult {
         absolutePhysicalPath: String
     )
     case nonSelecting(reply: ToolResultDTOs.ReadFileReply)
+}
+
+enum MCPStoreBackedFileTreeEmptyReason: Equatable {
+    case requestedPathOutsideLoadedRoots
+    case selectionEmpty
+    case rootProjectionEmpty
 }
 
 /// Namespace for independently injected app-process capability families.
@@ -193,6 +200,7 @@ enum MCPAppPhysicalCapabilityAdapters {
     ) async -> FrozenPromptGitReviewContext
     typealias ParseManageSelectionInputs = @Sendable (_ rawPaths: [String], _ slicesValue: Value?) -> MCPServerViewModel.ManageSelectionInputs
     typealias ResolveFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata) async -> WorkspaceLookupContext
+    typealias RequiredFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata) async throws -> MCPServerViewModel.FrozenFileToolAuthority
     typealias ResolveMutationFileToolContext = @MainActor @Sendable (
         _ metadata: MCPServerViewModel.RequestMetadata,
         _ toolName: String
@@ -300,7 +308,7 @@ enum MCPAppPhysicalCapabilityAdapters {
     typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?, _ operationID: String) async throws -> MCPFileActionMutationAcknowledgement
     typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ request: MCPServerViewModel.CodeStructureRequest, _ includePathNotFoundIssue: Bool, _ requestedPaths: [String], _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.CodeStructureReplyDTO
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope, _ maximumSeedCount: Int) async throws -> [WorkspaceFileRecord]
-    typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
+    typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int, emptyReason: MCPStoreBackedFileTreeEmptyReason?)
     typealias ReadFile = @MainActor @Sendable (
         _ input: WorkspaceExactFileInput,
         _ startLine1Based: Int?,
@@ -319,16 +327,18 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ reply: ToolResultDTOs.ReadFileReply,
         _ requestedPath: String,
         _ absolutePhysicalPath: String,
-        _ metadata: MCPServerViewModel.RequestMetadata
-    ) async throws -> Void
+        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ authority: MCPServerViewModel.FrozenFileToolAuthority
+    ) async throws -> Bool
     typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async throws -> MCPReadFileAutoSelectionCoordinator.DrainResult
     typealias EnqueueFileSearchAutoSelection = @MainActor @Sendable (
         _ mode: SearchMode,
         _ contextLines: Int,
         _ reply: ToolResultDTOs.SearchResultDTO,
         _ resolvedPhysicalPaths: [String],
-        _ metadata: MCPServerViewModel.RequestMetadata
-    ) async throws -> Void
+        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ authority: MCPServerViewModel.FrozenFileToolAuthority
+    ) async throws -> Bool
     typealias WorkspaceContextMessage = @MainActor @Sendable (_ operation: String?, _ path: String?) async -> String
     typealias ParseCopyPresetSelector = @Sendable (_ value: Value?) -> MCPServerViewModel.CopyPresetSelector?
     typealias ResolveCopyPreset = @MainActor @Sendable (_ selector: MCPServerViewModel.CopyPresetSelector) -> CopyPreset?
@@ -361,6 +371,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         let executeAgentRun: ExecuteTool
         let executeAgentManage: ExecuteTool
         let executeAgentSessionLink: ExecuteTool
+        let executeAgentSelf: ExecuteTool
         let requireTargetWindow: RequireTargetWindow
         let requireCurrentTabContext: RequireCurrentTabContext
         let requireAgentModeConnection: RequireAgentModeConnection
@@ -404,6 +415,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         let workspaceSearch: WorkspaceSearch
         let parseManageSelectionInputs: ParseManageSelectionInputs
         let resolveFileToolLookupContext: ResolveFileToolLookupContext
+        let requiredFileToolLookupContext: RequiredFileToolLookupContext
         let resolveMutationFileToolContext: ResolveMutationFileToolContext
         let stabilizedVirtualSelection: StabilizedVirtualSelection
         let freezePromptGitReviewContext: FreezePromptGitReviewContext

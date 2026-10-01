@@ -13,7 +13,11 @@ import Logging
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptRegexCore
 import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 enum ReadFileAutoSelectionCoverageCertificateMissReason: String, CaseIterable, Hashable {
     case noCertificate = "no_certificate"
@@ -179,6 +183,7 @@ final class MCPServerViewModel: ObservableObject {
         let baseScope: WorkspaceLookupRootScope
         let sourceIdentity: AgentWorkspaceLookupContextIdentity
         let visibleRootFingerprint: String
+        let readinessTicket: WorkspaceSearchReadinessTicket?
     }
 
     struct FileToolLookupContextCacheEntry {
@@ -187,10 +192,277 @@ final class MCPServerViewModel: ObservableObject {
         let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot
     }
 
+    struct FrozenFileToolAuthority {
+        let lookupContext: WorkspaceLookupContext
+        let rootCatalogSnapshot: WorkspaceRootCatalogSnapshot
+        var canonicalRoots: Set<WorkspaceRootRef> {
+            Set(rootCatalogSnapshot.primaryRoots)
+        }
+
+        let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot?
+        let sourceIdentity: AgentWorkspaceLookupContextIdentity?
+
+        @MainActor
+        static func capture(
+            lookupContext: WorkspaceLookupContext,
+            rootCatalogSnapshot: WorkspaceRootCatalogSnapshot,
+            store: WorkspaceFileContextStore,
+            sourceIdentity: AgentWorkspaceLookupContextIdentity? = nil
+        ) async throws -> FrozenFileToolAuthority {
+            try Task.checkCancellation()
+            let lifetime: WorkspaceSessionRootLifetimeSnapshot?
+            if let projection = lookupContext.bindingProjection {
+                guard Set(projection.visibleLogicalRootRefs) == Set(rootCatalogSnapshot.primaryRoots) else {
+                    throw FileToolAuthorityFailure.mismatchedProjection
+                }
+                lifetime = await store.sessionBoundRootScopeValidationSnapshot(
+                    lookupContext.rootScope,
+                    expectedPhysicalRoots: projection.physicalRootRefs
+                )
+            } else {
+                lifetime = nil
+            }
+            let canonicalRoots = Set(rootCatalogSnapshot.primaryRoots)
+            guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
+                throw FileToolAuthorityFailure.mismatchedProjection
+            }
+            try Task.checkCancellation()
+            if lookupContext.bindingProjection != nil, lifetime == nil {
+                throw FileToolAuthorityFailure.worktreeScopeUnavailable
+            }
+            if let lifetime, await !(lifetime.isCurrent()) {
+                throw FileToolAuthorityFailure.worktreeScopeUnavailable
+            }
+            return FrozenFileToolAuthority(
+                lookupContext: lookupContext,
+                rootCatalogSnapshot: rootCatalogSnapshot,
+                sessionRootLifetimeSnapshot: lifetime,
+                sourceIdentity: sourceIdentity
+            )
+        }
+
+        @MainActor
+        func validate(
+            workspaceManager: WorkspaceManagerViewModel,
+            store: WorkspaceFileContextStore
+        ) async throws {
+            guard rootCatalogSnapshot.workspaceID == rootCatalogSnapshot.ticket.workspaceID else {
+                throw FileToolAuthorityFailure.superseded
+            }
+            do {
+                try workspaceManager.validateWorkspaceSearchReadiness(
+                    rootCatalogSnapshot.ticket,
+                    admission: .rootCatalog
+                )
+            } catch {
+                throw FileToolAuthorityFailure.superseded
+            }
+            guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
+                throw FileToolAuthorityFailure.mismatchedProjection
+            }
+            if lookupContext.bindingProjection != nil {
+                guard let sessionRootLifetimeSnapshot else {
+                    throw FileToolAuthorityFailure.worktreeScopeUnavailable
+                }
+                guard await sessionRootLifetimeSnapshot.isCurrent() else {
+                    throw FileToolAuthorityFailure.worktreeScopeUnavailable
+                }
+            }
+        }
+
+        @MainActor
+        func performIfCurrent(
+            workspaceManager: WorkspaceManagerViewModel,
+            operation: @MainActor () throws -> Void
+        ) throws -> Bool {
+            if let projection = lookupContext.bindingProjection {
+                guard Set(projection.visibleLogicalRootRefs) == Set(rootCatalogSnapshot.primaryRoots) else {
+                    throw FileToolAuthorityFailure.mismatchedProjection
+                }
+            }
+
+            var operationError: Error?
+            do {
+                try workspaceManager.validateWorkspaceSearchReadiness(
+                    rootCatalogSnapshot.ticket,
+                    admission: .rootCatalog
+                )
+            } catch {
+                return false
+            }
+            if lookupContext.bindingProjection != nil {
+                guard let sessionRootLifetimeSnapshot else { return false }
+                let performed = sessionRootLifetimeSnapshot.performIfGenerationCurrent {
+                    do {
+                        try operation()
+                    } catch {
+                        operationError = error
+                    }
+                }
+                if let operationError { throw operationError }
+                return performed
+            } else {
+                try operation()
+                return true
+            }
+        }
+
+        func hasSameRoutingAuthority(as other: FrozenFileToolAuthority) -> Bool {
+            guard sourceIdentity == other.sourceIdentity,
+                  lookupContext == other.lookupContext,
+                  rootCatalogSnapshot == other.rootCatalogSnapshot,
+                  canonicalRoots == other.canonicalRoots
+            else {
+                return false
+            }
+            switch (sessionRootLifetimeSnapshot, other.sessionRootLifetimeSnapshot) {
+            case (nil, nil):
+                return true
+            case let (lhs?, _?):
+                return lhs.isGenerationCurrent()
+            default:
+                return false
+            }
+        }
+    }
+
+    enum FileToolAuthorityFailure: LocalizedError, Equatable {
+        case unavailable
+        case timedOut
+        case superseded
+        case mismatchedProjection
+        case worktreeScopeUnavailable
+
+        static let retryAfterMilliseconds = 1000
+
+        var errorCode: String {
+            switch self {
+            case .unavailable: "workspace_authority_unavailable"
+            case .timedOut: "workspace_authority_timeout"
+            case .superseded: "workspace_authority_superseded"
+            case .mismatchedProjection: "workspace_authority_mismatch"
+            case .worktreeScopeUnavailable: "worktree_scope_unavailable"
+            }
+        }
+
+        var errorDescription: String? {
+            switch self {
+            case .unavailable:
+                "The resolved workspace file authority is unavailable. No canonical checkout was used."
+            case .timedOut:
+                "The workspace root catalog did not become ready in time. No canonical checkout was used."
+            case .superseded:
+                "Workspace authority changed while the file request was resolving. No canonical checkout was used."
+            case .mismatchedProjection:
+                "The workspace root catalog no longer matches the loaded roots. No canonical checkout was used."
+            case .worktreeScopeUnavailable:
+                "The bound worktree scope is unavailable. No canonical checkout was used."
+            }
+        }
+
+        var retryable: Bool {
+            true
+        }
+    }
+
+    enum FileToolLookupResolutionFailure: Error, Equatable {
+        case authority(FileToolAuthorityFailure)
+        case cancelled
+    }
+
+    typealias FileToolLookupResolution = Result<WorkspaceLookupContext, FileToolLookupResolutionFailure>
+
+    @MainActor
+    final class FileToolLookupResolutionSupersession {
+        private(set) var isSuperseded = false
+
+        func markSuperseded() {
+            isSuperseded = true
+        }
+    }
+
     struct PendingFileToolLookupContextResolution {
         let id: UUID
         let key: FileToolLookupContextCacheKey
-        let task: Task<WorkspaceLookupContext, Never>
+        let task: Task<FileToolLookupResolution, Never>
+        let supersession: FileToolLookupResolutionSupersession
+        var waiterCount: Int
+    }
+
+    /// Bridges a shared resolution task to one caller without transferring cancellation
+    /// ownership. The first terminal event wins, so cancelling one request resumes only that
+    /// request while the shared flight remains available to other waiters.
+    final class FileToolLookupResolutionWaiter: @unchecked Sendable {
+        private enum Terminal {
+            case resolution(FileToolLookupResolution)
+            case cancelled
+        }
+
+        private let lock = NSLock()
+        private var terminal: Terminal?
+        private var continuation: CheckedContinuation<FileToolLookupResolution, any Error>?
+
+        func value(
+            from task: Task<FileToolLookupResolution, Never>
+        ) async throws -> FileToolLookupResolution {
+            try Task.checkCancellation()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    install(continuation)
+                    Task { @MainActor [weak self] in
+                        let resolution = await task.value
+                        self?.finish(.resolution(resolution))
+                    }
+                }
+            } onCancel: {
+                finish(.cancelled)
+            }
+        }
+
+        private func install(
+            _ continuation: CheckedContinuation<FileToolLookupResolution, any Error>
+        ) {
+            let terminal: Terminal?
+            lock.lock()
+            if self.continuation == nil, self.terminal == nil {
+                self.continuation = continuation
+                terminal = nil
+            } else {
+                terminal = self.terminal
+            }
+            lock.unlock()
+            if let terminal {
+                resume(continuation, with: terminal)
+            }
+        }
+
+        private func finish(_ terminal: Terminal) {
+            let continuation: CheckedContinuation<FileToolLookupResolution, any Error>?
+            lock.lock()
+            guard self.terminal == nil else {
+                lock.unlock()
+                return
+            }
+            self.terminal = terminal
+            continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            if let continuation {
+                resume(continuation, with: terminal)
+            }
+        }
+
+        private func resume(
+            _ continuation: CheckedContinuation<FileToolLookupResolution, any Error>,
+            with terminal: Terminal
+        ) {
+            switch terminal {
+            case let .resolution(resolution):
+                continuation.resume(returning: resolution)
+            case .cancelled:
+                continuation.resume(throwing: CancellationError())
+            }
+        }
     }
 
     #if DEBUG
@@ -431,6 +703,7 @@ final class MCPServerViewModel: ObservableObject {
     // ---------------------------------------------------------------------
     let windowID: Int
     private(set) var service: MCPService
+    private let perfRecorder: any AgentModePerfRecording
     let logger = Logger(label: "com.repoprompt.mcp")
 
     #if DEBUG
@@ -597,7 +870,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private var agentRunToolService: AgentRunMCPToolService {
-        AgentRunMCPToolService(
+        var toolService = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
@@ -637,7 +910,7 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource in
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource, preserveRoutedInitialEffort in
                 try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
                     target: target,
                     message: message,
@@ -650,6 +923,7 @@ final class MCPServerViewModel: ObservableObject {
                     workflow: workflow,
                     expectedParentSessionID: expectedParentSessionID,
                     oracleReviewSource: oracleReviewSource,
+                    preserveRoutedInitialEffort: preserveRoutedInitialEffort,
                     dispatchInstruction: {
                         #if DEBUG
                             self.agentRunDispatchOverrideForTesting
@@ -660,6 +934,8 @@ final class MCPServerViewModel: ObservableObject {
                 )
             }
         )
+        toolService.perfRecorder = perfRecorder
+        return toolService
     }
 
     private func resolveAgentRunOracleReviewLaunchSource(
@@ -867,7 +1143,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     private var agentExploreToolService: AgentExploreMCPToolService {
-        AgentExploreMCPToolService(
+        var toolService = AgentExploreMCPToolService(
             toolName: MCPWindowToolName.agentExplore,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
@@ -892,7 +1168,7 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _, preserveRoutedInitialEffort in
                 try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
                     target: target,
                     message: message,
@@ -905,15 +1181,19 @@ final class MCPServerViewModel: ObservableObject {
                     modelRaw: modelRaw,
                     reasoningEffortRaw: reasoningEffortRaw,
                     taskLabelKind: taskLabelKind,
-                    workflow: workflow
+                    workflow: workflow,
+                    preserveRoutedInitialEffort: preserveRoutedInitialEffort
                 )
             }
         )
+        toolService.perfRecorder = perfRecorder
+        return toolService
     }
 
     private var agentManageToolService: AgentManageMCPToolService {
         AgentManageMCPToolService(
             toolName: MCPWindowToolName.agentManage,
+            perfRecorder: perfRecorder,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             resolveSpawnSourceTabID: { [self] metadata in
@@ -924,6 +1204,25 @@ final class MCPServerViewModel: ObservableObject {
             },
             bindCurrentRequestToTab: { [self] tabID, metadata in
                 try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
+            }
+        )
+    }
+
+    private var agentSelfToolService: AgentSelfMCPToolService {
+        AgentSelfMCPToolService(
+            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            requireTargetWindow: { [self] in try requireTargetWindow() },
+            resolveObserverEndpoint: { [self] metadata, targetWindow in
+                await resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
+            },
+            captureCallOrigin: { AgentSelfMCPCallOrigin.current },
+            readSelf: { window, endpoint, origin in
+                window.agentModeViewModel.agentSelfContextSnapshot(endpoint: endpoint, origin: origin)
+            },
+            scheduleCompact: { window, endpoint, origin, note, key in
+                await window.agentModeViewModel.agentSelfCompactMCPAdmission(
+                    endpoint: endpoint, origin: origin, note: note, idempotencyKey: key
+                )
             }
         )
     }
@@ -1139,19 +1438,23 @@ final class MCPServerViewModel: ObservableObject {
         executeAskOracle: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing ask_oracle") }
             let metadata = await captureRequestMetadata()
-            guard try await drainReadFileAutoSelection(
-                metadata: metadata,
-                requirement: .mirroredSelectionAndMetrics
-            ) == .completed else { throw CancellationError() }
+            try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                try await self.drainReadFileAutoSelection(
+                    metadata: metadata,
+                    requirement: .mirroredSelectionAndMetrics
+                )
+            }
             return try await oracleToolService.executeAskOracle(args: args)
         },
         executeOracleSend: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_send") }
             let metadata = await captureRequestMetadata()
-            guard try await drainReadFileAutoSelection(
-                metadata: metadata,
-                requirement: .mirroredSelectionAndMetrics
-            ) == .completed else { throw CancellationError() }
+            try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                try await self.drainReadFileAutoSelection(
+                    metadata: metadata,
+                    requirement: .mirroredSelectionAndMetrics
+                )
+            }
             return try await oracleToolService.executeOracleSend(args: args)
         },
         executeOracleChatLog: { [weak self] args in
@@ -1175,6 +1478,12 @@ final class MCPServerViewModel: ObservableObject {
                 throw MCPError.internalError("Window deallocated while executing agent_session_link")
             }
             return try await agentSessionLinkToolService.execute(args: args)
+        },
+        executeAgentSelf: { [weak self] args in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while executing agent_self")
+            }
+            return try await agentSelfToolService.execute(args: args)
         },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
@@ -1439,6 +1748,12 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return .visibleWorkspace }
             return await resolveFileToolLookupContext(from: metadata)
         },
+        requiredFileToolLookupContext: { [weak self] metadata in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while resolving file-tool authority")
+            }
+            return try await requiredFileToolLookupContext(from: metadata)
+        },
         resolveMutationFileToolContext: { [weak self] metadata, toolName in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while resolving mutation worktree scope")
@@ -1636,27 +1951,29 @@ final class MCPServerViewModel: ObservableObject {
                 lookupContext: lookupContext
             )
         },
-        enqueueReadFileAutoSelection: { [weak self] reply, requestedPath, absolutePhysicalPath, metadata in
+        enqueueReadFileAutoSelection: { [weak self] reply, requestedPath, absolutePhysicalPath, metadata, authority in
             guard let self else { throw MCPError.internalError("Window deallocated while enqueuing read_file auto-selection") }
-            try await enqueueReadFileAutoSelection(
+            return try await enqueueReadFileAutoSelection(
                 reply: reply,
                 requestedPath: requestedPath,
                 absolutePhysicalPath: absolutePhysicalPath,
-                metadata: metadata
+                metadata: metadata,
+                authority: authority
             )
         },
         drainReadFileAutoSelection: { [weak self] metadata, requirement in
             guard let self else { throw MCPError.internalError("Window deallocated while draining read_file auto-selection") }
             return try await drainReadFileAutoSelection(metadata: metadata, requirement: requirement)
         },
-        enqueueFileSearchAutoSelection: { [weak self] mode, contextLines, reply, resolvedPhysicalPaths, metadata in
+        enqueueFileSearchAutoSelection: { [weak self] mode, contextLines, reply, resolvedPhysicalPaths, metadata, authority in
             guard let self else { throw MCPError.internalError("Window deallocated while enqueuing file_search auto-selection") }
-            try await enqueueFileSearchAutoSelection(
+            return try await enqueueFileSearchAutoSelection(
                 mode: mode,
                 contextLines: contextLines,
                 reply: reply,
                 resolvedPhysicalPaths: resolvedPhysicalPaths,
-                metadata: metadata
+                metadata: metadata,
+                authority: authority
             )
         },
         workspaceContextMessage: { [weak self] operation, path in
@@ -1736,6 +2053,16 @@ final class MCPServerViewModel: ObservableObject {
         selection: windowToolSelectionCapabilities,
         files: windowToolFileCapabilities
     )
+
+    @MainActor
+    func domainReadFileToolDependencies() -> MCPFileToolProvider.Dependencies {
+        (
+            context: windowToolContextCapabilities,
+            selection: windowToolSelectionCapabilities,
+            files: windowToolFileCapabilities
+        )
+    }
+
     @MainActor
     private lazy var promptContextToolProvider = MCPPromptContextToolProvider(
         runtime: windowToolRuntime,
@@ -1775,6 +2102,15 @@ final class MCPServerViewModel: ObservableObject {
         },
         releaseContext: { [weak self] context in
             await self?.releaseDomainReadAppExecutionContext(for: context)
+        },
+        resolveFailure: { toolName, arguments, error in
+            guard let failure = error as? FileToolAuthorityFailure
+            else { return nil }
+            return try MCPFileToolProvider.authorityFailureValue(
+                toolName: toolName,
+                args: arguments,
+                failure: failure
+            )
         },
         backend: MCPDomainReadToolBackend { [weak self] toolName, context, args, sideEffects in
             guard let self else {
@@ -1937,8 +2273,10 @@ final class MCPServerViewModel: ObservableObject {
             }
             return .converged
         }
-        guard let workspaceManager else { return .invalidated }
-        return await workspaceManager.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
+        guard let workspaceManager, let workspaceID = key.workspaceID else { return .invalidated }
+        return await workspaceManager.applyStoredSelectionMirrorForReadFileAutoSelection(
+            for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: key.tabID)
+        )
     }
 
     /// Presentation snapshot cache. Domain routing remains the only routing authority.
@@ -2733,6 +3071,7 @@ final class MCPServerViewModel: ObservableObject {
     /// ---------------------------------------------------------------------
     init(
         service: MCPService,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         promptVM: PromptViewModel,
         oracleVM: OracleViewModel,
         workspaceManager: WorkspaceManagerViewModel,
@@ -2750,6 +3089,7 @@ final class MCPServerViewModel: ObservableObject {
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
         self.service = service
+        self.perfRecorder = perfRecorder
         self.windowID = windowID
         self.promptVM = promptVM
         self.oracleVM = oracleVM
@@ -3454,6 +3794,22 @@ final class MCPServerViewModel: ObservableObject {
         let indexedRunID = shouldRegisterRunToolExecution(toolName: name)
             ? executionRunID
             : nil
+        // Capture the exact self caller at registration, before the tool body can suspend. Neither
+        // request metadata nor a later live tab lookup may substitute a successor run attempt.
+        let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf,
+                                                         let context = resolvedContext?.snapshot,
+                                                         let runID = context.runID,
+                                                         indexedRunID == runID,
+                                                         let window = try? requireTargetWindow(),
+                                                         let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
+                                                         let session = window.agentModeViewModel.sessions[context.tabID],
+                                                         session.runID == runID,
+                                                         let ownership = session.activeRunOwnership
+        {
+            .init(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
+        } else {
+            nil
+        }
 
         // Generate a unique token for this tool execution to prevent cleanup races
         let toolToken = UUID()
@@ -3520,7 +3876,9 @@ final class MCPServerViewModel: ObservableObject {
                         EditFlowPerf.Stage.MCPToolCall.providerExecution,
                         EditFlowPerf.Dimensions(toolName: name)
                     ) {
-                        try await body()
+                        try await AgentSelfMCPCallOrigin.$current.withValue(selfCallOrigin) {
+                            try await body()
+                        }
                     }
                     EditFlowPerf.lifecycleEvent(
                         EditFlowPerf.Lifecycle.MCPRunTool.providerEnded,
@@ -4381,8 +4739,9 @@ final class MCPServerViewModel: ObservableObject {
         reply: ToolResultDTOs.ReadFileReply,
         requestedPath: String,
         absolutePhysicalPath: String,
-        metadata: RequestMetadata
-    ) async throws {
+        metadata: RequestMetadata,
+        authority: FrozenFileToolAuthority
+    ) async throws -> Bool {
         #if DEBUG || EDIT_FLOW_PERF
             let autoSelectTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.total)
             defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.total, autoSelectTotal) }
@@ -4415,6 +4774,14 @@ final class MCPServerViewModel: ObservableObject {
             )
             throw error
         }
+        if resolvedContext.isRunlessOneShotHint {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.AutoSelect.eligibilityResolution,
+                eligibilityResolution,
+                EditFlowPerf.Dimensions(outcome: "oneShotHint")
+            )
+            return false
+        }
         let hasVirtualContext = true
         let shouldApply = AutoSliceSelection.shouldApply(
             purpose: purpose,
@@ -4425,7 +4792,7 @@ final class MCPServerViewModel: ObservableObject {
             eligibilityResolution,
             EditFlowPerf.Dimensions(outcome: shouldApply ? "eligible" : "ineligible")
         )
-        guard shouldApply else { return }
+        guard shouldApply else { return false }
 
         let selectionProjection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.selectionProjection)
         guard let selection = AutoSliceSelection.readFileSelection(from: reply, fallbackPath: requestedPath) else {
@@ -4434,7 +4801,7 @@ final class MCPServerViewModel: ObservableObject {
                 selectionProjection,
                 EditFlowPerf.Dimensions(outcome: "missing")
             )
-            return
+            return false
         }
         let intent: MCPReadFileAutoSelectionCoordinator.Intent = switch selection {
         case .full:
@@ -4462,18 +4829,26 @@ final class MCPServerViewModel: ObservableObject {
             intent: intent,
             resolvedPaths: [absolutePhysicalPath]
         )
-        let key = try readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
-        let accepted = readFileAutoSelectionCoordinator.enqueue(
+        let currentResolvedContext = try resolveTabContextSnapshot(
+            from: metadata,
+            toolName: "enqueueReadFileAutoSelection"
+        )
+        let key = try readFileAutoSelectionContextKey(resolvedContext: currentResolvedContext, metadata: metadata)
+        guard readFileAutoSelectionCoordinator.enqueue(
             intent: intent,
+            authority: authority,
             coverageIdentity: coverageIdentity,
             for: key
-        )
-        if accepted, purpose == .unknown {
+        ) else {
+            throw FileToolAuthorityFailure.superseded
+        }
+        if purpose == .unknown {
             // Interactive CLI requests have no run policy and commonly disconnect after one call.
             // Make the successful read response their selection durability boundary while preserving
             // Agent Mode's asynchronous response path.
             _ = await readFileAutoSelectionCoordinator.drain(.mirroredSelectionAndMetrics, for: key)
         }
+        return true
     }
 
     @MainActor
@@ -4485,6 +4860,7 @@ final class MCPServerViewModel: ObservableObject {
             from: metadata,
             toolName: "drainReadFileAutoSelection"
         )
+        if resolvedContext.isRunlessOneShotHint { return .completed }
         let key = try readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
         for predecessorKey in readFileAutoSelectionPredecessorContextKeys(
             metadata: metadata,
@@ -4498,6 +4874,31 @@ final class MCPServerViewModel: ObservableObject {
             guard predecessorResult == .completed else { return predecessorResult }
         }
         return await readFileAutoSelectionCoordinator.drain(requirement, for: key)
+    }
+
+    /// Runs one read-file auto-selection drain, which also covers eligible `file_search` selections,
+    /// and throws unless its prerequisite completed.
+    /// Callers keep their own drain requirement and skip conditions. Two cases keep cancellation
+    /// classification (`CancellationError`): a task cancellation observed after the drain, whatever
+    /// the drain returned, and a `.cancelled` drain result, which can also come from a replayed
+    /// mirror settlement rather than this task. A deferred or invalidated prerequisite throws
+    /// `MCPSelectionPrerequisiteError`. Nothing is rolled back.
+    @MainActor
+    static func requireReadFileAutoSelectionPrerequisite(
+        _ drain: @MainActor () async throws -> MCPReadFileAutoSelectionCoordinator.DrainResult
+    ) async throws {
+        let prerequisite = try await drain()
+        try Task.checkCancellation()
+        switch prerequisite {
+        case .completed:
+            return
+        case .cancelled:
+            throw CancellationError()
+        case .deferred:
+            throw MCPSelectionPrerequisiteError.deferred
+        case .invalidated:
+            throw MCPSelectionPrerequisiteError.invalidated
+        }
     }
 
     @MainActor
@@ -5079,15 +5480,8 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
 
-        let metadata = RequestMetadata(
-            connectionID: {
-                if case let .bound(connectionID, _) = key.route { return connectionID }
-                return nil
-            }(),
-            clientName: nil,
-            windowID: key.windowID
-        )
-        let authoritativeLookupContext = await resolveFileToolLookupContext(from: metadata)
+        // Never re-resolve a queued intent against a newer workspace authority.
+        let authoritativeLookupContext = batch.authority.lookupContext
         let lookupRootScope = authoritativeLookupContext.rootScope
         let batchIdentity = batch.coverageIdentity
         let logicalAbsoluteSliceRebaseCandidates = batch.sliceEntries.compactMap { entry -> String? in
@@ -5153,7 +5547,8 @@ final class MCPServerViewModel: ObservableObject {
                 lookupContext: authoritativeLookupContext,
                 contextKey: key,
                 expectedBaseSelection: initialSelection,
-                automaticCodemapDisposition: batch.automaticCodemapDisposition
+                automaticCodemapDisposition: batch.automaticCodemapDisposition,
+                authority: batch.authority
             ) else { continue }
 
             verifiedCanonicalChange = verifiedCanonicalChange || !authoritativeResult.canonicalUnchanged
@@ -5249,8 +5644,9 @@ final class MCPServerViewModel: ObservableObject {
         contextLines: Int,
         reply: ToolResultDTOs.SearchResultDTO,
         resolvedPhysicalPaths: [String],
-        metadata: RequestMetadata
-    ) async throws {
+        metadata: RequestMetadata,
+        authority: FrozenFileToolAuthority
+    ) async throws -> Bool {
         let shapeEligibility = EditFlowPerf.begin(
             EditFlowPerf.Stage.Search.AutoSelect.shapeEligibility,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
@@ -5261,7 +5657,7 @@ final class MCPServerViewModel: ObservableObject {
                 shapeEligibility,
                 EditFlowPerf.Dimensions(outcome: "skippedShape", searchMode: mode.rawValue, contextLines: contextLines)
             )
-            return
+            return false
         }
         guard !reply.contentMatchGroups.isEmpty else {
             EditFlowPerf.end(
@@ -5269,7 +5665,7 @@ final class MCPServerViewModel: ObservableObject {
                 shapeEligibility,
                 EditFlowPerf.Dimensions(outcome: "skippedEmpty", searchMode: mode.rawValue, contextLines: contextLines)
             )
-            return
+            return false
         }
         EditFlowPerf.end(
             EditFlowPerf.Stage.Search.AutoSelect.shapeEligibility,
@@ -5305,6 +5701,14 @@ final class MCPServerViewModel: ObservableObject {
             )
             throw error
         }
+        if resolvedContext.isRunlessOneShotHint {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Search.AutoSelect.agentEligibility,
+                agentEligibility,
+                EditFlowPerf.Dimensions(outcome: "oneShotHint")
+            )
+            return false
+        }
         let shouldApply = AutoSliceSelection.shouldApply(
             purpose: purpose,
             hasVirtualContext: true
@@ -5314,7 +5718,7 @@ final class MCPServerViewModel: ObservableObject {
             agentEligibility,
             EditFlowPerf.Dimensions(outcome: shouldApply ? "eligible" : "ineligible")
         )
-        guard shouldApply else { return }
+        guard shouldApply else { return false }
 
         let mutation = EditFlowPerf.begin(EditFlowPerf.Stage.Search.AutoSelect.mutation)
         let entries = AutoSliceSelection.searchEntries(from: reply.contentMatchGroups).map { entry in
@@ -5326,7 +5730,7 @@ final class MCPServerViewModel: ObservableObject {
                 mutation,
                 EditFlowPerf.Dimensions(outcome: "skippedEmpty")
             )
-            return
+            return false
         }
         let intent = MCPReadFileAutoSelectionCoordinator.Intent.slices(
             entries: entries,
@@ -5339,6 +5743,7 @@ final class MCPServerViewModel: ObservableObject {
         let key = try readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
         let accepted = readFileAutoSelectionCoordinator.enqueue(
             intent: intent,
+            authority: authority,
             coverageIdentity: coverageIdentity,
             for: key
         )
@@ -5356,6 +5761,7 @@ final class MCPServerViewModel: ObservableObject {
             mutation,
             EditFlowPerf.Dimensions(outcome: accepted ? "enqueued" : "invalidated")
         )
+        return accepted
     }
 
     private func applySelectionSlices(
@@ -6067,7 +6473,7 @@ final class MCPServerViewModel: ObservableObject {
             return DTO(code: "signature_pending", phase: "render_demand", path: pathByFileID[fileID], retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "Signature generation is still pending.")
         case let .unavailable(fileID, reason):
             let retryable = switch reason {
-            case .busy, .gitTransient, .staleCurrentness: true
+            case .busy, .rootTransient, .staleCurrentness: true
             default: false
             }
             return DTO(code: "signature_unavailable", phase: "render_demand", path: pathByFileID[fileID], retryable: retryable, retryAfterMilliseconds: retryable ? 100 : nil, attempted: nil, limit: nil, message: "A signature artifact is unavailable; graph data remains usable.")
@@ -6958,7 +7364,7 @@ final class MCPServerViewModel: ObservableObject {
         maxDepth: Int?,
         startPath: String?,
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
-    ) async throws -> (result: FileTreeResult, rootCount: Int) {
+    ) async throws -> (result: FileTreeResult, rootCount: Int, emptyReason: MCPStoreBackedFileTreeEmptyReason?) {
         let presentationMode: WorkspaceFileTreePresentationMode
         switch mode.lowercased() {
         case "selected": presentationMode = .selected
@@ -6971,13 +7377,24 @@ final class MCPServerViewModel: ObservableObject {
         let filePathDisplay = await MainActor.run { promptVM.filePathDisplayOption }
         let showCodeMapMarkers = await MainActor.run { !promptVM.codeMapsGloballyDisabled }
         let selection = try await lookupContext.physicalizeSelection(storedSelectionForCurrentTabContext(includeCodemapPathsWhenSelectedUsage: true))
+        if presentationMode == .selected,
+           selection.isEmptyForSelectedFileTree
+        {
+            return (FileTreeResult(
+                tree: "No files are selected.",
+                usedSelectedMarker: false,
+                usedCodeMapMarker: false,
+                wasTruncated: false,
+                note: "Selection is empty"
+            ), 0, .selectionEmpty)
+        }
         let store = promptVM.workspaceFileContextStore
         let fileTree = await store.makeCurrentSnapshotFileTreePresentation(
             selection: selection,
             request: WorkspaceFileTreePresentationRequest(
                 mode: presentationMode,
                 filePathDisplay: filePathDisplay,
-                onlyIncludeRootsWithSelectedFiles: false,
+                onlyIncludeRootsWithSelectedFiles: presentationMode == .selected,
                 includeLegend: false,
                 showCodeMapMarkers: showCodeMapMarkers,
                 rootScope: lookupContext.rootScope,
@@ -6987,16 +7404,40 @@ final class MCPServerViewModel: ObservableObject {
             lookupContext: lookupContext,
             profile: .mcpRead
         )
-        if fileTree.rootCount == 0 {
+        let selectedProjectionIsEmpty = presentationMode == .selected
+            && selection.manualCodemapPaths.isEmpty
+            && fileTree.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if fileTree.rootCount == 0 || selectedProjectionIsEmpty {
             let hasStartPath = startPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            let msg = await workspaceContextMessage(forOperation: MCPWindowToolName.getFileTree, path: hasStartPath ? startPath : nil)
+            let selectedPathsUnavailable = presentationMode == .selected && !hasStartPath
+            let msg = if selectedPathsUnavailable {
+                "No selected files could be resolved in the loaded workspace."
+            } else if hasStartPath {
+                await workspaceContextMessage(forOperation: MCPWindowToolName.getFileTree, path: startPath)
+            } else {
+                "The resolved workspace has no configured roots."
+            }
+            let emptyReason: MCPStoreBackedFileTreeEmptyReason = if hasStartPath {
+                .requestedPathOutsideLoadedRoots
+            } else if presentationMode == .selected {
+                .selectionEmpty
+            } else {
+                .rootProjectionEmpty
+            }
+            let note = if selectedPathsUnavailable {
+                "Selected files are unavailable"
+            } else if hasStartPath {
+                "Requested path is outside the loaded roots"
+            } else {
+                "No roots configured"
+            }
             return (FileTreeResult(
                 tree: msg,
                 usedSelectedMarker: false,
                 usedCodeMapMarker: false,
                 wasTruncated: false,
-                note: hasStartPath ? "Requested path is outside the loaded roots" : "No workspace loaded"
-            ), 0)
+                note: note
+            ), 0, emptyReason)
         }
 
         return (FileTreeResult(
@@ -7005,7 +7446,7 @@ final class MCPServerViewModel: ObservableObject {
             usedCodeMapMarker: showCodeMapMarkers && fileTree.content.contains(" +"),
             wasTruncated: false,
             note: nil
-        ), fileTree.rootCount)
+        ), fileTree.rootCount, nil)
     }
 
     @MainActor

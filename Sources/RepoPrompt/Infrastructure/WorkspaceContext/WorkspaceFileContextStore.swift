@@ -3,6 +3,9 @@ import CoreServices
 import Dispatch
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 #if DEBUG
     import CryptoKit
 #endif
@@ -183,6 +186,9 @@ struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
 }
 
 actor WorkspaceFileContextStore {
+    private let restorePerfRecorder: any WorkspaceRestorePerfRecording
+    let perfRecorder: any AgentModePerfRecording
+
     enum CodemapGraphIndexBuildStoreEventKind: String, Hashable {
         case rootInventoryAndSearchReady
         case scheduled
@@ -424,11 +430,18 @@ actor WorkspaceFileContextStore {
     }
 
     private enum CodemapEligibilityResolution {
-        case eligible
-        case terminal(WorkspaceCodemapGitTerminalUnavailableReason, WorkspaceCodemapNonGitFilesystemProof?)
-        case transient(WorkspaceCodemapGitTransientUnavailableReason)
+        /// Positive admission evidence: either Git preflight passed or this root is a positively
+        /// proven safe non-Git folder. Cache presence never means "terminally unavailable".
+        case eligible(WorkspaceCodemapRootEligibilityEvidence)
+        case terminal(WorkspaceCodemapRootTerminalUnavailableReason)
+        case transient(WorkspaceCodemapRootTransientUnavailableReason)
         case stale
         case cancelled
+
+        var evidence: WorkspaceCodemapRootEligibilityEvidence? {
+            guard case let .eligible(evidence) = self else { return nil }
+            return evidence
+        }
     }
 
     private struct CodemapEligibilityFlight {
@@ -465,6 +478,45 @@ actor WorkspaceFileContextStore {
         let task: Task<Void, Never>
     }
 
+    /// Identifies one authority-recovery reconciliation while its deltas are being applied.
+    ///
+    /// Carried as a task local so it names *this* application, not "any application for this root":
+    /// the store suspends during the disk scan, so unrelated watcher or explicit-mutation ingress
+    /// for the same root can interleave and must keep its normal fencing.
+    private struct CodemapRecoveryApplication {
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let flightID: UUID
+    }
+
+    @TaskLocal private static var activeCodemapRecoveryApplication: CodemapRecoveryApplication?
+
+    /// Physical-catalog recovery owned by one root epoch after its root authority was revoked.
+    ///
+    /// It retains the revoked authority because during the recovery interval no session, launch or
+    /// eligibility record remains, and without one a detach could not recognise the root as having
+    /// outstanding work. It deliberately does not also retain the engine: the detach that precedes
+    /// this recovery already retained that epoch's terminal release, and a second copy here would
+    /// be a second owner of one obligation.
+    private struct CodemapRootAuthorityRecoveryFlight {
+        let id: UUID
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let authority: CodemapRootAuthority
+        let task: Task<Void, Never>
+    }
+
+    /// A root epoch whose physical catalog has to be reconciled before replacement work may run.
+    ///
+    /// The recovery flight above is the task; this is the requirement that task exists for. Every
+    /// non-terminal detach — suspension, a catalog fence, a further authority change — cancels the
+    /// task, and bounded retries can exhaust it, but neither event makes the retired inventory safe
+    /// to enumerate. The requirement therefore outlives the task and is discharged only by a scan
+    /// that actually succeeds, or dropped by the unload that ends the epoch. It is conditional by
+    /// construction: it exists only between an accepted authority invalidation and that scan.
+    private struct CodemapCatalogRecoveryRequirement {
+        let authority: CodemapRootAuthority
+        var retryExhausted = false
+    }
+
     /// UI-status lower bound for coverage that remains valid while a path-level
     /// invalidation replaces the current projection job.
     private struct CodemapRootStatusCoverageBaseline {
@@ -487,6 +539,13 @@ actor WorkspaceFileContextStore {
         case repositoryAuthority
         case catalogAdvanced
         case unload
+
+        /// True for the one command that terminalizes the engine's root epoch rather than
+        /// invalidating it. Every other command leaves the epoch loaded and still owed a release.
+        var unloadsRoot: Bool {
+            if case .unload = self { return true }
+            return false
+        }
     }
 
     private final class CodemapDemandCompletion: @unchecked Sendable {
@@ -654,6 +713,9 @@ actor WorkspaceFileContextStore {
 
     private struct CodemapRootSession {
         let authority: CodemapRootAuthority
+        /// Admission evidence this session was set up with. Kept separately from the registration
+        /// value so a proof refresh never breaks duplicate-registration equality.
+        var eligibilityEvidence: WorkspaceCodemapRootEligibilityEvidence?
         var endpoint: WorkspaceCodemapBindingIntegrationEndpoint?
         var routeToken: WorkspaceCodemapBindingIntegrationRouteToken?
         var runtime: CodeMapArtifactRuntime?
@@ -718,6 +780,20 @@ actor WorkspaceFileContextStore {
         let id: UUID
         let rootEpoch: WorkspaceCodemapRootEpoch
         let task: Task<Void, Never>
+    }
+
+    /// The engine epoch a root still owes a terminal release for while no live session holds it.
+    ///
+    /// A registered root leaves per-epoch engine and capability state behind — including the
+    /// retained replacement generation an authority change installs, which only
+    /// `WorkspaceCodemapRootCapabilityService.release` drops together with its tombstone. Nothing
+    /// but `engine.unloadRoot` reaches that release, and every non-terminal detach takes the engine
+    /// handle out of the live records while the state survives. The handle is therefore retained
+    /// here across that interval. Exactly one owner holds this obligation at any time: the live
+    /// session's engine handle while a session exists, otherwise this record.
+    private struct CodemapRetainedTerminalRelease {
+        let authority: CodemapRootAuthority
+        let engine: WorkspaceCodemapBindingEngine
     }
 
     private struct CodemapCleanupFlight {
@@ -1464,7 +1540,7 @@ actor WorkspaceFileContextStore {
             let ingressGeneration: UInt64
             let rootKind: WorkspaceRootKind
             let launchPhase: WorkspaceCodemapGraphIndexLaunchPhase?
-            let terminalReason: WorkspaceCodemapGitTerminalUnavailableReason?
+            let terminalReason: WorkspaceCodemapRootTerminalUnavailableReason?
             let engine: WorkspaceCodemapBindingEngine?
             let milestones: [CodemapFullLoadMilestone]
 
@@ -1482,6 +1558,7 @@ actor WorkspaceFileContextStore {
             let graph: WorkspaceCodemapGraphIncrementalAccounting?
             let accounting: WorkspaceCodemapBindingEngineAccounting?
             let queueWaitMilliseconds: [UInt64]
+            let sourceMode: WorkspaceCodemapRootSourceMode?
         }
 
         func debugCodemapGraphStatusSnapshot(
@@ -1682,17 +1759,20 @@ actor WorkspaceFileContextStore {
                     observations[capture.rootEpoch] = DebugCodemapFullLoadEngineObservation(
                         graph: nil,
                         accounting: nil,
-                        queueWaitMilliseconds: []
+                        queueWaitMilliseconds: [],
+                        sourceMode: nil
                     )
                     continue
                 }
                 let graph = await engine.selectionGraph(rootEpoch: capture.rootEpoch)?.incrementalAccounting()
                 let accounting = await engine.accounting()
                 let admission = await engine.debugGraphIndexAdmissionSnapshot(rootEpoch: capture.rootEpoch)
+                let sourceMode = await engine.sourceMode(rootEpoch: capture.rootEpoch)
                 observations[capture.rootEpoch] = DebugCodemapFullLoadEngineObservation(
                     graph: graph,
                     accounting: accounting,
-                    queueWaitMilliseconds: admission.queueWaitMilliseconds
+                    queueWaitMilliseconds: admission.queueWaitMilliseconds,
+                    sourceMode: sourceMode
                 )
             }
 
@@ -1761,7 +1841,7 @@ actor WorkspaceFileContextStore {
                         ?? codemapEligibilityFlightsByRootEpoch[rootEpoch]?.authority
                         ?? completed?.authority
                         ?? codemapGraphIndexBuildRetriesByRootEpoch[rootEpoch]?.authority
-                    let terminalReason: WorkspaceCodemapGitTerminalUnavailableReason? = if case let .terminal(reason, _)? = completed?.result {
+                    let terminalReason: WorkspaceCodemapRootTerminalUnavailableReason? = if case let .terminal(reason)? = completed?.result {
                         reason
                     } else {
                         nil
@@ -1807,6 +1887,8 @@ actor WorkspaceFileContextStore {
                     catalogGeneration: capture.catalogGeneration,
                     ingressGeneration: capture.ingressGeneration,
                     rootKind: CodemapFullLoadDebugSupport.rootKindName(capture.rootKind),
+                    sourceKind: observation?.sourceMode?.sourceKind,
+                    manifestMode: observation?.sourceMode?.manifestMode,
                     state: .superseded,
                     reason: "visible_root_universe_or_epoch_changed",
                     launchPhase: launchPhase,
@@ -1876,6 +1958,8 @@ actor WorkspaceFileContextStore {
                 catalogGeneration: capture.catalogGeneration,
                 ingressGeneration: capture.ingressGeneration,
                 rootKind: CodemapFullLoadDebugSupport.rootKindName(capture.rootKind),
+                sourceKind: observation?.sourceMode?.sourceKind,
+                manifestMode: observation?.sourceMode?.manifestMode,
                 state: state,
                 reason: reason,
                 launchPhase: launchPhase,
@@ -1894,6 +1978,15 @@ actor WorkspaceFileContextStore {
 
         func debugCodemapEnginePresent(rootID: UUID) -> Bool {
             debugCodemapBindingEngine(rootID: rootID) != nil
+        }
+
+        /// Real source and manifest mode of the newest engine-backed session for this root.
+        /// Derived from live session state, not from eligibility text.
+        func debugCodemapRootSourceMode(rootID: UUID) async -> WorkspaceCodemapRootSourceMode? {
+            guard let (rootEpoch, engine) = debugCodemapBindingEngine(rootID: rootID) else {
+                return nil
+            }
+            return await engine.sourceMode(rootEpoch: rootEpoch)
         }
 
         func codemapBindingEngineAccountingForTesting(
@@ -2528,7 +2621,7 @@ actor WorkspaceFileContextStore {
                 "all_loaded_excluding_git_data"
             case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
                 "session_bound_workspace(logical=\(logicalRootPaths.sorted().joined(separator: ","));physical=\(physicalRootPaths.sorted().joined(separator: ",")))"
-            case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots, _):
                 "validated_session_bound_workspace(logical=\(canonicalRoots.map(\.standardizedFullPath).sorted().joined(separator: ","));physical=\(physicalRoots.map(\.standardizedFullPath).sorted().joined(separator: ",")))"
             }
         }
@@ -3007,6 +3100,7 @@ actor WorkspaceFileContextStore {
     private let codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe
     private let codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe
     private let codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy
+    private var nonGitCodeMapsEnabled: Bool
     private let selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory
     private let selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy
     private let automaticSelectionAccountingMaximum: Int
@@ -3019,7 +3113,9 @@ actor WorkspaceFileContextStore {
         WorkspaceCodemapBindingDemandResult
     ) async -> WorkspaceCodemapBindingDemandResult
     private let codemapAutomaticSelectionQueryHook: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
-    private struct TerminalNonGitCodemapCacheEntry {
+    /// Positive filesystem admission evidence for one root epoch. It is revalidated before use,
+    /// including for ready sessions, so a cached proof never bypasses root currentness.
+    private struct FilesystemCodemapEvidenceCacheEntry {
         let standardizedRootPath: String
         let proof: WorkspaceCodemapNonGitFilesystemProof
     }
@@ -3040,8 +3136,21 @@ actor WorkspaceFileContextStore {
     private var codemapGraphIndexRetryExhaustionByRootEpoch: [
         WorkspaceCodemapRootEpoch: CodemapGraphIndexRetryExhaustion
     ] = [:]
-    private var terminalNonGitCodemapCacheByEpoch: [
-        WorkspaceCodemapRootEpoch: TerminalNonGitCodemapCacheEntry
+    private var codemapRootAuthorityRecoveryFlightsByRootEpoch: [
+        WorkspaceCodemapRootEpoch: CodemapRootAuthorityRecoveryFlight
+    ] = [:]
+    private var codemapCatalogRecoveryRequirementsByRootEpoch: [
+        WorkspaceCodemapRootEpoch: CodemapCatalogRecoveryRequirement
+    ] = [:]
+    /// Written when a detach takes an epoch's engine handle out of the live records without
+    /// terminalizing it, read back by the unload that discharges it, and retired when a live
+    /// session takes the epoch again. Not an admission fence: it records a handle the store still
+    /// owes a release for, not outstanding work, so it must never gate setup, demand or builds.
+    private var codemapRetainedTerminalReleasesByRootEpoch: [
+        WorkspaceCodemapRootEpoch: CodemapRetainedTerminalRelease
+    ] = [:]
+    private var filesystemCodemapEvidenceByRootEpoch: [
+        WorkspaceCodemapRootEpoch: FilesystemCodemapEvidenceCacheEntry
     ] = [:]
     #if DEBUG
         private let codemapGraphIndexBuildLaunchPolicyForTesting: CodemapGraphIndexBuildLaunchPolicyForTesting
@@ -3183,6 +3292,7 @@ actor WorkspaceFileContextStore {
             codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
             codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
+            nonGitCodeMapsEnabled: Bool = true,
             codemapGraphIndexBuildLaunchPolicyForTesting: CodemapGraphIndexBuildLaunchPolicyForTesting = .enabled,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
@@ -3207,7 +3317,9 @@ actor WorkspaceFileContextStore {
             ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result },
             codemapAutomaticSelectionQueryHook: @escaping @Sendable (
                 WorkspaceCodemapRootEpoch
-            ) async -> Void = { _ in }
+            ) async -> Void = { _ in },
+            restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
+            perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
@@ -3216,6 +3328,7 @@ actor WorkspaceFileContextStore {
             self.codemapLocalGitClassificationProbe = codemapLocalGitClassificationProbe
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
+            self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.codemapGraphIndexBuildLaunchPolicyForTesting = codemapGraphIndexBuildLaunchPolicyForTesting
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
@@ -3227,6 +3340,8 @@ actor WorkspaceFileContextStore {
             self.codemapGraphPublicationWaiter = codemapGraphPublicationWaiter
             self.codemapDemandResultHook = codemapDemandResultHook
             self.codemapAutomaticSelectionQueryHook = codemapAutomaticSelectionQueryHook
+            self.restorePerfRecorder = restorePerfRecorder
+            self.perfRecorder = perfRecorder
             isCatalogShardShadowValidationEnabled = enableCatalogShardShadowValidation
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
             #if os(macOS)
@@ -3251,6 +3366,7 @@ actor WorkspaceFileContextStore {
             codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
             codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
+            nonGitCodeMapsEnabled: Bool = false,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
             automaticSelectionAccountingMaximum: Int = .max,
@@ -3274,7 +3390,9 @@ actor WorkspaceFileContextStore {
             ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result },
             codemapAutomaticSelectionQueryHook: @escaping @Sendable (
                 WorkspaceCodemapRootEpoch
-            ) async -> Void = { _ in }
+            ) async -> Void = { _ in },
+            restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
+            perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.unloadTerminationPolicy = unloadTerminationPolicy
@@ -3282,6 +3400,7 @@ actor WorkspaceFileContextStore {
             self.codemapLocalGitClassificationProbe = codemapLocalGitClassificationProbe
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
+            self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
             precondition(automaticSelectionAccountingMaximum >= 0)
@@ -3292,6 +3411,8 @@ actor WorkspaceFileContextStore {
             self.codemapGraphPublicationWaiter = codemapGraphPublicationWaiter
             self.codemapDemandResultHook = codemapDemandResultHook
             self.codemapAutomaticSelectionQueryHook = codemapAutomaticSelectionQueryHook
+            self.restorePerfRecorder = restorePerfRecorder
+            self.perfRecorder = perfRecorder
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator()
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -7438,7 +7559,7 @@ actor WorkspaceFileContextStore {
             requestedMatches = Set(requestedPhysicalRootPaths.map {
                 StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
             }) == expectedPaths
-        case let .validatedSessionBoundWorkspace(canonicalRoots, requestedPhysicalRoots):
+        case let .validatedSessionBoundWorkspace(canonicalRoots, requestedPhysicalRoots, _):
             let requestedValidation = WorkspaceLookupRootSelectorValidator.validate(
                 canonicalRoots: canonicalRoots,
                 physicalRoots: requestedPhysicalRoots
@@ -7522,7 +7643,7 @@ actor WorkspaceFileContextStore {
                 return !FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) ||
                     !isDirectory.boolValue
             }.sorted()
-        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots, _):
             guard !canonicalRoots.isEmpty || !physicalRoots.isEmpty else {
                 return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
             }
@@ -10062,28 +10183,73 @@ actor WorkspaceFileContextStore {
 
     @discardableResult
     func reconcileLoadedRootCatalogWithDisk(rootID: UUID) async -> [FileSystemDelta] {
-        guard let state = rootStatesByID[rootID] else { return [] }
+        await performLoadedRootCatalogReconciliation(rootID: rootID).deltas
+    }
+
+    /// Reconciliation outcome for callers that need to know the scan actually succeeded.
+    ///
+    /// An empty delta list is ambiguous on its own: it is produced both by an unchanged tree and
+    /// by a failed enumeration. Recovery from a replaced root binding must not treat the second
+    /// case as a completed reconciliation, so success is reported separately.
+    private struct LoadedRootCatalogReconciliation {
+        let succeeded: Bool
+        let deltas: [FileSystemDelta]
+    }
+
+    private func performLoadedRootCatalogReconciliation(
+        rootID: UUID
+    ) async -> LoadedRootCatalogReconciliation {
+        guard let state = rootStatesByID[rootID] else {
+            return LoadedRootCatalogReconciliation(succeeded: false, deltas: [])
+        }
         let root = state.root
         let folderPaths = Set(
             state.folderIDsByRelativePath.compactMap { relativePath, folderID -> String? in
                 isDiscoverableFolderID(folderID) ? relativePath : nil
             }
         )
-        guard !folderPaths.isEmpty else { return [] }
-
-        let deltas: [FileSystemDelta]
-        do {
-            deltas = try await state.service.scanFoldersInParallel(folderPaths.sorted()).deltas
-        } catch {
-            return []
+        // Nothing discoverable to enumerate is a successful no-op, not a failed scan.
+        guard !folderPaths.isEmpty else {
+            return LoadedRootCatalogReconciliation(succeeded: true, deltas: [])
         }
-        guard !deltas.isEmpty,
-              let currentRoot = rootStatesByID[rootID]?.root,
-              currentRoot.standardizedFullPath == root.standardizedFullPath
-        else { return deltas }
 
-        await handleObservedFileSystemDeltas(deltas, root: root)
-        return deltas
+        var remaining = folderPaths.sorted()
+        var deltas: [FileSystemDelta] = []
+        do {
+            while !remaining.isEmpty {
+                try Task.checkCancellation()
+                let result = try await state.service.scanFoldersInParallel(remaining)
+                guard !result.scannedFolders.isEmpty else {
+                    return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
+                }
+                guard let currentState = rootStatesByID[rootID],
+                      currentState.lifetimeID == state.lifetimeID,
+                      currentState.root.standardizedFullPath == root.standardizedFullPath
+                else {
+                    return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
+                }
+                // The service commits each batch to its visited inventory. Apply that batch to
+                // the store before scanning the next one so a later failure/retry cannot lose it.
+                if !result.deltas.isEmpty {
+                    await handleObservedFileSystemDeltas(result.deltas, root: root)
+                }
+                deltas.append(contentsOf: result.deltas)
+                remaining.removeAll { result.scannedFolders.contains($0) }
+                guard rootStatesByID[rootID]?.lifetimeID == state.lifetimeID else {
+                    return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
+                }
+            }
+        } catch {
+            return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
+        }
+        guard !Task.isCancelled,
+              let currentState = rootStatesByID[rootID],
+              currentState.lifetimeID == state.lifetimeID,
+              currentState.root.standardizedFullPath == root.standardizedFullPath
+        else {
+            return LoadedRootCatalogReconciliation(succeeded: false, deltas: deltas)
+        }
+        return LoadedRootCatalogReconciliation(succeeded: true, deltas: deltas)
     }
 
     func ensureIndexedFiles(paths: [String]) async -> [String] {
@@ -10684,6 +10850,11 @@ actor WorkspaceFileContextStore {
               codemapSuspendedRootEpochs.remove(rootEpoch) != nil
         else { return .unchanged }
         codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
+        // The suspension detached this root's authority recovery, but not the requirement it ran
+        // for. Restart it before scheduling anything: the schedule below is a no-op while that
+        // requirement is registered, and the recovery reschedules the build itself once its scan
+        // has actually reconciled the replacement inventory.
+        restartCodemapCatalogRecoveryIfPending(rootEpoch: rootEpoch)
         scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
         publishCodemapRootStatusesIfChanged()
         return .changed
@@ -10702,6 +10873,13 @@ actor WorkspaceFileContextStore {
             rootEpoch: rootEpoch,
             phase: codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase ?? .notScheduled
         )
+        if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
+            // Retry the catalog scan, not the graph: the retained requirement keeps every
+            // admission route fenced until reconciliation actually succeeds.
+            restartCodemapCatalogRecoveryIfPending(rootEpoch: rootEpoch)
+            return codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch] == nil
+                ? .unavailable : .scheduled
+        }
         if let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine {
             let disposition = await engine.prioritizeGraphIndexNow(rootEpoch: rootEpoch)
             if disposition != .unavailable {
@@ -10715,7 +10893,7 @@ actor WorkspaceFileContextStore {
             case .transientRetry, .retryExhausted, .cancelled, .superseded:
                 codemapGraphIndexBuildLaunchesByRootEpoch.removeValue(forKey: rootEpoch)
             case .notScheduled, .eligibilityQueued, .setupJoining, .engineScheduling,
-                 .handedOff, .terminalNonGit:
+                 .handedOff, .terminalUnavailable:
                 return .promoted
             }
         }
@@ -10728,8 +10906,73 @@ actor WorkspaceFileContextStore {
         codemapRootStatusContinuations.removeValue(forKey: id)
     }
 
+    /// Changing the opt-in revokes prior filesystem capabilities before admitting new work.
+    /// Git-root sessions are not affected by this compatibility setting.
+    func setNonGitCodeMapsEnabled(_ enabled: Bool) async {
+        guard nonGitCodeMapsEnabled != enabled else { return }
+        nonGitCodeMapsEnabled = enabled
+        var affectedRootIDs: [UUID] = []
+        for (rootID, state) in rootStatesByID {
+            guard case .nonGitRoot = state.service.ignoreRulePolicy,
+                  rootStatesByID[rootID]?.lifetimeID == state.lifetimeID,
+                  nonGitCodeMapsEnabled == enabled
+            else { continue }
+            let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
+            _ = detachCodemapSession(rootEpoch: rootEpoch)
+            filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: rootEpoch)
+            affectedRootIDs.append(rootID)
+        }
+        await awaitCodemapCleanupFlights(rootIDs: Set(affectedRootIDs))
+        guard nonGitCodeMapsEnabled == enabled else { return }
+        if enabled {
+            for rootID in affectedRootIDs {
+                guard let state = rootStatesByID[rootID] else { continue }
+                scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: WorkspaceCodemapRootEpoch(
+                    rootID: rootID,
+                    rootLifetimeID: state.lifetimeID
+                ))
+            }
+        }
+    }
+
     private func codemapGenerationIsSuspended(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
         codemapSuspendedRootEpochs.contains(rootEpoch)
+    }
+
+    /// True when the deltas being applied on *this* call chain are the ones produced by the root's
+    /// own authority recovery.
+    ///
+    /// Those deltas belong to the recovery that already owns this epoch: its session is revoked and
+    /// every admission entrance is fenced by `codemapRootWorkIsFenced`. Applying them must therefore
+    /// stay inside that barrier instead of opening a second root-authority detach or waiting on a
+    /// cleanup flight — either would make the recovery wait on work that is waiting for it.
+    ///
+    /// Provenance comes from the task local, so ingress that merely runs concurrently keeps its
+    /// normal fencing. Currency requires the same loaded lifetime and rejects an application whose
+    /// epoch has since been taken over by a different recovery flight.
+    private func codemapRecoveryOwnsCatalogApplication(rootID: UUID) -> Bool {
+        guard let application = Self.activeCodemapRecoveryApplication,
+              application.rootEpoch.rootID == rootID,
+              rootStatesByID[rootID]?.lifetimeID == application.rootEpoch.rootLifetimeID
+        else { return false }
+        guard let flight = codemapRootAuthorityRecoveryFlightsByRootEpoch[application.rootEpoch]
+        else { return true }
+        return flight.id == application.flightID
+    }
+
+    /// Root-level fence shared by every codemap admission entrance: setup, interactive demand and
+    /// each graph-build launch route.
+    ///
+    /// Cleanup, a root mutation fence, a running authority recovery and an outstanding catalog
+    /// recovery requirement all mean the root's session or catalog is mid-transition. Admitting
+    /// work during any of them would run against a retired inventory, so they are checked in one
+    /// place rather than repeated per entrance. The last one is what survives a non-terminal detach
+    /// that cancels the recovery task, so cancelling recovery can never open this barrier.
+    private func codemapRootWorkIsFenced(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
+        codemapCleanupFlightsByRootID[rootEpoch.rootID] != nil ||
+            codemapRootMutationFenceTokensByRootEpoch[rootEpoch] != nil ||
+            codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch] != nil ||
+            codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch] != nil
     }
 
     func currentCodemapRootStatusUpdate() -> WorkspaceCodemapRootStatusUpdate {
@@ -10754,11 +10997,13 @@ actor WorkspaceFileContextStore {
         let suspended = codemapGenerationIsSuspended(rootEpoch: rootEpoch)
         let accounting = codemapGraphAccountingByRootEpoch[rootEpoch]
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
-        let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
+        let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
+            .retryExhausted
+        } else if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
             .workerRecoveryExhausted
         } else {
             switch launchPhase {
-            case .terminalNonGit: .notGitRepository
+            case .terminalUnavailable: .sourceRootUnavailable
             case .retryExhausted: .retryExhausted
             default: nil
             }
@@ -10771,7 +11016,7 @@ actor WorkspaceFileContextStore {
             switch launchPhase {
             case .eligibilityQueued, .setupJoining, .engineScheduling, .handedOff, .transientRetry:
                 .indexing
-            case .terminalNonGit, .retryExhausted:
+            case .terminalUnavailable, .retryExhausted:
                 .unavailable
             case .notScheduled, .cancelled, .superseded, nil:
                 .notInitialized
@@ -10860,7 +11105,7 @@ actor WorkspaceFileContextStore {
     ) async throws -> WorkspaceRootRecord {
         let standardizedPath = (path as NSString).standardizingPath
         #if DEBUG
-            let rootLoadRouteStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let rootLoadRouteStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let rootLoadName = URL(fileURLWithPath: standardizedPath).lastPathComponent
         #endif
         try Task.checkCancellation()
@@ -10893,13 +11138,13 @@ actor WorkspaceFileContextStore {
                 throw WorkspaceFileContextStoreError.rootAlreadyLoadedWithDifferentConfiguration(standardizedPath)
             }
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "store.rootLoad.existing",
                     fields: [
                         "rootName": rootLoadName,
-                        "rootID": WorkspaceRestorePerfLog.shortID(existing.id),
+                        "rootID": restorePerfRecorder.shortID(existing.id),
                         "kind": "\(loadConfiguration.kind)",
-                        "duration": rootLoadRouteStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": rootLoadRouteStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -10917,7 +11162,7 @@ actor WorkspaceFileContextStore {
                 )
             }
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "store.rootLoad.joinInFlight",
                     fields: [
                         "rootName": rootLoadName,
@@ -10937,7 +11182,7 @@ actor WorkspaceFileContextStore {
         }
 
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootLoad.scheduled",
                 fields: [
                     "rootName": rootLoadName,
@@ -11105,8 +11350,8 @@ actor WorkspaceFileContextStore {
 
         let rootURL = URL(fileURLWithPath: standardizedPath).standardizedFileURL
         #if DEBUG
-            let performLoadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-            WorkspaceRestorePerfLog.event(
+            let performLoadStartMS = restorePerfRecorder.timestampMSIfEnabled()
+            restorePerfRecorder.event(
                 "store.rootLoad.begin",
                 fields: [
                     "rootName": rootURL.lastPathComponent,
@@ -11138,15 +11383,15 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             var rootRecordCreatedFields: [String: String] = [
                 "rootName": root.name,
-                "rootID": WorkspaceRestorePerfLog.shortID(root.id),
+                "rootID": restorePerfRecorder.shortID(root.id),
                 "kind": "\(root.kind)",
-                "durationSinceStoreRootLoadBegin": performLoadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                "durationSinceStoreRootLoadBegin": performLoadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
             ]
             rootRecordCreatedFields.merge(
                 WorkspaceRootLoadDiagnostics.rootRecordCreatedFields(forPath: standardizedPath),
                 uniquingKeysWith: { _, diagnostic in diagnostic }
             )
-            WorkspaceRestorePerfLog.event("store.rootLoad.rootRecordCreated", fields: rootRecordCreatedFields)
+            restorePerfRecorder.event("store.rootLoad.rootRecordCreated", fields: rootRecordCreatedFields)
         #endif
 
         var state = RootState(
@@ -11174,7 +11419,7 @@ actor WorkspaceFileContextStore {
 
         #if DEBUG
             let coldStartWalkStart = WorkspaceFileSearchDebugTiming.now()
-            let walkStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let walkStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var chunkCount = 0
         #endif
         for try await event in await service.loadContentsInChunks(of: rootURL) {
@@ -11185,16 +11430,16 @@ actor WorkspaceFileContextStore {
                 if chunkCount == 1 {
                     var firstChunkFields: [String: String] = [
                         "rootName": root.name,
-                        "rootID": WorkspaceRestorePerfLog.shortID(root.id),
+                        "rootID": restorePerfRecorder.shortID(root.id),
                         "chunkFolders": "\(chunk.folders.count)",
                         "chunkFiles": "\(chunk.files.count)",
-                        "durationSinceStoreRootLoadBegin": performLoadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "durationSinceStoreRootLoadBegin": performLoadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                     firstChunkFields.merge(
                         WorkspaceRootLoadDiagnostics.firstPreparedChunkFields(forPath: standardizedPath),
                         uniquingKeysWith: { _, diagnostic in diagnostic }
                     )
-                    WorkspaceRestorePerfLog.event("store.rootLoad.firstPreparedChunk", fields: firstChunkFields)
+                    restorePerfRecorder.event("store.rootLoad.firstPreparedChunk", fields: firstChunkFields)
                 }
             #endif
             indexFolders(chunk.folders, root: root, state: &state, indexes: &stagedIndexes)
@@ -11210,28 +11455,28 @@ actor WorkspaceFileContextStore {
                 files: stagedIndexes.filesByID.count,
                 folders: stagedIndexes.foldersByID.count
             )
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootLoad.walk",
                 fields: [
                     "rootName": root.name,
                     "chunkCount": "\(chunkCount)",
                     "folders": "\(stagedIndexes.foldersByID.count)",
                     "files": "\(stagedIndexes.filesByID.count)",
-                    "duration": walkStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": walkStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
-            let commitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let commitStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
 
         commit(stagedIndexes)
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootLoad.commit",
                 fields: [
                     "rootName": root.name,
                     "folders": "\(stagedIndexes.foldersByID.count)",
                     "files": "\(stagedIndexes.filesByID.count)",
-                    "duration": commitStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": commitStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -11275,14 +11520,14 @@ actor WorkspaceFileContextStore {
         publishCodemapRootStatusesIfChanged()
         scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootLoad.end",
                 fields: [
                     "rootName": root.name,
-                    "rootID": WorkspaceRestorePerfLog.shortID(root.id),
+                    "rootID": restorePerfRecorder.shortID(root.id),
                     "folders": "\(stagedIndexes.foldersByID.count)",
                     "files": "\(stagedIndexes.filesByID.count)",
-                    "duration": performLoadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": performLoadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -11525,7 +11770,15 @@ actor WorkspaceFileContextStore {
             }
             codemapAuthorityGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
             codemapGraphIndexInvalidationGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
-            terminalNonGitCodemapCacheByEpoch.removeValue(forKey: rootEpoch)
+            // The detach above consumed any retained release for this epoch into the terminal
+            // cleanup it returned. Dropping it here as well keeps a dead epoch from outliving its
+            // lifetime in this map if some future detach path ever declines to capture it.
+            codemapRetainedTerminalReleasesByRootEpoch.removeValue(forKey: rootEpoch)
+            // The unload above cancelled and drained any recovery this epoch still owed a scan to.
+            // Its requirement exists to keep replacement work off a retired inventory, and this
+            // epoch will never serve again, so terminal cleanup is where it is discarded.
+            codemapCatalogRecoveryRequirementsByRootEpoch.removeValue(forKey: rootEpoch)
+            filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: rootEpoch)
             let pathFenceTokenIDs = codemapPathFenceTokensByID.compactMap { entry in
                 entry.value.rootEpoch == rootEpoch ? entry.key : nil
             }
@@ -11555,10 +11808,10 @@ actor WorkspaceFileContextStore {
             await interactiveReadCache.invalidate(rootID: entry.rootID)
         }
         #if DEBUG
-            let rootUnloadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let rootUnloadStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let rootUnloadFolderCount = statesToUnload.reduce(0) { $0 + $1.state.folderIDsByRelativePath.count }
             let rootUnloadFileCount = statesToUnload.reduce(0) { $0 + $1.state.fileIDsByRelativePath.count }
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.begin",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
@@ -11566,7 +11819,7 @@ actor WorkspaceFileContextStore {
                     "fileCount": "\(rootUnloadFileCount)"
                 ]
             )
-            let detachStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let detachStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
 
         let unloadingPaths = statesToUnload.map(\.state.root.standardizedFullPath)
@@ -11595,14 +11848,14 @@ actor WorkspaceFileContextStore {
             ))
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.detach",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
-                    "duration": detachStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": detachStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
-            let stopWatchersStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let stopWatchersStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
 
         // Stop each detached service exactly once. The caller only waits through a bounded
@@ -11634,14 +11887,14 @@ actor WorkspaceFileContextStore {
             }
         #endif
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.stopWatchers",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
-                    "duration": stopWatchersStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": stopWatchersStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
-            let indexCleanupStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let indexCleanupStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
 
         for entry in statesToUnload {
@@ -11696,13 +11949,13 @@ actor WorkspaceFileContextStore {
         }
 
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.indexCleanup",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
                     "removedFolders": "\(rootUnloadFolderCount)",
                     "removedFiles": "\(rootUnloadFileCount)",
-                    "duration": indexCleanupStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": indexCleanupStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -11725,11 +11978,11 @@ actor WorkspaceFileContextStore {
             }
         ))
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.end",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
-                    "duration": rootUnloadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": rootUnloadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -12563,7 +12816,12 @@ actor WorkspaceFileContextStore {
                 continue
             }
 
-            guard let graph = await engine.selectionGraph(rootEpoch: rootEpoch) else {
+            // Same serving boundary as structure queries: a retained graph must not answer from a
+            // committed snapshot whose root binding is no longer the one on disk.
+            guard await engine.rootAuthorityIsCurrentForServing(rootEpoch: rootEpoch),
+                  codemapSessionsByRootEpoch[rootEpoch]?.authority == session.authority,
+                  let graph = await engine.selectionGraph(rootEpoch: rootEpoch)
+            else {
                 rootResults.append(WorkspaceCodemapAutomaticSelectionRootResult(
                     rootEpoch: rootEpoch,
                     status: .pending,
@@ -12824,10 +13082,15 @@ actor WorkspaceFileContextStore {
             workspaceCodemapRootEpochPrecedes($0.rootEpoch, $1.rootEpoch)
         }) {
             let rootEpoch = rootReceipt.rootEpoch
+            // Accepting a receipt is a serving boundary of its own. The committed graph still
+            // carries the authority it was built under, so an unannounced physical replacement can
+            // only be observed by revalidating the root binding here as well.
             guard let state = rootStatesByID[rootEpoch.rootID],
                   state.lifetimeID == rootEpoch.rootLifetimeID,
                   let session = codemapSessionsByRootEpoch[rootEpoch],
                   let engine = session.engine,
+                  await engine.rootAuthorityIsCurrentForServing(rootEpoch: rootEpoch),
+                  codemapSessionsByRootEpoch[rootEpoch]?.authority == session.authority,
                   let graph = await engine.selectionGraph(rootEpoch: rootEpoch)
             else {
                 let issues: [WorkspaceCodemapAutomaticSelectionIssue] = [.rootEpochChanged(rootEpoch)]
@@ -13040,9 +13303,15 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             guard codemapGraphIndexBuildLaunchPolicyForTesting == .enabled else { return }
         #endif
+        // Legacy plain roots do no automatic Code Map work until the persisted opt-in is on.
+        if !nonGitCodeMapsEnabled,
+           let state = rootStatesByID[rootEpoch.rootID],
+           case .nonGitRoot = state.service.ignoreRulePolicy
+        {
+            return
+        }
         guard !codemapGenerationIsSuspended(rootEpoch: rootEpoch),
-              codemapCleanupFlightsByRootID[rootEpoch.rootID] == nil,
-              codemapRootMutationFenceTokensByRootEpoch[rootEpoch] == nil,
+              !codemapRootWorkIsFenced(rootEpoch: rootEpoch),
               let authority = currentCodemapAuthority(rootEpoch: rootEpoch),
               codemapPreflightAuthorityIsCurrent(authority)
         else { return }
@@ -13051,7 +13320,7 @@ actor WorkspaceFileContextStore {
             case .cancelled, .superseded, .transientRetry:
                 break
             case .notScheduled, .eligibilityQueued, .setupJoining, .engineScheduling,
-                 .handedOff, .terminalNonGit, .retryExhausted:
+                 .handedOff, .terminalUnavailable, .retryExhausted:
                 return
             }
         }
@@ -13131,19 +13400,19 @@ actor WorkspaceFileContextStore {
             )
             return
         }
+        let eligibilityEvidence: WorkspaceCodemapRootEligibilityEvidence
         switch eligibility {
-        case .eligible:
+        case let .eligible(evidence):
+            eligibilityEvidence = evidence
             recordCodemapGraphIndexBuildStoreEvent(
                 .eligibilityEligible,
                 rootEpoch: authority.rootEpoch,
                 phase: .setupJoining
             )
-        case let .terminal(reason, _):
-            let unavailable = WorkspaceCodemapArtifactDemandUnavailableReason.gitTerminal(reason)
+        case let .terminal(reason):
+            let unavailable = WorkspaceCodemapArtifactDemandUnavailableReason.rootTerminal(reason)
             installCodemapTerminalSetupDisposition(unavailable, authority: authority)
-            let phase: WorkspaceCodemapGraphIndexLaunchPhase = reason == .nonGit
-                ? .terminalNonGit
-                : .superseded
+            let phase: WorkspaceCodemapGraphIndexLaunchPhase = .terminalUnavailable
             recordCodemapGraphIndexBuildStoreEvent(
                 .eligibilityTerminal,
                 rootEpoch: authority.rootEpoch,
@@ -13187,7 +13456,10 @@ actor WorkspaceFileContextStore {
             return
         }
 
-        guard let setup = ensureCodemapSetupTask(authority: authority) else {
+        guard let setup = ensureCodemapSetupTask(
+            authority: authority,
+            evidence: eligibilityEvidence
+        ) else {
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
                 authority: authority,
@@ -13274,42 +13546,36 @@ actor WorkspaceFileContextStore {
     private func resolveCodemapEligibility(
         authority: CodemapRootAuthority
     ) async -> CodemapEligibilityResolution {
-        var requiresGitPreflight = false
         if let completed = codemapCompletedEligibilityByRootEpoch[authority.rootEpoch],
            completed.authority == authority,
            codemapPreflightAuthorityIsCurrent(authority)
         {
-            if case let .terminal(.nonGit, proof?) = completed.result {
-                switch codemapLocalGitClassificationProbe.validate(proof) {
-                case .current:
-                    return completed.result
-                case .requiresLocalReclassification:
-                    break
-                case .requiresGitPreflight:
-                    requiresGitPreflight = true
+            if let proof = completed.result.evidence?.filesystemProof {
+                // Positive evidence is only reusable while it is still current.
+                if case let .current(currentProof) = codemapLocalGitClassificationProbe.refresh(proof) {
+                    return .eligible(.filesystem(currentProof))
                 }
                 codemapCompletedEligibilityByRootEpoch.removeValue(forKey: authority.rootEpoch)
-                terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
+                filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: authority.rootEpoch)
             } else {
                 return completed.result
             }
         }
-        if let cached = terminalNonGitCodemapCacheByEpoch[authority.rootEpoch] {
+        if let cached = filesystemCodemapEvidenceByRootEpoch[authority.rootEpoch] {
             guard cached.standardizedRootPath == authority.standardizedRootPath,
                   codemapPreflightAuthorityIsCurrent(authority)
             else {
-                terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
+                filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: authority.rootEpoch)
                 return .stale
             }
-            switch codemapLocalGitClassificationProbe.validate(cached.proof) {
-            case .current:
-                return .terminal(.nonGit, cached.proof)
-            case .requiresLocalReclassification:
-                break
-            case .requiresGitPreflight:
-                requiresGitPreflight = true
+            if case let .current(currentProof) = codemapLocalGitClassificationProbe.refresh(cached.proof) {
+                filesystemCodemapEvidenceByRootEpoch[authority.rootEpoch] = .init(
+                    standardizedRootPath: cached.standardizedRootPath,
+                    proof: currentProof
+                )
+                return .eligible(.filesystem(currentProof))
             }
-            terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
+            filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: authority.rootEpoch)
         }
 
         let flight: CodemapEligibilityFlight
@@ -13321,16 +13587,19 @@ actor WorkspaceFileContextStore {
             let id = UUID()
             let task = Task { [weak self] in
                 guard let self else { return CodemapEligibilityResolution.cancelled }
-                return await performCodemapEligibility(
-                    authority: authority,
-                    requiresGitPreflight: requiresGitPreflight
-                )
+                return await performCodemapEligibility(authority: authority)
             }
             flight = CodemapEligibilityFlight(id: id, authority: authority, task: task)
             codemapEligibilityFlightsByRootEpoch[authority.rootEpoch] = flight
         }
 
-        let result = await flight.task.value
+        let resolved = await flight.task.value
+        let filesystemOptOut = !nonGitCodeMapsEnabled && resolved.evidence?.filesystemProof != nil
+        let result: CodemapEligibilityResolution = if filesystemOptOut {
+            .terminal(.nonGit)
+        } else {
+            resolved
+        }
         if codemapEligibilityFlightsByRootEpoch[authority.rootEpoch]?.id == flight.id {
             codemapEligibilityFlightsByRootEpoch.removeValue(forKey: authority.rootEpoch)
         }
@@ -13345,11 +13614,10 @@ actor WorkspaceFileContextStore {
         case .transient, .stale, .cancelled:
             break
         }
-        if case let .terminal(.nonGit, proof?) = result,
-           codemapPreflightAuthorityIsCurrent(authority),
-           codemapLocalGitClassificationProbe.validate(proof) == .current
+        if let proof = result.evidence?.filesystemProof,
+           codemapPreflightAuthorityIsCurrent(authority)
         {
-            terminalNonGitCodemapCacheByEpoch[authority.rootEpoch] = .init(
+            filesystemCodemapEvidenceByRootEpoch[authority.rootEpoch] = .init(
                 standardizedRootPath: authority.standardizedRootPath,
                 proof: proof
             )
@@ -13364,13 +13632,20 @@ actor WorkspaceFileContextStore {
               session.authority == authority
         else { return nil }
         if case .ready? = session.setupDisposition, session.engine != nil {
-            return .eligible
+            guard let evidence = session.eligibilityEvidence else { return nil }
+            // A ready session is not permission to skip root currentness: filesystem evidence is
+            // revalidated here too, and a stale proof falls through to a full resolution.
+            guard let proof = evidence.filesystemProof else { return .eligible(evidence) }
+            guard case let .current(currentProof) =
+                codemapLocalGitClassificationProbe.refresh(proof)
+            else { return nil }
+            return .eligible(.filesystem(currentProof))
         }
         if case let .unavailable(reason)? = session.setupDisposition {
             switch reason {
-            case let .gitTerminal(reason):
-                return .terminal(reason, nil)
-            case let .gitTransient(reason):
+            case let .rootTerminal(reason):
+                return .terminal(reason)
+            case let .rootTransient(reason):
                 return .transient(reason)
             default:
                 return nil
@@ -13380,33 +13655,277 @@ actor WorkspaceFileContextStore {
     }
 
     private func performCodemapEligibility(
-        authority: CodemapRootAuthority,
-        requiresGitPreflight: Bool
+        authority: CodemapRootAuthority
     ) async -> CodemapEligibilityResolution {
+        // The local proof opens its root with O_NOFOLLOW. Classify the physical directory,
+        // while retaining the loaded alias in catalog identities for binding checks.
         let rootURL = URL(fileURLWithPath: authority.standardizedRootPath, isDirectory: true)
-        if !requiresGitPreflight {
-            let local = await codemapLocalGitClassificationProbe.resolve(rootURL)
-            guard !Task.isCancelled else { return .cancelled }
-            guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
-            if case let .definitelyNonGit(proof) = local,
-               codemapLocalGitClassificationProbe.validate(proof) == .current
-            {
-                return .terminal(.nonGit, proof)
-            }
+            .resolvingSymlinksInPath().standardizedFileURL
+        let local = await codemapLocalGitClassificationProbe.resolve(rootURL)
+        guard !Task.isCancelled else { return .cancelled }
+        guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
+        if case let .definitelyNonGit(proof) = local,
+           case let .current(currentProof) = codemapLocalGitClassificationProbe.refresh(proof)
+        {
+            return nonGitCodeMapsEnabled ? .eligible(.filesystem(currentProof)) : .terminal(.nonGit)
         }
         guard !Task.isCancelled else { return .cancelled }
         guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
         let result = await codemapGitEligibilityProbe.resolve(rootURL)
         guard !Task.isCancelled else { return .cancelled }
         guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
-        return switch result {
+        switch result {
         case .eligible:
-            .eligible
+            return .eligible(.gitPreflightPassed)
         case let .terminalUnavailable(reason):
-            .terminal(reason, nil)
+            guard reason == .nonGit else { return .terminal(reason) }
+            // Git preflight reporting non-Git is not a final answer. Either a fresh definite proof
+            // admits the root, or this stays transient and goes through existing retry/exhaustion.
+            let retry = await codemapLocalGitClassificationProbe.resolve(rootURL)
+            guard !Task.isCancelled else { return .cancelled }
+            guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
+            guard case let .definitelyNonGit(proof) = retry,
+                  case let .current(currentProof) = codemapLocalGitClassificationProbe.refresh(proof)
+            else { return .transient(.repositoryChanging) }
+            return nonGitCodeMapsEnabled ? .eligible(.filesystem(currentProof)) : .terminal(.nonGit)
         case let .transientUnavailable(reason):
-            .transient(reason)
+            return .transient(reason)
         }
+    }
+
+    /// Terminal setup disposition for a root, or nil while it is merely pending or retryable.
+    private func codemapTerminalSetupUnavailableReason(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapArtifactDemandUnavailableReason? {
+        guard case let .unavailable(reason)? =
+            codemapSessionsByRootEpoch[rootEpoch]?.setupDisposition,
+            codemapUnavailableIsStable(reason)
+        else { return nil }
+        return reason
+    }
+
+    /// Accepts the engine's routed report that the root authority behind one registration is no
+    /// longer current.
+    ///
+    /// The engine has already prevented further serving and late publication. This installs the
+    /// existing mutation fence and lets the existing cleanup flight own draining and re-resolution;
+    /// it must never await the reporting worker's own drain.
+    private func acceptCodemapRootAuthorityInvalidation(
+        registration: WorkspaceCodemapBindingRootRegistration,
+        authority: CodemapRootAuthority
+    ) {
+        // Same-epoch authority replacement reuses the root epoch, so an epoch-keyed route lookup
+        // can deliver a delayed report to the registration that already replaced the reporting one.
+        // The report therefore has to name its originating registration, and this closure's
+        // captured setup authority is what it is checked against: a replacement always carries
+        // strictly newer catalog and ingress generations, so a foreign report cannot match.
+        let rootEpoch = authority.rootEpoch
+        guard codemapSetupRegistration(for: authority) == registration,
+              let session = codemapSessionsByRootEpoch[rootEpoch],
+              session.authority == authority,
+              session.engine != nil,
+              codemapAuthorityIsCurrent(authority)
+        else { return }
+        // Detach installs the existing mutation fence and hands draining plus same-epoch
+        // replacement registration to the cleanup flight. Deliberately not awaited: the reporting
+        // worker must never wait on its own drain.
+        let cleanup = detachCodemapSession(
+            rootEpoch: rootEpoch,
+            invalidationCommands: [.repositoryAuthority]
+        )
+        // A revoked root authority means the physical binding moved, so the loaded catalog can no
+        // longer be trusted to describe what is on disk. Recovery reconciles it first and only then
+        // releases the replacement graph build; rebuilding from the retired inventory would map
+        // files that are gone and omit files that are newly present. Deliberately not awaited: the
+        // reporting worker must never wait on its own drain.
+        beginCodemapRootAuthorityRecovery(authority: authority, predecessorCleanup: cleanup)
+    }
+
+    /// Registers the recovery that follows an accepted root-authority invalidation.
+    ///
+    /// The flight is owned like the other per-root-epoch codemap flights: a later
+    /// `detachCodemapSession` cancels it and drains it as predecessor work, and while it is
+    /// registered no replacement graph build can be scheduled for this root epoch. It is created
+    /// after the detach above so the detach that produced it cannot cancel it, and it carries that
+    /// detach's cleanup as its captured predecessor.
+    private func beginCodemapRootAuthorityRecovery(
+        authority: CodemapRootAuthority,
+        predecessorCleanup: CodemapCleanupFlight?
+    ) {
+        let rootEpoch = authority.rootEpoch
+        // Installed before the flight and independently of it: the requirement is what keeps the
+        // barrier closed if this task is cancelled or its retries exhaust, and it is idempotent so
+        // a restart joins an already running recovery instead of duplicating the obligation.
+        codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch] = CodemapCatalogRecoveryRequirement(
+            authority: authority
+        )
+        guard codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch] == nil else { return }
+        let flightID = UUID()
+        let predecessorCleanupTask = predecessorCleanup?.task
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await recoverCodemapRootAfterAuthorityReplacement(
+                rootEpoch: rootEpoch,
+                flightID: flightID,
+                predecessorCleanupTask: predecessorCleanupTask
+            )
+        }
+        codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch] = CodemapRootAuthorityRecoveryFlight(
+            id: flightID,
+            rootEpoch: rootEpoch,
+            authority: authority,
+            task: task
+        )
+        publishCodemapRootStatusesIfChanged()
+    }
+
+    /// Registration value `performCodemapSetup` hands to the engine for one setup authority.
+    private func codemapSetupRegistration(
+        for authority: CodemapRootAuthority
+    ) -> WorkspaceCodemapBindingRootRegistration {
+        WorkspaceCodemapBindingRootRegistration(
+            rootID: authority.rootEpoch.rootID,
+            rootLifetimeID: authority.rootEpoch.rootLifetimeID,
+            loadedRootURL: URL(fileURLWithPath: authority.standardizedRootPath, isDirectory: true),
+            catalogGeneration: authority.catalogGeneration,
+            ingressGeneration: authority.ingressGeneration
+        )
+    }
+
+    /// Reconciles the physical catalog after a root binding change, then releases the replacement
+    /// graph build.
+    ///
+    /// This reuses the same store-owned catalog reconciliation the checkout-authority refresh runs
+    /// after its fence, so it applies through the ordinary delta ingress whether or not a watcher
+    /// is attached. It deliberately runs outside the cleanup flight: a path fence taken during
+    /// reconciliation waits on any registered cleanup flight, so reconciling from inside one would
+    /// make each side wait for the other. The replacement build is released here rather than by the
+    /// cleanup flight so the reconciled catalog is in place before graph work enumerates it.
+    private func recoverCodemapRootAfterAuthorityReplacement(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        flightID: UUID,
+        predecessorCleanupTask: Task<Void, Never>?
+    ) async {
+        guard rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID else {
+            finishCodemapRootAuthorityRecovery(
+                rootEpoch: rootEpoch,
+                flightID: flightID,
+                didReconcile: false
+            )
+            return
+        }
+        // Deliberately the cleanup captured when this recovery was created, not whichever flight is
+        // registered by the time it starts. Recovery must not begin before its own detach has
+        // drained, but a later detach cancels this recovery and drains it as predecessor work:
+        // waiting on the flight registered at that point would be waiting on a cleanup that is
+        // waiting for this task. Nothing created before this task can depend on it, so waiting on
+        // the captured predecessor is acyclic by construction.
+        if let predecessorCleanupTask {
+            await predecessorCleanupTask.value
+        }
+        var attempt = 0
+        while true {
+            // Ownership is checked with cancellation and lifetime: a detach removes this flight
+            // before cancelling it, so a recovery that is no longer the registered one must not
+            // reconcile an epoch that has been handed to a cleanup flight or to a newer recovery.
+            guard !Task.isCancelled,
+                  codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch]?.id == flightID,
+                  rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID
+            else {
+                finishCodemapRootAuthorityRecovery(
+                    rootEpoch: rootEpoch,
+                    flightID: flightID,
+                    didReconcile: false
+                )
+                return
+            }
+            if await applyCodemapRecoveryReconciliation(rootEpoch: rootEpoch, flightID: flightID) {
+                finishCodemapRootAuthorityRecovery(
+                    rootEpoch: rootEpoch,
+                    flightID: flightID,
+                    didReconcile: true
+                )
+                return
+            }
+            attempt += 1
+            // Bounded retry through the existing graph-index retry policy. Exhaustion retires the
+            // task but not the requirement it ran for: that record is what keeps setup, demand and
+            // every build route from enumerating the retired inventory, and what a later resume
+            // restarts. Only a successful scan, or the unload that ends the epoch, discharges it.
+            guard attempt <= codemapGraphIndexBuildRetryPolicy.maximumRetryCount else {
+                // A superseded scan must not mark its replacement as exhausted.
+                if codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch]?.id == flightID {
+                    codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted = true
+                }
+                finishCodemapRootAuthorityRecovery(
+                    rootEpoch: rootEpoch,
+                    flightID: flightID,
+                    didReconcile: false
+                )
+                return
+            }
+            try? await codemapGraphIndexBuildRetryPolicy.sleep(
+                codemapGraphIndexBuildRetryPolicy.backoffNanoseconds(forAttempt: attempt)
+            )
+        }
+    }
+
+    /// Runs one reconciliation attempt as the recovery's own catalog application.
+    ///
+    /// The task-local identity is what lets `codemapRecoveryOwnsCatalogApplication` recognise the
+    /// resulting deltas as belonging to this recovery rather than to an external mutation that
+    /// happens to interleave while the disk scan is suspended.
+    private func applyCodemapRecoveryReconciliation(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        flightID: UUID
+    ) async -> Bool {
+        await Self.$activeCodemapRecoveryApplication.withValue(
+            CodemapRecoveryApplication(rootEpoch: rootEpoch, flightID: flightID)
+        ) {
+            await performLoadedRootCatalogReconciliation(rootID: rootEpoch.rootID).succeeded
+        }
+    }
+
+    /// Retires the recovery task, and on a successful scan discharges its requirement and releases
+    /// the replacement graph build.
+    ///
+    /// A revoked root authority leaves no launch behind, so the replacement authority needs the
+    /// same reschedule that path and root mutation fences perform. Without it the root would
+    /// re-register and issue a newer authority but never rebuild its selection graph. Both the
+    /// requirement and the flight are retired before that reschedule, because both are fences the
+    /// schedule check honours. A cancelled, superseded or exhausted recovery retires only the task:
+    /// its requirement stays, so nothing is admitted until some later recovery actually reconciles.
+    private func finishCodemapRootAuthorityRecovery(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        flightID: UUID,
+        didReconcile: Bool
+    ) {
+        guard codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch]?.id == flightID else { return }
+        defer { publishCodemapRootStatusesIfChanged() }
+        codemapRootAuthorityRecoveryFlightsByRootEpoch.removeValue(forKey: rootEpoch)
+        guard didReconcile else { return }
+        codemapCatalogRecoveryRequirementsByRootEpoch.removeValue(forKey: rootEpoch)
+        guard rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID else { return }
+        codemapGraphIndexBuildReschedulePendingRootEpochs.insert(rootEpoch)
+        schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(rootEpoch: rootEpoch)
+    }
+
+    /// Restarts an authority recovery whose task was cancelled or exhausted while its catalog
+    /// requirement is still outstanding.
+    ///
+    /// A running recovery is joined rather than replaced, and the barrier is never opened here: the
+    /// requirement stays registered until the restarted scan succeeds, so callers that follow this
+    /// with a schedule request still schedule nothing until then.
+    private func restartCodemapCatalogRecoveryIfPending(rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard let requirement = codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch],
+              codemapRootAuthorityRecoveryFlightsByRootEpoch[rootEpoch] == nil,
+              !codemapGenerationIsSuspended(rootEpoch: rootEpoch),
+              rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID
+        else { return }
+        beginCodemapRootAuthorityRecovery(
+            authority: requirement.authority,
+            predecessorCleanup: codemapCleanupFlightsByRootID[rootEpoch.rootID]
+        )
     }
 
     private func installCodemapTerminalSetupDisposition(
@@ -13430,23 +13949,29 @@ actor WorkspaceFileContextStore {
     }
 
     private func ensureCodemapSetupTask(
-        authority: CodemapRootAuthority
+        authority: CodemapRootAuthority,
+        evidence: WorkspaceCodemapRootEligibilityEvidence?
     ) -> Task<CodemapSetupDisposition, Never>? {
         guard !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
+              !codemapRootWorkIsFenced(rootEpoch: authority.rootEpoch),
               codemapPreflightAuthorityIsCurrent(authority)
         else { return nil }
         codemapCompletedEligibilityByRootEpoch.removeValue(forKey: authority.rootEpoch)
         if let existing = codemapSessionsByRootEpoch[authority.rootEpoch] {
             guard existing.authority == authority else { return nil }
+            if let evidence, existing.setupTask == nil, existing.setupDisposition == nil {
+                codemapSessionsByRootEpoch[authority.rootEpoch]?.eligibilityEvidence = evidence
+            }
             if let setupTask = existing.setupTask { return setupTask }
             if let disposition = existing.setupDisposition {
                 return Task { disposition }
             }
         } else {
-            codemapSessionsByRootEpoch[authority.rootEpoch] = CodemapRootSession(
-                authority: authority
-            )
+            var session = CodemapRootSession(authority: authority)
+            session.eligibilityEvidence = evidence
+            codemapSessionsByRootEpoch[authority.rootEpoch] = session
         }
+        let setupEvidence = codemapSessionsByRootEpoch[authority.rootEpoch]?.eligibilityEvidence
         #if DEBUG
             codemapSetupTaskCreationCountForTesting += 1
         #endif
@@ -13454,7 +13979,7 @@ actor WorkspaceFileContextStore {
             guard let self else {
                 return CodemapSetupDisposition.unavailable(.cancelled)
             }
-            return await performCodemapSetup(authority: authority)
+            return await performCodemapSetup(authority: authority, evidence: setupEvidence)
         }
         codemapSessionsByRootEpoch[authority.rootEpoch]?.setupTask = setupTask
         return setupTask
@@ -13677,8 +14202,7 @@ actor WorkspaceFileContextStore {
         if codemapGenerationIsSuspended(rootEpoch: rootEpoch) {
             return .init(result: .unavailable(.cancelled), ownership: .notAcquired)
         }
-        if codemapCleanupFlightsByRootID[file.rootID] != nil ||
-            codemapRootMutationFenceTokensByRootEpoch[rootEpoch] != nil ||
+        if codemapRootWorkIsFenced(rootEpoch: rootEpoch) ||
             codemapPathIsFenced(rootEpoch: rootEpoch, relativePath: file.standardizedRelativePath)
         {
             return .init(result: .unavailable(.busy(retryAfterMilliseconds: nil)), ownership: .notAcquired)
@@ -13715,25 +14239,12 @@ actor WorkspaceFileContextStore {
             codemapSessionsByRootEpoch[rootEpoch]?.setupDisposition,
             codemapUnavailableIsStable(reason)
         {
-            var shouldReturnStableUnavailable = true
-            if case .gitTerminal(.nonGit) = reason,
-               let cached = terminalNonGitCodemapCacheByEpoch[rootEpoch]
-            {
-                if cached.standardizedRootPath == authority.standardizedRootPath,
-                   codemapLocalGitClassificationProbe.validate(cached.proof) == .current
-                {
-                    shouldReturnStableUnavailable = true
-                } else {
-                    codemapCompletedEligibilityByRootEpoch.removeValue(forKey: rootEpoch)
-                    codemapSessionsByRootEpoch.removeValue(forKey: rootEpoch)
-                    shouldReturnStableUnavailable = false
-                }
-            }
-            if shouldReturnStableUnavailable {
-                return .init(result: .unavailable(reason), ownership: .notAcquired)
-            }
+            // `nonGit` is only ever a negative Git preflight result now, so it can no longer be a
+            // terminal session disposition and needs no positive-proof escape hatch here.
+            return .init(result: .unavailable(reason), ownership: .notAcquired)
         }
 
+        var demandEligibilityEvidence: WorkspaceCodemapRootEligibilityEvidence?
         if codemapSessionsByRootEpoch[rootEpoch] == nil {
             let eligibility = await resolveCodemapEligibility(authority: authority)
             guard codemapPreflightAuthorityIsCurrent(authority),
@@ -13745,13 +14256,13 @@ actor WorkspaceFileContextStore {
                 return .init(result: .unavailable(.staleCurrentness), ownership: .notAcquired)
             }
             switch eligibility {
-            case .eligible:
-                break
-            case let .terminal(reason, _):
-                installCodemapTerminalSetupDisposition(.gitTerminal(reason), authority: authority)
-                return .init(result: .unavailable(.gitTerminal(reason)), ownership: .notAcquired)
+            case let .eligible(evidence):
+                demandEligibilityEvidence = evidence
+            case let .terminal(reason):
+                installCodemapTerminalSetupDisposition(.rootTerminal(reason), authority: authority)
+                return .init(result: .unavailable(.rootTerminal(reason)), ownership: .notAcquired)
             case let .transient(reason):
-                return .init(result: .unavailable(.gitTransient(reason)), ownership: .notAcquired)
+                return .init(result: .unavailable(.rootTransient(reason)), ownership: .notAcquired)
             case .stale:
                 return .init(result: .unavailable(.staleCurrentness), ownership: .notAcquired)
             case .cancelled:
@@ -13794,7 +14305,9 @@ actor WorkspaceFileContextStore {
         }
 
         if codemapSessionsByRootEpoch[rootEpoch] == nil {
-            codemapSessionsByRootEpoch[rootEpoch] = CodemapRootSession(authority: authority)
+            var session = CodemapRootSession(authority: authority)
+            session.eligibilityEvidence = demandEligibilityEvidence
+            codemapSessionsByRootEpoch[rootEpoch] = session
         }
 
         let pathGeneration = codemapSessionsByRootEpoch[rootEpoch]?
@@ -13823,7 +14336,7 @@ actor WorkspaceFileContextStore {
             task: nil
         )
 
-        _ = ensureCodemapSetupTask(authority: authority)
+        _ = ensureCodemapSetupTask(authority: authority, evidence: demandEligibilityEvidence)
 
         codemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id] = record
         #if DEBUG
@@ -14004,6 +14517,11 @@ actor WorkspaceFileContextStore {
             } else if let session = codemapSessionsByRootEpoch[rootEpoch],
                       codemapAuthorityIsCurrent(session.authority),
                       let engine = session.engine,
+                      // A committed graph keeps answering after indexing finishes, so this serving
+                      // boundary validates the root binding itself instead of relying on graph
+                      // work that may no longer be running.
+                      await engine.rootAuthorityIsCurrentForServing(rootEpoch: rootEpoch),
+                      codemapAuthorityIsCurrent(session.authority),
                       let graph = await engine.selectionGraph(rootEpoch: rootEpoch)
             {
                 let capturedAuthority = session.authority
@@ -14056,18 +14574,21 @@ actor WorkspaceFileContextStore {
                     continue
                 }
             } else {
-                let isNonGit = terminalNonGitCodemapCacheByEpoch[rootEpoch] != nil
+                // Unavailability follows the root's actual terminal setup disposition. An admitted
+                // root that is still awaiting its graph stays pending, whatever its source mode is.
+                let terminalReason = codemapTerminalSetupUnavailableReason(rootEpoch: rootEpoch)
+                let isUnavailable = terminalReason != nil
                 roots.append(WorkspaceCodemapStructureRootResult(
                     rootEpoch: rootEpoch,
                     rootDisplayName: rootName,
-                    status: isNonGit ? .unavailable : .pending,
+                    status: isUnavailable ? .unavailable : .pending,
                     coverage: nil,
-                    updatesPending: !isNonGit,
+                    updatesPending: !isUnavailable,
                     seeds: rootSeedIDs.map {
                         WorkspaceCodemapStructureSeedResult(
                             fileID: $0,
                             path: seedPathsByFileID[$0] ?? rootName,
-                            state: isNonGit ? .notIndexed : .pending
+                            state: isUnavailable ? .notIndexed : .pending
                         )
                     },
                     nodes: [],
@@ -14075,15 +14596,15 @@ actor WorkspaceFileContextStore {
                     unresolved: [],
                     truncation: nil,
                     issues: [WorkspaceCodemapStructureIssueRecord(
-                        code: isNonGit ? "git_root_unavailable" : "graph_indexing",
+                        code: isUnavailable ? "git_root_unavailable" : "graph_indexing",
                         phase: "graph_snapshot",
                         path: nil,
-                        retryable: !isNonGit,
-                        retryAfterMilliseconds: isNonGit ? nil : 100,
+                        retryable: !isUnavailable,
+                        retryAfterMilliseconds: isUnavailable ? nil : 100,
                         attempted: nil,
                         limit: nil,
-                        message: isNonGit
-                            ? "Code structure is unavailable because this root has no Git repository authority."
+                        message: isUnavailable
+                            ? "Code structure is unavailable because this root has no usable source authority."
                             : "The root-local committed graph is still being initialized."
                     )],
                     receipt: nil
@@ -14143,8 +14664,7 @@ actor WorkspaceFileContextStore {
             guard let receipt = root.receipt,
                   let session = codemapSessionsByRootEpoch[root.rootEpoch],
                   codemapAuthorityIsCurrent(session.authority),
-                  let engine = session.engine,
-                  let graph = await engine.selectionGraph(rootEpoch: root.rootEpoch)
+                  let engine = session.engine
             else {
                 if root.hasUsefulData {
                     dispositions[root.rootEpoch] = .invalid(
@@ -14154,8 +14674,30 @@ actor WorkspaceFileContextStore {
                 }
                 continue
             }
+            // Accepting a receipt is a serving boundary of its own. The committed graph still
+            // carries the authority it was built under, so an unannounced physical replacement can
+            // only be observed by revalidating the root binding here as well; a failed check
+            // invalidates the receipt instead of preserving its structure.
+            guard await engine.rootAuthorityIsCurrentForServing(rootEpoch: root.rootEpoch),
+                  codemapSessionsByRootEpoch[root.rootEpoch]?.authority == session.authority,
+                  let graph = await engine.selectionGraph(rootEpoch: root.rootEpoch)
+            else {
+                dispositions[root.rootEpoch] = .invalid(
+                    code: "graph_revalidation_failed",
+                    message: "The root binding changed after this structure result was produced."
+                )
+                continue
+            }
             let affectedFileIDs = Set(root.nodes.map(\.fileID)).union(root.seeds.map(\.fileID))
-            switch await graph.revalidate(receipt, affectedFileIDs: affectedFileIDs) {
+            let graphDisposition = await graph.revalidate(receipt, affectedFileIDs: affectedFileIDs)
+            guard codemapSessionsByRootEpoch[root.rootEpoch]?.authority == session.authority else {
+                dispositions[root.rootEpoch] = .invalid(
+                    code: "graph_revalidation_failed",
+                    message: "The root binding changed after this structure result was produced."
+                )
+                continue
+            }
+            switch graphDisposition {
             case let .valid(freshness):
                 dispositions[root.rootEpoch] = .valid(updatesPending: freshness != .current)
             case .invalid:
@@ -15042,7 +15584,8 @@ actor WorkspaceFileContextStore {
     #endif
 
     private func performCodemapSetup(
-        authority: CodemapRootAuthority
+        authority: CodemapRootAuthority,
+        evidence: WorkspaceCodemapRootEligibilityEvidence?
     ) async -> CodemapSetupDisposition {
         guard codemapAuthorityIsCurrent(authority) else {
             return .unavailable(.staleCurrentness)
@@ -15104,6 +15647,11 @@ actor WorkspaceFileContextStore {
                     update,
                     authority: authority
                 )
+            } reportRootAuthorityInvalidated: { [weak self] registration in
+                await self?.acceptCodemapRootAuthorityInvalidation(
+                    registration: registration,
+                    authority: authority
+                )
             }
         )
         let registry = runtime.bindingIntegrationRegistry
@@ -15144,17 +15692,18 @@ actor WorkspaceFileContextStore {
             return .unavailable(.staleCurrentness)
         }
         codemapSessionsByRootEpoch[authority.rootEpoch]?.engine = engine
+        if codemapSessionsByRootEpoch[authority.rootEpoch]?.engine != nil {
+            // The live session is now this epoch's engine owner, so an earlier detach's retained
+            // release would be a second owner of one obligation — and the epoch it names is the
+            // one being registered here, not a retired binding.
+            codemapRetainedTerminalReleasesByRootEpoch.removeValue(forKey: authority.rootEpoch)
+        }
 
-        let registration = WorkspaceCodemapBindingRootRegistration(
-            rootID: authority.rootEpoch.rootID,
-            rootLifetimeID: authority.rootEpoch.rootLifetimeID,
-            loadedRootURL: URL(fileURLWithPath: authority.standardizedRootPath, isDirectory: true),
-            catalogGeneration: authority.catalogGeneration,
-            ingressGeneration: authority.ingressGeneration
-        )
+        let registration = codemapSetupRegistration(for: authority)
         let rootSelectionGraph = selectionGraphFactory.make(rootEpoch: authority.rootEpoch)
         let registrationResult = await engine.registerRoot(
             registration,
+            evidence: evidence,
             selectionGraph: rootSelectionGraph
         )
         guard codemapAuthorityIsCurrent(authority), !Task.isCancelled else {
@@ -15169,9 +15718,9 @@ actor WorkspaceFileContextStore {
         case let .unavailable(state):
             switch state {
             case let .terminalUnavailable(reason):
-                .unavailable(.gitTerminal(reason))
+                .unavailable(.rootTerminal(reason))
             case let .transientUnavailable(reason, _):
-                .unavailable(.gitTransient(reason))
+                .unavailable(.rootTransient(reason))
             case .unresolved, .resolving, .eligible:
                 .unavailable(.registrationFailed)
             }
@@ -16140,11 +16689,11 @@ actor WorkspaceFileContextStore {
         switch reason {
         case .rootNotLoaded, .fileNotCataloged, .unsupportedFileType:
             true
-        case let .gitTerminal(reason):
+        case let .rootTerminal(reason):
             reason != .releasedRootEpoch
         case let .demandUnavailable(reason):
             reason != .transient
-        case .gitTransient, .busy, .rejected, .routeConflict, .registrationFailed,
+        case .rootTransient, .busy, .rejected, .routeConflict, .registrationFailed,
              .runtimeFailure, .staleCurrentness, .cancelled:
             false
         }
@@ -16625,7 +17174,7 @@ actor WorkspaceFileContextStore {
         rootEpoch: WorkspaceCodemapRootEpoch,
         invalidationCommands: [CodemapInvalidationCommand] = [.catalogAdvanced],
         graphInvalidationReason: WorkspaceCodemapGraphRevocationReason =
-            .repositoryAuthorityChanged
+            .rootAuthorityChanged
     ) -> CodemapCleanupFlight? {
         codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
         let launch = codemapGraphIndexBuildLaunchesByRootEpoch.removeValue(forKey: rootEpoch)
@@ -16641,6 +17190,11 @@ actor WorkspaceFileContextStore {
         eligibilityFlight?.task.cancel()
         let graphIndexRetry = codemapGraphIndexBuildRetriesByRootEpoch.removeValue(forKey: rootEpoch)
         graphIndexRetry?.task.cancel()
+        // A recovery flight from an earlier authority replacement belongs to the lifetime being
+        // detached now, so it is cancelled here and drained with the other predecessor work below.
+        let authorityRecoveryFlight = codemapRootAuthorityRecoveryFlightsByRootEpoch
+            .removeValue(forKey: rootEpoch)
+        authorityRecoveryFlight?.task.cancel()
         let completedEligibility = codemapCompletedEligibilityByRootEpoch.removeValue(
             forKey: rootEpoch
         )
@@ -16670,16 +17224,40 @@ actor WorkspaceFileContextStore {
                 changes: changes
             ))
         }
+        let unloadsRoot = invalidationCommands.contains(where: \.unloadsRoot)
+        let retainedTerminalRelease = codemapRetainedTerminalReleasesByRootEpoch[rootEpoch]
+        // A retained terminal release is the root's last record of an epoch whose engine handle an
+        // earlier detach already took, so an unload has to be admitted on that alone. Only a
+        // terminal command is admitted that way: a non-terminal invalidation for an epoch with no
+        // live work would re-run an invalidation the engine has already applied.
+        // An in-flight authority recovery is outstanding root work in its own right — during that
+        // interval it is the only record of the revoked authority — so it must reach the cleanup
+        // flight below rather than be cancelled and forgotten here.
         guard session != nil || launch != nil || eligibilityFlight != nil || completedEligibility != nil
-            || graphIndexRetry != nil
+            || graphIndexRetry != nil || authorityRecoveryFlight != nil
+            || (unloadsRoot && retainedTerminalRelease != nil)
         else {
             return codemapCleanupFlightsByRootID[rootEpoch.rootID]
         }
         advanceCodemapGraphIndexInvalidationGeneration(rootEpoch: rootEpoch)
         guard let authority = session?.authority ?? launch?.authority ?? eligibilityFlight?.authority
             ?? completedEligibility?.authority ?? graphIndexRetry?.authority
+            ?? authorityRecoveryFlight?.authority ?? retainedTerminalRelease?.authority
         else {
             return codemapCleanupFlightsByRootID[rootEpoch.rootID]
+        }
+        let detachedEngine = session?.engine ?? retainedTerminalRelease?.engine
+        // The epoch's engine handle changes owner here. A terminal detach hands it to the cleanup
+        // chain that releases it, so the retained record is retired; every other detach leaves the
+        // epoch registered with the engine and no session holding it, so the record is what keeps
+        // that obligation reachable until a later setup or unload takes it.
+        if unloadsRoot {
+            codemapRetainedTerminalReleasesByRootEpoch.removeValue(forKey: rootEpoch)
+        } else if let detachedEngine {
+            codemapRetainedTerminalReleasesByRootEpoch[rootEpoch] = CodemapRetainedTerminalRelease(
+                authority: authority,
+                engine: detachedEngine
+            )
         }
         let authorityGeneration = codemapAuthorityGenerationsByRootEpoch[rootEpoch]
             ?? authority.ingressGeneration
@@ -16696,13 +17274,15 @@ actor WorkspaceFileContextStore {
         for bundle in session.map({ Array($0.bundlesByRequestID.values) }) ?? [] {
             bundle.close()
         }
-        let predecessorTasks = codemapPathInvalidationFlightsByRootEpoch[rootEpoch]
-            .map { [$0.task] } ?? []
+        let predecessorTasks = (codemapPathInvalidationFlightsByRootEpoch[rootEpoch].map { [$0.task] } ?? [])
+            + (authorityRecoveryFlight.map { [$0.task] } ?? [])
         let detached = DetachedCodemapSession(
             authority: authority,
             registry: session?.runtime?.bindingIntegrationRegistry,
             routeToken: session?.routeToken,
-            engine: session?.engine,
+            // Recovery-only and record-less detaches have no session left, but still have to
+            // terminalize the engine epoch the revoked authority belonged to.
+            engine: detachedEngine,
             owners: demandRecords.map(\.owner),
             setupTask: session?.setupTask,
             demandTasks: demandRecords.compactMap(\.task),
@@ -16721,69 +17301,82 @@ actor WorkspaceFileContextStore {
         return startCodemapCleanup(detached)
     }
 
+    /// Registers one detached session as the root's outstanding cleanup obligation.
+    ///
+    /// A root has at most one registered flight, and it is the tail of a strictly ordered chain:
+    /// work detached while an earlier flight is registered runs *after* that flight instead of
+    /// being merged into it or dropped. Merging is impossible — a flight's commands, engine handle
+    /// and predecessor tasks are fixed when it is created, so it can neither drain work detached
+    /// later nor terminalize on a later unload's behalf — and dropping would strand exactly that
+    /// work, most visibly a cancelled authority recovery that nothing would then wait for. Each
+    /// link keeps its own waiters; only the tail is registered, so the root stays fenced until the
+    /// whole chain has drained.
     private func startCodemapCleanup(
         _ detached: DetachedCodemapSession
     ) -> CodemapCleanupFlight {
-        if let existing = codemapCleanupFlightsByRootID[detached.authority.rootEpoch.rootID] {
-            return existing
-        }
+        let rootID = detached.authority.rootEpoch.rootID
+        let predecessor = codemapCleanupFlightsByRootID[rootID]
         let cleanupID = UUID()
         let task = Task { [weak self] in
-            for predecessorTask in detached.predecessorTasks {
-                await predecessorTask.value
+            if let predecessor {
+                await predecessor.task.value
             }
-            if let graphStatusTask = detached.graphStatusTask {
-                await graphStatusTask.value
-            }
-            if let graphWorkerRecoveryStatusTask = detached.graphWorkerRecoveryStatusTask {
-                await graphWorkerRecoveryStatusTask.value
-            }
-            await detached.selectionGraph?.shutdown(reason: detached.graphInvalidationReason)
-            if let registry = detached.registry, let routeToken = detached.routeToken {
-                _ = await registry.unregister(routeToken)
-            }
-            if let engine = detached.engine {
-                await self?.applyCodemapInvalidationCommands(
-                    detached.invalidationCommands,
-                    rootEpoch: detached.authority.rootEpoch,
-                    engine: engine
-                )
-                for owner in detached.owners {
-                    _ = await engine.cancel(owner: owner)
-                }
-                if detached.invalidationCommands.contains(where: {
-                    if case .unload = $0 { true } else { false }
-                }) {
-                    await engine.unloadRoot(rootEpoch: detached.authority.rootEpoch)
-                }
-            }
-            if let setupTask = detached.setupTask {
-                _ = await setupTask.value
-            }
-            if let preloadLaunchTask = detached.preloadLaunchTask {
-                await preloadLaunchTask.value
-            }
-            if let eligibilityTask = detached.eligibilityTask {
-                _ = await eligibilityTask.value
-            }
-            if let graphIndexRetryTask = detached.graphIndexRetryTask {
-                await graphIndexRetryTask.value
-            }
-            for demandTask in detached.demandTasks {
-                await demandTask.value
-            }
-            await self?.finishCodemapCleanup(
-                rootID: detached.authority.rootEpoch.rootID,
-                cleanupID: cleanupID
-            )
+            await self?.performDetachedCodemapCleanup(detached)
+            await self?.finishCodemapCleanup(rootID: rootID, cleanupID: cleanupID)
         }
         let flight = CodemapCleanupFlight(
             id: cleanupID,
             rootEpoch: detached.authority.rootEpoch,
             task: task
         )
-        codemapCleanupFlightsByRootID[detached.authority.rootEpoch.rootID] = flight
+        codemapCleanupFlightsByRootID[rootID] = flight
         return flight
+    }
+
+    /// Drains and terminalizes one detached session. Runs once per link of a root's cleanup chain,
+    /// after every earlier link has completed.
+    private func performDetachedCodemapCleanup(_ detached: DetachedCodemapSession) async {
+        for predecessorTask in detached.predecessorTasks {
+            await predecessorTask.value
+        }
+        if let graphStatusTask = detached.graphStatusTask {
+            await graphStatusTask.value
+        }
+        if let graphWorkerRecoveryStatusTask = detached.graphWorkerRecoveryStatusTask {
+            await graphWorkerRecoveryStatusTask.value
+        }
+        await detached.selectionGraph?.shutdown(reason: detached.graphInvalidationReason)
+        if let registry = detached.registry, let routeToken = detached.routeToken {
+            _ = await registry.unregister(routeToken)
+        }
+        if let engine = detached.engine {
+            await applyCodemapInvalidationCommands(
+                detached.invalidationCommands,
+                rootEpoch: detached.authority.rootEpoch,
+                engine: engine
+            )
+            for owner in detached.owners {
+                _ = await engine.cancel(owner: owner)
+            }
+            if detached.invalidationCommands.contains(where: \.unloadsRoot) {
+                await engine.unloadRoot(rootEpoch: detached.authority.rootEpoch)
+            }
+        }
+        if let setupTask = detached.setupTask {
+            _ = await setupTask.value
+        }
+        if let preloadLaunchTask = detached.preloadLaunchTask {
+            await preloadLaunchTask.value
+        }
+        if let eligibilityTask = detached.eligibilityTask {
+            _ = await eligibilityTask.value
+        }
+        if let graphIndexRetryTask = detached.graphIndexRetryTask {
+            await graphIndexRetryTask.value
+        }
+        for demandTask in detached.demandTasks {
+            await demandTask.value
+        }
     }
 
     private func applyCodemapInvalidationCommands(
@@ -16824,14 +17417,22 @@ actor WorkspaceFileContextStore {
     }
 
     private func finishCodemapCleanup(rootID: UUID, cleanupID: UUID) {
-        guard codemapCleanupFlightsByRootID[rootID]?.id == cleanupID else { return }
-        let rootEpoch = codemapCleanupFlightsByRootID[rootID]?.rootEpoch
-        codemapCleanupFlightsByRootID.removeValue(forKey: rootID)
+        // Waiters joined one specific link, so a link that a later chained detach superseded still
+        // has to release its own. Only the tail deregisters the root: until it does, the chain is
+        // still outstanding work and the root stays fenced.
         let waiters = codemapCleanupWaitersByCleanupID.removeValue(forKey: cleanupID) ?? [:]
         for continuation in waiters.values {
             continuation.resume()
         }
+        guard codemapCleanupFlightsByRootID[rootID]?.id == cleanupID else { return }
+        let rootEpoch = codemapCleanupFlightsByRootID[rootID]?.rootEpoch
+        codemapCleanupFlightsByRootID.removeValue(forKey: rootID)
         if let rootEpoch {
+            // Every non-terminal detach that cancelled an authority recovery drains through a
+            // chain ending here, so this is where the requirement it left behind gets its task
+            // back. Suspension is the one case that cannot restart here, because the root must
+            // stay idle until it is resumed; resume performs the same restart itself.
+            restartCodemapCatalogRecoveryIfPending(rootEpoch: rootEpoch)
             schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(rootEpoch: rootEpoch)
         }
     }
@@ -17050,10 +17651,9 @@ actor WorkspaceFileContextStore {
             return
         }
         guard codemapGraphIndexBuildReschedulePendingRootEpochs.contains(rootEpoch),
-              codemapRootMutationFenceTokensByRootEpoch[rootEpoch] == nil,
+              !codemapRootWorkIsFenced(rootEpoch: rootEpoch),
               codemapPathInvalidationFlightsByRootEpoch[rootEpoch] == nil,
               !codemapPathFenceTokensByID.values.contains(where: { $0.rootEpoch == rootEpoch }),
-              codemapCleanupFlightsByRootID[rootEpoch.rootID] == nil,
               rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID
         else { return }
         codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
@@ -19907,7 +20507,11 @@ actor WorkspaceFileContextStore {
             requiresFullResync: requiresFullResync
         )
         if let rootCommand = invalidation.rootCommand {
-            if repositoryMutationFence == nil {
+            // Same ownership rule as the repository-authority route above: the recovery that
+            // produced these deltas already holds this epoch, so it neither re-fences it nor waits
+            // on cleanup flights for it.
+            let recoveryOwnsApplication = codemapRecoveryOwnsCatalogApplication(rootID: rootID)
+            if repositoryMutationFence == nil, !recoveryOwnsApplication {
                 await fenceCodemapRootAuthority(rootIDs: [rootID], command: rootCommand)
             }
             guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
@@ -19920,7 +20524,7 @@ actor WorkspaceFileContextStore {
             // Publisher application has already revoked the old root codemap authority. Keep the
             // derived cleanup flight retained/fenced, but do not hold the basic catalog publication
             // open on its completion. Direct codemap-sensitive callers retain the synchronous fence.
-            if servicePublicationSequence == nil {
+            if servicePublicationSequence == nil, !recoveryOwnsApplication {
                 await awaitCodemapCleanupFlights(rootIDs: [rootID])
             }
             if repositoryMutationFence == nil, let current = rootStatesByID[rootID] {
@@ -19987,8 +20591,12 @@ actor WorkspaceFileContextStore {
         guard let state = rootStatesByID[rootID] else { return nil }
         let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
         if requiresFullResync {
-            terminalNonGitCodemapCacheByEpoch.removeValue(forKey: rootEpoch)
+            filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: rootEpoch)
         }
+        // Control-entry deltas produced by this root's own authority recovery stay under that
+        // recovery's barrier; detaching its owner again would deadlock it against the cleanup the
+        // detach creates.
+        guard !codemapRecoveryOwnsCatalogApplication(rootID: rootID) else { return nil }
         let repositoryLayoutMayHaveChanged = deltas.contains { prepared in
             let path = prepared.relativePath
             return path == ".git" || path.hasPrefix(".git/") || path == "HEAD" ||
@@ -19996,7 +20604,7 @@ actor WorkspaceFileContextStore {
         }
         guard repositoryLayoutMayHaveChanged else { return nil }
 
-        terminalNonGitCodemapCacheByEpoch.removeValue(forKey: rootEpoch)
+        filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: rootEpoch)
         recordCodemapGraphIndexBuildStoreEvent(
             .repositoryAuthorityDetached,
             rootEpoch: rootEpoch,
@@ -21257,7 +21865,7 @@ actor WorkspaceFileContextStore {
                 physicalRootPaths: normalizedPhysicalRootPaths,
                 dependencies: dependencies
             )
-        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots, _):
             let normalizedLogicalRootPaths = canonicalRoots.map(\.standardizedFullPath).sorted()
             let normalizedPhysicalRootPaths = physicalRoots.map(\.standardizedFullPath).sorted()
             let dependencies = rootsForPathLookup(scope: scope).compactMap { root -> SearchCatalogRootDependency? in
@@ -21330,8 +21938,9 @@ actor WorkspaceFileContextStore {
             hasher.combine(normalizedSessionSelectorPaths(canonicalRootPaths).sorted())
             hasher.combine(normalizedSessionSelectorPaths(physicalRootPaths).sorted())
             return UInt64(bitPattern: Int64(hasher.finalize()))
-        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots, includesGitData):
             var hasher = Hasher()
+            hasher.combine(includesGitData)
             hasher.combine("validatedSessionBoundWorkspace")
             hasher.combine(canonicalRoots.sorted { $0.id.uuidString < $1.id.uuidString })
             hasher.combine(physicalRoots.sorted { $0.id.uuidString < $1.id.uuidString })
@@ -21407,8 +22016,11 @@ actor WorkspaceFileContextStore {
             true
         case .allLoadedExcludingGitData:
             kinds.contains { $0 != .workspaceGitData }
-        case .sessionBoundWorkspace, .validatedSessionBoundWorkspace:
+        case .sessionBoundWorkspace:
             kinds.contains(.primaryWorkspace) || kinds.contains(.sessionWorktree)
+        case let .validatedSessionBoundWorkspace(_, _, includesGitData):
+            kinds.contains(.primaryWorkspace) || kinds.contains(.sessionWorktree)
+                || (includesGitData && kinds.contains(.workspaceGitData))
         }
     }
 
@@ -21448,7 +22060,7 @@ actor WorkspaceFileContextStore {
                     false
                 }
             }
-        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots, includesGitData):
             guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
                 canonicalRoots: canonicalRoots,
                 physicalRoots: physicalRoots
@@ -21459,7 +22071,9 @@ actor WorkspaceFileContextStore {
                     selector.canonicalRootPathsByID[root.id] == root.standardizedFullPath
                 case .sessionWorktree:
                     selector.physicalRootPathsByID[root.id] == root.standardizedFullPath
-                case .workspaceGitData, .supplementalSystem:
+                case .workspaceGitData:
+                    includesGitData && !canonicalRoots.isEmpty && physicalRoots.isEmpty
+                case .supplementalSystem:
                     false
                 }
             }

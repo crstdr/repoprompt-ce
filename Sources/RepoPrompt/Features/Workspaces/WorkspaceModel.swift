@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptFoundation
 
 struct WorkspaceDuplicateGroupSummary: Identifiable, Equatable {
     struct DuplicateWorkspaceRow: Identifiable, Equatable {
@@ -140,6 +141,10 @@ struct StoredSelection: Codable, Equatable, Hashable {
         self.codemapAutoEnabled = codemapAutoEnabled
     }
 
+    var isEmptyForSelectedFileTree: Bool {
+        selectedPaths.isEmpty && manualCodemapPaths.isEmpty && slices.isEmpty
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         try self.init(
@@ -223,6 +228,8 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
     var name: String
     var lastModified: Date
     var isPinned: Bool
+    /// Explicit order among pinned Agent sessions. nil preserves legacy activity sorting.
+    var pinnedOrder: Int?
     var activeChatSessionID: UUID?
     var activeAgentSessionID: UUID?
 
@@ -241,6 +248,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         name: String = "T1",
         lastModified: Date = Date(),
         isPinned: Bool = false,
+        pinnedOrder: Int? = nil,
         activeChatSessionID: UUID? = nil,
         activeAgentSessionID: UUID? = nil,
         selection: StoredSelection = .init(),
@@ -255,6 +263,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         self.name = name
         self.lastModified = lastModified
         self.isPinned = isPinned
+        self.pinnedOrder = pinnedOrder
         self.activeChatSessionID = activeChatSessionID
         self.activeAgentSessionID = activeAgentSessionID
         self.selection = selection
@@ -272,6 +281,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? "T1"
         lastModified = try c.decodeIfPresent(Date.self, forKey: .lastModified) ?? Date()
         isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        pinnedOrder = try? c.decode(Int.self, forKey: .pinnedOrder)
         activeChatSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeChatSessionID)
         activeAgentSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeAgentSessionID)
         selection = (try? c.decodeIfPresent(StoredSelection.self, forKey: .selection)) ?? .init()
@@ -289,6 +299,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         try c.encode(name, forKey: .name)
         try c.encode(lastModified, forKey: .lastModified)
         try c.encode(isPinned, forKey: .isPinned)
+        try c.encodeIfPresent(pinnedOrder, forKey: .pinnedOrder)
         try c.encodeIfPresent(activeChatSessionID, forKey: .activeChatSessionID)
         try c.encodeIfPresent(activeAgentSessionID, forKey: .activeAgentSessionID)
         try c.encode(selection, forKey: .selection)
@@ -305,6 +316,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         case name
         case lastModified
         case isPinned
+        case pinnedOrder
         case activeChatSessionID
         case activeAgentSessionID
         case selection

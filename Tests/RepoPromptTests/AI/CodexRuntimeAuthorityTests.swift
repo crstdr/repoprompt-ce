@@ -1,5 +1,8 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptInstrumentation
+import RepoPromptProcess
+import RepoPromptSecureStorage
 import XCTest
 
 final class CodexRuntimeAuthorityTests: XCTestCase {
@@ -32,7 +35,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         ).get()
 
         XCTAssertEqual(runtime.executableURL, armExecutable)
-        XCTAssertEqual(runtime.version, .init(major: 0, minor: 156, patch: 0))
+        XCTAssertEqual(runtime.version, CodexRuntimeAuthority.bundledVersion)
         XCTAssertEqual(runtime.source, .bundled(target: "aarch64-apple-darwin"))
         XCTAssertTrue(runtime.statePaths.codexHome.path.hasPrefix(support.path))
         XCTAssertTrue(runtime.statePaths.sqliteHome.path.hasPrefix(support.path))
@@ -45,7 +48,9 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: runtime.statePaths.codexHome.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: runtime.statePaths.sqliteHome.path))
         XCTAssertTrue(runtime.redactedDiagnosticSummary.contains("provenance=bundled:aarch64-apple-darwin"))
-        XCTAssertTrue(runtime.redactedDiagnosticSummary.contains("version=0.156.0"))
+        XCTAssertTrue(
+            runtime.redactedDiagnosticSummary.contains("version=\(CodexRuntimeAuthority.bundledVersion)")
+        )
         XCTAssertFalse(runtime.redactedDiagnosticSummary.contains(temporaryDirectory.path))
     }
 
@@ -320,6 +325,11 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
                 provisionsRepoPromptMCPOnStart: false
             )
         }
+
+        XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.capturedLoginShell), "captured_login_shell")
+        XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.enrichedFallback), "enriched_fallback")
+        XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.inheritedRichEnvironment), "inherited_rich_environment")
+        XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.previousCapturedFallback), "previous_captured_fallback")
 
         let first = try await makeClient().prepareRuntimeForLaunch()
         let newlyPrepared = try await makeClient().prepareRuntimeForLaunch()
@@ -639,7 +649,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         )
         let metadata: [String: Any] = [
             "layoutVersion": 1,
-            "version": "0.156.0",
+            "version": CodexRuntimeAuthority.bundledVersion.description,
             "target": target,
             "variant": "codex",
             "entrypoint": "bin/codex",

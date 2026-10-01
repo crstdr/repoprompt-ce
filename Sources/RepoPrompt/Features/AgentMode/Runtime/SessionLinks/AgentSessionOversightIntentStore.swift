@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 // Durable oversight intents: the user's directed overseer → overseen relationships and nothing else.
 //
@@ -8,16 +9,17 @@ import Foundation
 // writes them on link creation and removal. Invariants: the durable payload carries no link IDs,
 // generations, endpoint incarnations, or Auto-wake/snooze state — those are process-local and are
 // re-derived on restore — and every mutation is token-fenced so a stale attempt cannot overwrite a
-// newer document.
+// newer document. Legacy delegation fields are ignored; live grants derive their capabilities from
+// current authority defaults, never from UUID-keyed saved data.
 
 // MARK: - Durable model
 
 /// One directed overseer → overseen relationship the user explicitly created.
 ///
-/// This is the **entire** durable payload. Link IDs, generations, endpoint incarnations, binding
-/// generations, capabilities, reservations, observations, cursors, waiters, prompt inventories, and
-/// delivery state stay process-local in `DomainAgentSessionLinkAuthority` and are never written to
-/// disk: a persisted grant would be an authorization this process never re-derived.
+/// Together with the document version, this is the **entire** durable
+/// payload. Link IDs, generations, endpoint incarnations, binding generations, reservations,
+/// observations, cursors, waiters, prompt inventories, and delivery state stay process-local in
+/// `DomainAgentSessionLinkAuthority` and are never written to disk.
 struct AgentSessionOversightIntent: Codable, Hashable {
     let observerSessionID: UUID
     let targetSessionID: UUID
@@ -41,7 +43,8 @@ struct AgentSessionOversightIntent: Codable, Hashable {
     }
 }
 
-/// Versioned on-disk envelope. Version 1 carries only the directed UUID pairs.
+/// Versioned on-disk envelope. Swift's synthesized decoder ignores the legacy `delegations`
+/// key while retaining the directed `links`, and every subsequent write omits that key.
 struct AgentSessionOversightIntentDocument: Codable {
     static let currentVersion = 1
 
@@ -235,6 +238,7 @@ actor AgentSessionOversightIntentStore {
     static let maxDecodedRowCount = 65536
     private static let maxQuarantineAttempts = 4
 
+    private let restorePerfRecorder: any WorkspaceRestorePerfRecording
     private let fileURL: URL
     private let backupsDirectoryURL: URL
     private let mode: AgentSessionOversightPersistenceMode
@@ -279,8 +283,10 @@ actor AgentSessionOversightIntentStore {
         makeUUID: @escaping @Sendable () -> UUID = UUID.init,
         storeProcessGeneration: UUID = UUID(),
         maxFileByteCount: Int = AgentSessionOversightIntentStore.maxFileByteCount,
-        maxDecodedRowCount: Int = AgentSessionOversightIntentStore.maxDecodedRowCount
+        maxDecodedRowCount: Int = AgentSessionOversightIntentStore.maxDecodedRowCount,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) {
+        self.restorePerfRecorder = restorePerfRecorder
         self.fileURL = fileURL
         self.backupsDirectoryURL = backupsDirectoryURL
         self.mode = mode
@@ -296,7 +302,8 @@ actor AgentSessionOversightIntentStore {
     /// Production location, beside `windowSessions.json`.
     static func production(
         mode: AgentSessionOversightPersistenceMode,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) -> AgentSessionOversightIntentStore {
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
@@ -305,7 +312,8 @@ actor AgentSessionOversightIntentStore {
             fileURL: base.appendingPathComponent(filename),
             backupsDirectoryURL: base.appendingPathComponent(backupsDirectoryName, isDirectory: true),
             mode: mode,
-            fileManager: fileManager
+            fileManager: fileManager,
+            restorePerfRecorder: restorePerfRecorder
         )
     }
 
@@ -639,7 +647,7 @@ actor AgentSessionOversightIntentStore {
         _ receipt: AgentSessionOversightIntentMutationReceipt
     ) -> AgentSessionOversightIntentMutationReceipt {
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.store.receipt",
                 fields: [
                     "op": operation,
@@ -663,14 +671,14 @@ actor AgentSessionOversightIntentStore {
             didLogLaunchClassification = true
             switch result {
             case .suppressed:
-                WorkspaceRestorePerfLog.event("oversight.store.load", fields: ["result": "suppressed"])
+                restorePerfRecorder.event("oversight.store.load", fields: ["result": "suppressed"])
             case let .blocked(reason):
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "oversight.store.load",
                     fields: ["result": "blocked", "reason": reason.diagnosticLabel]
                 )
             case let .ready(load):
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "oversight.store.load",
                     fields: ["result": load.source.rawValue, "pairs": String(load.tokenByPair.count)]
                 )

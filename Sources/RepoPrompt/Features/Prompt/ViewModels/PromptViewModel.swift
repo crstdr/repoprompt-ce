@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptInstrumentation
 import SwiftUI
 
 enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
@@ -2273,6 +2274,7 @@ class PromptViewModel: ObservableObject {
     private let settingsManager: SettingsManaging
     private let storedPromptPersistence: any StoredPromptPersistenceServing
     private let promptClipboardPasteboard: NSPasteboard
+    private let perfRecorder: any AgentModePerfRecording
 
     #if DEBUG
         var clipboardContentBuilderOverrideForTesting: (() async -> String?)?
@@ -2287,7 +2289,8 @@ class PromptViewModel: ObservableObject {
         settingsManager: SettingsManaging,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         promptClipboardPasteboard: NSPasteboard = .general,
-        refreshAvailableModelsOnInit: Bool = true
+        refreshAvailableModelsOnInit: Bool = true,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2297,6 +2300,7 @@ class PromptViewModel: ObservableObject {
         self.settingsManager = settingsManager
         self.storedPromptPersistence = storedPromptPersistence ?? StoredPromptPersistenceService()
         self.promptClipboardPasteboard = promptClipboardPasteboard
+        self.perfRecorder = perfRecorder
         codeMapsGloballyDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
 
         // Removed usage of workspaceManager to load an initial prompt
@@ -2665,7 +2669,7 @@ class PromptViewModel: ObservableObject {
         let issues = await notifyComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
         #if DEBUG
             for tabID in tabIDs {
-                AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
+                perfRecorder.markSidebarDeleteFullCleanupComplete(
                     tabID: tabID,
                     source: "PromptViewModel.runPostProjectionComposeTabCleanup",
                     fields: ["reason": String(describing: reason)]
@@ -3910,12 +3914,16 @@ class PromptViewModel: ObservableObject {
     func stashComposeTabs(
         withIDs ids: Set<UUID>,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        postPreflightValidation: (@MainActor () -> Bool)? = nil,
+        expandCascade: Bool = true,
         onProjectionRemovalCommitted: ComposeTabsProjectionRemovalCallback? = nil
     ) async -> ComposeTabMutationReport {
         await removeComposeTabs(
             withIDs: ids,
             reason: .stash,
+            expandCascade: expandCascade,
             isMutationContextCurrent: isMutationContextCurrent,
+            postPreflightValidation: postPreflightValidation,
             onProjectionRemovalCommitted: onProjectionRemovalCommitted
         )
     }
@@ -4178,7 +4186,7 @@ class PromptViewModel: ObservableObject {
             onProjectionRemovalCommitted?(tabsBeingClosed)
             #if DEBUG
                 for tabID in tabsBeingClosed {
-                    AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
+                    perfRecorder.markSidebarDeleteVisibleRemoved(
                         tabID: tabID,
                         source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
                         fields: ["reason": String(describing: reason)]
@@ -4235,7 +4243,7 @@ class PromptViewModel: ObservableObject {
         onProjectionRemovalCommitted?(tabsBeingClosed)
         #if DEBUG
             for tabID in tabsBeingClosed {
-                AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
+                perfRecorder.markSidebarDeleteVisibleRemoved(
                     tabID: tabID,
                     source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
                     fields: ["reason": String(describing: reason)]
@@ -4672,6 +4680,9 @@ class PromptViewModel: ObservableObject {
             let tabID = manager.workspaces[index].composeTabs[tabIndex].id
             guard tabIDs.contains(tabID), manager.workspaces[index].composeTabs[tabIndex].isPinned != pinned else { continue }
             manager.workspaces[index].composeTabs[tabIndex].isPinned = pinned
+            if !pinned {
+                manager.workspaces[index].composeTabs[tabIndex].pinnedOrder = nil
+            }
             updatedTabIDs.insert(tabID)
         }
         guard !updatedTabIDs.isEmpty else {
@@ -4681,6 +4692,41 @@ class PromptViewModel: ObservableObject {
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         return ComposeTabPinMutationReport(updatedTabIDs: updatedTabIDs, contextRejected: false)
+    }
+
+    /// Assigns an explicit order to the supplied pinned tabs in one workspace mutation.
+    /// The caller validates the complete Agent-session pin set before invoking this method.
+    @discardableResult
+    @MainActor
+    func setPinnedComposeTabOrder(
+        _ orderedTabIDs: [UUID],
+        workspaceID: UUID
+    ) -> Bool {
+        guard let manager = workspaceManager,
+              let workspace = manager.activeWorkspace,
+              workspace.id == workspaceID,
+              let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+              Set(orderedTabIDs).count == orderedTabIDs.count
+        else { return false }
+
+        let rankByTabID = Dictionary(uniqueKeysWithValues: orderedTabIDs.enumerated().map { ($0.element, $0.offset) })
+        let pinnedIDs = Set(manager.workspaces[index].composeTabs.filter(\.isPinned).map(\.id))
+        guard Set(orderedTabIDs).isSubset(of: pinnedIDs) else { return false }
+
+        var changed = false
+        for tabIndex in manager.workspaces[index].composeTabs.indices {
+            let tabID = manager.workspaces[index].composeTabs[tabIndex].id
+            guard let rank = rankByTabID[tabID] else { continue }
+            if manager.workspaces[index].composeTabs[tabIndex].pinnedOrder != rank {
+                manager.workspaces[index].composeTabs[tabIndex].pinnedOrder = rank
+                changed = true
+            }
+        }
+        guard changed else { return true }
+        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        manager.markWorkspaceDirty()
+        manager.pollAndSaveState()
+        return true
     }
 
     @MainActor
