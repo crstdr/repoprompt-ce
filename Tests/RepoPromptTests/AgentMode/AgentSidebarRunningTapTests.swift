@@ -3,180 +3,117 @@ import AppKit
 import SwiftUI
 import XCTest
 
-/// Hosts the sidebar's row `ForEach` and presses a row while running sessions
-/// re-sort or a root becomes a thread child. Either change used to replace the
-/// view under the pointer and drop the in-flight tap.
+/// Protects the rendered row lifetime needed to retain an in-flight press.
+/// This deliberately does not assert AppKit mouse delivery: the CI XCTest
+/// process can render rows without delivering even a stationary control tap.
 @MainActor
 final class AgentSidebarRunningTapTests: XCTestCase {
-    func testTapActivatesThePressedRowWhenTheListStaysStill() {
-        let now = Date()
-        let harness = SidebarRunningTapHarness(now: now)
-        harness.rows = Self.sessions(now: now)
-        let pressedIndex = 3
-        let pressedID = harness.rows[pressedIndex].tabID
-        let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
-        let appeared = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
-        XCTAssertTrue(appeared)
-        let point = Self.point(in: host, rowIndex: pressedIndex)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
-        _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
-
-        XCTAssertEqual(harness.activated, [pressedID])
-        window.orderOut(nil)
-    }
-
-    func testTapActivatesThePressedRowWhenRunningSessionsResort() {
-        let now = Date()
-        let harness = SidebarRunningTapHarness(now: now)
-        harness.rows = Self.sessions(now: now)
-        let pressedIndex = 3
-        let pressedID = harness.rows[pressedIndex].tabID
-        let promotedID = harness.rows[harness.rows.count - 1].tabID
-        XCTAssertNotEqual(promotedID, pressedID)
-
-        let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
-        _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
-
-        let sectionIDAtPress = harness.seenSectionIDs.last
-        let point = Self.point(in: host, rowIndex: pressedIndex)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
-
-        harness.rows = Self.sessions(now: now, promotedTabID: promotedID)
-        let resorted = Self.render(until: Date().addingTimeInterval(0.4)) {
-            harness.renderedFirstRowID == promotedID
-        }
-        XCTAssertTrue(resorted, "The press must overlap a rendered re-sort")
-        XCTAssertEqual(
-            harness.seenSectionIDs.last,
-            sectionIDAtPress,
-            "Re-sorting running rows must not change the date section identity"
+    func testRenderedRowIdentitySurvivesAStationaryUpdate() throws {
+        let rows = Self.sessions(now: Self.now)
+        var updated = rows
+        updated[3] = Self.session(
+            index: 1, activity: rows[3].activityDate, title: "Updated while pressed"
         )
 
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
-        _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
-
-        XCTAssertEqual(harness.activated, [pressedID])
-        window.orderOut(nil)
+        // The control updates content, not just the same value twice, and both
+        // renderers must retain it when no ancestry or ordering changes.
+        try Self.assertRowLifetime(before: rows, after: updated, pressedID: rows[3].tabID)
+        try Self.assertRowLifetime(
+            before: rows, after: updated, pressedID: rows[3].tabID,
+            style: .firstRowSectionIdentity
+        )
     }
 
-    func testTapActivatesThePressedRowWhenThatRowMovesDuringThePress() {
-        let now = Date()
-        let harness = SidebarRunningTapHarness(now: now)
-        harness.rows = Self.sessions(now: now)
-        let pressedIndex = 3
-        let pressedID = harness.rows[pressedIndex].tabID
+    func testRenderedRowIdentitySurvivesOtherRunningSessionsResorting() throws {
+        let rows = Self.sessions(now: Self.now)
+        let pressedID = rows[3].tabID
+        let promotedID = try XCTUnwrap(rows.last?.tabID)
+        let updated = Self.sessions(now: Self.now, promotedTabID: promotedID)
+        XCTAssertNotEqual(promotedID, pressedID)
+        XCTAssertEqual(updated.first?.tabID, promotedID)
+        XCTAssertNotEqual(rows.map(\.tabID), updated.map(\.tabID))
 
-        let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
-        _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
-
-        let point = Self.point(in: host, rowIndex: pressedIndex)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
-
-        harness.rows = Self.sessions(now: now, promotedTabID: pressedID)
-        let moved = Self.render(until: Date().addingTimeInterval(0.4)) {
-            harness.renderedFirstRowID == pressedID
-        }
-        XCTAssertTrue(moved, "The press must overlap the pressed row moving to the top")
-
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
-        _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
-
-        XCTAssertEqual(harness.activated, [pressedID])
-        window.orderOut(nil)
+        try Self.assertRowLifetime(before: rows, after: updated, pressedID: pressedID)
+        try Self.assertRowLifetime(
+            before: rows, after: updated, pressedID: pressedID,
+            style: .firstRowSectionIdentity, survives: false
+        )
     }
 
-    func testTapSurvivesWhenAnEarlierRunOfTheSameDayJoinsToday() throws {
-        let now = Date()
-        let yesterday = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: now))
+    func testRenderedRowIdentitySurvivesThePressedRowMoving() throws {
+        let rows = Self.sessions(now: Self.now)
+        let pressedID = rows[3].tabID
+        let updated = Self.sessions(now: Self.now, promotedTabID: pressedID)
+        XCTAssertNotEqual(rows.first?.tabID, pressedID)
+        XCTAssertEqual(updated.first?.tabID, pressedID)
+
+        try Self.assertRowLifetime(before: rows, after: updated, pressedID: pressedID)
+        try Self.assertRowLifetime(
+            before: rows, after: updated, pressedID: pressedID,
+            style: .firstRowSectionIdentity, survives: false
+        )
+    }
+
+    func testRenderedRowIdentitySurvivesASectionOrdinalChange() throws {
+        let yesterday = Self.now.addingTimeInterval(-86400)
         let pinned = Self.session(index: 0, activity: yesterday, isPinned: true)
-        let today = Self.session(index: 1, activity: now)
+        let today = Self.session(index: 1, activity: Self.now)
         let pressed = Self.session(index: 2, activity: yesterday.addingTimeInterval(-60))
-        let harness = SidebarRunningTapHarness(now: now)
-        harness.rows = [pinned, today, pressed]
-        let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
-        _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
-
-        let sectionIDAtPress = harness.sectionIDByRow[pressed.tabID]
-        let point = Self.point(in: host, rowIndex: 2)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
-
-        harness.rows = [
-            Self.session(index: 0, activity: now.addingTimeInterval(5), isPinned: true),
+        let rows = [pinned, today, pressed]
+        let updated = [
+            Self.session(index: 0, activity: Self.now.addingTimeInterval(5), isPinned: true),
             today,
             pressed
         ]
-        let shifted = Self.render(until: Date().addingTimeInterval(0.4)) {
-            harness.sectionIDByRow[pressed.tabID] != sectionIDAtPress
-        }
-        XCTAssertTrue(
-            shifted,
-            "The press must overlap the later Yesterday section changing ordinal"
+        let before = Self.sections(rows)
+        let after = Self.sections(updated)
+        XCTAssertEqual(before.map(\.bucket), [.yesterday, .today, .yesterday])
+        XCTAssertEqual(after.map(\.bucket), [.today, .yesterday])
+        XCTAssertNotEqual(before.last?.id, after.last?.id)
+        XCTAssertEqual(before.last?.groups.first?.id, after.last?.groups.first?.id)
+
+        try Self.assertRowLifetime(before: rows, after: updated, pressedID: pressed.tabID)
+        // Even bucket/ordinal section IDs are not safe ancestors of the row.
+        try Self.assertRowLifetime(
+            before: rows, after: updated, pressedID: pressed.tabID,
+            style: .sectionAndGroupAncestry, survives: false
         )
-
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
-        _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
-
-        XCTAssertEqual(harness.activated, [pressed.tabID])
-        window.orderOut(nil)
     }
 
-    func testTapSurvivesWhenAPressedRootBecomesAThreadChild() {
-        let now = Date()
-        let parent = Self.session(index: 0, activity: now)
-        let pressed = Self.session(index: 1, activity: now.addingTimeInterval(-30))
-        let harness = SidebarRunningTapHarness(now: now)
-        harness.rows = [parent, pressed]
-        let (window, host) = Self.makeWindow(harness)
-        window.setFrameOrigin(NSPoint(x: 80, y: 80))
-        window.makeKeyAndOrderFront(nil)
-        _ = Self.render(until: Date().addingTimeInterval(0.3)) { harness.appeared }
-
-        let groupIDAtPress = harness.groupIDByRow[pressed.tabID]
-        XCTAssertEqual(groupIDAtPress, pressed.tabID)
-        let point = Self.point(in: host, rowIndex: 1)
-        window.sendEvent(Self.mouseEvent(.leftMouseDown, at: point, window: window))
-
-        harness.rows = [
-            Self.session(index: 0, activity: now, hasThreadChildren: true),
+    func testRenderedRowIdentitySurvivesRootToThreadChildRegrouping() throws {
+        let parent = Self.session(index: 0, activity: Self.now)
+        let pressed = Self.session(index: 1, activity: Self.now.addingTimeInterval(-30))
+        let rows = [parent, pressed]
+        let updated = [
+            Self.session(index: 0, activity: Self.now, hasThreadChildren: true),
             Self.session(
-                index: 1,
-                activity: now.addingTimeInterval(-30),
-                parentSessionID: parent.tabID,
-                depth: 1
+                index: 1, activity: pressed.activityDate,
+                parentSessionID: parent.tabID, depth: 1
             )
         ]
-        let regrouped = Self.render(until: Date().addingTimeInterval(0.4)) {
-            harness.groupIDByRow[pressed.tabID] == parent.tabID
-        }
-        XCTAssertTrue(
-            regrouped,
-            "The press must overlap the row leaving its own group for its parent"
+        let before = Self.sections(rows)
+        let after = Self.sections(updated)
+        XCTAssertEqual(before.map(\.id), after.map(\.id))
+        XCTAssertEqual(before.first?.groups.map(\.id), [parent.tabID, pressed.tabID])
+        XCTAssertEqual(after.first?.groups.map(\.id), [parent.tabID])
+        XCTAssertEqual(after.first?.groups.first?.rows.map(\.tabID), [parent.tabID, pressed.tabID])
+
+        try Self.assertRowLifetime(before: rows, after: updated, pressedID: pressed.tabID)
+        try Self.assertRowLifetime(
+            before: rows, after: updated, pressedID: pressed.tabID,
+            style: .sectionAndGroupAncestry, survives: false
         )
-
-        window.sendEvent(Self.mouseEvent(.leftMouseUp, at: point, window: window))
-        _ = Self.render(until: Date().addingTimeInterval(0.2)) { !harness.activated.isEmpty }
-
-        XCTAssertEqual(harness.activated, [pressed.tabID])
-        window.orderOut(nil)
     }
 
     func testDateSectionIdentitySurvivesARunningResort() throws {
-        let now = Date()
+        let now = Self.now
         let rows = Self.sessions(now: now)
-        let before = AgentSidebarDateSectionBuilder.activeSections(for: rows, now: now)
+        let before = AgentSidebarDateSectionBuilder.activeSections(for: rows, now: now, calendar: Self.calendar)
         let promotedID = try XCTUnwrap(rows.last?.tabID)
         let after = AgentSidebarDateSectionBuilder.activeSections(
             for: Self.sessions(now: now, promotedTabID: promotedID),
-            now: now
+            now: now,
+            calendar: Self.calendar
         )
 
         XCTAssertEqual(before.map(\.id), after.map(\.id))
@@ -185,21 +122,21 @@ final class AgentSidebarRunningTapTests: XCTestCase {
     }
 
     func testSplitRunsOfTheSameDayKeepDistinctSectionIdentities() throws {
-        let now = Date()
-        let yesterday = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: now))
+        let now = Self.now
+        let yesterday = try XCTUnwrap(Self.calendar.date(byAdding: .day, value: -1, to: now))
         let rows = [
             Self.session(index: 0, activity: yesterday, isPinned: true),
             Self.session(index: 1, activity: now),
             Self.session(index: 2, activity: yesterday.addingTimeInterval(-60))
         ]
-        let sections = AgentSidebarDateSectionBuilder.activeSections(for: rows, now: now)
+        let sections = AgentSidebarDateSectionBuilder.activeSections(for: rows, now: now, calendar: Self.calendar)
 
         XCTAssertEqual(sections.map(\.bucket), [.yesterday, .today, .yesterday])
         XCTAssertEqual(Set(sections.map(\.id)).count, sections.count)
     }
 
     func testArchivedSectionIdentitySurvivesReorderingWithinADay() throws {
-        let now = Date()
+        let now = Self.now
         let first = try StashedTab(
             id: XCTUnwrap(UUID(uuidString: "10000000-0000-4000-8000-000000000001")),
             tab: ComposeTabState(),
@@ -214,11 +151,13 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let forward = AgentSidebarDateSectionBuilder.archivedSections(
             for: [first, second],
             now: now,
+            calendar: Self.calendar,
             dateInfo: { _ in info }
         )
         let reversed = AgentSidebarDateSectionBuilder.archivedSections(
             for: [second, first],
             now: now,
+            calendar: Self.calendar,
             dateInfo: { _ in info }
         )
 
@@ -227,9 +166,9 @@ final class AgentSidebarRunningTapTests: XCTestCase {
     }
 
     func testRenderedRowsKeepSectionHeadersThreadOrderAndDepth() throws {
-        let now = Date()
-        let yesterday = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: now))
-        let previous = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -3, to: now))
+        let now = Self.now
+        let yesterday = try XCTUnwrap(Self.calendar.date(byAdding: .day, value: -1, to: now))
+        let previous = try XCTUnwrap(Self.calendar.date(byAdding: .day, value: -3, to: now))
         let pinned = Self.session(index: 0, activity: yesterday, isPinned: true)
         let parent = Self.session(index: 1, activity: now, hasThreadChildren: true)
         let child = Self.session(
@@ -242,7 +181,8 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let rendered = AgentSidebarDateSectionBuilder.renderedActiveRows(
             for: AgentSidebarDateSectionBuilder.activeSections(
                 for: [pinned, parent, child, older],
-                now: now
+                now: now,
+                calendar: Self.calendar
             )
         )
 
@@ -258,8 +198,8 @@ final class AgentSidebarRunningTapTests: XCTestCase {
     }
 
     func testArchivedRenderedRowsKeepOneHeaderPerDay() throws {
-        let now = Date()
-        let yesterday = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: now))
+        let now = Self.now
+        let yesterday = try XCTUnwrap(Self.calendar.date(byAdding: .day, value: -1, to: now))
         let today = try StashedTab(
             id: XCTUnwrap(UUID(uuidString: "10000000-0000-4000-8000-000000000011")),
             tab: ComposeTabState(),
@@ -274,6 +214,7 @@ final class AgentSidebarRunningTapTests: XCTestCase {
             for: AgentSidebarDateSectionBuilder.archivedSections(
                 for: [today, older],
                 now: now,
+                calendar: Self.calendar,
                 dateInfo: { tab in
                     AgentModeViewModel.SidebarSessionDateInfo(
                         lastEngagementAt: tab.stashedAt,
@@ -293,6 +234,7 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         let sectionFrames = Self.measureFrames(.sectionForEach)
         let flatFrames = Self.measureFrames(.flatRows)
 
+        XCTAssertEqual(Set(sectionFrames.keys), Set(["H-Yesterday", "H-Today", "H-Previous", "R0", "R1", "R2", "R3"]))
         XCTAssertEqual(sectionFrames.keys.sorted(), flatFrames.keys.sorted())
         for name in sectionFrames.keys.sorted() {
             XCTAssertEqual(
@@ -310,41 +252,63 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         }
     }
 
-    private static let rowHeight: CGFloat = 36
+    private static let now = Date(timeIntervalSince1970: 1_780_660_800)
+    private static let calendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        return calendar
+    }()
+
+    private static func sections(
+        _ rows: [AgentModeViewModel.SidebarSession]
+    ) -> [AgentSidebarActiveDateSection] {
+        AgentSidebarDateSectionBuilder.activeSections(for: rows, now: now, calendar: calendar)
+    }
+
+    private static func assertRowLifetime(
+        before: [AgentModeViewModel.SidebarSession],
+        after: [AgentModeViewModel.SidebarSession],
+        pressedID: UUID,
+        style: SidebarIdentityList.Style = .current,
+        survives: Bool = true,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let host = NSHostingView(rootView: SidebarIdentityList(sections: sections(before), style: style))
+        host.frame = CGRect(x: 0, y: 0, width: 280, height: 420)
+        host.layoutSubtreeIfNeeded()
+        let initialRows = identityRows(in: host)
+        XCTAssertEqual(Set(initialRows.compactMap { $0.session?.tabID }), Set(before.map(\.tabID)), file: file, line: line)
+        XCTAssertEqual(initialRows.count, before.count, file: file, line: line)
+        let pressedRow = try XCTUnwrap(initialRows.first { $0.session?.tabID == pressedID }, file: file, line: line)
+        // A row-local marker, not a synthetic gesture/activation implementation.
+        // Keeping a strong reference also prevents address reuse from hiding replacement.
+        pressedRow.pressedTabID = pressedID
+
+        host.rootView = SidebarIdentityList(sections: sections(after), style: style)
+        host.layoutSubtreeIfNeeded()
+        let updatedRows = identityRows(in: host)
+        XCTAssertNil(host.window, "Identity checks must not require a window", file: file, line: line)
+        XCTAssertEqual(Set(updatedRows.compactMap { $0.session?.tabID }), Set(after.map(\.tabID)), file: file, line: line)
+        XCTAssertEqual(updatedRows.count, after.count, file: file, line: line)
+        let updatedRow = try XCTUnwrap(updatedRows.first { $0.session?.tabID == pressedID }, file: file, line: line)
+        XCTAssertEqual(updatedRow.session, after.first { $0.tabID == pressedID }, "The retained row must receive updated content", file: file, line: line)
+        XCTAssertEqual(pressedRow === updatedRow, survives, "\(style) effective row identity", file: file, line: line)
+        XCTAssertEqual(updatedRow.pressedTabID, survives ? pressedID : nil, "\(style) row-local press state", file: file, line: line)
+    }
+
+    private static func identityRows(in view: NSView) -> [SidebarIdentityRowView] {
+        (view as? SidebarIdentityRowView).map { [$0] } ?? view.subviews.flatMap { identityRows(in: $0) }
+    }
 
     private static func measureFrames(
         _ style: SidebarLayoutProbe.Style
     ) -> [String: CGRect] {
         let sink = SidebarLayoutFrameSink()
         let host = NSHostingView(rootView: SidebarLayoutProbe(style: style, sink: sink))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: 420),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.contentView = host
-        window.setFrameOrigin(NSPoint(x: 140, y: 140))
-        window.makeKeyAndOrderFront(nil)
-        _ = render(until: Date().addingTimeInterval(0.4)) { sink.frames.count >= 7 }
-        window.orderOut(nil)
-        return sink.frames
-    }
-
-    private static func makeWindow(
-        _ harness: SidebarRunningTapHarness
-    ) -> (NSWindow, NSHostingView<SidebarRunningTapList>) {
-        let host = NSHostingView(rootView: SidebarRunningTapList(harness: harness))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: rowHeight * 5),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.contentView = host
-        window.layoutIfNeeded()
+        host.frame = CGRect(x: 0, y: 0, width: 280, height: 420)
         host.layoutSubtreeIfNeeded()
-        return (window, host)
+        return sink.frames
     }
 
     private static func sessions(
@@ -368,13 +332,14 @@ final class AgentSidebarRunningTapTests: XCTestCase {
         isPinned: Bool = false,
         parentSessionID: UUID? = nil,
         depth: Int = 0,
-        hasThreadChildren: Bool = false
+        hasThreadChildren: Bool = false,
+        title: String? = nil
     ) -> AgentModeViewModel.SidebarSession {
         let tabID = UUID(uuidString: "00000000-0000-4000-8000-00000000000\(index)")!
         return AgentModeViewModel.SidebarSession(
             id: tabID,
             tabID: tabID,
-            title: "Running \(index)",
+            title: title ?? "Running \(index)",
             lastUserMessageAt: nil,
             activityDate: activity,
             isPinned: isPinned,
@@ -385,104 +350,76 @@ final class AgentSidebarRunningTapTests: XCTestCase {
             hasThreadChildren: hasThreadChildren
         )
     }
-
-    private static func point(in host: NSView, rowIndex: Int) -> NSPoint {
-        let yFromTop = CGFloat(rowIndex) * rowHeight + rowHeight / 2
-        let y = host.isFlipped ? yFromTop : host.bounds.height - yFromTop
-        return host.convert(NSPoint(x: 40, y: y), to: nil)
-    }
-
-    private static func mouseEvent(
-        _ type: NSEvent.EventType,
-        at point: NSPoint,
-        window: NSWindow
-    ) -> NSEvent {
-        NSEvent.mouseEvent(
-            with: type,
-            location: point,
-            modifierFlags: [],
-            timestamp: ProcessInfo.processInfo.systemUptime,
-            windowNumber: window.windowNumber,
-            context: nil,
-            eventNumber: 1,
-            clickCount: 1,
-            pressure: 1
-        )!
-    }
-
-    private static func render(until deadline: Date, condition: () -> Bool) -> Bool {
-        while Date() < deadline {
-            if condition() { return true }
-            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
-        }
-        return condition()
-    }
 }
 
-@MainActor
-private final class SidebarRunningTapHarness: ObservableObject {
-    @Published var rows: [AgentModeViewModel.SidebarSession] = []
-    var activated: [UUID] = []
-    var appeared = false
-    var seenSectionIDs: [UUID] = []
-    var renderedFirstRowID: UUID?
-    let now: Date
-
-    init(now: Date) {
-        self.now = now
+/// The production list supplies identity and header ancestry; only the row
+/// content is replaced with an inspectable AppKit lifetime probe.
+private struct SidebarIdentityList: View {
+    enum Style {
+        case current
+        case firstRowSectionIdentity
+        case sectionAndGroupAncestry
     }
 
-    var sectionIDByRow: [UUID: UUID] = [:]
-    var groupIDByRow: [UUID: UUID] = [:]
+    let sections: [AgentSidebarActiveDateSection]
+    let style: Style
 
-    func note(_ sections: [AgentSidebarActiveDateSection]) {
-        renderedFirstRowID = sections.first?.groups.first?.rows.first?.tabID
-        noteSectionID(sections.first?.id)
-        var ids: [UUID: UUID] = [:]
-        var groupIDs: [UUID: UUID] = [:]
-        for section in sections {
-            for group in section.groups {
-                for row in group.rows {
-                    ids[row.tabID] = section.id
-                    groupIDs[row.tabID] = group.id
+    var body: some View {
+        VStack(spacing: 2) {
+            switch style {
+            case .current:
+                AgentSidebarKeyedRowList(
+                    items: AgentSidebarDateSectionBuilder.renderedActiveRows(for: sections),
+                    showsHeader: \.showsHeader,
+                    headerTitle: \.headerTitle,
+                    isFirstHeader: \.isFirstHeader
+                ) { item in
+                    SidebarIdentityRow(session: item.session)
+                }
+            case .firstRowSectionIdentity:
+                // Before ebf21f155, a section was keyed by its first row.
+                // Recreate that changing ancestor even with today's builder.
+                ForEach(sections) { section in
+                    legacySection(section)
+                        .id(section.groups.first?.id)
+                }
+            case .sectionAndGroupAncestry:
+                // Stable day/ordinal sections alone still replace a row when
+                // its section ordinal or thread-group ancestry changes.
+                ForEach(sections) { section in
+                    legacySection(section)
                 }
             }
         }
-        sectionIDByRow = ids
-        groupIDByRow = groupIDs
     }
 
-    func noteSectionID(_ id: UUID?) {
-        guard let id, seenSectionIDs.last != id else { return }
-        seenSectionIDs.append(id)
+    private func legacySection(_ section: AgentSidebarActiveDateSection) -> some View {
+        ForEach(section.groups) { group in
+            ForEach(group.rows) { session in
+                SidebarIdentityRow(session: session)
+            }
+        }
     }
 }
 
-private struct SidebarRunningTapList: View {
-    @ObservedObject var harness: SidebarRunningTapHarness
+private struct SidebarIdentityRow: NSViewRepresentable {
+    let session: AgentModeViewModel.SidebarSession
 
-    var body: some View {
-        let sections = AgentSidebarDateSectionBuilder.activeSections(for: harness.rows, now: harness.now)
-        let _ = harness.note(sections)
-        VStack(spacing: 0) {
-            // Same row-keyed list as the sidebar. Headers stay off so a click
-            // lands on the row index the test pressed.
-            AgentSidebarKeyedRowList(
-                items: AgentSidebarDateSectionBuilder.renderedActiveRows(for: sections),
-                showsHeader: { _ in false },
-                headerTitle: { _ in "" },
-                isFirstHeader: { _ in false }
-            ) { item in
-                let session = item.session
-                Text(verbatim: session.title)
-                    .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36, alignment: .leading)
-                    .contentShape(Rectangle())
-                    .onTapGesture { harness.activated.append(session.tabID) }
-                    .focusable()
-            }
-        }
-        .frame(width: 280, height: 180, alignment: .top)
-        .onAppear { harness.appeared = true }
+    func makeNSView(context _: Context) -> SidebarIdentityRowView {
+        SidebarIdentityRowView()
+    }
+
+    func updateNSView(_ view: SidebarIdentityRowView, context _: Context) {
+        view.session = session
+    }
+}
+
+private final class SidebarIdentityRowView: NSView {
+    var session: AgentModeViewModel.SidebarSession?
+    var pressedTabID: UUID?
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 280, height: 36)
     }
 }
 
