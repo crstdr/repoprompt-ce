@@ -1458,6 +1458,19 @@ actor WorkspaceFileContextStore {
             codemapEligibilityFlightsByRootEpoch.count
         }
 
+        /// Counts of live per-subscriber stream continuations. A released
+        /// subscriber's slot is removed via `onTermination`, so these should
+        /// return to zero after the subscribing view model is released.
+        func streamContinuationCountsForTesting() -> (
+            appliedIndex: Int, codemapMarkerReadiness: Int, codemapRootStatus: Int
+        ) {
+            (
+                appliedIndexContinuations.count,
+                codemapMarkerReadinessContinuations.count,
+                codemapRootStatusContinuations.count
+            )
+        }
+
         func codemapGraphIndexBuildRetrySnapshotForTesting(
             rootEpoch: WorkspaceCodemapRootEpoch
         ) -> (attempt: Int, deadlineNanoseconds: UInt64)? {
