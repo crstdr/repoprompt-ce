@@ -437,6 +437,82 @@ final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
 
     // MARK: - Per-turn slicing
 
+    /// Same-process, interleaved benchmark: fixture construction and assertions stay
+    /// outside timing. Five samples follow one warm-up of each implementation. The
+    /// time budget is deliberately generous for debug/headless CI; exact equality is
+    /// the correctness gate, not a load-sensitive relative timing assertion.
+    func testLargeProjectionGroupingMatchesHistoricalSlicesWithinBudget() {
+        let turnCount = 1000
+        let transcript = AgentTranscript(
+            turns: (0 ..< turnCount).map {
+                makeFullTurn(index: $0, retentionTier: $0.isMultiple(of: 5) ? .archived : .full)
+            },
+            nextSequenceIndex: turnCount * 3
+        )
+        let projection = AgentTranscriptProjectionBuilder.build(from: transcript)
+        XCTAssertFalse(projection.workingBlocks.isEmpty)
+        XCTAssertFalse(projection.archivedBlocks.isEmpty)
+        XCTAssertGreaterThanOrEqual(projection.rowAnchorIndex.count, turnCount)
+        let reference = historicalTurnCaches(transcript, projection: projection)
+        let warm = AgentTranscriptProjectionBuilder.updatedTurnCaches(for: transcript, projection: projection)
+        XCTAssertEqual(warm, reference)
+        XCTAssertEqual(
+            AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, turnCaches: warm).projection,
+            projection,
+            "Grouped caches must reproduce every displayed row, block and anchor"
+        )
+
+        var baselineSeconds: [Double] = []
+        var groupedSeconds: [Double] = []
+        for sample in 0 ..< 5 {
+            func baselineSample() {
+                let start = ProcessInfo.processInfo.systemUptime
+                let result = historicalTurnCaches(transcript, projection: projection)
+                baselineSeconds.append(ProcessInfo.processInfo.systemUptime - start)
+                XCTAssertEqual(result, reference)
+            }
+            func groupedSample() {
+                let start = ProcessInfo.processInfo.systemUptime
+                let result = AgentTranscriptProjectionBuilder.updatedTurnCaches(for: transcript, projection: projection)
+                let elapsed = ProcessInfo.processInfo.systemUptime - start
+                groupedSeconds.append(elapsed)
+                XCTAssertLessThan(elapsed, 5, "1,000-turn grouped cache refresh exceeded its 5-second budget")
+                XCTAssertEqual(result, reference)
+            }
+            if sample.isMultiple(of: 2) {
+                baselineSample()
+                groupedSample()
+            } else {
+                groupedSample()
+                baselineSample()
+            }
+        }
+        print("TRANSCRIPT_GROUPING_PERF turns=\(turnCount) blocks=\(projection.workingBlocks.count + projection.archivedBlocks.count) rowAnchors=\(projection.rowAnchorIndex.count) blockAnchors=\(projection.anchorBlockIndex.count) baselineMedianSeconds=\(baselineSeconds.sorted()[2]) groupedMedianSeconds=\(groupedSeconds.sorted()[2]) samples=5")
+    }
+
+    /// Frozen copy of the pre-optimization per-turn filtering algorithm, including
+    /// projected-row suppression. Independent of the grouping implementation.
+    private func historicalTurnCaches(
+        _ transcript: AgentTranscript,
+        projection: AgentTranscriptProjection
+    ) -> [UUID: AgentTranscriptTurnProjectionCache] {
+        var caches: [UUID: AgentTranscriptTurnProjectionCache] = [:]
+        for turn in transcript.turns where turn.isCompleted {
+            let working = projection.workingBlocks.filter { $0.turnID == turn.id }
+            let archived = projection.archivedBlocks.filter { $0.turnID == turn.id }
+            caches[turn.id] = AgentTranscriptTurnProjectionCache(
+                token: AgentTranscriptProjectionBuilder.validationToken(for: turn),
+                workingBlocks: working,
+                archivedBlocks: archived,
+                workingRows: working.filter { $0.kind != .groupedHistory && $0.kind != .collapsedHistoryRange }.flatMap(\.rows),
+                archivedRows: archived.filter { $0.kind != .groupedHistory && $0.kind != .collapsedHistoryRange }.flatMap(\.rows),
+                rowAnchorIndex: projection.rowAnchorIndex.filter { anchorTurnID($0.value) == turn.id },
+                anchorBlockIndex: projection.anchorBlockIndex.filter { anchorTurnID($0.key) == turn.id }
+            )
+        }
+        return caches
+    }
+
     func testCachesSliceBlocksRowsAndAnchorsPerTurn() throws {
         let turn0 = makeFullTurn(index: 0)
         let turn1 = makeFullTurn(index: 1)
@@ -654,6 +730,89 @@ final class AgentToolResultPersistenceContextTests: XCTestCase {
             context: nil,
             purpose: .persistentStorage
         ).transcript
+    }
+
+    func testLargePersistencePassMatchesBaselineAndDeduplicatesParsingWithinBudget() throws {
+        let sharedID = UUID()
+        let payloads = try (0 ..< 16).map { index in
+            let data = try JSONSerialization.data(withJSONObject: [
+                "content": [["type": "text", "text": "payload \(index): " + String(repeating: "λ-data ", count: 500)]]
+            ], options: .sortedKeys)
+            return String(decoding: data, as: UTF8.self)
+        }
+        var activities = (0 ..< 4000).map { index in
+            makeToolCallActivity(
+                id: index.isMultiple(of: 13) ? sharedID : UUID(),
+                sequenceIndex: index + 1,
+                toolExecution: index.isMultiple(of: 19) ? nil : makeExecution(
+                    name: "read_file", resultJSON: payloads[index % payloads.count]
+                )
+            )
+        }
+        // Exercise the bounded cache beyond 128 distinct entries, invalid JSON, and
+        // payloads above the 16-KiB cache limit, not just a repeated-payload best case.
+        for index in 0 ..< 140 {
+            activities.append(makeToolCallActivity(
+                id: UUID(), sequenceIndex: activities.count + 1,
+                toolExecution: makeExecution(name: "read_file", resultJSON: "{\"unique\":\(index)}")
+            ))
+        }
+        for payload in ["not json", "{\"text\":\"" + String(repeating: "x", count: 17000) + "\"}"] {
+            for _ in 0 ..< 8 {
+                activities.append(makeToolCallActivity(
+                    id: sharedID, sequenceIndex: activities.count + 1,
+                    toolExecution: makeExecution(name: "read_file", resultJSON: payload)
+                ))
+            }
+        }
+        for index in activities.indices {
+            activities[index].itemKind = .toolResult
+        }
+        let transcript = makeTranscript(activities: activities)
+        let reference = baseline(transcript)
+        let context = AgentToolResultProcessingContext(cachesToolExecutions: false)
+        let observed = AgentToolResultPersistencePolicy.sanitizeTranscriptForPersistenceWithMetrics(
+            transcript, context: context
+        ).transcript
+        XCTAssertEqual(observed, reference)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        XCTAssertEqual(try encoder.encode(observed), try encoder.encode(reference), "Saved content must be byte-identical")
+        let metrics = context.snapshotMetrics()
+        #if DEBUG || EDIT_FLOW_PERF
+            XCTAssertGreaterThan(metrics.jsonParseCacheHitCount, 1000)
+            XCTAssertLessThan(metrics.jsonParseCacheMissCount, metrics.jsonParseAttemptCount / 4)
+            XCTAssertEqual(metrics.toolExecutionCacheHitCount, 0, "Repeated IDs must never share executions")
+        #endif
+
+        // Warm both paths, then alternate order in five samples in the same process.
+        XCTAssertEqual(AgentToolResultPersistencePolicy.sanitizeTranscriptForPersistence(transcript), reference)
+        var baselineSeconds: [Double] = []
+        var memoizedSeconds: [Double] = []
+        for sample in 0 ..< 5 {
+            func baselineSample() {
+                let start = ProcessInfo.processInfo.systemUptime
+                let result = baseline(transcript)
+                baselineSeconds.append(ProcessInfo.processInfo.systemUptime - start)
+                XCTAssertEqual(result, reference)
+            }
+            func memoizedSample() {
+                let start = ProcessInfo.processInfo.systemUptime
+                let result = AgentToolResultPersistencePolicy.sanitizeTranscriptForPersistence(transcript)
+                let elapsed = ProcessInfo.processInfo.systemUptime - start
+                memoizedSeconds.append(elapsed)
+                XCTAssertLessThan(elapsed, 15, "4,156-activity persistence pass exceeded its 15-second budget")
+                XCTAssertEqual(result, reference)
+            }
+            if sample.isMultiple(of: 2) {
+                baselineSample()
+                memoizedSample()
+            } else {
+                memoizedSample()
+                baselineSample()
+            }
+        }
+        print("TRANSCRIPT_PERSISTENCE_PERF activities=\(activities.count) parseAttempts=\(metrics.jsonParseAttemptCount) parseHits=\(metrics.jsonParseCacheHitCount) parseMisses=\(metrics.jsonParseCacheMissCount) baselineMedianSeconds=\(baselineSeconds.sorted()[2]) memoizedMedianSeconds=\(memoizedSeconds.sorted()[2]) samples=5")
     }
 
     func testRepeatedActivityIDWithMissingExecutionMatchesNilContextBaseline() {
