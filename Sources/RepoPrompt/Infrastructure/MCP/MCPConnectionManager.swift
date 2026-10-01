@@ -15030,9 +15030,11 @@ actor ServerNetworkManager {
                 return CallTool.Result(content: [.text(text: "Server unavailable", annotations: nil, _meta: nil)], isError: true)
             }
             let canonicalName = Self.canonicalToolName(for: params.name)
+            var startRoutingArguments = params.arguments ?? [:]
+            startRoutingArguments.removeValue(forKey: MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey)
             let startArguments = canonicalName == MCPWindowToolName.agentRun
                 ? MCPToolArgsNormalizer.normalize(
-                    params: params.arguments, originalToolName: params.name, canonicalToolName: canonicalName
+                    params: startRoutingArguments, originalToolName: params.name, canonicalToolName: canonicalName
                 ).payload
                 : params.arguments ?? [:]
             guard MCPToolExecutionContractCatalog.isAgentRunStartCall(

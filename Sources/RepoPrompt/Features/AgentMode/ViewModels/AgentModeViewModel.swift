@@ -1017,6 +1017,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     #if DEBUG
         var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)?
+        var test_beforeFailedMCPControlRegistrationCleanup: (@MainActor () async -> Void)?
         /// Holds lane creation after provenance is installed and before configuration.
         var test_afterOversightLaneProvision: (@MainActor (UUID) async -> Void)?
         var test_updateBindingsCallCount: Int = 0
@@ -9718,23 +9719,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #if DEBUG
             await test_afterMCPControlRegistration?(activationID)
         #endif
+        func cleanupFailedRegistration() async {
+            try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+            #if DEBUG
+                await test_beforeFailedMCPControlRegistrationCleanup?()
+            #endif
+            await AgentRunSessionStore.cleanup(registration: registration)
+        }
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
               !session.bindingTransitionInProgress,
               session.mcpControlActivationGeneration == activationGeneration
         else {
-            await AgentRunSessionStore.cleanup(registration: registration)
+            await cleanupFailedRegistration()
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
         }
         if requireInactiveRunState, session.runState.isActive {
-            await AgentRunSessionStore.cleanup(registration: registration)
+            await cleanupFailedRegistration()
             throw MCPError.invalidParams(
                 "The requested agent session became active before MCP control activation."
             )
         }
         do { try MCPAgentRunStartExecutionScope.current?.checkAdmission() }
         catch {
-            await AgentRunSessionStore.cleanup(registration: registration)
+            await cleanupFailedRegistration()
             throw error
         }
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
@@ -9773,18 +9781,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               session.mcpControlContext?.activationID == activationID,
               session.mcpControlContext?.registration == registration
         else {
-            await AgentRunSessionStore.cleanup(registration: registration)
+            await cleanupFailedRegistration()
             throw MCPError.invalidParams("The MCP control activation was superseded during setup.")
         }
         guard cancellationInstalled else {
             session.mcpControlContext = nil
-            await AgentRunSessionStore.cleanup(registration: registration)
+            await cleanupFailedRegistration()
             throw MCPError.internalError(
                 "The Agent session runtime stopped before its cancellation handler could be installed."
             )
         }
         do { try MCPAgentRunStartExecutionScope.current?.checkAdmission() }
         catch {
+            try? MCPAgentRunStartExecutionScope.current?.enterReturn()
             _ = await mcpDeactivateOwnedControlContext(sessionID: sessionID, expectedContext: activatedContext)
             throw error
         }

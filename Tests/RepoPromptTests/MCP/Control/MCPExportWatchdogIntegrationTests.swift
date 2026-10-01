@@ -142,7 +142,11 @@ import XCTest
                     let json = try String(decoding: JSONSerialization.data(withJSONObject: start), as: UTF8.self)
                     var cases: [([String: Any], Bool)] = [
                         (start, true), (["args": start], true),
-                        (["args": json], true), (["agent_run": start], true)
+                        (["args": json], true), (["agent_run": start], true),
+                        (["agent_run": start, MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey: [
+                            "connection_id": endpoint.connectionID.uuidString,
+                            "connection_generation": "1", "request_id": "annotated-start"
+                        ]], true)
                     ]
                     for op in ["wait", "poll", "steer", "not_an_operation"] {
                         cases.append((["op": op, "_rawJSON": true], false))

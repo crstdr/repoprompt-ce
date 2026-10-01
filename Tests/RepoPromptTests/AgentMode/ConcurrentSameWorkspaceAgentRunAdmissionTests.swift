@@ -27,6 +27,79 @@ import XCTest
             cleanupOperation = operation
         }
 
+        func testSupersededUnscopedStarterCannotDeactivateSuccessorControl() async throws {
+            try await assertSupersededActivation(scoped: false)
+        }
+
+        func testSupersededStartActivationEntersReturnBeforeOwnerCleanup() async throws {
+            try await assertSupersededActivation(scoped: true)
+        }
+
+        private func assertSupersededActivation(scoped: Bool) async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let target = try await vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Activation race"
+            )
+            let sessionID = try XCTUnwrap(target.sessionID)
+            let clock = MCPExportWatchdogManualClock()
+            let scope = scoped ? MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment) : nil
+            let registrationGate = AdmissionSaveGate()
+            let cleanupGate = AdmissionHandoffGate()
+            vm.test_afterMCPControlRegistration = { _ in await registrationGate.enterFirstAndWait() }
+            vm.test_beforeFailedMCPControlRegistrationCleanup = {
+                if let scope {
+                    XCTAssertEqual(scope.phase, .returning)
+                    XCTAssertEqual(scope.deadline.instant, .seconds(35))
+                    await cleanupGate.enterAndWait()
+                }
+            }
+            let first = Task {
+                try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                        target: target, message: "Fixture instruction",
+                        metadata: .init(connectionID: nil, clientName: "activation-race-test", windowID: fixture.window.windowID),
+                        agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
+                        dispatchInstruction: { _, _, _, _, _ in
+                            XCTFail("Superseded activation dispatched")
+                            throw AdmissionTestError.expected
+                        }
+                    )
+                }
+            }
+            do {
+                try await waitUntil("first activation registration") { await registrationGate.hasEntered() }
+                try await clock.advanceWithoutSleepers(by: .seconds(10))
+                let successor = try await vm.mcpActivateControlContext(
+                    forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil
+                )
+                await registrationGate.open()
+                if scoped {
+                    await cleanupGate.waitUntilEntered()
+                    try await clock.advanceWithoutSleepers(by: .seconds(25))
+                    XCTAssertThrowsError(try scope?.checkAdmission())
+                    XCTAssertEqual(scope?.recoveryMetadata()["dispatch_state"], .string("not_attempted"))
+                    await cleanupGate.open()
+                }
+                do {
+                    _ = try await first.value
+                    XCTFail("Superseded activation succeeded")
+                } catch {}
+                XCTAssertEqual(vm.mcpRegistration(sessionID: sessionID), successor.registration)
+                XCTAssertEqual(vm.session(for: target.tabID).mcpControlContext?.activationID, successor.activationID)
+                vm.test_afterMCPControlRegistration = nil
+                vm.test_beforeFailedMCPControlRegistrationCleanup = nil
+            } catch {
+                await registrationGate.open()
+                await cleanupGate.open()
+                _ = try? await first.value
+                vm.test_afterMCPControlRegistration = nil
+                vm.test_beforeFailedMCPControlRegistrationCleanup = nil
+                throw error
+            }
+        }
+
         func testExpiredStartAfterDurableAdmissionNeverDispatchesAndReportsExistingIdentity() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup { await fixture.cleanup() }

@@ -235,8 +235,6 @@ enum AgentExternalMCPRunStarter {
                     _ = await agentModeVM.mcpDeactivateOwnedControlContext(
                         sessionID: sessionID, expectedContext: ownedContext
                     )
-                } else if startScope == nil {
-                    await agentModeVM.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
                 }
             }
             throw error
