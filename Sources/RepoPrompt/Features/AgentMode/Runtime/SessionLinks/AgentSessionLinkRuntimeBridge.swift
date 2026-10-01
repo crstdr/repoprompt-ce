@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 // The process-wide runtime bridge between the MCP tool surface, the domain link authority, and
 // every window's live sessions.
@@ -758,6 +759,13 @@ final class AgentSessionLinkRuntimeBridge {
         authority: AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
     )
 
+    private var restorePerfRecorder: any WorkspaceRestorePerfRecording
+
+    func installRestorePerfRecorder(_ recorder: any WorkspaceRestorePerfRecording) {
+        restorePerfRecorder = recorder
+        launchCoordinator?.installRestorePerfRecorder(recorder)
+    }
+
     /// One observed target: its exact endpoint incarnation, its retained observation, and the tail of
     /// its serial publication chain.
     /// How much of the projection tree one refresh pass has to rebuild.
@@ -1129,8 +1137,10 @@ final class AgentSessionLinkRuntimeBridge {
         toolAdvertisementInvalidator: @escaping @Sendable (UUID) async -> Void = { sessionID in
             await ServerNetworkManager.shared.notifyToolListChangedForAgentSession(sessionID)
         },
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) {
+        self.restorePerfRecorder = restorePerfRecorder
         self.authority = authority
         self.host = host
         self.toolAdvertisementInvalidator = toolAdvertisementInvalidator
@@ -1361,7 +1371,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func launchCoordinatorIfNeeded() -> AgentSessionOversightLaunchCoordinator {
         if let launchCoordinator { return launchCoordinator }
-        let coordinator = AgentSessionOversightLaunchCoordinator(delegate: self)
+        let coordinator = AgentSessionOversightLaunchCoordinator(delegate: self, restorePerfRecorder: restorePerfRecorder)
         // Born frozen when the process already is. The freeze is a one-way latch on the bridge, so a
         // coordinator created afterwards has to inherit it rather than start a reconciliation drain
         // that quitting has no way to stop.
@@ -1625,7 +1635,7 @@ final class AgentSessionLinkRuntimeBridge {
             reachedDeadline = !barrierSettled
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.termination",
                 fields: [
                     "outcome": reachedDeadline ? "deadline_reached" : "settled",
@@ -1904,12 +1914,12 @@ final class AgentSessionLinkRuntimeBridge {
         /// written here — this is the surface that carries another session's transcript, so its
         /// diagnostics stay strictly structural.
         private func logPairLane(pair: AgentSessionOversightIntent, outcome: String) {
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.pairLane",
                 fields: [
                     "outcome": outcome,
-                    "observer": WorkspaceRestorePerfLog.shortID(pair.observerSessionID),
-                    "target": WorkspaceRestorePerfLog.shortID(pair.targetSessionID)
+                    "observer": restorePerfRecorder.shortID(pair.observerSessionID),
+                    "target": restorePerfRecorder.shortID(pair.targetSessionID)
                 ]
             )
         }
@@ -4213,7 +4223,7 @@ final class AgentSessionLinkRuntimeBridge {
         let queued = endpoints.intersection(knownTargetEndpoints)
         guard !queued.isEmpty else { return }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.locationRefresh",
                 fields: [
                     "scope": "exact",
@@ -4235,7 +4245,7 @@ final class AgentSessionLinkRuntimeBridge {
             knownTargetEndpoints.filter { $0.workspaceID == id }
         } ?? knownTargetEndpoints
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.locationRefresh",
                 fields: [
                     "scope": "global",
@@ -4262,7 +4272,7 @@ final class AgentSessionLinkRuntimeBridge {
             observers.formUnion(inputs.inboundObserverEndpoints.values)
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.locationRefresh",
                 fields: [
                     "scope": "drained",
@@ -5120,7 +5130,7 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     enum AttentionRequestDisposition: Equatable {
-        case accepted
+        case accepted(hasWaitingOn: Bool)
         case atCapacity
         /// Candidate UUIDs are present only when the caller omitted `observer_session_id`.
         case ambiguous(candidateObserverSessionIDs: [UUID]?, omittedCandidateCount: Int)
@@ -5222,7 +5232,9 @@ final class AgentSessionLinkRuntimeBridge {
         let finalCandidates = host.agentSessionLinkCandidates()
         let finalLiveEndpoints = Set(finalCandidates.map(\.domainEndpoint))
         guard finalLiveEndpoints == currentLiveEndpoints,
-              finalLiveEndpoints.contains(authorization.target),
+              let finalTarget = finalCandidates.first(where: {
+                  $0.domainEndpoint == authorization.target
+              }),
               let finalObserver = finalCandidates.first(where: {
                   $0.domainEndpoint == authorization.observer
               }),
@@ -5254,7 +5266,8 @@ final class AgentSessionLinkRuntimeBridge {
             if notices.snapshot.queueRevision != previousQueueRevision {
                 publishPassiveNotices(notices.snapshot, to: authorization.observer)
             }
-            return .accepted
+            let hasWaitingOn = host.agentSessionLinkObservationSnapshot(for: finalTarget).waitingOn != nil
+            return .accepted(hasWaitingOn: hasWaitingOn)
         case .atCapacity:
             return .atCapacity
         case .unavailable:
@@ -6133,9 +6146,10 @@ final class AgentSessionLinkRuntimeBridge {
             )
         )
         let targetEndpoint = target.lease.target
-        let liveness: AgentSessionLinkSendLivenessProbe = { [weak self] in
-            guard let self, let host = self.host else { return .unavailable }
-            return host.agentSessionLinkSendLiveness(
+        // Keep the validated host across Stop's authorization suspension, just as for send.
+        // Its probe still re-proves both exact endpoints and the target window's closing state.
+        let liveness: AgentSessionLinkSendLivenessProbe = {
+            host.agentSessionLinkSendLiveness(
                 observer: request.observerEndpoint, target: targetEndpoint
             )
         }

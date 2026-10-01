@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptProcess
+import RepoPromptSecureStorage
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -27,6 +29,14 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual(Level.from(rawValue: "  fullApproval "), .fullApproval)
         for level in Level.allCases {
             XCTAssertEqual(Level.from(rawValue: level.rawValue), level)
+        }
+    }
+
+    func testDevinPermissionOptionScope() {
+        XCTAssertTrue(ACPPermissionOptionPolicy.isAutoSelectable(optionID: "allow_once", for: .devin))
+        XCTAssertTrue(ACPPermissionOptionPolicy.isAutoSelectable(optionID: "allow_session", for: .devin))
+        for optionID in ["allow_always", "allow_always_global", "allow_server_session", "allow_server_always"] {
+            XCTAssertFalse(ACPPermissionOptionPolicy.isAutoSelectable(optionID: optionID, for: .devin))
         }
     }
 
