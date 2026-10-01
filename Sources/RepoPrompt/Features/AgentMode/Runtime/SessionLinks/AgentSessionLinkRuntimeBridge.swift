@@ -5120,7 +5120,7 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     enum AttentionRequestDisposition: Equatable {
-        case accepted
+        case accepted(hasWaitingOn: Bool)
         case atCapacity
         /// Candidate UUIDs are present only when the caller omitted `observer_session_id`.
         case ambiguous(candidateObserverSessionIDs: [UUID]?, omittedCandidateCount: Int)
@@ -5222,7 +5222,9 @@ final class AgentSessionLinkRuntimeBridge {
         let finalCandidates = host.agentSessionLinkCandidates()
         let finalLiveEndpoints = Set(finalCandidates.map(\.domainEndpoint))
         guard finalLiveEndpoints == currentLiveEndpoints,
-              finalLiveEndpoints.contains(authorization.target),
+              let finalTarget = finalCandidates.first(where: {
+                  $0.domainEndpoint == authorization.target
+              }),
               let finalObserver = finalCandidates.first(where: {
                   $0.domainEndpoint == authorization.observer
               }),
@@ -5254,7 +5256,8 @@ final class AgentSessionLinkRuntimeBridge {
             if notices.snapshot.queueRevision != previousQueueRevision {
                 publishPassiveNotices(notices.snapshot, to: authorization.observer)
             }
-            return .accepted
+            let hasWaitingOn = host.agentSessionLinkObservationSnapshot(for: finalTarget).waitingOn != nil
+            return .accepted(hasWaitingOn: hasWaitingOn)
         case .atCapacity:
             return .atCapacity
         case .unavailable:

@@ -6391,7 +6391,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
         XCTAssertEqual(created.result, .created)
         XCTAssertEqual(created.firstTask, .delivered)
-        XCTAssertEqual(attentionResult, .accepted)
+        XCTAssertEqual(attentionResult, .accepted(hasWaitingOn: false))
         let notices = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
         XCTAssertEqual(notices.attentionRequests.map(\.targetSessionID), [lane.sessionID])
         let inverse = await fixture.authority.authorizeRequestAttention(
