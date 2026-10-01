@@ -111,6 +111,23 @@ enum AgentSidebarRowTap {
 
 // MARK: - Agent Session Row
 
+/// Code-level UX switch (deliberately not a user setting): `true` renders an overseer-only
+/// `eye.fill` mark as a passive state indicator — tooltip only, no menu. `false` restores
+/// click → Oversee-by for every role mark. Flip back to compare workflows.
+@MainActor
+var agentOversightPassiveOverseerOnlyMark = true
+
+/// The mark opens the Oversee-by menu unless the row is overseer-only while the passive
+/// switch above is on. Overseen and dual-role marks always keep the menu.
+@MainActor
+func agentSessionRowOversightMarkIsInteractive(role: AgentSessionOversightRole) -> Bool {
+    !(
+        agentOversightPassiveOverseerOnlyMark
+            && role.ownOverseerSlot != nil
+            && role.overseers.isEmpty
+    )
+}
+
 struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
@@ -1228,6 +1245,7 @@ struct AgentSessionRow: View {
                             interactive: allowsDirectMutations
                                 && onAddSidebarOversight != nil
                                 && onStopSidebarOversight != nil
+                                && agentSessionRowOversightMarkIsInteractive(role: oversightRole)
                         )
                     }
 

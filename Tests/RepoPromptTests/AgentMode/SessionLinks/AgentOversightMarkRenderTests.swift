@@ -184,4 +184,35 @@ final class AgentOversightMarkRenderTests: XCTestCase {
             0
         )
     }
+
+    // MARK: - Passive overseer-only switch
+
+    private func role(own: Int?, overseers: Int) -> AgentSessionOversightRole {
+        AgentSessionOversightRole(
+            ownOverseerSlot: own,
+            overseers: (0 ..< overseers).map {
+                .init(sessionID: id(UInt8($0 + 1)), displayName: "Overseer \($0)", slot: $0)
+            },
+            overseeingNames: own == nil ? [] : ["Lane B"]
+        )
+    }
+
+    /// Switch ON (current default): an overseer-only mark is passive — tooltip only — while
+    /// overseen and dual-role marks keep the Oversee-by menu.
+    func testPassiveSwitchOnMakesOnlyOverseerOnlyMarksNonInteractive() {
+        agentOversightPassiveOverseerOnlyMark = true
+        defer { agentOversightPassiveOverseerOnlyMark = true }
+        XCTAssertFalse(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 0)))
+        XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: nil, overseers: 1)))
+        XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 1)))
+    }
+
+    /// Switch OFF (rollback path): every role mark keeps the menu, including overseer-only.
+    func testPassiveSwitchOffRestoresOverseerOnlyMenu() {
+        agentOversightPassiveOverseerOnlyMark = false
+        defer { agentOversightPassiveOverseerOnlyMark = true }
+        XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 0)))
+        XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: nil, overseers: 1)))
+        XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 1)))
+    }
 }
