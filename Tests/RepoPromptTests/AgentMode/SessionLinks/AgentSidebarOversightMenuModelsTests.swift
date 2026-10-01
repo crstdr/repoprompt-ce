@@ -740,6 +740,46 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertEqual(menu.createdByLabel, "RepoPrompt PM")
     }
 
+    /// Jump items are exactly the linked observers, linked targets and the unlinked-creator
+    /// row — they render with `jumpItemIcon` so they read as links, while candidates, section
+    /// labels and unlink items stay plain. The icon lives in the view layer; this asserts the
+    /// model partition that decides icon-ness plus the pinned symbol.
+    func testJumpItemsAreExactlyTheLinkedOptionsAndCreator() {
+        XCTAssertEqual(AgentOversightUICopy.jumpItemIcon, "arrow.up.forward")
+
+        let target = candidate(windowID: 1, displayName: "Row")
+        let linkedObserver = candidate(windowID: 2, displayName: "Overseer")
+        let availableObserver = candidate(windowID: 3, displayName: "Candidate")
+        let linkedTarget = candidate(windowID: 4, displayName: "Managed")
+        let creator = candidate(windowID: 5, displayName: "Creator")
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                linked: [Linked(endpoint: linkedObserver.domainEndpoint, linkID: UUID(), generation: 1)],
+                linkedTargets: [Linked(endpoint: linkedTarget.domainEndpoint, linkID: UUID(), generation: 1)],
+                activeOutboundObserverEndpoints: [availableObserver.domainEndpoint]
+            ),
+            candidates: [target, linkedObserver, availableObserver, linkedTarget, creator],
+            createdByLabel: "Creator",
+            creatorSessionID: creator.sessionID
+        )
+
+        // Jump items: linked observers + linked targets + the unlinked creator section.
+        XCTAssertEqual(
+            Set(menu.linkedObservers.map(\.peerEndpoint)),
+            [linkedObserver.domainEndpoint]
+        )
+        XCTAssertEqual(
+            Set(menu.linkedTargets.map(\.peerEndpoint)),
+            [linkedTarget.domainEndpoint]
+        )
+        XCTAssertTrue(menu.showsCreatedBySection)
+        // Candidates stay plain — none of them are jump items.
+        XCTAssertTrue(menu.availableObservers.allSatisfy { $0.relationship == .available })
+        XCTAssertTrue(menu.availableTargets.allSatisfy { $0.relationship == .available })
+    }
+
     /// Creator collapse: sole-overseer creator merges the section; a creator who still oversees
     /// alongside others or not at all never produces a separate Created-by section.
     func testCreatorSectionCollapseRules() {
