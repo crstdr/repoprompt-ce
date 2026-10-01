@@ -3,7 +3,7 @@ import Foundation
 /// Single owner of user-visible copy for the unified sidebar oversight UI.
 ///
 /// Scope: the row relationship marks, the shared lane menu ("Oversee by"), the inverse
-/// "Make overseer of" / "Oversee" menu, the Session-ID sheets, and the link confirmation
+/// "Oversee" menu, the Session-ID sheets, and the link confirmation
 /// dialog. Existing dashboard/pill copy (`AgentMonitorPillModels`, resolver `uiMessage`
 /// strings, persistence copy) stays in its current owners and is only referenced from here.
 ///
@@ -74,13 +74,18 @@ enum AgentOversightUICopy {
     // MARK: - Menus
 
     static let overseeByTitle = "Oversee by"
-    /// Inverse submenu title while the clicked row oversees nothing yet.
-    static let makeOverseerOfTitle = "Make overseer of"
-    /// Inverse submenu title once the clicked row already oversees at least one session.
+    /// Inverse submenu title — always "Oversee ▸" regardless of existing outbound links
+    /// (Cristian, 2026-10-01).
     static let overseeTitle = "Oversee"
     static let sessionIDMenuItem = "Session ID…"
     static let noEligibleOverseers = "No eligible overseers"
     static let noSessionsToOversee = "No sessions to oversee"
+    /// Disabled header line atop both oversight menus — one plain line about what the popup
+    /// does. Approved by Cristian 2026-10-01.
+    static let oversightMenuHeader = "Manage session oversight"
+    /// Disabled reason shown in the Oversee-by / Oversee context submenus on a row whose chat
+    /// has no session ID yet (fresh chat before the first send). Approved by Cristian 2026-10-01.
+    static let oversightAvailableAfterFirstMessage = "Available after the first message"
 
     static func openLabel(_ displayName: String) -> String {
         "Open \"\(displayName)\""

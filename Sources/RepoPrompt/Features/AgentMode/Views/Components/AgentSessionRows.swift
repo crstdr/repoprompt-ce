@@ -111,6 +111,23 @@ enum AgentSidebarRowTap {
 
 // MARK: - Agent Session Row
 
+/// Code-level UX switch (deliberately not a user setting): `true` renders an overseer-only
+/// `eye.fill` mark as a passive state indicator — tooltip only, no menu. `false` restores
+/// click → Oversee-by for every role mark. Flip back to compare workflows.
+@MainActor
+var agentOversightPassiveOverseerOnlyMark = true
+
+/// The mark opens the Oversee-by menu unless the row is overseer-only while the passive
+/// switch above is on. Overseen and dual-role marks always keep the menu.
+@MainActor
+func agentSessionRowOversightMarkIsInteractive(role: AgentSessionOversightRole) -> Bool {
+    !(
+        agentOversightPassiveOverseerOnlyMark
+            && role.ownOverseerSlot != nil
+            && role.overseers.isEmpty
+    )
+}
+
 struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
@@ -173,6 +190,10 @@ struct AgentSessionRow: View {
     /// Re-resolves the exact current target projection whenever SwiftUI materializes either menu.
     /// A frozen props value would make an available observer actionable after it closed or rebound.
     var resolveSidebarOversightMenu: (@MainActor () -> AgentSidebarOversightMenuProps?)?
+    /// Non-nil when the row could host oversight but lacks a bound session ID (a fresh chat
+    /// before the first send, or any ID-less row): the context menu then offers the Oversee-by
+    /// and Oversee submenus containing only this disabled reason.
+    var sidebarOversightUnavailableReason: String?
     /// Resolves the row's current exact target even when lifecycle eligibility makes its menu nil.
     /// This fences feedback from a system menu that stayed open across an in-place rebind.
     var resolveSidebarOversightTargetEndpoint:
@@ -263,6 +284,9 @@ struct AgentSessionRow: View {
         /// depends on this list, so resolving it live while the menu is open reintroduces the
         /// removed-item measurement crash.
         var sidebarOversightMenu: AgentSidebarOversightMenuProps?
+        /// Frozen alongside the menu for the same reason — an ID gaining a session mid-menu
+        /// must not swap a disabled pair for a live section while the menu is open.
+        var sidebarOversightUnavailableReason: String?
     }
 
     @State private var menuSnapshot = ContextMenuSnapshot(
@@ -271,7 +295,8 @@ struct AgentSessionRow: View {
         hasAttentionRunState: false,
         hasOnStash: false,
         hasOnDismissAttention: false,
-        sidebarOversightMenu: nil
+        sidebarOversightMenu: nil,
+        sidebarOversightUnavailableReason: nil
     )
 
     /// The oversight menu as it should appear, or nil when the section must not be offered.
@@ -286,6 +311,16 @@ struct AgentSessionRow: View {
               onStopSidebarOversight != nil
         else { return nil }
         return menu
+    }
+
+    /// An ID-less row (a fresh chat before the first send) still lists both Oversee submenus in
+    /// its context menu — enabled labels containing only the disabled reason — so the feature is
+    /// discoverable without minting a session ID early. Suppressed while direct mutations are
+    /// off (multi-select, bulk action in flight) — those modes hide the oversight section.
+    var showsDisabledOversightContextSubmenus: Bool {
+        allowsDirectMutations
+            && sidebarOversightUnavailableReason != nil
+            && presentableSidebarOversightMenu == nil
     }
 
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -412,6 +447,8 @@ struct AgentSessionRow: View {
     private func sidebarOversightMenuContent(
         _ menu: AgentSidebarOversightMenuProps
     ) -> some View {
+        Button(AgentOversightUICopy.oversightMenuHeader) {}
+            .disabled(true)
         if let reason = menu.targetIneligibleReason {
             Button(reason) {}
                 .disabled(true)
@@ -447,12 +484,14 @@ struct AgentSessionRow: View {
         .disabled(menu.targetIneligibleReason != nil)
     }
 
-    /// The inverse "Make overseer of" / "Oversee" submenu: one checked list of sessions this row
+    /// The inverse "Oversee ▸" submenu: one checked list of sessions this row
     /// oversees or could oversee (ticked first), then the Session-ID escape hatch.
     @ViewBuilder
     private func sidebarOversightInverseMenuContent(
         _ menu: AgentSidebarOversightMenuProps
     ) -> some View {
+        Button(AgentOversightUICopy.oversightMenuHeader) {}
+            .disabled(true)
         if let reason = menu.observerIneligibleReason {
             Button(reason) {}
                 .disabled(true)
@@ -1056,18 +1095,42 @@ struct AgentSessionRow: View {
                 sidebarOversightInverseMenuContent(menu)
             } label: {
                 Label(
-                    menu.isOverseer
-                        ? AgentOversightUICopy.overseeTitle
-                        : AgentOversightUICopy.makeOverseerOfTitle,
+                    AgentOversightUICopy.overseeTitle,
                     systemImage: AgentOversightUICopy.manageOversightIcon
                 )
             }
-            .accessibilityLabel(
-                menu.isOverseer
-                    ? AgentOversightUICopy.overseeTitle
-                    : AgentOversightUICopy.makeOverseerOfTitle
-            )
+            .accessibilityLabel(AgentOversightUICopy.overseeTitle)
             .accessibilityValue(sidebarOversightInverseMenuAccessibilityValue(menu))
+        }
+    }
+
+    /// The two Oversee submenus for an ID-less row: the labels stay enabled so the reason is
+    /// discoverable, while the only item inside each is the disabled explanation.
+    private func sidebarOversightUnavailableContextMenu(reason: String) -> some View {
+        Group {
+            Menu {
+                Button(reason) {}
+                    .disabled(true)
+            } label: {
+                Label(
+                    AgentOversightUICopy.overseeByTitle,
+                    systemImage: AgentOversightUICopy.manageOversightIcon
+                )
+            }
+            .accessibilityLabel(AgentOversightUICopy.overseeByTitle)
+            .accessibilityValue(reason)
+
+            Menu {
+                Button(reason) {}
+                    .disabled(true)
+            } label: {
+                Label(
+                    AgentOversightUICopy.overseeTitle,
+                    systemImage: AgentOversightUICopy.manageOversightIcon
+                )
+            }
+            .accessibilityLabel(AgentOversightUICopy.overseeTitle)
+            .accessibilityValue(reason)
         }
     }
 
@@ -1101,17 +1164,25 @@ struct AgentSessionRow: View {
         interactive: Bool
     ) -> some View {
         if interactive, let menu {
-            Menu {
-                sidebarOversightMenuContent(menu)
-            } label: {
-                oversightMarkGlyph
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .hoverTooltip(tooltip)
-            .accessibilityLabel(tooltip)
-            .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+            // A macOS Menu template-renders its label image, which would flatten the palette
+            // colours (and the two-tone/count colours) to the control tint — and to white on
+            // selected rows. The coloured glyph therefore stays ordinary content underneath a
+            // clear-label Menu that owns the same hit target; the glyph itself never hit-tests.
+            oversightMarkGlyph
+                .accessibilityHidden(true)
+                .overlay {
+                    Menu {
+                        sidebarOversightMenuContent(menu)
+                    } label: {
+                        Color.clear
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .accessibilityLabel(tooltip)
+                    .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+                }
+                .fixedSize()
+                .hoverTooltip(tooltip)
         } else {
             oversightMarkGlyph
                 .fixedSize()
@@ -1220,6 +1291,7 @@ struct AgentSessionRow: View {
                             interactive: allowsDirectMutations
                                 && onAddSidebarOversight != nil
                                 && onStopSidebarOversight != nil
+                                && agentSessionRowOversightMarkIsInteractive(role: oversightRole)
                         )
                     }
 
@@ -1355,6 +1427,9 @@ struct AgentSessionRow: View {
             if let sidebarOversightMenu = menuSnapshot.sidebarOversightMenu {
                 sidebarOversightContextMenu(sidebarOversightMenu)
                 Divider()
+            } else if let reason = menuSnapshot.sidebarOversightUnavailableReason {
+                sidebarOversightUnavailableContextMenu(reason: reason)
+                Divider()
             }
 
             if !menuSnapshot.showsSelectionPresentation {
@@ -1401,7 +1476,10 @@ struct AgentSessionRow: View {
                     hasAttentionRunState: attentionRunState != nil,
                     hasOnStash: onStash != nil,
                     hasOnDismissAttention: onDismissAttention != nil,
-                    sidebarOversightMenu: presentableSidebarOversightMenu
+                    sidebarOversightMenu: presentableSidebarOversightMenu,
+                    sidebarOversightUnavailableReason: showsDisabledOversightContextSubmenus
+                        ? sidebarOversightUnavailableReason
+                        : nil
                 )
             }
         }

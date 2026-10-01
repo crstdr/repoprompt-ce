@@ -699,6 +699,9 @@ struct AgentModeSessionsListView: View {
                             onDismissAttention: dismissAttentionAction,
                             onCopySessionID: copySessionIDAction,
                             resolveSidebarOversightMenu: sidebarOversightMenuResolver,
+                            sidebarOversightUnavailableReason: session.sessionID == nil
+                                ? AgentOversightUICopy.oversightAvailableAfterFirstMessage
+                                : nil,
                             resolveSidebarOversightTargetEndpoint:
                             sidebarOversightTargetEndpointResolver,
                             onAddSidebarOversight: { observerEndpoint, targetEndpoint in

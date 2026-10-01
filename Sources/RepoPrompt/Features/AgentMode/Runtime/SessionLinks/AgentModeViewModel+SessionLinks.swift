@@ -1025,7 +1025,7 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Inverse-direction add for the sidebar's "Make overseer of" / "Oversee" menu: the row
+    /// Inverse-direction add for the sidebar's "Oversee" menu: the row
     /// rendered by the sidebar is the *observer*. Uses the general exact-endpoint Add so the row
     /// may acquire its first outbound link — the sidebar's existing-overseer precondition does
     /// not apply to this direction.
