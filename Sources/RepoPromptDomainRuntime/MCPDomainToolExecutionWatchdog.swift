@@ -1,19 +1,19 @@
 import Foundation
 
-package enum MCPToolExecutionSettlement: String, Equatable {
+package enum MCPToolExecutionSettlement: String, Equatable, Sendable {
     case success
     case cancellation
     case error
 }
 
-package enum MCPToolExecutionCancellationOrigin: String, Equatable {
+package enum MCPToolExecutionCancellationOrigin: String, Equatable, Sendable {
     case watchdogDeadline = "watchdog_deadline"
     case requestCancellation = "request_cancellation"
     case clientDeadline = "client_deadline"
     case serverExportEnvelope = "server_export_envelope"
 }
 
-package struct MCPToolExecutionCancelledError: Error, Equatable, LocalizedError {
+package struct MCPToolExecutionCancelledError: Error, Equatable, LocalizedError, Sendable {
     package init() {}
 
     package var errorDescription: String? {
@@ -25,7 +25,7 @@ package struct MCPToolExecutionCancelledError: Error, Equatable, LocalizedError 
     }
 }
 
-package enum MCPToolExecutionWatchdogEvent: Equatable {
+package enum MCPToolExecutionWatchdogEvent: Equatable, Sendable {
     case deadlineExpired
     case cancellationRequested(origin: MCPToolExecutionCancellationOrigin)
     case settledDuringGrace(
@@ -37,20 +37,20 @@ package enum MCPToolExecutionWatchdogEvent: Equatable {
     case detachedForSettlement
 }
 
-package enum MCPToolExecutionWatchdogError: Error, Equatable {
+package enum MCPToolExecutionWatchdogError: Error, Equatable, Sendable {
     case admissionEnvelopeExpired
     case executionTimedOut(settlement: MCPToolExecutionSettlement)
     case executionDetached
     case cleanupUnresponsive
 }
 
-package enum MCPToolExecutionWatchdogSchedulingPoint: Equatable {
+package enum MCPToolExecutionWatchdogSchedulingPoint: Equatable, Sendable {
     case operationCompleted
     case deadlineExpired
     case cleanupGraceExpired
 }
 
-package struct MCPToolExecutionWatchdogEnvironment {
+package struct MCPToolExecutionWatchdogEnvironment: Sendable {
     package let now: @Sendable () -> Duration
     package let sleep: @Sendable (Duration) async throws -> Void
     package let eventDidProduce: @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void
