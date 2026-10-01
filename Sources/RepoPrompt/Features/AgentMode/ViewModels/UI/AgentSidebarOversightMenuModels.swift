@@ -129,6 +129,23 @@ struct AgentSidebarOversightMenuProps: Equatable {
         targetOptions.filter { $0.relationship == .available }
     }
 
+    /// True when the row's creator still holds an inbound link — the Overseen-by section
+    /// collapses to `Created and overseen by:` when it is the row's only overseer.
+    var creatorIsOverseer: Bool {
+        creatorSessionID != nil
+            && linkedObservers.contains { $0.peerSessionID == creatorSessionID }
+    }
+
+    var creatorIsSoleOverseer: Bool {
+        creatorIsOverseer && linkedObservers.count == 1
+    }
+
+    /// The separate `Created by:` section appears only when the creator is not (or no
+    /// longer) an overseer — otherwise it is already in the Overseen-by list.
+    var showsCreatedBySection: Bool {
+        createdByLabel != nil && creatorSessionID != nil && !creatorIsOverseer
+    }
+
     var hasInbound: Bool {
         !linkedObservers.isEmpty || !inboundObserverNames.isEmpty
     }
@@ -253,6 +270,13 @@ enum AgentSidebarOversightMenuProjection {
             candidates.map { ($0.domainEndpoint, $0) },
             uniquingKeysWith: { first, _ in first }
         )
+        // Display names resolve app-wide by session ID, like the candidate lists: a linked
+        // peer whose live incarnation moved (rebind, generation rollover, another window)
+        // still names itself, and the compact ID only shows for a truly unknown session.
+        let candidatesBySessionID = Dictionary(
+            candidates.map { ($0.sessionID, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
 
         // MARK: Inbound (who oversees this row)
 
@@ -273,6 +297,7 @@ enum AgentSidebarOversightMenuProjection {
                 assertionFailure("Inbound oversight inventory and exact observer endpoint disagree.")
             }
             let observer = candidatesByEndpoint[observerEndpoint]
+            let observerBySession = candidatesBySessionID[observerEndpoint.sessionID]
             let observerCurrentlyEligible = observer.map {
                 AgentSessionLinkEndpointEligibility.addDisabledReason(
                     $0.eligibilityInput,
@@ -283,9 +308,13 @@ enum AgentSidebarOversightMenuProjection {
                 peerEndpoint: observerEndpoint,
                 peerSessionID: observerEndpoint.sessionID,
                 displayName: observer?.resolvedDisplayName
+                    ?? observerBySession?.resolvedDisplayName
+                    ?? item.displayName
                     ?? AgentMonitorSessionIDFormatter.short(observerEndpoint.sessionID),
-                providerDisplayName: normalizedProvider(observer?.providerDisplayName),
-                locationLabel: observer?.locationLabel,
+                providerDisplayName: normalizedProvider(
+                    observer?.providerDisplayName ?? observerBySession?.providerDisplayName
+                ),
+                locationLabel: observer?.locationLabel ?? observerBySession?.locationLabel,
                 relationship: .linked(
                     reference: DomainAgentSessionLinkReference(
                         linkID: item.linkID,
@@ -343,6 +372,7 @@ enum AgentSidebarOversightMenuProjection {
                 assertionFailure("Outbound oversight inventory and exact target endpoint disagree.")
             }
             let targetPeer = candidatesByEndpoint[linkedTargetEndpoint]
+            let targetPeerBySession = candidatesBySessionID[linkedTargetEndpoint.sessionID]
             let targetCurrentlyEligible = targetPeer.map {
                 AgentSessionLinkEndpointEligibility.targetResolveFailure(for: $0) == nil
             } ?? false
@@ -350,10 +380,13 @@ enum AgentSidebarOversightMenuProjection {
                 peerEndpoint: linkedTargetEndpoint,
                 peerSessionID: linkedTargetEndpoint.sessionID,
                 displayName: targetPeer?.resolvedDisplayName
+                    ?? targetPeerBySession?.resolvedDisplayName
                     ?? item.displayName
                     ?? AgentMonitorSessionIDFormatter.short(linkedTargetEndpoint.sessionID),
-                providerDisplayName: normalizedProvider(targetPeer?.providerDisplayName),
-                locationLabel: targetPeer?.locationLabel,
+                providerDisplayName: normalizedProvider(
+                    targetPeer?.providerDisplayName ?? targetPeerBySession?.providerDisplayName
+                ),
+                locationLabel: targetPeer?.locationLabel ?? targetPeerBySession?.locationLabel,
                 relationship: .linked(
                     reference: DomainAgentSessionLinkReference(
                         linkID: item.linkID,
@@ -426,18 +459,21 @@ enum AgentSidebarOversightMenuProjection {
             )
         }
 
-        // Mark tooltips read names from the authority inventories, not from the option lists:
-        // a linked peer is always a tooltip name even when its live candidate disappeared.
+        // Mark tooltips and the menu's jump sections read names from the same app-wide session
+        // resolver as the candidate lists: a linked peer is always a name even when its exact
+        // endpoint incarnation moved, and the compact ID is the last-resort fallback only.
         let inboundNames = inputs.inbound.items.map { item in
             inputs.inboundObserverEndpoints[item.linkID].flatMap {
                 candidatesByEndpoint[$0]?.resolvedDisplayName
-            } ?? item.displayName ?? AgentMonitorSessionIDFormatter.short(item.observerSessionID)
+            } ?? candidatesBySessionID[item.observerSessionID]?.resolvedDisplayName
+                ?? item.displayName ?? AgentMonitorSessionIDFormatter.short(item.observerSessionID)
         }
         let inboundSessionIDs = inputs.inbound.items.map(\.observerSessionID)
         let outboundNames = inputs.outbound.items.map { item in
             inputs.outboundTargetEndpoints[item.linkID].flatMap {
                 candidatesByEndpoint[$0]?.resolvedDisplayName
-            } ?? item.displayName ?? AgentMonitorSessionIDFormatter.short(item.targetSessionID)
+            } ?? candidatesBySessionID[item.targetSessionID]?.resolvedDisplayName
+                ?? item.displayName ?? AgentMonitorSessionIDFormatter.short(item.targetSessionID)
         }
 
         return AgentSidebarOversightMenuProps(
@@ -445,7 +481,8 @@ enum AgentSidebarOversightMenuProjection {
             targetSessionID: target.sessionID,
             targetDisplayName: target.resolvedDisplayName,
             observerOptions: observerOptions,
-            createdByLabel: createdByLabel,
+            createdByLabel: creatorSessionID
+                .flatMap { candidatesBySessionID[$0]?.resolvedDisplayName } ?? createdByLabel,
             targetOptions: targetOptions,
             targetIneligibleReason: targetFailure?.uiMessage,
             observerIneligibleReason: observerReason,

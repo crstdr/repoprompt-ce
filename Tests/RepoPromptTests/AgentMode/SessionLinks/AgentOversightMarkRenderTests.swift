@@ -186,7 +186,7 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         )
     }
 
-    // MARK: - Passive overseer-only switch
+    // MARK: - Passive-mark switch
 
     private func role(own: Int?, overseers: Int) -> AgentSessionOversightRole {
         AgentSessionOversightRole(
@@ -198,23 +198,22 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         )
     }
 
-    /// Switch ON (current default): an overseer-only mark is passive — tooltip only — while
-    /// overseen and dual-role marks keep the Oversee-by menu.
-    func testPassiveSwitchOnMakesOnlyOverseerOnlyMarksNonInteractive() {
-        agentOversightPassiveOverseerOnlyMark = true
-        defer { agentOversightPassiveOverseerOnlyMark = true }
-        XCTAssertFalse(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 0)))
+    /// Switch OFF (current default): every role mark opens the unified oversight menu.
+    func testMarkSwitchDefaultOpensMenuForAllRoles() {
+        agentOversightRoleMarksArePassive = false
+        defer { agentOversightRoleMarksArePassive = false }
+        XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 0)))
         XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: nil, overseers: 1)))
         XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 1)))
     }
 
-    /// Switch OFF (rollback path): every role mark keeps the menu, including overseer-only.
-    func testPassiveSwitchOffRestoresOverseerOnlyMenu() {
-        agentOversightPassiveOverseerOnlyMark = false
-        defer { agentOversightPassiveOverseerOnlyMark = true }
-        XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 0)))
-        XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: nil, overseers: 1)))
-        XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 1)))
+    /// Switch ON (rollback path): every role mark becomes a passive tooltip-only indicator.
+    func testPassiveSwitchOnMakesAllMarksPassive() {
+        agentOversightRoleMarksArePassive = true
+        defer { agentOversightRoleMarksArePassive = false }
+        XCTAssertFalse(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 0)))
+        XCTAssertFalse(agentSessionRowOversightMarkIsInteractive(role: role(own: nil, overseers: 1)))
+        XCTAssertFalse(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 1)))
     }
 
     // MARK: - ID-less rows (option a)
