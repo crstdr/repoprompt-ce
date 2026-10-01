@@ -295,6 +295,64 @@ import XCTest
             XCTAssertEqual(scope.recoveryMetadata()["dispatch_state"], .string("not_attempted"))
         }
 
+        func testSemanticWaitFailureReturnsBeforeBlockedHeartbeatErrorCleanup() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            let gate = AdmissionHandoffGate()
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            var service = makeAgentRunStartService(window: fixture.window, recorder: recorder, onHeartbeatError: {
+                XCTAssertEqual(scope.phase, .returning)
+                XCTAssertEqual(scope.deadline.instant, .seconds(35))
+                await gate.enterAndWait()
+            })
+            service.testAfterTargetResolution = { target in
+                if let sessionID = target.sessionID {
+                    _ = try? await vm.mcpActivateControlContext(forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil, startPending: true)
+                }
+            }
+            service.testWaitUntilInteresting = { cursor, _ in
+                try? await clock.advanceWithoutWakingSleepers(by: .seconds(10))
+                return .terminalPublicationRejected(epoch: .init(
+                    sessionID: cursor.registration.sessionID, activationID: UUID(),
+                    registrationGeneration: cursor.registration.generation, id: UUID(), ordinal: 1,
+                    continuityGeneration: 0, transitionKind: .unrelated
+                ), reason: "fixture_terminal_rejection")
+            }
+            var ended = 0
+            service.endAgentRunWait = { _, _ in ended += 1 }
+            service.beginAgentRunWait = { _, _, _ in .init(token: UUID(), parentRunID: UUID()) }
+            let controlledService = service
+            let task = Task {
+                try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await MCPToolExecutionWatchdog.execute(
+                        deadline: .seconds(150), cancellationGrace: .seconds(5), cleanupDisposition: .detachAndSettle,
+                        startScope: scope, environment: clock.environment,
+                        operation: { try await controlledService.execute(args: ["op": .string("start"), "message": .string("Fixture instruction"), "timeout": .int(3600)]) }
+                    )
+                }
+            }
+            await gate.waitUntilEntered()
+            do {
+                try await clock.waitForSleeper(expected: .seconds(25))
+                try await clock.advanceSleeper(expected: .seconds(25))
+                try await clock.waitForSleeper(expected: .seconds(5))
+                try await clock.advanceSleeper(expected: .seconds(5))
+                do { _ = try await task.value
+                    XCTFail("Blocked cleanup returned success")
+                } catch { XCTAssertEqual(error as? MCPToolExecutionWatchdogError, .executionDetached) }
+                XCTAssertEqual(ended, 0)
+                await gate.open()
+                try await waitUntil("detached wait registration cleanup") { ended == 1 }
+            } catch {
+                await gate.open()
+                _ = try? await task.value
+                throw error
+            }
+        }
+
         func testExpiredStartAfterDurableAdmissionNeverDispatchesAndReportsExistingIdentity() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup { await fixture.cleanup() }
@@ -2177,7 +2235,8 @@ import XCTest
             window: WindowState,
             recorder: AdmissionProviderRecorder,
             validateBeforeProviderDispatch: ((AdmissionIdentityPair) async throws -> Void)? = nil,
-            afterHeartbeat: (() async throws -> Void)? = nil
+            afterHeartbeat: (() async throws -> Void)? = nil,
+            onHeartbeatError: (() async -> Void)? = nil
         ) -> AgentRunMCPToolService {
             var service = AgentRunMCPToolService(
                 toolName: MCPWindowToolName.agentRun,
@@ -2193,9 +2252,14 @@ import XCTest
                 resolveSpawnParentSourceTabID: { _ in nil },
                 resolveSpawnParentSessionID: { _, _ in nil },
                 withHeartbeat: { _, _, _, _, operation in
-                    let value = try await operation()
-                    try await afterHeartbeat?()
-                    return value
+                    do {
+                        let value = try await operation()
+                        try await afterHeartbeat?()
+                        return value
+                    } catch {
+                        await onHeartbeatError?()
+                        throw error
+                    }
                 },
                 startRun: { target, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _, _ in
                     let sessionID = try XCTUnwrap(target.sessionID)

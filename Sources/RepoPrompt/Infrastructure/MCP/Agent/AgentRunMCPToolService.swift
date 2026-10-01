@@ -379,6 +379,7 @@ struct AgentRunMCPToolService {
         var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
         var testBeforeWorktreeBindingCommit: (() async -> Void)?
         var testBeforeProviderDispatch: (() async -> Void)?
+        var testWaitUntilInteresting: (@Sendable (AgentRunSessionStore.WaitCursor, TimeInterval) async -> AgentRunSessionStore.WaitDisposition)?
         var testBeforeSteerDispatch: (() async -> Void)?
         var testAfterSteerDispatchBeforeBookkeeping: ((AgentModeViewModel.MCPSessionTarget?) async throws -> Void)?
         var testAfterProviderStartBeforeBookkeeping: (() async -> Void)?
@@ -1589,12 +1590,17 @@ struct AgentRunMCPToolService {
         let snapshot: Value
         do {
             let startSemanticDeadline = try startScope?.enterSemanticWait(seconds: timeoutSeconds)
+            #if DEBUG
+                let testWaitUntilInteresting = testWaitUntilInteresting
+            #endif
             snapshot = try await withHeartbeat(
                 metadata.connectionID,
                 toolName,
                 stage,
                 message
             ) {
+                // Error exits must start return before the heartbeat wrapper tears down.
+                defer { try? startScope?.enterReturn() }
                 var cursor = initialCursor
                 while true {
                     if Task.isCancelled {
@@ -1618,10 +1624,16 @@ struct AgentRunMCPToolService {
                         ))
                         return value
                     }
-                    let disposition = await AgentRunSessionStore.waitUntilInteresting(
-                        cursor: cursor,
-                        timeoutSeconds: remaining
-                    )
+                    let disposition: AgentRunSessionStore.WaitDisposition
+                    #if DEBUG
+                        if let testWaitUntilInteresting {
+                            disposition = await testWaitUntilInteresting(cursor, remaining)
+                        } else {
+                            disposition = await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: remaining)
+                        }
+                    #else
+                        disposition = await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: remaining)
+                    #endif
                     switch disposition {
                     case let .snapshotReady(triggeringSnapshot):
                         completionBox.set(AgentRunWaitScopeCompletion(

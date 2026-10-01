@@ -1628,6 +1628,8 @@ actor ServerNetworkManager {
     #if DEBUG
         private var debugAfterDirectAdmissionPendingPublishedForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterBootstrapPolicyReadinessForTesting: (@Sendable (String) async -> Void)?
+        private var debugForceResolvedToolMissingForTesting: (@Sendable () async -> Bool)?
+        private var debugBeforeToolNotFoundObserversForTesting: (@Sendable () async -> Void)?
         private var debugForceConnectionLimiterUnavailableForTesting: (@Sendable (UUID) async -> Bool)?
         private var debugBeforeFinishRequestProgressForTesting: (@Sendable () async -> Void)?
         private var debugAfterConnectionCallLimiterResolutionForTesting: (@Sendable (UUID) async -> Void)?
@@ -10345,6 +10347,13 @@ actor ServerNetworkManager {
                 debugAfterBootstrapPolicyReadinessForTesting = handler
             }
 
+            func debugSetMissingStartFinalizationForTesting(
+                missing: (@Sendable () async -> Bool)?, beforeObservers: (@Sendable () async -> Void)?
+            ) {
+                debugForceResolvedToolMissingForTesting = missing
+                debugBeforeToolNotFoundObserversForTesting = beforeObservers
+            }
+
             func debugSetEarlyStartFinalizationForTesting(
                 limiterUnavailable: (@Sendable (UUID) async -> Bool)?,
                 beforeFinish: (@Sendable () async -> Void)?
@@ -14541,6 +14550,9 @@ actor ServerNetworkManager {
                                         scope: registrationScope
                                     )
                                 }
+                                #if DEBUG
+                                    if await self.debugForceResolvedToolMissingForTesting?() == true { resolvedTool = nil }
+                                #endif
                                 if let resolvedTool {
                                     let toolDef = resolvedTool.definition
                                     connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(String(describing: registrationScope))")
@@ -14991,6 +15003,10 @@ actor ServerNetworkManager {
                                 }
 
                                 EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)
+                                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                                #if DEBUG
+                                    await self.debugBeforeToolNotFoundObserversForTesting?()
+                                #endif
                                 endPermitPreDispatchEnvelopeIfNeeded()
                                 releaseResourceAdmissionLeases(outcome: "tool_not_found")
                                 let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
