@@ -1283,7 +1283,10 @@ package enum MCPDomainCanonicalToolDefinitions {
             return canonicalizeAgentControlWaitSemantics(
                 MCPDomainToolDefinition(
                     name: definition.name,
-                    description: description,
+                    description: description.replacingOccurrences(
+                        of: "Pass `detach: true` to return immediately.",
+                        with: "Pass `detach: true` to return immediately. Start: setup ≤150s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
+                    ),
                     inputSchema: definition.inputSchema,
                     annotations: definition.annotations,
                     isEnabledByDefault: definition.isEnabledByDefault

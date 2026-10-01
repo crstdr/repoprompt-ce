@@ -2243,6 +2243,9 @@ final class MCPServerViewModel: ObservableObject {
     ] = [:]
     #if DEBUG
         @MainActor
+        var test_shouldPreserveAgentRunSourceBinding: ((UUID, RequestMetadata) async -> Bool)?
+
+        @MainActor
         var readFileAutoSelectionForcedAuthoritativeProbeIDsByContext: [
             MCPReadFileAutoSelectionCoordinator.ContextKey: Set<UUID>
         ] = [:]
@@ -4291,6 +4294,7 @@ final class MCPServerViewModel: ObservableObject {
             mcpServerViewModelDebugLog("bindCurrentRequestToTabIfPossible preserved agent-run source binding connectionID=\(connectionID) targetTab=\(tabID)")
             return
         }
+        try MCPAgentRunStartExecutionScope.current?.checkAdmission()
         try bindTabForConnection(
             connectionID: connectionID,
             clientName: metadata.clientName,
@@ -4304,6 +4308,11 @@ final class MCPServerViewModel: ObservableObject {
         connectionID: UUID,
         metadata: RequestMetadata
     ) async -> Bool {
+        #if DEBUG
+            if let decision = test_shouldPreserveAgentRunSourceBinding {
+                return await decision(connectionID, metadata)
+            }
+        #endif
         guard await ServerNetworkManager.shared.runPurpose(for: connectionID) == .agentModeRun else {
             return false
         }

@@ -12358,7 +12358,7 @@ actor ServerNetworkManager {
         // ------------------------------------------------------------------
         //  tools/call  (UPDATED)
         // ------------------------------------------------------------------
-        await server.withMethodHandler(CallTool.self) { [weak self] params in
+        let requestBody: @Sendable (CallTool.Parameters) async -> CallTool.Result = { [weak self] params in
             guard let self else {
                 return CallTool.Result(
                     content: [MCP.Tool.Content.text(text: "Server unavailable", annotations: nil, _meta: nil)],
@@ -12459,7 +12459,8 @@ actor ServerNetworkManager {
                     appInvocationID: inheritedRequestIdentity?.appInvocationID,
                     requestOrdinal: inheritedRequestIdentity?.requestOrdinal
                 )
-                let invocationID = requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
+                let invocationID = MCPAgentRunStartExecutionScope.current?.invocationID
+                    ?? requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
                 let resolvedRequestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineIdentity(
                     jsonRPCRequestID: requestIdentity.jsonRPCRequestID,
                     connectionID: requestIdentity.connectionID,
@@ -12486,7 +12487,7 @@ actor ServerNetworkManager {
                     ))
                 }
             #else
-                let invocationID = UUID()
+                let invocationID = MCPAgentRunStartExecutionScope.current?.invocationID ?? UUID()
                 let resolvedRequestIdentity: MCPRequestTimelineIdentity? = nil
                 let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
             #endif
@@ -13715,7 +13716,7 @@ actor ServerNetworkManager {
                                         slot: MCPCodeStructureSettlementRegistry.Slot?
                                     )
                                     if contract.cleanupDisposition == .detachAndSettle,
-                                       toolName != MCPWindowToolName.fileActions
+                                       [MCPWindowToolName.getCodeStructure, MCPWindowToolName.readFile, MCPWindowToolName.getFileTree].contains(toolName)
                                     {
                                         guard let windowID = Self.currentToolDispatchAuthorization?.windowIdentity?.windowID else {
                                             throw MCPToolExecutionDispatchError.structureSettlementWindowUnresolved
@@ -13994,6 +13995,19 @@ actor ServerNetworkManager {
                                         )
                                     }
 
+                                    if let startScope = MCPAgentRunStartExecutionScope.current,
+                                       startScope.connectionID == connectionID,
+                                       startScope.invocationID == invocationID
+                                    {
+                                        do {
+                                            let value = try await tracedOperation(nil)
+                                            await recordSynchronousSettlement(.success)
+                                            return value
+                                        } catch {
+                                            await recordSynchronousSettlement(MCPToolExecutionCancelledError.matches(error) ? .cancellation : .error)
+                                            throw error
+                                        }
+                                    }
                                     switch contract {
                                     case let .bounded(deadline, cancellationGrace, _):
                                         do {
@@ -15008,6 +15022,36 @@ actor ServerNetworkManager {
                 } // withPermit wrapper
             } // LimiterEnvelope wrapper
             return await finalizeToolResult(result)
+        }
+        await server.withMethodHandler(CallTool.self) { [weak self] params in
+            guard let self else {
+                return CallTool.Result(content: [.text(text: "Server unavailable", annotations: nil, _meta: nil)], isError: true)
+            }
+            let canonicalName = Self.canonicalToolName(for: params.name)
+            guard MCPToolExecutionContractCatalog.isAgentRunStartCall(
+                toolName: canonicalName, arguments: params.arguments ?? [:]
+            ) else {
+                return await MCPAgentRunStartExecutionScope.$current.withValue(nil) { await requestBody(params) }
+            }
+            let environment = await toolExecutionWatchdogEnvironment
+            let scope = MCPAgentRunStartExecutionScope(connectionID: connectionID, environment: environment)
+            return await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                do {
+                    return try await MCPToolExecutionWatchdog.execute(
+                        deadline: MCPTimeoutPolicy.agentRunStartSetupDeadline,
+                        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                        cleanupDisposition: .detachAndSettle,
+                        startScope: scope, environment: environment,
+                        operation: { await requestBody(params) }
+                    )
+                } catch {
+                    // Deadline-to-return is memory-only: no routing, snapshots, or host cleanup.
+                    let code = MCPToolExecutionCancelledError.matches(error)
+                        ? "tool_execution_cancelled" : "tool_execution_deadline_exceeded"
+                    let value = scope.timeoutValue(code: code, message: "Start request did not settle within its setup/return envelope; inspect its existing identity before recovery.")
+                    return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
+                }
+            }
         }
     }
 

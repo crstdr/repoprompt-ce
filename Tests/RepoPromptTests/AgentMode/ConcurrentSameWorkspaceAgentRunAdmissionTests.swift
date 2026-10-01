@@ -27,6 +27,121 @@ import XCTest
             cleanupOperation = operation
         }
 
+        func testExpiredStartAfterDurableAdmissionNeverDispatchesAndReportsExistingIdentity() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            let recorder = AdmissionProviderRecorder(expectedCount: 0, blockProviders: false)
+            var service = makeAgentRunStartService(window: fixture.window, recorder: recorder)
+            service.testBeforeProviderDispatch = {
+                // The durable creation owner must have recorded identity before this suspension.
+                XCTAssertNotNil(scope.recoveryMetadata()["session_id"])
+                try? await clock.advanceWithoutSleepers(by: .seconds(150))
+            }
+            do {
+                _ = try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await service.execute(args: [
+                        "op": .string("start"), "message": .string("Fixture instruction"),
+                        "detach": .bool(true)
+                    ])
+                }
+                XCTFail("Expired setup dispatched")
+            } catch { XCTAssertTrue(error is CancellationError, "Unexpected failure: \(error)") }
+            let count = await recorder.count()
+            XCTAssertEqual(count, 0)
+            XCTAssertEqual(scope.recoveryMetadata()["dispatch_state"], .string("not_attempted"))
+            XCTAssertNotNil(scope.recoveryMetadata()["session_id"])
+        }
+
+        func testCancelledZeroTimeoutStartAfterAdmissionNeverDispatches() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            let recorder = AdmissionProviderRecorder(expectedCount: 0, blockProviders: false)
+            var service = makeAgentRunStartService(window: fixture.window, recorder: recorder)
+            service.testBeforeProviderDispatch = { scope.close() }
+            do {
+                _ = try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await service.execute(args: [
+                        "op": .string("start"), "message": .string("Fixture instruction"),
+                        "timeout": .int(0)
+                    ])
+                }
+                XCTFail("Cancelled setup dispatched")
+            } catch { XCTAssertTrue(error is CancellationError, "Unexpected failure: \(error)") }
+            let count = await recorder.count()
+            XCTAssertEqual(count, 0)
+            XCTAssertNotNil(scope.recoveryMetadata()["session_id"])
+        }
+
+        func testStartSemanticClockBeginsAfterDelayedWaitRegistration() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            var service = makeAgentRunStartService(window: fixture.window, recorder: recorder)
+            service.testAfterTargetResolution = { target in
+                if let sessionID = target.sessionID {
+                    _ = try? await fixture.window.agentModeViewModel.mcpActivateControlContext(
+                        forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil,
+                        startPending: true
+                    )
+                }
+            }
+            service.beginAgentRunWait = { _, _, _ in
+                XCTAssertEqual(scope.phase, .setup)
+                try? await clock.advanceWithoutSleepers(by: .seconds(100))
+                return nil
+            }
+            _ = try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                try await service.execute(args: [
+                    "op": .string("start"), "message": .string("Fixture instruction"), "timeout": .int(1)
+                ])
+            }
+            XCTAssertEqual(scope.phase, .returning)
+            XCTAssertEqual(scope.deadline.instant, .seconds(125))
+            let count = await recorder.count()
+            XCTAssertEqual(count, 1)
+        }
+
+        func testUncertainOrAcceptedStartFailureRetainsDurableTargetWithoutRedispatch() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let recorder = AdmissionProviderRecorder(expectedCount: 0, blockProviders: false)
+            for accepted in [false, true] {
+                let clock = MCPExportWatchdogManualClock()
+                let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+                let service = makeAgentRunStartService(
+                    window: fixture.window, recorder: recorder,
+                    validateBeforeProviderDispatch: { _ in
+                        try scope.beginDispatch()
+                        if accepted { scope.recordDispatch(accepted: true) }
+                        throw AdmissionTestError.fixtureSetup("Acknowledgement unavailable")
+                    }
+                )
+                do {
+                    _ = try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                        try await service.execute(args: [
+                            "op": .string("start"), "message": .string("Fixture instruction"), "detach": .bool(true)
+                        ])
+                    }
+                    XCTFail("Expected acknowledgement failure")
+                } catch { XCTAssertTrue(String(describing: error).contains("Acknowledgement unavailable")) }
+                let recorded = try XCTUnwrap(scope.recoveryMetadata()["session_id"]?.stringValue)
+                let sessionID = try XCTUnwrap(UUID(uuidString: recorded))
+                XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                    $0.activeAgentSessionID == sessionID
+                } == true)
+                XCTAssertEqual(scope.recoveryMetadata()["dispatch_state"], .string(accepted ? "accepted" : "unknown"))
+            }
+            let count = await recorder.count()
+            XCTAssertEqual(count, 0)
+            XCTAssertEqual(fixture.window.agentModeViewModel.test_outstandingProvisionalMCPSessionTargetCount, 2)
+        }
+
         func testSixOverlappingAgentRunStartsPersistUniqueIdentitiesAndDispatchProvidersExactlyOnce() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup {

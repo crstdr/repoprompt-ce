@@ -2,6 +2,7 @@ import Combine
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import SwiftUI
 
 struct AgentContextUsage: Codable, Equatable {
@@ -8045,6 +8046,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         var ownershipCommitted = preparation == nil
+        var scopedCommitAttempted = false
         do {
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
@@ -8093,14 +8095,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             }
 
+            try MCPAgentRunStartExecutionScope.current?.checkAdmission()
             if let materializer, let preparation {
+                try MCPAgentRunStartExecutionScope.current?.recordWorktreeIntent("Inspect manage_worktree list for the existing binding; do not repeat creation.")
+                scopedCommitAttempted = MCPAgentRunStartExecutionScope.current != nil
                 _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
+            }
+            if MCPAgentRunStartExecutionScope.current != nil {
+                guard sessions[session.tabID] === session,
+                      session.activeAgentSessionID == sessionID,
+                      session.worktreeBindings == previousBindings
+                else { throw ExecutionLocationTransitionError.stale }
             }
             _ = commitWorktreeBindings(desiredBindings, to: session)
             return session.worktreeBindings
         } catch {
-            if !ownershipCommitted, let materializer, let preparation {
+            if !ownershipCommitted, !scopedCommitAttempted, let materializer, let preparation {
                 await materializer.abort(preparation)
             }
             throw error
@@ -9189,6 +9200,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "The target tab changed before Agent session admission completed."
                 )
             }
+            try MCPAgentRunStartExecutionScope.current?.recordTarget(sessionID: intendedSessionID, tabID: session.tabID)
             guard let installedBinding = installPersistentSessionBinding(
                 sessionID: intendedSessionID,
                 on: session,
@@ -9309,7 +9321,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
         let expectedSessionID = session.activeAgentSessionID
         func requireConfigurationAdmission() throws {
-            guard requireInactiveRunState || !modelParameterSelections.isEmpty else { return }
+            let startScope = MCPAgentRunStartExecutionScope.current
+            try startScope?.checkAdmission()
+            if let startScope {
+                guard let sessionID = session.activeAgentSessionID else { throw CancellationError() }
+                try startScope.recordTarget(sessionID: sessionID, tabID: tabID)
+            }
+            guard startScope != nil || requireInactiveRunState || !modelParameterSelections.isEmpty else { return }
             guard sessions[tabID] === session,
                   session.activeAgentSessionID == expectedSessionID,
                   !session.bindingTransitionInProgress,
@@ -9655,11 +9673,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 "The requested agent session is already running and cannot be reactivated for inactive MCP control."
             )
         }
+        try MCPAgentRunStartExecutionScope.current?.checkAdmission()
         // A new control activation owns a new launch lifecycle. Never retain review state from a
         // prior activation, including direct/source-equals-target starts that do not stage anew.
         mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
         let existingContext = session.mcpControlContext
         let activationID = UUID()
+        try MCPAgentRunStartExecutionScope.current?.recordActivation(activationID)
         if existingContext != nil {
             codexCoordinator.handleMCPControlReset(
                 for: session,
@@ -9674,6 +9694,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 cleanupSessionStore: true
             )
         }
+        try MCPAgentRunStartExecutionScope.current?.checkAdmission()
         session.mcpControlCleanupTask?.cancel()
         session.mcpControlActivationGeneration &+= 1
         let activationGeneration = session.mcpControlActivationGeneration
@@ -9704,6 +9725,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams(
                 "The requested agent session became active before MCP control activation."
             )
+        }
+        do { try MCPAgentRunStartExecutionScope.current?.checkAdmission() }
+        catch {
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw error
         }
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
             ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
@@ -9751,6 +9777,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 "The Agent session runtime stopped before its cancellation handler could be installed."
             )
         }
+        do { try MCPAgentRunStartExecutionScope.current?.checkAdmission() }
+        catch {
+            _ = await mcpDeactivateOwnedControlContext(sessionID: sessionID, expectedContext: activatedContext)
+            throw error
+        }
         session.mcpFollowUpRunPending = startPending
         mcpControlledTabIDs.insert(tabID)
         if markSessionAsMCPOriginated {
@@ -9790,6 +9821,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             await AgentRunSessionStore.cleanup(registration: registration)
             throw MCPError.invalidParams("The MCP control activation was superseded during setup.")
+        }
+        do { try MCPAgentRunStartExecutionScope.current?.checkAdmission() }
+        catch {
+            _ = await mcpDeactivateOwnedControlContext(sessionID: sessionID, expectedContext: activatedContext)
+            throw error
         }
         if tabID == currentTabID {
             updateBindingsFromSession(session)
@@ -10922,6 +10958,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let activeDispatchWakeIdentity = delivery.isActiveRunDispatch
             ? mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
             : nil
+        let startScope = MCPAgentRunStartExecutionScope.current
         let ackCancellationTarget = codexAttemptID.map {
             (tracker: session.codexSteerAckTracker, attemptID: $0)
         }
@@ -10937,32 +10974,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             defer {
                 session.isMCPInstructionDispatchInProgress = false
             }
-            submission = withMCPWorkflowOverride(session: session, workflow: workflow) {
-                if let nativePreparedTurn {
-                    return submitPreparedUserTurn(
+            try startScope?.beginDispatch()
+            // Provider tasks have child lifetime, not the enclosing start request's lifetime.
+            submission = MCPAgentRunStartExecutionScope.$current.withValue(nil) {
+                withMCPWorkflowOverride(session: session, workflow: workflow) {
+                    if let nativePreparedTurn {
+                        return submitPreparedUserTurn(
+                            tabID: session.tabID,
+                            session: session,
+                            trimmedText: trimmedText,
+                            attachmentsToSend: [],
+                            taggedFilesToSend: [],
+                            activeWorkflow: nativePreparedTurn.bubbleWorkflow,
+                            nativePreparedTurn: nativePreparedTurn,
+                            codexAttemptID: codexAttemptID,
+                            autoEffortAudit: submittedAutoEffortAudit,
+                            isLocalComposerInput: false
+                        )
+                    }
+                    return submitUserTurn(
+                        text: trimmedText,
                         tabID: session.tabID,
-                        session: session,
-                        trimmedText: trimmedText,
-                        attachmentsToSend: [],
-                        taggedFilesToSend: [],
-                        activeWorkflow: nativePreparedTurn.bubbleWorkflow,
-                        nativePreparedTurn: nativePreparedTurn,
                         codexAttemptID: codexAttemptID,
+                        autoEffortSelection: submittedAutoEffortSelection,
                         autoEffortAudit: submittedAutoEffortAudit,
                         isLocalComposerInput: false
                     )
                 }
-                return submitUserTurn(
-                    text: trimmedText,
-                    tabID: session.tabID,
-                    codexAttemptID: codexAttemptID,
-                    autoEffortSelection: submittedAutoEffortSelection,
-                    autoEffortAudit: submittedAutoEffortAudit,
-                    isLocalComposerInput: false
-                )
             }
             switch submission {
             case .submitted:
+                startScope?.recordDispatch(accepted: true)
                 if let submittedAutoEffortSelection {
                     recordSubmittedAutoEffort(submittedAutoEffortSelection, for: session)
                 }
@@ -11017,6 +11059,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 handleObservedMCPStateChange(for: session)
                 return delivery
             case let .blocked(message):
+                startScope?.recordDispatch(accepted: false)
                 if let codexAttemptID {
                     session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
                 }

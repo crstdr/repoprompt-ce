@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 import SwiftUI
 
 enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
@@ -3136,6 +3137,7 @@ class PromptViewModel: ObservableObject {
                 replacementTabID: UUID()
             )
             let recoveryClaim = AgentProvisionalAdmissionClaim(identity: provisionalIdentity)
+            try MCPAgentRunStartExecutionScope.current?.recordTarget(sessionID: sessionID, tabID: newTab.id)
 
             let preAdmissionForegroundStoredTab = manager.workspaces[index].activeComposeTabID.flatMap { activeTabID in
                 manager.workspaces[index].composeTabs.first(where: { $0.id == activeTabID })
@@ -3159,6 +3161,7 @@ class PromptViewModel: ObservableObject {
             manager.markWorkspaceDirty(workspaceID: expectedWorkspaceID)
 
             let receipt = await manager.persistAgentAdmission(provisionalIdentity)
+            if receipt.commitEvidence != .none { MCPAgentRunStartExecutionScope.current?.confirmTarget() }
             await notifyAgentAdmissionPersistenceReceiptForTesting(
                 provisionalIdentity,
                 receipt: receipt
