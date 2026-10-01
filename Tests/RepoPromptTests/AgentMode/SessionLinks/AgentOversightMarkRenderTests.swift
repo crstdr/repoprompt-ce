@@ -75,7 +75,8 @@ final class AgentOversightMarkRenderTests: XCTestCase {
     }
 
     /// Pixels within `tolerance` (per sRGB channel) of `expected`. A template-rendered mark
-    /// samples as the control's text tint instead — a very different colour.
+    /// samples as the control's text tint instead — a very different colour. `pixelsWide`/`High`
+    /// are used (not `size`, which is points) so a retina backing still scans the whole bitmap.
     private func pixelCount(
         near expected: NSColor,
         in rep: NSBitmapImageRep,
@@ -83,10 +84,8 @@ final class AgentOversightMarkRenderTests: XCTestCase {
     ) -> Int {
         guard let want = expected.usingColorSpace(.sRGB) else { return 0 }
         var count = 0
-        let width = Int(rep.size.width)
-        let height = Int(rep.size.height)
-        for x in 0 ..< width {
-            for y in 0 ..< height {
+        for x in 0 ..< rep.pixelsWide {
+            for y in 0 ..< rep.pixelsHigh {
                 guard let pixel = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
                 if abs(pixel.redComponent - want.redComponent) < tolerance,
                    abs(pixel.greenComponent - want.greenComponent) < tolerance,
@@ -99,8 +98,12 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         return count
     }
 
+    /// A glyph-sized mark is far more than a stray matching pixel even at 1x backing.
+    private let markPixelFloor = 8
+
     /// The failing case from Cristian's live check: an overseen row's interactive mark must
-    /// paint the overseer's slot-0 group colour, not the control tint.
+    /// paint the overseer's slot-0 group colour, not the control tint. The selected row
+    /// reported identical white pixels — same template path — so both states are asserted.
     func testInteractiveOverseenMarkKeepsTheFirstOverseersPaletteColour() {
         let role = AgentSessionOversightRole(
             ownOverseerSlot: nil,
@@ -111,9 +114,37 @@ final class AgentOversightMarkRenderTests: XCTestCase {
 
         let (rep, window) = rasterize(row(role: role, interactive: true))
         defer { window.close() }
-        XCTAssertGreaterThan(
-            pixelCount(near: expected, in: rep), 0,
+        XCTAssertGreaterThanOrEqual(
+            pixelCount(near: expected, in: rep), markPixelFloor,
             "interactive overseen mark lost the overseer's palette colour (template-flattened)"
+        )
+
+        var selectedRow = row(role: role, interactive: true)
+        selectedRow.isSelected = true
+        let (selectedRep, selectedWindow) = rasterize(selectedRow)
+        defer { selectedWindow.close() }
+        XCTAssertGreaterThanOrEqual(
+            pixelCount(near: expected, in: selectedRep), markPixelFloor,
+            "interactive overseen mark lost the palette colour on the selected row"
+        )
+    }
+
+    /// The non-interactive branch was already correct — the mark was only template-flattened
+    /// inside a Menu label — so a muted row keeps its colour too. Guards the two branches
+    /// staying visually identical.
+    func testNonInteractiveOverseenMarkKeepsTheSamePaletteColour() {
+        let role = AgentSessionOversightRole(
+            ownOverseerSlot: nil,
+            overseers: [.init(sessionID: id(1), displayName: "Overseer", slot: 0)],
+            overseeingNames: []
+        )
+        let expected = AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true)
+
+        let (rep, window) = rasterize(row(role: role, interactive: false))
+        defer { window.close() }
+        XCTAssertGreaterThanOrEqual(
+            pixelCount(near: expected, in: rep), markPixelFloor,
+            "non-interactive overseen mark lost the palette colour"
         )
     }
 
@@ -131,14 +162,14 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         let (rep, window) = rasterize(row(role: role, interactive: true))
         defer { window.close() }
 
-        XCTAssertGreaterThan(
+        XCTAssertGreaterThanOrEqual(
             pixelCount(near: AgentOversightPalette.resolvedColor(for: 1, darkAppearance: true), in: rep),
-            0,
+            markPixelFloor,
             "dual-role mark lost the row's own group colour"
         )
-        XCTAssertGreaterThan(
+        XCTAssertGreaterThanOrEqual(
             pixelCount(near: AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true), in: rep),
-            0,
+            markPixelFloor,
             "dual-role mark lost the first overseer's ring colour"
         )
     }
