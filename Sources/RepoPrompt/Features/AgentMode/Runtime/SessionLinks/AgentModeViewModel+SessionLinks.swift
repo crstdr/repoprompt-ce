@@ -847,10 +847,7 @@ extension AgentModeViewModel {
         mutation(&updated)
         guard updated != monitorPillPropsByEndpoint else { return }
         monitorPillPropsByEndpoint = updated
-        let published = ui.statusPills.snapshot
-        if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
-            syncStatusPillsUIState()
-        }
+        syncStatusPillsUIStateIfMonitorStale()
         NotificationCenter.default.post(
             name: .agentSessionLinkOverseerProjectionDidChange,
             object: self
