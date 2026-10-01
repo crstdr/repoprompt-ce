@@ -3,6 +3,7 @@ import Combine
 import Foundation
 import os
 import RepoPromptDomainRuntime
+import RepoPromptWorkspaceCore
 import SwiftUI
 
 enum WindowKind: String, Codable {
@@ -242,6 +243,7 @@ class WindowState: ObservableObject {
     let promptManager: PromptViewModel
     let oracleViewModel: OracleViewModel
     let apiSettingsViewModel: APISettingsViewModel
+    let routerSettingsViewModel: RouterSettingsViewModel
     let contextBuilderAgentViewModel: ContextBuilderAgentViewModel
     let agentModeViewModel: AgentModeViewModel
     #if DEBUG
@@ -634,6 +636,7 @@ class WindowState: ObservableObject {
         promptManager = composition.promptManager
         oracleViewModel = composition.oracleViewModel
         apiSettingsViewModel = composition.apiSettingsViewModel
+        routerSettingsViewModel = composition.routerSettingsViewModel
         contextBuilderAgentViewModel = composition.contextBuilderAgentViewModel
         agentModeViewModel = composition.agentModeViewModel
         #if DEBUG
@@ -883,6 +886,7 @@ class WindowState: ObservableObject {
         guard !shouldSuppressObservationSideEffects else { return }
         guard isCurrentlyFocused != focused else { return }
         isCurrentlyFocused = focused
+        NotificationService.shared.agentNotifications.visibilityMayHaveChanged()
         workspaceFilesViewModel.setWindowFocused(focused)
         scheduleFocusSideEffects(focused)
     }
@@ -1691,7 +1695,16 @@ class WindowState: ObservableObject {
         } else {
             focusWindowIfPossible()
         }
+        if route.interactionID != nil {
+            agentModeViewModel.revealPendingNotificationInteraction(tabID: route.tabID)
+        }
         return .routed
+    }
+
+    /// Whether the given agent session is the transcript the user is looking at in this window.
+    func isAgentSessionVisible(tabID: UUID, sessionID: UUID?) -> Bool {
+        guard !isClosing, isCurrentlyFocused else { return false }
+        return agentModeViewModel.isAgentSessionDisplayed(tabID: tabID, sessionID: sessionID)
     }
 
     @MainActor
@@ -2456,6 +2469,9 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
+        // Finish this window's own saves (including the final `onDisappear` capture) before any
+        // teardown step can stop the presentation that owns them (#1089).
+        await workspaceManager.awaitOwnSavesForWindowClose()
         await workspaceManager.awaitRootReconciliationShutdown()
         await promptManager.gitViewModel.shutdownForWindowClose()
 

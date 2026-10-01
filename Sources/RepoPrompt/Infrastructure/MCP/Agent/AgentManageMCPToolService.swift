@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptInstrumentation
 
 @MainActor
 struct AgentManageMCPToolService {
@@ -54,6 +55,7 @@ struct AgentManageMCPToolService {
     }
 
     let toolName: String
+    let perfRecorder: any AgentModePerfRecording
     let captureRequestMetadata: () async -> RequestMetadata
     let requireTargetWindow: () throws -> WindowState
     let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
@@ -61,6 +63,11 @@ struct AgentManageMCPToolService {
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
     let cleanupDependencies: CleanupDependencies
+    /// One-shot demand-scoped OpenCode observation source for explicit model-parameter
+    /// resolution. Defaults to the live polling service; tests inject a scripted provider via the
+    /// initializer to capture the resolved workspace directly (no live ACP process, no mutable
+    /// global).
+    let openCodeOneShotObservationProvider: AgentMCPModelParameterSupport.OneShotObservationProvider
     #if DEBUG
         var test_resumeSetupBoundary: (@MainActor (_ afterActivation: Bool) async -> Void)?
         var testAfterTargetResolution: ((AgentModeViewModel.MCPSessionTarget) async -> Void)?
@@ -68,6 +75,7 @@ struct AgentManageMCPToolService {
 
     init(
         toolName: String,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         captureRequestMetadata: @escaping () async -> RequestMetadata,
         requireTargetWindow: @escaping () throws -> WindowState,
         resolveSpawnSourceTabID: @escaping (_ metadata: RequestMetadata) async -> UUID?,
@@ -76,9 +84,11 @@ struct AgentManageMCPToolService {
         restrictDiscoveryToRoleLabels: @escaping @MainActor (_ workspaceID: UUID?) -> Bool = { workspaceID in
             GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID).restrictMCPAgentDiscoveryToRoleLabels
         },
-        cleanupDependencies: CleanupDependencies = .live
+        cleanupDependencies: CleanupDependencies = .live,
+        openCodeOneShotObservationProvider: @escaping AgentMCPModelParameterSupport.OneShotObservationProvider = AgentMCPModelParameterSupport.liveOneShotObservationProvider
     ) {
         self.toolName = toolName
+        self.perfRecorder = perfRecorder
         self.captureRequestMetadata = captureRequestMetadata
         self.requireTargetWindow = requireTargetWindow
         self.resolveSpawnSourceTabID = resolveSpawnSourceTabID
@@ -86,6 +96,7 @@ struct AgentManageMCPToolService {
         self.bindCurrentRequestToTab = bindCurrentRequestToTab
         self.restrictDiscoveryToRoleLabels = restrictDiscoveryToRoleLabels
         self.cleanupDependencies = cleanupDependencies
+        self.openCodeOneShotObservationProvider = openCodeOneShotObservationProvider
     }
 
     private struct HandoffSessionInfo {
@@ -200,8 +211,14 @@ struct AgentManageMCPToolService {
             return try await executeStopSession(args: args)
         case "cleanup_sessions":
             return try await executeCleanupSessions(args: args)
+        case "list_pinned_sessions":
+            return try await executeListPinnedSessions()
+        case "set_session_pin":
+            return try await executeSetSessionPin(args: args)
+        case "reorder_pinned_sessions":
+            return try await executeReorderPinnedSessions(args: args)
         default:
-            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, create_session, resume_session, stop_session, cleanup_sessions, or list_workflows.")
+            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, create_session, resume_session, stop_session, cleanup_sessions, list_pinned_sessions, set_session_pin, reorder_pinned_sessions, or list_workflows.")
         }
     }
 
@@ -209,9 +226,33 @@ struct AgentManageMCPToolService {
         let targetWindow = try requireTargetWindow()
         let availability = targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
         let workspaceID = targetWindow.workspaceManager.activeWorkspace?.id
+        let openCodeWorkspacePath = targetWindow.workspaceManager.activeWorkspace?.repoPaths.first
         let rolesOnly = try parseBool(args["roles_only"], name: "roles_only", defaultValue: false)
         let restrictedDiscovery = restrictDiscoveryToRoleLabels(workspaceID)
         let omitAgentCatalog = rolesOnly || restrictedDiscovery
+        // Demand-scoped OpenCode enrichment is expensive: each uncached entry can drive a
+        // serialized disposable-controller probe. Restrict OpenCode enrichment to the
+        // advertised current/default model and dedupe canonical models so one enumeration
+        // performs at most one probe. Cursor is synchronous and cheap.
+        var probedOpenCodeCanonicals = Set<String>()
+        let openCodeCurrentModelRaw: String? = await OpenCodeACPModelPollingService.shared
+            .latestSnapshot()?.models.currentModelRaw
+        let openCodeEnrichmentTargetRaw = openCodeCurrentModelRaw
+            ?? AgentModelCatalog.discoveryAgents(availability: availability)
+            .first(where: { $0.agent.acpProviderID == .openCode })?.defaults.modelRaw
+        /// Returns whether an OpenCode enumeration for `agent`/`modelRaw` should acquire
+        /// metadata now: deduped per canonical model, and targeted at the advertised
+        /// current/default model only so list_agents never starts N serialized controllers.
+        func shouldEnrichOpenCodeModel(agent: AgentProviderKind, modelRaw: String) -> Bool {
+            guard agent.acpProviderID == .openCode else { return true }
+            let canonical = ACPModelParameterIdentity.canonicalBaseModelRaw(modelRaw, providerID: .openCode)
+            guard !probedOpenCodeCanonicals.contains(canonical) else { return false }
+            guard let openCodeEnrichmentTargetRaw,
+                  ACPModelParameterIdentity.canonicalBaseModelRaw(openCodeEnrichmentTargetRaw, providerID: .openCode) == canonical
+            else { return false }
+            probedOpenCodeCanonicals.insert(canonical)
+            return true
+        }
         var agents: [Value] = []
         for entry in omitAgentCatalog ? [] : AgentModelCatalog.discoveryAgents(availability: availability) {
             // Flatten all models — each start target becomes its own entry.
@@ -232,8 +273,18 @@ struct AgentManageMCPToolService {
                         if let effort = target.reasoningEffort {
                             obj["reasoning_effort"] = .string(effort.rawValue)
                         }
-                        if entry.agent == .cursor {
-                            let parameters = AgentMCPModelParameterSupport.definitionValues(modelRaw: target.modelRaw)
+                        if entry.agent.acpProviderID != nil,
+                           shouldEnrichOpenCodeModel(agent: entry.agent, modelRaw: target.modelRaw)
+                        {
+                            // Discovery failure is already reduced to empty inside
+                            // `definitions`; a throwing `try await` here preserves the
+                            // cancellation the support layer now correctly rethrows.
+                            let parameters = try await AgentMCPModelParameterSupport.definitionValues(
+                                agent: entry.agent,
+                                modelRaw: target.modelRaw,
+                                workspacePath: openCodeWorkspacePath,
+                                oneShot: openCodeOneShotObservationProvider
+                            )
                             if !parameters.isEmpty {
                                 obj["model_parameters"] = .array(parameters)
                             }
@@ -247,8 +298,15 @@ struct AgentManageMCPToolService {
                     if let modelID = model.modelID {
                         obj["model_id"] = .string(modelID)
                     }
-                    if entry.agent == .cursor {
-                        let parameters = AgentMCPModelParameterSupport.definitionValues(modelRaw: model.id)
+                    if entry.agent.acpProviderID != nil,
+                       shouldEnrichOpenCodeModel(agent: entry.agent, modelRaw: model.id)
+                    {
+                        let parameters = try await AgentMCPModelParameterSupport.definitionValues(
+                            agent: entry.agent,
+                            modelRaw: model.id,
+                            workspacePath: openCodeWorkspacePath,
+                            oneShot: openCodeOneShotObservationProvider
+                        )
                         if !parameters.isEmpty {
                             obj["model_parameters"] = .array(parameters)
                         }
@@ -400,6 +458,145 @@ struct AgentManageMCPToolService {
         return .object([
             "sessions": .array(Array(filtered.prefix(limit)).map(Value.object))
         ])
+    }
+
+    /// Sidebar pin state is workspace-wide UI state, not a child-session control capability.
+    /// A model-run connection cannot mutate or enumerate another user's pinned rows.
+    private func requireAdministrativePinCaller(targetWindow: WindowState) async throws {
+        let metadata = await captureRequestMetadata()
+        guard await operationCaller(metadata: metadata, targetWindow: targetWindow) == .administrativePrincipal else {
+            throw MCPError.invalidParams("Session pin management requires an external administrative MCP connection.")
+        }
+    }
+
+    private func pinnedSessionRows(
+        targetWindow: WindowState,
+        workspace: WorkspaceModel
+    ) -> [AgentModeViewModel.SidebarSession] {
+        targetWindow.agentModeViewModel.sidebarSessions(for: workspace.composeTabs)
+            .filter { $0.isPinned && $0.sessionID != nil }
+    }
+
+    private func executeListPinnedSessions() async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        try await requireAdministrativePinCaller(targetWindow: targetWindow)
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.list_pinned_sessions.")
+        }
+        let tabsByID = Dictionary(uniqueKeysWithValues: workspace.composeTabs.map { ($0.id, $0) })
+        let rows = pinnedSessionRows(targetWindow: targetWindow, workspace: workspace)
+        return .object([
+            "workspace_id": .string(workspace.id.uuidString),
+            "session_ids": .array(rows.compactMap { $0.sessionID.map { .string($0.uuidString) } }),
+            "sessions": .array(rows.compactMap { row in
+                guard let sessionID = row.sessionID else { return nil }
+                return .object([
+                    "session_id": .string(sessionID.uuidString),
+                    "tab_id": .string(row.tabID.uuidString),
+                    "name": .string(row.title),
+                    "pinned_order": tabsByID[row.tabID]?.pinnedOrder.map(Value.int) ?? .null
+                ])
+            })
+        ])
+    }
+
+    private func executeSetSessionPin(args: [String: Value]) async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        try await requireAdministrativePinCaller(targetWindow: targetWindow)
+        let reference = try requireNonEmptyString(args["session_id"], name: "session_id")
+        guard let sessionID = UUID(uuidString: reference),
+              let workspace = targetWindow.workspaceManager.activeWorkspace,
+              let row = targetWindow.agentModeViewModel.sidebarSessions(for: workspace.composeTabs)
+              .first(where: { $0.sessionID == sessionID })
+        else {
+            throw AgentSessionTargetOperationGuard.denialError(reference: reference)
+        }
+        guard let requested = args["pinned"] else {
+            throw MCPError.invalidParams("pinned is required.")
+        }
+        let pinned = try parseBool(requested, name: "pinned", defaultValue: false)
+        let report = targetWindow.promptManager.setComposeTabsPinned(
+            pinned,
+            for: [row.tabID],
+            isMutationContextCurrent: { targetWindow.workspaceManager.activeWorkspaceID == workspace.id }
+        )
+        guard !report.contextRejected else {
+            throw MCPError.invalidParams("The active workspace or session changed before pinning.")
+        }
+        return .object([
+            "session_id": .string(sessionID.uuidString),
+            "pinned": .bool(pinned),
+            "changed": .bool(!report.updatedTabIDs.isEmpty)
+        ])
+    }
+
+    /// Full-list compare-and-swap prevents a second MCP writer from silently displacing pins.
+    /// All validation and the workspace mutation run on the MainActor without suspension.
+    private func executeReorderPinnedSessions(args: [String: Value]) async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        try await requireAdministrativePinCaller(targetWindow: targetWindow)
+        let expectedIDs = try parseSessionIDs(args["expected_session_ids"], name: "expected_session_ids")
+        let desiredIDs = try parseSessionIDs(args["session_ids"], name: "session_ids")
+        guard Set(expectedIDs) == Set(desiredIDs) else {
+            throw MCPError.invalidParams("session_ids must contain exactly the expected pinned sessions.")
+        }
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.reorder_pinned_sessions.")
+        }
+        let rows = pinnedSessionRows(targetWindow: targetWindow, workspace: workspace)
+        let currentIDs = rows.compactMap(\.sessionID)
+        guard currentIDs == expectedIDs else {
+            throw MCPError.invalidParams("Pinned session order changed; call list_pinned_sessions and retry with its current order.")
+        }
+        let tabIDBySessionID = Dictionary(rows.compactMap { row in
+            row.sessionID.map { ($0, row.tabID) }
+        }, uniquingKeysWith: { first, _ in first })
+        guard tabIDBySessionID.count == rows.count else {
+            throw MCPError.invalidParams("Pinned sessions contain duplicate identities.")
+        }
+        let orderedTabIDs = desiredIDs.compactMap { tabIDBySessionID[$0] }
+        guard orderedTabIDs.count == desiredIDs.count else {
+            throw MCPError.invalidParams("The pinned session set changed before reordering.")
+        }
+        let rankByTabID = Dictionary(uniqueKeysWithValues: orderedTabIDs.enumerated().map { ($0.element, $0.offset) })
+        let previewTabs = workspace.composeTabs.map { tab -> ComposeTabState in
+            var preview = tab
+            if let rank = rankByTabID[tab.id] {
+                preview.pinnedOrder = rank
+            }
+            return preview
+        }
+        let projectedIDs = targetWindow.agentModeViewModel.sidebarSessions(for: previewTabs)
+            .filter(\.isPinned)
+            .compactMap(\.sessionID)
+        guard projectedIDs == desiredIDs else {
+            throw MCPError.invalidParams("Thread grouping prevents the requested pinned order from being displayed.")
+        }
+        guard targetWindow.promptManager.setPinnedComposeTabOrder(orderedTabIDs, workspaceID: workspace.id) else {
+            throw MCPError.invalidParams("The active workspace or pinned sessions changed before reordering.")
+        }
+        return .object([
+            "workspace_id": .string(workspace.id.uuidString),
+            "session_ids": .array(desiredIDs.map { .string($0.uuidString) })
+        ])
+    }
+
+    private func parseSessionIDs(_ value: Value?, name: String) throws -> [UUID] {
+        guard let values = value?.arrayValue else {
+            throw MCPError.invalidParams("\(name) must be an array of session UUIDs.")
+        }
+        var ids: [UUID] = []
+        var seen = Set<UUID>()
+        for item in values {
+            guard let raw = item.stringValue,
+                  let id = UUID(uuidString: raw),
+                  seen.insert(id).inserted
+            else {
+                throw MCPError.invalidParams("\(name) must contain unique session UUIDs.")
+            }
+            ids.append(id)
+        }
+        return ids
     }
 
     private func executeGetLog(args: [String: Value]) async throws -> Value {
@@ -609,11 +806,6 @@ struct AgentManageMCPToolService {
             workspaceID: workspace.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
-        let modelParameterSelections = try AgentMCPModelParameterSupport.resolve(
-            value: args["model_parameters"],
-            agent: resolved.agent.flatMap { AgentProviderKind(rawValue: $0) },
-            modelRaw: resolved.model
-        )
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: nil,
@@ -627,6 +819,43 @@ struct AgentManageMCPToolService {
             #if DEBUG
                 await testAfterTargetResolution?(target)
             #endif
+            // Validate explicit model parameters inside the discard-on-failure scope. A throw
+            // during parsing/acquisition/validation/cancellation must not leak the allocated
+            // target; for the Cursor path the parameters are parsed after target allocation and
+            // rejected before configuration is applied. The effective workspace is resolved
+            // from the same source the composer uses (`effectiveWorkspacePath(for:)`), so a
+            // worktree-bound session validates against its real OpenCode config. A genuine
+            // resolution failure (worktree unavailable/mismatched) or cancellation propagates
+            // rather than silently acquiring from the repo root; only an explicitly absent
+            // binding falls back.
+            let createParameterWorkspacePath: String?
+            do {
+                createParameterWorkspacePath = try agentModeVM.session(for: target.tabID, createIfNeeded: false)
+                    .flatMap { try agentModeVM.effectiveWorkspacePath(for: $0) }
+                    ?? workspace.repoPaths.first
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MCPError.invalidParams(
+                    "Failed to resolve the session workspace for model parameter validation: \(error.localizedDescription)"
+                )
+            }
+            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
+                value: args["model_parameters"],
+                agent: resolved.agent.flatMap { AgentProviderKind(rawValue: $0) },
+                modelRaw: resolved.model,
+                workspacePath: createParameterWorkspacePath,
+                oneShot: openCodeOneShotObservationProvider
+            )
+            // A role-label create inherits the role's stored pin as a baseline, captured with
+            // the role resolution above. Explicit request parameters override matching
+            // identities; a compound
+            // model_id inherits nothing, because the resolver hands back no baseline for one — which
+            // is why the merge needs no role check here.
+            let modelParameterSelections = AgentMCPModelParameterSupport.merged(
+                inherited: selection.modelParameterSelections,
+                explicit: explicitModelParameterSelections
+            )
             try agentModeVM.requireCurrentMCPWorkspaceTarget(
                 target,
                 expectedWorkspaceID: workspace.id
@@ -754,10 +983,36 @@ struct AgentManageMCPToolService {
             }
             let parameterAgentRaw = resolved.agent ?? hydratedSession.selectedAgent.rawValue
             let parameterModelRaw = resolved.model ?? hydratedSession.selectedModelRaw
-            let modelParameterSelections = try AgentMCPModelParameterSupport.resolve(
+            // Acquire metadata for the session's effective workspace (the composer's source),
+            // not the repo root — a worktree-bound session may resolve a different OpenCode
+            // config. A genuine resolution failure or cancellation propagates: silently falling
+            // back to the repo root reintroduces the original mis-scope. Only an explicitly
+            // absent binding falls back.
+            let parameterWorkspacePath: String?
+            do {
+                parameterWorkspacePath = try agentModeVM.effectiveWorkspacePath(for: hydratedSession)
+                    ?? workspace.repoPaths.first
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MCPError.invalidParams(
+                    "Failed to resolve the session workspace for model parameter validation: \(error.localizedDescription)"
+                )
+            }
+            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
                 value: args["model_parameters"],
                 agent: AgentProviderKind(rawValue: parameterAgentRaw),
-                modelRaw: parameterModelRaw
+                modelRaw: parameterModelRaw,
+                workspacePath: parameterWorkspacePath,
+                oneShot: openCodeOneShotObservationProvider
+            )
+            // A role-label resume inherits the role's stored pin as a baseline. Explicit request
+            // parameters override matching identities; a compound
+            // model_id inherits nothing, because the resolver hands back no baseline for one — which
+            // is why the merge needs no role check here.
+            let modelParameterSelections = AgentMCPModelParameterSupport.merged(
+                inherited: selection.modelParameterSelections,
+                explicit: explicitModelParameterSelections
             )
             // Resume adopts the live session's existing control registration. Re-registering the
             // same persistent session expires in-flight waiters and splits poll state from the UI.
@@ -965,7 +1220,7 @@ struct AgentManageMCPToolService {
         }
 
         #if DEBUG
-            let cleanupStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let cleanupStartMS = perfRecorder.timestampMSIfEnabled()
             var debugOpenDeletedCount = 0
             var debugPersistedDeletedCount = 0
         #endif
@@ -1012,11 +1267,11 @@ struct AgentManageMCPToolService {
                     )
                 } else {
                     #if DEBUG
-                        let persistedLoadStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                        let persistedLoadStartMS = perfRecorder.timestampMSIfEnabled()
                     #endif
                     let meta = try await cleanupDependencies.loadPersistedMetadata(sessionID, workspace)
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
+                        perfRecorder.durationEvent(
                             "cleanup.sessions.loadPersistedMeta",
                             startMS: persistedLoadStartMS,
                             fields: [
@@ -1131,7 +1386,7 @@ struct AgentManageMCPToolService {
                 if let openTabID {
                     usedOpenTabAuthority = true
                     #if DEBUG
-                        let deleteOpenStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                        let deleteOpenStartMS = perfRecorder.timestampMSIfEnabled()
                     #endif
                     mutationStarted = true
                     providerCleanupOutcome = try await cleanupDependencies.deleteOpenSession(
@@ -1142,7 +1397,7 @@ struct AgentManageMCPToolService {
                     durableDeletionCommitted = true
                     await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(deletionAttempt)
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
+                        perfRecorder.durationEvent(
                             "cleanup.sessions.deleteOpen",
                             startMS: deleteOpenStartMS,
                             tabID: openTabID,
@@ -1159,14 +1414,14 @@ struct AgentManageMCPToolService {
                     let persistedSession = try await cleanupDependencies.loadPersistedSession(sessionID, workspace)
                     try cleanupDependencies.checkCancellation()
                     #if DEBUG
-                        let deletePersistedStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                        let deletePersistedStartMS = perfRecorder.timestampMSIfEnabled()
                     #endif
                     mutationStarted = true
                     try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
                     durableDeletionCommitted = true
                     await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(deletionAttempt)
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
+                        perfRecorder.durationEvent(
                             "cleanup.sessions.deletePersisted",
                             startMS: deletePersistedStartMS,
                             fields: ["sessionID": sessionID.uuidString]
@@ -1174,7 +1429,7 @@ struct AgentManageMCPToolService {
                         debugPersistedDeletedCount += 1
                     #endif
                     #if DEBUG
-                        let finalizeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                        let finalizeStartMS = perfRecorder.timestampMSIfEnabled()
                     #endif
                     let affectedTabCount = await cleanupDependencies.finalizePersistedReferences(
                         agentModeVM,
@@ -1182,7 +1437,7 @@ struct AgentManageMCPToolService {
                         workspace.id
                     )
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
+                        perfRecorder.durationEvent(
                             "cleanup.sessions.finalize",
                             startMS: finalizeStartMS,
                             fields: [
@@ -1319,7 +1574,7 @@ struct AgentManageMCPToolService {
         }
 
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "cleanup.sessions.execute",
                 startMS: cleanupStartMS,
                 fields: [

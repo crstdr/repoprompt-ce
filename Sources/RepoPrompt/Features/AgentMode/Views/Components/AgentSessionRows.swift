@@ -4,10 +4,39 @@ import SwiftUI
 
 // MARK: - Agent Session Row
 
+enum AgentSessionCreatorBadgeCopy {
+    static let iconName = "rectangle.connected.to.line.below"
+
+    static func tooltip(for creatorLabel: String) -> String {
+        "Created by \(creatorLabel)"
+    }
+}
+
+private struct AgentSessionCreatorBadge: View {
+    let creatorLabel: String
+    let onOpen: () -> Void
+
+    var body: some View {
+        let tooltip = AgentSessionCreatorBadgeCopy.tooltip(for: creatorLabel)
+        Button(action: onOpen) {
+            Image(systemName: AgentSessionCreatorBadgeCopy.iconName)
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverTooltip(tooltip)
+        .accessibilityLabel(tooltip)
+    }
+}
+
 struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
     var isOverseer = false
+    var createdByLabel: String?
+    var onOpenCreator: (() -> Void)?
     let isPinned: Bool
     let isMCPControlled: Bool
     let runState: AgentSessionRunState
@@ -615,8 +644,11 @@ struct AgentSessionRow: View {
                 Button(action: toggleSelection) {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        .padding(6)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .padding(-6) // Keep the row layout unchanged around the larger hit target.
                 .disabled(!isInteractionEnabled)
                 .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(title)")
                 .accessibilityValue(isSelected ? "Selected" : "Not selected")
@@ -654,6 +686,12 @@ struct AgentSessionRow: View {
 
                     if isOverseer {
                         overseerBadge
+                    }
+
+                    if let creatorLabel = createdByLabel ?? sidebarOversightMenu?.createdByLabel {
+                        AgentSessionCreatorBadge(creatorLabel: creatorLabel) {
+                            onOpenCreator?()
+                        }
                     }
 
                     if isPinned {
@@ -1287,6 +1325,8 @@ struct AgentSessionRow: View {
 
 struct AgentStashedSessionRow: View {
     let stashed: StashedTab
+    var createdByLabel: String?
+    var onOpenCreator: (() -> Void)?
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
@@ -1393,8 +1433,11 @@ struct AgentStashedSessionRow: View {
                 Button(action: toggleSelection) {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        .padding(6)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .padding(-6) // Keep the row layout unchanged around the larger hit target.
                 .disabled(!isInteractionEnabled)
                 .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(stashed.tab.name)")
                 .accessibilityValue(isSelected ? "Selected" : "Not selected")
@@ -1410,6 +1453,11 @@ struct AgentStashedSessionRow: View {
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                    if let createdByLabel {
+                        AgentSessionCreatorBadge(creatorLabel: createdByLabel) {
+                            onOpenCreator?()
+                        }
+                    }
                     if stashed.tab.isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinIconSize))
@@ -1512,24 +1560,17 @@ struct AgentStashedSessionRow: View {
 /// - Read as "actively processing" without competing with the green waiting
 ///   dot — running is informational, waiting is actionable, so running
 ///   should not out-shout it.
-private struct AgentRowActivityArc: View {
+struct AgentRowActivityArc: View {
     var tint: Color = .accentColor
-    @State private var rotation: Double = 0
 
     var body: some View {
-        Circle()
-            .trim(from: 0.0, to: 0.7)
-            .stroke(
-                tint.opacity(0.75),
-                style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
-            )
-            .frame(width: 15, height: 15)
-            .rotationEffect(.degrees(rotation))
-            .onAppear {
-                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
-                    rotation = 360
-                }
-            }
+        // Spun by the render server (see `AgentRowActivityArcLayerView`): a SwiftUI `repeatForever`
+        // rotation here re-rendered the row's whole window on the main thread every frame.
+        AgentRowAnimatedActivityArc(tint: tint)
+            .frame(width: AgentRowActivityArcLayerView.diameter, height: AgentRowActivityArcLayerView.diameter)
+            // An AppKit view is not an accessibility element on its own; this keeps the arc one
+            // element carrying the "Running" label.
+            .accessibilityElement()
             .accessibilityLabel("Running")
     }
 }
@@ -1546,6 +1587,7 @@ extension AgentProviderKind {
         case .openCode, .antigravity: "curlybraces.square"
         case .cursor: "cursorarrow"
         case .grokBuild: "bolt.circle.fill"
+        case .devin: "terminal.fill"
         }
     }
 }

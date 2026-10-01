@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
 import XCTest
 
 @MainActor
@@ -106,6 +107,56 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
         )
 
         XCTAssertEqual(defaultLabel, .pair)
+    }
+
+    func testRouterOwnedStartKeepsRoleSemanticsWithoutResolvingChildModelPin() {
+        XCTAssertEqual(
+            AgentRunMCPToolService.taskLabelKindForRouterOwnedStart(
+                requestedModelID: nil,
+                defaultTaskLabel: .pair
+            ),
+            .pair
+        )
+        XCTAssertEqual(
+            AgentRunMCPToolService.taskLabelKindForRouterOwnedStart(
+                requestedModelID: "explore",
+                defaultTaskLabel: .pair
+            ),
+            .explore
+        )
+        XCTAssertNil(
+            AgentRunMCPToolService.taskLabelKindForRouterOwnedStart(
+                requestedModelID: "claudeCode:unavailable-stale-model",
+                defaultTaskLabel: .pair
+            )
+        )
+    }
+
+    func testExplicitModelAndParameterPinsBypassModelRouter() {
+        XCTAssertTrue(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: nil,
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertTrue(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "engineer",
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "codexExec:gpt-6-sol-xhigh",
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "devin:swe-2",
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "engineer",
+            hasExplicitModelParameters: true
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: nil,
+            hasExplicitModelParameters: true
+        ))
     }
 
     private func makeBindingService(

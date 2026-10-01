@@ -1,4 +1,6 @@
 import Combine
+import RepoPromptProcess
+import RepoPromptSecureStorage
 import SwiftUI
 
 #if DEBUG
@@ -357,6 +359,9 @@ public class APISettingsViewModel: ObservableObject {
     private var openCodeModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
     private var grokBuildModelsTask: Task<Void, Never>?
+    private var devinModelsTask: Task<Void, Never>?
+    @Published private(set) var isDiscoveringDevinModels = false
+    @Published private(set) var devinModelDiscoveryMessage: String?
     private var openRouterModelsTask: Task<Void, Never>?
     private var customModelsTask: Task<Void, Never>?
     private var initialLoadTask: Task<Void, Never>?
@@ -390,6 +395,7 @@ public class APISettingsViewModel: ObservableObject {
             cursorAvailable: isCursorConnected,
             grokBuildAvailable: isGrokBuildConnected,
             antigravityAvailable: AntigravityRuntimeManager.installedRuntimeSync() != nil,
+            devinAvailable: DevinRuntimeLocator.isInstalledSync(),
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -442,10 +448,17 @@ public class APISettingsViewModel: ObservableObject {
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
             grokBuildAvailable: isVerifiedContextBuilderProvider(.grokBuild) && isGrokBuildConnected,
+            devinAvailable: DevinRuntimeLocator.isInstalledSync(),
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
         )
+    }
+
+    /// Provider availability safe for automatic routing. Persisted connection flags are only
+    /// configuration hints; Router may choose a provider only after this process has verified it.
+    var modelRouterAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        contextBuilderRestorationAvailabilityContext
     }
 
     var recommendationProviderStatusSnapshot: ProviderStatusSnapshot {
@@ -499,6 +512,8 @@ public class APISettingsViewModel: ObservableObject {
             isGrokBuildConnected
         case .antigravity:
             AntigravityRuntimeManager.installedRuntimeSync() != nil
+        case .devin:
+            DevinRuntimeLocator.isInstalledSync()
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -1053,6 +1068,10 @@ public class APISettingsViewModel: ObservableObject {
                 guard let self else { return }
                 await loadStoredDataIfNeeded()
                 guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+                refreshDevinModels()
+                if let devinModelsTask {
+                    await devinModelsTask.value
+                }
                 await validateCachedContextBuilderProvidersIfNeeded()
             }
         }
@@ -1063,6 +1082,8 @@ public class APISettingsViewModel: ObservableObject {
         hasPreparedForWindowClose = true
         initialLoadTask?.cancel()
         initialLoadTask = nil
+        devinModelsTask?.cancel()
+        devinModelsTask = nil
         openAIModelsTask?.cancel()
         openAIModelsTask = nil
         deepSeekModelsTask?.cancel()
@@ -1091,6 +1112,7 @@ public class APISettingsViewModel: ObservableObject {
 
     deinit {
         initialLoadTask?.cancel()
+        devinModelsTask?.cancel()
         openAIModelsTask?.cancel()
         deepSeekModelsTask?.cancel()
         fireworksModelsTask?.cancel()
@@ -1746,6 +1768,31 @@ public class APISettingsViewModel: ObservableObject {
         return host == "api.openai.com" || host.hasSuffix(".openai.com")
     }
 
+    func refreshDevinModels(force: Bool = false) {
+        guard devinModelsTask == nil else { return }
+        isDiscoveringDevinModels = true
+        devinModelDiscoveryMessage = nil
+        devinModelsTask = Task { [weak self] in
+            guard let self else { return }
+            let outcome = await DevinModelDiscoveryService.shared.discoverIfNeeded(force: force)
+            guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+            isDiscoveringDevinModels = false
+            switch outcome {
+            case .notInstalled:
+                devinModelDiscoveryMessage = "Devin CLI is not installed."
+            case let .discovered(modelCount):
+                devinModelDiscoveryMessage = "\(modelCount) models advertised by Devin."
+            case .noModelsAdvertised:
+                devinModelDiscoveryMessage = "Devin ACP advertised no selectable models."
+            case let .failed(message):
+                devinModelDiscoveryMessage = "Model discovery failed: \(message)"
+            }
+            refreshAgentAvailability()
+            await updateAvailableModels()
+            devinModelsTask = nil
+        }
+    }
+
     func updateAvailableModels() async {
         var modelSet = Set<AIModel>()
 
@@ -1866,6 +1913,10 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
         }
 
+        if DevinRuntimeLocator.isInstalledSync() {
+            modelSet.formUnion(AIModel.modelsForProvider(.devin))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -1935,6 +1986,7 @@ public class APISettingsViewModel: ObservableObject {
         case .claudeCode: "claude_code"
         case .codex: "codex"
         case .openCode: "opencode"
+        case .devin: "devin"
         }
     }
 
@@ -1952,11 +2004,11 @@ public class APISettingsViewModel: ObservableObject {
             case .anthropic:
                 anthropicApiKey = trimmedKey
                 isAnthropicKeyValid = true
-                seedPreferredComposeModelIfMissing(AIModel.claude4Sonnet, reason: "api_settings.validate_key.default_seed.anthropic")
+                seedPreferredComposeModelIfMissing(AIModel.claudeSonnet55, reason: "api_settings.validate_key.default_seed.anthropic")
             case .openAI:
                 openAIApiKey = trimmedKey
                 isOpenAIKeyValid = true
-                seedPreferredComposeModelIfMissing(AIModel.gpt54Mini, reason: "api_settings.validate_key.default_seed.openai")
+                seedPreferredComposeModelIfMissing(AIModel.gpt6Luna, reason: "api_settings.validate_key.default_seed.openai")
             case .gemini:
                 geminiApiKey = trimmedKey
                 isGeminiKeyValid = true
@@ -1967,7 +2019,7 @@ public class APISettingsViewModel: ObservableObject {
             case .openRouter:
                 openRouterApiKey = trimmedKey
                 isOpenRouterKeyValid = true
-                seedPreferredComposeModelIfMissing(AIModel.openrouterClaude4Sonnet, reason: "api_settings.validate_key.default_seed.openrouter")
+                seedPreferredComposeModelIfMissing(AIModel.openrouterClaudeSonnet55, reason: "api_settings.validate_key.default_seed.openrouter")
             case .azure:
                 azureBaseURL = ""
                 azureApiKey = ""
@@ -2010,6 +2062,8 @@ public class APISettingsViewModel: ObservableObject {
             case .cursor:
                 break
             case .grokBuild:
+                break
+            case .devin:
                 break
             }
 
@@ -2072,6 +2126,8 @@ public class APISettingsViewModel: ObservableObject {
         case .cursor:
             break
         case .grokBuild:
+            break
+        case .devin:
             break
         }
         await updateAvailableModels()
@@ -3303,7 +3359,7 @@ public class APISettingsViewModel: ObservableObject {
         applyCodexConnectionPhase(.testingAppServer)
 
         // Use an owned non-agent Codex client so health-check failures cannot poison chat or polling.
-        let provider = CodexCLIProvider(logCollector: collector)
+        let provider = CodexCLIProvider(logCollector: collector, perfRecorder: AIProviderFactory.perfRecorder)
         collector.append("Created Codex CLI provider for health check")
 
         do {

@@ -1,6 +1,20 @@
 import Foundation
+import RepoPromptInstrumentation
 
 class AIProviderFactory {
+    /// Installed once by the app composition root; Infrastructure must not construct
+    /// the app-side recorder itself (that would be a wrong-way edge into Features).
+    private static let perfRecorderSlot = AgentModePerfRecorderBox()
+
+    static func installPerfRecorder(_ recorder: any AgentModePerfRecording) {
+        perfRecorderSlot.install(recorder)
+    }
+
+    /// The app-installed recorder (Noop until the composition root installs one).
+    static var perfRecorder: any AgentModePerfRecording {
+        perfRecorderSlot.snapshot()
+    }
+
     static func createProvider(
         for providerType: AIProviderType,
         keyManager: KeyManager,
@@ -18,7 +32,7 @@ class AIProviderFactory {
         }
 
         // CLI providers don't need API keys - they leverage existing authentication
-        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor || providerType == .grokBuild {
+        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor || providerType == .grokBuild || providerType == .devin {
             return try await createProvider(
                 for: providerType,
                 key: "",
@@ -82,13 +96,15 @@ class AIProviderFactory {
             return ClaudeCodeProvider()
         case .codex:
             // Standard non-agent Codex chat owns a fresh app-server client per request.
-            return CodexCLIProvider()
+            return CodexCLIProvider(perfRecorder: perfRecorder)
         case .openCode:
             return OpenCodeCLIProvider()
         case .cursor:
             return CursorCLIProvider()
         case .grokBuild:
             return GrokBuildCLIProvider()
+        case .devin:
+            return DevinCLIProvider()
         case .customProvider:
             let config = try CustomProviderConfiguration.load()
 
@@ -181,6 +197,7 @@ enum AIProviderType: Codable, Equatable {
     case openCode // OpenCode CLI provider case
     case cursor // Cursor CLI provider case
     case grokBuild // Grok Build CLI provider case
+    case devin
 }
 
 extension AIProviderType {
@@ -203,6 +220,7 @@ extension AIProviderType {
         case .openCode: "OpenCode"
         case .cursor: "Cursor CLI"
         case .grokBuild: "Grok Build"
+        case .devin: "Devin"
         }
     }
 

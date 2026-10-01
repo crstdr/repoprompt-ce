@@ -7,15 +7,17 @@
 //
 
 import AppKit
+import RepoPromptInstrumentation
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct AgentComposerActions {
-    let storeDraft: (_ tabID: UUID, _ text: String) -> Void
-    let retrieveDraft: (_ tabID: UUID) -> String
+    let storeDraft: (_ tabID: UUID, _ text: String, _ acknowledgedSequence: UInt64) -> Void
+    let loadDraft: (_ tabID: UUID) -> AgentComposerDraftSnapshot
     let claimSubmit: (_ attempt: AgentComposerSubmitAttempt) -> AgentModeViewModel.AgentComposerSubmitClaimResult
     let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
+    let cancelRouting: (_ tabID: UUID) async -> Void
     let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
     let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let commitTaggedFile: (_ tabID: UUID, _ suggestion: MentionSuggestion, _ displayName: String) -> Void
@@ -27,7 +29,7 @@ struct AgentComposerActions {
     let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> Void
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
-    let selectCursorModelParameter: (_ configID: String, _ valueRaw: String) -> Void
+    let selectACPModelParameter: (_ target: ACPModelParameterSelection, _ openCodeDiscoveryKey: OpenCodeACPModelParameterKey?) -> Void
     let setAutoEditEnabled: (_ enabled: Bool) -> Void
     let setProviderPermissionLevel: (_ id: AgentProviderPermissionLevelID) -> Void
     let applyCodexToolSettingMutation: (_ mutation: CodexToolSettingMutation) -> Void
@@ -37,6 +39,7 @@ struct AgentComposerActions {
 }
 
 struct AgentInputBar: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let agentModeVM: AgentModeViewModel
     @ObservedObject var composerUI: AgentComposerUIStore
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
@@ -82,7 +85,7 @@ struct AgentInputBar: View {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.inputBar")
+            let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
         AgentComposerView(
             props: composerUI.props,
@@ -107,13 +110,16 @@ struct AgentInputBar: View {
 
     private var composerActions: AgentComposerActions {
         AgentComposerActions(
-            storeDraft: { tabID, text in agentModeVM.storeDraftText(for: tabID, text) },
-            retrieveDraft: { tabID in agentModeVM.retrieveDraftText(for: tabID) },
+            storeDraft: { tabID, text, sequence in
+                agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
+            },
+            loadDraft: { tabID in agentModeVM.loadDraftSnapshotForComposer(for: tabID) },
             claimSubmit: { attempt in agentModeVM.claimComposerSubmitAttempt(attempt) },
             executeSubmit: { claim, text in
                 await agentModeVM.executeComposerSubmitAttempt(text: text, claim: claim)
             },
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
+            cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
             removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
             commitTaggedFile: { tabID, suggestion, displayName in
@@ -139,8 +145,8 @@ struct AgentInputBar: View {
             },
             reasoningEffortOptionsForCurrentSelection: { agentModeVM.reasoningEffortOptionsForCurrentSelection() },
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
-            selectCursorModelParameter: { configID, valueRaw in
-                agentModeVM.selectCursorModelParameter(configID: configID, valueRaw: valueRaw)
+            selectACPModelParameter: { target, openCodeDiscoveryKey in
+                agentModeVM.selectACPModelParameter(target, openCodeDiscoveryKey: openCodeDiscoveryKey)
             },
             setAutoEditEnabled: { enabled in agentModeVM.setAutoEditEnabled(enabled) },
             setProviderPermissionLevel: { id in agentModeVM.setProviderPermissionLevel(id) },
@@ -164,7 +170,7 @@ struct AgentInputBar: View {
     @ViewBuilder
     private var statusPills: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.inputBar.statusPills")
+            let _ = perfRecorder.increment("ui.body.inputBar.statusPills")
         #endif
         AgentStatusPillsRow(
             agentModeVM: agentModeVM,
@@ -242,6 +248,7 @@ enum AgentFileMentionText {
 }
 
 struct AgentComposerView: View, Equatable {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let props: AgentComposerProps
     let placeholderText: String
     let actions: AgentComposerActions
@@ -258,8 +265,9 @@ struct AgentComposerView: View, Equatable {
     @FocusState var isFocused: Bool
 
     @State private var localInputText: String = ""
+    @State private var externalTextUpdateTick: Int = 0
     @State private var submissionLatch = AgentComposerSubmissionLatch()
-    @State private var lastAppliedDraftRestorationEventIDByTab: [UUID: UUID] = [:]
+    @State private var acknowledgedDraftRestorationSequenceByTab: [UUID: UInt64] = [:]
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
@@ -448,7 +456,7 @@ struct AgentComposerView: View, Equatable {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.composer")
+            let _ = perfRecorder.increment("ui.body.composer")
         #endif
         VStack(spacing: 0) {
             ComposerChrome(
@@ -487,7 +495,7 @@ struct AgentComposerView: View, Equatable {
         .onDisappear {
             // Store draft when leaving
             if let tabID = currentTabID {
-                actions.storeDraft(tabID, localInputText)
+                actions.storeDraft(tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
             }
             steeringUnsupportedDismissTask?.cancel()
             steeringUnsupportedDismissTask = nil
@@ -498,7 +506,7 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: currentTabID) { oldTabID, newTabID in
             // Switch drafts when tab changes
             if let oldTabID {
-                actions.storeDraft(oldTabID, localInputText)
+                actions.storeDraft(oldTabID, localInputText, acknowledgedDraftRestorationSequenceByTab[oldTabID] ?? 0)
             }
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
@@ -507,7 +515,7 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
-            actions.storeDraft(tabID, newValue)
+            actions.storeDraft(tabID, newValue, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
         }
         .onChange(of: props.draftRestorationEvent) { _, event in
             guard let event, event.tabID == currentTabID else { return }
@@ -533,15 +541,19 @@ struct AgentComposerView: View, Equatable {
                     restoredText = AgentComposerDraftRestorationReducer.apply(
                         operation,
                         to: localInputText,
-                        lastAppliedRestorationEventID: lastAppliedDraftRestorationEventIDByTab[event.tabID]
+                        acknowledgedSequence: acknowledgedDraftRestorationSequenceByTab[event.tabID] ?? 0
                     )
                 } else {
                     restoredText = event.text
                 }
             }
-            lastAppliedDraftRestorationEventIDByTab[event.tabID] = event.id
-            setLocalInputText(restoredText, forceRevision: true)
-            actions.storeDraft(event.tabID, restoredText)
+            let sequence = max(
+                acknowledgedDraftRestorationSequenceByTab[event.tabID] ?? 0,
+                event.operation?.fragments.last?.sequence ?? 0
+            )
+            acknowledgedDraftRestorationSequenceByTab[event.tabID] = sequence
+            setLocalInputText(restoredText, forceRevision: true, isExternalUpdate: true)
+            actions.storeDraft(event.tabID, restoredText, sequence)
             DispatchQueue.main.async {
                 isSyncingDraftFromSession = false
             }
@@ -620,6 +632,7 @@ struct AgentComposerView: View, Equatable {
                         await actions.slashSkillSuggestions(query)
                     }
                 ),
+                externalUpdateTick: externalTextUpdateTick,
                 onHeightChange: { newHeight in
                     editorTextFieldHeight = newHeight
                 }
@@ -652,12 +665,16 @@ struct AgentComposerView: View, Equatable {
                         mcpControlChip
                     }
                     if props.hasAvailableAgentProviders {
-                        agentProviderModelPicker
-                        cursorModelParameterPickers
-                        reasoningEffortPicker
-                        claudeEffortPicker
-                        codexToolsButton
-                        claudeToolsButton
+                        if props.isGlobalModelRouterControllingFreshTask {
+                            automaticRouterTargetChip
+                        } else {
+                            agentProviderModelPicker
+                            acpModelParameterPickers
+                            reasoningEffortPicker
+                            claudeEffortPicker
+                            codexToolsButton
+                            claudeToolsButton
+                        }
                     } else {
                         connectAgentProvidersButton
                     }
@@ -685,7 +702,9 @@ struct AgentComposerView: View, Equatable {
                     transaction.animation = nil
                 }
 
-                if let cancelTarget = props.cancelTarget {
+                if props.isRoutingFreshTask, let tabID = props.currentTabID {
+                    CancelButton(action: { Task { await actions.cancelRouting(tabID) } })
+                } else if let cancelTarget = props.cancelTarget {
                     CancelButton(action: { cancelRun(cancelTarget) })
                 } else {
                     SendOrResendButton(
@@ -728,6 +747,25 @@ struct AgentComposerView: View, Equatable {
     }
 
     // MARK: - Agent Pickers
+
+    private var automaticRouterTargetChip: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            Text("Automatic · Jev")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        }
+        .foregroundColor(.accentColor)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.accentColor.opacity(0.10))
+        .cornerRadius(6)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Model Router")
+        .accessibilityValue("Automatic with Jev")
+        .hoverTooltip("Jev will choose the provider, model, and reasoning effort after you send. Turn off Router to choose them manually.")
+        .fixedSize(horizontal: true, vertical: false)
+    }
 
     private enum LayoutMetrics {
         static let providerChipMaxWidth: CGFloat = 250
@@ -886,6 +924,16 @@ struct AgentComposerView: View, Equatable {
                 actions.selectAgentModel(agent, "")
             }]
         }
+        if agent == .devin {
+            return DevinModelCatalog.current.menuGroups(for: options).flatMap { group -> [StableMenuItem] in
+                guard group.rendersAsSubmenu else {
+                    return group.entries.map { inputBarModelMenuItem(agent: agent, model: $0.option) }
+                }
+                return [.submenu(group.displayName, items: group.entries.map {
+                    inputBarModelMenuItem(agent: agent, model: $0.option, title: $0.effortDisplayName)
+                })]
+            }
+        }
         guard agent == .openCode else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
         }
@@ -996,48 +1044,56 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    @ViewBuilder
-    private var cursorModelParameterPickers: some View {
-        if props.selectedAgent == .cursor {
-            ForEach(props.cursorModelParameterControls) { control in
-                Menu {
-                    ForEach(control.choices, id: \.rawValue) { choice in
-                        Button {
-                            actions.selectCursorModelParameter(control.configID, choice.rawValue)
-                        } label: {
-                            HStack {
-                                Text(choice.displayName)
-                                if choice.rawValue == control.selectedValueRaw {
-                                    Spacer()
-                                    Image(systemName: "checkmark")
-                                }
+    private var acpModelParameterPickers: some View {
+        ForEach(props.acpModelParameterControls) { control in
+            Menu {
+                ForEach(control.choices, id: \.rawValue) { choice in
+                    Button {
+                        actions.selectACPModelParameter(
+                            ACPModelParameterSelection(
+                                providerID: control.providerID,
+                                baseModelRaw: control.baseModelRaw,
+                                kind: control.kind,
+                                configID: control.configID,
+                                valueRaw: choice.rawValue
+                            ),
+                            control.openCodeDiscoveryKey
+                        )
+                    } label: {
+                        HStack {
+                            Text(choice.displayName)
+                            if choice.rawValue == control.selectedValueRaw {
+                                Spacer()
+                                Image(systemName: "checkmark")
                             }
                         }
                     }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(control.selectedDisplayName)
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    }
-                    .foregroundColor(
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(control.selectedDisplayName)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                }
+                .foregroundColor(
+                    control.isSavedValueUnavailable || (
                         control.kind == .speed
                             && control.selectedDisplayName.caseInsensitiveCompare("fast") == .orderedSame
-                            ? .orange
-                            : .secondary
                     )
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(pickerChipColor)
-                    .cornerRadius(4)
-                }
-                .menuStyle(.borderlessButton)
-                .accessibilityLabel(Text(control.accessibilityLabel))
-                .accessibilityValue(Text(control.accessibilityValue))
-                .disabled(modelControlsDisabled || control.choices.isEmpty)
-                .opacity(modelControlsDisabled ? 0.55 : 1.0)
-                .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : "Cursor \(control.displayName)")
-                .fixedSize()
+                        ? .orange
+                        : .secondary
+                )
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(pickerChipColor)
+                .cornerRadius(4)
             }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel(Text(control.accessibilityLabel))
+            .accessibilityValue(Text(control.accessibilityValue))
+            .disabled(modelControlsDisabled || control.choices.isEmpty)
+            .opacity(modelControlsDisabled ? 0.55 : 1.0)
+            .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : control.tooltip)
+            .fixedSize()
         }
     }
 
@@ -1531,7 +1587,11 @@ struct AgentComposerView: View, Equatable {
             return
         }
 
-        actions.storeDraft(attempt.sourceTabID, rawDraftSnapshot)
+        actions.storeDraft(
+            attempt.sourceTabID,
+            rawDraftSnapshot,
+            acknowledgedDraftRestorationSequenceByTab[attempt.sourceTabID] ?? 0
+        )
         switch actions.claimSubmit(attempt) {
         case let .claimed(claim):
             Task { @MainActor in
@@ -1547,7 +1607,7 @@ struct AgentComposerView: View, Equatable {
                     return
                 }
                 if effects.shouldClearInput {
-                    setLocalInputText("")
+                    setLocalInputText("", isExternalUpdate: true)
                     resetTextFieldTrigger.toggle()
                 }
                 if let blockedMessage = effects.blockedMessage {
@@ -1588,19 +1648,19 @@ struct AgentComposerView: View, Equatable {
 
     private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?) {
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "agent.composer.submit.rejected",
                 tabID: currentTabID,
                 fields: [
                     "reason": reason,
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
-                    "propsTabID": AgentModePerfDiagnostics.shortID(props.currentTabID),
-                    "targetTabID": AgentModePerfDiagnostics.shortID(target?.tabID),
-                    "attemptID": AgentModePerfDiagnostics.shortID(submissionLatch.activeAttemptID(for: currentTabID)),
+                    "currentTabID": perfRecorder.shortID(currentTabID),
+                    "propsTabID": perfRecorder.shortID(props.currentTabID),
+                    "targetTabID": perfRecorder.shortID(target?.tabID),
+                    "attemptID": perfRecorder.shortID(submissionLatch.activeAttemptID(for: currentTabID)),
                     "inputRevision": String(submissionLatch.inputRevision),
-                    "expectedSubmissionToken": AgentModePerfDiagnostics.shortID(target?.expectedSubmissionToken),
-                    "expectedSourceAgentSessionID": AgentModePerfDiagnostics.shortID(target?.expectedSourceAgentSessionID),
-                    "expectedPersistentBindingGeneration": AgentModePerfDiagnostics.shortID(target?.expectedPersistentBindingIdentity?.generation),
+                    "expectedSubmissionToken": perfRecorder.shortID(target?.expectedSubmissionToken),
+                    "expectedSourceAgentSessionID": perfRecorder.shortID(target?.expectedSourceAgentSessionID),
+                    "expectedPersistentBindingGeneration": perfRecorder.shortID(target?.expectedPersistentBindingIdentity?.generation),
                     "expectedBindingTransitionGeneration": target.map { String($0.expectedBindingTransitionGeneration) } ?? "nil"
                 ]
             )
@@ -1648,7 +1708,8 @@ struct AgentComposerView: View, Equatable {
                     displayName: attachment.displayName,
                     relativePath: attachment.relativePath,
                     from: localInputText
-                )
+                ),
+                isExternalUpdate: true
             )
         }
     }
@@ -1690,7 +1751,14 @@ struct AgentComposerView: View, Equatable {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private func setLocalInputText(_ newValue: String, forceRevision: Bool = false) {
+    private func setLocalInputText(
+        _ newValue: String,
+        forceRevision: Bool = false,
+        isExternalUpdate: Bool = false
+    ) {
+        if isExternalUpdate {
+            externalTextUpdateTick &+= 1
+        }
         guard forceRevision || localInputText != newValue else {
             isInputEmpty = newValue.isEmpty
             return
@@ -1702,7 +1770,13 @@ struct AgentComposerView: View, Equatable {
 
     private func loadDraftFromSession(for tabID: UUID) {
         isSyncingDraftFromSession = true
-        setLocalInputText(actions.retrieveDraft(tabID), forceRevision: true)
+        let snapshot = actions.loadDraft(tabID)
+        acknowledgedDraftRestorationSequenceByTab[tabID] = snapshot.restorationSequence
+        setLocalInputText(
+            snapshot.text,
+            forceRevision: true,
+            isExternalUpdate: true
+        )
         DispatchQueue.main.async {
             isSyncingDraftFromSession = false
         }

@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptInstrumentation
 
 @MainActor
 struct AgentExploreMCPToolService {
@@ -8,12 +9,13 @@ struct AgentExploreMCPToolService {
     typealias StartRun = AgentRunMCPToolService.StartRun
 
     let toolName: String
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     let captureRequestMetadata: () async -> RequestMetadata
     let requireTargetWindow: () throws -> WindowState
     let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
-    var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
+    var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
     let startRun: StartRun
     #if DEBUG
@@ -36,12 +38,19 @@ struct AgentExploreMCPToolService {
             operationName: "agent_explore.start",
             vcsService: vcsService,
             gitTargetResolver: gitTargetResolver,
-            preBindingCommitObserver: preBindingCommitObserver
+            preBindingCommitObserver: preBindingCommitObserver,
+            startupPhaseEventSink: AppWorktreeStartupPhaseEventSink()
         )
     }
 
-    static func resolvedStartTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try AgentRunMCPToolService.resolvedStartTimeoutSeconds(value)
+    static func resolvedStartTimeoutSeconds(
+        _ value: Value?,
+        capturedDefaultWaitSeconds: TimeInterval
+    ) throws -> TimeInterval {
+        try AgentRunMCPToolService.resolvedStartTimeoutSeconds(
+            value,
+            capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+        )
     }
 
     func execute(args: [String: Value]) async throws -> Value {
@@ -69,7 +78,11 @@ struct AgentExploreMCPToolService {
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
         try validateBatchWorktreeRequest(worktreeStartRequest, messageCount: messages.count)
         let detach = AgentMCPToolHelpers.parseBool(args["detach"]) ?? false
-        let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(args["timeout"])
+        let capturedDefaultWaitSeconds = AgentRunMCPToolService.capturedDefaultWaitTimeoutSeconds()
+        let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(
+            args["timeout"],
+            capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+        )
 
         let metadata = await captureRequestMetadata()
         let context = try await resolveStartContext(metadata: metadata)
@@ -155,7 +168,9 @@ struct AgentExploreMCPToolService {
         }
 
         var isBatch: Bool {
-            if case .batch = self { return true }
+            if case .batch = self {
+                return true
+            }
             return false
         }
     }
@@ -309,7 +324,9 @@ struct AgentExploreMCPToolService {
                 await context.agentModeVM.mcpDiscardSessionTarget(target)
                 let remainingTargets = Array(targets.dropFirst(index + 1))
                 await discardTargets(remainingTargets, agentModeVM: context.agentModeVM)
-                if error is CancellationError { throw error }
+                if error is CancellationError {
+                    throw error
+                }
                 guard !started.isEmpty else { throw error }
                 let startedIDs = started.map(\.outcome.snapshot.sessionID.uuidString).joined(separator: ", ")
                 throw MCPError.internalError(
@@ -334,18 +351,58 @@ struct AgentExploreMCPToolService {
             target,
             expectedWorkspaceID: context.expectedWorkspaceID
         )
+        var selection = context.selection
+        var routedReasoningEffortRaw: String?
+        var routerSelectedTarget = false
+        do {
+            if let routed = try await context.agentModeVM.routeSubagentTargetIfEnabled(
+                task: message,
+                surface: .headless
+            ) {
+                selection = AgentMCPSelectionResolver.ResolvedSelection(
+                    agentRaw: routed.agentRaw,
+                    modelRaw: routed.modelRaw,
+                    taskLabelKind: .explore,
+                    modelParameterSelections: routed.modelParameters
+                )
+                routedReasoningEffortRaw = routed.reasoningEffortRaw
+                routerSelectedTarget = true
+                #if DEBUG
+                    perfRecorder.event("modelRouter.subagent.selected", fields: [
+                        "entryPoint": "agent_explore.start",
+                        "provider": routed.agentRaw,
+                        "model": routed.modelRaw,
+                        "effort": routed.reasoningEffortRaw ?? "provider-default"
+                    ])
+                #endif
+            }
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+        // An `explore` role default may carry a stored model-parameter pin (e.g. an OpenCode
+        // thinking level). Stage it onto the freshly created session so the run builder picks it
+        // up from stored selections, exactly as `agent_run` start does. No rollback bookkeeping:
+        // a failed explore start discards its target rather than restoring it. A role without a
+        // pin resolves to an empty array, which stages nothing.
+        _ = try context.agentModeVM.mcpStageModelParameterSelections(
+            tabID: target.tabID,
+            agentRaw: selection.agentRaw,
+            modelRaw: selection.modelRaw,
+            selections: selection.modelParameterSelections
+        )
         let outcome = try await startRun(
             target,
             message,
             context.metadata,
             context.agentModeVM,
-            context.selection.agentRaw,
-            context.selection.modelRaw,
-            nil,
+            selection.agentRaw,
+            selection.modelRaw,
+            routedReasoningEffortRaw,
             .explore,
             nil,
             nil,
-            nil
+            nil,
+            routerSelectedTarget
         )
         context.agentModeVM.mcpAcceptSessionTarget(target)
         return outcome

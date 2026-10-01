@@ -1,10 +1,12 @@
 import Foundation
+import RepoPromptProcess
 
 enum ACPProviderID: String, Codable, Hashable {
     case openCode
     case cursor
     case grokBuild
     case antigravity
+    case devin
 }
 
 enum ACPSupportResult: Equatable {
@@ -125,6 +127,10 @@ struct ACPRunRequest {
     let taskLabelKind: AgentModelCatalog.TaskLabelKind?
     let sessionModeID: String?
     let autoApproveAllToolPermissions: Bool
+    /// Provider-native CLI permission mode applied by the provider at PROCESS LAUNCH
+    /// (Devin `--permission-mode`). Never sent over ACP and never passed to
+    /// `setSessionMode`; `nil` means "pass no flag".
+    let launchPermissionMode: String?
     let modelParameterSelections: [ACPModelParameterSelection]
 
     init(
@@ -136,6 +142,7 @@ struct ACPRunRequest {
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         sessionModeID: String? = nil,
         autoApproveAllToolPermissions: Bool = false,
+        launchPermissionMode: String? = nil,
         modelParameterSelections: [ACPModelParameterSelection] = []
     ) {
         self.agentKind = agentKind
@@ -146,6 +153,7 @@ struct ACPRunRequest {
         self.taskLabelKind = taskLabelKind
         self.sessionModeID = sessionModeID
         self.autoApproveAllToolPermissions = autoApproveAllToolPermissions
+        self.launchPermissionMode = launchPermissionMode
         self.modelParameterSelections = modelParameterSelections
     }
 }
@@ -245,6 +253,29 @@ struct ACPModelParameterApplicationReport: Equatable {
         self.alreadyCurrent = alreadyCurrent
         self.skipped = skipped
     }
+
+    /// A skipped selection means a requested model parameter could not be honoured. Callers
+    /// fail loudly before prompting rather than silently running at another value. This lives on
+    /// the report type because the check depends only on the report — it is the shared owner for
+    /// both the Agent Mode runner and the Context Builder headless provider.
+    func validateNoSkippedSelections() throws {
+        guard skipped.isEmpty else {
+            throw ACPModelParameterSelectionError.skipped(selections: skipped)
+        }
+    }
+}
+
+/// A requested ACP model parameter that could not be applied to the session.
+enum ACPModelParameterSelectionError: LocalizedError, Equatable {
+    case skipped(selections: [ACPModelParameterSelection])
+
+    var errorDescription: String? {
+        switch self {
+        case let .skipped(selections):
+            let values = selections.map { "\($0.configID)=\($0.valueRaw)" }.joined(separator: ", ")
+            return "The selected model settings are stale or unsupported for this ACP session: \(values). Refresh the model settings and try again."
+        }
+    }
 }
 
 /// A provider-owned direct model-selection RPC (e.g. Grok's `session/set_model`).
@@ -302,6 +333,12 @@ protocol ACPAgentProvider: Sendable {
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async
     func normalizeError(_ error: Error) -> Error
 
+    /// Recognizes a provider-owned response ID only. After ordinary request correlation fails,
+    /// the controller requires only a string `id` and no `method` before consulting this hook.
+    /// Keep this synchronous and side-effect-free.
+    /// This must be a protocol requirement so calls through an existential reach overrides.
+    func recognizesUnmatchedResponseID(_ id: String) -> Bool
+
     /// Opts a provider into ACP's parameterized model picker capability and classifies
     /// provider-owned select options without changing their exact wire identity.
     var supportsParameterizedModelPicker: Bool { get }
@@ -314,6 +351,10 @@ protocol ACPAgentProvider: Sendable {
 }
 
 extension ACPAgentProvider {
+    func recognizesUnmatchedResponseID(_: String) -> Bool {
+        false
+    }
+
     var supportsParameterizedModelPicker: Bool {
         false
     }

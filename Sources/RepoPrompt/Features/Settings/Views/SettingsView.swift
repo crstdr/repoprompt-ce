@@ -38,8 +38,8 @@ struct SettingsView: View {
     /// Canonical sidebar order. Agent-mode first, then General (app-wide
     /// preferences), MCP, models/providers, workspaces, and the copy-&-chat
     /// workflow.
-    private static let sidebarSectionOrder: [TabSection] = [
-        .agentMode, .general, .mcp, .api, .workspaces, .copyChat
+    static let sidebarSectionOrder: [TabSection] = [
+        .agentMode, .router, .general, .mcp, .api, .workspaces, .copyChat
     ]
 
     /// Legacy alias tabs that are kept in the enum for deep-link and
@@ -246,6 +246,8 @@ struct SettingsView: View {
             // deep-links into each of the other Agent Mode settings surfaces, so
             // it sits first in the sidebar.
             [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentWorkflows, .contextBuilder]
+        case .router:
+            [.modelRouter]
         case .mcp:
             [.mcp, .mcpTools, .permissions, .modelPresets]
         case .api:
@@ -253,7 +255,7 @@ struct SettingsView: View {
         case .workspaces:
             [.manageWorkspaces, .managePresets]
         case .general:
-            [.appearance, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry]
+            [.appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry]
         case .copyChat:
             // `.copyPresets` and `.chatPresets` are intentionally omitted from the
             // sidebar – they now resolve to the unified Workflow Presets surface.
@@ -302,6 +304,9 @@ struct SettingsView: View {
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .telemetry:
             TelemetrySettingsView()
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .notifications:
+            NotificationSettingsView()
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .chatSettings:
             ChatSettingsView(promptViewModel: promptViewModel, windowID: windowState.windowID, closeAction: closeAction)
@@ -395,6 +400,9 @@ struct SettingsView: View {
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .modelRouter:
+            RouterSettingsView(viewModel: windowState.routerSettingsViewModel, onNavigate: { selectedTab = $0 })
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .agentModels:
             AgentModelsSettingsView(
                 promptVM: promptViewModel,
@@ -482,6 +490,7 @@ struct SettingsView: View {
 
 enum TabSection: String, Identifiable {
     case agentMode
+    case router
     case mcp
     case api
     case workspaces
@@ -495,6 +504,7 @@ enum TabSection: String, Identifiable {
     var title: String {
         switch self {
         case .agentMode: "Agent Mode"
+        case .router: "Router"
         case .mcp: "MCP Server"
         case .api: "Models & Providers"
         case .workspaces: "Workspaces"
@@ -515,6 +525,7 @@ enum SettingsTab: String, CaseIterable {
     case keyboardShortcuts
     case advanced
     case telemetry
+    case notifications
     case chatSettings
     case apiGeneral
     case openRouter
@@ -530,6 +541,7 @@ enum SettingsTab: String, CaseIterable {
     case chatPresets // Chat presets management (legacy deep-link → workflowPresets with Chat scope)
     case contextBuilder // Context builder settings
     case agentMode // Agent Mode "Overview" tab (formerly labeled "Agent Mode Behavior")
+    case modelRouter // Optional backend-neutral fresh-task model routing
     case agentModels // NEW: Unified model config shell (Phase 1 IA scaffolding)
     case agentPermissions // NEW: Unified permissions shell (Phase 1 IA scaffolding)
     case agentWorkflows // Agent Mode workflow prompts and featured/custom workflows
@@ -544,6 +556,7 @@ enum SettingsTab: String, CaseIterable {
         case .keyboardShortcuts: "Keyboard Shortcuts"
         case .advanced: "Advanced"
         case .telemetry: "Telemetry"
+        case .notifications: "Notifications"
         case .chatSettings: "Chat Settings"
         case .apiGeneral: "API Providers"
         case .openRouter: "OpenRouter"
@@ -559,6 +572,7 @@ enum SettingsTab: String, CaseIterable {
         case .chatPresets: "Chat Presets"
         case .contextBuilder: "Context Builder"
         case .agentMode: "Overview"
+        case .modelRouter: "Model Router"
         case .agentModels: "Agent Models"
         case .agentPermissions: "Agent Permissions"
         case .agentWorkflows: "Agent Workflows"
@@ -575,6 +589,7 @@ enum SettingsTab: String, CaseIterable {
         case .keyboardShortcuts: "keyboard"
         case .advanced: "gearshape.2"
         case .telemetry: "lock.shield"
+        case .notifications: "bell.badge"
         case .chatSettings: "message"
         case .apiGeneral: "key"
         case .openRouter: "network"
@@ -590,6 +605,7 @@ enum SettingsTab: String, CaseIterable {
         case .chatPresets: "bubble.left.and.bubble.right"
         case .contextBuilder: "sparkles"
         case .agentMode: "brain.head.profile"
+        case .modelRouter: "arrow.triangle.branch"
         case .agentModels: "brain"
         case .agentPermissions: "lock.shield"
         case .agentWorkflows: "bolt.fill"
@@ -607,6 +623,10 @@ enum SettingsTab: String, CaseIterable {
              .agentMode:
             .agentMode
 
+        // Optional model routing
+        case .modelRouter:
+            .router
+
         // MCP Server
         case .mcp, .mcpTools, .permissions, .modelPresets:
             .mcp
@@ -620,7 +640,7 @@ enum SettingsTab: String, CaseIterable {
             .workspaces
 
         // General
-        case .appearance, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry:
+        case .appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry:
             .general
 
         // Copy & Chat workflows
@@ -725,6 +745,20 @@ enum SettingsTab: String, CaseIterable {
             ]
         case .telemetry:
             ["telemetry", "privacy", "crash", "diagnostics", "sentry"]
+        case .notifications:
+            [
+                "notifications",
+                "alerts",
+                "banner",
+                "badge",
+                "dock",
+                "approve",
+                "approval",
+                "reply",
+                "question",
+                "turn complete",
+                "sound"
+            ]
         case .chatSettings:
             [
                 "chat",
@@ -1083,6 +1117,18 @@ enum SettingsTab: String, CaseIterable {
                 "sessionless compose tabs",
                 "show compose tabs",
                 "agent session visibility"
+            ]
+        case .modelRouter:
+            [
+                "model router",
+                "router",
+                "jev",
+                "typesafe",
+                "automatic model selection",
+                "route this task",
+                "routing backend",
+                "provider allowlist",
+                "privacy"
             ]
         case .agentModels:
             [

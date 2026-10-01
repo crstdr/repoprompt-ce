@@ -2,6 +2,9 @@ import AppKit
 import Combine
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 import SwiftUI
 
 // AgentLogEntry and AgentLogEntryType are defined in Models/Agent/AgentLogModels.swift
@@ -121,7 +124,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     typealias ProviderFactory = (
         _ agent: AgentProviderKind,
         _ modelString: String?,
-        _ workspacePath: String?
+        _ workspacePath: String?,
+        _ modelParameterSelections: [ACPModelParameterSelection]
     ) -> HeadlessAgentProvider
 
     private func debugLog(_ message: @autoclosure () -> String) {
@@ -137,6 +141,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         private static let maxLogEntries = 5
 
         let tabID: UUID
+        let perfRecorder: any AgentModePerfRecording
         @Published var agentLog: [AgentLogEntry]
         /// Total tool calls for the current run (tracked separately since agentLog is limited)
         @Published var toolCallCount: Int = 0
@@ -317,6 +322,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Generic N>1 post-discovery state and the task that must drain before replacement.
         var followUpOracleGroupState = ContextBuilderOracleGroupState()
         var followUpOracleGroupTask: Task<OracleGroupRuntime.Completion, Error>?
+        var followUpOracleGroupSupervision: ContextBuilderOracleGroupSupervision?
 
         /// Per-tab selected follow-up type for automatic analysis
         var selectedFollowUpType: ContextBuilderFollowUpType = .plan
@@ -325,8 +331,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         func beginRunAttempt(source: String) -> AgentRunOwnership {
             let ownership = runLifecycleTracker.begin(tabID: tabID, persistentSessionID: nil)
             #if DEBUG
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.started")
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.started.source.\(source)")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.started")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.started.source.\(source)")
             #endif
             return ownership
         }
@@ -348,7 +354,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             )
             #if DEBUG
                 if case let .rejected(reason) = result {
-                    AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
+                    perfRecorder.increment("contextBuilder.run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
                 }
             #endif
             return result
@@ -371,13 +377,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         private func recordRunAttemptEnded(source: String) {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.ended")
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.ended.source.\(source)")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.ended")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.ended.source.\(source)")
             #endif
         }
 
-        init(tabID: UUID) {
+        init(tabID: UUID, perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
             self.tabID = tabID
+            self.perfRecorder = perfRecorder
             agentLog = []
             agentRunState = .idle
             isAgentBusy = false
@@ -396,6 +403,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mcpWorkspaceID = nil
             followUpOracleSessionID = nil
             followUpOracleGroupTask = nil
+            followUpOracleGroupSupervision = nil
             pendingAskUser = nil
             askUserContinuation = nil
             pendingAskUserRunID = nil
@@ -429,6 +437,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Owns active and terminal-cleanup Context Builder attempts.
     private let runRegistry = ContextBuilderRunRegistry()
+
+    #if DEBUG
+        // One clock domain for source observations, admissions and the grouped poller.
+        var oracleGroupClockForTesting: (@MainActor @Sendable () -> TimeInterval)?
+        var oracleGroupSleepForTesting: (@MainActor @Sendable (TimeInterval) async throws -> Void)?
+    #endif
 
     #if DEBUG
         /// Opt-in, invocation-scoped counters for isolated tests and separately approved live diagnostics.
@@ -590,7 +604,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         func replaceSessionForTesting(tabID: UUID) {
-            sessions[tabID] = TabSession(tabID: tabID)
+            sessions[tabID] = TabSession(tabID: tabID, perfRecorder: perfRecorder)
         }
 
         func hasFollowUpOracleGroupTaskForTesting(tabID: UUID) -> Bool {
@@ -1034,6 +1048,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         workspaceManager?.activeWorkspace?.repoPaths.first
     }
 
+    /// Execution root for the Context Builder effort chooser's demand-scoped probe.
+    /// Worktree-aware only during a run; the chooser edits future configuration, so the active
+    /// workspace root is the honest preview context (the composer's fallback tier).
+    var chooserProbeWorkspacePath: String? {
+        currentWorkspacePath
+    }
+
     /// Track which agents are running (for cleanup)
     private var activeAgentRuns: Set<UUID> = []
 
@@ -1044,6 +1065,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private let codexModelPollingService: CodexModelPollingService
+    private let perfRecorder: any AgentModePerfRecording
     private var hasPreparedForWindowClose = false
 
     // MARK: - Init / Deinit
@@ -1055,7 +1077,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         oracleViewModel: OracleViewModel,
         settingsManager: GlobalSettingsStore = .shared,
         providerFactory: ProviderFactory? = nil,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.promptManager = promptManager
         self.workspaceManager = workspaceManager
@@ -1063,11 +1086,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         self.oracleViewModel = oracleViewModel
         self.settingsManager = settingsManager
         self.codexModelPollingService = codexModelPollingService
-        self.providerFactory = providerFactory ?? { agent, modelString, workspacePath in
+        self.perfRecorder = perfRecorder
+        self.providerFactory = providerFactory ?? { agent, modelString, workspacePath, modelParameterSelections in
             AgentRuntimeProviderService.shared.makeProvider(
                 for: agent,
                 modelString: modelString,
-                workspacePath: workspacePath
+                workspacePath: workspacePath,
+                modelParameterSelections: modelParameterSelections
             )
         }
         refreshAvailableAgents()
@@ -1503,7 +1528,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         if let existing = sessions[tabID] {
             return existing
         }
-        let newSession = TabSession(tabID: tabID)
+        let newSession = TabSession(tabID: tabID, perfRecorder: perfRecorder)
         sessions[tabID] = newSession
         return newSession
     }
@@ -1771,6 +1796,98 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         updateDynamicModelPolling(startCursorPolling: false)
     }
 
+    /// The scope a Context Builder pin write lands in. Surfaces capture this at render time and
+    /// hand it back, so a menu opened against one scope cannot write into another after an
+    /// inheritance change — provider/model can stay identical across that switch, because a new
+    /// workspace override profile starts as a copy of the global one.
+    var contextBuilderEditingScope: AgentModelsEditingScope {
+        if let workspaceID = currentWorkspaceID,
+           settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        {
+            .workspace(workspaceID)
+        } else {
+            .global
+        }
+    }
+
+    /// Set or clear the Context Builder agent's ACP parameter pin, persisting the displayed
+    /// agent+model choice atomically so the pin stays eligible. Resolve the write target from the
+    /// current settings authority rather than the cached `@Published` selection. Cross-surface
+    /// notifications arrive on a later runloop turn, so the
+    /// cache can still describe the menu's old model when another surface has already committed a
+    /// newer one. Re-running the normal display resolution also preserves intentional availability
+    /// fallback pinning instead of comparing directly against the persisted raw value.
+    func setContextBuilderModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        expectedProviderID: ACPProviderID,
+        expectedModelRaw: String,
+        expectedScope: AgentModelsEditingScope
+    ) {
+        let scope = contextBuilderEditingScope
+        guard scope == expectedScope,
+              let liveSelection = Self.contextBuilderPinWriteSelection(
+                  resolvedPersistedContextBuilderSelection(),
+                  expectedProviderID: expectedProviderID,
+                  expectedModelRaw: expectedModelRaw
+              )
+        else { return }
+        settingsManager.setAgentModelsContextBuilderModelParameter(
+            selections,
+            agentRaw: liveSelection.agent.rawValue,
+            modelRaw: liveSelection.modelRaw,
+            scope: scope
+        )
+    }
+
+    private static func contextBuilderPinWriteSelection(
+        _ liveSelection: AgentModelCatalog.NormalizedAgentSelection?,
+        expectedProviderID: ACPProviderID,
+        expectedModelRaw: String
+    ) -> AgentModelCatalog.NormalizedAgentSelection? {
+        guard let liveSelection,
+              let liveProviderID = liveSelection.agent.acpProviderID,
+              liveProviderID == expectedProviderID,
+              ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  liveSelection.modelRaw,
+                  providerID: liveProviderID
+              ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  expectedModelRaw,
+                  providerID: liveProviderID
+              )
+        else { return nil }
+        return liveSelection
+    }
+
+    #if DEBUG
+        static func test_contextBuilderPinWriteSelection(
+            liveAgent: AgentProviderKind,
+            liveModelRaw: String,
+            expectedProviderID: ACPProviderID,
+            expectedModelRaw: String
+        ) -> AgentModelCatalog.NormalizedAgentSelection? {
+            contextBuilderPinWriteSelection(
+                .init(agent: liveAgent, modelRaw: liveModelRaw),
+                expectedProviderID: expectedProviderID,
+                expectedModelRaw: expectedModelRaw
+            )
+        }
+    #endif
+
+    /// The saved `.thinking` pin value for the current Context Builder selection, if any. The
+    /// chip's saved-state input.
+    var contextBuilderThinkingParameterValueRaw: String? {
+        contextBuilderModelParameters.last { $0.kind == .thinking }?.valueRaw
+    }
+
+    /// The saved OpenCode effort pin for the **displayed** Context Builder selection. Display
+    /// and probe must agree with the model the chip is mounted for (`selectedModelRaw`), which
+    /// availability fallback can make differ from the persisted choice without writing back.
+    var contextBuilderModelParameters: [ACPModelParameterSelection] {
+        settingsManager
+            .effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
+            .contextBuilderModelParameterSelections(for: selectedAgent, modelRaw: selectedModelRaw)
+    }
+
     /// Update the effective Agent Models profile's Context Builder selection.
     private func persistAgentModelToEffectiveProfile() {
         guard !isRestoringState else { return }
@@ -1922,7 +2039,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         return ContextBuilderResolvedRunAuthority(
             configuration: configuration,
             agentKind: selection.agent,
-            modelRaw: selection.modelRaw
+            modelRaw: selection.modelRaw,
+            modelParameterSelections: profile.contextBuilderModelParameterSelections(
+                for: selection.agent,
+                modelRaw: selection.modelRaw
+            )
         )
     }
 
@@ -2050,6 +2171,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     origin: .mcp(controlToken: mcpControlToken),
                     agentKind: runAgent,
                     modelRaw: runModelRaw,
+                    modelParameterSelections: authority.modelParameterSelections,
                     workspaceContext: workspaceContext,
                     mcpConfiguration: configuration,
                     continuation: continuation,
@@ -2162,11 +2284,22 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 generatedResponseAuthority: base.generatedResponseAuthority,
                 isSystemWorkspace: base.isSystemWorkspace
             )
+            let overrideAgentKind = agentOverride ?? resolved.agentKind
+            let overrideModelRaw = modelOverrideRaw ?? resolved.modelRaw
+            let overrideSelections = (agentOverride == nil && modelOverrideRaw == nil)
+                ? resolved.modelParameterSelections
+                : settingsManager
+                .effectiveAgentModelsProfile(workspaceID: identity.workspaceID)
+                .contextBuilderModelParameterSelections(
+                    for: overrideAgentKind,
+                    modelRaw: overrideModelRaw
+                )
             return try await runContextBuilderForMCP(
                 authority: ContextBuilderResolvedRunAuthority(
                     configuration: configuration,
-                    agentKind: agentOverride ?? resolved.agentKind,
-                    modelRaw: modelOverrideRaw ?? resolved.modelRaw
+                    agentKind: overrideAgentKind,
+                    modelRaw: overrideModelRaw,
+                    modelParameterSelections: overrideSelections
                 ),
                 instructionsOverride: instructionsOverride,
                 workspaceContext: workspaceContext,
@@ -2227,7 +2360,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
         #if DEBUG
             if !accepted {
-                AgentModePerfDiagnostics.increment(
+                perfRecorder.increment(
                     "contextBuilder.run.lifecycle.event.rejected",
                     tabID: record.tabID
                 )
@@ -2436,7 +2569,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         #if DEBUG
-            AgentModePerfDiagnostics.increment("contextBuilder.run.teardown.started", tabID: record.tabID)
+            perfRecorder.increment("contextBuilder.run.teardown.started", tabID: record.tabID)
         #endif
 
         let disposalTask = Task { @MainActor [record] in
@@ -2454,7 +2587,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard let self else { return }
             if runRegistry.removeAfterTeardown(record) {
                 #if DEBUG
-                    AgentModePerfDiagnostics.increment("contextBuilder.run.teardown.completed", tabID: record.tabID)
+                    perfRecorder.increment("contextBuilder.run.teardown.completed", tabID: record.tabID)
                     observeStartupBoundary(.teardown, record: record)
                     runTestHooks?.teardownCompleted?(record.runID)
                 #endif
@@ -2571,7 +2704,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             ownership: ownership,
             origin: .ui,
             agentKind: runAgent,
-            modelRaw: runModelRaw
+            modelRaw: runModelRaw,
+            modelParameterSelections: settingsManager
+                .effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
+                .contextBuilderModelParameterSelections(
+                    for: runAgent,
+                    modelRaw: runModelRaw
+                )
         )
 
         guard runRegistry.register(record) else {
@@ -2732,7 +2871,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let providerWorkspacePath = record.mcpConfiguration?.providerWorkspacePath
                 ?? record.workspaceContext?.providerWorkspacePath
                 ?? currentWorkspacePath
-            let provider = providerFactory(record.agentKind, modelString, providerWorkspacePath)
+            let provider = providerFactory(
+                record.agentKind,
+                modelString,
+                providerWorkspacePath,
+                record.modelParameterSelections
+            )
             guard record.installProvider(provider) else {
                 await provider.dispose()
                 await lease.failAndCleanup()
@@ -3836,7 +3980,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             allowClarifyingQuestions: runBehavior.allowClarifyingQuestions,
             responseType: responseType,
             instructions: session.contextBuilderInstructions,
-            questionTimeoutSeconds: runBehavior.questionTimeoutSeconds
+            questionTimeoutSeconds: runBehavior.questionTimeoutSeconds,
+            restrictsReviewGitToExplicitReadOnly: Self.restrictsReviewGitToExplicitReadOnly(
+                workspaceContext: workspaceContext,
+                mcpConfiguration: mcpConfiguration
+            ),
+            reviewRootNames: workspaceContext?.reviewGitContext.displayContext.roots.map(\.logicalRootName) ?? []
         )
         debugLog("System prompt includes ask_user: \(systemPrompt.contains("ask_user"))")
         let userMessage = await buildAgentUserMessage(
@@ -3846,6 +3995,17 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 ?? mcpConfiguration?.nestedTabContext.frozenLookupContext
         )
         return AgentMessage(systemPrompt: systemPrompt, userMessage: userMessage)
+    }
+
+    /// Mirrors the precedence used when installing the nested discovery tab context, so the prompt
+    /// describes the same review-target state that `MCPContextBuilderGitReviewPolicy` enforces.
+    static func restrictsReviewGitToExplicitReadOnly(
+        workspaceContext: ContextBuilderWorkspaceContext?,
+        mcpConfiguration: ContextBuilderMCPRunConfiguration?
+    ) -> Bool {
+        let resolution = workspaceContext?.reviewTargetResolution
+            ?? mcpConfiguration?.nestedTabContext.contextBuilderReviewTargetResolution
+        return resolution?.restrictsGitToExplicitReadOnly ?? false
     }
 
     private func buildAgentUserMessage(
@@ -4628,17 +4788,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     @MainActor
     func planStatus(for tabID: UUID?) -> ContextBuilderPlanStatus {
         guard let id = tabID, let session = sessions[id] else { return .idle }
-        if session.isBackgroundPlanGenerating {
-            return .generating
-        }
-        if let error = session.backgroundPlanError {
-            return .error(error)
-        }
-        if let route = session.generatedAnswerRoute {
-            let preview = session.backgroundPlanResponsePreviewText ?? session.backgroundPlanResponseText
-            return .ready(route: route, previewText: preview)
-        }
-        return .idle
+        return session.planStatus
+    }
+
+    @MainActor
+    func failedAnswerRoute(for tabID: UUID?) -> ContextBuilderGeneratedAnswerRoute? {
+        guard let tabID else { return nil }
+        return sessions[tabID]?.failedAnswerRoute
     }
 
     /// Returns the current context-builder follow-up Oracle chat ID for a tab, when known.
@@ -4709,16 +4865,18 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             return false
         }
         let task = session.followUpOracleGroupTask
-        let members = session.followUpOracleGroupState.invalidateAndTakeMembers()
+        let supervision = session.followUpOracleGroupSupervision
+        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
         let cleanupGeneration = session.followUpOracleGroupState.generation
+        supervision?.cancel()
         task?.cancel()
-        for member in members {
-            await oracleViewModel.cancelStreaming(in: member.sessionID)
-        }
+        // Each captured lane releases its exact stream/waiter before its task joins. Never
+        // look up whatever query a member session happens to host after this await.
         if let task { _ = await task.result }
         let stillOwnsCleanup = session.followUpOracleGroupState.generation == cleanupGeneration
         if stillOwnsCleanup {
             session.followUpOracleGroupTask = nil
+            session.followUpOracleGroupSupervision = nil
         }
         return stillOwnsCleanup
     }
@@ -4749,6 +4907,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             throw CancellationError()
         }
         let generation = session.followUpOracleGroupState.beginRun()
+        let supervision: ContextBuilderOracleGroupSupervision
+        #if DEBUG
+            supervision = ContextBuilderOracleGroupSupervision(
+                clock: oracleGroupClockForTesting ?? { ProcessInfo.processInfo.systemUptime },
+                sleep: oracleGroupSleepForTesting ?? { try await Task.sleep(for: .seconds($0)) }
+            )
+        #else
+            supervision = ContextBuilderOracleGroupSupervision()
+        #endif
+        session.followUpOracleGroupSupervision = supervision
         let groupPrompt = ContextBuilderFrozenOraclePack.prompt(for: mode, prompt: prompt)
         let oracleStore = AppDomainRuntimeComposition.shared.oracleConversationStore
 
@@ -4885,7 +5053,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     tabContext: tabContext,
                     frozenInput: frozenPack.input,
                     callbacks: callbacks,
-                    resolvedStartExecution: execution
+                    resolvedStartExecution: execution,
+                    contextBuilderSupervision: supervision
                 )
             }
             session.followUpOracleGroupTask = task
@@ -4893,16 +5062,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let completion = try await withTaskCancellationHandler {
                 try await task.value
             } onCancel: {
+                supervision.cancel()
                 task.cancel()
-                Task { @MainActor [weak self] in
-                    guard let self, let session = sessions[tabID],
-                          session.followUpOracleGroupState.generation == generation
-                    else { return }
-                    let members = session.followUpOracleGroupState.members
-                    for member in members {
-                        await oracleViewModel.cancelStreaming(in: member.sessionID)
-                    }
-                }
             }
             try requireCurrentOracleRun(session: session, generation: generation)
             let groupReply = ContextBuilderOracleGroupReply(result: completion.result)
@@ -4914,10 +5075,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     "Context Builder Oracle group result did not match its prepared members"
                 )
             }
-            guard let primary = session.followUpOracleGroupState.members.first else {
-                throw ChatToolError.internalError("Context Builder Oracle group completed without Primary state")
-            }
-            let primaryResult = groupReply.result.primary
             try await oracleStore.releaseArtifactReservation(
                 frozenPack.reservation,
                 removeIfUnreferenced: false
@@ -4927,36 +5084,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 await runTestHooks?.afterOracleArtifactReservationReleased?(generation)
             #endif
             try requireCurrentOracleRun(session: session, generation: generation)
-            if primaryResult.status != .completed,
-               let partialResponse = primaryResult.error?.partialResponse,
-               !partialResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            {
-                session.backgroundPlanResponseText = partialResponse
-            }
-            let primaryResponse = try groupReply.requiredCompletedPrimaryResponse()
-            let errors = groupReply.orderedResults.compactMap { result in
-                result.error.map {
-                    "\(OracleViewModel.oracleLabel(laneIndex: result.laneIndex)) failed: \($0.message)"
-                }
-            }
-            let reply = ChatSendReply(
-                chatId: primary.sessionID,
-                shortId: primary.chatID,
-                mode: mode.mcpModeName,
-                response: primaryResponse,
-                errors: errors.isEmpty ? nil : errors,
-                oracleGroup: groupReply
+            let reply = try session.completeOracleGroupReply(
+                groupReply,
+                generation: generation,
+                originWorkspaceID: originWorkspaceID,
+                mode: mode
             )
-            session.isBackgroundPlanGenerating = false
-            session.backgroundPlanResponseText = reply.response
-            session.backgroundPlanReasoningText = nil
-            session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
-                workspaceID: originWorkspaceID,
-                tabID: tabID,
-                chatID: primary.chatID
-            )
-            session.followUpOracleGroupState.finish(generation: generation)
-            session.followUpOracleGroupTask = nil
             clearPendingBackgroundPlanUIRefresh(for: tabID)
             applyPlanPreview(to: session)
             updateRuntimeBindings(from: session)
@@ -5982,6 +6115,74 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 message: message
             )
         )
+    }
+}
+
+extension ContextBuilderAgentViewModel.TabSession {
+    /// Called only after the runtime settled and artifact reservation release succeeded.
+    /// A failed primary is a group outcome, not a failure to deliver the group.
+    @MainActor
+    func completeOracleGroupReply(
+        _ groupReply: ContextBuilderOracleGroupReply,
+        generation: UInt64,
+        originWorkspaceID: UUID,
+        mode: HeadlessMode
+    ) throws -> ChatSendReply {
+        try Task.checkCancellation()
+        guard followUpOracleGroupState.generation == generation else { throw CancellationError() }
+        guard followUpOracleGroupState.matchesFinalResult(groupReply.result, generation: generation),
+              let primary = followUpOracleGroupState.members.first
+        else {
+            throw ChatToolError.internalError("Context Builder Oracle group result did not match its prepared members")
+        }
+        let primaryResult = groupReply.result.primary
+        let errors = groupReply.orderedResults.compactMap { result in
+            result.error.map {
+                "\(OracleViewModel.oracleLabel(laneIndex: result.laneIndex)) \(result.status.rawValue): \($0.message)"
+            }
+        }
+        let reply = ChatSendReply(
+            chatId: primary.sessionID,
+            shortId: primary.chatID,
+            mode: mode.mcpModeName,
+            response: primaryResult.status == .completed ? primaryResult.response : nil,
+            errors: errors.isEmpty ? nil : errors,
+            oracleGroup: groupReply
+        )
+        isBackgroundPlanGenerating = false
+        backgroundPlanResponseText = reply.response ?? primaryResult.error?.partialResponse
+        backgroundPlanReasoningText = nil
+        backgroundPlanError = primaryResult.status == .completed ? nil :
+            ContextBuilderOraclePrimaryCompletionError.notCompleted(
+                status: primaryResult.status,
+                code: primaryResult.error?.code ?? "oracle_primary_not_completed",
+                message: primaryResult.error?.message ?? "Primary Oracle did not complete successfully."
+            ).localizedDescription
+        generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
+            workspaceID: originWorkspaceID,
+            tabID: tabID,
+            chatID: primary.chatID
+        )
+        followUpOracleGroupState.finish(generation: generation)
+        followUpOracleGroupTask = nil
+        followUpOracleGroupSupervision = nil
+        return reply
+    }
+
+    @MainActor
+    var planStatus: ContextBuilderPlanStatus {
+        if isBackgroundPlanGenerating { return .generating }
+        if let error = backgroundPlanError { return .error(error) }
+        if let route = generatedAnswerRoute {
+            return .ready(route: route, previewText: backgroundPlanResponsePreviewText ?? backgroundPlanResponseText)
+        }
+        return .idle
+    }
+
+    @MainActor
+    var failedAnswerRoute: ContextBuilderGeneratedAnswerRoute? {
+        guard !isBackgroundPlanGenerating, backgroundPlanError != nil else { return nil }
+        return generatedAnswerRoute
     }
 }
 

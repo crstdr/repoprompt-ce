@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptInstrumentation
 import SwiftUI
 
 enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
@@ -780,6 +781,13 @@ class PromptViewModel: ObservableObject {
         fileManager.currentWorkspaceID
     }
 
+    /// The active workspace's execution root, used by demand-scoped OpenCode effort probes on
+    /// the Settings/popover surfaces (the composer's fallback tier). No worktree binding: these
+    /// surfaces edit future configuration and only preview metadata.
+    var activeWorkspaceRootPath: String? {
+        workspaceManager?.activeWorkspace?.repoPaths.first
+    }
+
     private var currentAgentModelsEditingScope: AgentModelsEditingScope {
         guard let workspaceID = currentWorkspaceID,
               settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
@@ -817,6 +825,55 @@ class PromptViewModel: ObservableObject {
             profile,
             contextBuilderWriteIntent: .userInitiated
         )
+    }
+
+    /// Set or clear the Context Builder agent's OpenCode effort pin, persisting the displayed
+    /// agent+model choice atomically so the pin stays eligible in the effective profile.
+    ///
+    /// Guarded write: the captured scope/provider/model must still match the live selection
+    /// resolved from the current effective profile, so a stale menu cannot revert a model changed
+    /// by another surface before this view model's published cache receives its notification.
+    func setContextBuilderModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        expectedProviderID: ACPProviderID,
+        expectedModelRaw: String,
+        expectedScope: AgentModelsEditingScope
+    ) {
+        let scope = currentAgentModelsEditingScope
+        guard scope == expectedScope,
+              let liveSelection = resolvedPersistedContextBuilderSelection(),
+              let providerID = liveSelection.agent.acpProviderID,
+              providerID == expectedProviderID,
+              ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  liveSelection.modelRaw,
+                  providerID: providerID
+              ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  expectedModelRaw,
+                  providerID: providerID
+              )
+        else { return }
+        settingsManager.setAgentModelsContextBuilderModelParameter(
+            selections,
+            agentRaw: liveSelection.agent.rawValue,
+            modelRaw: liveSelection.modelRaw,
+            scope: scope
+        )
+    }
+
+    /// The saved `.thinking` pin value for the current Context Builder selection, if any. The
+    /// chip's saved-state input.
+    var contextBuilderThinkingParameterValueRaw: String? {
+        contextBuilderModelParameters.last { $0.kind == .thinking }?.valueRaw
+    }
+
+    /// The saved OpenCode effort pin for the current Context Builder agent+model selection,
+    /// filtered to the persisted explicit choice's provider + canonical model.
+    var contextBuilderModelParameters: [ACPModelParameterSelection] {
+        currentAgentModelsProfile()
+            .contextBuilderModelParameterSelections(
+                for: contextBuilderAgent,
+                modelRaw: contextBuilderAgentModelRaw
+            )
     }
 
     private var isSyncingSettings = false
@@ -2217,6 +2274,7 @@ class PromptViewModel: ObservableObject {
     private let settingsManager: SettingsManaging
     private let storedPromptPersistence: any StoredPromptPersistenceServing
     private let promptClipboardPasteboard: NSPasteboard
+    private let perfRecorder: any AgentModePerfRecording
 
     #if DEBUG
         var clipboardContentBuilderOverrideForTesting: (() async -> String?)?
@@ -2230,7 +2288,9 @@ class PromptViewModel: ObservableObject {
         windowID: Int,
         settingsManager: SettingsManaging,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
-        promptClipboardPasteboard: NSPasteboard = .general
+        promptClipboardPasteboard: NSPasteboard = .general,
+        refreshAvailableModelsOnInit: Bool = true,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2240,6 +2300,7 @@ class PromptViewModel: ObservableObject {
         self.settingsManager = settingsManager
         self.storedPromptPersistence = storedPromptPersistence ?? StoredPromptPersistenceService()
         self.promptClipboardPasteboard = promptClipboardPasteboard
+        self.perfRecorder = perfRecorder
         codeMapsGloballyDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
 
         // Removed usage of workspaceManager to load an initial prompt
@@ -2252,8 +2313,10 @@ class PromptViewModel: ObservableObject {
         loadStoredPrompts()
         updateFileTree()
 
-        Task {
-            await self.refreshAvailableModels()
+        if refreshAvailableModelsOnInit {
+            Task {
+                await self.refreshAvailableModels()
+            }
         }
 
         syncSettingsFromSettingsManager()
@@ -2606,7 +2669,7 @@ class PromptViewModel: ObservableObject {
         let issues = await notifyComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
         #if DEBUG
             for tabID in tabIDs {
-                AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
+                perfRecorder.markSidebarDeleteFullCleanupComplete(
                     tabID: tabID,
                     source: "PromptViewModel.runPostProjectionComposeTabCleanup",
                     fields: ["reason": String(describing: reason)]
@@ -3851,12 +3914,16 @@ class PromptViewModel: ObservableObject {
     func stashComposeTabs(
         withIDs ids: Set<UUID>,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        postPreflightValidation: (@MainActor () -> Bool)? = nil,
+        expandCascade: Bool = true,
         onProjectionRemovalCommitted: ComposeTabsProjectionRemovalCallback? = nil
     ) async -> ComposeTabMutationReport {
         await removeComposeTabs(
             withIDs: ids,
             reason: .stash,
+            expandCascade: expandCascade,
             isMutationContextCurrent: isMutationContextCurrent,
+            postPreflightValidation: postPreflightValidation,
             onProjectionRemovalCommitted: onProjectionRemovalCommitted
         )
     }
@@ -4119,7 +4186,7 @@ class PromptViewModel: ObservableObject {
             onProjectionRemovalCommitted?(tabsBeingClosed)
             #if DEBUG
                 for tabID in tabsBeingClosed {
-                    AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
+                    perfRecorder.markSidebarDeleteVisibleRemoved(
                         tabID: tabID,
                         source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
                         fields: ["reason": String(describing: reason)]
@@ -4176,7 +4243,7 @@ class PromptViewModel: ObservableObject {
         onProjectionRemovalCommitted?(tabsBeingClosed)
         #if DEBUG
             for tabID in tabsBeingClosed {
-                AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
+                perfRecorder.markSidebarDeleteVisibleRemoved(
                     tabID: tabID,
                     source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
                     fields: ["reason": String(describing: reason)]
@@ -4613,6 +4680,9 @@ class PromptViewModel: ObservableObject {
             let tabID = manager.workspaces[index].composeTabs[tabIndex].id
             guard tabIDs.contains(tabID), manager.workspaces[index].composeTabs[tabIndex].isPinned != pinned else { continue }
             manager.workspaces[index].composeTabs[tabIndex].isPinned = pinned
+            if !pinned {
+                manager.workspaces[index].composeTabs[tabIndex].pinnedOrder = nil
+            }
             updatedTabIDs.insert(tabID)
         }
         guard !updatedTabIDs.isEmpty else {
@@ -4622,6 +4692,41 @@ class PromptViewModel: ObservableObject {
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         return ComposeTabPinMutationReport(updatedTabIDs: updatedTabIDs, contextRejected: false)
+    }
+
+    /// Assigns an explicit order to the supplied pinned tabs in one workspace mutation.
+    /// The caller validates the complete Agent-session pin set before invoking this method.
+    @discardableResult
+    @MainActor
+    func setPinnedComposeTabOrder(
+        _ orderedTabIDs: [UUID],
+        workspaceID: UUID
+    ) -> Bool {
+        guard let manager = workspaceManager,
+              let workspace = manager.activeWorkspace,
+              workspace.id == workspaceID,
+              let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+              Set(orderedTabIDs).count == orderedTabIDs.count
+        else { return false }
+
+        let rankByTabID = Dictionary(uniqueKeysWithValues: orderedTabIDs.enumerated().map { ($0.element, $0.offset) })
+        let pinnedIDs = Set(manager.workspaces[index].composeTabs.filter(\.isPinned).map(\.id))
+        guard Set(orderedTabIDs).isSubset(of: pinnedIDs) else { return false }
+
+        var changed = false
+        for tabIndex in manager.workspaces[index].composeTabs.indices {
+            let tabID = manager.workspaces[index].composeTabs[tabIndex].id
+            guard let rank = rankByTabID[tabID] else { continue }
+            if manager.workspaces[index].composeTabs[tabIndex].pinnedOrder != rank {
+                manager.workspaces[index].composeTabs[tabIndex].pinnedOrder = rank
+                changed = true
+            }
+        }
+        guard changed else { return true }
+        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        manager.markWorkspaceDirty()
+        manager.pollAndSaveState()
+        return true
     }
 
     @MainActor
@@ -6470,6 +6575,8 @@ class PromptViewModel: ObservableObject {
             return api.isCursorConnected
         case .grokBuild:
             return api.isGrokBuildConnected
+        case .devin:
+            return DevinRuntimeLocator.isInstalledSync()
         }
     }
 

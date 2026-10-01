@@ -3,6 +3,8 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSecureStorage
+import RepoPromptWorkspaceCore
 import XCTest
 
 final class MCPReadMutationPathContractTests: XCTestCase {
@@ -2898,6 +2900,27 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             includingPropertiesForKeys: nil
         )
         XCTAssertFalse(contents.contains { $0.lastPathComponent.hasPrefix(".repoprompt.create.") })
+    }
+
+    @MainActor
+    func testCodeStructureSettlementNoticeTombstoneRejectsDelayedPresentationAndOldClear() async throws {
+        let root = try makeTemporaryDirectory(name: "CodeStructureSettlementNoticeTombstone")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let (server, _) = try makeInProcessMCPFileActionsServer(store: store, root: root)
+
+        server.clearCodeStructureSettlementLimitNotice(generation: 41)
+        server.presentCodeStructureSettlementLimitNotice(generation: 41)
+        XCTAssertNil(server.codeStructureSettlementLimitNotice)
+
+        server.presentCodeStructureSettlementLimitNotice(generation: 42)
+        XCTAssertEqual(server.codeStructureSettlementLimitNotice?.generation, 42)
+        server.clearCodeStructureSettlementLimitNotice(generation: 41)
+        XCTAssertEqual(server.codeStructureSettlementLimitNotice?.generation, 42)
+
+        server.clearCodeStructureSettlementLimitNotice(generation: 42)
+        XCTAssertNil(server.codeStructureSettlementLimitNotice)
     }
 
     @MainActor

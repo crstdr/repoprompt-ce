@@ -3,6 +3,52 @@ import Foundation
 import XCTest
 
 final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
+    func testClaudeCodeCatalogExposesOpus55AcrossAgentSelection() {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: false,
+            openCodeAvailable: false
+        )
+        let options = AgentModelCatalog.options(for: .claudeCode, availability: availability)
+        let opus55Options = options.filter { $0.rawValue.hasPrefix("claude-opus-5-5:") }
+
+        XCTAssertEqual(
+            opus55Options.map(\.rawValue),
+            [
+                "claude-opus-5-5:low",
+                "claude-opus-5-5:medium",
+                "claude-opus-5-5:high",
+                "claude-opus-5-5:xhigh",
+                "claude-opus-5-5:max"
+            ]
+        )
+        XCTAssertEqual(opus55Options.first?.displayName, "Opus 5.5 Low")
+        XCTAssertTrue(AgentModelCatalog.isValid(
+            rawModel: "claude-opus-5-5:xhigh",
+            for: .claudeCode,
+            availability: availability
+        ))
+        XCTAssertTrue(AgentModel.modelsForAgent(.claudeCode).contains(.claudeOpus55))
+    }
+
+    func testClaudeCodeCatalogExposesSonnet55AndRestrictedMythos51() {
+        let availability = AgentModelCatalog.AvailabilityContext.current
+        for raw in ["claude-sonnet-5-5:xhigh", "claude-sonnet-5-5:max", "claude-mythos-5-1:high"] {
+            XCTAssertTrue(
+                AgentModelCatalog.isValid(rawModel: raw, for: .claudeCode, availability: availability),
+                raw
+            )
+        }
+        let claudeModels = AgentModel.modelsForAgent(.claudeCode)
+        XCTAssertTrue(claudeModels.contains(.claudeSonnet55))
+        XCTAssertTrue(claudeModels.contains(.claudeMythos51))
+        XCTAssertEqual(AgentModel.claudeSonnet55.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(AgentModel.claudeSonnet55.discoveryTags, [.balanced, .engineering, .extendedContext])
+        // The restricted tier is selectable but never a recommendation target.
+        XCTAssertEqual(AgentModel.claudeMythos51.discoveryTags, [])
+        XCTAssertEqual(AgentModel.resolvedModel(forRaw: "claude-sonnet-5-5:high", agentKind: .claudeCode), .claudeSonnet55)
+    }
+
     func testBridgeRuntimeSmokeMapsPluginIDsDiscoveryRuntimeAndHeadlessAdapters() throws {
         let cases: [(AgentProviderKind, String)] = [
             (.claudeCode, "claude-code"),

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 struct AgentSessionSidebarSnapshot: Equatable {
     var searchText: String
@@ -26,6 +27,7 @@ struct AgentSessionSidebarSnapshot: Equatable {
 
 @MainActor
 final class AgentSessionSidebarUIStore: ObservableObject {
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot = AgentSessionSidebarSnapshot(
         searchText: "",
         visibleSessionCount: AgentModeViewModel.sessionSidebarPageSize,
@@ -193,7 +195,16 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             next.collapsedThreadKeys.remove(key)
         }
         next.defaultCollapsedThreadKeysHandled.insert(key)
-        _ = publish(next, eventName: "sessionSidebar.threadCollapse", force: false)
+        // Thread collapse is presentation-only: `sidebarRowsApplyingThreadCollapse`
+        // applies it to already-built rows, and `build()` never reads collapse
+        // state. The projection cache key carries the whole snapshot, so the
+        // collapsed list still re-projects without rebuilding rows.
+        _ = publish(
+            next,
+            eventName: "sessionSidebar.threadCollapse",
+            force: false,
+            affectsRowContent: false
+        )
     }
 
     func toggleThreadCollapse(_ key: AgentSidebarThreadKey) {
@@ -203,14 +214,24 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     func clearCollapsedThreads() {
         var next = snapshot
         next.collapsedThreadKeys.removeAll()
-        _ = publish(next, eventName: "sessionSidebar.threadCollapse.clear", force: false)
+        _ = publish(
+            next,
+            eventName: "sessionSidebar.threadCollapse.clear",
+            force: false,
+            affectsRowContent: false
+        )
     }
 
     func expandAllSidebarThreads(eligibleKeys: [AgentSidebarThreadKey]) {
         var next = snapshot
         next.collapsedThreadKeys.removeAll()
         next.defaultCollapsedThreadKeysHandled.formUnion(eligibleKeys)
-        _ = publish(next, eventName: "sessionSidebar.threadCollapse.expandAll", force: false)
+        _ = publish(
+            next,
+            eventName: "sessionSidebar.threadCollapse.expandAll",
+            force: false,
+            affectsRowContent: false
+        )
     }
 
     func seedDefaultCollapsedThreads(eligibleKeys: [AgentSidebarThreadKey]) {
@@ -219,7 +240,12 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         var next = snapshot
         next.collapsedThreadKeys.formUnion(newKeys)
         next.defaultCollapsedThreadKeysHandled.formUnion(newKeys)
-        _ = publish(next, eventName: "sessionSidebar.threadCollapse.seedDefaults", force: false)
+        _ = publish(
+            next,
+            eventName: "sessionSidebar.threadCollapse.seedDefaults",
+            force: false,
+            affectsRowContent: false
+        )
     }
 
     // MARK: - Run-state attention
@@ -261,7 +287,14 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         var next = snapshot
         next.attentionRunStateByTabID[tabID] = state
         next.attentionMarkedAtByTabID[tabID] = markedAt
-        return publish(next, eventName: "sessionSidebar.attention.mark", force: false)
+        // Attention badges are read by the row view and by the collapsed-descendant
+        // count in `sidebarRowsApplyingThreadCollapse`, both downstream of `build()`.
+        return publish(
+            next,
+            eventName: "sessionSidebar.attention.mark",
+            force: false,
+            affectsRowContent: false
+        )
     }
 
     /// Clear the unseen-attention badge for a single tab.
@@ -271,7 +304,12 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         var next = snapshot
         next.attentionRunStateByTabID.removeValue(forKey: tabID)
         next.attentionMarkedAtByTabID.removeValue(forKey: tabID)
-        return publish(next, eventName: "sessionSidebar.attention.clear", force: false)
+        return publish(
+            next,
+            eventName: "sessionSidebar.attention.clear",
+            force: false,
+            affectsRowContent: false
+        )
     }
 
     /// Clear attention for a batch of tabs (e.g. closing tabs).
@@ -289,18 +327,31 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             }
         }
         guard changed else { return false }
-        return publish(next, eventName: "sessionSidebar.attention.clearBatch", force: false)
+        return publish(
+            next,
+            eventName: "sessionSidebar.attention.clearBatch",
+            force: false,
+            affectsRowContent: false
+        )
     }
 
+    /// Forced republish used by `syncSidebarUIState(refresh:reason:)` after its
+    /// content fingerprint has already proven that sidebar-visible content
+    /// changed. This is the one path that legitimately invalidates row content.
     func refresh() {
-        _ = publish(snapshot, eventName: "sessionSidebar.refresh", force: true)
+        _ = publish(
+            snapshot,
+            eventName: "sessionSidebar.refresh",
+            force: true,
+            affectsRowContent: true
+        )
     }
 
     private func publishSelection(_ next: AgentSidebarSelectionState, eventName: String) {
         guard next != selectionState else { return }
         selectionState = next
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 eventName,
                 published: true,
                 details: [
@@ -330,17 +381,25 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     /// Publishes the next snapshot if it differs from the current one (or if
     /// `force` is true). Returns whether a new revision was emitted so callers
     /// can fall back to their own refresh path when nothing changed.
+    ///
+    /// `affectsRowContent` is intentionally required rather than defaulted.
+    /// `rowContentRevision` is the only content term of
+    /// `SidebarSessionRowsCacheKey`, so bumping it discards every built row and
+    /// forces a full O(sessions) rebuild. A permissive default previously made
+    /// over-invalidation the accidental path for presentation-only state such as
+    /// thread collapse and attention badges; requiring the argument forces each
+    /// new call site to decide deliberately.
     @discardableResult
     private func publish(
         _ proposedSnapshot: AgentSessionSidebarSnapshot,
         eventName: String,
         force: Bool,
-        affectsRowContent: Bool = true
+        affectsRowContent: Bool
     ) -> Bool {
         var next = proposedSnapshot
         guard force || next != snapshot else {
             #if DEBUG
-                AgentModePerfDiagnostics.recordStoreUpdate("sessionSidebar", published: false)
+                perfRecorder.recordStoreUpdate("sessionSidebar", published: false)
             #endif
             return false
         }
@@ -348,7 +407,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         if affectsRowContent { next.rowContentRevision &+= 1 }
         snapshot = next
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 eventName,
                 published: true,
                 details: [

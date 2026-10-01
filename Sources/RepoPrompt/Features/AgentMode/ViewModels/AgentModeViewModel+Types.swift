@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
 
 struct AgentPersistentSessionBindingIdentity: Equatable, Hashable {
     let tabID: UUID
@@ -266,6 +267,7 @@ extension AgentModeViewModel {
         let normalizedName: String
         let activeAgentSessionID: UUID?
         let isPinned: Bool
+        let pinnedOrder: Int?
         let lastModified: Date
     }
 
@@ -489,6 +491,11 @@ extension AgentModeViewModel {
         func containsArgument(_ name: String) -> Bool {
             suppliedArgumentNames.contains(name)
         }
+    }
+
+    enum MCPSessionCreationKind {
+        case mcpControlled
+        case oversightLane(creatorSessionID: UUID)
     }
 
     struct MCPSessionTarget: Equatable {
@@ -853,6 +860,7 @@ extension AgentModeViewModel {
         let sessionID: UUID?
         let canStash: Bool
         let parentSessionID: UUID?
+        let createdByOverseerSessionID: UUID?
         let depth: Int
         let isMCPControlled: Bool
         /// Bound-worktree visual identity for this session (Item 10). Nil when
@@ -873,7 +881,12 @@ extension AgentModeViewModel {
         /// completing or needing approval still gets a visible signal.
         let hiddenThreadDescendantAttentionCount: Int
         let threadActivityDate: Date?
-        let searchFields: AgentSessionSearchFields
+        /// Deferred search-field inputs. Rows intentionally store the raw source
+        /// rather than normalized `AgentSessionSearchFields` so ordinary sidebar
+        /// rebuilds never pay ICU folding cost for a search box that is empty.
+        /// Use `makeSearchFields()` (or the view model's memoized accessor) to
+        /// materialize fields when a query is actually active.
+        let searchFieldSource: AgentSessionSearchFieldSource
 
         init(
             id: UUID,
@@ -885,6 +898,7 @@ extension AgentModeViewModel {
             sessionID: UUID?,
             canStash: Bool = false,
             parentSessionID: UUID?,
+            createdByOverseerSessionID: UUID? = nil,
             depth: Int,
             isMCPControlled: Bool,
             worktree: AgentWorktreeIndicator? = nil,
@@ -895,7 +909,7 @@ extension AgentModeViewModel {
             hiddenThreadDescendantCount: Int = 0,
             hiddenThreadDescendantAttentionCount: Int = 0,
             threadActivityDate: Date? = nil,
-            searchFields: AgentSessionSearchFields = .empty
+            searchFieldSource: AgentSessionSearchFieldSource = .empty
         ) {
             self.id = id
             self.tabID = tabID
@@ -906,6 +920,7 @@ extension AgentModeViewModel {
             self.sessionID = sessionID
             self.canStash = canStash
             self.parentSessionID = parentSessionID
+            self.createdByOverseerSessionID = createdByOverseerSessionID
             self.depth = depth
             self.isMCPControlled = isMCPControlled
             self.worktree = worktree
@@ -916,7 +931,16 @@ extension AgentModeViewModel {
             self.hiddenThreadDescendantCount = hiddenThreadDescendantCount
             self.hiddenThreadDescendantAttentionCount = hiddenThreadDescendantAttentionCount
             self.threadActivityDate = threadActivityDate
-            self.searchFields = searchFields
+            self.searchFieldSource = searchFieldSource
+        }
+
+        /// Materializes normalized search fields for this row.
+        ///
+        /// Callers on a repeated path should prefer
+        /// `AgentModeViewModel.sidebarSearchFields(for:)`, which memoizes the
+        /// result on the main actor.
+        func makeSearchFields() -> AgentSessionSearchFields {
+            AgentModeSidebarSessionBuilder.searchFields(source: searchFieldSource)
         }
     }
 

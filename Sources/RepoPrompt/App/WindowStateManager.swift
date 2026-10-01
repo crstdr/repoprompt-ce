@@ -239,6 +239,7 @@ final class WorkspaceActivityCoordinator {
     private var workspaceManagersByOwnerID: [UUID: WeakWorkspaceManager] = [:]
     private var activationWorkspaceIDByLeaseID: [UUID: UUID] = [:]
     private var deletionLeaseIDByWorkspaceID: [UUID: UUID] = [:]
+    private var laneRetirementClaimIDByWorkspaceID: [UUID: UUID] = [:]
     private let confirmedDeletionTimeout: Duration
 
     init(confirmedDeletionTimeout: Duration = .seconds(15)) {
@@ -254,7 +255,9 @@ final class WorkspaceActivityCoordinator {
     }
 
     func beginActivation(workspaceID: UUID) -> ActivationLease? {
-        guard deletionLeaseIDByWorkspaceID[workspaceID] == nil else { return nil }
+        guard deletionLeaseIDByWorkspaceID[workspaceID] == nil,
+              laneRetirementClaimIDByWorkspaceID[workspaceID] == nil
+        else { return nil }
         let lease = ActivationLease(id: UUID(), workspaceID: workspaceID)
         activationWorkspaceIDByLeaseID[lease.id] = workspaceID
         return lease
@@ -263,6 +266,21 @@ final class WorkspaceActivityCoordinator {
     func endActivation(_ lease: ActivationLease) {
         guard activationWorkspaceIDByLeaseID[lease.id] == lease.workspaceID else { return }
         activationWorkspaceIDByLeaseID.removeValue(forKey: lease.id)
+    }
+
+    func claimLaneRetirement(workspaceID: UUID) -> UUID? {
+        guard deletionLeaseIDByWorkspaceID[workspaceID] == nil,
+              laneRetirementClaimIDByWorkspaceID[workspaceID] == nil,
+              !activationWorkspaceIDByLeaseID.values.contains(workspaceID)
+        else { return nil }
+        let claimID = UUID()
+        laneRetirementClaimIDByWorkspaceID[workspaceID] = claimID
+        return claimID
+    }
+
+    func releaseLaneRetirement(workspaceID: UUID, claimID: UUID) {
+        guard laneRetirementClaimIDByWorkspaceID[workspaceID] == claimID else { return }
+        laneRetirementClaimIDByWorkspaceID.removeValue(forKey: workspaceID)
     }
 
     func claimDeletion(workspaceIDs: Set<UUID>) -> DeletionClaim {
@@ -282,6 +300,8 @@ final class WorkspaceActivityCoordinator {
                 blockedReasonsByWorkspaceID[workspaceID] = "Workspace is being activated in another window."
             } else if deletionLeaseIDByWorkspaceID[workspaceID] != nil {
                 blockedReasonsByWorkspaceID[workspaceID] = "Workspace deletion is already in progress."
+            } else if laneRetirementClaimIDByWorkspaceID[workspaceID] != nil {
+                blockedReasonsByWorkspaceID[workspaceID] = "A lane is being retired in this workspace."
             } else {
                 deletionLeaseIDByWorkspaceID[workspaceID] = leaseID
                 claimedWorkspaceIDs.insert(workspaceID)
@@ -314,6 +334,8 @@ final class WorkspaceActivityCoordinator {
         for workspaceID in workspaceIDs {
             if deletionLeaseIDByWorkspaceID[workspaceID] != nil {
                 failures[workspaceID] = "Workspace deletion is already in progress."
+            } else if laneRetirementClaimIDByWorkspaceID[workspaceID] != nil {
+                failures[workspaceID] = "A lane is being retired in this workspace."
             } else {
                 deletionLeaseIDByWorkspaceID[workspaceID] = leaseID
                 claimed.insert(workspaceID)
@@ -509,6 +531,9 @@ class WindowStatesManager: ObservableObject {
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
 
+    /// App-global bundled router registry plus shared backend credential/readiness authorities.
+    let modelRouterRuntime = AgentTaskRouterRuntime()
+
     /// Serializes workspace activation and deletion claims across every app window.
     let workspaceActivityCoordinator = WorkspaceActivityCoordinator()
 
@@ -629,7 +654,7 @@ class WindowStatesManager: ObservableObject {
         let mode = AppLaunchConfiguration.current.agentSessionOversightPersistenceMode(
             autoRestoreWorkspacesEnabled: autoRestoreWorkspacesEnabled
         )
-        let store = AgentSessionOversightIntentStore.production(mode: mode)
+        let store = AgentSessionOversightIntentStore.production(mode: mode, restorePerfRecorder: AppWorkspaceRestorePerfRecorder())
         Task { @MainActor in
             await AgentSessionLinkRuntimeBridge.shared.bootstrapIntentStore(store)
         }
@@ -1059,6 +1084,8 @@ class WindowStatesManager: ObservableObject {
         // Eager revocation for both endpoints of every link this window held. Operation-time identity
         // revalidation still catches a missed hook, but the surviving endpoint should learn now.
         invalidateAgentSessionLinks(forClosedWindowID: state.windowID)
+        // Retract every attention notification this window owned; its sessions are gone.
+        NotificationService.shared.agentNotifications.removeWindow(state.windowID)
         explicitlyClosingWindowIDs.remove(state.windowID)
         // A window that closes mid-restore must not leave the persistence gate held.
         restorePersistenceGate.finishRestoringWindow(state.windowID)
@@ -1271,6 +1298,7 @@ class WindowStatesManager: ObservableObject {
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
+            self.modelRouterRuntime.cancelAll()
             // Cancel any pending focus/workspace change notifications that might trigger updates
             self.cancellablesDuringTermination()
         }

@@ -7,6 +7,8 @@
 
 import AppKit
 import Combine
+import RepoPromptFoundation
+import RepoPromptSecureStorage
 import Sparkle
 import SwiftUI
 
@@ -407,7 +409,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
     @discardableResult
     nonisolated static func performPassiveAppcastCheck(
-        check: () async -> Bool,
+        check: @MainActor () async -> Bool,
         now: Date = Date(),
         defaults: UserDefaults = .standard
     ) async -> Bool {

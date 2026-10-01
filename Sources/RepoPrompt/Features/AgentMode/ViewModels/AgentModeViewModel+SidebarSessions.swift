@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 @MainActor
 extension AgentModeViewModel {
@@ -267,7 +268,7 @@ extension AgentModeViewModel {
         lookup: ArchivedSidebarSessionLookup
     ) -> [StashedTab] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let trimmedSearch = searchText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let query = AgentSessionSearchQuery.parse(trimmedSearch)
@@ -281,7 +282,7 @@ extension AgentModeViewModel {
             )
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.filteredArchivedTabs",
                 startMS: startMS,
                 fields: [
@@ -360,7 +361,7 @@ extension AgentModeViewModel {
         dateInfoByID: [UUID: SidebarSessionDateInfo]
     ) -> [StashedTab] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let sortedTabs = filteredTabs.sorted { lhs, rhs in
             if lhs.tab.isPinned != rhs.tab.isPinned {
@@ -386,7 +387,7 @@ extension AgentModeViewModel {
             } else {
                 fields["preFiltered"] = "true"
             }
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.sortedArchivedTabs",
                 startMS: startMS,
                 fields: fields
@@ -494,7 +495,8 @@ extension AgentModeViewModel {
             sessionListSortDates: ownerValidatedSessionListSortDates,
             sessionListCacheReady: ownerValidatedSessionListCacheReady,
             sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
-            mcpControlledTabIDs: mcpControlledTabIDs
+            mcpControlledTabIDs: mcpControlledTabIDs,
+            perfRecorder: perfRecorder
         ).build()
         if includeComposeTabsWithoutAgentSessions {
             agentChatsSidebarRowsCache = (cacheKey, rows)
@@ -727,13 +729,17 @@ extension AgentModeViewModel {
         diagnosticSource: String
     ) -> [SidebarSession] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
         let effectiveSearchText = searchText
         let searchTrimmed = effectiveSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let result: [SidebarSession]
         if searchTrimmed.isEmpty {
+            // Search normalization is demand-driven. Release the last active
+            // query's materialized fields when search deactivates so a large
+            // workspace does not retain them indefinitely.
+            sidebarSearchFieldsMemo.removeAll(keepingCapacity: true)
             result = sidebarRowsApplyingThreadCollapse(
                 sortedSessions,
                 currentTabID: currentTabID,
@@ -751,14 +757,15 @@ extension AgentModeViewModel {
             )
 
             let query = AgentSessionSearchQuery.parse(searchTrimmed)
+            let materializedSearchFields = sidebarSearchFields(for: sortedSessions)
 
             // Collect direct matches and include their ancestor chain so matching
             // child sessions remain visible in threaded context. Do not inject
             // the active session unless it is an actual match; otherwise sidebar
             // search presents false positives for arbitrary queries.
             var matchedIDs = Set<UUID>()
-            for session in sortedSessions {
-                if AgentSessionSearchMatcher.matches(query: query, fields: session.searchFields) {
+            for (session, fields) in zip(sortedSessions, materializedSearchFields) {
+                if AgentSessionSearchMatcher.matches(query: query, fields: fields) {
                     matchedIDs.insert(session.id)
                     var cursor = session.parentSessionID
                     var visitedSessionIDs: Set<UUID> = []
@@ -781,12 +788,12 @@ extension AgentModeViewModel {
             )
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.filteredSessions",
                 startMS: startMS,
                 fields: [
                     "canonicalCount": String(sortedSessions.count),
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
+                    "currentTabID": perfRecorder.shortID(currentTabID),
                     "filteredCount": String(result.count),
                     "inputTabCount": String(inputTabCount),
                     "searchActive": String(!searchTrimmed.isEmpty),
@@ -804,14 +811,14 @@ extension AgentModeViewModel {
         diagnosticSource: String
     ) -> [SidebarSession] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let isSearching = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
         let collapsedThreadKeys = ui.sessionSidebar.snapshot.collapsedThreadKeys
         guard !rows.isEmpty else {
             #if DEBUG
-                AgentModePerfDiagnostics.durationEvent(
+                perfRecorder.durationEvent(
                     "sidebar.threadCollapse",
                     startMS: startMS,
                     fields: [
@@ -911,7 +918,7 @@ extension AgentModeViewModel {
             }
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.threadCollapse",
                 startMS: startMS,
                 fields: [
@@ -926,6 +933,62 @@ extension AgentModeViewModel {
             )
         #endif
         return displayedRows
+    }
+
+    /// Materializes normalized search fields for `rows`, reusing previously
+    /// materialized values whose source inputs are unchanged.
+    ///
+    /// Returns one entry per element of `rows`, positionally aligned, so callers
+    /// index the result by position rather than by row id. That keeps the lookup
+    /// total: there is no missing-key case, and therefore no uncounted fallback
+    /// that could bypass the memo and under-report the materialization counter.
+    ///
+    /// The memo is owned by this view model (main actor) and is replaced by the
+    /// current row set on every call, so it cannot outgrow the visible sidebar or
+    /// retain fields for rows that no longer exist.
+    func sidebarSearchFields(for rows: [SidebarSession]) -> [AgentSessionSearchFields] {
+        #if DEBUG
+            let startMS = perfRecorder.timestampMSIfEnabled()
+        #endif
+        var refreshed: [UUID: (source: AgentSessionSearchFieldSource, fields: AgentSessionSearchFields)] = [:]
+        refreshed.reserveCapacity(rows.count)
+        var result: [AgentSessionSearchFields] = []
+        result.reserveCapacity(rows.count)
+        var materializedCount = 0
+        for row in rows {
+            if let cached = sidebarSearchFieldsMemo[row.id], cached.source == row.searchFieldSource {
+                refreshed[row.id] = cached
+                result.append(cached.fields)
+                continue
+            }
+            let fields = row.makeSearchFields()
+            materializedCount += 1
+            #if DEBUG
+                test_sidebarSearchFieldsMaterializationCount &+= 1
+            #endif
+            refreshed[row.id] = (row.searchFieldSource, fields)
+            result.append(fields)
+        }
+        sidebarSearchFieldsMemo = refreshed
+        #if DEBUG
+            // Emitted only on the active-search path. Absence of this event while
+            // the sidebar is in use is the live signal that an inactive search box
+            // normalized nothing. Counts only — no titles, paths, or ids.
+            perfRecorder.increment(
+                "sidebar.searchFields.materialized",
+                by: materializedCount
+            )
+            perfRecorder.durationEvent(
+                "sidebar.searchFieldsMaterialize",
+                startMS: startMS,
+                fields: [
+                    "rowCount": String(rows.count),
+                    "materializedCount": String(materializedCount),
+                    "reusedCount": String(rows.count - materializedCount)
+                ]
+            )
+        #endif
+        return result
     }
 
     private func sidebarThreadActivityDate(for row: SidebarSession) -> Date {
@@ -951,6 +1014,7 @@ extension AgentModeViewModel {
             sessionID: row.sessionID,
             canStash: row.canStash,
             parentSessionID: row.parentSessionID,
+            createdByOverseerSessionID: row.createdByOverseerSessionID,
             depth: row.depth,
             isMCPControlled: row.isMCPControlled,
             worktree: row.worktree,
@@ -961,7 +1025,7 @@ extension AgentModeViewModel {
             hiddenThreadDescendantCount: hiddenThreadDescendantCount,
             hiddenThreadDescendantAttentionCount: hiddenThreadDescendantAttentionCount,
             threadActivityDate: threadActivityDate,
-            searchFields: row.searchFields
+            searchFieldSource: row.searchFieldSource
         )
     }
 
@@ -971,7 +1035,7 @@ extension AgentModeViewModel {
         visibleSessionCount: Int? = nil
     ) -> Int {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let requestedVisibleCount = max(0, visibleSessionCount ?? sessionSidebarVisibleSessionCount)
         let activeIndex: Int?
@@ -986,12 +1050,12 @@ extension AgentModeViewModel {
             result = min(filteredSessions.count, requestedVisibleCount)
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.visibleCount.effective",
                 startMS: startMS,
                 fields: [
                     "activeIndex": activeIndex.map(String.init) ?? "n/a",
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
+                    "currentTabID": perfRecorder.shortID(currentTabID),
                     "effectiveVisibleCount": String(result),
                     "expandedForActive": String(result > requestedVisibleCount),
                     "filteredCount": String(filteredSessions.count),

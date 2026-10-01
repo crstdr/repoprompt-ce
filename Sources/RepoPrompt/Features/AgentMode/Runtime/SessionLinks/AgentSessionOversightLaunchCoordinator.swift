@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 // Restores durable oversight intents into live links after launch and window restore.
 //
@@ -9,7 +10,10 @@ import RepoPromptDomainRuntime
 // source and `AgentSessionDeletionRegistry` tells it which sessions are gone for good. Invariants:
 // an intent is replayed against exact restoration-ready incarnations only, never against a UUID
 // match alone; restore never starts a run, publishes prompt inventory, or arms an Auto-wake by
-// itself — the bootstrap after restore goes through the ordinary publication path.
+// itself — the bootstrap after restore goes through the ordinary publication path. The only
+// hydration it causes is a one-shot, passive transcript load of the background tabs a saved pair
+// is actually waiting on, so saved oversight comes back at launch instead of only after the user
+// happens to open every endpoint's tab.
 
 // MARK: - Restore topology
 
@@ -131,6 +135,11 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
 
     /// Reports an aggregate, identifier-free warning for the persistence surface.
     func launchCoordinatorReportWarning(id: String, message: String)
+
+    /// Asks the host to passively load the persisted state of these described-but-unhydrated
+    /// sessions, so a waiting launch entry can reach restoration readiness without the user opening
+    /// each tab. Fire-and-forget: readiness changes re-enter the pass through the ordinary signal.
+    func launchCoordinatorRequestHydration(sessionIDs: Set<UUID>)
 }
 
 // MARK: - Coordinator
@@ -143,15 +152,23 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
 ///   the user creates later is persisted and activated by the ordinary interactive path.
 /// - It is *reason-aware*: it distinguishes "the window topology we expected was fully observed" from
 ///   "we gave up waiting", and only the former lets an absent session be classified as gone.
-/// - It is *not a controller*: there is no timer, no polling, no debounce, no eager hydration, and no
-///   perpetual desired-state enforcement. A dirty flag is drained by one retained MainActor task, and
-///   an entry that has nothing to do simply waits for process lifetime.
+/// - It is *not a controller*: there is no timer, no polling, no debounce, and no perpetual
+///   desired-state enforcement. A dirty flag is drained by one retained MainActor task, and an entry
+///   that has nothing to do simply waits for process lifetime. The one proactive step is a single
+///   passive load request per saved endpoint whose background tab is described but not hydrated —
+///   without it a saved pair whose tabs the user never reopens would never be restored at all.
 ///
 /// Each automatic entry may call reservation **at most once**. Later lifecycle revocation terminalizes
 /// it permanently rather than requeueing it: a user who watched oversight end must not have it
 /// silently reappear.
 @MainActor
 final class AgentSessionOversightLaunchCoordinator {
+    private var restorePerfRecorder: any WorkspaceRestorePerfRecording
+
+    func installRestorePerfRecorder(_ recorder: any WorkspaceRestorePerfRecording) {
+        restorePerfRecorder = recorder
+    }
+
     // MARK: Entry state
 
     enum EntryState: Equatable {
@@ -219,9 +236,16 @@ final class AgentSessionOversightLaunchCoordinator {
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
+    /// Sessions this launch already asked the host to hydrate. One request per session per launch:
+    /// a load that ends terminal must not be retried in a loop, and the pass re-runs on every event.
+    private var hydrationRequestedSessionIDs: Set<UUID> = []
 
-    init(delegate: (any AgentSessionOversightLaunchCoordinatorDelegate)? = nil) {
+    init(
+        delegate: (any AgentSessionOversightLaunchCoordinatorDelegate)? = nil,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
+    ) {
         self.delegate = delegate
+        self.restorePerfRecorder = restorePerfRecorder
     }
 
     func attach(delegate: any AgentSessionOversightLaunchCoordinatorDelegate) {
@@ -257,7 +281,7 @@ final class AgentSessionOversightLaunchCoordinator {
         guard topology != state else { return }
         topology = state
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.topology",
                 fields: [
                     "state": state.diagnosticLabel,
@@ -431,7 +455,7 @@ final class AgentSessionOversightLaunchCoordinator {
         }
         #if DEBUG
             let stillPending = pendingCleanupCount
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.cleanupRetry",
                 fields: [
                     "attempted": String(attempted),
@@ -464,7 +488,7 @@ final class AgentSessionOversightLaunchCoordinator {
         private func logDiscoveryPendingOnce(_ discovery: [AgentSessionLinkDiscoveryState]) {
             guard !launchPairOrder.isEmpty, !didLogDiscoveryPending else { return }
             didLogDiscoveryPending = true
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.discovery",
                 fields: [
                     "state": "pending",
@@ -491,11 +515,11 @@ final class AgentSessionOversightLaunchCoordinator {
         ) {
             var fields = [
                 "outcome": outcome,
-                "observer": WorkspaceRestorePerfLog.shortID(pair.observerSessionID),
-                "target": WorkspaceRestorePerfLog.shortID(pair.targetSessionID)
+                "observer": restorePerfRecorder.shortID(pair.observerSessionID),
+                "target": restorePerfRecorder.shortID(pair.targetSessionID)
             ]
             if let reason { fields["reason"] = reason }
-            WorkspaceRestorePerfLog.event("oversight.reconcile", fields: fields)
+            restorePerfRecorder.event("oversight.reconcile", fields: fields)
         }
     #endif
 
@@ -507,6 +531,10 @@ final class AgentSessionOversightLaunchCoordinator {
 
     var reservationStartCount: Int {
         entries.values.count { $0.didStartReservation }
+    }
+
+    var requestedHydrationSessionIDs: Set<UUID> {
+        hydrationRequestedSessionIDs
     }
 
     // MARK: Pass
@@ -555,6 +583,11 @@ final class AgentSessionOversightLaunchCoordinator {
             candidatesBySession[candidate.sessionID, default: []].append(candidate)
         }
 
+        requestHydrationForWaitingEntries(
+            descriptorCounts: descriptorCounts,
+            candidatesBySession: candidatesBySession
+        )
+
         for pair in launchPairOrder {
             guard !isFrozen else { return }
             guard let entry = entries[pair] else { continue }
@@ -592,6 +625,56 @@ final class AgentSessionOversightLaunchCoordinator {
                 continue
             }
         }
+    }
+
+    /// Requests a passive load for every endpoint a waiting entry is blocked on only because its
+    /// background tab has not been hydrated yet.
+    ///
+    /// Bounded to the saved pairs' own endpoints, requested at most once per session per launch, and
+    /// only after every restore barrier has cleared (this runs inside the gated pass). A session that
+    /// is not described anywhere, is described more than once, or is being deleted is left alone:
+    /// hydration could not make it restorable, and classification decides its fate as before.
+    private func requestHydrationForWaitingEntries(
+        descriptorCounts: [UUID: Int],
+        candidatesBySession: [UUID: [AgentSessionLinkEndpointCandidate]]
+    ) {
+        guard let delegate else { return }
+        let registry = AgentSessionDeletionRegistry.shared
+        var requested: Set<UUID> = []
+        for pair in launchPairOrder {
+            guard entries[pair]?.state == .waiting else { continue }
+            for sessionID in [pair.observerSessionID, pair.targetSessionID] {
+                guard !hydrationRequestedSessionIDs.contains(sessionID),
+                      !registry.isPermanentlyDeleted(sessionID: sessionID),
+                      !registry.isDeletionInProgress(sessionID: sessionID),
+                      (descriptorCounts[sessionID] ?? 0) == 1
+                else {
+                    continue
+                }
+                let matches = candidatesBySession[sessionID] ?? []
+                let needsHydration = switch matches.count {
+                case 0:
+                    true
+                case 1:
+                    switch matches[0].restorationReadiness {
+                    case .pending, .unbound: true
+                    case .authoritative, .terminal: false
+                    }
+                default:
+                    false
+                }
+                if needsHydration { requested.insert(sessionID) }
+            }
+        }
+        guard !requested.isEmpty else { return }
+        hydrationRequestedSessionIDs.formUnion(requested)
+        #if DEBUG
+            restorePerfRecorder.event(
+                "oversight.hydrationRequested",
+                fields: ["sessions": String(requested.count)]
+            )
+        #endif
+        delegate.launchCoordinatorRequestHydration(sessionIDs: requested)
     }
 
     private enum Disposition {

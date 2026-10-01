@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 /// Background actor that handles all VCS (git/jj) operations off the main thread.
 /// Communicates with `GitViewModel` via `AsyncStream<GitStatusSnapshot>`.
@@ -647,7 +649,7 @@ actor GitStatusActor {
                 scope: scope,
                 selectedAbsolutePaths: selectedAbs,
                 repoURL: repoURL,
-                useCache: !forceRefreshSnapshot
+                allowCachedResult: !forceRefreshSnapshot
             )
             return result.text.isEmpty ? nil : result.text
         } catch {

@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 /// Global, non-window-scoped MCP service for allowlisted RepoPrompt app settings.
 ///
@@ -49,7 +50,7 @@ final class AppSettingsMCPService: Service {
 
                 **Selectors**: `get` accepts exactly one of `key`, `keys`, or `group`. `set` and `options` take one `key`.
 
-                **Groups**: `ui` · `prompt_packaging` · `models` · `context_builder` · `mcp` · `code_maps` · `file_system` · `agent_mode`
+                **Groups**: `ui` · `prompt_packaging` · `models` · `context_builder` · `mcp` · `code_maps` · `file_system` · `agent_mode` · `notifications`
 
                 **Examples**:
                 - `{"op":"list","group":"ui"}`
@@ -65,7 +66,7 @@ final class AppSettingsMCPService: Service {
                 inputSchema: .object(
                     properties: [
                         "op": .string(description: "Operation.", enum: ["list", "get", "set", "options"]),
-                        "group": .string(description: "Settings group.", enum: ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode"]),
+                        "group": .string(description: "Settings group.", enum: ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode", "notifications"]),
                         "key": .string(description: "Allowlisted setting key (required for set/options)."),
                         "keys": .array(description: "Multiple keys (get only).", items: .string()),
                         "value": .anyOf([
@@ -604,7 +605,7 @@ private struct AppSettingDefinition: @unchecked Sendable {
 }
 
 private enum AppSettingsMCPRegistry {
-    static let groups = ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode"]
+    static let groups = ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode", "notifications"]
 
     private static let appearanceModes = ["System", "Light", "Dark"]
     private static let filePathDisplayOptions = ["Full", "Relative"]
@@ -853,6 +854,13 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.globalCodeMapsDisabled()) },
             write: { try $0.setCodeMapsGloballyDisabled(requiredBool(from: $1)) }
         ),
+        boolSetting(
+            key: "code_maps.non_git_enabled",
+            group: "code_maps",
+            description: "Explicit opt-in for Code Maps in non-Git folders. Existing settings without this key remain disabled.",
+            read: { .bool($0.nonGitCodeMapsEnabled) },
+            write: { try $0.setNonGitCodeMapsEnabled(requiredBool(from: $1)) }
+        ),
 
         // Agent Mode behavior. This exposes durable prompt-shaping preferences only;
         // internal provider/runtime toggles remain omitted.
@@ -892,6 +900,22 @@ private enum AppSettingsMCPRegistry {
                     throw MCPError.invalidParams("Invalid provider cleanup action '\(raw)'.")
                 }
                 store.setProviderConversationCleanupAction(action)
+            }
+        ),
+        integerEnumSetting(
+            key: "agent_mode.subagent_default_wait_seconds",
+            group: "agent_mode",
+            label: "Default Subagent Wait",
+            description: "Maximum otherwise-quiet wait for MCP subagent start, wait, and steer-and-wait operations when timeout is omitted. Shorter waits allow more frequent progress checks; longer waits reduce routine model calls.",
+            allowedValues: MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds,
+            read: { .int($0.subagentDefaultWaitSeconds()) },
+            write: { store, value in
+                let seconds = try requiredInt(from: value)
+                guard store.setSubagentDefaultWaitSeconds(seconds) else {
+                    throw MCPError.invalidParams(
+                        "Invalid value for 'agent_mode.subagent_default_wait_seconds'. Allowed values: \(MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds.map(String.init).joined(separator: ", "))."
+                    )
+                }
             }
         ),
 
@@ -947,7 +971,23 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setShowEmptyFolders(requiredBool(from: $1)) },
             afterWrite: fileSystemPreferencesDidChangeHook(key: "file_system.show_empty_folders")
         )
-    ] + debugDefinitions
+    ] + notificationDefinitions + debugDefinitions
+
+    /// Notification preferences. Keys, labels, and descriptions are single-sourced in
+    /// `NotificationSettingDescriptor` so the Settings pane and this surface cannot drift.
+    private static let notificationDefinitions: [AppSettingDefinition] = NotificationSettingDescriptor.all.map { descriptor in
+        boolSetting(
+            key: descriptor.appSettingsKey,
+            group: "notifications",
+            label: descriptor.label,
+            description: descriptor.description,
+            read: { .bool($0.notificationSetting(descriptor)) },
+            write: { store, value in
+                let enabled = try requiredBool(from: value)
+                store.setNotificationSetting(descriptor, enabled)
+            }
+        )
+    }
 
     #if DEBUG
         private static let debugDefinitions: [AppSettingDefinition] = [
@@ -1064,6 +1104,31 @@ private enum AppSettingsMCPRegistry {
             allowedValues: allowedValues,
             read: read,
             validate: { value in try validateEnumString(value, key: key, allowedValues: allowedValues) },
+            write: write,
+            afterWrite: afterWrite
+        )
+    }
+
+    private static func integerEnumSetting(
+        key: String,
+        group: String,
+        label: String? = nil,
+        description: String,
+        allowedValues: [Int],
+        read: @escaping @MainActor (GlobalSettingsStore) -> Value,
+        write: @escaping @MainActor (GlobalSettingsStore, Value) throws -> Void,
+        afterWrite: (@MainActor (GlobalSettingsStore, Value, NotificationCenter) -> Void)? = nil
+    ) -> AppSettingDefinition {
+        let allowedValueStrings = allowedValues.map(String.init)
+        return AppSettingDefinition(
+            key: key,
+            group: group,
+            valueType: .number,
+            label: label,
+            description: description,
+            allowedValues: allowedValueStrings,
+            read: read,
+            validate: { value in try validateEnumInteger(value, key: key, allowedValues: allowedValues) },
             write: write,
             afterWrite: afterWrite
         )
@@ -1227,6 +1292,27 @@ private enum AppSettingsMCPRegistry {
         return .string(raw)
     }
 
+    private static func validateEnumInteger(_ value: Value, key: String, allowedValues: [Int]) throws -> Value {
+        let number: Int
+        switch value {
+        case let .int(int):
+            number = int
+        case let .double(double):
+            guard let exact = Int(exactly: double) else {
+                throw MCPError.invalidParams("Setting '\(key)' requires an integer second value.")
+            }
+            number = exact
+        default:
+            throw MCPError.invalidParams("Setting '\(key)' requires an integer second value.")
+        }
+        guard allowedValues.contains(number) else {
+            throw MCPError.invalidParams(
+                "Invalid value for '\(key)'. Allowed values: \(allowedValues.map(String.init).joined(separator: ", "))."
+            )
+        }
+        return .int(number)
+    }
+
     private static func validateTrimmedString(_ value: Value, key: String, maxLength: Int, allowEmpty: Bool) throws -> Value {
         guard case let .string(raw) = value else {
             throw MCPError.invalidParams("Setting '\(key)' requires a string value.")
@@ -1383,6 +1469,13 @@ private enum AppSettingsMCPRegistry {
         return double
     }
 
+    private static func requiredInt(from value: Value) throws -> Int {
+        guard case let .int(int) = value else {
+            throw MCPError.invalidParams("Expected normalized integer value.")
+        }
+        return int
+    }
+
     private static func stringOrNull(_ value: String?) -> Value {
         guard let value, !value.isEmpty else { return .null }
         return .string(value)
@@ -1417,6 +1510,8 @@ private enum AppSettingsMCPRegistry {
             .openCode
         case .antigravity:
             nil
+        case .devin:
+            .devin
         case .cursor:
             .cursor
         case .grokBuild:
@@ -1443,6 +1538,7 @@ private enum AppSettingsMCPRegistry {
         case .openCode: "openCode"
         case .cursor: "cursor"
         case .grokBuild: "grokBuild"
+        case .devin: "devin"
         }
     }
 

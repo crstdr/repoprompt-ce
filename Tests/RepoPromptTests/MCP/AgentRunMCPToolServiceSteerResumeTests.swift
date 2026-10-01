@@ -24,7 +24,10 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             XCTAssertIdentical(controlledSession, session)
             XCTAssertFalse(controlledSession.isMCPOriginated)
             XCTAssertTrue(controlledSession.mcpFollowUpRunPending)
-            await agentModeVM.prepareMCPWaitTrackingForRunStart(session: controlledSession)
+            await agentModeVM.prepareMCPWaitTrackingForRunStart(
+                session: controlledSession,
+                stopFence: AgentRunStartStopFence(session: controlledSession)
+            )
             let context = try XCTUnwrap(controlledSession.mcpControlContext)
             observedEpoch = try XCTUnwrap(context.currentEpoch)
             controlledSession.runState = .running
@@ -376,7 +379,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in nil },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { _, _, _, _, _, _, _, _, _, _, _ in
+            startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
                 throw MCPError.internalError("startRun should not be used by steer resume tests")
             }
         )

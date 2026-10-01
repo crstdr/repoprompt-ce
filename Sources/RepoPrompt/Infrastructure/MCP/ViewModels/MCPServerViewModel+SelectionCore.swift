@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 extension MCPServerViewModel {
     nonisolated static let codeMapsGloballyDisabledMCPMessage = "Code Maps are globally disabled in Advanced Settings; codemap-only selection modes and get_code_structure are unavailable."
@@ -107,8 +109,18 @@ extension MCPServerViewModel {
 
     @MainActor
     func lookupContext(for context: TabContextSnapshot) async -> WorkspaceLookupContext {
-        if let frozenLookupContext = context.frozenLookupContext {
-            return frozenLookupContext
+        if let authority = context.frozenFileToolAuthority,
+           let workspaceManager
+        {
+            do {
+                try await authority.validate(
+                    workspaceManager: workspaceManager,
+                    store: promptVM.workspaceFileContextStore
+                )
+                return authority.lookupContext
+            } catch {
+                return AgentWorkspaceLookupContextResolver.failClosedLookupContext
+            }
         }
         return await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
             source: AgentWorkspaceLookupContextSource(
@@ -493,11 +505,11 @@ extension MCPServerViewModel {
             switch reason {
             case .unsupportedFileType:
                 .unmapped(terminal: true)
-            case .gitTerminal:
+            case .rootTerminal:
                 .unmapped(terminal: true)
             case let .demandUnavailable(reason):
                 demandUnavailableDisposition(reason)
-            case .rootNotLoaded, .fileNotCataloged, .gitTransient, .busy,
+            case .rootNotLoaded, .fileNotCataloged, .rootTransient, .busy,
                  .rejected, .routeConflict, .registrationFailed, .runtimeFailure,
                  .staleCurrentness, .cancelled:
                 .pending
