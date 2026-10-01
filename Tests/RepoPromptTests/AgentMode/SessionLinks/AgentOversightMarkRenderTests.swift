@@ -215,4 +215,27 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: nil, overseers: 1)))
         XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 1)))
     }
+
+    // MARK: - ID-less rows (option a)
+
+    /// A fresh chat has no session ID until the first send: its context menu still lists both
+    /// Oversee submenus, each containing only the approved disabled reason.
+    func testIDLessRowOffersDisabledOversightSubmenusWithReason() {
+        XCTAssertEqual(
+            AgentOversightUICopy.oversightAvailableAfterFirstMessage,
+            "Available after the first message"
+        )
+
+        var idlessRow = row(role: .none, interactive: false)
+        idlessRow.oversightUnavailableReason = AgentOversightUICopy.oversightAvailableAfterFirstMessage
+        XCTAssertTrue(idlessRow.showsDisabledOversightContextSubmenus)
+
+        // A bound row resolves a live menu — the disabled pair must not appear alongside it.
+        var linkedRow = row(role: .none, interactive: true)
+        linkedRow.oversightUnavailableReason = AgentOversightUICopy.oversightAvailableAfterFirstMessage
+        XCTAssertFalse(linkedRow.showsDisabledOversightContextSubmenus)
+
+        // And a bound row never carries the reason.
+        XCTAssertFalse(row(role: .none, interactive: true).showsDisabledOversightContextSubmenus)
+    }
 }
