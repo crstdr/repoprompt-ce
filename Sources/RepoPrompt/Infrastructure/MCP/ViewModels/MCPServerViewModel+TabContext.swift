@@ -2,7 +2,9 @@ import Combine
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
 import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 #if DEBUG
     private func tabContextLog(_ message: @autoclosure () -> String) {
