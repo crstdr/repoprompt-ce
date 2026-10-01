@@ -9329,7 +9329,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         modelParameterSelections: [ACPModelParameterSelection] = [],
         requireInactiveRunState: Bool = false,
         expectedTarget: PersistentBindingTransitionToken? = nil,
-        workspaceAuthority: MCPWorkspaceTargetAuthority? = nil
+        workspaceAuthority: MCPWorkspaceTargetAuthority? = nil,
+        expectedControlContext: AgentMCPControlContext? = nil
     ) async throws {
         if let expectedTarget, !persistentBindingTransitionIsCurrent(expectedTarget) {
             throw MCPError.invalidParams("The agent session binding changed before model configuration.")
@@ -9342,6 +9343,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if let startScope {
                 guard let sessionID = session.activeAgentSessionID else { throw CancellationError() }
                 try startScope.recordTarget(sessionID: sessionID, tabID: tabID)
+            }
+            if let sessionID = expectedSessionID {
+                try requireMCPControlOwnership(sessionID: sessionID, expectedContext: expectedControlContext)
             }
             guard startScope != nil || requireInactiveRunState || !modelParameterSelections.isEmpty else { return }
             guard sessions[tabID] === session,
@@ -10911,17 +10915,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    /// An acquired activation must remain the mutation owner after preparatory suspensions.
+    func requireMCPControlOwnership(sessionID: UUID, expectedContext: AgentMCPControlContext? = nil) throws {
+        let activationID = expectedContext?.activationID ?? MCPAgentRunStartExecutionScope.current?.activationID
+        guard let activationID else { return }
+        guard let session = mcpControlledSession(sessionID: sessionID),
+              let context = session.mcpControlContext,
+              context.activationID == activationID,
+              expectedContext.map({ context.registration == $0.registration }) ?? true
+        else {
+            throw MCPError.invalidParams("The MCP control activation changed before configuration or dispatch.")
+        }
+    }
+
     func mcpDispatchInstruction(
         sessionID: UUID,
         text: String,
         allowStartingRun: Bool,
         workflow: AgentWorkflowDefinition? = nil,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
-        preserveRoutedInitialEffort: Bool = false
+        preserveRoutedInitialEffort: Bool = false,
+        expectedControlContext: AgentMCPControlContext? = nil
     ) async throws -> MCPInstructionDispatch {
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
+        try requireMCPControlOwnership(sessionID: sessionID, expectedContext: expectedControlContext)
         guard session.autoEffortJudgmentID == nil else {
             throw MCPError.invalidParams("Auto effort is already choosing effort for this session. Retry after that turn starts.")
         }
@@ -11004,6 +11023,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             defer {
                 session.isMCPInstructionDispatchInProgress = false
             }
+            try requireMCPControlOwnership(sessionID: sessionID, expectedContext: expectedControlContext)
             try startScope?.beginDispatch()
             // Provider tasks have child lifetime, not the enclosing start request's lifetime.
             submission = MCPAgentRunStartExecutionScope.$current.withValue(nil) {

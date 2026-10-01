@@ -214,6 +214,87 @@ import XCTest
             XCTAssertEqual(vm.test_outstandingProvisionalMCPSessionTargetCount, 0)
         }
 
+        func testSupersededStartDuringConfigurationCannotMutateOrDispatchSuccessor() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let target = try await vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Configuration ownership"
+            )
+            let sessionID = try XCTUnwrap(target.sessionID)
+            let gate = AdmissionSaveGate()
+            vm.test_beforeMCPSelectionCommit = { await gate.enterFirstAndWait() }
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: MCPExportWatchdogManualClock().environment)
+            var dispatched = false
+            let task = Task {
+                try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                        target: target, message: "Fixture instruction",
+                        metadata: .init(connectionID: nil, clientName: "configuration-owner-test", windowID: fixture.window.windowID),
+                        agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: "low",
+                        dispatchInstruction: { _, _, _, _, _ in
+                            dispatched = true
+                            throw AdmissionTestError.expected
+                        }
+                    )
+                }
+            }
+            try await waitUntil("configuration suspended") { await gate.hasEntered() }
+            let successor = try await vm.mcpActivateControlContext(
+                forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil
+            )
+            let session = vm.session(for: target.tabID)
+            let priorEffort = session.selectedReasoningEffortRaw
+            await gate.open()
+            do { _ = try await task.value
+                XCTFail("Superseded start succeeded")
+            } catch {}
+            vm.test_beforeMCPSelectionCommit = nil
+            XCTAssertFalse(dispatched)
+            XCTAssertEqual(session.selectedReasoningEffortRaw, priorEffort)
+            XCTAssertEqual(session.mcpControlContext?.activationID, successor.activationID)
+            XCTAssertEqual(vm.mcpRegistration(sessionID: sessionID), successor.registration)
+            XCTAssertEqual(scope.recoveryMetadata()["dispatch_state"], .string("not_attempted"))
+        }
+
+        func testSupersededStartDuringRequestBindingCannotDispatchSuccessor() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let target = try await vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Dispatch ownership"
+            )
+            let sessionID = try XCTUnwrap(target.sessionID)
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: MCPExportWatchdogManualClock().environment)
+            var successor: AgentModeViewModel.AgentMCPControlContext?
+            var dispatched = false
+            do {
+                _ = try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
+                        target: target, message: "Fixture instruction",
+                        metadata: .init(connectionID: nil, clientName: "dispatch-owner-test", windowID: fixture.window.windowID),
+                        bindCurrentRequestToTab: { _, _ in
+                            successor = try await MCPAgentRunStartExecutionScope.$current.withValue(nil) {
+                                try await vm.mcpActivateControlContext(
+                                    forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil
+                                )
+                            }
+                        },
+                        agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
+                        dispatchInstruction: { _, _, _, _, _ in
+                            dispatched = true
+                            throw AdmissionTestError.expected
+                        }
+                    )
+                }
+                XCTFail("Superseded start succeeded")
+            } catch {}
+            XCTAssertFalse(dispatched)
+            let acceptedSuccessor = try XCTUnwrap(successor)
+            XCTAssertEqual(vm.mcpRegistration(sessionID: sessionID), acceptedSuccessor.registration)
+            XCTAssertEqual(scope.recoveryMetadata()["dispatch_state"], .string("not_attempted"))
+        }
+
         func testExpiredStartAfterDurableAdmissionNeverDispatchesAndReportsExistingIdentity() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup { await fixture.cleanup() }

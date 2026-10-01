@@ -1628,6 +1628,8 @@ actor ServerNetworkManager {
     #if DEBUG
         private var debugAfterDirectAdmissionPendingPublishedForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterBootstrapPolicyReadinessForTesting: (@Sendable (String) async -> Void)?
+        private var debugForceConnectionLimiterUnavailableForTesting: (@Sendable (UUID) async -> Bool)?
+        private var debugBeforeFinishRequestProgressForTesting: (@Sendable () async -> Void)?
         private var debugAfterConnectionCallLimiterResolutionForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterConnectionCallPermitAcquiredForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterConnectionCallLimiterRejectionForTesting: (@Sendable (UUID) async -> Void)?
@@ -10343,6 +10345,14 @@ actor ServerNetworkManager {
                 debugAfterBootstrapPolicyReadinessForTesting = handler
             }
 
+            func debugSetEarlyStartFinalizationForTesting(
+                limiterUnavailable: (@Sendable (UUID) async -> Bool)?,
+                beforeFinish: (@Sendable () async -> Void)?
+            ) {
+                debugForceConnectionLimiterUnavailableForTesting = limiterUnavailable
+                debugBeforeFinishRequestProgressForTesting = beforeFinish
+            }
+
             func debugSetAfterConnectionCallLimiterResolutionForTesting(
                 _ handler: (@Sendable (UUID) async -> Void)?
             ) {
@@ -12789,6 +12799,7 @@ actor ServerNetworkManager {
                     // reveals nothing beyond "you have no oversight authority".
                     return CallTool.Result.err("Tool '\(toolName)' is not available for this session.")
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant {
+                    try? MCPAgentRunStartExecutionScope.current?.enterReturn()
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
                             "toolName": toolName,
@@ -12924,6 +12935,10 @@ actor ServerNetworkManager {
                 nil
             }
             func finishRequestProgress(_ result: CallTool.Result) async -> CallTool.Result {
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                #if DEBUG
+                    await debugBeforeFinishRequestProgressForTesting?()
+                #endif
                 if let capturedProgressState {
                     await domainHost.finishRequestProgress(capturedProgressState)
                 }
@@ -12969,12 +12984,17 @@ actor ServerNetworkManager {
             if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {
                 return await finishRequestProgress(admissionTimeout)
             }
-            let limiterResolution = await EditFlowPerf.measure(
+            var limiterResolution = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.limiterResolution,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
                 await self.connectionCallLimiterResolution(for: connectionID)
             }
+            #if DEBUG
+                if await debugForceConnectionLimiterUnavailableForTesting?(connectionID) == true {
+                    limiterResolution = nil
+                }
+            #endif
             endPreLimiterEnvelopeIfNeeded()
             guard let limiterResolution else {
                 connectionLog("tools/call \(toolName): rejected because connection limiter is unavailable")

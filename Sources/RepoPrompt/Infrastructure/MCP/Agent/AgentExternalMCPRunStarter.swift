@@ -176,7 +176,8 @@ enum AgentExternalMCPRunStarter {
                 tabID: target.tabID,
                 agentRaw: agentRaw,
                 modelRaw: resolvedModel,
-                reasoningEffortRaw: resolvedEffort
+                reasoningEffortRaw: resolvedEffort,
+                expectedControlContext: ownedContext
             )
             try startScope?.checkAdmission()
             switch bindingDisposition {
@@ -204,6 +205,7 @@ enum AgentExternalMCPRunStarter {
             }
 
             try startScope?.checkAdmission()
+            try agentModeVM.requireMCPControlOwnership(sessionID: sessionID, expectedContext: ownedContext)
             let delivery: AgentModeViewModel.MCPInstructionDispatch
             if let dispatchInstruction {
                 try startScope?.beginDispatch()
@@ -215,7 +217,8 @@ enum AgentExternalMCPRunStarter {
                     text: message,
                     allowStartingRun: true,
                     workflow: workflow,
-                    preserveRoutedInitialEffort: preserveRoutedInitialEffort
+                    preserveRoutedInitialEffort: preserveRoutedInitialEffort,
+                    expectedControlContext: ownedContext
                 )
             }
 

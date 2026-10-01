@@ -128,6 +128,53 @@ import XCTest
             }
         }
 
+        func testEarlyStartManagerFailureEntersReturnBeforeProgressCleanup() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let clock = MCPExportWatchdogManualClock()
+                let gate = MCPExecutionIgnoringCancellationGate()
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    await manager.debugSetEarlyStartFinalizationForTesting(limiterUnavailable: { _ in
+                        try? await clock.advanceWithoutWakingSleepers(by: .seconds(10))
+                        return true
+                    }, beforeFinish: {
+                        let scope = MCPAgentRunStartExecutionScope.current
+                        XCTAssertEqual(scope?.phase, .returning)
+                        XCTAssertEqual(scope?.deadline.instant, .seconds(35))
+                        await gate.enterAndWait()
+                    })
+                    let task = Task {
+                        try await endpoint.callTool(name: MCPWindowToolName.agentRun, arguments: [
+                            "op": "start", "message": "Fixture instruction", "detach": true, "_rawJSON": true
+                        ])
+                    }
+                    try await gate.waitUntilEntered(count: 1)
+                    try await clock.waitForSleeper(expected: .seconds(25))
+                    try await clock.advanceSleeper(expected: .seconds(25))
+                    try await clock.waitForSleeper(expected: .seconds(5))
+                    try await clock.advanceSleeper(expected: .seconds(5))
+                    let payload = try await Self.toolResultObject(task.value)
+                    XCTAssertEqual(payload["code"] as? String, "tool_execution_deadline_exceeded")
+                    await gate.release()
+                    XCTAssertNil(payload["session_id"])
+                    await manager.debugSetEarlyStartFinalizationForTesting(limiterUnavailable: nil, beforeFinish: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await gate.release()
+                    await manager.debugSetEarlyStartFinalizationForTesting(limiterUnavailable: nil, beforeFinish: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testNormalizedStartClassificationOwnsScopeWithoutAffectingOtherOperations() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
