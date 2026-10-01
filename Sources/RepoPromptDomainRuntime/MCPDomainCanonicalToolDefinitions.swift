@@ -1280,13 +1280,16 @@ package enum MCPDomainCanonicalToolDefinitions {
                     of: oldWaitDescription,
                     with: currentWaitDescription
                 )
+            let oldStartDescription = "Pass `detach: true` to return immediately."
+            let currentStartDescription = oldStartDescription
+                + " Start: setup ≤150s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
+            let startDescription = description.contains(currentStartDescription)
+                ? description
+                : description.replacingOccurrences(of: oldStartDescription, with: currentStartDescription)
             return canonicalizeAgentControlWaitSemantics(
                 MCPDomainToolDefinition(
                     name: definition.name,
-                    description: description.replacingOccurrences(
-                        of: "Pass `detach: true` to return immediately.",
-                        with: "Pass `detach: true` to return immediately. Start: setup ≤150s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
-                    ),
+                    description: startDescription,
                     inputSchema: definition.inputSchema,
                     annotations: definition.annotations,
                     isEnabledByDefault: definition.isEnabledByDefault
@@ -2707,6 +2710,12 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     package static func test_agentSessionLinkPreviousCompactDefinition() -> MCPDomainToolDefinition {
         applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())
+    }
+
+    package static func test_canonicalizeGlobalSemantics(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        canonicalizeGlobalSemantics(definition)
     }
 
     package static func test_canonicalizeAgentControlWaitSemantics(
