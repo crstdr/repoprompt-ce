@@ -864,6 +864,7 @@ extension AgentModeViewModel {
         mutation(&updated)
         guard updated != monitorPillPropsByEndpoint else { return }
         monitorPillPropsByEndpoint = updated
+        agentSessionLinkReconcileOversightColourSlots()
         let published = ui.statusPills.snapshot
         if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
             syncStatusPillsUIState()
@@ -893,6 +894,56 @@ extension AgentModeViewModel {
     func agentSessionLinkIsOverseer(tabID: UUID) -> Bool {
         guard let sessionID = sessions[tabID]?.activeAgentSessionID else { return false }
         return agentSessionLinkIsOverseer(tabID: tabID, expectedSessionID: sessionID)
+    }
+
+    /// Reconciles the palette allocator with the overseers present in the published projections.
+    /// Runs inside the sole storage-mutation boundary so every change notification already observes
+    /// a settled slot map. A row's overseer appears either in its own inbound rows or, when only the
+    /// overseer's row is projected here, through that row's outbound list.
+    private func agentSessionLinkReconcileOversightColourSlots() {
+        var firstLinkCreatedAt: [UUID: Date] = [:]
+        func consider(_ overseerSessionID: UUID, createdAt: Date) {
+            if let existing = firstLinkCreatedAt[overseerSessionID], existing <= createdAt {
+                return
+            }
+            firstLinkCreatedAt[overseerSessionID] = createdAt
+        }
+        for props in monitorPillPropsByEndpoint.values {
+            for row in props.inbound {
+                consider(row.observerSessionID, createdAt: row.linkCreatedAt ?? .distantFuture)
+            }
+            if let sessionID = props.endpoint?.sessionID ?? props.sessionID {
+                for row in props.outbound {
+                    consider(sessionID, createdAt: row.linkCreatedAt ?? .distantFuture)
+                }
+            }
+        }
+        agentOversightColourAllocator.reconcile(activeOverseerFirstLinkDates: firstLinkCreatedAt)
+    }
+
+    /// The row's oversight roles for the Fb mark model: its own palette slot when it oversees,
+    /// plus its overseers in link-creation order. Everything comes from the published projection
+    /// and the in-memory allocator — no disk reads, no authority hop.
+    func agentSidebarOversightRole(
+        tabID: UUID,
+        expectedSessionID: UUID
+    ) -> AgentSessionOversightRole {
+        guard let endpoint = agentSidebarOversightTargetEndpoint(
+            tabID: tabID,
+            expectedSessionID: expectedSessionID
+        ),
+            let props = monitorPillPropsByEndpoint[endpoint],
+            props.endpoint == endpoint
+        else {
+            return .none
+        }
+        let allocator = agentOversightColourAllocator
+        return AgentSessionOversightRole.make(
+            inbound: props.inbound,
+            outbound: props.outbound,
+            ownSessionID: props.sessionID ?? expectedSessionID,
+            slot: { allocator.slot(for: $0) }
+        )
     }
 
     /// Current target-centric oversight choices for one exact active sidebar row.

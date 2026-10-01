@@ -559,12 +559,12 @@ struct AgentModeSessionsListView: View {
                         let copySessionIDAction: (() -> Bool)? = copySessionIDTarget.map { target in
                             { agentModeVM.copyAgentSessionID(target: target) }
                         }
-                        let isOverseer = session.sessionID.map { sessionID in
-                            agentModeVM.agentSessionLinkIsOverseer(
+                        let oversightRole = session.sessionID.map { sessionID in
+                            agentModeVM.agentSidebarOversightRole(
                                 tabID: session.tabID,
                                 expectedSessionID: sessionID
                             )
-                        } ?? false
+                        } ?? .none
                         let sidebarOversightMenuResolver: (@MainActor () -> AgentSidebarOversightMenuProps?)? =
                             session.sessionID.map { expectedSessionID in
                                 { @MainActor in
@@ -618,7 +618,9 @@ struct AgentModeSessionsListView: View {
                         AgentSessionRow(
                             title: session.title,
                             isActive: session.tabID == currentTabID,
-                            isOverseer: isOverseer,
+                            oversightRole: oversightRole,
+                            creatorSessionID: creator?.sessionID,
+                            creatorDisplayName: creator?.label,
                             onOpenCreator: {
                                 guard let targetSessionID = session.sessionID,
                                       let creatorSessionID = creator?.sessionID,

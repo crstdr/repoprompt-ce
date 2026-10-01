@@ -111,30 +111,16 @@ enum AgentSidebarRowTap {
 
 // MARK: - Agent Session Row
 
-/// Which presentation the unified oversight mark wears on a row, derived from the two
-/// independent facts "currently overseen" (inbound links) and "created by an overseer"
-/// (provenance). Colour is never the only signal — the tooltip names both facts.
-enum AgentSessionOversightMarkKind: Equatable {
-    /// Active inbound links and no creator provenance: linked by the user. Purple, same as
-    /// the overseer eye.
-    case linkedByUser
-    /// Overseer-created lane with at least one active inbound link. Orange.
-    case createdLinked
-    /// Overseer-created lane whose links are all gone. Dim orange provenance cue.
-    case createdUnlinked
-
-    static func kind(hasInbound: Bool, creatorSessionID: UUID?) -> Self? {
-        if hasInbound {
-            return creatorSessionID == nil ? .linkedByUser : .createdLinked
-        }
-        return creatorSessionID == nil ? nil : .createdUnlinked
-    }
-}
-
 struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
-    var isOverseer = false
+    /// Fb mark model: the row's own group slot when it oversees, plus its overseers in
+    /// link-creation order. Drives the inline eye mark; `.none` renders nothing.
+    var oversightRole = AgentSessionOversightRole.none
+    /// Overseer-creator provenance for the tooltip's `Created by:` segment. Live links still own
+    /// the mark's colour; this never paints a separate origin mark.
+    var creatorSessionID: UUID?
+    var creatorDisplayName: String?
     /// Revalidates and navigates to the lane's creator for the `Open creator "{name}"` item.
     /// The label itself comes from the shared menu model.
     var onOpenCreator: (() -> Void)?
@@ -339,8 +325,8 @@ struct AgentSessionRow: View {
         fontPreset.scaledClamped(10, max: 13)
     }
 
-    private var overseerBadgeFontSize: CGFloat {
-        fontPreset.scaledClamped(9, min: 9, max: 12)
+    private var oversightMarkFontSize: CGFloat {
+        fontPreset.scaledClamped(10, min: 9, max: 12)
     }
 
     private var chipHorizontalPadding: CGFloat {
@@ -986,16 +972,9 @@ struct AgentSessionRow: View {
 
     private var rowAccessibilityValue: String {
         var parts = [isSelected ? "Selected" : "Not selected"]
-        // VoiceOver reads the same text as the mark tooltips (approved copy matrix).
-        if let menu = resolveSidebarOversightMenu?() {
-            if !menu.outboundTargetNames.isEmpty {
-                parts.append(
-                    AgentOversightUICopy.overseeingTooltip(targetNames: menu.outboundTargetNames)
-                )
-            }
-            if let text = oversightMarkTooltip(menu: menu) {
-                parts.append(text)
-            }
+        // VoiceOver reads the same combined line the mark shows on hover.
+        if oversightRole.hasMark {
+            parts.append(oversightMarkTooltip())
         }
         if let sidebarOversightFailureMessage {
             parts.append("Oversight action failed: \(sidebarOversightFailureMessage)")
@@ -1038,7 +1017,7 @@ struct AgentSessionRow: View {
         Menu {
             sidebarOversightMenuContent(menu)
         } label: {
-            Image(systemName: AgentOversightUICopy.relationshipMarkIcon)
+            Image(systemName: AgentOversightUICopy.manageOversightIcon)
                 .font(.system(size: 11))
                 .foregroundColor(
                     isSidebarOversightMenuHovered || !sidebarOversightBusyKeys.isEmpty
@@ -1067,7 +1046,7 @@ struct AgentSessionRow: View {
             } label: {
                 Label(
                     AgentOversightUICopy.overseeByTitle,
-                    systemImage: AgentOversightUICopy.relationshipMarkIcon
+                    systemImage: AgentOversightUICopy.manageOversightIcon
                 )
             }
             .accessibilityLabel(AgentOversightUICopy.overseeByTitle)
@@ -1080,7 +1059,7 @@ struct AgentSessionRow: View {
                     menu.isOverseer
                         ? AgentOversightUICopy.overseeTitle
                         : AgentOversightUICopy.makeOverseerOfTitle,
-                    systemImage: AgentOversightUICopy.relationshipMarkIcon
+                    systemImage: AgentOversightUICopy.manageOversightIcon
                 )
             }
             .accessibilityLabel(
@@ -1092,70 +1071,40 @@ struct AgentSessionRow: View {
         }
     }
 
-    // MARK: - Overseen / provenance mark
+    // MARK: - Oversight role mark (Fb iconography)
 
-    /// Which mark the row shows next to its title, or `nil` for none. Provenance (created by an
-    /// overseer) and active inbound oversight are independent facts; both come from the same
-    /// frozen menu model the mark opens.
-    private func oversightMarkKind(
-        menu: AgentSidebarOversightMenuProps
-    ) -> AgentSessionOversightMarkKind? {
-        AgentSessionOversightMarkKind.kind(
-            hasInbound: menu.hasInbound,
-            creatorSessionID: menu.creatorSessionID
+    /// The mark's combined tooltip/VoiceOver line — `Overseeing: … · Overseen by: … · Created
+    /// by: …`, segments omitted when empty. Only called for rows carrying a role, so at least one
+    /// segment is always present; provenance joins the same line rather than painting its own mark.
+    private func oversightMarkTooltip() -> String {
+        let creatorIsSoleOverseer = oversightRole.overseers.count == 1
+            && oversightRole.overseers.first?.sessionID == creatorSessionID
+        return AgentOversightUICopy.oversightMarkTooltip(
+            overseeingNames: oversightRole.overseeingNames,
+            overseenByNames: oversightRole.overseers.map(\.displayName),
+            creator: creatorDisplayName,
+            creatorIsSoleOverseer: creatorIsSoleOverseer
         )
     }
 
-    private func oversightMarkTooltip(menu: AgentSidebarOversightMenuProps) -> String? {
-        let hasInbound = menu.hasInbound
-        let creator = menu.createdByLabel
-        let names = menu.inboundObserverNames
-        let creatorIsSoleOverseer = hasInbound && names.count == 1
-            && menu.inboundObserverSessionIDs.first == menu.creatorSessionID
-
-        switch oversightMarkKind(menu: menu) {
-        case .linkedByUser:
-            return AgentOversightUICopy.overseenByTooltip(observerNames: names)
-        case .createdLinked:
-            guard let creator else { return nil }
-            return creatorIsSoleOverseer
-                ? AgentOversightUICopy.createdAndOverseenTooltip(creator: creator)
-                : AgentOversightUICopy.createdByOverseenByTooltip(
-                    creator: creator,
-                    observerNames: names
-                )
-        case .createdUnlinked:
-            guard let creator else { return nil }
-            return AgentOversightUICopy.createdByUnlinkedTooltip(creator: creator)
-        case .none:
-            return nil
-        }
-    }
-
-    /// The always-visible overseen/provenance mark. When mutations are allowed, clicking opens the
-    /// Oversee-by lane menu — the same menu model as the hover affordance and the context submenu.
-    /// Otherwise it stays a passive state marker so it can never offer a mutation the row forbids.
+    /// The always-visible role mark, drawn inline just before the title. One mark per row:
+    /// `eye.fill` in the row's own group colour when it oversees, `eye` in its first overseer's
+    /// group colour when it is overseen, and a two-tone `eye.circle.fill` when both apply. Several
+    /// overseers keep the first overseer's colour (link-creation order) plus a count superscript.
+    /// When mutations are allowed, clicking opens the Oversee-by lane menu — the same menu model
+    /// as the hover affordance and the context submenu. Otherwise it stays a passive state marker
+    /// so it can never offer a mutation the row forbids.
     @ViewBuilder
-    private func overseenMark(
-        menu: AgentSidebarOversightMenuProps,
+    private func oversightMark(
+        menu: AgentSidebarOversightMenuProps?,
         tooltip: String,
         interactive: Bool
     ) -> some View {
-        let kind = oversightMarkKind(menu: menu)
-        let color: Color = switch kind {
-        case .linkedByUser, nil:
-            // Same purple as the overseer eye: linked by the user.
-            Color(nsColor: .systemPurple)
-        case .createdLinked:
-            .orange
-        case .createdUnlinked:
-            .orange.opacity(0.45)
-        }
-        if interactive {
+        if interactive, let menu {
             Menu {
                 sidebarOversightMenuContent(menu)
             } label: {
-                overseenMarkGlyph(menu: menu, color: color)
+                oversightMarkGlyph
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
@@ -1164,26 +1113,42 @@ struct AgentSessionRow: View {
             .accessibilityLabel(tooltip)
             .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
         } else {
-            overseenMarkGlyph(menu: menu, color: color)
+            oversightMarkGlyph
                 .fixedSize()
                 .hoverTooltip(tooltip)
                 .accessibilityLabel(tooltip)
         }
     }
 
-    private func overseenMarkGlyph(
-        menu: AgentSidebarOversightMenuProps,
-        color: Color
-    ) -> some View {
+    @ViewBuilder
+    private var oversightMarkGlyph: some View {
+        let ownColor = oversightRole.ownOverseerSlot.map { AgentOversightPalette.color(for: $0) }
+        let overseerColor = oversightRole.overseers.first
+            .map { AgentOversightPalette.color(for: $0.slot) }
         HStack(spacing: 1) {
-            Image(systemName: AgentOversightUICopy.relationshipMarkIcon)
-                .font(.system(size: 10))
-            if menu.inboundObserverNames.count > 1 {
-                Text("\(menu.inboundObserverNames.count)")
-                    .font(.system(size: 8, weight: .semibold))
+            switch (ownColor, overseerColor) {
+            case let (.some(own), .some(overseer)):
+                // Both roles: the eye keeps this row's own group colour, the ring its overseer's.
+                Image(systemName: AgentOversightUICopy.dualRoleMarkIcon)
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(own, overseer)
+            case let (.some(own), .none):
+                Image(systemName: AgentOversightUICopy.overseerMarkIcon)
+                    .foregroundStyle(own)
+            case let (.none, .some(overseer)):
+                Image(systemName: AgentOversightUICopy.overseenMarkIcon)
+                    .foregroundStyle(overseer)
+            case (.none, .none):
+                EmptyView()
+            }
+            if oversightRole.overseers.count > 1 {
+                Text("\(oversightRole.overseers.count)")
+                    .font(.system(size: 7, weight: .bold))
+                    .baselineOffset(4)
+                    .foregroundStyle(overseerColor ?? .secondary)
             }
         }
-        .foregroundStyle(color)
+        .font(.system(size: oversightMarkFontSize, weight: .semibold))
     }
 
     @ViewBuilder
@@ -1246,27 +1211,23 @@ struct AgentSessionRow: View {
             // Session name
             VStack(alignment: .leading, spacing: titleVStackSpacing) {
                 HStack(spacing: titlePinSpacing) {
-                    Text(title)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: isActive ? .semibold : .regular))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .layoutPriority(0)
-
-                    if isOverseer {
-                        overseerBadge(names: sidebarOversightMenu?.outboundTargetNames)
-                    }
-
-                    if let sidebarOversightMenu,
-                       let markTooltip = oversightMarkTooltip(menu: sidebarOversightMenu)
-                    {
-                        overseenMark(
+                    // The oversight role mark sits inline just before the title text; the status
+                    // plate keeps carrying the dot/chevron run state ahead of it.
+                    if oversightRole.hasMark {
+                        oversightMark(
                             menu: sidebarOversightMenu,
-                            tooltip: markTooltip,
+                            tooltip: oversightMarkTooltip(),
                             interactive: allowsDirectMutations
                                 && onAddSidebarOversight != nil
                                 && onStopSidebarOversight != nil
                         )
                     }
+
+                    Text(title)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: isActive ? .semibold : .regular))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(0)
 
                     if isPinned {
                         Image(systemName: "pin.fill")
@@ -1304,12 +1265,12 @@ struct AgentSessionRow: View {
                     .accessibilityLabel(dismissAttentionActionLabel)
                 }
 
-                // The grey hover affordance uses the same glyph as the overseen mark. Once the
-                // mark is persistent — active inbound oversight or creator provenance — it already
-                // opens the same lane menu, so the hover icon stays hidden on those rows.
+                // The grey hover affordance appears only on rows with no role mark. Once the
+                // mark is persistent it already opens the same lane menu, so the affordance
+                // stays hidden on those rows.
                 if allowsDirectMutations,
                    let sidebarOversightMenu,
-                   oversightMarkKind(menu: sidebarOversightMenu) == nil,
+                   !oversightRole.hasMark,
                    onAddSidebarOversight != nil,
                    onStopSidebarOversight != nil
                 {
@@ -1507,22 +1468,6 @@ struct AgentSessionRow: View {
             showRenameAlert = false
             oversightSessionIDSheet = nil
         }
-    }
-
-    /// Non-clickable purple eye: "this session oversees others". The tooltip names the exact
-    /// outbound lanes (up to three, then "+N more") from the shared in-memory projection.
-    private func overseerBadge(names: [String]?) -> some View {
-        Image(systemName: AgentOversightUICopy.overseerIcon)
-            .font(.system(size: overseerBadgeFontSize, weight: .semibold))
-            .foregroundStyle(Color(nsColor: .systemPurple))
-            .fixedSize()
-            .layoutPriority(1)
-            .hoverTooltip(
-                names?.isEmpty == false
-                    ? AgentOversightUICopy.overseeingTooltip(targetNames: names ?? [])
-                    : nil
-            )
-            .accessibilityHidden(true)
     }
 
     /// True when this row should advertise that it was opened by an
@@ -2038,15 +1983,16 @@ struct AgentStashedSessionRow: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                     if let createdByLabel {
-                        // Archived lanes have no live endpoint, so the provenance mark is a plain
-                        // navigation button rather than a lane-menu opener.
-                        let tooltip = AgentOversightUICopy.createdByUnlinkedTooltip(
+                        // Archived lanes have no live endpoint and no role mark — the eye family
+                        // only ever means a live role — so the provenance affordance stays a plain
+                        // neutral navigation button to the creator.
+                        let tooltip = AgentOversightUICopy.createdByTooltip(
                             creator: createdByLabel
                         )
                         Button(action: { onOpenCreator?() }) {
-                            Image(systemName: AgentOversightUICopy.relationshipMarkIcon)
+                            Image(systemName: "person.crop.circle")
                                 .font(.system(size: 11))
-                                .foregroundStyle(.orange.opacity(0.45))
+                                .foregroundStyle(.secondary)
                                 .frame(width: 16, height: 16)
                                 .contentShape(Rectangle())
                         }
