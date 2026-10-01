@@ -175,7 +175,6 @@ final class AgentModeMCPToolAdvertisementPolicyTests: XCTestCase {
     }
 }
 
-
 final class MCPToolIdleWaitTests: XCTestCase {
     @MainActor
     func testAlreadyCancelledToolIdleWaitDoesNotTakeIdleFastPath() async {
