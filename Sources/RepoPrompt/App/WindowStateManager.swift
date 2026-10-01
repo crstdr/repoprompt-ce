@@ -654,7 +654,7 @@ class WindowStatesManager: ObservableObject {
         let mode = AppLaunchConfiguration.current.agentSessionOversightPersistenceMode(
             autoRestoreWorkspacesEnabled: autoRestoreWorkspacesEnabled
         )
-        let store = AgentSessionOversightIntentStore.production(mode: mode)
+        let store = AgentSessionOversightIntentStore.production(mode: mode, restorePerfRecorder: AppWorkspaceRestorePerfRecorder())
         Task { @MainActor in
             await AgentSessionLinkRuntimeBridge.shared.bootstrapIntentStore(store)
         }
