@@ -1018,6 +1018,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #if DEBUG
         var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)?
         var test_beforeFailedMCPControlRegistrationCleanup: (@MainActor () async -> Void)?
+        var test_afterMCPApprovalStoreUpdate: (@MainActor () async -> Void)?
+        var test_afterWorktreeBindingPreparation: (@MainActor () async throws -> Void)?
+        var test_beforeWorktreeBindingAbort: (@MainActor () async -> Void)?
         /// Holds lane creation after provenance is installed and before configuration.
         var test_afterOversightLaneProvision: (@MainActor (UUID) async -> Void)?
         var test_updateBindingsCallCount: Int = 0
@@ -8054,6 +8057,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var ownershipCommitted = preparation == nil
         var scopedCommitAttempted = false
         do {
+            #if DEBUG
+                try await test_afterWorktreeBindingPreparation?()
+            #endif
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
                   session.worktreeBindings == previousBindings,
@@ -8117,7 +8123,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             _ = commitWorktreeBindings(desiredBindings, to: session)
             return session.worktreeBindings
         } catch {
+            try? MCPAgentRunStartExecutionScope.current?.enterReturn()
             if !ownershipCommitted, !scopedCommitAttempted, let materializer, let preparation {
+                #if DEBUG
+                    await test_beforeWorktreeBindingAbort?()
+                #endif
                 await materializer.abort(preparation)
             }
             throw error
@@ -9829,16 +9839,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 updateGlobalDefault: false
             )
         }
+        #if DEBUG
+            await test_afterMCPApprovalStoreUpdate?()
+        #endif
         guard sessions[tabID] === session,
               session.mcpControlActivationGeneration == activationGeneration,
               session.mcpControlContext?.activationID == activationID,
               session.mcpControlContext?.registration == registration
         else {
-            await AgentRunSessionStore.cleanup(registration: registration)
+            await cleanupFailedRegistration()
             throw MCPError.invalidParams("The MCP control activation was superseded during setup.")
         }
         do { try MCPAgentRunStartExecutionScope.current?.checkAdmission() }
         catch {
+            try? MCPAgentRunStartExecutionScope.current?.enterReturn()
             _ = await mcpDeactivateOwnedControlContext(sessionID: sessionID, expectedContext: activatedContext)
             throw error
         }
@@ -9866,6 +9880,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// by durable admission; accepted targets retain their durable ownership.
     @discardableResult
     func mcpDiscardSessionTarget(_ target: MCPSessionTarget) async -> MCPSessionTargetDiscardResult {
+        try? MCPAgentRunStartExecutionScope.current?.enterReturn()
         guard let claim = target.recoveryClaim else {
             switch target.origin {
             case .existingSession, .existingTab:

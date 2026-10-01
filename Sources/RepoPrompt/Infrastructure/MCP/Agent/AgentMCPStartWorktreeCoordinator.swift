@@ -421,6 +421,7 @@ struct AgentMCPStartWorktreeCoordinator {
                 expectedWorkspaceID: expectedWorkspaceID
             )
         } catch {
+            try? MCPAgentRunStartExecutionScope.current?.enterReturn()
             if let createdWorktree {
                 try await removeUncommittedWorktree(createdWorktree, repository: repository)
             }

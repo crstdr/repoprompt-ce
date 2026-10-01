@@ -56,6 +56,7 @@ class PromptViewModel: ObservableObject {
             (@MainActor (AgentProvisionalAdmissionIdentity, AgentAdmissionPersistenceReceipt) async -> Void)?
         private var agentAdmissionRecoveryCompletedHandlerForTesting:
             (@MainActor (AgentProvisionalAdmissionIdentity, AgentAdmissionRecoveryOutcome) async -> Void)?
+        var test_beforeAgentAdmissionFailureCleanup: (@MainActor () async -> Void)?
         private var agentAdmissionRecoveryRetryHandlerForTesting:
             (@MainActor (Int, AgentAdmissionRecoveryOutcome) async -> Void)?
 
@@ -3182,6 +3183,10 @@ class PromptViewModel: ObservableObject {
             case .commit:
                 return .created(newTab, receipt, recoveryClaim)
             case let .localRollback(reason):
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                #if DEBUG
+                    await test_beforeAgentAdmissionFailureCleanup?()
+                #endif
                 await rollbackProvisionalAgentSessionTab(
                     checkpoint: rollbackCheckpoint,
                     manager: manager
@@ -3192,6 +3197,10 @@ class PromptViewModel: ObservableObject {
                 }
                 return .rejected(receipt, reason)
             case let .recoverWorkspace(reason):
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                #if DEBUG
+                    await test_beforeAgentAdmissionFailureCleanup?()
+                #endif
                 guard recoveryClaim.beginWorkspaceRecovery() else {
                     await rollbackProvisionalAgentSessionTab(
                         checkpoint: rollbackCheckpoint,

@@ -35,7 +35,11 @@ import XCTest
             try await assertSupersededActivation(scoped: true)
         }
 
-        private func assertSupersededActivation(scoped: Bool) async throws {
+        func testLateApprovalStoreSupersessionEntersReturnBeforeOwnerCleanup() async throws {
+            try await assertSupersededActivation(scoped: true, afterApproval: true)
+        }
+
+        private func assertSupersededActivation(scoped: Bool, afterApproval: Bool = false) async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup { await fixture.cleanup() }
             let vm = fixture.window.agentModeViewModel
@@ -47,7 +51,11 @@ import XCTest
             let scope = scoped ? MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment) : nil
             let registrationGate = AdmissionSaveGate()
             let cleanupGate = AdmissionHandoffGate()
-            vm.test_afterMCPControlRegistration = { _ in await registrationGate.enterFirstAndWait() }
+            if afterApproval {
+                vm.test_afterMCPApprovalStoreUpdate = { await registrationGate.enterFirstAndWait() }
+            } else {
+                vm.test_afterMCPControlRegistration = { _ in await registrationGate.enterFirstAndWait() }
+            }
             vm.test_beforeFailedMCPControlRegistrationCleanup = {
                 if let scope {
                     XCTAssertEqual(scope.phase, .returning)
@@ -88,16 +96,122 @@ import XCTest
                 } catch {}
                 XCTAssertEqual(vm.mcpRegistration(sessionID: sessionID), successor.registration)
                 XCTAssertEqual(vm.session(for: target.tabID).mcpControlContext?.activationID, successor.activationID)
+                vm.test_afterMCPApprovalStoreUpdate = nil
                 vm.test_afterMCPControlRegistration = nil
                 vm.test_beforeFailedMCPControlRegistrationCleanup = nil
             } catch {
                 await registrationGate.open()
                 await cleanupGate.open()
                 _ = try? await first.value
+                vm.test_afterMCPApprovalStoreUpdate = nil
                 vm.test_afterMCPControlRegistration = nil
                 vm.test_beforeFailedMCPControlRegistrationCleanup = nil
                 throw error
             }
+        }
+
+        func testAdmissionRollbackAndRecoveryEnterReturnBeforeOwnerCleanup() async throws {
+            for recover in [false, true] {
+                let fixture = try await DurableAgentAdmissionFixture.make()
+                let manager = fixture.window.workspaceManager
+                let prompt = fixture.window.promptManager
+                let clock = MCPExportWatchdogManualClock()
+                let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+                let gate = AdmissionHandoffGate()
+                if !recover {
+                    manager.setWorkspacePersistenceOutcomeOverrideForTesting(.rejected(
+                        reason: "authority_revision_conflict", category: .authorityRevisionConflict
+                    ))
+                }
+                prompt.setAgentAdmissionPersistenceReceiptHandlerForTesting { identity, receipt in
+                    try? await clock.advanceWithoutSleepers(by: .seconds(10))
+                    if recover {
+                        XCTAssertNotEqual(receipt.commitEvidence, .none)
+                        if let index = manager.workspaces.firstIndex(where: { $0.id == identity.workspaceID }) {
+                            manager.workspaces[index].composeTabs.removeAll { $0.id == identity.tabID }
+                        }
+                    }
+                }
+                prompt.test_beforeAgentAdmissionFailureCleanup = {
+                    XCTAssertEqual(scope.phase, .returning, "recover=\(recover)")
+                    XCTAssertEqual(scope.deadline.instant, .seconds(35))
+                    await gate.enterAndWait()
+                }
+                let task = Task {
+                    try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                        try await fixture.window.agentModeViewModel.mcpResolveOrCreateSessionTarget(
+                            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Rejected admission"
+                        )
+                    }
+                }
+                await gate.waitUntilEntered()
+                try await clock.advanceWithoutSleepers(by: .seconds(25))
+                XCTAssertThrowsError(try scope.checkAdmission())
+                await gate.open()
+                do { _ = try await task.value
+                    XCTFail("Rejected admission succeeded")
+                } catch {}
+                prompt.test_beforeAgentAdmissionFailureCleanup = nil
+                prompt.setAgentAdmissionPersistenceReceiptHandlerForTesting(nil)
+                manager.setWorkspacePersistenceOutcomeOverrideForTesting(nil)
+                await fixture.cleanup()
+            }
+        }
+
+        func testFailedPreCommitWorktreePreparationEntersReturnBeforeAbort() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let target = try await vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Worktree abort"
+            )
+            let sessionID = try XCTUnwrap(target.sessionID)
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            let gate = AdmissionHandoffGate()
+            vm.test_afterWorktreeBindingPreparation = {
+                try await clock.advanceWithoutSleepers(by: .seconds(10))
+                throw AdmissionTestError.expected
+            }
+            vm.test_beforeWorktreeBindingAbort = {
+                XCTAssertEqual(scope.phase, .returning)
+                XCTAssertEqual(scope.deadline.instant, .seconds(35))
+                await gate.enterAndWait()
+            }
+            let task = Task {
+                try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    try await vm.transitionWorktreeBindings([], forSessionID: sessionID, intent: .initialSend)
+                }
+            }
+            await gate.waitUntilEntered()
+            try await clock.advanceWithoutSleepers(by: .seconds(25))
+            XCTAssertThrowsError(try scope.checkAdmission())
+            await gate.open()
+            do { _ = try await task.value
+                XCTFail("Failed transition succeeded")
+            } catch AdmissionTestError.expected {}
+            vm.test_afterWorktreeBindingPreparation = nil
+            vm.test_beforeWorktreeBindingAbort = nil
+            XCTAssertTrue(vm.session(for: target.tabID).worktreeBindings.isEmpty)
+        }
+
+        func testDirectOwnedAdmissionDiscardEntersReturnBeforeRecovery() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let target = try await vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Discard deadline"
+            )
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            try await clock.advanceWithoutSleepers(by: .seconds(10))
+            let result = await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                await vm.mcpDiscardSessionTarget(target)
+            }
+            XCTAssertEqual(result, .complete)
+            XCTAssertEqual(scope.phase, .returning)
+            XCTAssertEqual(scope.deadline.instant, .seconds(35))
+            XCTAssertEqual(vm.test_outstandingProvisionalMCPSessionTargetCount, 0)
         }
 
         func testExpiredStartAfterDurableAdmissionNeverDispatchesAndReportsExistingIdentity() async throws {
