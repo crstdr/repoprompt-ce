@@ -1,6 +1,6 @@
 import AppKit
 
-/// Samples whether a window is presented on screen, for `WindowState.isPresentationVisible`.
+/// Presentation-only policy; it must never gate execution, persistence, or model publication.
 enum WindowPresentationVisibility {
     /// Window notifications after which the sample can change.
     static let windowNotifications: [Notification.Name] = [
