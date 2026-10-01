@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptProcess
 
 enum DevinIntegrationConfiguration {
     static let cleanupArtifactKind = "devinIsolatedMCPConfiguration"
