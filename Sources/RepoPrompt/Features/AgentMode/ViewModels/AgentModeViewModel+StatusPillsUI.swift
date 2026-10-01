@@ -2,7 +2,10 @@ import Foundation
 
 extension AgentModeViewModel {
     func makeStatusPillsSnapshot() -> AgentStatusPillsSnapshot {
-        AgentStatusPillsSnapshot(
+        #if DEBUG
+            test_statusPillsSnapshotBuildCount += 1
+        #endif
+        return AgentStatusPillsSnapshot(
             currentTabID: currentTabID,
             selectedWorkflow: selectedWorkflow,
             stagedSlashCommand: stagedSlashCommandProps(tabID: currentTabID),
@@ -24,9 +27,10 @@ extension AgentModeViewModel {
         ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
-    /// Publishes only when the stored snapshot actually differs — the link-projection publisher
-    /// calls this on every mutation, and most mutations leave the pills untouched.
-    func syncStatusPillsUIStateIfChanged() {
+    /// Preserve notify-time monitor freshness without rebuilding for unrelated endpoint updates.
+    /// The link-projection publisher calls this on every mutation, and most mutations leave the
+    /// pills untouched.
+    func syncStatusPillsUIStateIfMonitorStale() {
         let published = ui.statusPills.snapshot
         if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
             syncStatusPillsUIState()
