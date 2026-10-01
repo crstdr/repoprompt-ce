@@ -1853,7 +1853,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             Pass `op` plus fields for that operation.
             list: cursor?, max_items?
             poll: exactly one of session_id/session_ids
-            wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds?
+            wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds? Local input cancels older waits.
             read: session_id, cursor?, from?, max_items?, max_output_bytes?
             send: session_id, message, idempotency_key; workflow_id|workflow_name?; delivery?; replace_pending?
             cancel_pending_send: session_id, idempotency_key
@@ -1899,8 +1899,10 @@ package enum MCPDomainCanonicalToolDefinitions {
                     ["change", "idle", "sendable"]
                 ),
                 "timeout_seconds": .object([
-                    "description": .string("[wait] Max seconds; default 60; 0 polls immediately."),
-                    "type": .string("number")
+                    "description": .string("[wait] 0-60 seconds; default 60; 0 polls."),
+                    "type": .string("number"),
+                    "minimum": .int(0),
+                    "maximum": .int(60)
                 ]),
                 "from": enumStringSchema(
                     "[read] Fresh page origin: tail (default/newest) or start (oldest).",
