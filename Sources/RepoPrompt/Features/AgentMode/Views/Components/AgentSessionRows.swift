@@ -1101,17 +1101,25 @@ struct AgentSessionRow: View {
         interactive: Bool
     ) -> some View {
         if interactive, let menu {
-            Menu {
-                sidebarOversightMenuContent(menu)
-            } label: {
-                oversightMarkGlyph
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .hoverTooltip(tooltip)
-            .accessibilityLabel(tooltip)
-            .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+            // A macOS Menu template-renders its label image, which would flatten the palette
+            // colours (and the two-tone/count colours) to the control tint — and to white on
+            // selected rows. The coloured glyph therefore stays ordinary content underneath a
+            // clear-label Menu that owns the same hit target; the glyph itself never hit-tests.
+            oversightMarkGlyph
+                .accessibilityHidden(true)
+                .overlay {
+                    Menu {
+                        sidebarOversightMenuContent(menu)
+                    } label: {
+                        Color.clear
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .accessibilityLabel(tooltip)
+                    .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+                }
+                .fixedSize()
+                .hoverTooltip(tooltip)
         } else {
             oversightMarkGlyph
                 .fixedSize()
