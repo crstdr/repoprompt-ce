@@ -13,7 +13,11 @@ import Logging
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptRegexCore
 import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 enum ReadFileAutoSelectionCoverageCertificateMissReason: String, CaseIterable, Hashable {
     case noCertificate = "no_certificate"
@@ -699,6 +703,7 @@ final class MCPServerViewModel: ObservableObject {
     // ---------------------------------------------------------------------
     let windowID: Int
     private(set) var service: MCPService
+    private let perfRecorder: any AgentModePerfRecording
     let logger = Logger(label: "com.repoprompt.mcp")
 
     #if DEBUG
@@ -865,7 +870,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private var agentRunToolService: AgentRunMCPToolService {
-        AgentRunMCPToolService(
+        var toolService = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
@@ -929,6 +934,8 @@ final class MCPServerViewModel: ObservableObject {
                 )
             }
         )
+        toolService.perfRecorder = perfRecorder
+        return toolService
     }
 
     private func resolveAgentRunOracleReviewLaunchSource(
@@ -1136,7 +1143,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     private var agentExploreToolService: AgentExploreMCPToolService {
-        AgentExploreMCPToolService(
+        var toolService = AgentExploreMCPToolService(
             toolName: MCPWindowToolName.agentExplore,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
@@ -1179,11 +1186,14 @@ final class MCPServerViewModel: ObservableObject {
                 )
             }
         )
+        toolService.perfRecorder = perfRecorder
+        return toolService
     }
 
     private var agentManageToolService: AgentManageMCPToolService {
         AgentManageMCPToolService(
             toolName: MCPWindowToolName.agentManage,
+            perfRecorder: perfRecorder,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             resolveSpawnSourceTabID: { [self] metadata in
@@ -3061,6 +3071,7 @@ final class MCPServerViewModel: ObservableObject {
     /// ---------------------------------------------------------------------
     init(
         service: MCPService,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         promptVM: PromptViewModel,
         oracleVM: OracleViewModel,
         workspaceManager: WorkspaceManagerViewModel,
@@ -3078,6 +3089,7 @@ final class MCPServerViewModel: ObservableObject {
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
         self.service = service
+        self.perfRecorder = perfRecorder
         self.windowID = windowID
         self.promptVM = promptVM
         self.oracleVM = oracleVM
