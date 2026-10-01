@@ -279,15 +279,27 @@ final class LifecycleRecorder: @unchecked Sendable {
 final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     private let recorder: LifecycleRecorder
     private let resumeGate: TestReleaseFence?
+    private let snapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus?
+    private let compactEmitsTurnLifecycle: Bool
+    private var eventsContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
     private(set) var hasActiveThread = false
 
-    init(recorder: LifecycleRecorder, resumeGate: TestReleaseFence? = nil) {
+    init(
+        recorder: LifecycleRecorder,
+        resumeGate: TestReleaseFence? = nil,
+        snapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus? = nil,
+        compactEmitsTurnLifecycle: Bool = false
+    ) {
         self.recorder = recorder
         self.resumeGate = resumeGate
+        self.snapshotLatestTurnStatus = snapshotLatestTurnStatus
+        self.compactEmitsTurnLifecycle = compactEmitsTurnLifecycle
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
-        AsyncStream { _ in }
+        AsyncStream { continuation in
+            eventsContinuation = continuation
+        }
     }
 
     func ensureEventsStreamReady() {}
@@ -349,7 +361,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
             runtimeStatus: .idle,
             currentTurnID: nil,
             activeTurnIDs: [],
-            latestTurnStatus: nil
+            latestTurnStatus: snapshotLatestTurnStatus
         )
     }
 
@@ -382,6 +394,11 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
 
     func compactThread() async throws {
         recorder.record("codex:compact")
+        if compactEmitsTurnLifecycle {
+            eventsContinuation?.yield(.turnStarted(turnID: "lifecycle-compact-turn"))
+            eventsContinuation?.yield(.contextCompacted(turnID: "lifecycle-compact-turn"))
+            eventsContinuation?.yield(.turnCompleted(turnID: "lifecycle-compact-turn", status: .completed))
+        }
     }
 
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
