@@ -1,5 +1,6 @@
 import Combine
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import SwiftUI
 
 // MARK: - Sessions Sidebar
@@ -38,6 +39,7 @@ enum AgentSidebarCreatorNavigation {
 }
 
 struct AgentModeSessionsSidebarView: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let rootsStore: AgentWorkspaceRootsSidebarStore
     let agentModeVM: AgentModeViewModel
     @ObservedObject var sidebarUI: AgentSessionSidebarUIStore
@@ -116,7 +118,7 @@ struct AgentModeSessionsSidebarView: View {
 
     var body: some View {
         #if DEBUG
-            let _ = Self.recordBodyMetric()
+            let _ = recordBodyMetric()
         #endif
         VStack(spacing: 0) {
             // Search box at top
@@ -228,8 +230,8 @@ struct AgentModeSessionsSidebarView: View {
     }
 
     #if DEBUG
-        private static func recordBodyMetric() {
-            AgentModePerfDiagnostics.increment("ui.body.agentSessionsSidebar")
+        private func recordBodyMetric() {
+            perfRecorder.increment("ui.body.agentSessionsSidebar")
         }
     #endif
 
@@ -381,6 +383,7 @@ private struct BulkActionChip: View {
 }
 
 struct AgentModeSessionsListView: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let agentModeVM: AgentModeViewModel
     @ObservedObject var sidebarUI: AgentSessionSidebarUIStore
     @ObservedObject var promptManager: PromptViewModel
@@ -450,7 +453,7 @@ struct AgentModeSessionsListView: View {
 
     var body: some View {
         #if DEBUG
-            let _ = Self.recordBodyMetric()
+            let _ = recordBodyMetric()
         #endif
         // The sidebar projection intentionally does not cache exact oversight role. Reading this
         // revision makes a post-storage link projection invalidation re-evaluate the exact role below
@@ -475,7 +478,7 @@ struct AgentModeSessionsListView: View {
             renderedOrder: snapshot.renderedSelectionOrder
         )
         let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
-        let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
+        let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions, perfRecorder: perfRecorder)
         let firstActiveSectionID = activeSections.first?.id
         let selectionState = sidebarUI.selectionState
         let showsSelectionPresentation = selectionState.showsSelectionPresentation
@@ -1089,8 +1092,8 @@ struct AgentModeSessionsListView: View {
     }
 
     #if DEBUG
-        private static func recordBodyMetric() {
-            AgentModePerfDiagnostics.increment("ui.body.agentSessionsList")
+        private func recordBodyMetric() {
+            perfRecorder.increment("ui.body.agentSessionsList")
         }
     #endif
 }
@@ -1215,10 +1218,11 @@ enum AgentSidebarDateSectionBuilder {
     static func activeSections(
         for rows: [AgentModeViewModel.SidebarSession],
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) -> [AgentSidebarActiveDateSection] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let groups = activeGroups(for: rows, now: now, calendar: calendar)
         var sections: [AgentSidebarActiveDateSection] = []
@@ -1238,7 +1242,7 @@ enum AgentSidebarDateSectionBuilder {
             }
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.dateSections.active",
                 startMS: startMS,
                 fields: [
@@ -1291,10 +1295,11 @@ enum AgentSidebarDateSectionBuilder {
         for tabs: [StashedTab],
         now: Date = Date(),
         calendar: Calendar = .current,
-        dateInfo: (StashedTab) -> AgentModeViewModel.SidebarSessionDateInfo
+        dateInfo: (StashedTab) -> AgentModeViewModel.SidebarSessionDateInfo,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) -> [AgentSidebarArchivedDateSection] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         var sections: [AgentSidebarArchivedDateSection] = []
         for stashed in tabs {
@@ -1321,7 +1326,7 @@ enum AgentSidebarDateSectionBuilder {
             }
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.dateSections.archived",
                 startMS: startMS,
                 fields: [
@@ -1338,6 +1343,7 @@ enum AgentSidebarDateSectionBuilder {
 // MARK: - Archived Sessions List
 
 struct ArchivedSessionsList: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let tabs: [StashedTab]
     let hasMore: Bool
     let remainingCount: Int
@@ -1384,7 +1390,8 @@ struct ArchivedSessionsList: View {
     var body: some View {
         let sections = AgentSidebarDateSectionBuilder.archivedSections(
             for: tabs,
-            dateInfo: { dateInfoByStashedTabID[$0.id] ?? agentModeVM.archivedSessionDateInfo(for: $0) }
+            dateInfo: { dateInfoByStashedTabID[$0.id] ?? agentModeVM.archivedSessionDateInfo(for: $0) },
+            perfRecorder: perfRecorder
         )
         let firstSectionID = sections.first?.id
         VStack(spacing: fontPreset.scaledClamped(2, max: 3)) {

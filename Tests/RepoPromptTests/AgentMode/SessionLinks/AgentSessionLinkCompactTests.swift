@@ -1,6 +1,7 @@
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSecureStorage
 import XCTest
 
 /// Live-view-model coverage for the overseer `compact` transaction.
