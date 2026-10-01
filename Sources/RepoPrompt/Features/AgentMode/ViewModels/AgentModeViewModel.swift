@@ -1023,6 +1023,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_syncComposerCallCount: Int = 0
         var test_syncRuntimeMetricsCallCount: Int = 0
         var test_syncRunInteractionCallCount: Int = 0
+        var test_statusPillsSnapshotBuildCount: Int = 0
         var test_workspaceManager: WorkspaceManagerViewModel? {
             workspaceManager
         }

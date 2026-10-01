@@ -3,6 +3,57 @@ import Foundation
 import XCTest
 
 final class AgentSessionLanePolicyTests: XCTestCase {
+    @MainActor
+    func testSharedWarmCompletionDoesNotInvalidateAlreadyAdvertisedModels() async throws {
+        let registry = AgentACPModelRegistry.shared
+        let catalogue = AgentAdvertisedModelCatalog.shared
+        let availability = AgentModelCatalog.AvailabilityContext(openCodeAvailable: true)
+        registry.test_reset(providerID: .openCode)
+        defer { registry.test_reset(providerID: .openCode) }
+        let option = AgentModelOption(
+            rawValue: "warm-race-model", displayName: "Warm race", description: nil,
+            isPlaceholderDefault: false, isProviderDefault: false
+        )
+        XCTAssertTrue(registry.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(options: [option], currentModelRaw: option.rawValue), for: .openCode
+        ))
+        registry.test_clearMemoryPreservingStore(providerID: .openCode)
+        let firstGate = ACPWarmCompletionGate()
+        let secondGate = ACPWarmCompletionGate()
+        let firstParked = expectation(description: "First waiter loaded the shared warm task")
+        let secondParked = expectation(description: "Second waiter loaded the shared warm task")
+        let first = Task {
+            await registry.warmStandardStoreIfNeeded(beforeCompleting: {
+                firstParked.fulfill()
+                await firstGate.wait()
+            })
+        }
+        await fulfillment(of: [firstParked], timeout: 5)
+        let second = Task {
+            await registry.warmStandardStoreIfNeeded(beforeCompleting: {
+                secondParked.fulfill()
+                await secondGate.wait()
+            })
+        }
+        await fulfillment(of: [secondParked], timeout: 5)
+        await firstGate.open()
+        await first.value
+        let options = AgentModelCatalog.options(for: .openCode, availability: availability)
+        XCTAssertTrue(options.contains { $0.rawValue == option.rawValue })
+        XCTAssertNoThrow(try catalogue.selection("openCode:warm-race-model", availability: availability))
+        let generationAfterAdvertising = catalogue.productionGeneration(for: .openCode)
+        await secondGate.open()
+        await second.value
+        XCTAssertEqual(
+            catalogue.productionGeneration(for: .openCode), generationAfterAdvertising,
+            "The second waiter must not invalidate the first waiter's newly advertised catalogue"
+        )
+        XCTAssertNoThrow(
+            try catalogue.selection("openCode:warm-race-model", availability: availability),
+            "A model just advertised without source changes must remain admissible"
+        )
+    }
+
     func testExplicitModelUsesAdvertisedFullIDWithoutRoleSubstitution() throws {
         let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true, grokBuildAvailable: true)
         // Use the production producer, not another list of accepted models.
@@ -376,5 +427,21 @@ final class AgentSessionLanePolicyTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? AgentSessionLanePolicy.RoleResolutionError, .roleUnavailable)
         }
+    }
+}
+
+private actor ACPWarmCompletionGate {
+    private var isOpen = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func open() {
+        isOpen = true
+        continuation?.resume()
+        continuation = nil
     }
 }
