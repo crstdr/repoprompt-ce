@@ -74,25 +74,36 @@ enum AgentOversightUICopy {
     // MARK: - Menus
 
     static let overseeByTitle = "Oversee by"
-    /// Inverse submenu title — always "Oversee ▸" regardless of existing outbound links
-    /// (Cristian, 2026-10-01).
-    static let overseeTitle = "Oversee"
+    /// Candidate submenu for starting outbound links — always "Oversee new ▸" (Cristian,
+    /// 2026-10-01).
+    static let overseeNewTitle = "Oversee new"
+    /// The link-unlink submenu. Approved by Cristian 2026-10-01.
+    static let unlinkTitle = "Unlink"
     static let sessionIDMenuItem = "Session ID…"
     static let noEligibleOverseers = "No eligible overseers"
     static let noSessionsToOversee = "No sessions to oversee"
-    /// Disabled header line atop both oversight menus — one plain line about what the popup
-    /// does. Approved by Cristian 2026-10-01.
+    /// Disabled section labels over the linked-jump lists at the top of the menu. Approved
+    /// by Cristian 2026-10-01.
+    static let overseeingSectionLabel = "Overseeing:"
+    static let overseenBySectionLabel = "Overseen by:"
+    /// Disabled group labels inside the Unlink ▸ submenu — same words, no colon. Approved
+    /// by Cristian 2026-10-01.
+    static let overseeingUnlinkLabel = "Overseeing"
+    static let overseenByUnlinkLabel = "Overseen by"
+    /// Creator-collapse variants of the section labels: the combined label when the creator is
+    /// the row's only overseer, and the standalone label when the creator is not linked.
+    /// Approved by Cristian 2026-10-01.
+    static let createdAndOverseenBySectionLabel = "Created and overseen by:"
+    static let createdBySectionLabel = "Created by:"
+    /// Disabled header line atop the oversight menu when the row has no link sections to
+    /// explain — one plain line about what the popup does. Approved by Cristian 2026-10-01.
     static let oversightMenuHeader = "Manage session oversight"
-    /// Disabled reason shown in the Oversee-by / Oversee context submenus on a row whose chat
+    /// Disabled reason shown in the Oversee-by / Oversee-new context submenus on a row whose chat
     /// has no session ID yet (fresh chat before the first send). Approved by Cristian 2026-10-01.
     static let oversightAvailableAfterFirstMessage = "Available after the first message"
 
     static func openLabel(_ displayName: String) -> String {
         "Open \"\(displayName)\""
-    }
-
-    static func openCreatorLabel(_ creator: String) -> String {
-        "Open creator \"\(creator)\""
     }
 
     /// VoiceOver action name for a checked (linked) menu item: selecting it unlinks.
@@ -115,6 +126,11 @@ enum AgentOversightUICopy {
         availableCount: Int
     ) -> String {
         "Overseen by \(overseenByCount); \(availableCount) available"
+    }
+
+    /// VoiceOver value of the Unlink ▸ submenu.
+    static func unlinkMenuAccessibilityValue(linkCount: Int) -> String {
+        "\(linkCount) linked"
     }
 
     /// Unified capitalization for every "Copy Session ID" surface.

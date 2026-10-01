@@ -3955,6 +3955,13 @@ final class AgentSessionLinkRuntimeBridge {
     ) async -> MonitorProjection {
         let sessionID = candidate.sessionID
         let endpoint = candidate.domainEndpoint
+        // Display names resolve app-wide by session ID: a linked peer whose exact endpoint
+        // incarnation moved (rebind or another window) still names itself, and the compact ID
+        // only shows for a truly unknown session.
+        let candidatesBySessionID = Dictionary(
+            candidates.map { ($0.sessionID, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
 
         var outbound: [AgentMonitorPillProps.Outbound] = []
         var statusSamples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
@@ -4011,6 +4018,7 @@ final class AgentSessionLinkRuntimeBridge {
                 targetEndpoint: targetEndpoint,
                 linkCreatedAt: item.createdAt,
                 displayName: item.displayName ?? target?.resolvedDisplayName
+                    ?? candidatesBySessionID[item.targetSessionID]?.resolvedDisplayName
                     ?? AgentMonitorSessionIDFormatter.short(item.targetSessionID),
                 providerDisplayName: target?.providerDisplayName,
                 locationLabel: target?.locationLabel,
@@ -4034,6 +4042,7 @@ final class AgentSessionLinkRuntimeBridge {
                 observerEndpoint: observerEndpoint,
                 linkCreatedAt: item.createdAt,
                 displayName: observer?.resolvedDisplayName
+                    ?? candidatesBySessionID[item.observerSessionID]?.resolvedDisplayName
                     ?? AgentMonitorSessionIDFormatter.short(item.observerSessionID),
                 // UI only, exactly as on the outbound rows: the observing session's window is what
                 // the user needs to identify here, and it never reaches an agent-facing payload.
