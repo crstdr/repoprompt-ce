@@ -458,10 +458,7 @@ struct AgentSessionRow: View {
             Button(AgentOversightUICopy.overseeingSectionLabel) {}
                 .disabled(true)
             ForEach(menu.linkedTargets) { option in
-                Button(AgentOversightUICopy.openLabel(option.menuLabel)) {
-                    openLinkedSession(option.peerEndpoint)
-                }
-                .accessibilityHint(option.fullIdentityDescription)
+                sidebarOversightJumpItem(option)
             }
         }
         if !menu.linkedObservers.isEmpty {
@@ -472,18 +469,18 @@ struct AgentSessionRow: View {
             ) {}
                 .disabled(true)
             ForEach(menu.linkedObservers) { option in
-                Button(AgentOversightUICopy.openLabel(option.menuLabel)) {
-                    openLinkedSession(option.peerEndpoint)
-                }
-                .accessibilityHint(option.fullIdentityDescription)
+                sidebarOversightJumpItem(option)
             }
         }
         if menu.showsCreatedBySection, let creatorLabel = menu.createdByLabel {
             Button(AgentOversightUICopy.createdBySectionLabel) {}
                 .disabled(true)
-            Button(AgentOversightUICopy.openLabel(creatorLabel)) {
+            Button {
                 onOpenCreator?()
+            } label: {
+                Label(creatorLabel, systemImage: AgentOversightUICopy.jumpItemIcon)
             }
+            .accessibilityHint(AgentOversightUICopy.openHint(creatorLabel))
         }
 
         if hasTopSections {
@@ -542,14 +539,14 @@ struct AgentSessionRow: View {
             Divider()
             Menu {
                 if !menu.linkedTargets.isEmpty {
-                    Button(AgentOversightUICopy.overseeingUnlinkLabel) {}
+                    Button(AgentOversightUICopy.overseeingSectionLabel) {}
                         .disabled(true)
                     ForEach(menu.linkedTargets) { option in
                         sidebarOversightUnlinkOutboundItem(option, menu: menu)
                     }
                 }
                 if !menu.linkedObservers.isEmpty {
-                    Button(AgentOversightUICopy.overseenByUnlinkLabel) {}
+                    Button(AgentOversightUICopy.overseenBySectionLabel) {}
                         .disabled(true)
                     ForEach(menu.linkedObservers) { option in
                         sidebarOversightUnlinkInboundItem(option, menu: menu)
@@ -565,6 +562,19 @@ struct AgentSessionRow: View {
                 )
             )
         }
+    }
+
+    /// One jump item under a linked section — the peer's display label plus the link arrow;
+    /// selecting it opens that session across windows.
+    private func sidebarOversightJumpItem(
+        _ option: AgentSidebarOversightMenuProps.PeerOption
+    ) -> some View {
+        Button {
+            openLinkedSession(option.peerEndpoint)
+        } label: {
+            Label(option.menuLabel, systemImage: AgentOversightUICopy.jumpItemIcon)
+        }
+        .accessibilityHint(AgentOversightUICopy.openHint(option.menuLabel))
     }
 
     /// One candidate row in the Oversee-by submenu. Selecting links after the shared

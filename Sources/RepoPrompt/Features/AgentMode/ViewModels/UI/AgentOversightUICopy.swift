@@ -82,19 +82,19 @@ enum AgentOversightUICopy {
     static let sessionIDMenuItem = "Session ID…"
     static let noEligibleOverseers = "No eligible overseers"
     static let noSessionsToOversee = "No sessions to oversee"
-    /// Disabled section labels over the linked-jump lists at the top of the menu. Approved
-    /// by Cristian 2026-10-01.
-    static let overseeingSectionLabel = "Overseeing:"
-    static let overseenBySectionLabel = "Overseen by:"
-    /// Disabled group labels inside the Unlink ▸ submenu — same words, no colon. Approved
-    /// by Cristian 2026-10-01.
-    static let overseeingUnlinkLabel = "Overseeing"
-    static let overseenByUnlinkLabel = "Overseen by"
+    /// Disabled labels over the linked-jump lists at the top of the menu — and for the
+    /// matching groups inside Unlink ▸, which reuse these same constants. Colon-less per
+    /// Cristian 2026-10-01.
+    static let overseeingSectionLabel = "Overseeing"
+    static let overseenBySectionLabel = "Overseen by"
     /// Creator-collapse variants of the section labels: the combined label when the creator is
     /// the row's only overseer, and the standalone label when the creator is not linked.
     /// Approved by Cristian 2026-10-01.
-    static let createdAndOverseenBySectionLabel = "Created and overseen by:"
-    static let createdBySectionLabel = "Created by:"
+    static let createdAndOverseenBySectionLabel = "Created and overseen by"
+    static let createdBySectionLabel = "Created by"
+    /// SF Symbol marking jump items (the linked/creator sessions) so they read as links.
+    /// Approved by Cristian 2026-10-01.
+    static let jumpItemIcon = "arrow.up.forward"
     /// Disabled header line atop the oversight menu when the row has no link sections to
     /// explain — one plain line about what the popup does. Approved by Cristian 2026-10-01.
     static let oversightMenuHeader = "Manage session oversight"
@@ -102,8 +102,9 @@ enum AgentOversightUICopy {
     /// has no session ID yet (fresh chat before the first send). Approved by Cristian 2026-10-01.
     static let oversightAvailableAfterFirstMessage = "Available after the first message"
 
-    static func openLabel(_ displayName: String) -> String {
-        "Open \"\(displayName)\""
+    /// VoiceOver hint on a linked/creator jump item: selecting it opens that session.
+    static func openHint(_ displayName: String) -> String {
+        "Opens \"\(displayName)\""
     }
 
     /// VoiceOver action name for a checked (linked) menu item: selecting it unlinks.
