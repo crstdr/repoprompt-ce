@@ -1126,7 +1126,7 @@ struct AgentSessionRow: View {
         .hoverTooltip(AgentOversightUICopy.manageOversightTooltip)
         .accessibilityLabel(AgentOversightUICopy.manageOversightTooltip)
         .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
-        .accessibilityHint("Choose exact Agent sessions that oversee this session.")
+        .accessibilityHint("Manage which exact Agent sessions oversee or are overseen by this session.")
     }
 
     /// The two Oversee submenus for an ID-less row: the labels stay enabled so the reason is

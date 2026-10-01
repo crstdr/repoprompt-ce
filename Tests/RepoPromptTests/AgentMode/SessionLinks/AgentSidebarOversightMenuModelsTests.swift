@@ -631,10 +631,10 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
 
     // MARK: - Unified menu model (approved 2026-10-01)
 
-    /// The mark, the hover glyph and the context menu all render this one props model: each
-    /// direction must partition into exactly the linked jump items and the candidate submenu,
-    /// with no overlap and nothing dropped.
-    func testEverySurfaceReadsTheSamePartitionedModel() {
+    /// Model-partition check for the shared props the mark, hover glyph and context menu all
+    /// render: each direction splits into exactly the linked jump items plus the candidate
+    /// submenu entries — disjoint, complete, and carrying the expected endpoints.
+    func testMenuPropsPartitionIntoLinkedAndAvailableSubsets() {
         let target = candidate(windowID: 1, displayName: "Row")
         let linkedObserver = candidate(windowID: 2, displayName: "Overseer")
         let availableObserver = candidate(windowID: 3, displayName: "Candidate")
@@ -653,6 +653,8 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         let observerEndpoints = Set(menu.observerOptions.map(\.peerEndpoint))
         let linkedObserverEndpoints = Set(menu.linkedObservers.map(\.peerEndpoint))
         let availableObserverEndpoints = Set(menu.availableObservers.map(\.peerEndpoint))
+        XCTAssertEqual(linkedObserverEndpoints, [linkedObserver.domainEndpoint])
+        XCTAssertEqual(availableObserverEndpoints, [availableObserver.domainEndpoint])
         XCTAssertEqual(
             observerEndpoints,
             linkedObserverEndpoints.union(availableObserverEndpoints)
@@ -662,11 +664,17 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         let targetEndpoints = Set(menu.targetOptions.map(\.peerEndpoint))
         let linkedTargetEndpoints = Set(menu.linkedTargets.map(\.peerEndpoint))
         let availableTargetEndpoints = Set(menu.availableTargets.map(\.peerEndpoint))
+        XCTAssertEqual(linkedTargetEndpoints, [linkedTarget.domainEndpoint])
+        XCTAssertFalse(availableTargetEndpoints.isEmpty)
         XCTAssertEqual(
             targetEndpoints,
             linkedTargetEndpoints.union(availableTargetEndpoints)
         )
         XCTAssertTrue(linkedTargetEndpoints.isDisjoint(with: availableTargetEndpoints))
+
+        // Candidates never carry a linked relationship — the checkmark-unlink contract is gone.
+        XCTAssertTrue(menu.availableObservers.allSatisfy { $0.relationship == .available })
+        XCTAssertTrue(menu.availableTargets.allSatisfy { $0.relationship == .available })
     }
 
     /// A linked overseer whose live incarnation sits at a different endpoint — e.g. rebound or
