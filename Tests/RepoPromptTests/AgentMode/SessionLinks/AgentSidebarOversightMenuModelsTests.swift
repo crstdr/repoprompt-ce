@@ -628,4 +628,163 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             )
         )
     }
+
+    // MARK: - Unified menu model (approved 2026-10-01)
+
+    /// Model-partition check for the shared props the mark, hover glyph and context menu all
+    /// render: each direction splits into exactly the linked jump items plus the candidate
+    /// submenu entries — disjoint, complete, and carrying the expected endpoints.
+    func testMenuPropsPartitionIntoLinkedAndAvailableSubsets() {
+        let target = candidate(windowID: 1, displayName: "Row")
+        let linkedObserver = candidate(windowID: 2, displayName: "Overseer")
+        let availableObserver = candidate(windowID: 3, displayName: "Candidate")
+        let linkedTarget = candidate(windowID: 4, displayName: "Managed")
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                linked: [Linked(endpoint: linkedObserver.domainEndpoint, linkID: UUID(), generation: 1)],
+                linkedTargets: [Linked(endpoint: linkedTarget.domainEndpoint, linkID: UUID(), generation: 1)],
+                activeOutboundObserverEndpoints: [availableObserver.domainEndpoint]
+            ),
+            candidates: [target, linkedObserver, availableObserver, linkedTarget]
+        )
+
+        let observerEndpoints = Set(menu.observerOptions.map(\.peerEndpoint))
+        let linkedObserverEndpoints = Set(menu.linkedObservers.map(\.peerEndpoint))
+        let availableObserverEndpoints = Set(menu.availableObservers.map(\.peerEndpoint))
+        XCTAssertEqual(linkedObserverEndpoints, [linkedObserver.domainEndpoint])
+        XCTAssertEqual(availableObserverEndpoints, [availableObserver.domainEndpoint])
+        XCTAssertEqual(
+            observerEndpoints,
+            linkedObserverEndpoints.union(availableObserverEndpoints)
+        )
+        XCTAssertTrue(linkedObserverEndpoints.isDisjoint(with: availableObserverEndpoints))
+
+        let targetEndpoints = Set(menu.targetOptions.map(\.peerEndpoint))
+        let linkedTargetEndpoints = Set(menu.linkedTargets.map(\.peerEndpoint))
+        let availableTargetEndpoints = Set(menu.availableTargets.map(\.peerEndpoint))
+        XCTAssertEqual(linkedTargetEndpoints, [linkedTarget.domainEndpoint])
+        XCTAssertFalse(availableTargetEndpoints.isEmpty)
+        XCTAssertEqual(
+            targetEndpoints,
+            linkedTargetEndpoints.union(availableTargetEndpoints)
+        )
+        XCTAssertTrue(linkedTargetEndpoints.isDisjoint(with: availableTargetEndpoints))
+
+        // Candidates never carry a linked relationship — the checkmark-unlink contract is gone.
+        XCTAssertTrue(menu.availableObservers.allSatisfy { $0.relationship == .available })
+        XCTAssertTrue(menu.availableTargets.allSatisfy { $0.relationship == .available })
+    }
+
+    /// A linked overseer whose live incarnation sits at a different endpoint — e.g. rebound or
+    /// living in another window — still resolves its name from the app-wide candidate list by
+    /// session ID instead of degrading to the compact ID. Reproduces the live-check bug where
+    /// the overseer rendered as `6F23…A872`.
+    func testCrossWindowLinkedObserverNameResolvesBySessionID() throws {
+        let sessionID = id("ABCD0000-0000-0000-0000-00000000000B")
+        let target = candidate(windowID: 1, displayName: "Row")
+        // The linked endpoint captured at grant time: different window and transition generation.
+        let linkedEndpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: 7,
+            workspaceID: id("20000000-0000-0000-0000-000000000002"),
+            tabID: UUID(),
+            sessionID: sessionID,
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 3
+        )
+        // The live candidate for the same session: another endpoint in another window.
+        let livePeer = candidate(
+            windowID: 7,
+            workspaceID: id("20000000-0000-0000-0000-000000000002"),
+            tabID: UUID(),
+            sessionID: sessionID,
+            transitionGeneration: 4,
+            displayName: "RepoPrompt PM",
+            locationLabel: "kidfriendly-overseer (main)"
+        )
+        XCTAssertNotEqual(linkedEndpoint, livePeer.domainEndpoint)
+
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                linked: [Linked(endpoint: linkedEndpoint, linkID: UUID(), generation: 1)]
+            ),
+            candidates: [target, livePeer]
+        )
+
+        let linked = try XCTUnwrap(menu.linkedObservers.first)
+        XCTAssertEqual(linked.menuLabel, "kidfriendly-overseer (main): RepoPrompt PM")
+        XCTAssertEqual(menu.inboundObserverNames, ["RepoPrompt PM"])
+    }
+
+    /// The creator label resolves the same way: a live creator in another window names itself
+    /// even when the persisted index label is stale or missing.
+    func testCreatorLabelResolvesTheLiveCandidateNameBySessionID() {
+        let creatorID = id("ABCD0000-0000-0000-0000-00000000000C")
+        let target = candidate(windowID: 1, displayName: "Row")
+        let creator = candidate(
+            windowID: 7,
+            workspaceID: id("20000000-0000-0000-0000-000000000002"),
+            sessionID: creatorID,
+            displayName: "RepoPrompt PM"
+        )
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(target: target),
+            candidates: [target, creator],
+            createdByLabel: AgentMonitorSessionIDFormatter.short(creatorID),
+            creatorSessionID: creatorID
+        )
+        XCTAssertEqual(menu.createdByLabel, "RepoPrompt PM")
+    }
+
+    /// Creator collapse: sole-overseer creator merges the section; a creator who still oversees
+    /// alongside others or not at all never produces a separate Created-by section.
+    func testCreatorSectionCollapseRules() {
+        let target = candidate(windowID: 1, displayName: "Row")
+        let creator = candidate(windowID: 2, displayName: "Creator")
+        let other = candidate(windowID: 3, displayName: "Other overseer")
+        let soleMenu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                linked: [Linked(endpoint: creator.domainEndpoint, linkID: UUID(), generation: 1)]
+            ),
+            candidates: [target, creator],
+            createdByLabel: "Creator",
+            creatorSessionID: creator.sessionID
+        )
+        XCTAssertTrue(soleMenu.creatorIsOverseer)
+        XCTAssertTrue(soleMenu.creatorIsSoleOverseer)
+        XCTAssertFalse(soleMenu.showsCreatedBySection)
+
+        let sharedMenu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                linked: [
+                    Linked(endpoint: creator.domainEndpoint, linkID: UUID(), generation: 1),
+                    Linked(endpoint: other.domainEndpoint, linkID: UUID(), generation: 2)
+                ]
+            ),
+            candidates: [target, creator, other],
+            createdByLabel: "Creator",
+            creatorSessionID: creator.sessionID
+        )
+        XCTAssertTrue(sharedMenu.creatorIsOverseer)
+        XCTAssertFalse(sharedMenu.creatorIsSoleOverseer)
+        XCTAssertFalse(sharedMenu.showsCreatedBySection)
+
+        let unlinkedCreatorMenu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(target: target),
+            candidates: [target, creator],
+            createdByLabel: "Creator",
+            creatorSessionID: creator.sessionID
+        )
+        XCTAssertFalse(unlinkedCreatorMenu.creatorIsOverseer)
+        XCTAssertTrue(unlinkedCreatorMenu.showsCreatedBySection)
+    }
 }
