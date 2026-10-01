@@ -193,7 +193,7 @@ struct AgentSessionRow: View {
     /// Non-nil when the row could host oversight but lacks a bound session ID (a fresh chat
     /// before the first send, or any ID-less row): the context menu then offers the Oversee-by
     /// and Oversee submenus containing only this disabled reason.
-    var oversightUnavailableReason: String?
+    var sidebarOversightUnavailableReason: String?
     /// Resolves the row's current exact target even when lifecycle eligibility makes its menu nil.
     /// This fences feedback from a system menu that stayed open across an in-place rebind.
     var resolveSidebarOversightTargetEndpoint:
@@ -284,7 +284,9 @@ struct AgentSessionRow: View {
         /// depends on this list, so resolving it live while the menu is open reintroduces the
         /// removed-item measurement crash.
         var sidebarOversightMenu: AgentSidebarOversightMenuProps?
-        var oversightUnavailableReason: String?
+        /// Frozen alongside the menu for the same reason — an ID gaining a session mid-menu
+        /// must not swap a disabled pair for a live section while the menu is open.
+        var sidebarOversightUnavailableReason: String?
     }
 
     @State private var menuSnapshot = ContextMenuSnapshot(
@@ -294,7 +296,7 @@ struct AgentSessionRow: View {
         hasOnStash: false,
         hasOnDismissAttention: false,
         sidebarOversightMenu: nil,
-        oversightUnavailableReason: nil
+        sidebarOversightUnavailableReason: nil
     )
 
     /// The oversight menu as it should appear, or nil when the section must not be offered.
@@ -313,9 +315,12 @@ struct AgentSessionRow: View {
 
     /// An ID-less row (a fresh chat before the first send) still lists both Oversee submenus in
     /// its context menu — enabled labels containing only the disabled reason — so the feature is
-    /// discoverable without minting a session ID early.
+    /// discoverable without minting a session ID early. Suppressed while direct mutations are
+    /// off (multi-select, bulk action in flight) — those modes hide the oversight section.
     var showsDisabledOversightContextSubmenus: Bool {
-        oversightUnavailableReason != nil && presentableSidebarOversightMenu == nil
+        allowsDirectMutations
+            && sidebarOversightUnavailableReason != nil
+            && presentableSidebarOversightMenu == nil
     }
 
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -1113,6 +1118,7 @@ struct AgentSessionRow: View {
                 )
             }
             .accessibilityLabel(AgentOversightUICopy.overseeByTitle)
+            .accessibilityValue(reason)
 
             Menu {
                 Button(reason) {}
@@ -1124,6 +1130,7 @@ struct AgentSessionRow: View {
                 )
             }
             .accessibilityLabel(AgentOversightUICopy.overseeTitle)
+            .accessibilityValue(reason)
         }
     }
 
@@ -1420,7 +1427,7 @@ struct AgentSessionRow: View {
             if let sidebarOversightMenu = menuSnapshot.sidebarOversightMenu {
                 sidebarOversightContextMenu(sidebarOversightMenu)
                 Divider()
-            } else if let reason = menuSnapshot.oversightUnavailableReason {
+            } else if let reason = menuSnapshot.sidebarOversightUnavailableReason {
                 sidebarOversightUnavailableContextMenu(reason: reason)
                 Divider()
             }
@@ -1470,8 +1477,8 @@ struct AgentSessionRow: View {
                     hasOnStash: onStash != nil,
                     hasOnDismissAttention: onDismissAttention != nil,
                     sidebarOversightMenu: presentableSidebarOversightMenu,
-                    oversightUnavailableReason: showsDisabledOversightContextSubmenus
-                        ? oversightUnavailableReason
+                    sidebarOversightUnavailableReason: showsDisabledOversightContextSubmenus
+                        ? sidebarOversightUnavailableReason
                         : nil
                 )
             }

@@ -179,6 +179,7 @@ final class AgentOversightMarkRenderTests: XCTestCase {
     func testRowWithoutRolePaintsNoPalettePixels() {
         let (rep, window) = rasterize(row(role: .none, interactive: false))
         defer { window.close() }
+        XCTAssertGreaterThan(rep.pixelsWide, 0, "raster produced an empty bitmap")
         XCTAssertEqual(
             pixelCount(near: AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true), in: rep),
             0
@@ -227,12 +228,21 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         )
 
         var idlessRow = row(role: .none, interactive: false)
-        idlessRow.oversightUnavailableReason = AgentOversightUICopy.oversightAvailableAfterFirstMessage
+        idlessRow.sidebarOversightUnavailableReason =
+            AgentOversightUICopy.oversightAvailableAfterFirstMessage
         XCTAssertTrue(idlessRow.showsDisabledOversightContextSubmenus)
+
+        // Multi-select / bulk-mutation modes suppress the oversight section entirely.
+        var suppressedRow = row(role: .none, interactive: false)
+        suppressedRow.sidebarOversightUnavailableReason =
+            AgentOversightUICopy.oversightAvailableAfterFirstMessage
+        suppressedRow.showsSelectionPresentation = true
+        XCTAssertFalse(suppressedRow.showsDisabledOversightContextSubmenus)
 
         // A bound row resolves a live menu — the disabled pair must not appear alongside it.
         var linkedRow = row(role: .none, interactive: true)
-        linkedRow.oversightUnavailableReason = AgentOversightUICopy.oversightAvailableAfterFirstMessage
+        linkedRow.sidebarOversightUnavailableReason =
+            AgentOversightUICopy.oversightAvailableAfterFirstMessage
         XCTAssertFalse(linkedRow.showsDisabledOversightContextSubmenus)
 
         // And a bound row never carries the reason.
