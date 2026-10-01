@@ -24,6 +24,15 @@ extension AgentModeViewModel {
         ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
+    /// Publishes only when the stored snapshot actually differs — the link-projection publisher
+    /// calls this on every mutation, and most mutations leave the pills untouched.
+    func syncStatusPillsUIStateIfChanged() {
+        let published = ui.statusPills.snapshot
+        if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
+            syncStatusPillsUIState()
+        }
+    }
+
     /// Persistent projection for the primary execution root. The initial intent
     /// remains deferred until first send; committed bindings remain visible afterward.
     func executionLocationProps(tabID: UUID?) -> AgentExecutionLocationProps? {

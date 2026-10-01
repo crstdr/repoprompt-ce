@@ -51,7 +51,7 @@ package actor DomainAgentSessionLinkAuthority {
     /// This is deliberately not `DomainAgentSessionLinkLease`: that lease represents an
     /// observer-origin monitor operation and carries a monitor capability. An attention request runs in
     /// the inverse direction, and the exact active grant is its whole authority.
-    package struct RequestAttentionAuthorization: Hashable, Sendable {
+    package struct RequestAttentionAuthorization: Hashable {
         package let runtimeID: UUID
         package let runtimeGeneration: UInt64
         package let reference: DomainAgentSessionLinkReference
@@ -87,7 +87,7 @@ package actor DomainAgentSessionLinkAuthority {
         }
     }
 
-    package enum RequestAttentionAuthorizationError: Error, Equatable, Sendable {
+    package enum RequestAttentionAuthorizationError: Error, Equatable {
         /// Indistinguishable absence, stale routing, or authorization denial.
         case denied
         /// More than one exact live grant can satisfy the request.
@@ -540,7 +540,8 @@ package actor DomainAgentSessionLinkAuthority {
                 observerSessionID: record.grant.observer.sessionID,
                 targetSessionID: targetSessionID,
                 displayName: targets[targetSessionID]?.snapshot.displayName,
-                capabilities: record.grant.capabilities
+                capabilities: record.grant.capabilities,
+                createdAt: record.grant.createdAt
             ))
         }
         items.sort(by: Self.orderedByTarget)
@@ -581,7 +582,8 @@ package actor DomainAgentSessionLinkAuthority {
                 observerSessionID: record.grant.observer.sessionID,
                 targetSessionID: record.grant.target.sessionID,
                 displayName: nil,
-                capabilities: record.grant.capabilities
+                capabilities: record.grant.capabilities,
+                createdAt: record.grant.createdAt
             ))
         }
         items.sort(by: Self.orderedByObserver)
