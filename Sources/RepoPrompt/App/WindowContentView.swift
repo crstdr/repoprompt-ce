@@ -63,6 +63,7 @@ struct WindowContentView: View {
 
                 guard !windowStatesManager.isTerminating else {
                     windowState.aiQueriesService.cancelQuery()
+                    windowState.mcpServer.stopServiceObservation()
                     return
                 }
 
