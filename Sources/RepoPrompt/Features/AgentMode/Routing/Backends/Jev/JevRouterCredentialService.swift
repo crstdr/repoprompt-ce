@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSecureStorage
 
 actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     enum ValidationResult: Equatable {
@@ -9,7 +10,7 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     }
 
     static let pinnedModel = "jev-1.13.0"
-    static let routingPolicyVersion = "jev-1.13.0-rpce-session-routing-v6-model-then-effort"
+    static let routingPolicyVersion = "jev-1.13.0-rpce-session-routing-v7-bounded-excerpt"
 
     private let secureKeys: SecureKeysService
     private let client: any JevRoutingClientProtocol

@@ -3,7 +3,10 @@ import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
+import RepoPromptRegexCore
 import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 @MainActor
 final class MCPFileToolProvider: MCPAppToolProviding {
@@ -398,11 +401,8 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     )
                 } else {
                     if !authority.isRunlessOneShotHint {
-                        guard try await dependencies.files.drainReadFileAutoSelection(
-                            metadata,
-                            .canonicalSelection
-                        ) == .completed else {
-                            throw CancellationError()
+                        try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                            try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection)
                         }
                     }
                     files = try await dependencies.context.resolveSelectedFilesForCodeStructure(
@@ -490,8 +490,8 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction)
                 if mode.lowercased() == "selected" {
                     if !authority.isRunlessOneShotHint {
-                        guard try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
-                            throw CancellationError()
+                        try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                            try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection)
                         }
                     }
                 }

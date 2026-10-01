@@ -292,6 +292,8 @@ struct GlobalDefaults: Codable, Equatable {
     var recommendationProviderFilterRaw: [String]?
     /// Cross-workspace override that disables Code Maps without mutating per-workspace modes.
     var codeMapsGloballyDisabled: Bool?
+    /// Non-Git Code Maps require an explicit opt-in; missing legacy values remain disabled.
+    var nonGitCodeMapsEnabled: Bool?
     /// Global per-repository visual identities for Git worktrees.
     /// Stored as an additive optional field for schema-compatible rollout.
     var worktreeVisualIdentitiesByRepositoryID: [String: WorktreeVisualIdentityRepositoryBucket]?
@@ -353,6 +355,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     @Published private(set) var chatSettings: [UUID: ChatGlobalSettings] = [:]
     @Published private(set) var agentModelsSettingsByWorkspaceID: [UUID: WorkspaceAgentModelsSettings] = [:]
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
+    @Published private(set) var nonGitCodeMapsEnabled: Bool = false
     @Published private(set) var modelRouterSettingsRevision: UInt64 = 0
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
     /// UI surfaces this when the store cannot safely repair the document automatically.
@@ -1874,6 +1877,27 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         updateModelOverridesScalar(commit: commit, mutation)
     }
 
+    // MARK: - Notifications
+
+    func notificationPreferences() -> NotificationPreferences {
+        (scalarPreferences.notifications ?? GlobalScalarPreferences.NotificationSettings()).resolved()
+    }
+
+    func updateNotificationSettings(
+        commit: Bool = true,
+        _ mutation: (inout GlobalScalarPreferences.NotificationSettings) -> Void
+    ) {
+        let before = scalarPreferences.notifications
+        updateScalarPreferences(commit: commit) { preferences in
+            var settings = preferences.notifications ?? GlobalScalarPreferences.NotificationSettings()
+            mutation(&settings)
+            preferences.notifications = settings
+        }
+        if before != scalarPreferences.notifications {
+            NotificationCenter.default.post(name: .notificationPreferencesDidChange, object: self)
+        }
+    }
+
     private func updateUIScalar(
         commit: Bool,
         _ mutation: (inout GlobalScalarPreferences.UISettings) -> Void
@@ -2195,6 +2219,17 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         }
         globalDefaults.codeMapsGloballyDisabled = disabled
         codeMapsGloballyDisabled = disabled
+        if commit {
+            save()
+        }
+    }
+
+    func setNonGitCodeMapsEnabled(_ enabled: Bool, commit: Bool = true) {
+        guard nonGitCodeMapsEnabled != enabled || (globalDefaults.nonGitCodeMapsEnabled ?? false) != enabled else {
+            return
+        }
+        globalDefaults.nonGitCodeMapsEnabled = enabled
+        nonGitCodeMapsEnabled = enabled
         if commit {
             save()
         }
@@ -2657,6 +2692,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
         }
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
+        nonGitCodeMapsEnabled = globalDefaults.nonGitCodeMapsEnabled ?? false
         persistenceBlockReason = fileStore.blockReason
         if persistenceBlockReason == nil,
            migratedContextBuilderState.didChange
@@ -2757,6 +2793,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             let disabledInvalidSync = disableInvalidLoadedAgentModelsSyncState()
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
+            nonGitCodeMapsEnabled = globalDefaults.nonGitCodeMapsEnabled ?? false
             persistenceBlockReason = fileStore.blockReason
             if persistenceBlockReason == nil,
                migratedContextBuilderState.didChange

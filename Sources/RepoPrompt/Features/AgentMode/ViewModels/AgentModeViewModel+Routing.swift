@@ -135,7 +135,10 @@ extension AgentModeViewModel {
               let backendID = configuration.selectedBackendID,
               runtime.isBackendReady(backendID)
         else {
-            return .blocked(message: "Model Router is unavailable. Turn it off to send with the current selection.")
+            return await submitUserTurnAfterAutoEffort(
+                text: text, claim: claim, session: session, destinationTabID: destinationTabID,
+                routerAudit: .init(configured: true, eligible: true, judgmentRequested: false, decision: .unavailable)
+            )
         }
 
         let providers = providers(for: .primarySession, configuration: configuration)
@@ -178,6 +181,20 @@ extension AgentModeViewModel {
         }
         let candidates = stagedResult.candidates
         let outcome = stagedResult.outcome
+        var routedAudit = AgentAutomationTurnAudit.Feature(
+            configured: true,
+            eligible: true,
+            judgmentRequested: stagedResult.judgmentRequested,
+            decision: .selected,
+            fallbackApplied: stagedResult.effortFallback
+        )
+        let fallbackAudit = AgentAutomationTurnAudit.Feature(
+            configured: true,
+            eligible: true,
+            judgmentRequested: stagedResult.judgmentRequested,
+            decision: .fallback,
+            fallbackApplied: true
+        )
 
         let currentConfiguration = modelRouterSettingsStore.modelRouterConfiguration()
         guard composerSubmitClaimIsCurrent(claim),
@@ -192,12 +209,20 @@ extension AgentModeViewModel {
         switch outcome {
         case let .selected(opaqueKey, _):
             guard let selected = candidates.only(where: { $0.opaqueKey == opaqueKey }) else {
-                return .blocked(message: "The router returned an invalid target.")
+                return await submitUserTurnAfterAutoEffort(
+                    text: text, claim: claim, session: session, destinationTabID: destinationTabID,
+                    routerAudit: fallbackAudit
+                )
             }
             let baseline = RoutedSelectionRollback(target: executableTarget(for: session))
             guard applyRoutingTarget(selected.target, to: session) else {
-                return .blocked(message: "The routed target is no longer available.")
+                return await submitUserTurnAfterAutoEffort(
+                    text: text, claim: claim, session: session, destinationTabID: destinationTabID,
+                    routerAudit: fallbackAudit
+                )
             }
+            routedAudit.chosenModelRaw = selected.target.modelRaw
+            routedAudit.chosenEffortRaw = selected.target.reasoningEffortRaw
             guard composerSubmitClaimIsCurrent(claim),
                   sessions[destinationTabID] === session,
                   modelRouterSettingsStore.modelRouterConfiguration().revision == configuration.revision,
@@ -209,7 +234,8 @@ extension AgentModeViewModel {
             let result = submitUserTurn(
                 text: text,
                 tabID: destinationTabID,
-                rawDraftText: claim.attempt.rawDraftSnapshot
+                rawDraftText: claim.attempt.rawDraftSnapshot,
+                routerAudit: routedAudit
             )
             if result != .submitted {
                 restoreRoutingSelection(baseline, on: session)
@@ -219,7 +245,10 @@ extension AgentModeViewModel {
             }
             return result
         case .abstained, .failed:
-            return .blocked(message: "The Router could not choose a target. Retry, or turn off Router to use your current selection.")
+            return await submitUserTurnAfterAutoEffort(
+                text: text, claim: claim, session: session, destinationTabID: destinationTabID,
+                routerAudit: fallbackAudit
+            )
         case .cancelled:
             return .blocked(message: "Model routing was cancelled.")
         }
@@ -231,27 +260,32 @@ extension AgentModeViewModel {
         text: String,
         claim: AgentComposerSubmitClaim,
         session: TabSession,
-        destinationTabID: UUID
+        destinationTabID: UUID,
+        routerAudit: AgentAutomationTurnAudit.Feature? = nil
     ) async -> UserTurnSubmissionResult {
         guard modelRouterSettingsStore.autoEffortEnabled() else {
             return submitUserTurn(
                 text: text,
                 tabID: destinationTabID,
-                rawDraftText: claim.attempt.rawDraftSnapshot
+                rawDraftText: claim.attempt.rawDraftSnapshot,
+                routerAudit: routerAudit
             )
         }
-        let selection = await chooseAutoEffortForUserTurn(
+        let choice = await chooseAutoEffortForUserTurn(
             text: claim.attempt.rawDraftSnapshot,
             session: session,
             workflow: session.selectedWorkflow
         )
+        let selection = choice.selection
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session
         else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
         let result = submitUserTurn(
             text: text,
             tabID: destinationTabID,
             rawDraftText: claim.attempt.rawDraftSnapshot,
-            autoEffortSelection: selection
+            autoEffortSelection: selection,
+            autoEffortAudit: choice.audit,
+            routerAudit: routerAudit
         )
         if result == .submitted, let selection {
             recordSubmittedAutoEffort(selection, for: session)
@@ -265,15 +299,20 @@ extension AgentModeViewModel {
         text: String,
         session: TabSession,
         workflow: AgentWorkflowDefinition?
-    ) async -> AutoEffortTurnSelection? {
-        guard modelRouterSettingsStore.autoEffortEnabled(),
-              !session.runState.isActive,
+    ) async -> (selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature) {
+        guard modelRouterSettingsStore.autoEffortEnabled() else {
+            return (nil, .init(configured: false, eligible: false, judgmentRequested: false, decision: .disabled))
+        }
+        guard !session.runState.isActive,
               AutoEffortModelPolicy.shouldJudgeWorkflow(workflow),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"),
-              let maskedExcerpt = AutoEffortTaskSummary.make(from: text),
-              let runtime = modelRouterRuntime,
-              runtime.isBackendReady(.jev)
-        else { return nil }
+              let maskedExcerpt = AutoEffortTaskSummary.make(from: text)
+        else {
+            return (nil, .init(configured: true, eligible: false, judgmentRequested: false, decision: .ineligible))
+        }
+        guard let runtime = modelRouterRuntime, runtime.isBackendReady(.jev) else {
+            return (nil, .init(configured: true, eligible: true, judgmentRequested: false, decision: .unavailable))
+        }
 
         let provider = session.selectedAgent
         let modelRaw = session.selectedModelRaw
@@ -284,7 +323,7 @@ extension AgentModeViewModel {
         let manualEffortRaw: String?
         switch provider {
         case .codexExec:
-            guard let base = CodexModelSpecifier(raw: modelRaw).baseModel else { return nil }
+            guard let base = CodexModelSpecifier(raw: modelRaw).baseModel else { return ineligibleAutoEffortChoice() }
             let option = codexCoordinator.modelOptions(for: .codexExec).first {
                 CodexModelSpecifier(raw: $0.rawValue).baseModel?.caseInsensitiveCompare(base) == .orderedSame
             }
@@ -295,7 +334,7 @@ extension AgentModeViewModel {
             )
             manualEffortRaw = codexCoordinator.effectiveCodexSelection(for: session).reasoningEffort
         case .claudeCode:
-            guard let base = ClaudeModelSpecifier(raw: modelRaw).baseModel else { return nil }
+            guard let base = ClaudeModelSpecifier(raw: modelRaw).baseModel else { return ineligibleAutoEffortChoice() }
             modelID = base
             efforts = AutoEffortModelPolicy.claudeEfforts(
                 modelRaw: modelRaw,
@@ -306,9 +345,9 @@ extension AgentModeViewModel {
             )
             manualEffortRaw = claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
         default:
-            return nil
+            return ineligibleAutoEffortChoice()
         }
-        guard efforts.count >= 2 else { return nil }
+        guard efforts.count >= 2 else { return ineligibleAutoEffortChoice() }
         let judgmentID = UUID()
         session.autoEffortJudgmentID = judgmentID
         if currentTabID == session.tabID { syncStatusPillsUIState() }
@@ -333,19 +372,35 @@ extension AgentModeViewModel {
               session.selectedModelRaw == modelRaw,
               !session.runState.isActive,
               let chosen, efforts.contains(chosen)
-        else { return nil }
+        else {
+            return (nil, .init(configured: true, eligible: true, judgmentRequested: true, decision: .fallback, fallbackApplied: true))
+        }
         let currentManualEffortRaw: String? = switch provider {
         case .codexExec: codexCoordinator.effectiveCodexSelection(for: session).reasoningEffort
         case .claudeCode: claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
         default: nil
         }
-        guard currentManualEffortRaw == manualEffortRaw else { return nil }
-        return AutoEffortTurnSelection(
-            provider: provider,
-            selectedModelRaw: modelRaw,
-            manualEffortRaw: manualEffortRaw,
-            effortRaw: chosen
+        guard currentManualEffortRaw == manualEffortRaw else {
+            return (nil, .init(configured: true, eligible: true, judgmentRequested: true, decision: .fallback, fallbackApplied: true))
+        }
+        return (
+            AutoEffortTurnSelection(
+                provider: provider,
+                selectedModelRaw: modelRaw,
+                manualEffortRaw: manualEffortRaw,
+                effortRaw: chosen
+            ),
+            .init(
+                configured: true, eligible: true, judgmentRequested: true, decision: .selected,
+                chosenModelRaw: modelRaw, chosenEffortRaw: chosen
+            )
         )
+    }
+
+    private func ineligibleAutoEffortChoice() -> (
+        selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature
+    ) {
+        (nil, .init(configured: true, eligible: false, judgmentRequested: false, decision: .ineligible))
     }
 
     func recordSubmittedAutoEffort(_ selection: AutoEffortTurnSelection, for session: TabSession) {
@@ -367,7 +422,7 @@ extension AgentModeViewModel {
               configuration.validity == .valid,
               let backendID = configuration.selectedBackendID,
               runtime.isBackendReady(backendID)
-        else { throw GlobalModelRoutingError.unavailable }
+        else { return nil }
         let result = await routeModelThenEffort(
             requestID: UUID(),
             text: task,
@@ -383,14 +438,11 @@ extension AgentModeViewModel {
         }
         switch result.outcome {
         case let .selected(opaqueKey, _):
-            guard let selected = result.candidates.only(where: { $0.opaqueKey == opaqueKey }) else {
-                throw GlobalModelRoutingError.failed
-            }
-            return selected.target
+            return result.candidates.only(where: { $0.opaqueKey == opaqueKey })?.target
         case .cancelled:
             throw GlobalModelRoutingError.cancelled
         case .abstained, .failed:
-            throw GlobalModelRoutingError.failed
+            return nil
         }
     }
 
@@ -405,6 +457,7 @@ extension AgentModeViewModel {
         runtime: AgentTaskRouterRuntime
     ) async -> StagedTaskRoutingResult {
         let builder = AgentTaskRoutingCandidateBuilder()
+        let routingText = AgentTaskRoutingTaskExcerpt.make(from: text)
         guard let models = try? builder.build(
             allowedProviders: providers,
             availability: modelRouterAvailabilityContext,
@@ -418,12 +471,14 @@ extension AgentModeViewModel {
         }
 
         let selectedModel: AgentTaskRoutingCandidateBuilder.Candidate
+        var modelEvidence: AgentTaskRoutingDecisionEvidence?
+        var judgmentRequested = false
         if models.count == 1 {
             selectedModel = firstModel
         } else {
             guard let modelRequest = try? AgentTaskRoutingEnvelopeBuilder().build(
                 requestID: requestID,
-                text: text,
+                text: routingText,
                 scope: scope,
                 decisionStage: .model,
                 customInstructions: configuration.customInstructions,
@@ -434,46 +489,62 @@ extension AgentModeViewModel {
                     outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
                 )
             }
+            judgmentRequested = true
             let modelOutcome = await runtime.coordinator.route(backendID: backendID, request: modelRequest)
-            guard case let .selected(modelKey, _) = modelOutcome,
+            guard case let .selected(modelKey, evidence) = modelOutcome,
                   let match = models.only(where: { $0.opaqueKey == modelKey })
-            else { return StagedTaskRoutingResult(candidates: models, outcome: modelOutcome) }
+            else { return StagedTaskRoutingResult(candidates: models, outcome: modelOutcome, judgmentRequested: true) }
             selectedModel = match
+            modelEvidence = evidence
         }
 
         guard !Task.isCancelled else {
-            return StagedTaskRoutingResult(candidates: models, outcome: .cancelled)
+            return StagedTaskRoutingResult(candidates: models, outcome: .cancelled, judgmentRequested: judgmentRequested)
         }
+        let modelFallback = StagedTaskRoutingResult(
+            candidates: models,
+            outcome: .selected(opaqueKey: selectedModel.opaqueKey, evidence: modelEvidence),
+            judgmentRequested: judgmentRequested,
+            effortFallback: true
+        )
         guard let efforts = try? builder.buildEfforts(
             for: selectedModel,
             availability: modelRouterAvailabilityContext
         ), let firstEffort = efforts.first else {
-            return StagedTaskRoutingResult(
-                candidates: models,
-                outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
-            )
+            return modelFallback
         }
         guard efforts.count > 1 else {
             return StagedTaskRoutingResult(
                 candidates: efforts,
-                outcome: .selected(opaqueKey: firstEffort.opaqueKey, evidence: nil)
+                outcome: .selected(opaqueKey: firstEffort.opaqueKey, evidence: nil),
+                judgmentRequested: judgmentRequested
             )
         }
         guard let effortRequest = try? AgentTaskRoutingEnvelopeBuilder().build(
             requestID: requestID,
-            text: text,
+            text: routingText,
             scope: scope,
             decisionStage: .effort,
             customInstructions: configuration.customInstructions,
             candidates: efforts.map(\.descriptor)
         ) else {
+            return modelFallback
+        }
+        judgmentRequested = true
+        let effortOutcome = await runtime.coordinator.route(backendID: backendID, request: effortRequest)
+        switch effortOutcome {
+        case .selected:
+            return StagedTaskRoutingResult(candidates: efforts, outcome: effortOutcome, judgmentRequested: true)
+        case .cancelled:
+            return StagedTaskRoutingResult(candidates: models, outcome: .cancelled, judgmentRequested: judgmentRequested)
+        case .abstained, .failed:
             return StagedTaskRoutingResult(
-                candidates: efforts,
-                outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
+                candidates: modelFallback.candidates,
+                outcome: modelFallback.outcome,
+                judgmentRequested: true,
+                effortFallback: true
             )
         }
-        let effortOutcome = await runtime.coordinator.route(backendID: backendID, request: effortRequest)
-        return StagedTaskRoutingResult(candidates: efforts, outcome: effortOutcome)
     }
 
     private func modelRouterConfigurationIsCurrent(
