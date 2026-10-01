@@ -429,6 +429,8 @@ struct AgentSessionRow: View {
     private func sidebarOversightMenuContent(
         _ menu: AgentSidebarOversightMenuProps
     ) -> some View {
+        Button(AgentOversightUICopy.overseeByMenuHeader) {}
+            .disabled(true)
         if let reason = menu.targetIneligibleReason {
             Button(reason) {}
                 .disabled(true)
@@ -470,6 +472,8 @@ struct AgentSessionRow: View {
     private func sidebarOversightInverseMenuContent(
         _ menu: AgentSidebarOversightMenuProps
     ) -> some View {
+        Button(AgentOversightUICopy.overseeMenuHeader) {}
+            .disabled(true)
         if let reason = menu.observerIneligibleReason {
             Button(reason) {}
                 .disabled(true)
@@ -799,6 +803,7 @@ struct AgentSessionRow: View {
                 title: AgentOversightUICopy.inboundSessionIDSheetTitle(
                     session: request.rowDisplayName
                 ),
+                header: AgentOversightUICopy.sessionIDSheetHeader,
                 fieldAccessibilityLabel: AgentOversightUICopy
                     .overseerSessionIDFieldAccessibilityLabel,
                 submitLabel: AgentOversightUICopy.addOverseerButton,
@@ -820,6 +825,7 @@ struct AgentSessionRow: View {
                 title: AgentOversightUICopy.sessionIDSheetTitle(
                     observer: request.rowDisplayName
                 ),
+                header: AgentOversightUICopy.sessionIDSheetHeader,
                 fieldAccessibilityLabel: AgentOversightUICopy.sessionIDFieldAccessibilityLabel,
                 submitLabel: AgentOversightUICopy.overseeSessionButton,
                 resolve: { raw in

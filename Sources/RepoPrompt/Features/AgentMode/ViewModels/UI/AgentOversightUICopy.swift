@@ -81,6 +81,12 @@ enum AgentOversightUICopy {
     static let sessionIDMenuItem = "Session ID…"
     static let noEligibleOverseers = "No eligible overseers"
     static let noSessionsToOversee = "No sessions to oversee"
+    /// Disabled header lines atop the oversight menus and the Session-ID sheet — one plain
+    /// line about what the popup does. PLACEHOLDER copy reusing approved phrases until
+    /// Cristian approves the final strings (PR #32).
+    static let overseeByMenuHeader = "Oversee by"
+    static let overseeMenuHeader = "Make overseer of"
+    static let sessionIDSheetHeader = "Session ID…"
 
     static func openLabel(_ displayName: String) -> String {
         "Open \"\(displayName)\""

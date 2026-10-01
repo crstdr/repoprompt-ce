@@ -55,6 +55,8 @@ struct AgentOversightSessionIDSheet: View {
     }
 
     let title: String
+    /// One-line explanation shown under the title — the popup's disabled header line.
+    var header: String?
     let fieldAccessibilityLabel: String
     let submitLabel: String
     /// Pure, read-only resolution of the pasted text; never focuses or activates anything.
@@ -82,6 +84,13 @@ struct AgentOversightSessionIDSheet: View {
                 .font(.system(size: 13, weight: .semibold))
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let header {
+                Text(header)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             TextField(AgentOversightUICopy.sessionIDFieldPlaceholder, text: $identifierText)
                 .textFieldStyle(.roundedBorder)
