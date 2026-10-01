@@ -23,7 +23,9 @@ struct WindowContentView: View {
     var body: some View {
         ContentView(windowState: windowState)
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
+            .debugBuildWindowEdge()
             .environmentObject(windowState) // If your subviews need it
+            .environment(\.agentModePerfRecorder, windowState.agentModeViewModel.perfRecorder)
             .environmentObject(sparkleManager)
             .environmentObject(versionManager) // Pass versionManager to ContentView
             // Let SwiftUI own the window title. Without this, the scene re-applies the

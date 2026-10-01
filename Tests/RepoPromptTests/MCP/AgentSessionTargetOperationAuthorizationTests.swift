@@ -515,7 +515,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
             resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in callerSessionID },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { _, _, _, _, _, _, _, _, _, _, _ in
+            startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
                 throw MCPError.internalError("startRun is not used by authorization tests")
             }
         )
@@ -567,6 +567,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
             lastRunState: AgentSessionRunState.completed.rawValue,
             acpModelParameterSelections: [],
             parentSessionID: parentSessionID,
+            createdByOverseerSessionID: nil,
             isMCPOriginated: true,
             worktreeBindingSummaries: [],
             activeWorktreeMergeSummaries: []

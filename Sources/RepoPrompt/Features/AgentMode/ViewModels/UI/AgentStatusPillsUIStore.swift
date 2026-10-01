@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptInstrumentation
 
 struct AgentExecutionLocationProps: Equatable {
     let tabID: UUID
@@ -19,6 +20,13 @@ struct AgentModelRouterPillProps: Equatable {
     let disabledReason: String?
 }
 
+struct AgentAutoEffortPillProps: Equatable {
+    let isOn: Bool
+    let isAvailable: Bool
+    let isJudging: Bool
+    let feedback: AutoEffortTurnFeedback?
+}
+
 struct AgentStatusPillsSnapshot: Equatable {
     let currentTabID: UUID?
     let selectedWorkflow: AgentWorkflowDefinition?
@@ -29,6 +37,7 @@ struct AgentStatusPillsSnapshot: Equatable {
     let autoEditEnabled: Bool
     let interviewFirst: Bool
     let modelRouter: AgentModelRouterPillProps
+    let autoEffort: AgentAutoEffortPillProps
     let executionLocation: AgentExecutionLocationProps?
     let activeAgentSessionID: UUID?
     let activeRunID: UUID?
@@ -53,6 +62,12 @@ struct AgentStatusPillsSnapshot: Equatable {
             isRouting: false,
             disabledReason: "Configure Model Router in Settings."
         ),
+        autoEffort: AgentAutoEffortPillProps(
+            isOn: false,
+            isAvailable: false,
+            isJudging: false,
+            feedback: nil
+        ),
         executionLocation: nil,
         activeAgentSessionID: nil,
         activeRunID: nil,
@@ -62,6 +77,7 @@ struct AgentStatusPillsSnapshot: Equatable {
 
 @MainActor
 final class AgentStatusPillsUIStore: ObservableObject {
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentStatusPillsSnapshot
     @Published private(set) var revision: UInt64 = 0
 
@@ -72,20 +88,20 @@ final class AgentStatusPillsUIStore: ObservableObject {
     func update(_ nextSnapshot: AgentStatusPillsSnapshot) {
         guard snapshot != nextSnapshot else {
             #if DEBUG
-                AgentModePerfDiagnostics.recordStoreUpdate("statusPills", published: false)
+                perfRecorder.recordStoreUpdate("statusPills", published: false)
             #endif
             return
         }
         snapshot = nextSnapshot
         revision &+= 1
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 "statusPills",
                 published: true,
                 details: [
                     "revision": String(revision),
                     "runState": String(describing: snapshot.runState),
-                    "tabID": AgentModePerfDiagnostics.shortID(snapshot.currentTabID)
+                    "tabID": perfRecorder.shortID(snapshot.currentTabID)
                 ]
             )
         #endif

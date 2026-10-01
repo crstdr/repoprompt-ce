@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
 import XCTest
 
 final class AgentTaskRouterCoreTests: XCTestCase {
@@ -126,6 +127,52 @@ final class AgentTaskRouterCoreTests: XCTestCase {
             text: "task",
             candidates: (0 ... AgentTaskRoutingEnvelopeBuilder.maximumCandidates).map { descriptor("candidate-\($0)") }
         )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .invalidCandidateCount) }
+    }
+
+    func testLongRoutingExcerptIsDeterministicBoundedAndMasksBothEnds() {
+        let task = "Investigate the parser. password=openingSecret "
+            + String(repeating: "irrelevant middle ", count: 300)
+            + " Finally, verify the fix. token=endingSecret"
+
+        let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
+
+        XCTAssertEqual(excerpt, AgentTaskRoutingTaskExcerpt.make(from: task))
+        XCTAssertTrue(excerpt.contains("Investigate the parser"))
+        XCTAssertTrue(excerpt.contains("verify the fix"))
+        XCTAssertTrue(excerpt.contains("middle omitted"))
+        XCTAssertFalse(excerpt.contains("openingSecret"))
+        XCTAssertFalse(excerpt.contains("endingSecret"))
+        XCTAssertLessThanOrEqual(excerpt.count, AgentTaskRoutingEnvelopeBuilder.maximumCharacters)
+        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes)
+    }
+
+    func testLongRoutingExcerptOmitsUnsafeCutSegmentsButStillProvidesJevInput() {
+        let task = "```\nprivate text\n" + String(repeating: "secret", count: 1000)
+            + "\n```\nPlease inspect the result."
+
+        let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
+
+        XCTAssertFalse(excerpt.contains("private text"))
+        XCTAssertFalse(excerpt.contains("secret"))
+        XCTAssertTrue(excerpt.contains("middle omitted"))
+        XCTAssertNoThrow(try AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: UUID(), text: excerpt, candidates: [descriptor("a"), descriptor("b")]
+        ))
+    }
+
+    func testShortRoutingTaskRemainsExact() {
+        XCTAssertEqual(AgentTaskRoutingTaskExcerpt.make(from: "  Implement a parser  "), "Implement a parser")
+    }
+
+    func testLongRoutingExcerptRespectsUTF8Limit() {
+        let task = "Review Unicode handling. " + String(repeating: "✈️ ", count: 3000)
+            + " Finally, add tests."
+
+        let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
+
+        XCTAssertTrue(excerpt.contains("middle omitted"))
+        XCTAssertTrue(excerpt.contains("add tests"))
+        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes)
     }
 
     func testExecutableIdentityIncludesEffortAndNormalizedACPParameters() {
@@ -655,6 +702,43 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertNil(CodexModelSpecifier(raw: "gpt-6-sol-ultra").reasoningEffort)
         XCTAssertEqual(AgentModel.resolvedModel(forRaw: "gpt-6-sol-max", agentKind: .codexExec), .gpt6SolMax)
         XCTAssertEqual(AgentModel.resolvedModel(forRaw: "gpt-6-luna-low", agentKind: .codexExec), .gpt6LunaLow)
+    }
+
+    func testRoutingPrefersGPT61SolAndSonnet55WhenAdvertised() throws {
+        let codexOptions = Self.advertisedCodexOptions + [
+            Self.modelOption("gpt-6.1-sol-medium", "GPT-6.1 Sol Medium"),
+            Self.modelOption("gpt-6.1-sol-high", "GPT-6.1 Sol High")
+        ]
+        let claudeOptions = Self.advertisedClaudeOptions + [
+            Self.modelOption("claude-sonnet-5-5", "Claude Sonnet 5.5")
+        ]
+        let candidates = try candidateBuilder(codexOptions: codexOptions, claudeOptions: claudeOptions).build(
+            allowedProviders: [.claudeCode, .codexExec],
+            availability: .init(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false)
+        )
+
+        let solCandidate = try XCTUnwrap(candidates.first {
+            CodexModelSpecifier(raw: $0.target.modelRaw).baseModel?.hasSuffix("-sol") == true
+        })
+        XCTAssertEqual(CodexModelSpecifier(raw: solCandidate.target.modelRaw).baseModel, "gpt-6.1-sol")
+        XCTAssertTrue(solCandidate.descriptor.targetDescription.contains("GPT-6.1 Sol"))
+        XCTAssertTrue(solCandidate.descriptor.targetDescription.contains("$2 input / $10 output"))
+        XCTAssertFalse(solCandidate.descriptor.targetDescription.contains("No verified API list price"))
+
+        let sonnetCandidate = try XCTUnwrap(candidates.first { $0.utilityTier == "claude-sonnet" })
+        XCTAssertEqual(ClaudeModelSpecifier(raw: sonnetCandidate.target.modelRaw).baseModel, "claude-sonnet-5-5")
+        XCTAssertTrue(sonnetCandidate.descriptor.targetDescription.contains("Claude Sonnet 5.5"))
+        XCTAssertTrue(sonnetCandidate.descriptor.targetDescription.contains("$2 input / $10 output"))
+        XCTAssertFalse(sonnetCandidate.descriptor.targetDescription.contains("No verified API list price"))
+
+        XCTAssertEqual(
+            AutoEffortModelPolicy.codexEfforts(modelRaw: "gpt-6.1-sol-high", advertised: [.low, .medium, .high, .xhigh, .max, .ultra]),
+            ["low", "medium", "high", "xhigh", "max"]
+        )
+        XCTAssertEqual(
+            AutoEffortModelPolicy.claudeEfforts(modelRaw: "claude-sonnet-5-5:high", advertised: [.low, .medium, .high, .xhigh, .max]),
+            ["low", "medium", "high", "xhigh", "max"]
+        )
     }
 
     func testApprovedCodexFamilySelectionTracksNewestAdvertisedVersionOnly() throws {
