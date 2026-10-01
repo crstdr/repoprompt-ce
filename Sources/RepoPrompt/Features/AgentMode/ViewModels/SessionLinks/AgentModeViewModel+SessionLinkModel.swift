@@ -1,40 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
 
-struct AgentSessionLinkModelReceipt {
-    let modelID: String
-    let modelRaw: String
-    let reasoningEffortRaw: String?
-    let changed: Bool
-}
-
-enum AgentSessionLinkModelOutcome {
-    case accepted(AgentSessionLinkModelReceipt)
-    case blocked(AgentSessionLinkSendFailure)
-    case invalid(String)
-}
-
-extension AgentSessionLinkEndpointHost {
-    func agentSessionLinkModelAvailability(windowID _: Int) -> AgentModelCatalog.AvailabilityContext {
-        .none
-    }
-
-    func agentSessionLinkModelCandidate(
-        for _: DomainAgentSessionLinkEndpointIdentity
-    ) -> AgentSessionLinkEndpointCandidate? {
-        nil
-    }
-
-    func agentSessionLinkPerformSetModel(
-        to _: AgentSessionLinkEndpointCandidate,
-        modelID _: String,
-        liveness _: @escaping AgentSessionLinkSendLivenessProbe,
-        reauthorize _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
-    ) async -> AgentSessionLinkModelOutcome {
-        .blocked(.endpointHost)
-    }
-}
-
 extension AgentModeViewModel {
     /// Workspace-qualified model routing never invokes the generic lifecycle discovery sweep.
     func agentSessionLinkModelIdentity(

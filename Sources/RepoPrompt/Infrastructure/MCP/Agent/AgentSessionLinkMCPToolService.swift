@@ -170,10 +170,9 @@ struct AgentSessionLinkMCPToolService {
 
     static func parseModelID(_ value: Value?) throws -> String {
         guard case let .string(raw)? = value,
-              let id = AgentModelSelectionID.parse(raw), id.rawValue == raw,
-              AgentProviderKind(rawValue: id.agentRaw) != nil
+              AgentSessionLinkRuntimeBridge.isValidModelID(raw)
         else {
-            throw MCPError.invalidParams(AgentAdvertisedModelCatalog.AdmissionError.invalidID.message)
+            throw MCPError.invalidParams(AgentSessionLinkRuntimeBridge.invalidModelIDMessage)
         }
         return raw
     }

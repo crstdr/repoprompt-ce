@@ -74,6 +74,39 @@ final class AgentSessionLanePolicyTests: XCTestCase {
         }
     }
 
+    func testBackendConfigurationChangeInvalidatesAdmissionAndFencesPausedProducers() throws {
+        let catalogue = AgentAdvertisedModelCatalog.shared
+        let agents: [AgentProviderKind] = [.claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        let availability = AgentModelCatalog.AvailabilityContext(
+            zaiConfigured: true, kimiConfigured: true, customClaudeCompatibleConfigured: true
+        )
+        let option = AgentModelOption(
+            rawValue: "claude-opus-5-5", displayName: "Model", description: nil,
+            isPlaceholderDefault: false, isProviderDefault: false
+        )
+        let generations = Dictionary(uniqueKeysWithValues: agents.map {
+            ($0, catalogue.productionGeneration(for: $0))
+        })
+        defer { agents.forEach { catalogue.invalidate($0) } }
+        for agent in agents {
+            XCTAssertTrue(try catalogue.record([option], for: agent, generation: XCTUnwrap(generations[agent])))
+            XCTAssertNoThrow(try catalogue.selection("\(agent.rawValue):\(option.rawValue)", availability: availability))
+        }
+
+        let suiteName = "backend-admission-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        // A separate store exercises the process-wide invalidator without changing real preferences.
+        ClaudeCodeCompatibleBackendStore(defaults: defaults).saveConfig(ClaudeCodeCompatibleBackendID.custom.defaultPreset)
+
+        for agent in agents {
+            XCTAssertThrowsError(try catalogue.selection("\(agent.rawValue):\(option.rawValue)", availability: availability)) {
+                XCTAssertEqual($0 as? AgentAdvertisedModelCatalog.AdmissionError, .catalogueUnavailable)
+            }
+            XCTAssertFalse(try catalogue.record([option], for: agent, generation: XCTUnwrap(generations[agent])))
+        }
+    }
+
     func testMemoryOnlyAdmissionDoesNotDiscoverOrSubstituteMissingCatalogue() throws {
         let catalogue = AgentAdvertisedModelCatalog()
         let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true)
