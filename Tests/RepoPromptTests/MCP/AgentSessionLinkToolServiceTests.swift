@@ -73,21 +73,42 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(polled["pending_send"]?.objectValue?["idempotency_key"], .string("queued-key"))
     }
 
-    func testWaitRejectsCapturedEndpointReplacement() async throws {
+    func testWaitServesRehydratedObserverWithoutCapturedOrigin() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         var service = fixture.service
-        service.captureWaitInput = { .init(endpoint: fixture.target.domainEndpoint, generation: 0) }
-        do {
-            _ = try await service.execute(args: [
-                "op": .string("wait"),
-                "session_id": .string(fixture.target.sessionID.uuidString),
-                "timeout_seconds": .int(0)
-            ])
-            XCTFail("A later route must not borrow the captured endpoint")
-        } catch {
-            XCTAssertTrue(String(describing: error).contains("Observer route changed"))
+        var endpointRehydrated = false
+        service.captureWaitInput = {
+            XCTAssertFalse(endpointRehydrated)
+            return nil
         }
+        service.resolveObserverEndpoint = { _, _ in
+            endpointRehydrated = true
+            return fixture.observer.domainEndpoint
+        }
+        let result = try await Self.executeObject(service, args: [
+            "op": .string("wait"), "session_id": .string(fixture.target.sessionID.uuidString),
+            "timeout_seconds": .int(0)
+        ])
+        XCTAssertTrue(endpointRehydrated)
+        XCTAssertEqual(result["result"]?.stringValue, "timeout")
+        XCTAssertNil(result["_meta"]?.objectValue?["wake_reason"])
+    }
+
+    func testWaitServesResolvedObserverWithoutBorrowingMismatchedOrigin() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        var service = fixture.service
+        let input = fixture.bridge.captureWaitInput(for: fixture.target.domainEndpoint)
+        service.captureWaitInput = { input }
+        await fixture.bridge.acceptLocalInput(for: fixture.target.domainEndpoint).value
+        await fixture.bridge.acceptLocalInput(for: fixture.observer.domainEndpoint).value
+        let result = try await Self.executeObject(service, args: [
+            "op": .string("wait"), "session_id": .string(fixture.target.sessionID.uuidString),
+            "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(result["result"]?.stringValue, "timeout")
+        XCTAssertNil(result["_meta"]?.objectValue?["wake_reason"])
     }
 
     func testLocalInputCancelledAggregateNamesTargetLostAtSurvivorFence() async throws {
