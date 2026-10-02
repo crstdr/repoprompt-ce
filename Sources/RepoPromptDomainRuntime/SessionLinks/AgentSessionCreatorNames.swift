@@ -22,6 +22,9 @@ package struct AgentSessionCreatorNames {
     private var retentionOrder: [UUID] = []
     package private(set) var snapshot: [UUID: String] = [:]
     package static let retentionLimit = 4096
+    package var liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> {
+        Set(live.map(\.endpoint))
+    }
 
     package mutating func replaceLive(_ candidates: [AgentSessionLinkEndpointCandidate]) {
         live = candidates.filter { !$0.isClosing && !$0.isDeletionInProgress }.map {
@@ -40,6 +43,13 @@ package struct AgentSessionCreatorNames {
                   source.sessionID == entry.endpoint.sessionID else { return nil }
             let trimmed = source.name.trimmingCharacters(in: .whitespacesAndNewlines)
             return (entry.endpoint, trimmed.isEmpty ? AgentMonitorSessionIDFormatter.short(source.sessionID) : trimmed)
+        }
+        let liveIDs = Set(live.map(\.endpoint.sessionID))
+        // An already-known remote creator can be renamed by a settled non-live local copy after
+        // its window closes. Do not create membership, resurrect deletion, or override any live copy.
+        for source in sources.values where retained[source.sessionID] != nil && !liveIDs.contains(source.sessionID) {
+            let trimmed = source.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            retained[source.sessionID] = trimmed.isEmpty ? AgentMonitorSessionIDFormatter.short(source.sessionID) : trimmed
         }
         rebuild()
     }

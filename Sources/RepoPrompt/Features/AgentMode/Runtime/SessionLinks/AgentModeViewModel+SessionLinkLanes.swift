@@ -224,25 +224,9 @@ extension AgentModeViewModel {
             return nil
         }
         guard let creatorID = agentSessionLinkLaneCreatorSessionID(tabID: tabID, expectedSessionID: expectedSessionID) else { return nil }
-        let menu = archived ? nil : agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: expectedSessionID)
         let label = (names ?? sidebarCreatorDisplayNames)[creatorID]
-            ?? (menu?.creatorSessionID == creatorID ? menu?.createdByLabel : nil)
             ?? agentSessionLinkLocalCreatorLabel(creatorID: creatorID)
         return (creatorID, label)
-    }
-
-    func agentSessionLinkLaneCreatorSessionID(for sessionID: UUID) -> UUID? {
-        let live = sessions.values.first { $0.activeAgentSessionID == sessionID }
-        return live?.createdByOverseerSessionID
-            ?? (
-                live?.hasLoadedPersistedState == true
-                    ? nil : ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID
-            )
-    }
-
-    func agentSessionLinkLaneCreatorLabel(for sessionID: UUID) -> String? {
-        guard let creatorID = agentSessionLinkLaneCreatorSessionID(for: sessionID) else { return nil }
-        return sidebarCreatorDisplayNames[creatorID] ?? agentSessionLinkLocalCreatorLabel(creatorID: creatorID)
     }
 
     func agentSessionLinkLocalCreatorLabel(creatorID: UUID) -> String {

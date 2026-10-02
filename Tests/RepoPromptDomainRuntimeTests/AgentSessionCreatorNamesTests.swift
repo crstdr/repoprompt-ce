@@ -35,6 +35,24 @@ final class AgentSessionCreatorNamesTests: XCTestCase {
         XCTAssertNil(names.snapshot[id], "Committed deletion prunes retained names")
     }
 
+    func testSettledSourceRenameAfterLiveRemovalRefreshesOnlyKnownRetainedNames() {
+        let creator = candidate(windowID: 2, name: "Remote before close")
+        let unknownID = UUID()
+        var names = AgentSessionCreatorNames()
+        names.replaceLive([creator])
+        names.replaceLive([])
+        let sources: [UUID: AgentSessionCreatorNames.Source] = [
+            creator.tabID: .init(workspaceID: creator.workspaceID, sessionID: creator.sessionID, name: "Reloaded after close"),
+            UUID(): .init(workspaceID: creator.workspaceID, sessionID: unknownID, name: "Never live")
+        ]
+        names.update(windowID: 1, sources: sources)
+        XCTAssertEqual(names.snapshot[creator.sessionID], "Reloaded after close")
+        XCTAssertNil(names.snapshot[unknownID], "A non-live source cannot create retained membership")
+        names.remove(creator.sessionID)
+        names.update(windowID: 1, sources: sources)
+        XCTAssertNil(names.snapshot[creator.sessionID], "A source rename cannot resurrect pruned deletion")
+    }
+
     func testRetiredNameRetentionIsBoundedAndDoesNotEvictLiveNames() throws {
         let candidates = (0 ... AgentSessionCreatorNames.retentionLimit).map {
             candidate(name: "Creator \($0)")

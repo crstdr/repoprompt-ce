@@ -230,7 +230,7 @@ final class StableMenuClickTargetTests: XCTestCase {
             }
             .frame(width: 200, height: 40)
             .contentShape(Rectangle())
-            .onTapGesture { }
+            .onTapGesture {}
         }
     }
 

@@ -2163,6 +2163,47 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.host.creatorNameSnapshot[replacement.sessionID], "Live replacement")
     }
 
+    func testCreatorSoleLinkedObserverNameDeltaRepaintsMenuWithoutAuthorityOrPassiveChanges() async throws {
+        let fixture = makeFixture()
+        fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        guard case .added = await addLink(fixture) else { return XCTFail("setup link failed") }
+        await fixture.bridge.test_settleProjections()
+        let before = try XCTUnwrap(fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint])
+        XCTAssertTrue(try XCTUnwrap(before.sidebarOversightMenu).creatorIsOverseer)
+        XCTAssertEqual(before.sidebarOversightMenu?.linkedObservers.map(\.displayName), ["Planning"])
+        let authorityBefore = await fixture.authority.snapshot()
+        let inventoriesBefore = fixture.host.publishedInventoriesByEndpoint
+        let passiveBefore = fixture.host.passiveNoticePublicationCount
+        let renamed = makeCandidate(
+            windowID: fixture.observer.windowID,
+            sessionID: fixture.observer.sessionID,
+            workspaceID: fixture.observer.workspaceID,
+            tabID: fixture.observer.tabID,
+            persistentBindingGeneration: fixture.observer.persistentBindingGeneration,
+            bindingTransitionGeneration: fixture.observer.bindingTransitionGeneration,
+            displayName: "Renamed sole overseer"
+        )
+        fixture.host.candidates = [renamed, fixture.target]
+        let readsBefore = fixture.host.candidateReadCount
+        fixture.bridge.noteCreatorNameSourceChanged(windowID: renamed.windowID, sources: [
+            renamed.tabID: .init(workspaceID: renamed.workspaceID, sessionID: renamed.sessionID, name: "Renamed sole overseer")
+        ])
+        XCTAssertEqual(fixture.host.candidateReadCount, readsBefore, "The source delta must not discover candidates inline")
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        let after = try XCTUnwrap(fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint])
+        let menu = try XCTUnwrap(after.sidebarOversightMenu)
+        XCTAssertTrue(menu.creatorIsOverseer)
+        XCTAssertEqual(menu.linkedObservers.map(\.displayName), ["Renamed sole overseer"])
+        XCTAssertEqual(menu.inboundObserverNames, ["Renamed sole overseer"])
+        XCTAssertEqual(after.inbound.map(\.displayName), ["Renamed sole overseer"])
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint, inventoriesBefore)
+        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, passiveBefore)
+        let authorityAfter = await fixture.authority.snapshot()
+        XCTAssertEqual(authorityAfter, authorityBefore)
+    }
+
     func testCreatorFiftyRowsAcrossThreeWindowConsumersHaveBoundedSettledReads() async throws {
         let consumers = (1 ... 3).map { id in
             AgentModeViewModel(
@@ -2200,7 +2241,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await bridge.test_settleMonitorProjectionRefresh()
         let readsBefore = host.candidateReadCount
         // Predeclared generous Debug budget: 30 trials of 50 active + 50 archive memory reads,
-        // each trial under one second. This is not a rendered/full-window UI benchmark.
+        // each trial under one second. These are in-process consumers without workspace managers
+        // or registered windows: this measures the bounded label getter, not owner updates or UI.
+        // Both active/archive getters now avoid the lifecycle/menu workspace walk entirely.
         var durations: [Double] = []
         for _ in 0 ..< 30 {
             let start = Date.timeIntervalSinceReferenceDate

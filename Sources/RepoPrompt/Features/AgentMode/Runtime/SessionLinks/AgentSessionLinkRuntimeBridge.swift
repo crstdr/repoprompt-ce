@@ -1061,8 +1061,13 @@ final class AgentSessionLinkRuntimeBridge {
     /// Settles UI-only name changes at the source owner; no authority or candidate sweep on rename.
     func noteCreatorNameSourceChanged(windowID: Int, sources: [UUID: AgentSessionCreatorNames.Source]) {
         guard !isFrozenForTermination else { return }
+        let previous = creatorNames.snapshot
         creatorNames.update(windowID: windowID, sources: sources)
+        guard previous != creatorNames.snapshot else { return }
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
+        // Every live target menu can include this name among linked/available peers. Repaint from
+        // cached membership in the existing coalesced UI-only lane, never the authoritative lane.
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: creatorNames.liveEndpoints)
     }
 
     private func settleCreatorNames(_ candidates: [AgentSessionLinkEndpointCandidate]) {
