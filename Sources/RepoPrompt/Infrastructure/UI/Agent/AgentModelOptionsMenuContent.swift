@@ -12,13 +12,7 @@ enum AgentModelMenuTitle {
     }
 
     private static func devinDisplayName(rawValue: String, baseName: String) -> String {
-        guard let definition = ACPModelParameterResolver.parameterSet(
-            providerID: .devin,
-            selectedModelRaw: rawValue
-        )?.definition(kind: .thinking),
-            let choice = definition.choice(matching: definition.currentValueRaw)
-        else { return baseName }
-        return "\(baseName) · \(choice.displayName)"
+        DevinModelCatalog.current.entry(matching: rawValue)?.option.displayName ?? baseName
     }
 }
 

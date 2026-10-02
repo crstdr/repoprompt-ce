@@ -425,7 +425,8 @@ final class DevinPermissionLevelTests: XCTestCase {
             selectedModelRaw: option.rawValue,
             onSelect: { _, selected in XCTAssertEqual(selected.rawValue, "swe-2-high") }
         )
-        XCTAssertEqual(items.map(\.title), ["SWE-2 · High"])
+        // Upstream groups effort choices under the family rather than flattening the title.
+        XCTAssertEqual(items.map(\.title), ["SWE-2"])
         XCTAssertEqual(AgentModelMenuTitle.displayName(for: AIModel.devinCustom(name: option.rawValue)), "SWE-2 · High")
         XCTAssertEqual(option.rawValue, "swe-2-high")
     }
@@ -841,12 +842,12 @@ final class DevinPermissionLevelTests: XCTestCase {
             Set(pickerModels.map(\.modelName)),
             Set(choices.map { "gpt-6-astra-\($0.rawValue)" } + ["swe-1-7-medium"])
         )
-        XCTAssertEqual(AIModel.devinCustom(name: "gpt-6-astra-high").displayName, "GPT-6 Astra High Thinking")
+        XCTAssertEqual(AIModel.devinCustom(name: "gpt-6-astra-high").displayName, "GPT-6 Astra · High")
         XCTAssertEqual(AIModel.devinCustom(name: "gpt-6-astra-xhigh").modelName, "gpt-6-astra-xhigh")
         XCTAssertEqual(AgentModelCatalog.options(
             for: .devin,
             availability: .init(devinAvailable: true)
-        ).map(\.rawValue), [base, "swe-1-7-medium"])
+        ).map(\.rawValue), choices.map { "gpt-6-astra-\($0.rawValue)" } + ["swe-1-7-medium"])
     }
 
     func testHeadlessAndOracleDoNotInheritAgentModePermission() {
@@ -1209,7 +1210,9 @@ final class DevinPermissionLevelTests: XCTestCase {
                     ))
                 }
             )
-            let shouldApprove = ["git", "git-input-update", "manage_selection", "corroborated"].contains(scenario)
+            // Fork ledger row 13: a new rawInput replaces the authorization context.
+            // A sparse permission cannot borrow the old MCP metadata after that update.
+            let shouldApprove = ["git", "manage_selection", "corroborated"].contains(scenario)
             do {
                 let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
                 for try await _ in stream {}
