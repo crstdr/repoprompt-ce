@@ -107,6 +107,39 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTFail("Waiter never parked", file: file, line: line)
     }
 
+    func testExactMembershipTracksPartialRevocationReplacementAndShutdown() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let first = makeEndpoint()
+        let second = makeEndpoint()
+        let firstGrant = try await activateLink(authority, observer: observer, target: first)
+        _ = try await activateLink(authority, observer: observer, target: second)
+        let outbound = await authority.hasActiveOutboundLink(observerEndpoint: observer)
+        let inboundOnly = await authority.hasActiveLink(endpoint: first)
+        let notOutbound = await authority.hasActiveOutboundLink(observerEndpoint: first)
+        XCTAssertTrue(outbound)
+        XCTAssertTrue(inboundOnly)
+        XCTAssertFalse(notOutbound)
+        _ = await authority.revoke(linkID: firstGrant.id, generation: firstGrant.generation, reason: .userRequested)
+        let stillOutbound = await authority.hasActiveOutboundLink(observerEndpoint: observer)
+        let removed = await authority.hasActiveLink(endpoint: first)
+        XCTAssertTrue(stillOutbound, "Removing one of multiple links must retain the remaining membership")
+        XCTAssertFalse(removed)
+        let replacement = makeEndpoint(sessionID: second.sessionID)
+        _ = try await activateLink(authority, observer: first, target: replacement)
+        let oldTarget = await authority.hasActiveLink(endpoint: second)
+        let oldObserver = await authority.hasActiveOutboundLink(observerEndpoint: observer)
+        let newTarget = await authority.hasActiveLink(endpoint: replacement)
+        XCTAssertFalse(oldTarget)
+        XCTAssertFalse(oldObserver, "Replacing the target incarnation revokes its previous observer membership")
+        XCTAssertTrue(newTarget)
+        await authority.finishShutdown()
+        let shutDownObserver = await authority.hasActiveOutboundLink(observerEndpoint: first)
+        let shutDownTarget = await authority.hasActiveLink(endpoint: replacement)
+        XCTAssertFalse(shutDownObserver)
+        XCTAssertFalse(shutDownTarget)
+    }
+
     // MARK: - Reservation, activation, invariants
 
     func testActivationSeedsInitialSnapshotSoFirstPollIsNeverEmpty() async throws {
@@ -1046,6 +1079,10 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(repeated, .notFound, "revocation is idempotent and never resurrects")
         let revokedLeaseError = await authority.validate(lease: lease)
         XCTAssertEqual(revokedLeaseError, .linkRevoked)
+        let removedModelAuthorization = await authority.authorize(
+            operation: .monitorSetModel, observerEndpoint: observer, targetSessionID: target.sessionID
+        )
+        XCTAssertEqual(removedModelAuthorization, .failure(.noActiveLink), "Derived pair index must remove a revoked grant")
 
         let second = try await activateLink(authority, observer: observer, target: target)
         XCTAssertNotEqual(second.id, first.id)
