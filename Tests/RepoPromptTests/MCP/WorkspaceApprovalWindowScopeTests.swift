@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import RepoPromptApp
 import XCTest
@@ -93,23 +94,20 @@ final class WorkspaceApprovalWindowScopeTests: XCTestCase {
             "The fallback must leave some window able to answer the request."
         )
 
-        manager.resolveApproval(allow: true, alwaysAllow: false)
+        manager.resolveApproval(requestID: request.id, respondingWindowID: unrelatedWindowID, allow: true)
         let result = await pending.value
         XCTAssertTrue(result.isApproved)
         XCTAssertNil(manager.pendingRequest)
         XCTAssertNil(manager.presentedTargetWindowID)
     }
 
-    private func waitUntilPresented(
-        _ manager: WorkspaceApprovalManager,
-        requestID: UUID,
-        timeout: TimeInterval = 5
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if manager.pendingRequest?.id == requestID { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Request was never presented within \(timeout)s")
+    private func waitUntilPresented(_ manager: WorkspaceApprovalManager, requestID: UUID) async throws {
+        let presented = expectation(description: "Request presented")
+        let observation = manager.$pendingRequest
+            .first { $0?.id == requestID }
+            .sink { _ in presented.fulfill() }
+        defer { observation.cancel() }
+        await fulfillment(of: [presented], timeout: 5)
+        XCTAssertEqual(manager.pendingRequest?.id, requestID)
     }
 }
