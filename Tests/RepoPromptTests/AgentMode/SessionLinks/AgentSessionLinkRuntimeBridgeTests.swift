@@ -1070,7 +1070,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 threadID: "acp-session",
                 turnID: "acp-session",
                 itemID: "tool-\(id)",
-                overseerOneTimeAllowAvailable: oneTimeAllowAvailable
+                overseerOneTimeAllowAvailable: oneTimeAllowAvailable,
+                plainApproveAvailable: oneTimeAllowAvailable
             )
         }
 
@@ -1090,7 +1091,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             target: sendTarget,
             request: interactionRequest(restricted.id, ["response": .string("accept")])
         )
-        XCTAssertEqual(accept, .responded(.manualOnly(.noOneTimeAllowOption)))
+        guard case .responded(.invalid) = accept else { return XCTFail("Expected invalid, got \(accept)") }
         XCTAssertEqual(session.pendingApproval, restricted, "a refused accept applies nothing")
         // Decline and cancel pass the observer policy and reach the ACP controller hop. This fixture
         // has no live ACP process, so that hop reports `unavailable` rather than a manual-only refusal.
