@@ -1280,10 +1280,16 @@ package enum MCPDomainCanonicalToolDefinitions {
                     of: oldWaitDescription,
                     with: currentWaitDescription
                 )
+            let oldStartDescription = "Pass `detach: true` to return immediately."
+            let currentStartDescription = oldStartDescription
+                + " Start: setup ≤150s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
+            let startDescription = description.contains(currentStartDescription)
+                ? description
+                : description.replacingOccurrences(of: oldStartDescription, with: currentStartDescription)
             return canonicalizeAgentControlWaitSemantics(
                 MCPDomainToolDefinition(
                     name: definition.name,
-                    description: description,
+                    description: startDescription,
                     inputSchema: definition.inputSchema,
                     annotations: definition.annotations,
                     isEnabledByDefault: definition.isEnabledByDefault
@@ -1853,7 +1859,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             Pass `op` plus fields for that operation.
             list: cursor?, max_items?
             poll: exactly one of session_id/session_ids
-            wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds?
+            wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds? Local input cancels older waits.
             read: session_id, cursor?, from?, max_items?, max_output_bytes?
             send: session_id, message, idempotency_key; workflow_id|workflow_name?; delivery?; replace_pending?
             cancel_pending_send: session_id, idempotency_key
@@ -1899,8 +1905,10 @@ package enum MCPDomainCanonicalToolDefinitions {
                     ["change", "idle", "sendable"]
                 ),
                 "timeout_seconds": .object([
-                    "description": .string("[wait] Max seconds; default 60; 0 polls immediately."),
-                    "type": .string("number")
+                    "description": .string("[wait] 0-60 seconds; default 60; 0 polls."),
+                    "type": .string("number"),
+                    "minimum": .int(0),
+                    "maximum": .int(60)
                 ]),
                 "from": enumStringSchema(
                     "[read] Fresh page origin: tail (default/newest) or start (oldest).",
@@ -2029,6 +2037,55 @@ package enum MCPDomainCanonicalToolDefinitions {
                 inputSchema: inputSchema,
                 annotations: previous.annotations,
                 isEnabledByDefault: previous.isEnabledByDefault
+            )
+        }
+    }
+
+    /// Outer projection only; all prior exact migration stages remain frozen.
+    private enum AgentSessionLinkModelSelectionMigration {
+        static let description = AgentSessionLinkRefusalSubreasonMigration.description
+            .replacingOccurrences(of: " | stop", with: " | stop | set_model")
+            .replacingOccurrences(
+                of: "- `retire_lane`: [manage + created by you] unlink/stash idle lane, never delete; no idempotency key.",
+                with: "- `retire_lane`: [manage + created by you] unlink/stash idle lane, never delete; no idempotency key.\n- `set_model`: [manage] same agent, idle; next turn."
+            )
+
+        static let inputSchema: Value = {
+            guard case var .object(schema) = AgentSessionLinkLaneOperationsMigration.inputSchema,
+                  case var .object(properties)? = schema["properties"],
+                  case var .object(op)? = properties["op"],
+                  case var .array(operations)? = op["enum"],
+                  case var .object(sessionID)? = properties["session_id"],
+                  case let .string(sessionSummary)? = sessionID["description"],
+                  case var .object(name)? = properties["session_name"],
+                  case let .string(nameSummary)? = name["description"],
+                  case let .string(summary)? = schema["description"]
+            else { preconditionFailure("agent_session_link model selection requires lane schema") }
+            operations.append(.string("set_model"))
+            op["enum"] = .array(operations)
+            properties["op"] = .object(op)
+            properties["model_id"] = .object(["type": .string("string")])
+            sessionID["description"] = .string(sessionSummary.replacingOccurrences(of: "]", with: ", set_model]"))
+            properties["session_id"] = .object(sessionID)
+            name["description"] = .string(nameSummary.replacingOccurrences(of: "Name, max", with: "Max"))
+            properties["session_name"] = .object(name)
+            schema["properties"] = .object(properties)
+            schema["description"] = .string(
+                summary.replacingOccurrences(of: "role?,", with: "role|model_id?,")
+                    + "\nset_model: session_id, model_id"
+            )
+            return .object(schema)
+        }()
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description && definition.inputSchema == inputSchema
+        }
+
+        static func applying(to definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(definition.description == AgentSessionLinkRefusalSubreasonMigration.description && definition.inputSchema == AgentSessionLinkLaneOperationsMigration.inputSchema)
+            return MCPDomainToolDefinition(
+                name: definition.name, description: description, inputSchema: inputSchema,
+                annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
             )
         }
     }
@@ -2240,8 +2297,26 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
+        if AgentSessionLinkModelSelectionMigration.isCurrent(definition) { return definition }
+        precondition(!agentSessionLinkModelSelectionIsPartial(definition), "Partial agent_session_link model selection contract")
+        return AgentSessionLinkModelSelectionMigration.applying(to: canonicalizeAgentSessionLinkBeforeModelSelection(definition))
+    }
+
+    private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
+        !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
+            && (
+                definition.description.contains("set_model")
+                    || stringOccurrenceCount(of: "set_model", in: definition.inputSchema) > 0
+                    || stringOccurrenceCount(of: "model_id", in: definition.inputSchema) > 0
+            )
+    }
+
+    private static func canonicalizeAgentSessionLinkBeforeModelSelection(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
         if definition.description == AgentSessionLinkRefusalSubreasonMigration.description,
-           definition.inputSchema == AgentSessionLinkLaneOperationsMigration.inputSchema {
+           definition.inputSchema == AgentSessionLinkLaneOperationsMigration.inputSchema
+        {
             return definition
         }
         return AgentSessionLinkRefusalSubreasonMigration.apply(canonicalizeAgentSessionLinkBeforeRefusalSubreason(definition))
@@ -2625,8 +2700,22 @@ package enum MCPDomainCanonicalToolDefinitions {
         canonicalizeAgentSessionLink(definition)
     }
 
+    package static func test_agentSessionLinkPreviousStopDefinition() -> MCPDomainToolDefinition {
+        canonicalizeAgentSessionLinkBeforeModelSelection(test_agentSessionLinkLegacyCurrentDefinition())
+    }
+
+    package static func test_agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
+        agentSessionLinkModelSelectionIsPartial(definition)
+    }
+
     package static func test_agentSessionLinkPreviousCompactDefinition() -> MCPDomainToolDefinition {
         applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())
+    }
+
+    package static func test_canonicalizeGlobalSemantics(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        canonicalizeGlobalSemantics(definition)
     }
 
     package static func test_canonicalizeAgentControlWaitSemantics(

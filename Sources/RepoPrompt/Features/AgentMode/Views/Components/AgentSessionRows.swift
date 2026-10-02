@@ -1,6 +1,113 @@
 import AppKit
+import OSLog
 import RepoPromptDomainRuntime
 import SwiftUI
+
+// MARK: - Sidebar tap diagnostics
+
+@MainActor
+enum AgentSidebarTapModifierReader {
+    /// Flags from `NSApp.currentEvent` when the tap handler runs.
+    ///
+    /// This is not captured from the mouse-down that started the click. A later
+    /// flags-changed or key event can be current, and a command or shift bit on
+    /// that event reinterprets the click. A nil app or a nil current event is a
+    /// plain click. `NSApp` is an implicitly unwrapped optional, so a test
+    /// process that has not created the shared application must not touch it.
+    static func currentFlags() -> NSEvent.ModifierFlags {
+        guard NSApp != nil else { return [] }
+        return NSApp.currentEvent?.modifierFlags ?? []
+    }
+
+    static func gesture(for flags: NSEvent.ModifierFlags) -> AgentSidebarSelectionGesture {
+        var modifiers: AgentSidebarSelectionModifiers = []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        return AgentSidebarSelectionGesture(modifiers: modifiers)
+    }
+}
+
+@MainActor
+enum AgentSidebarTapDiagnostics {
+    static let logger = Logger(subsystem: "com.repoprompt.agents", category: "sidebar-tap")
+
+    #if DEBUG
+        static var recordForTests = false
+        static var testLines: [String] = []
+    #endif
+
+    static func log(
+        disposition: AgentSidebarSelectionGestureDisposition,
+        reason: String?,
+        modifierFlags: NSEvent.ModifierFlags,
+        selectionCount: Int,
+        workspaceMatched: Bool,
+        rowID: UUID?
+    ) {
+        let outcome = switch disposition {
+        case .activate:
+            "activate"
+        case .selectionChanged:
+            "selectionChanged"
+        case .ignored:
+            "ignored"
+        }
+        var fields = ["outcome=\(outcome)"]
+        if let reason, reason != outcome {
+            fields.append("reason=\(reason)")
+        }
+        fields.append(contentsOf: [
+            "flags=\(modifierFlags.rawValue)",
+            "selection=\(selectionCount)",
+            "workspaceMatched=\(workspaceMatched)",
+            "row=\(rowID?.uuidString ?? "none")"
+        ])
+        let line = fields.joined(separator: " ")
+        logger.log("\(line, privacy: .public)")
+        #if DEBUG
+            if recordForTests {
+                testLines.append(line)
+            }
+        #endif
+    }
+}
+
+@MainActor
+enum AgentSidebarRowTap {
+    static func handle(
+        isInteractionEnabled: Bool,
+        tapRowID: UUID?,
+        tapSelectionCount: Int,
+        tapWorkspaceMatched: Bool,
+        onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureResult,
+        onActivate: () -> Void
+    ) {
+        let flags = AgentSidebarTapModifierReader.currentFlags()
+        guard isInteractionEnabled else {
+            AgentSidebarTapDiagnostics.log(
+                disposition: .ignored,
+                reason: "interaction-disabled",
+                modifierFlags: flags,
+                selectionCount: tapSelectionCount,
+                workspaceMatched: tapWorkspaceMatched,
+                rowID: tapRowID
+            )
+            return
+        }
+        let result = onSelectionGesture(AgentSidebarTapModifierReader.gesture(for: flags))
+        AgentSidebarTapDiagnostics.log(
+            disposition: result.disposition,
+            reason: result.reason,
+            modifierFlags: flags,
+            selectionCount: result.selectionCount,
+            workspaceMatched: result.workspaceMatched,
+            rowID: result.rowID
+        )
+        if result.disposition == .activate {
+            onActivate()
+        }
+    }
+}
 
 // MARK: - Agent Session Row
 
@@ -58,8 +165,11 @@ struct AgentSessionRow: View {
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
+    var tapRowID: UUID?
+    var tapSelectionCount = 0
+    var tapWorkspaceMatched = false
     var commandProgressKind: AgentSidebarBulkActionKind?
-    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
+    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureResult
     let onSelect: () -> Void
     let onTogglePin: () -> Void
     var onStash: (() -> Void)?
@@ -1027,19 +1137,15 @@ struct AgentSessionRow: View {
         showDeleteConfirmation = true
     }
 
-    private var currentSelectionGesture: AgentSidebarSelectionGesture {
-        var modifiers: AgentSidebarSelectionModifiers = []
-        let flags = NSApp.currentEvent?.modifierFlags ?? []
-        if flags.contains(.command) { modifiers.insert(.command) }
-        if flags.contains(.shift) { modifiers.insert(.shift) }
-        return AgentSidebarSelectionGesture(modifiers: modifiers)
-    }
-
     private func handleRowTap() {
-        guard isInteractionEnabled else { return }
-        if onSelectionGesture(currentSelectionGesture) == .activate {
-            onSelect()
-        }
+        AgentSidebarRowTap.handle(
+            isInteractionEnabled: isInteractionEnabled,
+            tapRowID: tapRowID,
+            tapSelectionCount: tapSelectionCount,
+            tapWorkspaceMatched: tapWorkspaceMatched,
+            onSelectionGesture: onSelectionGesture,
+            onActivate: onSelect
+        )
     }
 
     private func toggleSelection() {
@@ -1647,7 +1753,7 @@ struct AgentSessionRow: View {
             // plate fill and the identity glyph so the chevron/arrow/dot
             // remains visually centered while the ring conveys motion.
             if runState == .running {
-                AgentRowActivityArc(tint: runningAccentColor)
+                AgentRowRunningIndicator(tint: runningAccentColor)
                     .allowsHitTesting(false)
             }
 
@@ -1920,14 +2026,74 @@ struct AgentRowActivityArc: View {
     var tint: Color = .accentColor
 
     var body: some View {
-        // Spun by the render server (see `AgentRowActivityArcLayerView`): a SwiftUI `repeatForever`
-        // rotation here re-rendered the row's whole window on the main thread every frame.
+        // Render-server rotation: no per-frame SwiftUI render, window layout, or commit on main.
         AgentRowAnimatedActivityArc(tint: tint)
             .frame(width: AgentRowActivityArcLayerView.diameter, height: AgentRowActivityArcLayerView.diameter)
-            // An AppKit view is not an accessibility element on its own; this keeps the arc one
-            // element carrying the "Running" label.
             .accessibilityElement()
-            .accessibilityLabel("Running")
+            .accessibilityLabel(AgentRowRunningIndicator.accessibilityLabelText)
+    }
+}
+
+/// The arc's geometry and accessibility, shared by the animated and still presentations so
+/// swapping between them never changes the row's layout or what VoiceOver announces.
+private struct AgentRowActivityArcShape: View {
+    var tint: Color
+
+    var body: some View {
+        Circle()
+            .trim(from: 0.0, to: 0.7)
+            .stroke(
+                tint.opacity(0.75),
+                style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+            )
+            .frame(width: 15, height: 15)
+            .accessibilityLabel(AgentRowRunningIndicator.accessibilityLabelText)
+    }
+}
+
+/// Whether a running row's arc may animate.
+///
+/// The arc animates only while its window is presented on screen and Reduce Motion is off. A hidden
+/// window keeps no animation at all (so other commits never have to walk one), and Reduce Motion asks
+/// for none. Otherwise the row shows the same arc standing still: running stays visible and
+/// labelled, it just stops spinning.
+enum AgentRowActivityIndicatorMode: Equatable {
+    case animated
+    case still
+
+    static func resolve(isWindowPresentationVisible: Bool, reduceMotion: Bool) -> Self {
+        isWindowPresentationVisible && !reduceMotion ? .animated : .still
+    }
+}
+
+/// The running row's status glyph. Switching modes swaps the view, so the animated arc's layer
+/// animation is installed again whenever the window becomes visible.
+struct AgentRowRunningIndicator: View {
+    static let accessibilityLabelText = "Running"
+
+    var tint: Color = .accentColor
+    /// Nil reads the process Reduce Motion setting. Tests pin it so the hosted
+    /// indicator does not depend on the runner's accessibility preferences.
+    var reduceMotionOverride: Bool?
+
+    init(tint: Color = .accentColor, reduceMotionOverride: Bool? = nil) {
+        self.tint = tint
+        self.reduceMotionOverride = reduceMotionOverride
+    }
+
+    @Environment(\.windowIsPresentationVisible) private var isWindowPresentationVisible
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        switch AgentRowActivityIndicatorMode.resolve(
+            isWindowPresentationVisible: isWindowPresentationVisible,
+            reduceMotion: reduceMotionOverride ?? reduceMotion
+        ) {
+        case .animated:
+            AgentRowActivityArc(tint: tint)
+        case .still:
+            AgentRowActivityArcShape(tint: tint)
+        }
     }
 }
 

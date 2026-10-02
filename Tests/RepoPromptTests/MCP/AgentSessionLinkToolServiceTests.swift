@@ -9,12 +9,120 @@ import XCTest
 /// freshly fenced managed poll/wait may carry a redacted pending interaction.
 @MainActor
 final class AgentSessionLinkToolServiceTests: XCTestCase {
+    func testWaitTimeoutIsWaitSpecificAndBounded() throws {
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.resolvedWaitTimeoutSeconds(nil), 60)
+        for seconds in [0.0, 0.5, 60.0] {
+            XCTAssertEqual(try AgentSessionLinkMCPToolService.resolvedWaitTimeoutSeconds(.double(seconds)), seconds)
+        }
+        for seconds in [-1.0, 60.01, 120.0, 86400.0] {
+            XCTAssertThrowsError(try AgentSessionLinkMCPToolService.resolvedWaitTimeoutSeconds(.double(seconds)))
+        }
+        XCTAssertEqual(try AgentMCPToolHelpers.parseTimeoutSeconds(.int(86400)), 86400)
+    }
+
+    func testDelayedOldWaitReturnsLocalInputMetadataAndNewWaitStillWorks() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        var delayed = fixture.service
+        let oldInput = fixture.bridge.captureWaitInput(for: fixture.observer.domainEndpoint)
+        delayed.captureWaitInput = { oldInput }
+        let release = fixture.bridge.acceptLocalInput(for: fixture.observer.domainEndpoint)
+        await release.value
+        let args: [String: Value] = [
+            "op": .string("wait"), "session_id": .string(fixture.target.sessionID.uuidString),
+            "timeout_seconds": .int(0)
+        ]
+        let old = try await Self.executeObject(delayed, args: args)
+        XCTAssertEqual(old["result"]?.stringValue, "cancelled")
+        XCTAssertEqual(old["_meta"]?.objectValue?["wake_reason"]?.stringValue, "local_user_input")
+        let current = try await Self.executeObject(fixture.service, args: args)
+        XCTAssertEqual(current["result"]?.stringValue, "timeout")
+        XCTAssertNil(current["_meta"]?.objectValue?["wake_reason"])
+    }
+
+    func testLocalInputCancellationPreservesQueuedSendProjectionAndQueue() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let targetID = Value.string(fixture.target.sessionID.uuidString)
+        let queued = try await Self.executeObject(fixture.service, args: [
+            "op": .string("send"), "session_id": targetID,
+            "message": .string("review the diff"), "idempotency_key": .string("queued-key"),
+            "delivery": .string("when_sendable")
+        ])
+        XCTAssertEqual(queued["result"]?.stringValue, "queued")
+        var delayed = fixture.service
+        let old = fixture.bridge.captureWaitInput(for: fixture.observer.domainEndpoint)
+        delayed.captureWaitInput = { old }
+        await fixture.bridge.acceptLocalInput(for: fixture.observer.domainEndpoint).value
+        let interrupted = try await Self.executeObject(delayed, args: [
+            "op": .string("wait"), "session_id": targetID, "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(interrupted["result"]?.stringValue, "cancelled")
+        XCTAssertEqual(interrupted["pending_send"]?.objectValue?["idempotency_key"], .string("queued-key"))
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": targetID
+        ])
+        XCTAssertEqual(polled["pending_send"]?.objectValue?["idempotency_key"], .string("queued-key"))
+    }
+
+    func testWaitRejectsCapturedEndpointReplacement() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        var service = fixture.service
+        service.captureWaitInput = { .init(endpoint: fixture.target.domainEndpoint, generation: 0) }
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("wait"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "timeout_seconds": .int(0)
+            ])
+            XCTFail("A later route must not borrow the captured endpoint")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("Observer route changed"))
+        }
+    }
+
+    func testWaitDoesNotUseSetModelOnlyRouting() {
+        XCTAssertFalse(ServerNetworkManager.isMemoryOnlyModelCall(
+            toolName: MCPWindowToolName.agentSessionLink, arguments: ["op": .string("wait")]
+        ))
+        XCTAssertTrue(ServerNetworkManager.isMemoryOnlyModelCall(
+            toolName: MCPWindowToolName.agentSessionLink, arguments: ["op": .string("set_model")]
+        ))
+    }
+
+    func testLocalInputCancelledAggregateNamesTargetLostAtSurvivorFence() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second")
+        fixture.host.candidates.append(second)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID, rawTargetSessionID: second.sessionID.uuidString
+        ) else { return XCTFail("Expected second link") }
+        var delayed = fixture.service
+        let old = fixture.bridge.captureWaitInput(for: fixture.observer.domainEndpoint)
+        delayed.captureWaitInput = { old }
+        await fixture.bridge.acceptLocalInput(for: fixture.observer.domainEndpoint).value
+        fixture.bridge.test_afterTerminalWaitSurvivorAuthorityValidation = {
+            fixture.host.candidates.removeAll { $0.domainEndpoint == second.domainEndpoint }
+        }
+        let result = try await Self.executeObject(delayed, args: [
+            "op": .string("wait"), "session_ids": .array([
+                .string(fixture.target.sessionID.uuidString), .string(second.sessionID.uuidString)
+            ]), "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(result["result"]?.stringValue, "cancelled")
+        XCTAssertEqual(result["targets"]?.arrayValue?.count, 1)
+        XCTAssertEqual(result["unavailable_session_ids"]?.arrayValue, [.string(second.sessionID.uuidString)])
+        XCTAssertEqual(result["_meta"]?.objectValue?["wake_reason"]?.stringValue, "local_user_input")
+    }
+
     // MARK: - Strict allowed keys
 
     func testEachOperationDeclaresExactlyItsDocumentedFields() {
         XCTAssertEqual(AgentSessionLinkMCPToolService.listKeys, ["op", "cursor", "max_items"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.createLaneKeys, [
-            "op", "idempotency_key", "role", "session_name", "workspace", "message",
+            "op", "idempotency_key", "role", "model_id", "session_name", "workspace", "message",
             "workflow_id", "workflow_name"
         ])
         XCTAssertEqual(AgentSessionLinkMCPToolService.retireLaneKeys, ["op", "session_id"])
@@ -59,6 +167,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ] {
             XCTAssertTrue(keys.isDisjoint(with: ["workflow_id", "workflow_name"]))
         }
+        XCTAssertEqual(AgentSessionLinkMCPToolService.setModelKeys, ["op", "session_id", "model_id"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.stopKeys, ["op", "session_id", "idempotency_key"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.setWaitingOnKeys, ["op", "summary", "clear"])
         XCTAssertEqual(
@@ -101,6 +210,49 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertFalse(AgentSessionLinkMCPToolService.pollKeys.contains("timeout_seconds"))
         XCTAssertFalse(AgentSessionLinkMCPToolService.pollKeys.contains("cursor"))
         XCTAssertFalse(AgentSessionLinkMCPToolService.readKeys.contains("session_ids"))
+    }
+
+    func testSetModelWireRequiresExactIDAndReportsNextTurnOnly() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let args: [String: Value] = [
+            "op": .string("set_model"),
+            "session_id": .string(fixture.target.sessionID.uuidString),
+            "model_id": .string("claudeCode:sonnet:high")
+        ]
+        let result = try await Self.executeObject(fixture.service, args: args)
+        XCTAssertEqual(result["result"], .string("accepted"))
+        XCTAssertEqual(result["model_id"], args["model_id"])
+        XCTAssertEqual(result["applies_to"], .string("next_turn"))
+        XCTAssertEqual(result["persistence"], .string("scheduled"))
+        XCTAssertEqual(result["changed"], .bool(true))
+        for extra in ["role", "message", "delivery", "idempotency_key", "workflow_id", "model_parameters", "session_ids"] {
+            var invalid = args
+            invalid[extra] = .string("not allowed")
+            do { _ = try await fixture.service.execute(args: invalid)
+                XCTFail("Accepted \(extra)")
+            } catch let error as MCPError { guard case .invalidParams = error else { return XCTFail("\(error)") } }
+        }
+        for invalidID: Value? in [nil, .null, .bool(true), .string(""), .string("pair"), .string("unknown:model")] {
+            var invalid = args
+            invalid["model_id"] = invalidID
+            do { _ = try await fixture.service.execute(args: invalid)
+                XCTFail("Accepted malformed model_id")
+            } catch let error as MCPError { guard case .invalidParams = error else { return XCTFail("\(error)") } }
+        }
+        let ambiguous: [String: Value] = try [
+            "op": .string("create_lane"),
+            "idempotency_key": .string("ambiguous"),
+            "role": .string("pair"),
+            "model_id": XCTUnwrap(args["model_id"])
+        ]
+        do { _ = try await fixture.service.execute(args: ambiguous)
+            XCTFail("Accepted role and model_id")
+        } catch let error as MCPError {
+            guard case let .invalidParams(message) = error else { return XCTFail("\(error)") }
+            XCTAssertTrue(try XCTUnwrap(message).contains("not both"))
+        }
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
     }
 
     // MARK: - Target parsing
@@ -839,6 +991,33 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let conflict = try await Self.executeObject(fixture.service, args: conflictArgs)
         XCTAssertEqual(conflict["result"], .string("idempotency_conflict"))
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
+
+        AgentAdvertisedModelCatalog.shared.record([
+            AgentModelOption(
+                rawValue: "explicit-model:high",
+                displayName: "Explicit",
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            )
+        ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+        defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+        var explicit = args
+        explicit["workspace"] = .string(workspace.id.uuidString)
+        explicit["idempotency_key"] = .string("explicit-model")
+        explicit["model_id"] = .string("claudeCode:explicit-model:high")
+        let pinned = try await Self.executeObject(fixture.service, args: explicit)
+        XCTAssertEqual(pinned["result"], .string("created"))
+        XCTAssertEqual(fixture.host.lastLaneSelection?.agentRaw, "claudeCode")
+        XCTAssertEqual(fixture.host.lastLaneSelection?.modelRaw, "explicit-model:high")
+        XCTAssertEqual(fixture.host.lastLaneSelection?.reasoningEffortRaw, "high")
+        explicit["model_id"] = .string("claudeCode:explicit-model:low")
+        let modelConflict = try await Self.executeObject(fixture.service, args: explicit)
+        XCTAssertEqual(modelConflict["result"], .string("idempotency_conflict"))
+        explicit["idempotency_key"] = .string("unadvertised-model")
+        let unavailable = try await Self.executeObject(fixture.service, args: explicit)
+        XCTAssertEqual(unavailable["result"], .string("model_unavailable"))
+        XCTAssertEqual(fixture.host.laneCreationCount, 2)
     }
 
     func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
@@ -2144,6 +2323,58 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertTrue(result["detail"]?.stringValue?.contains("Refresh `list`") == true)
     }
 
+    func testPartialWaitRefencesEarlierSurvivorsAfterLaterSiblingRevocation() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second")
+        let third = makeCandidate(windowID: 4, displayName: "Third")
+        fixture.host.candidates.append(contentsOf: [second, third])
+        for target in [second, third] {
+            guard case .added = await fixture.bridge.addMonitorLink(
+                observerSessionID: fixture.observer.sessionID,
+                rawTargetSessionID: target.sessionID.uuidString
+            ) else { return XCTFail("expected sibling link") }
+        }
+        let inventory = await fixture.authority.links(forObserver: fixture.observer.sessionID)
+        let first = try XCTUnwrap(inventory.items.first { $0.targetSessionID == fixture.target.sessionID })
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+
+        var fenceCount = 0
+        var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
+        var revokedEarlierSurvivor = false
+        fixture.bridge.test_afterManagedObservationAuthorityValidation = {
+            fenceCount += 1
+            if fenceCount == 1 {
+                // Force the original whole-batch fence into its per-target fallback.
+                deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: third.sessionID)
+            } else if fenceCount == 3 {
+                // The first survivor has already yielded its prompt; a later sibling's authority
+                // hop must not let that earlier inspection escape after its grant is revoked.
+                await fixture.bridge.revokeLink(linkID: first.linkID, generation: first.generation)
+                revokedEarlierSurvivor = true
+            }
+        }
+        defer {
+            fixture.bridge.test_afterManagedObservationAuthorityValidation = nil
+            if let deletionAttempt {
+                AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletionAttempt)
+            }
+        }
+
+        do {
+            _ = try await Self.executeObject(fixture.service, args: [
+                "op": .string("wait"),
+                "session_ids": .array([fixture.target, second, third].map { .string($0.sessionID.uuidString) }),
+                "timeout_seconds": .int(0)
+            ])
+            XCTFail("a changed survivor batch must deny rather than release an earlier prompt or cursor")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("No active session link"))
+        }
+        XCTAssertNotNil(deletionAttempt)
+        XCTAssertTrue(revokedEarlierSurvivor, "the later sibling must revoke the previously inspected survivor")
+    }
+
     func testSingleTargetWaitStillDeniesWhenItsObservationFenceFails() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
@@ -2701,15 +2932,21 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
         var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
         private(set) var laneCreationCount = 0
+        private(set) var lastLaneSelection: AgentSessionLanePolicy.RoleSelection?
+
+        func agentSessionLinkModelAvailability(windowID _: Int) -> AgentModelCatalog.AvailabilityContext {
+            .init()
+        }
 
         func agentSessionLinkCreateLane(
             destinationWindowID: Int,
             workspaceID: UUID,
             creatorSessionID: UUID,
             sessionName: String?,
-            selection _: AgentSessionLanePolicy.RoleSelection
+            selection: AgentSessionLanePolicy.RoleSelection
         ) async throws -> AgentSessionLaneHostCreationOutcome {
             laneCreationCount += 1
+            lastLaneSelection = selection
             var lane = AgentSessionLinkEndpointCandidate(
                 windowID: destinationWindowID,
                 workspaceID: workspaceID,
@@ -2755,6 +2992,21 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
             candidates
+        }
+
+        func agentSessionLinkModelCandidate(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionLinkEndpointCandidate? {
+            candidates.first { $0.domainEndpoint == endpoint }
+        }
+
+        func agentSessionLinkPerformSetModel(
+            to _: AgentSessionLinkEndpointCandidate, modelID: String,
+            liveness: @escaping AgentSessionLinkSendLivenessProbe,
+            reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkModelOutcome {
+            let result = await reauthorize()
+            guard result == .committed else { return .blocked(result.refusal) }
+            guard liveness().permitsDelivery else { return .blocked(.endpointInvalidated) }
+            return .accepted(.init(modelID: modelID, modelRaw: "sonnet:high", reasoningEffortRaw: "high", changed: true))
         }
 
         func agentSessionLinkLaneProvenance(
@@ -3019,6 +3271,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 requireTargetWindow: { window },
                 resolveObserverEndpoint: { _, _ in endpoint },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
+                resolveModelObserverEndpoint: { _ in endpoint },
+                captureWaitInput: { bridge.captureWaitInput(for: endpoint) },
                 bridge: bridge
             )
         }
@@ -3156,6 +3410,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             requireTargetWindow: { window },
             resolveObserverEndpoint: { _, _ in observerEndpoint },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
+            resolveModelObserverEndpoint: { _ in observerEndpoint },
+            captureWaitInput: { bridge.captureWaitInput(for: observerEndpoint) },
             bridge: bridge
         )
         return ReadReleaseFixture(

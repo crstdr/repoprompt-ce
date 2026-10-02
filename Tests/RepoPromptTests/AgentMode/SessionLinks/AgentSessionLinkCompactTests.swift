@@ -62,7 +62,11 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         codexResumeGate: TestReleaseFence? = nil,
         saverBehavior: LiveSendEventLog.SaverBehavior = .succeed,
         firstSaveGate: FirstSaveGate? = nil,
-        secondSaveGate: FirstSaveGate? = nil
+        secondSaveGate: FirstSaveGate? = nil,
+        codexStallWatchdogProbeThreshold: TimeInterval? = nil,
+        codexStallWatchdogRecoveryThreshold: TimeInterval? = nil,
+        codexStallWatchdogPollIntervalNanos: UInt64? = nil,
+        codexSnapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus? = nil
     ) throws -> Fixture {
         let events = LiveSendEventLog()
         let driftHook = AgentSessionLinkSendTransactionLiveTests.LiveSendDriftHook()
@@ -103,14 +107,21 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             shouldManageCodexTooling: shouldManageCodexTooling,
             codexControllerFactory: { _, _, _, _, _, _ in
                 events.record(.providerControllerCreated)
-                return LifecycleNoopCodexController(recorder: codexRecorder, resumeGate: codexResumeGate)
+                return LifecycleNoopCodexController(
+                    recorder: codexRecorder,
+                    resumeGate: codexResumeGate,
+                    snapshotLatestTurnStatus: codexSnapshotLatestTurnStatus
+                )
             },
             claudeControllerFactory: { _, _, _, _ in
                 events.record(.providerControllerCreated)
                 return claude
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
-            mcpServerEnabler: { true }
+            mcpServerEnabler: { true },
+            testCodexStallWatchdogPollIntervalNanos: codexStallWatchdogPollIntervalNanos,
+            testCodexStallWatchdogProbeThreshold: codexStallWatchdogProbeThreshold,
+            testCodexStallWatchdogRecoveryThreshold: codexStallWatchdogRecoveryThreshold
         )
         retainedViewModels.append(viewModel)
         viewModel.workspaceManager = manager
@@ -830,6 +841,72 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.session.codexPendingTurnKind, .compact)
         XCTAssertEqual(fixture.session.items.last?.text, AgentChatItem.overseerCompactionRequestText)
     }
+
+    /// Regression: a dispatched compaction whose provider lifecycle events never arrive must
+    /// still settle — the stall watchdog reconciles through `thread/read` instead of leaving
+    /// the lane `running` forever (cold Codex compact hang, 2026-10-01).
+    func testSilentCodexCompactionSettlesThroughTheStallWatchdog() async throws {
+        let fixture = try makeFixture(
+            agent: .codexExec,
+            codexStallWatchdogProbeThreshold: 0.05,
+            codexStallWatchdogRecoveryThreshold: 0.25,
+            codexStallWatchdogPollIntervalNanos: 10_000_000,
+            codexSnapshotLatestTurnStatus: .completed
+        )
+        fixture.session.codexConversationID = "lifecycle"
+
+        let outcome = await compact(fixture)
+
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("Expected an accepted Codex compaction, got \(outcome)")
+        }
+        XCTAssertEqual(delivery.deliveryState, .runStarted)
+        XCTAssertEqual(fixture.session.runState, .running)
+
+        try await AsyncTestWait.waitUntil("silent Codex compaction settles via the stall watchdog", timeout: 5) {
+            fixture.session.runState == .completed
+        }
+        XCTAssertEqual(fixture.session.codexPendingTurnKind, nil)
+        XCTAssertEqual(
+            fixture.codexRecorder.events.count(where: { $0 == "codex:compact" }),
+            1,
+            "Recovery reconciles the miss — it must never re-dispatch compaction"
+        )
+        XCTAssertFalse(fixture.codexRecorder.events.contains("codex:send"))
+    }
+
+    /// A stopped compaction must stay cancelled: the watchdog observes the terminal state
+    /// and never resurrects or retries the compact request.
+    func testStoppedCodexCompactionDoesNotResurrectThroughTheStallWatchdog() async throws {
+        let fixture = try makeFixture(
+            agent: .codexExec,
+            codexStallWatchdogProbeThreshold: 0.05,
+            codexStallWatchdogRecoveryThreshold: 0.25,
+            codexStallWatchdogPollIntervalNanos: 10_000_000,
+            codexSnapshotLatestTurnStatus: .completed
+        )
+        fixture.session.codexConversationID = "lifecycle"
+
+        let outcome = await compact(fixture)
+
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("Expected an accepted Codex compaction, got \(outcome)")
+        }
+        XCTAssertEqual(delivery.deliveryState, .runStarted)
+        XCTAssertEqual(fixture.session.runState, .running)
+
+        await fixture.viewModel.cancelAgentRun(tabID: fixture.tabID)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+
+        // Well past the probe + recovery bound; the lane must remain cancelled.
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        XCTAssertEqual(
+            fixture.codexRecorder.events.count(where: { $0 == "codex:compact" }),
+            1,
+            "A stopped compaction is never retried"
+        )
+    }
 }
 
 /// The raw provider-command lane of the Claude coordinator, driven directly.
@@ -1169,6 +1246,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
 
 /// A native runtime stub with an active session that records every provider-bound message.
 actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
+    private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
 
@@ -1197,14 +1275,27 @@ actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
         effortLevel _: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
-        NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "compact-recording")
+        configuration.replaceProcess()
+        return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "compact-recording")
     }
 
     func currentSessionRef() -> NativeAgentRuntimeSessionRef {
         NativeAgentRuntimeSessionRef(sessionID: "compact-recording")
     }
 
-    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {}
+    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {
+        _ = configuration.apply()
+    }
+
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        configuration.apply()
+    }
+
+    func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try configuration.validate(proof)
+        sentMessages.append(text)
+        return UUID()
+    }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
@@ -1215,6 +1306,9 @@ actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
         .noTurnInFlight
     }
 
-    func shutdown() {}
+    func shutdown() {
+        configuration.replaceProcess()
+    }
+
     func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) {}
 }

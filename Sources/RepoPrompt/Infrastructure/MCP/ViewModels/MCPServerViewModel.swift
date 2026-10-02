@@ -1248,6 +1248,9 @@ final class MCPServerViewModel: ObservableObject {
                     message: message,
                     operation: operation
                 )
+            },
+            resolveModelObserverEndpoint: { [self] metadata in
+                await resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata)
             }
         )
     }
@@ -1268,9 +1271,16 @@ final class MCPServerViewModel: ObservableObject {
     /// Current dashboard snapshot (updated via event-driven notifications)
     @Published private(set) var dashboard: MCPService.DashboardSnapshot? {
         didSet {
+            refreshDashboardCloseSafetyProjection()
             recomputeCloseSafetyState()
         }
     }
+
+    // Derived only when the dashboard source changes, not on tool registration/completion.
+    private var dashboardLiveWindowConnections = 0
+    private var dashboardLiveUnboundConnections = 0
+    private var dashboardWindowExecutionCount = 0
+    private var dashboardWindowToolName: String?
 
     @Published private(set) var closeSafetyState: WindowMCPCloseSafetyState = .inactive
 
@@ -1283,6 +1293,21 @@ final class MCPServerViewModel: ObservableObject {
     /// Subscription ID for dashboard updates (for cleanup)
     @MainActor
     private var dashboardSubscriptionID: UUID?
+
+    /// Task that iterates this window's own MCP state stream. Cancelled in
+    /// `stopServiceObservation()` during window teardown and in `deinit` so a
+    /// closed window's subscription — and this view model — are released.
+    private var stateObservationTask: Task<Void, Never>?
+
+    /// Set by `stopServiceObservation()` during window teardown; prevents a
+    /// late `updateDashboardSubscriptionIfNeeded()` from re-arming the
+    /// dashboard loop (which holds `self`) while teardown is in flight.
+    private var serviceObservationStopped = false
+
+    deinit {
+        stateObservationTask?.cancel()
+        dashboardTask?.cancel()
+    }
 
     enum DashboardConsumer: Hashable {
         case toolbarPopover
@@ -1349,11 +1374,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Returns the newest active tool name for this exact window.
     @MainActor
     var windowActiveToolName: String? {
-        let dashboardScope = dashboard?.connections
-            .flatMap(\.activeToolScopes)
-            .filter { $0.windowID == windowID }
-            .max(by: { $0.sequence < $1.sequence })
-        return dashboardScope?.toolName ?? activeToolName
+        dashboardWindowToolName ?? activeToolName
     }
 
     /// True when any tool is actively running for this window.
@@ -1421,7 +1442,10 @@ final class MCPServerViewModel: ObservableObject {
         guard let self else {
             throw MCPError.internalError("Window deallocated while executing \(name)")
         }
-        return try await runTool(name, freshnessPolicy: freshnessPolicy) { [weak self] in
+        return try await runTool(
+            name, freshnessPolicy: freshnessPolicy,
+            modelOnly: ServerNetworkManager.isMemoryOnlyModelCall(toolName: name, arguments: args)
+        ) { [weak self] in
             guard let self else {
                 throw MCPError.internalError("Window deallocated during \(name)")
             }
@@ -2229,6 +2253,9 @@ final class MCPServerViewModel: ObservableObject {
     ] = [:]
     #if DEBUG
         @MainActor
+        var test_shouldPreserveAgentRunSourceBinding: ((UUID, RequestMetadata) async -> Bool)?
+
+        @MainActor
         var readFileAutoSelectionForcedAuthoritativeProbeIDsByContext: [
             MCPReadFileAutoSelectionCoordinator.ContextKey: Set<UUID>
         ] = [:]
@@ -2328,13 +2355,30 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    private func dashboardConnectionsForThisWindow() -> [MCPService.DashboardConnection] {
-        guard let dashboard else { return [] }
-        let allowNilWindow = !isMultiWindowModeEffectivelyActive
-        return dashboard.connections.filter { connection in
-            connection.windowID == windowID || (allowNilWindow && connection.windowID == nil)
+    private func refreshDashboardCloseSafetyProjection() {
+        dashboardLiveWindowConnections = 0
+        dashboardLiveUnboundConnections = 0
+        dashboardWindowExecutionCount = 0
+        var newest: ConnectionDashboardActiveToolScope?
+        for connection in dashboard?.connections ?? [] {
+            if connection.state == .ready || connection.state == .waiting {
+                if connection.windowID == windowID { dashboardLiveWindowConnections += 1 }
+                if connection.windowID == nil { dashboardLiveUnboundConnections += 1 }
+            }
+            for scope in connection.activeToolScopes where scope.windowID == windowID {
+                dashboardWindowExecutionCount += 1
+                if newest.map({ scope.sequence > $0.sequence }) ?? true { newest = scope }
+            }
         }
+        dashboardWindowToolName = newest?.toolName
     }
+
+    #if DEBUG
+        @MainActor
+        func debugSetDashboardForTesting(_ snapshot: MCPService.DashboardSnapshot?) {
+            dashboard = snapshot
+        }
+    #endif
 
     @MainActor
     private func recomputeCloseSafetyState() {
@@ -2343,23 +2387,9 @@ final class MCPServerViewModel: ObservableObject {
             return
         }
 
-        let connections = dashboardConnectionsForThisWindow()
-        let liveConnections = connections.filter { connection in
-            switch connection.state {
-            case .ready, .waiting:
-                true
-            case .setup, .failed, .cancelled, .unknown:
-                false
-            }
-        }
-        let liveConnectionCount = liveConnections.count
-        let dashboardActiveExecutionCount = dashboard?.connections.reduce(into: 0) { count, connection in
-            count += connection.activeToolScopes.count(where: { $0.windowID == windowID })
-        } ?? 0
-        var activeExecutionCount = max(
-            activeToolExecutionsByID.count,
-            dashboardActiveExecutionCount
-        )
+        let liveConnectionCount = dashboardLiveWindowConnections
+            + (isMultiWindowModeEffectivelyActive ? 0 : dashboardLiveUnboundConnections)
+        var activeExecutionCount = max(activeToolExecutionsByID.count, dashboardWindowExecutionCount)
         let activeTool = windowActiveToolName
         if activeExecutionCount == 0, activeTool != nil {
             activeExecutionCount = 1
@@ -2626,6 +2656,7 @@ final class MCPServerViewModel: ObservableObject {
     /// continuation is cleaned up and a `CancellationError` is thrown.
     @MainActor
     func awaitNoActiveToolExecutions(runID: UUID) async throws {
+        try Task.checkCancellation()
         // Fast path: already idle
         let executions = activeToolExecutionIDsByRunID[runID]
         if executions == nil || executions!.isEmpty {
@@ -2643,7 +2674,7 @@ final class MCPServerViewModel: ObservableObject {
                 // Double-check under the same MainActor turn — tools may have
                 // drained between the fast-path check and here.
                 let stillActive = activeToolExecutionIDsByRunID[runID]
-                if stillActive == nil || stillActive!.isEmpty {
+                if Task.isCancelled || stillActive == nil || stillActive!.isEmpty {
                     steeringDebugLog("[AgentRunSteeringWake] MCP idle wait drained before parking runID=\(runID) waiterID=\(waiterID)")
                     continuation.resume()
                     return
@@ -3127,13 +3158,6 @@ final class MCPServerViewModel: ObservableObject {
         // Observe external client events from disk
         observeExternalEvents()
 
-        // ⬇️ NEW: Initialise local published properties with current service snapshot
-        Task { [weak self] in
-            guard let self else { return }
-            let snap = await self.service.currentState()
-            await apply(snap) // @MainActor method
-        }
-
         workspaceManager.$workspaces
             .dropFirst()
             .sink { [weak self] workspaces in
@@ -3154,17 +3178,36 @@ final class MCPServerViewModel: ObservableObject {
 
     // MARK: – Private helpers
 
-    /// Listens to `service.stateStream` and updates UI state.
-    /// Runs once during init, so no cancellation handling needed.
+    /// Listens to this window's own MCP state stream and updates UI state.
+    /// The per-subscriber stream ends via `stopServiceObservation()` during
+    /// window teardown (or task cancellation from `deinit`), so the loop does
+    /// not retain this view model for the life of the process.
     private func observeService() {
-        Task { [weak self] in
-            guard let self else { return }
-
-            for await snapshot in service.stateStream {
+        stateObservationTask = Task { [weak self, service = self.service] in
+            let (subscriptionID, stream) = await service.subscribeToStateUpdates()
+            defer {
+                Task { [service] in
+                    await service.unsubscribeFromStateUpdates(id: subscriptionID)
+                }
+            }
+            for await snapshot in stream {
+                guard !Task.isCancelled else { break }
                 // Hop back to the main actor for all UI/state mutations
-                await apply(snapshot)
+                await self?.apply(snapshot)
             }
         }
+    }
+
+    /// Ends this window's MCP state subscription. Called from
+    /// `WindowState.tearDown()` so the stream finishes and the observation
+    /// loop releases this view model; `deinit` cancels the task as a backstop.
+    /// The dashboard subscription is stopped too: its loop also holds `self`,
+    /// so leaving it running would keep the view model alive after close.
+    func stopServiceObservation() {
+        serviceObservationStopped = true
+        stateObservationTask?.cancel()
+        stateObservationTask = nil
+        stopDashboardUpdatesSubscription(clearSnapshot: true)
     }
 
     /// Observes external client error events written to disk by the CLI
@@ -3212,12 +3255,13 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         // Request user attention if app is not active
-        if snap.pendingClientID != nil, !NSApp.isActive {
+        if snap.pendingClientID != nil, NSApp?.isActive == false {
             NSApp.requestUserAttention(.criticalRequest)
         }
 
         if shouldObserveDashboardUpdates {
             let latestDashboard = await service.dashboardSnapshot()
+            guard !Task.isCancelled else { return }
             dashboard = latestDashboard
         } else if !windowToolsEnabled {
             dashboard = nil
@@ -3532,7 +3576,7 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func startDashboardUpdatesIfNeeded() {
-        guard shouldObserveDashboardUpdates, dashboardTask == nil else { return }
+        guard !serviceObservationStopped, shouldObserveDashboardUpdates, dashboardTask == nil else { return }
 
         let taskID = UUID()
         dashboardTaskID = taskID
@@ -3567,7 +3611,8 @@ final class MCPServerViewModel: ObservableObject {
 
             let initialSnap = await service.dashboardSnapshot()
             await MainActor.run {
-                guard self.shouldObserveDashboardUpdates else { return }
+                guard !Task.isCancelled, self.dashboardTaskID == taskID,
+                      self.shouldObserveDashboardUpdates else { return }
                 self.dashboard = initialSnap
             }
 
@@ -3577,7 +3622,8 @@ final class MCPServerViewModel: ObservableObject {
                 let snap = await service.dashboardSnapshot()
                 mcpServerViewModelDebugLog("Dashboard snapshot fetched with \(snap.connections.count) connection(s)")
                 await MainActor.run {
-                    guard self.shouldObserveDashboardUpdates else { return }
+                    guard !Task.isCancelled, self.dashboardTaskID == taskID,
+                          self.shouldObserveDashboardUpdates else { return }
                     self.dashboard = snap
                 }
             }
@@ -3722,6 +3768,7 @@ final class MCPServerViewModel: ObservableObject {
     private func runTool<T>(
         _ name: String,
         freshnessPolicy: MCPToolFreshnessPolicy,
+        modelOnly: Bool = false,
         body: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         #if DEBUG || EDIT_FLOW_PERF
@@ -3780,7 +3827,18 @@ final class MCPServerViewModel: ObservableObject {
         // This ensures non-tab-scoped tools (like get_file_tree, file_search) can
         // trigger context binding, preventing "live mode" drift in parallel runs
         let metadata = await captureRequestMetadata()
-        let resolvedContext = try? resolveTabContextSnapshot(
+        let modelRoute: ServerNetworkManager.CachedModelRunRoute?
+        if modelOnly {
+            guard let connectionID = metadata.connectionID,
+                  let route = await ServerNetworkManager.shared.cachedModelRunRoute(connectionID: connectionID),
+                  metadata.windowID == route.windowID,
+                  cachedModelObserverEndpoint(connectionID: connectionID, route: route, hint: metadata.tabContextHint) != nil
+            else { throw MCPError.invalidParams(ServerNetworkManager.modelRouteUnavailableMessage) }
+            modelRoute = route
+        } else {
+            modelRoute = nil
+        }
+        let resolvedContext = modelOnly ? nil : try? resolveTabContextSnapshot(
             from: metadata,
             toolName: name
         )
@@ -3789,8 +3847,20 @@ final class MCPServerViewModel: ObservableObject {
             mcpServerViewModelDebugLog("runTool '\(name)' bound context for tab=\(context.tabID) runID=\(context.runID?.uuidString ?? "nil")")
         }
 
+        // Freeze the observer's input generation at the first synchronous route snapshot.
+        // Later routing awaits must not borrow a rebound endpoint's generation.
+        let waitCallOrigin: DomainAgentSessionLinkWaitInput? = if name == MCPWindowToolName.agentSessionLink,
+                                                                  let context = resolvedContext?.snapshot,
+                                                                  let window = try? requireTargetWindow(),
+                                                                  let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID)
+        {
+            AgentSessionLinkRuntimeBridge.shared.captureWaitInput(for: endpoint)
+        } else {
+            nil
+        }
         let shouldTrackActiveTool = await shouldTrackActiveTool(for: metadata)
-        let executionRunID = await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext)
+        let executionRunID = modelOnly ? modelRoute?.runID
+            : await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext)
         let indexedRunID = shouldRegisterRunToolExecution(toolName: name)
             ? executionRunID
             : nil
@@ -3877,7 +3947,9 @@ final class MCPServerViewModel: ObservableObject {
                         EditFlowPerf.Dimensions(toolName: name)
                     ) {
                         try await AgentSelfMCPCallOrigin.$current.withValue(selfCallOrigin) {
-                            try await body()
+                            try await AgentSessionLinkWaitCallOrigin.$current.withValue(waitCallOrigin) {
+                                try await body()
+                            }
                         }
                     }
                     EditFlowPerf.lifecycleEvent(
@@ -4234,6 +4306,7 @@ final class MCPServerViewModel: ObservableObject {
             mcpServerViewModelDebugLog("bindCurrentRequestToTabIfPossible preserved agent-run source binding connectionID=\(connectionID) targetTab=\(tabID)")
             return
         }
+        try MCPAgentRunStartExecutionScope.current?.checkAdmission()
         try bindTabForConnection(
             connectionID: connectionID,
             clientName: metadata.clientName,
@@ -4247,6 +4320,11 @@ final class MCPServerViewModel: ObservableObject {
         connectionID: UUID,
         metadata: RequestMetadata
     ) async -> Bool {
+        #if DEBUG
+            if let decision = test_shouldPreserveAgentRunSourceBinding {
+                return await decision(connectionID, metadata)
+            }
+        #endif
         guard await ServerNetworkManager.shared.runPurpose(for: connectionID) == .agentModeRun else {
             return false
         }

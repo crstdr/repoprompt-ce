@@ -129,6 +129,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPrompt",
         "RepoPromptApp",
         "RepoPromptMCP",
+        "RepoPromptMCPCore",
         "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
@@ -142,6 +143,9 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptRegexCoreTests",
         "RepoPromptCodeMapCoreTests",
         "RepoPromptTests",
+        "RepoPromptMCPCoreTests",
+        "RepoPromptTestSupport",
+        "RepoPromptTestSandboxPreflight",
     )
     for name in required_targets:
         if name not in targets:
@@ -167,6 +171,31 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         )
 
     validate_repo_prompt_test_dependencies(targets["RepoPromptTests"], repo_root)
+
+    core_tests = targets["RepoPromptMCPCoreTests"]
+    if core_tests.get("type") != "test" or core_tests.get("path") != "Tests/RepoPromptMCPCoreTests":
+        raise GeneratorError("RepoPromptMCPCoreTests must remain the MCP core test target")
+    expected_core_test_dependencies = {
+        "RepoPromptTestSandboxPreflight",
+        "RepoPromptMCPCore",
+        "RepoPromptDomainRuntime",
+        "RepoPromptShared",
+        "RepoPromptTestSupport",
+    }
+    if set(_by_name_dependencies(core_tests)) != expected_core_test_dependencies:
+        raise GeneratorError(
+            "RepoPromptMCPCoreTests must depend on RepoPromptMCPCore, RepoPromptDomainRuntime, "
+            "RepoPromptShared, RepoPromptTestSupport, and RepoPromptTestSandboxPreflight"
+        )
+
+    for target_name, expected_type, expected_path in (
+        ("RepoPromptMCPCore", "regular", "Sources/RepoPromptMCPCore"),
+        ("RepoPromptTestSupport", "regular", "Tests/RepoPromptTestSupport"),
+        ("RepoPromptTestSandboxPreflight", "regular", "Tests/RepoPromptTestSandboxPreflight"),
+    ):
+        target = targets[target_name]
+        if target.get("type") != expected_type or target.get("path") != expected_path:
+            raise GeneratorError(f"{target_name} must retain {expected_path} as a {expected_type} target")
 
     domain_runtime = targets["RepoPromptDomainRuntime"]
     if domain_runtime.get("type") != "regular":
@@ -566,10 +595,9 @@ This directory is disposable. Regenerate it with `make xcode-generate`; do not e
   `REPOPROMPT_XCODE_TEST_FILTER` before building to run a focused filter.
 
 The root Swift package reference provides source browsing and indexing. Its native Xcode
-test action is not the supported test workflow because conductor owns the sandboxed test environment the root suites
-require. The vendored Sparkle
-XCFramework also declares an omitted dSYMs directory; this generator deliberately does
-not mutate `Vendor/` to compensate. Use the convenience schemes above.
+test action is not the supported test workflow because conductor owns the sandboxed
+test environment the root suites require. The vendored Sparkle dSYMs are present
+and verified by repository guardrails; use the convenience schemes above.
 
 Xcode does not expand project macros reliably for every external runnable field. The
 generated app scheme records the current worktree root as the working directory and the

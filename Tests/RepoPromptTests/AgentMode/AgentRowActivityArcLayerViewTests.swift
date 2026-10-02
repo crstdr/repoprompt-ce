@@ -29,6 +29,20 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         XCTAssertFalse(rotation.isRemovedOnCompletion)
     }
 
+    /// A hidden window keeps no layer arc at all: `AgentRowRunningIndicator` swaps to the still
+    /// shape so no window commit ever has to walk a live animation.
+    func testHiddenWindowKeepsNoAnimation() {
+        let visible = hostIndicator(isWindowPresentationVisible: true, reduceMotion: false)
+        let hidden = hostIndicator(isWindowPresentationVisible: false, reduceMotion: false)
+        defer {
+            visible.window.close()
+            hidden.window.close()
+        }
+
+        XCTAssertEqual(arcViews(in: visible.host).count, 1, "the visible running row renders the layer-backed arc")
+        XCTAssertTrue(arcViews(in: hidden.host).isEmpty, "a hidden window keeps no animation at all")
+    }
+
     /// SwiftUI draws in y-down space, so `rotationEffect(.degrees(+360))` spins clockwise and
     /// `Circle().trim(0, 0.7)` runs clockwise from 3 o'clock, leaving its gap at the top right. The
     /// layer arc must match: AppKit flips the flipped host view's backing layer, so the arc layer is
@@ -133,6 +147,21 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// The row's mode-resolving indicator, hosted with an explicit window-visibility override.
+    private func hostIndicator(
+        isWindowPresentationVisible: Bool,
+        reduceMotion: Bool
+    ) -> (host: NSHostingView<AnyView>, window: NSWindow) {
+        let host = NSHostingView(rootView: AnyView(
+            AgentRowRunningIndicator(reduceMotionOverride: reduceMotion)
+                .environment(\.windowIsPresentationVisible, isWindowPresentationVisible)
+        ))
+        let window = makeWindow()
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        return (host, window)
+    }
 
     /// The sidebar row's own running arc, hosted in a window the way the row hosts it.
     private func hostRunningArc() -> (host: NSHostingView<AgentRowActivityArc>, window: NSWindow) {

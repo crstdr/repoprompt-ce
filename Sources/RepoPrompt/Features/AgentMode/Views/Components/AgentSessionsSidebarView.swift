@@ -615,6 +615,7 @@ struct AgentModeSessionsListView: View {
                         let creator = session.sessionID.flatMap {
                             agentModeVM.agentSessionLinkLaneCreator(for: $0)
                         }
+
                         AgentSessionRow(
                             title: session.title,
                             isActive: session.tabID == currentTabID,
@@ -624,7 +625,8 @@ struct AgentModeSessionsListView: View {
                             onOpenCreator: {
                                 guard let targetSessionID = session.sessionID,
                                       let creatorSessionID = creator?.sessionID,
-                                      agentModeVM.agentSessionLinkLaneCreatorSessionID(for: targetSessionID) == creatorSessionID
+                                      agentModeVM.agentSessionLinkLaneCreatorSessionID(for: targetSessionID)
+                                      == creatorSessionID
                                 else { return }
                                 Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
                             },
@@ -643,6 +645,12 @@ struct AgentModeSessionsListView: View {
                             isSelected: selectionState.selectedIdentities.contains(identity),
                             showsSelectionPresentation: showsSelectionPresentation,
                             isInteractionEnabled: isInteractionEnabled,
+                            tapRowID: session.id,
+                            tapSelectionCount: selectionState.selectedIdentities.count,
+                            tapWorkspaceMatched: AgentSidebarTapWorkspaceGate.evaluate(
+                                sidebarWorkspaceID: snapshot.workspaceID,
+                                activeWorkspaceID: agentModeVM.workspaceManager?.activeWorkspaceID
+                            ).workspaceMatched,
                             commandProgressKind: selectionState.commandRowProgressOperation(
                                 for: identity,
                                 workspaceID: snapshot.workspaceID
@@ -652,7 +660,8 @@ struct AgentModeSessionsListView: View {
                                     gesture,
                                     identity: identity,
                                     renderedOrder: snapshot.renderedSelectionOrder,
-                                    workspaceID: snapshot.workspaceID
+                                    workspaceID: snapshot.workspaceID,
+                                    rowID: session.id
                                 )
                             },
                             onSelect: {
@@ -1380,6 +1389,9 @@ enum AgentSidebarDateSectionBuilder {
                 ]
             )
         #endif
+        assert(sections.allSatisfy { section in
+            !section.groups.isEmpty && section.groups.allSatisfy { !$0.rows.isEmpty }
+        })
         return sections
     }
 
@@ -1467,6 +1479,7 @@ enum AgentSidebarDateSectionBuilder {
                 ]
             )
         #endif
+        assert(sections.allSatisfy { !$0.rows.isEmpty })
         return sections
     }
 
@@ -1606,6 +1619,12 @@ struct ArchivedSessionsList: View {
                     isSelected: selectionState.selectedIdentities.contains(identity),
                     showsSelectionPresentation: selectionState.showsSelectionPresentation,
                     isInteractionEnabled: !selectionState.isMutationInFlight,
+                    tapRowID: stashed.id,
+                    tapSelectionCount: selectionState.selectedIdentities.count,
+                    tapWorkspaceMatched: AgentSidebarTapWorkspaceGate.evaluate(
+                        sidebarWorkspaceID: workspaceID,
+                        activeWorkspaceID: agentModeVM.workspaceManager?.activeWorkspaceID
+                    ).workspaceMatched,
                     commandProgressKind: selectionState.commandRowProgressOperation(
                         for: identity,
                         workspaceID: workspaceID
@@ -1615,7 +1634,8 @@ struct ArchivedSessionsList: View {
                             gesture,
                             identity: identity,
                             renderedOrder: renderedOrder,
-                            workspaceID: workspaceID
+                            workspaceID: workspaceID,
+                            rowID: stashed.id
                         )
                     },
                     onRestore: {

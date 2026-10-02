@@ -21,8 +21,16 @@ final class DevinCLIProvider: AIProvider {
     }
 
     #if DEBUG
-        static func test_arguments(modelName: String?, promptFilePath: String) -> [String] {
-            DevinOneShotCLIOptions(modelName: modelName, promptFilePath: promptFilePath).toTokens()
+        static func test_arguments(
+            modelName: String?,
+            promptFilePath: String,
+            permissionMode: String = "auto"
+        ) -> [String] {
+            DevinOneShotCLIOptions(
+                modelName: modelName,
+                promptFilePath: promptFilePath,
+                permissionMode: permissionMode
+            ).toTokens()
         }
 
         static func test_promptText(from message: AIMessage) -> String {
@@ -135,7 +143,8 @@ final class DevinCLIProvider: AIProvider {
             result = try await runner.run(
                 args: DevinOneShotCLIOptions(
                     modelName: modelName,
-                    promptFilePath: promptURL.path
+                    promptFilePath: promptURL.path,
+                    permissionMode: DevinAgentToolPreferences.unattendedLaunchPermissionMode()
                 ).toTokens(),
                 stdin: nil,
                 outputMode: .none,
@@ -231,6 +240,7 @@ final class DevinCLIProvider: AIProvider {
 private struct DevinOneShotCLIOptions {
     let modelName: String?
     let promptFilePath: String
+    let permissionMode: String
 
     func toTokens() -> [String] {
         var tokens: [String] = []
@@ -242,7 +252,7 @@ private struct DevinOneShotCLIOptions {
         }
         tokens += [
             "--respect-workspace-trust", "false",
-            "--permission-mode", "auto",
+            "--permission-mode", permissionMode,
             "--prompt-file", promptFilePath,
             "-p"
         ]

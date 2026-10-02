@@ -36,7 +36,11 @@ required_dirs=(
   "Sources/RepoPromptShared/MCP"
   "Sources/RepoPromptWorkspaceCore"
   "Sources/RepoPromptDomainRuntime"
+  "Sources/RepoPromptMCPCore"
   "Tests/RepoPromptTests"
+  "Tests/RepoPromptMCPCoreTests"
+  "Tests/RepoPromptTestSupport"
+  "Tests/RepoPromptTestSandboxPreflight"
   "Tests/RepoPromptWorkspaceCoreTests"
   "Tests/RepoPromptDomainRuntimeTests"
 )
@@ -328,6 +332,11 @@ if app_by_name_dependencies.count("RepoPromptDomainRuntime") != 1:
 repo_prompt_tests_dependencies = [dependency["byName"][0] for dependency in targets.get("RepoPromptTests", {}).get("dependencies", []) if dependency.get("byName")]
 if repo_prompt_tests_dependencies.count("RepoPromptDomainRuntime") != 1:
     errors.append("RepoPromptTests must directly consume RepoPromptDomainRuntime for adapter evidence")
+for test_target_name in ("RepoPromptTests", "RepoPromptMCPCoreTests"):
+    test_target = targets.get(test_target_name, {})
+    dependencies = [dependency["byName"][0] for dependency in test_target.get("dependencies", []) if dependency.get("byName")]
+    if dependencies.count("RepoPromptTestSandboxPreflight") != 1:
+        errors.append(f"{test_target_name} must depend on RepoPromptTestSandboxPreflight")
 
 code_map_core_tests = targets.get("RepoPromptCodeMapCoreTests", {})
 core_test_dependencies = [

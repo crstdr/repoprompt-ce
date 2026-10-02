@@ -11,8 +11,11 @@ struct AgentStashedSessionRow: View {
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
+    var tapRowID: UUID?
+    var tapSelectionCount = 0
+    var tapWorkspaceMatched = false
     var commandProgressKind: AgentSidebarBulkActionKind?
-    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
+    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureResult
     let onRestore: () -> Void
     let onDelete: () -> Void
     let sessionIDCopyAction: AgentSidebarSessionIDCopyAction
@@ -51,19 +54,15 @@ struct AgentStashedSessionRow: View {
         "Delete stashed tab"
     }
 
-    private var currentSelectionGesture: AgentSidebarSelectionGesture {
-        var modifiers: AgentSidebarSelectionModifiers = []
-        let flags = NSApp.currentEvent?.modifierFlags ?? []
-        if flags.contains(.command) { modifiers.insert(.command) }
-        if flags.contains(.shift) { modifiers.insert(.shift) }
-        return AgentSidebarSelectionGesture(modifiers: modifiers)
-    }
-
     private func handleRowTap() {
-        guard isInteractionEnabled else { return }
-        if onSelectionGesture(currentSelectionGesture) == .activate {
-            onRestore()
-        }
+        AgentSidebarRowTap.handle(
+            isInteractionEnabled: isInteractionEnabled,
+            tapRowID: tapRowID,
+            tapSelectionCount: tapSelectionCount,
+            tapWorkspaceMatched: tapWorkspaceMatched,
+            onSelectionGesture: onSelectionGesture,
+            onActivate: onRestore
+        )
     }
 
     private func toggleSelection() {

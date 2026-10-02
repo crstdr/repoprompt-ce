@@ -221,13 +221,35 @@ class CatalogTests(unittest.TestCase):
             baseline = root / 'baseline.json'
             baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0,
                                                           'expressions_500ms': 0}}))
+            def run_command(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+                if command == ['swift', 'test', 'list', '--skip-build']:
+                    environment = kwargs.get('env', {})
+                    self.assertIn('REPOPROMPT_TEST_SANDBOX_ROOT', environment)
+                    sandbox = Path(environment['REPOPROMPT_TEST_SANDBOX_ROOT'])
+                    self.assertTrue((sandbox / '.issue944-test-sandbox').is_file())
+                    for key in ('HOME', 'CFFIXED_USER_HOME', 'TMPDIR'):
+                        self.assertTrue(Path(environment[key]).is_relative_to(sandbox))
+                        self.assertTrue(Path(environment[key]).is_dir())
+                    return listing
+                if command == ['swift', 'package', 'clean']:
+                    self.assertNotIn('env', kwargs)
+                    return subprocess.CompletedProcess([], 0)
+                self.assertEqual(command, ['swift', 'package', 'dump-package'])
+                self.assertNotIn('env', kwargs)
+                return subprocess.CompletedProcess([], 0, stdout=json.dumps({
+                    'targets': [{'type': 'test', 'name': 'RepoPromptTests'}],
+                }))
+
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
-                    mock.patch.object(ci_build.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 0), listing, subprocess.CompletedProcess([], 0, stdout=json.dumps({'targets': [{'type': 'test', 'name': 'RepoPromptTests'}]}))]) as run, \
+                    mock.patch.object(ci_build.subprocess, 'run', side_effect=run_command) as run, \
                     mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
                     mock.patch.object(ci_build, 'sources_import_module', return_value=False), \
                     mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '1'}):
                 self.assertEqual(ci_build.main(), 0)
                 self.assertEqual(run.call_args_list[0].args[0], ['swift', 'package', 'clean'])
+                self.assertNotIn('env', ci_build.subprocess.Popen.call_args.kwargs)
+                listing_environment = run.call_args_list[1].kwargs['env']
+                self.assertFalse(Path(listing_environment['REPOPROMPT_TEST_SANDBOX_ROOT']).exists())
 
     def test_report_only_ratchet_keeps_regressed_diagnostic_visible(self) -> None:
         class BuildProcess:

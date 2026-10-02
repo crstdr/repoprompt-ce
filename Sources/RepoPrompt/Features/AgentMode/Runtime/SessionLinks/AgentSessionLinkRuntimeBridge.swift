@@ -95,6 +95,20 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// Default `nil` — hosts that do not own real windows present app-modally instead.
     func agentSessionLinkSheetWindow(windowID: Int) -> NSWindow?
 
+    func agentSessionLinkModelAvailability(windowID: Int) -> AgentModelCatalog.AvailabilityContext
+
+    /// Exact memory-only lookup; must not sweep sessions or resolve execution locations.
+    func agentSessionLinkModelCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkEndpointCandidate?
+
+    func agentSessionLinkPerformSetModel(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        modelID: String,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkModelOutcome
+
     /// Count independent compose-tab bindings without hydration.
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int
 
@@ -1001,6 +1015,8 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     private let authority: DomainAgentSessionLinkAuthority
+    private var localInputGenerations: [DomainAgentSessionLinkEndpointIdentity: UInt64] = [:]
+    private var localInputReleaseTasks: [DomainAgentSessionLinkEndpointIdentity: Task<Void, Never>] = [:]
     private weak var host: AgentSessionLinkEndpointHost?
     /// Durable oversight intent, installed by app composition.
     ///
@@ -3494,6 +3510,7 @@ final class AgentSessionLinkRuntimeBridge {
     ) async {
         let capturedBookkeeping = bookkeepingByReference
         let notices = await authority.invalidate(endpoint: endpoint, reason: reason)
+        await retireLocalInput(for: [endpoint])
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
         noteLifecycleEnded(sessionIDs: [endpoint.sessionID])
     }
@@ -3507,6 +3524,7 @@ final class AgentSessionLinkRuntimeBridge {
     func invalidateSession(_ sessionID: UUID, reason: DomainAgentSessionLinkRevocationReason) async {
         let capturedBookkeeping = bookkeepingByReference
         let notices = await authority.invalidateSession(sessionID: sessionID, reason: reason)
+        await retireLocalInput(for: localInputGenerations.keys.filter { $0.sessionID == sessionID })
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
         noteLifecycleEnded(sessionIDs: [sessionID])
     }
@@ -3514,6 +3532,7 @@ final class AgentSessionLinkRuntimeBridge {
     func invalidateWindow(_ windowID: Int, reason: DomainAgentSessionLinkRevocationReason) async {
         let capturedBookkeeping = bookkeepingByReference
         let notices = await authority.invalidateWindow(windowID: windowID, reason: reason)
+        await retireLocalInput(for: localInputGenerations.keys.filter { $0.windowID == windowID })
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
         noteLifecycleEnded(sessionIDs: Set(notices.flatMap { [$0.observerSessionID, $0.targetSessionID] }))
     }
@@ -3529,6 +3548,9 @@ final class AgentSessionLinkRuntimeBridge {
             windowID: windowID,
             reason: reason
         )
+        await retireLocalInput(for: localInputGenerations.keys.filter {
+            $0.workspaceID == workspaceID && (windowID == nil || $0.windowID == windowID)
+        })
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
         noteLifecycleEnded(sessionIDs: Set(notices.flatMap { [$0.observerSessionID, $0.targetSessionID] }))
     }
@@ -3557,7 +3579,7 @@ final class AgentSessionLinkRuntimeBridge {
     ) async {
         guard let host else { return }
         let live = Set(host.agentSessionLinkCandidates().map(\.domainEndpoint))
-        let affected = knownObserverEndpoints.union(knownTargetEndpoints).filter {
+        let affected = knownObserverEndpoints.union(knownTargetEndpoints).union(localInputGenerations.keys).filter {
             $0.windowID == windowID && $0.tabID == tabID && !live.contains($0)
         }
         guard !affected.isEmpty else {
@@ -3571,6 +3593,7 @@ final class AgentSessionLinkRuntimeBridge {
         var notices: [DomainAgentSessionLinkRevocationNotice] = []
         for endpoint in affected {
             notices += await authority.invalidate(endpoint: endpoint, reason: reason)
+            await retireLocalInput(for: [endpoint])
             knownObserverEndpoints.remove(endpoint)
             knownTargetEndpoints.remove(endpoint)
             removeChain(forTargetSession: endpoint.sessionID, matching: endpoint)
@@ -3593,7 +3616,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// particular advertisement invalidation, which used to reach these observers only through the
     /// lossy change feed, on exactly the lifecycle path that exists to repair stale state.
     private func sweepStaleEndpoints(liveCandidates: [AgentSessionLinkEndpointCandidate]) async {
-        guard !knownObserverEndpoints.isEmpty || !knownTargetEndpoints.isEmpty else { return }
+        guard !knownObserverEndpoints.isEmpty || !knownTargetEndpoints.isEmpty || !localInputGenerations.isEmpty else { return }
         let live = Set(liveCandidates.map(\.domainEndpoint))
         let capturedBookkeeping = bookkeepingByReference
         var notices: [DomainAgentSessionLinkRevocationNotice] = []
@@ -3616,6 +3639,7 @@ final class AgentSessionLinkRuntimeBridge {
             removeChain(forTargetSession: endpoint.sessionID, matching: endpoint)
         }
 
+        await retireLocalInput(for: localInputGenerations.keys.filter { !live.contains($0) })
         await reconcile(
             after: notices,
             capturedBookkeeping: capturedBookkeeping,
@@ -4771,7 +4795,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// whole batch would discard the healthy siblings' cursors. Instead each target is re-fenced on
     /// its own, like `terminalWaitSurvivingStates`: survivors keep their rows and prompts, and a
     /// target that fails its own fence releases nothing. Returns `nil` only when no target survives
-    /// (or for a single target that fails), so the caller denies exactly as before.
+    /// (or for a single target that fails), or when the final survivor batch changes again.
     func pendingInteractionsForWaitObservation(
         leases: [DomainAgentSessionLinkLease]
     ) async -> (
@@ -4782,15 +4806,17 @@ final class AgentSessionLinkRuntimeBridge {
             return (inspections, Set(leases.map(\.target.sessionID)))
         }
         guard leases.count > 1, !isFrozenForTermination else { return nil }
-        var inspections: [UUID: AgentSessionLinkPendingInteractionInspection] = [:]
-        var surviving: Set<UUID> = []
+        var surviving: [DomainAgentSessionLinkLease] = []
         for lease in leases {
-            guard let own = await pendingInteractionsForObservation(leases: [lease]) else { continue }
-            inspections.merge(own) { _, fenced in fenced }
-            surviving.insert(lease.target.sessionID)
+            guard await pendingInteractionsForObservation(leases: [lease]) != nil else { continue }
+            surviving.append(lease)
         }
-        guard !surviving.isEmpty, !isFrozenForTermination else { return nil }
-        return (inspections, surviving)
+        // A later sibling's authority hop can invalidate an earlier survivor. Release only a fresh
+        // projection of the final whole-survivor batch, never the provisional per-target prompts.
+        guard !surviving.isEmpty,
+              let inspections = await pendingInteractionsForObservation(leases: surviving)
+        else { return nil }
+        return (inspections, Set(surviving.map(\.target.sessionID)))
     }
 
     /// Submits one explicit observer answer to the target's exact current interaction.
@@ -5378,12 +5404,23 @@ final class AgentSessionLinkRuntimeBridge {
             lease = value
         case let .failure(error):
             if error == .capabilityDenied, operation.requiredMonitorCapability == .manage {
+                if operation == .monitorSetModel {
+                    guard case let .success(watch) = await authority.authorize(
+                        operation: .monitorPoll, observerEndpoint: observerEndpoint,
+                        targetSessionID: targetSessionID
+                    ), modelEndpoints(for: watch) != nil else { return .failure(.denied) }
+                    return .failure(.managementNotGranted)
+                }
                 return await managementNotGrantedOrDenied(
                     observerEndpoint: observerEndpoint,
                     targetSessionID: targetSessionID
                 )
             }
             return .failure(AuthorizationFailure(error))
+        }
+        if operation == .monitorSetModel {
+            guard let candidate = modelEndpoints(for: lease) else { return .failure(.denied) }
+            return .success(AuthorizedTarget(lease: lease, candidate: candidate))
         }
         guard let candidate = await revalidateEndpoints(for: lease) else {
             return .failure(.denied)
@@ -5633,14 +5670,59 @@ final class AgentSessionLinkRuntimeBridge {
         await authority.targetState(for: lease)
     }
 
+    /// Clear only genuinely gone incarnations after their input forwarding has settled.
+    private func retireLocalInput(for endpoints: [DomainAgentSessionLinkEndpointIdentity]) async {
+        for endpoint in endpoints {
+            while let forwarding = localInputReleaseTasks[endpoint] {
+                await forwarding.value
+            }
+            guard let generation = localInputGenerations[endpoint],
+                  host?.agentSessionLinkCandidates().contains(where: {
+                      $0.domainEndpoint == endpoint && !$0.isClosing
+                  }) != true,
+                  await authority.forgetLocalInput(.init(endpoint: endpoint, generation: generation)),
+                  localInputGenerations[endpoint] == generation else { continue }
+            localInputGenerations.removeValue(forKey: endpoint)
+        }
+    }
+
+    func captureWaitInput(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> DomainAgentSessionLinkWaitInput {
+        .init(endpoint: endpoint, generation: localInputGenerations[endpoint, default: 0])
+    }
+
+    /// Called synchronously at composer acceptance, before any host steering drain can start.
+    @discardableResult
+    func acceptLocalInput(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> Task<Void, Never> {
+        let generation = localInputGenerations[endpoint, default: 0] + 1
+        localInputGenerations[endpoint] = generation
+        let previous = localInputReleaseTasks[endpoint]
+        let authority = authority
+        let task = Task { [weak self] in
+            await previous?.value
+            await authority.acceptLocalInput(.init(endpoint: endpoint, generation: generation))
+            if self?.localInputGenerations[endpoint] == generation {
+                self?.localInputReleaseTasks.removeValue(forKey: endpoint)
+            }
+        }
+        localInputReleaseTasks[endpoint] = task
+        return task
+    }
+
     /// Bounded, event-driven wait. The authority owns one-waiter admission and atomic multi-target
     /// slot reservation; this is a pure forward so the service never holds the authority itself.
     func wait(
         requests: [DomainAgentSessionLinkWaitRequest],
         until predicate: DomainAgentSessionLinkWaitPredicate,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        observerInput: DomainAgentSessionLinkWaitInput? = nil
     ) async -> DomainAgentSessionLinkWaitResult {
-        await authority.wait(requests: requests, until: predicate, timeoutSeconds: timeoutSeconds)
+        if let observerInput {
+            // A post-acceptance request must not overtake the already-installed actor forwarding.
+            await localInputReleaseTasks[observerInput.endpoint]?.value
+        }
+        return await authority.wait(
+            requests: requests, until: predicate, timeoutSeconds: timeoutSeconds, observerInput: observerInput
+        )
     }
 
     func openReadCursor(
@@ -5989,6 +6071,51 @@ final class AgentSessionLinkRuntimeBridge {
             notePendingSendLedgerSettled(on: target.lease.reference)
             return .blocked(failure)
         }
+    }
+
+    // MARK: - Configuration-only model selection
+
+    private func modelEndpoints(for lease: DomainAgentSessionLinkLease) -> AgentSessionLinkEndpointCandidate? {
+        guard !isFrozenForTermination, !Task.isCancelled, let host,
+              let observer = host.agentSessionLinkModelCandidate(for: lease.observer),
+              let target = host.agentSessionLinkModelCandidate(for: lease.target),
+              observer.domainEndpoint == lease.observer, target.domainEndpoint == lease.target,
+              !observer.isClosing, !target.isClosing,
+              !observer.isDeletionInProgress, !target.isDeletionInProgress,
+              AgentSessionLinkEndpointEligibility.observerOperationEligibility(
+                  observer.eligibilityInput,
+                  roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
+              ) == .eligible
+        else { return nil }
+        return target
+    }
+
+    func setModel(target: AuthorizedTarget, modelID: String) async -> AgentSessionLinkModelOutcome {
+        guard let host, target.lease.capability == .manage,
+              modelEndpoints(for: target.lease) != nil else { return .blocked(.linkRevoked) }
+        // Retain the host and the ORIGINAL lease through routing. The only final authority hop
+        // occurs inside the target transaction; never reacquire a grant after revoke/relink.
+        return await host.agentSessionLinkPerformSetModel(
+            to: target.candidate, modelID: modelID,
+            liveness: { [self] in
+                let live = modelEndpoints(for: target.lease) != nil
+                return AgentSessionLinkSendLiveness(
+                    observerEndpointIsLive: live, targetEndpointIsLive: live,
+                    targetWindowIsClosing: isFrozenForTermination
+                )
+            },
+            reauthorize: { [self] in
+                guard !isFrozenForTermination, !Task.isCancelled else { return .shuttingDown }
+                let error = await authority.validate(lease: target.lease)
+                guard !isFrozenForTermination, !Task.isCancelled else { return .shuttingDown }
+                switch error {
+                case nil: return .committed
+                case .capabilityDenied?: return .managementRevoked
+                case .runtimeShuttingDown?: return .shuttingDown
+                default: return .linkRevoked
+                }
+            }
+        )
     }
 
     // MARK: - Overseer compaction
@@ -6932,12 +7059,19 @@ final class AgentSessionLinkRuntimeBridge {
         else { return .refused(.destinationUnavailable) }
         let selection: AgentSessionLanePolicy.RoleSelection
         do {
-            // Match create_session's cached ACP-model admission without a provider run.
-            await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
-            selection = try AgentSessionLanePolicy.resolveRole(
-                request.role, availability: .current, workspaceID: destination.workspaceID
-            )
-        } catch { return .refused(.roleUnavailable) }
+            if let modelID = request.modelID {
+                guard request.role == nil else { return .refused(.modelUnavailable) }
+                selection = try AgentSessionLanePolicy.resolveModel(
+                    modelID, availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID)
+                )
+            } else {
+                // Preserve the existing role/default behavior. Explicit selections never warm.
+                await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+                selection = try AgentSessionLanePolicy.resolveRole(
+                    request.role, availability: .current, workspaceID: destination.workspaceID
+                )
+            }
+        } catch { return .refused(request.modelID == nil ? .roleUnavailable : .modelUnavailable) }
         guard await authority.hasActiveLink(endpoint: observerEndpoint) else { return .refused(.denied) }
         // No suspension between this count and the reservation: admission is creator-scoped and
         // counts both active lanes and the pending allocations that have not linked yet.
@@ -7007,6 +7141,13 @@ final class AgentSessionLinkRuntimeBridge {
         }
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
         let creation: AgentSessionLaneHostCreationOutcome
+        do {
+            if let modelID = request.modelID {
+                guard try AgentSessionLanePolicy.resolveModel(
+                    modelID, availability: host.agentSessionLinkModelAvailability(windowID: destinationWindowID)
+                ) == selection else { return .refused(.modelUnavailable) }
+            }
+        } catch { return .refused(.modelUnavailable) }
         do {
             creation = try await host.agentSessionLinkCreateLane(
                 destinationWindowID: destinationWindowID,

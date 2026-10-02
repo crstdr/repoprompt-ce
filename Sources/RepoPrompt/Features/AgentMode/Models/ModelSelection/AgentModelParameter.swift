@@ -144,8 +144,9 @@ struct ACPModelParameterIdentity: Hashable {
 
     static func canonicalBaseModelRaw(_ raw: String, providerID: ACPProviderID) -> String {
         if providerID == .cursor {
-            return CursorAIModelCatalog.option(matching: raw)?.rawValue
-                ?? ACPAIModelCatalog.normalizedCursorModelAlias(raw)
+            // Pure identity: a saved parameter pin must resolve to the same identity before and
+            // after Cursor's discovery snapshot warms, so this never consults membership.
+            return CursorAIModelCatalog.canonicalIdentity(raw)
         }
         return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
@@ -197,7 +198,7 @@ enum ACPModelParameterResolver {
             let savedChoice = saved.flatMap { selection in
                 definition.choice(matching: selection.valueRaw)
                     ?? (
-                        providerID == .openCode
+                        providerID == .openCode || providerID == .devin
                             ? ACPModelParameterChoice(rawValue: selection.valueRaw, displayName: selection.valueRaw)
                             : nil
                     )
@@ -227,9 +228,19 @@ enum ACPModelParameterResolver {
                 workspacePath: workspacePath,
                 observation: openCodeParameters
             )
+        case .devin:
+            devinParameterSet(selectedModelRaw: selectedModelRaw)
         default:
             nil
         }
+    }
+
+    private static func devinParameterSet(selectedModelRaw: String) -> ACPModelParameterSet? {
+        let identity = ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: .devin)
+        let matches = AgentACPModelRegistry.shared.resolvedSnapshot(for: .devin)?.modelParameterSets.filter {
+            ACPModelParameterIdentity.canonicalBaseModelRaw($0.baseModelRaw, providerID: .devin) == identity
+        } ?? []
+        return matches.count == 1 ? matches[0] : nil
     }
 
     /// Accept OpenCode metadata only when the observation is `.available`, its key matches the

@@ -406,7 +406,6 @@ final class AgentModeRunService {
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             sessionModeID: runtimePermission.acpSessionModeID,
             autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
-            launchPermissionMode: runtimePermission.acpLaunchPermissionMode,
             // Resolve pins for whichever ACP provider is selected, not Cursor alone: OpenCode
             // effort pins ride this same path, and narrowing it to `.cursor` silently drops them.
             modelParameterSelections: selectedAgent.acpProviderID.map { providerID in
@@ -509,6 +508,7 @@ final class AgentModeRunService {
                 // Wait for all active MCP tool executions to finish before interrupting.
                 steeringDebugLog("[AgentRunSteeringWake] ACP flush waiting MCP idle tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
                 do {
+                    try await session.awaitObserverWaitRelease(runID: runID, runAttemptID: runAttemptID)
                     try await dependencies.awaitNoActiveMCPTools(runID)
                     steeringDebugLog("[AgentRunSteeringWake] ACP flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
                 } catch {
@@ -1053,6 +1053,7 @@ final class AgentModeRunService {
                 // Wait for all active MCP tool executions to finish before interrupting.
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush waiting MCP idle tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 do {
+                    try await session.awaitObserverWaitRelease(runID: runID, runAttemptID: runAttemptID)
                     try await dependencies.awaitNoActiveMCPTools(runID)
                     steeringDebugLog("[AgentRunSteeringWake] Claude flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 } catch {

@@ -95,8 +95,7 @@ final class DevinDiscoveryImportIsolationTests: XCTestCase {
             workspacePath: fixture.workspace.path,
             resumeSessionID: nil,
             attachments: [],
-            taskLabelKind: nil,
-            launchPermissionMode: "auto"
+            taskLabelKind: nil
         )
         guard case .supported = try await provider.support(for: request) else {
             return XCTFail("Scripted Devin launch should be supported")

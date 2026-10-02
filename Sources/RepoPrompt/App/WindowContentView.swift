@@ -30,6 +30,8 @@ struct WindowContentView: View {
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
             .debugBuildWindowEdge()
             .environmentObject(windowState) // If your subviews need it
+            // Presentation-only visibility for decorative animations, above the sidebar and detail.
+            .environment(\.windowIsPresentationVisible, windowState.isPresentationVisible)
             .environment(\.agentModePerfRecorder, windowState.agentModeViewModel.perfRecorder)
             .environmentObject(sparkleManager)
             .environmentObject(versionManager) // Pass versionManager to ContentView
@@ -69,6 +71,7 @@ struct WindowContentView: View {
 
                 guard !windowStatesManager.isTerminating else {
                     windowState.aiQueriesService.cancelQuery()
+                    windowState.mcpServer.stopServiceObservation()
                     return
                 }
 
