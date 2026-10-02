@@ -9,15 +9,23 @@ import XCTest
 /// freshly fenced managed poll/wait may carry a redacted pending interaction.
 @MainActor
 final class AgentSessionLinkToolServiceTests: XCTestCase {
-    func testWaitTimeoutIsWaitSpecificAndBounded() throws {
-        XCTAssertEqual(try AgentSessionLinkMCPToolService.resolvedWaitTimeoutSeconds(nil), 60)
-        for seconds in [0.0, 0.5, 60.0] {
-            XCTAssertEqual(try AgentSessionLinkMCPToolService.resolvedWaitTimeoutSeconds(.double(seconds)), seconds)
+    func testWaitPreservesLegacyTimeoutRangeWithLocalInputCancellation() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        var delayed = fixture.service
+        let oldInput = fixture.bridge.captureWaitInput(for: fixture.observer.domainEndpoint)
+        delayed.captureWaitInput = { oldInput }
+        await fixture.bridge.acceptLocalInput(for: fixture.observer.domainEndpoint).value
+        let timeouts: [Value?] = [nil, .int(0), .int(60), .double(60.01), .int(120), .int(86400)]
+        for timeout in timeouts {
+            var args: [String: Value] = [
+                "op": .string("wait"), "session_id": .string(fixture.target.sessionID.uuidString)
+            ]
+            args["timeout_seconds"] = timeout
+            let result = try await Self.executeObject(delayed, args: args)
+            XCTAssertEqual(result["result"]?.stringValue, "cancelled")
+            XCTAssertEqual(result["_meta"]?.objectValue?["wake_reason"]?.stringValue, "local_user_input")
         }
-        for seconds in [-1.0, 60.01, 120.0, 86400.0] {
-            XCTAssertThrowsError(try AgentSessionLinkMCPToolService.resolvedWaitTimeoutSeconds(.double(seconds)))
-        }
-        XCTAssertEqual(try AgentMCPToolHelpers.parseTimeoutSeconds(.int(86400)), 86400)
     }
 
     func testDelayedOldWaitReturnsLocalInputMetadataAndNewWaitStillWorks() async throws {
