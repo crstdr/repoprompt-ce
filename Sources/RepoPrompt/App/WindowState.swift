@@ -927,6 +927,7 @@ class WindowState: ObservableObject {
         }
         for publisher in publishers {
             publisher
+                .receive(on: RunLoop.main)
                 .sink { [weak self, weak window] _ in
                     guard let self, let window else { return }
                     schedulePresentationVisibilityUpdate(from: window)
