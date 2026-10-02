@@ -19,6 +19,12 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         return candidates
     }
 
+    func agentSessionLinkPublishCreatorNames(_ names: [UUID: String]) {
+        for window in allWindows where !window.isClosing {
+            window.agentModeViewModel.agentSessionLinkPublishCreatorNames(names)
+        }
+    }
+
     func agentSessionLinkSheetWindow(windowID: Int) -> NSWindow? {
         allWindows.first(where: { $0.windowID == windowID })?.nsWindow
     }

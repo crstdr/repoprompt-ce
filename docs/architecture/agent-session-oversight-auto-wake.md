@@ -179,6 +179,31 @@ may retract a routine pre-dispatch attempt, but not an exact live attention-back
 revocation, and every other hard gate still retract either kind. No control claims to cancel a
 physical provider call already in flight.
 
+## Sidebar creator names are UI-only settled presentation
+
+Active and archived creator rows use settled UI names plus known-tab/session provenance reads and
+the owner-valid index, without walking the target menu's lifecycle identity. A hydrated live nil
+creator suppresses stale indexed provenance, while a fresh unhydrated creator remains readable before
+index publication. Neither row discovers candidates or searches unrelated live sessions.
+
+The bridge derives live display names on binding/readiness/topology changes. The workspace array's
+mutation owner compares the active cohort's tab/session/name tuples, including reload/sync replacements;
+name-only changes update that UI snapshot synchronously without reconstructing provider/location
+candidates. Effective name changes also schedule a coalesced presentation-only repaint for live menus,
+whose linked/available peers and inbound labels use those names. Publication uses the existing
+exact-projection storage transaction, including a changed name signal for archived/unlinked consumers
+when exact props are equal. Late monitor publication
+re-resolves creator provenance and names against the current settled source. This changes no grants,
+prompt inventory, passive delivery, or Auto-wake policy.
+
+Live first-match `resolvedDisplayName` wins for duplicate session UUIDs; descriptive UUID lookup never
+selects an action endpoint. Up to 4,096 last-known display names are retained in launch-local memory,
+including a rename immediately followed by source removal/close. A later settled non-live source
+rename/reload updates only already-known retained names, never overriding a live first match or
+creating membership. Committed deletion prunes them.
+There is no new persisted state: after restart (or retention eviction), a non-live creator falls back
+to the requesting workspace's valid indexed name, then its compact UUID.
+
 ## Exact projection is presentation truth
 
 An overseer role is derived from one exact live endpoint's stored `AgentMonitorPillProps`, never from

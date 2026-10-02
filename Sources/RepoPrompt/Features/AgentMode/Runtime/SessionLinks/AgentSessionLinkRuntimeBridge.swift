@@ -176,6 +176,10 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// Active descendants across all workspace scopes; uncertain disk state blocks retirement.
     func agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: UUID) async -> Bool
 
+    /// Publishes settled UI names, independently of exact endpoint props and authority events.
+    func agentSessionLinkPublishCreatorNames(_ names: [UUID: String])
+
+    /// Non-enumerating owner-valid local-index/compact-ID fallback only.
     func agentSessionLinkLaneCreatorLabel(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> String?
@@ -544,6 +548,8 @@ extension AgentSessionLinkEndpointHost {
     func agentSessionLinkHasPersistedActiveChildSessions(parentSessionID _: UUID) async -> Bool {
         true
     }
+
+    func agentSessionLinkPublishCreatorNames(_: [UUID: String]) {}
 
     func agentSessionLinkLaneCreatorLabel(
         for _: DomainAgentSessionLinkEndpointIdentity
@@ -1052,6 +1058,27 @@ final class AgentSessionLinkRuntimeBridge {
     private var localInputGenerations: [DomainAgentSessionLinkEndpointIdentity: UInt64] = [:]
     private var localInputReleaseTasks: [DomainAgentSessionLinkEndpointIdentity: Task<Void, Never>] = [:]
     private weak var host: AgentSessionLinkEndpointHost?
+    private var creatorNames = AgentSessionCreatorNames()
+
+    /// Settles UI-only name changes at the source owner; no authority or candidate sweep on rename.
+    func noteCreatorNameSourceChanged(windowID: Int, sources: [UUID: AgentSessionCreatorNames.Source]) {
+        guard !isFrozenForTermination else { return }
+        let previous = creatorNames.snapshot
+        creatorNames.update(windowID: windowID, sources: sources)
+        guard previous != creatorNames.snapshot else { return }
+        host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
+        // Every live target menu can include this name among linked/available peers. Repaint from
+        // cached membership in the existing coalesced UI-only lane, never the authoritative lane.
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: creatorNames.liveEndpoints)
+    }
+
+    private func settleCreatorNames(_ candidates: [AgentSessionLinkEndpointCandidate]) {
+        creatorNames.replaceLive(candidates.filter {
+            !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: $0.sessionID)
+        })
+        host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
+    }
+
     /// Durable oversight intent, installed by app composition.
     ///
     /// Deliberately not constructed here. The bridge is a process singleton, so a self-bootstrapping
@@ -1494,7 +1521,9 @@ final class AgentSessionLinkRuntimeBridge {
     /// Called on attach, window registration/unregistration, restore-gate transitions, and discovery
     /// completion. The event never carries state; the coordinator always rereads the level snapshot.
     func noteTopologyMayHaveChanged() {
-        guard !isFrozenForTermination, let launchCoordinator else { return }
+        guard !isFrozenForTermination else { return }
+        requestCandidatePresentationRefresh()
+        guard let launchCoordinator else { return }
         if let host {
             launchCoordinator.updateTopologyState(host.agentSessionLinkRestoreTopologyState())
         }
@@ -1925,6 +1954,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// removed, and a disk failure there is recorded as a warning rather than pretending the deletion
     /// rolled back.
     private func handleCommittedSessionDeletion(_ sessionID: UUID) async {
+        creatorNames.remove(sessionID)
+        host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
         await invalidateSession(sessionID, reason: .sessionDeleted)
         guard !isFrozenForTermination, let intentStore else { return }
         // `removeAll` snapshots every attempted current token and assertion generation in the same
@@ -4122,6 +4153,15 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
 
+        let creatorID = host?.agentSessionLinkLaneProvenance(for: endpoint)
+        // Live names already supplied to the menu builder win. The host fallback must be local,
+        // non-enumerating, and is needed only for an unknown/non-live creator.
+        let creatorFallback = creatorID.flatMap { id -> String? in
+            if candidatesBySessionID[id] != nil {
+                return nil
+            }
+            return creatorNames.snapshot[id] ?? host?.agentSessionLinkLaneCreatorLabel(for: endpoint)
+        }
         let props = AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
@@ -4129,8 +4169,8 @@ final class AgentSessionLinkRuntimeBridge {
                 target: candidate,
                 inputs: inputs,
                 candidates: candidates,
-                createdByLabel: host?.agentSessionLinkLaneCreatorLabel(for: endpoint),
-                creatorSessionID: host?.agentSessionLinkLaneProvenance(for: endpoint)
+                createdByLabel: creatorFallback,
+                creatorSessionID: creatorID
             ),
             outbound: outbound,
             inbound: inbound,
@@ -4393,8 +4433,10 @@ final class AgentSessionLinkRuntimeBridge {
     /// discarded `statusSamples`, reconcile passive work, advance target activity, or trigger Auto-wake.
     private func requestCandidatePresentationRefresh() {
         guard let host else { return }
+        let candidates = host.agentSessionLinkCandidates()
+        settleCreatorNames(candidates)
         requestMonitorProjectionRefresh(
-            forExactObserverEndpoints: Set(host.agentSessionLinkCandidates().map(\.domainEndpoint))
+            forExactObserverEndpoints: Set(candidates.map(\.domainEndpoint))
         )
     }
 

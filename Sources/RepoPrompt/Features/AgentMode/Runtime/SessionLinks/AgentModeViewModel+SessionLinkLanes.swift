@@ -201,36 +201,35 @@ extension AgentModeViewModel {
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> String? {
         guard let creatorID = agentSessionLinkLaneProvenance(for: endpoint) else { return nil }
-        return agentSessionLinkLaneCreatorLabel(creatorID: creatorID)
+        return agentSessionLinkLocalCreatorLabel(creatorID: creatorID)
     }
 
-    func agentSessionLinkLaneCreatorSessionID(for sessionID: UUID) -> UUID? {
-        let live = sessions.values.first { $0.activeAgentSessionID == sessionID }
-        return live?.createdByOverseerSessionID
-            ?? (
-                live?.hasLoadedPersistedState == true
-                    ? nil : ownerValidatedSessionIndex[sessionID]?.createdByOverseerSessionID
-            )
-    }
-
-    func agentSessionLinkLaneCreator(for sessionID: UUID) -> (sessionID: UUID, label: String)? {
-        guard let creatorID = agentSessionLinkLaneCreatorSessionID(for: sessionID) else { return nil }
-        return (creatorID, agentSessionLinkLaneCreatorLabel(creatorID: creatorID))
-    }
-
-    func agentSessionLinkLaneCreatorLabel(for sessionID: UUID) -> String? {
-        agentSessionLinkLaneCreator(for: sessionID)?.label
-    }
-
-    private func agentSessionLinkLaneCreatorLabel(creatorID: UUID) -> String {
-        // Names resolve app-wide like the candidate lists: a creator live in any window names
-        // itself even when this window's index has no entry for it yet. The persisted index and
-        // then the compact ID follow for non-live or truly unknown sessions.
-        if let liveName = AgentSessionLinkRuntimeBridge.shared.agentSessionLinkAppWideCandidates()
-            .first(where: { $0.sessionID == creatorID })?.resolvedDisplayName
-        {
-            return liveName
+    /// Known row identity: never search unrelated live sessions. A matching hydrated nil is
+    /// authoritative; an unhydrated freshly provisioned creator still wins before index publication.
+    func agentSessionLinkLaneCreatorSessionID(tabID: UUID, expectedSessionID: UUID) -> UUID? {
+        if let live = sessions[tabID], live.activeAgentSessionID == expectedSessionID {
+            return live.createdByOverseerSessionID
+                ?? (live.hasLoadedPersistedState ? nil : ownerValidatedSessionIndex[expectedSessionID]?.createdByOverseerSessionID)
         }
+        return ownerValidatedSessionIndex[expectedSessionID]?.createdByOverseerSessionID
+    }
+
+    func agentSidebarLaneCreator(
+        tabID: UUID,
+        expectedSessionID: UUID,
+        names: [UUID: String]? = nil,
+        archived: Bool = false
+    ) -> (sessionID: UUID, label: String)? {
+        if !archived, let live = sessions[tabID], live.activeAgentSessionID != expectedSessionID {
+            return nil
+        }
+        guard let creatorID = agentSessionLinkLaneCreatorSessionID(tabID: tabID, expectedSessionID: expectedSessionID) else { return nil }
+        let label = (names ?? sidebarCreatorDisplayNames)[creatorID]
+            ?? agentSessionLinkLocalCreatorLabel(creatorID: creatorID)
+        return (creatorID, label)
+    }
+
+    func agentSessionLinkLocalCreatorLabel(creatorID: UUID) -> String {
         let name = ownerValidatedSessionIndex[creatorID]?.name.trimmingCharacters(in: .whitespacesAndNewlines)
         return name.flatMap { $0.isEmpty ? nil : $0 }
             ?? AgentMonitorSessionIDFormatter.short(creatorID)

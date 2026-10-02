@@ -68,9 +68,6 @@ package enum AgentOversightUICopy {
         "Created by: \(creator)"
     }
 
-    /// Hover affordance on rows that currently have no oversight role.
-    package static let manageOversightTooltip = "Manage oversight"
-
     // MARK: - Menus
 
     package static let overseeByTitle = "Oversee by"
