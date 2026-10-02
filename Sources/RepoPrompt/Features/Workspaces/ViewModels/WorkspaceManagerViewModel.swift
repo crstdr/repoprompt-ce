@@ -975,8 +975,34 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces.enumerated().map { ($1.id, $0) },
                 uniquingKeysWith: { _, last in last }
             )
+            // Derived only on mutation; exact model-routing reads never sweep or repair state.
+            // An ambiguous workspace or tab is deliberately unresolvable, not last-wins.
+            modelRoutingTabIndexes = Dictionary(
+                workspaces.map { workspace in
+                    (workspace.id, Dictionary(
+                        workspace.composeTabs.enumerated().map { ($1.id, $0) },
+                        uniquingKeysWith: { _, _ in -1 }
+                    ))
+                },
+                uniquingKeysWith: { _, _ in [:] }
+            )
             refreshSelectionMirrorContextRevision()
         }
+    }
+
+    private var modelRoutingTabIndexes: [UUID: [UUID: Int]] = [:]
+
+    /// Exact active-workspace binding. Missing, ambiguous, or stale indexes fail closed.
+    func modelRoutingTab(workspaceID: UUID, tabID: UUID) -> ComposeTabState? {
+        guard activeWorkspaceID == workspaceID,
+              let workspaceIndex = workspaceIndexMap[workspaceID],
+              workspaces.indices.contains(workspaceIndex),
+              workspaces[workspaceIndex].id == workspaceID,
+              let tabIndex = modelRoutingTabIndexes[workspaceID]?[tabID],
+              workspaces[workspaceIndex].composeTabs.indices.contains(tabIndex),
+              workspaces[workspaceIndex].composeTabs[tabIndex].id == tabID
+        else { return nil }
+        return workspaces[workspaceIndex].composeTabs[tabIndex]
     }
 
     @Published private(set) var domainWorkspaceAuthorityIssue: DomainWorkspaceAuthorityIssue?
@@ -16542,5 +16568,48 @@ class WorkspaceManagerViewModel: ObservableObject {
         } catch {
             print("Warning: Could not remove RepoPrompt-Backup folder: \(error)")
         }
+    }
+}
+
+@MainActor
+extension WorkspaceManagerViewModel: WorkspaceSelectionHost {
+    var activeSelectionWorkspace: WorkspaceSelectionWorkspace? {
+        activeWorkspace.map { workspace in
+            WorkspaceSelectionWorkspace(
+                id: workspace.id,
+                activeComposeTabID: workspace.activeComposeTabID,
+                firstComposeTabID: workspace.composeTabs.first?.id
+            )
+        }
+    }
+
+    func selectionTab(for identity: WorkspaceSelectionIdentity) -> WorkspaceSelectionTab? {
+        composeTab(for: identity).map { WorkspaceSelectionTab(id: $0.id, selection: $0.selection) }
+    }
+
+    func storeSelection(
+        _ selection: StoredSelection,
+        modifiedAt: Date,
+        for identity: WorkspaceSelectionIdentity
+    ) -> Bool {
+        guard var tab = composeTab(for: identity) else { return false }
+        tab.selection = selection
+        tab.lastModified = modifiedAt
+        return updateComposeTabStoredOnly(tab, inWorkspaceID: identity.workspaceID)
+    }
+
+    func committedSelectionRevision(for identity: WorkspaceSelectionIdentity) -> UInt64 {
+        selectionRevisionForMCP(workspaceID: identity.workspaceID, tabID: identity.tabID)
+    }
+}
+
+@MainActor
+extension WorkspaceManagerViewModel: WorkspaceSearchReadinessProviding {
+    func waitForSearchReadiness(timeout: Duration) async throws -> WorkspaceSearchReadinessTicket {
+        try await awaitWorkspaceSearchReadiness(timeout: timeout)
+    }
+
+    nonisolated func validateSearchReadiness(_ ticket: WorkspaceSearchReadinessTicket) throws {
+        try validateWorkspaceSearchReadinessSnapshot(ticket)
     }
 }

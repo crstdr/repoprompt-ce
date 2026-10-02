@@ -65,6 +65,33 @@ Conductor timings (last 3,000 jobs, net of queue):
 - **Gated:** `tests_sleep_calls` 47 → 49. Both come from main: #1067 added a fake clock whose `func sleep(_:)` declaration the regex counts (`ContextBuilderGroupedSupervisionTests`), and #1092 added a 2 ms `Task.sleep` poll (`AgentAdmissionRecoveryTests`).
 - **Tracked (refreshed, not gated):** app files 1,160 → 1,161, app lines 648,091 → 651,485, files over 2,000 lines 50 → 51, `.shared` uses 1,220 → 1,222, wrong-way edges 1,102 → 1,104, `@testable import RepoPromptApp` test files 319 → 324. Of these, this branch adds 2 app lines (the P0.6 access change) and 1 `@testable` file (the P0.6 goldens); the rest is main (`origin/main` alone measures 651,483 lines and 323 files).
 
+## Ratchet exception — advertised model admission (2026-09-30)
+
+`app_static_shared_declarations`: **102 → 103**, solely for
+`AgentAdvertisedModelCatalog.shared`. Generated with
+`python3 Scripts/modularization_metrics.py update --allow-regression --baseline /tmp/overseer-model-selection-ratchets.generated.json`;
+only this justified metric is adopted in `ratchets.json`. Other baselines stay unchanged;
+`app_files_over_5000_lines` remains 17. This is an explicit one-owner exception, not a
+relaxation of the gate or a rename to evade its `shared` count.
+
+The new owner is the process-memory index of exact advertised compound model IDs and their
+precomputed effort decomposition, shared by `set_model` and explicit `create_lane(model_id:)`.
+Ordinary catalogue producers populate it; ACP/Codex/backend configuration changes invalidate it.
+Admission only performs bounded memory lookups and refuses a cold index actionably. It never
+warms persistence, scans the full catalogue, discovers models, or calls a provider. Keeping this
+projection separate prevents the legacy discovery/resolution paths (including Codex effort parsing
+that can consult persistence) from leaking into the configuration-only transaction.
+
+Alternatives inspected: `AgentACPModelRegistry` owns ACP provider snapshots and store warming;
+`AgentCodexModelRegistry` owns Codex snapshots. Neither is a coherent owner for Claude, ACP,
+Codex, and other advertised targets together. `AgentModelCatalog` is a stateless catalogue facade;
+adding a differently named static cache there would preserve the new global lifetime while merely
+hiding it from the ratchet. Reworking all catalogue lifetimes/injection is outside this bounded
+feature and would add risk without strengthening its no-I/O contract. The index has no authority,
+provider lifecycle, or persistence ownership; independently constructed instances support admission
+tests. Future catalogue-service extraction should absorb this projection and remove this singleton,
+not duplicate it in individual registries. No other new global owner is authorized by this exception.
+
 ## Decisions
 
 | ID | Decision | Status |
@@ -1003,3 +1030,9 @@ then passed all 36 cases, including the timed-out case. The final full
 2 skipped, 0 failures, plus the other test products; 11m 6s execution.
 These timings are post-move observations only, not a before/after performance
 claim.
+
+## PR 3 WorkspaceContext prep (2026-10-01)
+
+This in-place C1/C2 slice removes WorkspaceContext, Search, and CodeMap's outbound references to Features, view models, and MCP implementation files. S8 now uses file search projections and feature-side path adapters; S9 stores selection values in WorkspaceContext and receives neutral workspace/tab values from the workspace manager; S17 uses neutral prompt/workspace values and a search-readiness contract. Startup and debug diagnostics use injected recorders from `WindowStateComposition`, following the PR 2 instrumentation contract pattern. The read-only, root-scoped `WorkspaceContextRootSnapshot` retains catalog and lifetime leases and has a Sendable/currentness contract test. No files or package targets move in this PR.
+
+Compiler-index readiness baseline on 101 files: 55 outbound target files, 168 outbound file edges, 1,040 symbols. The final index and validation tickets are recorded in `/tmp/rpce-pr-reviews/pr3-impl.md` for this worktree. FileSystem/VCS and other Infrastructure remain for subsequent milestones.
