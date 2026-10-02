@@ -6,9 +6,11 @@ import SwiftUI
 
 /// Code-level UX switch (deliberately not a user setting, repurposed from the overseer-only
 /// variant): `false` lets every role mark open the unified oversight menu on click; `true`
-/// renders all marks passive — tooltip only. Flip to compare workflows.
+/// renders all marks passive — tooltip only. Cristian decided right-click is the only
+/// interaction (2026-10-02): the click affordance and the hover gear both made oversight
+/// too obscure to be a habit, so marks are passive status.
 @MainActor
-var agentOversightRoleMarksArePassive = false
+var agentOversightRoleMarksArePassive = true
 
 /// The mark opens the unified oversight menu unless the passive switch above is on.
 @MainActor
@@ -116,7 +118,6 @@ struct AgentSessionRow: View {
 
     @State private var isHovered = false
     @State private var isCopySessionIDHovered = false
-    @State private var isSidebarOversightMenuHovered = false
     /// One generation-qualified busy marker per relationship. Different observers of the same target
     /// remain independently actionable.
     @State private var sidebarOversightBusyKeys: Set<AgentSidebarOversightActionKey> = []
@@ -841,33 +842,6 @@ struct AgentSessionRow: View {
         _ = onSelectionGesture(.toggle)
     }
 
-    /// Grey hover affordance on rows with no persistent oversight mark. It opens the same
-    /// Oversee-by lane menu the overseen/provenance mark opens — through the retained AppKit
-    /// menu, so an `isHovered` flip or a sidebar invalidation while browsing cannot tear it
-    /// down mid-tracking.
-    private func sidebarOversightHoverMenu(
-        _ menu: AgentSidebarOversightMenuProps
-    ) -> some View {
-        StableMenuButton(
-            items: sidebarOversightStableMenuItems,
-            triggerStyle: .plain
-        ) {
-            Image(systemName: AgentOversightUICopy.manageOversightIcon)
-                .font(.system(size: 11))
-                .foregroundColor(
-                    isSidebarOversightMenuHovered || !sidebarOversightBusyKeys.isEmpty
-                        ? .accentColor
-                        : .secondary
-                )
-        }
-        .fixedSize()
-        .onHover { isSidebarOversightMenuHovered = $0 }
-        .hoverTooltip(AgentOversightUICopy.manageOversightTooltip)
-        .accessibilityLabel(AgentOversightUICopy.manageOversightTooltip)
-        .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
-        .accessibilityHint("Manage which exact Agent sessions oversee or are overseen by this session.")
-    }
-
     // MARK: - Oversight role mark (Fb iconography)
 
     /// The mark's combined tooltip/VoiceOver line — `Overseeing: … · Overseen by: … · Created
@@ -1073,18 +1047,6 @@ struct AgentSessionRow: View {
                     .onHover { isDismissAttentionHovered = $0 }
                     .hoverTooltip(dismissAttentionActionLabel)
                     .accessibilityLabel(dismissAttentionActionLabel)
-                }
-
-                // The grey hover affordance appears only on rows with no role mark. Once the
-                // mark is persistent it already opens the same lane menu, so the affordance
-                // stays hidden on those rows.
-                if allowsDirectMutations,
-                   let sidebarOversightMenu,
-                   !oversightRole.hasMark,
-                   onAddSidebarOversight != nil,
-                   onStopSidebarOversight != nil
-                {
-                    sidebarOversightHoverMenu(sidebarOversightMenu)
                 }
 
                 if !showsSelectionPresentation, onCopySessionID != nil {

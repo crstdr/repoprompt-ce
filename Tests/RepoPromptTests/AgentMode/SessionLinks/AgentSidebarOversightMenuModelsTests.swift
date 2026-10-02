@@ -1238,19 +1238,19 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         )
     }
 
-    /// Switch OFF (current default): every role mark opens the unified oversight menu.
-    func testMarkSwitchDefaultOpensMenuForAllRoles() {
+    /// Switch OFF (not the default): every role mark would open the unified oversight menu.
+    func testMarkSwitchOffOpensMenuForAllRoles() {
         agentOversightRoleMarksArePassive = false
-        defer { agentOversightRoleMarksArePassive = false }
+        defer { agentOversightRoleMarksArePassive = true }
         XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 0)))
         XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: nil, overseers: 1)))
         XCTAssertTrue(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 1)))
     }
 
-    /// Switch ON (rollback path): every role mark becomes a passive tooltip-only indicator.
+    /// Switch ON (current default): every role mark is a passive tooltip-only indicator.
     func testPassiveSwitchOnMakesAllMarksPassive() {
         agentOversightRoleMarksArePassive = true
-        defer { agentOversightRoleMarksArePassive = false }
+        defer { agentOversightRoleMarksArePassive = true }
         XCTAssertFalse(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 0)))
         XCTAssertFalse(agentSessionRowOversightMarkIsInteractive(role: role(own: nil, overseers: 1)))
         XCTAssertFalse(agentSessionRowOversightMarkIsInteractive(role: role(own: 0, overseers: 1)))
