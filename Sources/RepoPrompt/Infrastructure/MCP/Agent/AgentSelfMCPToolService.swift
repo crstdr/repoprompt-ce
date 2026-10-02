@@ -23,12 +23,14 @@ struct AgentSelfMCPToolService {
     let captureCallOrigin: () -> AgentSelfMCPCallOrigin?
     let readSelf: (WindowState, Endpoint, AgentSelfMCPCallOrigin) -> AgentSelfContextSnapshot?
     let scheduleCompact: (WindowState, Endpoint, AgentSelfMCPCallOrigin, String, String) async -> Admission
+    var isToolEnabled: () -> Bool = { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSelf) }
 
     static let unavailableError = MCPError.invalidParams(
         "self_compact is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access."
     )
 
     func execute(args: [String: Value]) async throws -> Value {
+        guard isToolEnabled() else { throw MCPError.invalidParams("self_compact is disabled.") }
         guard let op = AgentMCPToolHelpers.normalizedString(args["op"])?.lowercased() else {
             throw MCPError.invalidParams("self_compact op is required: context or compact.")
         }

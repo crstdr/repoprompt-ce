@@ -339,19 +339,20 @@ package actor DirectHeadlessMCPService {
         }
 
         await server.withMethodHandler(CallTool.self) { params in
-            guard visibleNames.contains(params.name) else {
-                return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
+            let toolName = MCPDomainToolCatalog.canonicalCallName(for: params.name)
+            guard visibleNames.contains(toolName) else {
+                return Self.errorResult("Tool is unavailable for this client policy: \(toolName)")
             }
             do {
                 let arguments = try Self.validatedCallArguments(
-                    toolName: params.name,
+                    toolName: toolName,
                     arguments: params.arguments ?? [:]
                 )
-                let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(params.name)
+                let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(toolName)
                     ? .application
                     : .standalone(id: prepared.scopeID)
                 let resolution = try await prepared.runtime.domainHost.resolve(
-                    toolName: params.name,
+                    toolName: toolName,
                     scope: scope
                 )
                 let invocationID = UUID()

@@ -68,16 +68,18 @@ final class AgentSelfToolCatalogPolicyTests: XCTestCase {
             externalReloadInterval: nil
         ))
         try await runtime.start()
-        let name = "self_compact"
         let revoked = MCPDomainClientPolicySnapshot(
             restrictedToolNames: [], additionalToolNames: [], role: .engineer,
             allowsAgentExternalControlTools: true, hasExactAgentSessionLinkGrant: true
         )
-        do {
-            try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: name, policy: revoked)
-            XCTFail("revoked self_compact grant must deny a named call")
-        } catch let denial as MCPDomainCallPolicyDenial {
-            XCTAssertEqual(denial, .missingAdditionalGrant(toolName: name))
+        for name in ["self_compact", "agent_self"] {
+            let canonical = MCPDomainToolCatalog.canonicalCallName(for: name)
+            do {
+                try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: canonical, policy: revoked)
+                XCTFail("revoked self_compact grant must deny both names")
+            } catch let denial as MCPDomainCallPolicyDenial {
+                XCTAssertEqual(denial, .missingAdditionalGrant(toolName: "self_compact"))
+            }
         }
     }
 }
