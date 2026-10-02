@@ -167,8 +167,8 @@ extension AgentSessionRow {
                 unlinkItems += menu.linkedTargets.compactMap { option in
                     guard case let .linked(reference, _) = option.relationship else { return nil }
                     let busy = busyKeys.contains(.unlink(
-                        observerEndpoint: option.peerEndpoint,
-                        targetEndpoint: menu.targetEndpoint,
+                        observerEndpoint: menu.targetEndpoint,
+                        targetEndpoint: option.peerEndpoint,
                         reference: reference
                     ))
                     return .action(
@@ -179,7 +179,7 @@ extension AgentSessionRow {
                         accessibilityValue: busy ? "In progress" : nil,
                         accessibilityHint: option.fullIdentityDescription
                     ) {
-                        actions.unlink(option.peerEndpoint, menu.targetEndpoint, reference)
+                        actions.unlink(menu.targetEndpoint, option.peerEndpoint, reference)
                     }
                 }
             }

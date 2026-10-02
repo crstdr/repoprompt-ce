@@ -1501,6 +1501,32 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         XCTAssertEqual(unlinked[0].2, reference)
     }
 
+    /// The outbound direction unlink passes the row as observer and the peer as target —
+    /// the reverse of the inbound arm — so the runtime bridge fences the right link.
+    func testUnlinkOutboundDispatchesRowAsObserver() throws {
+        let reference = link(9)
+        let linkedTarget = peer(
+            "Target",
+            seed: 1,
+            relationship: .linked(reference: reference, peerCurrentlyEligible: true)
+        )
+        let menuProps = props(targetOptions: [linkedTarget])
+        var unlinked: [(DomainAgentSessionLinkEndpointIdentity, DomainAgentSessionLinkEndpointIdentity, DomainAgentSessionLinkReference)] = []
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            menuProps,
+            busyKeys: [],
+            actions: .init(unlink: { unlinked.append(($0, $1, $2)) })
+        ))
+
+        let unlink = try submenu("Unlink", in: menu)
+        XCTAssertEqual(unlink.items.map(\.title), ["Overseeing", "Target"])
+        fire(unlink.items[1])
+        XCTAssertEqual(unlinked.count, 1)
+        XCTAssertEqual(unlinked[0].0, menuProps.targetEndpoint)
+        XCTAssertEqual(unlinked[0].1, linkedTarget.peerEndpoint)
+        XCTAssertEqual(unlinked[0].2, reference)
+    }
+
     func testBusyKeyFreezesItemDisabledWithHourglass() throws {
         let candidateItem = peer("Session B", seed: 1)
         let menuProps = props(targetOptions: [candidateItem])
