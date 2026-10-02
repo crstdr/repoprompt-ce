@@ -598,6 +598,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ///
     /// Written only by `AgentModeViewModel+SessionLinks`; nothing else should mutate it.
     var monitorPillPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
+    var sidebarCreatorDisplayNames: [UUID: String] = [:]
 
     /// In-memory palette-slot assignments for overseer sessions, reconciled inside the
     /// projection mutation boundary so a row re-rendered by the oversight-change notification

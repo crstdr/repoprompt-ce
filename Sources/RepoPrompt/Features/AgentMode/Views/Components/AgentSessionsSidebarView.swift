@@ -613,7 +613,7 @@ struct AgentModeSessionsListView: View {
                         }
 
                         let creator = session.sessionID.flatMap {
-                            agentModeVM.agentSessionLinkLaneCreator(for: $0)
+                            agentModeVM.agentSidebarLaneCreator(tabID: session.tabID, expectedSessionID: $0)
                         }
                         AgentSessionRow(
                             title: session.title,
@@ -624,7 +624,7 @@ struct AgentModeSessionsListView: View {
                             onOpenCreator: {
                                 guard let targetSessionID = session.sessionID,
                                       let creatorSessionID = creator?.sessionID,
-                                      agentModeVM.agentSessionLinkLaneCreatorSessionID(for: targetSessionID) == creatorSessionID
+                                      agentModeVM.agentSessionLinkLaneCreatorSessionID(tabID: session.tabID, expectedSessionID: targetSessionID) == creatorSessionID
                                 else { return }
                                 Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
                             },
@@ -860,6 +860,7 @@ struct AgentModeSessionsListView: View {
                                     selectionState: selectionState,
                                     renderedOrder: snapshot.renderedSelectionOrder,
                                     agentModeVM: agentModeVM,
+                                    creatorDisplayNames: agentModeVM.sidebarCreatorDisplayNames,
                                     promptManager: promptManager
                                 )
                             }
@@ -1537,6 +1538,7 @@ struct ArchivedSessionsList: View {
     let selectionState: AgentSidebarSelectionState
     let renderedOrder: [AgentSidebarSelectionIdentity]
     let agentModeVM: AgentModeViewModel
+    let creatorDisplayNames: [UUID: String]
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject private var fontScale = FontScaleManager.shared
 
@@ -1591,7 +1593,12 @@ struct ArchivedSessionsList: View {
                 )
                 let stashedSessionID = sessionIDByStashedTabID[stashed.id]
                 let creator = stashedSessionID.flatMap {
-                    agentModeVM.agentSessionLinkLaneCreator(for: $0)
+                    agentModeVM.agentSidebarLaneCreator(
+                        tabID: stashed.tab.id,
+                        expectedSessionID: $0,
+                        names: creatorDisplayNames,
+                        archived: true
+                    )
                 }
                 AgentStashedSessionRow(
                     stashed: stashed,
@@ -1599,7 +1606,7 @@ struct ArchivedSessionsList: View {
                     onOpenCreator: {
                         guard let stashedSessionID,
                               let creatorSessionID = creator?.sessionID,
-                              agentModeVM.agentSessionLinkLaneCreatorSessionID(for: stashedSessionID) == creatorSessionID
+                              agentModeVM.agentSessionLinkLaneCreatorSessionID(tabID: stashed.tab.id, expectedSessionID: stashedSessionID) == creatorSessionID
                         else { return }
                         Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
                     },
