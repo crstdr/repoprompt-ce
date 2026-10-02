@@ -329,7 +329,7 @@ import XCTest
             let task = Task {
                 try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
                     try await MCPToolExecutionWatchdog.execute(
-                        deadline: .seconds(150), cancellationGrace: .seconds(5), cleanupDisposition: .detachAndSettle,
+                        deadline: .seconds(900), cancellationGrace: .seconds(5), cleanupDisposition: .detachAndSettle,
                         startScope: scope, environment: clock.environment,
                         operation: { try await controlledService.execute(args: ["op": .string("start"), "message": .string("Fixture instruction"), "timeout": .int(3600)]) }
                     )
@@ -364,7 +364,7 @@ import XCTest
             service.testBeforeProviderDispatch = {
                 // The durable creation owner must have recorded identity before this suspension.
                 XCTAssertNotNil(scope.recoveryMetadata()["session_id"])
-                try? await clock.advanceWithoutSleepers(by: .seconds(150))
+                try? await clock.advanceWithoutSleepers(by: .seconds(900))
             }
             do {
                 _ = try await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
@@ -476,7 +476,7 @@ import XCTest
             let clock = MCPExportWatchdogManualClock()
             let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
             fixture.window.promptManager.setAgentAdmissionPersistenceReceiptHandlerForTesting { _, _ in
-                try? await clock.advanceWithoutSleepers(by: .seconds(150))
+                try? await clock.advanceWithoutSleepers(by: .seconds(900))
             }
             defer { fixture.window.promptManager.setAgentAdmissionPersistenceReceiptHandlerForTesting(nil) }
             let recorder = AdmissionProviderRecorder(expectedCount: 0, blockProviders: false)
@@ -532,7 +532,7 @@ import XCTest
             let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
             let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
             var service = makeAgentRunStartService(window: fixture.window, recorder: recorder, validateBeforeProviderDispatch: { _ in
-                try await clock.advanceWithoutSleepers(by: .seconds(150))
+                try await clock.advanceWithoutSleepers(by: .seconds(900))
             })
             service.testAfterTargetResolution = { target in
                 if let sessionID = target.sessionID {
