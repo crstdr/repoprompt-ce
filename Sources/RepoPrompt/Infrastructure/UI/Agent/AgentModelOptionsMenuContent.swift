@@ -12,13 +12,7 @@ enum AgentModelMenuTitle {
     }
 
     private static func devinDisplayName(rawValue: String, baseName: String) -> String {
-        guard let definition = ACPModelParameterResolver.parameterSet(
-            providerID: .devin,
-            selectedModelRaw: rawValue
-        )?.definition(kind: .thinking),
-            let choice = definition.choice(matching: definition.currentValueRaw)
-        else { return baseName }
-        return "\(baseName) · \(choice.displayName)"
+        DevinModelCatalog.current.entry(matching: rawValue)?.option.displayName ?? baseName
     }
 }
 
@@ -110,6 +104,20 @@ struct AgentModelOptionsMenuContent: View {
                     }
                 } else if let option = group.options.first {
                     modelOptionButton(option)
+                }
+            }
+        } else if agentKind == .devin {
+            ForEach(Array(DevinModelCatalog.current.menuGroups(for: options).enumerated()), id: \.offset) { _, group in
+                if group.rendersAsSubmenu {
+                    Menu(group.displayName) {
+                        ForEach(group.entries, id: \.option.rawValue) { entry in
+                            modelOptionButton(entry.option, title: entry.effortDisplayName)
+                        }
+                    }
+                } else {
+                    ForEach(group.entries, id: \.option.rawValue) { entry in
+                        modelOptionButton(entry.option)
+                    }
                 }
             }
         } else if agentKind == .openCode {
@@ -249,6 +257,21 @@ enum AgentModelStableMenuItems {
                 selectedModelRaw: selectedModelRaw,
                 onSelect: onSelect
             )
+        }
+        if agentKind == .devin {
+            return DevinModelCatalog.current.menuGroups(for: visibleOptions).flatMap { group -> [StableMenuItem] in
+                let items = group.entries.map { entry in
+                    modelItem(
+                        entry.option,
+                        title: group.rendersAsSubmenu ? entry.effortDisplayName : nil,
+                        agentKind: agentKind,
+                        selectedAgent: selectedAgent,
+                        selectedModelRaw: selectedModelRaw,
+                        onSelect: onSelect
+                    )
+                }
+                return group.rendersAsSubmenu ? [.submenu(group.displayName, items: items)] : items
+            }
         }
         if agentKind == .openCode, groupOpenCode {
             return AgentModelCatalog.openCodeMenu(for: visibleOptions).providerGroups.flatMap { providerGroup -> [StableMenuItem] in

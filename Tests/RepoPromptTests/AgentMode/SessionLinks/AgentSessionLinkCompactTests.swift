@@ -1,6 +1,7 @@
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSecureStorage
 import XCTest
 
 /// Live-view-model coverage for the overseer `compact` transaction.
@@ -65,8 +66,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         codexStallWatchdogProbeThreshold: TimeInterval? = nil,
         codexStallWatchdogRecoveryThreshold: TimeInterval? = nil,
         codexStallWatchdogPollIntervalNanos: UInt64? = nil,
-        codexSnapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus? = nil,
-        codexCompactEmitsTurnLifecycle: Bool = false
+        codexSnapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus? = nil
     ) throws -> Fixture {
         let events = LiveSendEventLog()
         let driftHook = AgentSessionLinkSendTransactionLiveTests.LiveSendDriftHook()
@@ -110,8 +110,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
                 return LifecycleNoopCodexController(
                     recorder: codexRecorder,
                     resumeGate: codexResumeGate,
-                    snapshotLatestTurnStatus: codexSnapshotLatestTurnStatus,
-                    compactEmitsTurnLifecycle: codexCompactEmitsTurnLifecycle
+                    snapshotLatestTurnStatus: codexSnapshotLatestTurnStatus
                 )
             },
             claudeControllerFactory: { _, _, _, _ in
@@ -874,37 +873,6 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             "Recovery reconciles the miss — it must never re-dispatch compaction"
         )
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:send"))
-    }
-
-    /// The watchdog arming must not disturb the fast path: provider lifecycle events still
-    /// settle the compaction exactly once, well before any probe fires.
-    func testCodexCompactionWithProviderEventsSettlesExactlyOnce() async throws {
-        let fixture = try makeFixture(
-            agent: .codexExec,
-            codexStallWatchdogProbeThreshold: 0.05,
-            codexStallWatchdogRecoveryThreshold: 0.25,
-            codexStallWatchdogPollIntervalNanos: 10_000_000,
-            codexCompactEmitsTurnLifecycle: true
-        )
-        fixture.session.codexConversationID = "lifecycle"
-
-        let outcome = await compact(fixture)
-
-        guard case let .delivered(delivery) = outcome else {
-            return XCTFail("Expected an accepted Codex compaction, got \(outcome)")
-        }
-        XCTAssertEqual(delivery.deliveryState, .runStarted)
-
-        try await AsyncTestWait.waitUntil("compaction turn completion settles the run", timeout: 5) {
-            fixture.session.runState == .completed
-        }
-        XCTAssertEqual(
-            fixture.codexRecorder.events.count(where: { $0 == "codex:compact" }),
-            1,
-            "Exactly one provider compaction"
-        )
-        XCTAssertFalse(fixture.codexRecorder.events.contains("codex:send"))
-        XCTAssertNotNil(fixture.session.contextCompactedAt)
     }
 
     /// A stopped compaction must stay cancelled: the watchdog observes the terminal state

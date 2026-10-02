@@ -9,6 +9,8 @@ import MCP
 import Ontology
 import OSLog
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptInstrumentation
 import RepoPromptShared
 import SwiftUI
 
@@ -483,6 +485,28 @@ actor ServerNetworkManager {
     /// MCP listener from anywhere in the app.
     static let shared = ServerNetworkManager()
 
+    private var catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
+    private var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
+
+    func installPerfRecorder(_ recorder: any AgentModePerfRecording) {
+        perfRecorder = recorder
+    }
+
+    private var executionDiagnosticsSink: any MCPToolExecutionEventSink
+    private var phaseRecorderFactory: any MCPToolExecutionHandlerPhaseRecorderFactory
+
+    func installCatalogDiagnosticsSink(_ sink: any AgentSessionLinkCatalogEventSink) {
+        catalogDiagnosticsSink = sink
+    }
+
+    func installExecutionDiagnosticsSink(_ sink: any MCPToolExecutionEventSink) {
+        executionDiagnosticsSink = sink
+    }
+
+    func installPhaseRecorderFactory(_ factory: any MCPToolExecutionHandlerPhaseRecorderFactory) {
+        phaseRecorderFactory = factory
+    }
+
     enum StartDegradedReason: String, Equatable {
         case readinessTimedOut
         case readinessWaitCancelled
@@ -741,11 +765,17 @@ actor ServerNetworkManager {
     init(
         bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production,
         bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)? = nil,
-        domainHost: MCPDomainHost = AppDomainRuntimeComposition.shared.runtime.domainHost
+        domainHost: MCPDomainHost = AppDomainRuntimeComposition.shared.runtime.domainHost,
+        catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
+        executionDiagnosticsSink: any MCPToolExecutionEventSink = NoopMCPToolExecutionEventSink(),
+        phaseRecorderFactory: any MCPToolExecutionHandlerPhaseRecorderFactory = NoopMCPToolExecutionHandlerPhaseRecorderFactory()
     ) {
         self.bootstrapLifecycleTiming = bootstrapLifecycleTiming
         self.bootstrapPeerPIDResolver = bootstrapPeerPIDResolver
         defaultDomainHost = domainHost
+        self.catalogDiagnosticsSink = catalogDiagnosticsSink
+        self.executionDiagnosticsSink = executionDiagnosticsSink
+        self.phaseRecorderFactory = phaseRecorderFactory
     }
 
     // Bootstrap socket server. Startup candidates remain separate until bind/listen and
@@ -2852,13 +2882,17 @@ actor ServerNetworkManager {
             projectionRevision: runCatalogProjectionRevision
         )
         runCatalogObservationByRunID[runID] = observation
-        AgentSessionLinkCatalogDiagnostics.catalogPublished(
+        catalogDiagnosticsSink.record(.catalogPublished(
             runID: runID,
-            routeToken: routeToken,
+            tabID: routeToken?.observerEndpoint.tabID,
+            connectionID: routeToken?.connectionID,
             revision: runCatalogProjectionRevision,
+            routingGeneration: routeToken?.routingAuthorityGeneration,
+            lifecycleGeneration: routeToken?.connectionLifecycleGeneration,
+            routePresent: routeToken != nil,
             catalog: hasAgentSessionLink,
             outbound: hasActiveOutboundLink
-        )
+        ))
         let projection = observation.projection
         #if DEBUG
             await debugSuspendRunCatalogPublicationBeforeMainActorIfRequested()
@@ -3190,7 +3224,7 @@ actor ServerNetworkManager {
         }
 
         private func debugPolicyDiagnostic(_ name: String, connectionID: UUID, policy: (restricted: Set<String>, additional: Set<String>, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool)? = nil, extra: [String: String] = [:]) {
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "mcp.policy.\(name)",
                 fields: debugPolicyDiagnosticFields(connectionID: connectionID, policy: policy, extra: extra)
             )
@@ -11863,7 +11897,7 @@ actor ServerNetworkManager {
                     ]
                 )
             }
-            AgentModePerfDiagnostics.event("mcp.policy.pendingPolicyApplied", fields: [
+            perfRecorder.event("mcp.policy.pendingPolicyApplied", fields: [
                 "connectionID": connectionID.uuidString,
                 "clientName": clientName,
                 "clientPid": clientPid.map(String.init) ?? "nil",
@@ -12390,11 +12424,11 @@ actor ServerNetworkManager {
             connectionLog("tools/call received original=\(originalName) canonical=\(toolName) connection=\(connectionID)")
             if toolName == MCPWindowToolName.agentSessionLink {
                 let context = await agentSessionLinkCatalogDiagnosticContext(for: connectionID)
-                AgentSessionLinkCatalogDiagnostics.toolCallReceived(
+                await catalogDiagnosticsSink.record(.toolCallReceived(
                     runID: context.runID,
                     tabID: context.tabID,
                     connectionID: connectionID
-                )
+                ))
             }
             #if DEBUG
                 await debugPolicyDiagnostic("toolsCallReceived", connectionID: connectionID, extra: [
@@ -13667,7 +13701,9 @@ actor ServerNetworkManager {
                                     arguments: capturedArguments
                                 )
                                 let executionTraceOrigin = executionWatchdogEnvironment.now()
-                                let handlerPhaseRecorder = MCPToolExecutionHandlerPhaseRecorder(
+                                let executionSink = await self.executionDiagnosticsSink
+                                let recorderFactory = await self.phaseRecorderFactory
+                                let handlerPhaseRecorder = recorderFactory.make(
                                     origin: executionTraceOrigin,
                                     now: { executionWatchdogEnvironment.now() }
                                 )
@@ -13683,17 +13719,18 @@ actor ServerNetworkManager {
                                         using: handlerPhaseRecorder
                                     )
                                     let now = executionWatchdogEnvironment.now()
-                                    MCPToolExecutionTracer.emit(MCPToolExecutionTraceEvent(
+                                    executionSink.record(MCPToolExecutionDiagnosticEvent(
                                         toolName: toolName,
-                                        operationIdentity: evidenceOperationIdentity,
+                                        canonicalTool: evidenceOperationIdentity.canonicalTool,
+                                        normalizedOperation: evidenceOperationIdentity.normalizedOperation,
                                         connectionID: connectionID,
                                         invocationID: invocationID,
                                         runID: observerRunIDForCallbacksFinal,
                                         requestIdentity: resolvedRequestIdentity,
-                                        contractKind: contract.kind,
+                                        contractKind: .init(contract.kind),
                                         executionDeadlineSeconds: contract.deadline?.mcpSeconds,
                                         cleanupGraceSeconds: contract.cancellationGrace?.mcpSeconds,
-                                        cleanupDisposition: contract.cleanupDisposition,
+                                        cleanupDisposition: contract.cleanupDisposition.map(MCPToolExecutionDiagnosticEvent.CleanupDisposition.init),
                                         phase: .handlerPhaseTransition,
                                         elapsedMilliseconds: max(
                                             0,
@@ -13786,36 +13823,37 @@ actor ServerNetworkManager {
                                     }
 
                                     @Sendable func emitExecutionTrace(
-                                        _ phase: MCPToolExecutionTraceEvent.Phase,
+                                        _ phase: MCPToolExecutionDiagnosticEvent.Phase,
                                         resolvedCleanupDisposition: MCPToolExecutionCleanupDisposition? = nil,
                                         cancellationRequested: Bool? = nil,
-                                        cancellationOutcome: String? = nil,
+                                        cancellationOutcome: MCPToolExecutionSettlement? = nil,
                                         cancellationOrigin: MCPToolExecutionCancellationOrigin? = nil,
-                                        settlement: String? = nil,
-                                        graceOutcome: String? = nil,
-                                        escalationReason: String? = nil
+                                        settlement: MCPToolExecutionDiagnosticEvent.Settlement? = nil,
+                                        graceOutcome: MCPToolExecutionDiagnosticEvent.GraceOutcome? = nil,
+                                        escalationReason: MCPToolExecutionDiagnosticEvent.EscalationReason? = nil
                                     ) async {
                                         let now = executionWatchdogEnvironment.now()
                                         let handlerPhase = handlerPhaseRecorder.snapshot()
                                         let handlerPhaseAgeMilliseconds = handlerPhase.map {
                                             max(0, now.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds - $0.elapsedMilliseconds)
                                         }
-                                        MCPToolExecutionTracer.emit(MCPToolExecutionTraceEvent(
+                                        executionSink.record(MCPToolExecutionDiagnosticEvent(
                                             toolName: toolName,
-                                            operationIdentity: evidenceOperationIdentity,
+                                            canonicalTool: evidenceOperationIdentity.canonicalTool,
+                                            normalizedOperation: evidenceOperationIdentity.normalizedOperation,
                                             connectionID: connectionID,
                                             invocationID: invocationID,
                                             runID: observerRunIDForCallbacksFinal,
                                             requestIdentity: resolvedRequestIdentity,
-                                            contractKind: contract.kind,
+                                            contractKind: .init(contract.kind),
                                             executionDeadlineSeconds: contract.deadline?.mcpSeconds,
                                             cleanupGraceSeconds: contract.cancellationGrace?.mcpSeconds,
-                                            cleanupDisposition: resolvedCleanupDisposition ?? settlementAdmission.cleanupDisposition,
+                                            cleanupDisposition: (resolvedCleanupDisposition ?? settlementAdmission.cleanupDisposition).map(MCPToolExecutionDiagnosticEvent.CleanupDisposition.init),
                                             phase: phase,
                                             elapsedMilliseconds: max(0, now.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds),
                                             cancellationRequested: cancellationRequested,
-                                            cancellationOutcome: cancellationOutcome,
-                                            cancellationOrigin: cancellationOrigin,
+                                            cancellationOutcome: cancellationOutcome.map(MCPToolExecutionDiagnosticEvent.Outcome.init),
+                                            cancellationOrigin: cancellationOrigin.map(MCPToolExecutionDiagnosticEvent.CancellationOrigin.init),
                                             settlement: settlement,
                                             graceOutcome: graceOutcome,
                                             escalationReason: escalationReason,
@@ -13902,7 +13940,7 @@ actor ServerNetworkManager {
                                             )
                                         }
                                         let outcome = providerSettlement.rawValue
-                                        await emitExecutionTrace(.handlerCompleted, cancellationOutcome: outcome)
+                                        await emitExecutionTrace(.handlerCompleted, cancellationOutcome: providerSettlement)
                                         EditFlowPerf.lifecycleEvent(
                                             EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
                                             correlation: lifecycleCorrelation,
@@ -13941,10 +13979,10 @@ actor ServerNetworkManager {
                                         await emitExecutionTrace(
                                             .detachedSettled,
                                             cancellationRequested: true,
-                                            cancellationOutcome: providerSettlement.rawValue,
+                                            cancellationOutcome: providerSettlement,
                                             cancellationOrigin: .watchdogDeadline,
-                                            settlement: "detached",
-                                            graceOutcome: "expired"
+                                            settlement: .detached,
+                                            graceOutcome: .expired
                                         )
                                         EditFlowPerf.lifecycleEvent(
                                             EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
@@ -13988,7 +14026,7 @@ actor ServerNetworkManager {
                                         await emitExecutionTrace(
                                             .handlerCompleted,
                                             cancellationRequested: true,
-                                            cancellationOutcome: providerSettlement.rawValue,
+                                            cancellationOutcome: providerSettlement,
                                             cancellationOrigin: .requestCancellation
                                         )
                                         EditFlowPerf.lifecycleEvent(
@@ -14143,9 +14181,9 @@ actor ServerNetworkManager {
                                                         await emitExecutionTrace(
                                                             .settledDuringGrace,
                                                             cancellationRequested: cancellationRequested,
-                                                            cancellationOutcome: settlement.rawValue,
+                                                            cancellationOutcome: settlement,
                                                             cancellationOrigin: cancellationRequested ? .watchdogDeadline : nil,
-                                                            graceOutcome: cancellationRequested ? "settled" : "late_completion"
+                                                            graceOutcome: cancellationRequested ? .settled : .lateCompletion
                                                         )
                                                     case .cleanupGraceCappedByOuterEnvelope:
                                                         MCPLifecycleDiagnostics.shared.record(.cleanupGraceExpired, connectionID: connectionID, invocationID: invocationID)
@@ -14154,8 +14192,8 @@ actor ServerNetworkManager {
                                                             resolvedCleanupDisposition: .forceDisconnect,
                                                             cancellationRequested: true,
                                                             cancellationOrigin: .watchdogDeadline,
-                                                            graceOutcome: "capped",
-                                                            escalationReason: "outer_envelope_cleanup_cap"
+                                                            graceOutcome: .capped,
+                                                            escalationReason: .outerEnvelopeCleanupCap
                                                         )
                                                     case let .cleanupGraceExpired(resolvedDisposition):
                                                         MCPLifecycleDiagnostics.shared.record(.cleanupGraceExpired, connectionID: connectionID, invocationID: invocationID)
@@ -14164,8 +14202,8 @@ actor ServerNetworkManager {
                                                             resolvedCleanupDisposition: resolvedDisposition,
                                                             cancellationRequested: true,
                                                             cancellationOrigin: .watchdogDeadline,
-                                                            graceOutcome: "expired",
-                                                            escalationReason: "handler_ignored_cancellation"
+                                                            graceOutcome: .expired,
+                                                            escalationReason: .handlerIgnoredCancellation
                                                         )
                                                     case .detachedForSettlement:
                                                         await emitExecutionTrace(
@@ -14173,9 +14211,9 @@ actor ServerNetworkManager {
                                                             resolvedCleanupDisposition: .detachAndSettle,
                                                             cancellationRequested: true,
                                                             cancellationOrigin: .watchdogDeadline,
-                                                            settlement: "detached",
-                                                            graceOutcome: "expired",
-                                                            escalationReason: "detach_disposition_handler_ignored_cancellation"
+                                                            settlement: .detached,
+                                                            graceOutcome: .expired,
+                                                            escalationReason: .detachDispositionHandlerIgnoredCancellation
                                                         )
                                                     }
                                                 },
@@ -14192,8 +14230,8 @@ actor ServerNetworkManager {
                                                 resolvedCleanupDisposition: .forceDisconnect,
                                                 cancellationRequested: true,
                                                 cancellationOrigin: .watchdogDeadline,
-                                                graceOutcome: "expired",
-                                                escalationReason: "handler_ignored_cancellation"
+                                                graceOutcome: .expired,
+                                                escalationReason: .handlerIgnoredCancellation
                                             )
                                             throw MCPToolExecutionWatchdogError.cleanupUnresponsive
                                         }
@@ -15308,27 +15346,36 @@ actor ServerNetworkManager {
         let displayName = clientIdentifier(forConnection: connectionID) ?? "unknown"
         let stableKey = MCPClientIdentity.storageKey(displayName)
 
-        let peerIdentity: (observedProcessID: Int?, claimedProcessID: Int?, fingerprint: String?)
+        let peerIdentity: (
+            observedProcessID: Int?,
+            claimedProcessID: Int?,
+            fingerprint: String?,
+            verificationFailure: DomainClientPrincipalVerificationFailure?
+        )
         #if DEBUG
             switch debugDomainPeerIdentityByConnectionID[connectionID] {
             case let .verified(processID, fingerprint):
-                peerIdentity = (processID, processID, fingerprint)
+                peerIdentity = (processID, processID, fingerprint, nil)
             case .unverified:
-                peerIdentity = (nil, bootstrapClaimedPIDByConnectionID[connectionID], nil)
+                peerIdentity = (nil, bootstrapClaimedPIDByConnectionID[connectionID], nil, nil)
             case nil:
                 let processID = bootstrapObservedPeerPIDByConnectionID[connectionID]
+                let verification = processID.map(Self.peerExecutableVerification)
                 peerIdentity = (
                     processID,
                     bootstrapClaimedPIDByConnectionID[connectionID],
-                    processID.flatMap(Self.verifiedExecutableFingerprint)
+                    verification?.fingerprint,
+                    verification?.failure
                 )
             }
         #else
             let processID = bootstrapObservedPeerPIDByConnectionID[connectionID]
+            let verification = processID.map(Self.peerExecutableVerification)
             peerIdentity = (
                 processID,
                 bootstrapClaimedPIDByConnectionID[connectionID],
-                processID.flatMap(Self.verifiedExecutableFingerprint)
+                verification?.fingerprint,
+                verification?.failure
             )
         #endif
         let kind: DomainClientPrincipalKind = policy.purpose == .unknown ? .appProxy : .runScoped
@@ -15403,7 +15450,8 @@ actor ServerNetworkManager {
             runID: runID,
             provider: stableKey,
             verifiedIdentityFingerprint: peerIdentity.fingerprint,
-            claimedProcessID: peerIdentity.claimedProcessID.map(Int32.init)
+            claimedProcessID: peerIdentity.claimedProcessID.map(Int32.init),
+            verificationFailure: peerIdentity.verificationFailure
         )
         return DomainToolInvocationSecurityContext(
             principal: principal,
@@ -15421,17 +15469,25 @@ actor ServerNetworkManager {
     }
 
     /// Binds a kernel-authenticated peer PID to the executable identity currently on disk.
-    /// Display names never participate. Replacing the executable changes the inode and fingerprint.
-    private nonisolated static func verifiedExecutableFingerprint(_ processID: Int) -> String? {
+    /// Display names never participate. Replacing the executable changes the inode and fingerprint;
+    /// deleting it, as an app update does to a running helper's old bundle, leaves the peer unverifiable.
+    private nonisolated static func peerExecutableVerification(
+        _ processID: Int
+    ) -> (fingerprint: String?, failure: DomainClientPrincipalVerificationFailure?) {
         var buffer = [CChar](repeating: 0, count: 4096)
-        guard proc_pidpath(pid_t(processID), &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        guard proc_pidpath(pid_t(processID), &buffer, UInt32(buffer.count)) > 0 else {
+            return (nil, errno == ENOENT ? .executableMissing : nil)
+        }
         let path = String(cString: buffer)
         var info = stat()
-        guard lstat(path, &info) == 0 else { return nil }
+        guard lstat(path, &info) == 0 else {
+            return (nil, errno == ENOENT ? .executableMissing : nil)
+        }
         let material = "\(URL(fileURLWithPath: path).standardizedFileURL.path)|\(info.st_dev)|\(info.st_ino)"
-        return SHA256.hash(data: Data(material.utf8))
+        let fingerprint = SHA256.hash(data: Data(material.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
+        return (fingerprint, nil)
     }
 
     /// Returns the verified peer PID for a bootstrap socket connection, if available.

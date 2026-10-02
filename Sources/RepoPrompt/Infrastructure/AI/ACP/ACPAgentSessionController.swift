@@ -1,6 +1,8 @@
 import Darwin
 import Foundation
 import os
+import RepoPromptFoundation
+import RepoPromptProcess
 
 actor ACPAgentSessionController {
     struct RequestTimeouts {
@@ -1053,6 +1055,27 @@ actor ACPAgentSessionController {
                normalizedCursorModelAlias(model) == AgentModel.cursorAuto.rawValue,
                sessionModelConfigOptionID == nil
             {
+                return
+            }
+            if provider.providerID == .devin,
+               let entry = DevinModelCatalog.current.entry(matching: model),
+               let thinking = entry.thinking
+            {
+                // Devin ACP rejects effort-encoded IDs as `model` values: select the advertised
+                // family model, then its `thought_level`. The choice is validated against the
+                // live session's definition, so an unadvertised effort fails before any prompt.
+                try await setSessionModelViaConfigOptionsRPC(entry.advertisedModelRaw, sessionID: sessionID, forceRPC: forceRPC)
+                try Task.checkCancellation()
+                let report = try await applySessionModelParameterSelectionsSerialized([
+                    ACPModelParameterSelection(
+                        providerID: .devin,
+                        baseModelRaw: entry.advertisedModelRaw,
+                        kind: .thinking,
+                        configID: thinking.configID,
+                        valueRaw: thinking.choiceRaw
+                    )
+                ])
+                try report.validateNoSkippedSelections()
                 return
             }
             try await setSessionModelViaConfigOptionsRPC(model, sessionID: sessionID, forceRPC: forceRPC)

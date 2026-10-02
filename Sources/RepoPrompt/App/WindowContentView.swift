@@ -32,6 +32,7 @@ struct WindowContentView: View {
             .environmentObject(windowState) // If your subviews need it
             // Presentation-only visibility for decorative animations, above the sidebar and detail.
             .environment(\.windowIsPresentationVisible, windowState.isPresentationVisible)
+            .environment(\.agentModePerfRecorder, windowState.agentModeViewModel.perfRecorder)
             .environmentObject(sparkleManager)
             .environmentObject(versionManager) // Pass versionManager to ContentView
             // Let SwiftUI own the window title. Without this, the scene re-applies the
