@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -16,10 +17,29 @@ final class ACPPermissionScopeTests: XCTestCase {
         }
     }
 
+    func testNoOneTimeOptionDisablesPlainApproveForEveryACPProvider() async throws {
+        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
+            let outcome = try await permissionOutcome(providerID: providerID, decision: .decline, optionID: "allow_always")
+            XCTAssertEqual(outcome["outcome"], "selected")
+            XCTAssertEqual(outcome["optionId"], "reject_once")
+        }
+    }
+
+    func testOneTimeOptionKeepsPlainApprovalAvailable() async throws {
+        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
+            let outcome = try await permissionOutcome(
+                providerID: providerID, decision: .accept, optionID: "allow_once", optionKind: "allow_once"
+            )
+            XCTAssertEqual(outcome["outcome"], "selected")
+            XCTAssertEqual(outcome["optionId"], "allow_once")
+        }
+    }
+
     private func permissionOutcome(
         providerID: ACPProviderID,
         decision: AgentApprovalDecision,
-        optionID: String
+        optionID: String,
+        optionKind: String = "allow_always"
     ) async throws -> [String: String] {
         let directory = try makeTestDirectory(name: "ACPPermissionScope")
         let executable = directory.appendingPathComponent("scripted-acp")
@@ -43,7 +63,7 @@ final class ACPPermissionScopeTests: XCTestCase {
                 send({"id": "permission-1", "method": "session/request_permission", "params": {
                     "sessionId": "test-session", "toolCall": {"toolCallId": "tool-1", "title": "Shell command", "kind": "execute"},
                     "options": [
-                        {"optionId": "\#(optionID)", "kind": "allow_always", "name": "Always allow"},
+                        {"optionId": "\#(optionID)", "kind": "\#(optionKind)", "name": "Allow"},
                         {"optionId": "reject_once", "kind": "reject_once", "name": "Decline"}
                     ]
                 }})
@@ -74,6 +94,7 @@ final class ACPPermissionScopeTests: XCTestCase {
             let prompt = Task { try await controller.prompt(AgentMessage(userMessage: "Run"), request: request) }
             for await event in events {
                 if case let .approvalRequested(approval) = event {
+                    XCTAssertEqual(approval.supportsPlainApprove, optionKind == "allow_once", "\(providerID): \(optionID)")
                     await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: decision)
                     break
                 }
@@ -121,5 +142,75 @@ private struct ScriptedScopeProvider: ACPAgentProvider {
 
     func normalizeError(_ error: Error) -> Error {
         error
+    }
+}
+
+@MainActor
+final class ACPApprovalAvailabilityTests: XCTestCase {
+    func testUnavailablePlainApprovalStaysPendingAcrossSharedSubmissionPaths() async throws {
+        let context = try await AgentRunMCPControlledSessionContext.make(
+            workspaceNamePrefix: "ACP approval availability", workspaceSwitchReason: "acpApprovalAvailabilityTests",
+            clientName: "acp-approval-availability-tests", unusedStartRunMessage: "No provider starts"
+        )
+        addTeardownBlock { @MainActor in await context.cleanup() }
+        let viewModel = context.window.agentModeViewModel
+        for available in [false, true] {
+            let request = approval(available: available)
+            context.session.pendingApproval = request
+            context.session.runState = .waitingForApproval
+            XCTAssertEqual(request.supportsPlainApprove, available)
+            let interaction = try XCTUnwrap(viewModel.mcpPendingInteraction(for: context.session))
+            XCTAssertEqual(interaction.options.map(\.label).contains("accept"), available)
+            XCTAssertTrue(interaction.options.map(\.label).contains("accept_for_session"))
+            let descriptor = try XCTUnwrap(AgentPendingInteractionDescriptor.make(from: context.session))
+            let actions = AgentNotificationActionEligibility.actions(
+                for: descriptor, isMCPControlled: false, preferences: .defaults
+            )
+            XCTAssertEqual(actions.contains(.approve), available)
+            for response in ["accept", "approve"] {
+                let payload = AgentModeViewModel.MCPInteractionResponsePayload(
+                    text: nil, skip: false, responseArgument: .scalar(response), amendment: nil, answersByQuestionID: [:]
+                )
+                if available {
+                    _ = try viewModel.mcpPendingInteractionResolution(
+                        for: context.session, kind: .approval, interactionID: request.id, payload: payload
+                    )
+                } else {
+                    XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+                        for: context.session, kind: .approval, interactionID: request.id, payload: payload
+                    ))
+                    XCTAssertEqual(context.session.pendingApproval, request)
+                }
+            }
+            let submitted = viewModel.submitApprovalDecision(tabID: context.session.tabID, requestID: request.id, decision: .accept)
+            XCTAssertEqual(submitted, available)
+            if !available {
+                XCTAssertEqual(context.session.pendingApproval, request)
+                XCTAssertEqual(context.session.runState, .waitingForApproval)
+                viewModel.submitApprovalDecision(tabID: context.session.tabID, decision: .accept)
+                XCTAssertEqual(context.session.pendingApproval, request, "Unchecked/batch callers must not consume the prompt")
+            }
+            for decision: AgentApprovalDecision in [.acceptForSession, .acceptWithExecpolicyAmendment("remember"), .decline] {
+                context.session.pendingApproval = request
+                XCTAssertTrue(viewModel.submitApprovalDecision(tabID: context.session.tabID, requestID: request.id, decision: decision))
+            }
+        }
+    }
+
+    func testOtherProvidersKeepPlainApproveAndUnknownACPAvailabilityFailsClosed() {
+        let request = AgentApprovalRequest(
+            requestID: .codex(.int(1)), method: "requestApproval", kind: .commandExecution,
+            threadID: "thread", turnID: "turn", itemID: "item"
+        )
+        XCTAssertTrue(request.supportsPlainApprove)
+        XCTAssertFalse(approval(available: nil).supportsPlainApprove)
+    }
+
+    private func approval(available: Bool?) -> AgentApprovalRequest {
+        AgentApprovalRequest(
+            requestID: .acp("permission"), method: "session/request_permission", kind: .commandExecution,
+            threadID: "thread", turnID: "turn", itemID: "item", command: "ls",
+            plainApproveAvailable: available
+        )
     }
 }
