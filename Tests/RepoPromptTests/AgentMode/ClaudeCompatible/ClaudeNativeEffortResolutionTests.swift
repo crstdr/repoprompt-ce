@@ -302,6 +302,120 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         XCTAssertEqual(settings["effortLevel"] as? String, "high")
     }
 
+    @MainActor
+    func testSupersededPickerFailureKeepsNewerAutoEffortRestoration() async throws {
+        let controller = controller()
+        let pickerGate = ApplicationGate()
+        let controls = Writes()
+        let applied = Writes()
+        let writes = Writes()
+        await controller.test_installConfigurationTransport(controlRequest: { request in
+            let data = try JSONSerialization.data(withJSONObject: request)
+            controls.append(data)
+            if controls.count == 1 {
+                await pickerGate.pause()
+                throw NativeAgentRuntimeControllerError.invalidControlResponse("Picker rejected")
+            }
+            applied.append(data)
+            return [:]
+        }, write: { writes.append($0) })
+        let (coordinator, session, intent) = fixture(controller)
+        let ensured = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
+        XCTAssertEqual(ensured, .ready)
+        let picker = Task { await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test.picker") }
+        defer { picker.cancel()
+            pickerGate.resume()
+        }
+        try await pickerGate.waitUntilEntered()
+        let auto = await coordinator.sendClaudeNativeMessage(
+            session: session, text: "Auto turn", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false,
+            autoEffortSelection: .init(
+                provider: .claudeCode, selectedModelRaw: session.selectedModelRaw,
+                manualEffortRaw: "high", effortRaw: "low"
+            )
+        )
+        XCTAssertEqual(auto, .sent)
+        // Complete through the real decoder, not a fake interruption or queue reset.
+        await controller.test_handleConfigurationStdoutChunk(Data(
+            #"{"type":"result","subtype":"success","session_id":"auto-fallback-session","result":"done","is_error":false}"#.utf8
+        ) + Data([10]))
+        let inFlight = await controller.hasTurnInFlight
+        XCTAssertFalse(inFlight)
+        pickerGate.resume()
+        await picker.value
+        let manual = await coordinator.sendClaudeNativeMessage(
+            session: session, text: "Manual turn", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        XCTAssertEqual(manual, .sent)
+        XCTAssertEqual(controls.count, 3, "A stale picker failure must preserve the Auto restoration marker")
+        XCTAssertEqual(writes.count, 2)
+        try assertLastAppliedEffort(applied, equals: "high")
+    }
+
+    @MainActor
+    func testSupersededLandedAutoWriteRestoresAfterNewerPickerFails() async throws {
+        let controller = controller()
+        let autoGate = ApplicationGate()
+        let pickerGate = ApplicationGate()
+        let controls = Writes()
+        let applied = Writes()
+        let writes = Writes()
+        await controller.test_installConfigurationTransport(controlRequest: { request in
+            let data = try JSONSerialization.data(withJSONObject: request)
+            controls.append(data)
+            if (request["settings"] as? [String: Any])?["effortLevel"] as? String == "low" {
+                await autoGate.pause()
+            } else if controls.count == 2 {
+                await pickerGate.pause()
+                throw NativeAgentRuntimeControllerError.invalidControlResponse("Newer picker rejected")
+            }
+            applied.append(data)
+            return [:]
+        }, write: { writes.append($0) })
+        let (coordinator, session, intent) = fixture(controller)
+        let auto = Task {
+            await coordinator.sendClaudeNativeMessage(
+                session: session, text: "Superseded Auto turn", attachments: [], intent: intent,
+                allowsCatalogRouteControllerRecovery: false,
+                autoEffortSelection: .init(
+                    provider: .claudeCode, selectedModelRaw: session.selectedModelRaw,
+                    manualEffortRaw: "high", effortRaw: "low"
+                )
+            )
+        }
+        defer { auto.cancel()
+            autoGate.resume()
+            pickerGate.resume()
+        }
+        try await autoGate.waitUntilEntered()
+        let picker = Task { await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test.newer-picker") }
+        defer { picker.cancel() }
+        try await pickerGate.waitUntilEntered()
+        autoGate.resume()
+        let outcome = await auto.value
+        guard case .failed = outcome else { return XCTFail("Superseded Auto must not send: \(outcome)") }
+        XCTAssertEqual(writes.count, 0)
+        pickerGate.resume()
+        await picker.value
+        let manual = await coordinator.sendClaudeNativeMessage(
+            session: session, text: "Manual turn", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        XCTAssertEqual(manual, .sent)
+        XCTAssertEqual(controls.count, 3, "A landed but superseded Auto write still needs manual restoration")
+        XCTAssertEqual(writes.count, 1)
+        try assertLastAppliedEffort(applied, equals: "high")
+    }
+
+    private func assertLastAppliedEffort(_ applied: Writes, equals expected: String) throws {
+        let data = try XCTUnwrap(applied.line(at: applied.count - 1))
+        let request = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let settings = try XCTUnwrap(request["settings"] as? [String: Any])
+        XCTAssertEqual(settings["effortLevel"] as? String, expected)
+    }
+
     func testFailureTokenCannotBeReusedAfterFallbackOrTransportReplacement() async throws {
         for replaceTransport in [false, true] {
             let controller = controller()
@@ -325,10 +439,10 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
                 try await controller.applyModelAndEffort(model: "A", effortLevel: .high)
             } else {
                 let restored = try await controller.applyModelAndEffortForTurn(model: "A", effortLevel: .high, replacingFailure: failure)
-                XCTAssertTrue(restored)
+                XCTAssertEqual(restored, .applied)
             }
             let stale = try await controller.applyModelAndEffortForTurn(model: "A", effortLevel: .high, replacingFailure: failure)
-            XCTAssertFalse(stale)
+            XCTAssertEqual(stale, .superseded)
             XCTAssertEqual(controls.count, 2, "Consumed or foreign-lifetime failures authorize no provider IO")
         }
     }

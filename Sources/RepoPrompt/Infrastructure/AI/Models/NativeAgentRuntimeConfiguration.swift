@@ -21,6 +21,12 @@ struct NativeAgentRuntimeConfigurationFailure: Error, LocalizedError {
 
 enum NativeAgentRuntimeConfigurationApplication: Equatable {
     case applied(NativeAgentRuntimeConfigurationProof)
+    case appliedButSuperseded
     case superseded
     case notReady
+}
+
+/// Distinguishes turn authorization from provider settings that landed after newer intent.
+enum NativeAgentRuntimeTurnConfigurationOutcome: Equatable {
+    case applied, appliedButSuperseded, superseded
 }

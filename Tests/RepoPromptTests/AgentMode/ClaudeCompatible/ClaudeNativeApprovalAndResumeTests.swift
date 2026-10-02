@@ -241,7 +241,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             }
             gate.resume()
             let superseded = try await first.value
-            XCTAssertEqual(superseded, .superseded)
+            XCTAssertEqual(superseded, .appliedButSuperseded)
             XCTAssertEqual(writes.count, 0)
             guard case let .applied(proof) = latest else { return XCTFail("Latest application must be current") }
             _ = try await controller.sendUserMessage("current", configuration: proof)

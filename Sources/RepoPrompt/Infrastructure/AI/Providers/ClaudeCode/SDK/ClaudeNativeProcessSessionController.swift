@@ -455,7 +455,9 @@ final actor ClaudeNativeProcessSessionController {
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
         do {
-            _ = try await applyModelAndEffortWithProof(model: model, effortLevel: effortLevel)
+            guard try await applyModelAndEffortForTurn(model: model, effortLevel: effortLevel, replacingFailure: nil) == .applied else {
+                throw ControllerError.invalidControlResponse("Flag settings application was superseded")
+            }
         } catch let failure as NativeAgentRuntimeConfigurationFailure {
             // Live picker updates retain the existing, unwrapped error contract.
             throw failure.underlyingError
@@ -464,11 +466,12 @@ final actor ClaudeNativeProcessSessionController {
 
     func applyModelAndEffortForTurn(
         model: String?, effortLevel: ClaudeCodeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?
-    ) async throws -> Bool {
+    ) async throws -> NativeAgentRuntimeTurnConfigurationOutcome {
         switch try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure) {
-        case .applied: true
-        case .superseded: false
-        case .notReady: hasActiveSession && !isShuttingDown
+        case .applied: .applied
+        case .appliedButSuperseded: .appliedButSuperseded
+        case .superseded: .superseded
+        case .notReady: hasActiveSession && !isShuttingDown ? .applied : .superseded
         }
     }
 
@@ -544,11 +547,11 @@ final actor ClaudeNativeProcessSessionController {
                     "source": "live_update"
                 ] as [String: Any])
             }
-            guard lifetime == configurationLifetime,
-                  intentGeneration == latestFlagSettingsIntentGeneration,
-                  requestGeneration == flagSettingsRequestGeneration
-            else { return .superseded }
+            guard lifetime == configurationLifetime else { return .superseded }
             guard hasActiveSession, isInitialized, !isShuttingDown else { return .notReady }
+            guard intentGeneration == latestFlagSettingsIntentGeneration,
+                  requestGeneration == flagSettingsRequestGeneration
+            else { return resolved.request == nil ? .superseded : .appliedButSuperseded }
             // A nil request proves only a ready no-override policy, not a reset to a concrete model.
             let proof = NativeAgentRuntimeConfigurationProof(
                 lifetime: lifetime, intentGeneration: intentGeneration, requestGeneration: requestGeneration
@@ -1840,6 +1843,10 @@ final actor ClaudeNativeProcessSessionController {
 
     #if DEBUG
         /// In-memory transport for deterministic control-ACK/write races; never starts a provider.
+        func test_handleConfigurationStdoutChunk(_ data: Data) async {
+            await handleStdoutChunk(data)
+        }
+
         func test_installConfigurationTransport(
             initialized: Bool = true,
             controlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])? = { _ in [:] },
