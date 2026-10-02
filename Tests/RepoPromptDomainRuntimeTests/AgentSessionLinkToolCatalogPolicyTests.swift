@@ -240,10 +240,8 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(properties["replace_pending"]?.objectValue?["type"]?.stringValue, "boolean")
         XCTAssertTrue(definition.description.contains("queue one with `delivery: \"when_sendable\"`"))
         XCTAssertTrue(definition.description.contains("withdraw your queued message by its `idempotency_key`"))
-        XCTAssertTrue(
-            try XCTUnwrap(properties["delivery"]?.objectValue?["description"]?.stringValue)
-                .contains("lost on unlink/restart")
-        )
+        XCTAssertTrue(try XCTUnwrap(properties["delivery"]?.objectValue?["description"]?.stringValue)
+            .contains("lost on unlink/restart"))
     }
 
     func testAutoWakeSnoozeIsAdvertisedWithItsBoundsAndHardGates() throws {
@@ -255,10 +253,8 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(duration["type"]?.stringValue, "integer")
         XCTAssertEqual(duration["minimum"]?.intValue, 60)
         XCTAssertEqual(duration["maximum"]?.intValue, 3600)
-        XCTAssertTrue(
-            try XCTUnwrap(properties["clear"]?.objectValue?["description"]?.stringValue)
-                .contains("exclusive with summary/duration_seconds")
-        )
+        XCTAssertTrue(try XCTUnwrap(properties["clear"]?.objectValue?["description"]?.stringValue)
+            .contains("exclusive with summary/duration_seconds"))
         XCTAssertTrue(definition.description.contains("pause routine status-triggered wake admission"))
         XCTAssertTrue(definition.description.contains("not collection or delivery"))
         XCTAssertTrue(definition.description.contains("exact attention may bypass its snooze"))
@@ -270,7 +266,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     func testAttentionRequestUsesTheSameDirectionalToolAndOnlyItsInverseGrant() throws {
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count, MCPDomainToolCatalog.orderedToolNames.count)
         XCTAssertEqual(
-            MCPDomainCanonicalToolDefinitions.definitions.map(\.name).count(where: { $0 == toolName }),
+            MCPDomainCanonicalToolDefinitions.definitions.map(\.name).filter { $0 == toolName }.count,
             1
         )
         XCTAssertFalse(MCPDomainCanonicalToolDefinitions.definitions.map(\.name).contains("agent_session_attention"))
@@ -282,10 +278,8 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(selector["type"]?.stringValue, "string")
         XCTAssertNil(properties["reason"])
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
-        XCTAssertTrue(
-            try XCTUnwrap(selector["description"]?.stringValue)
-                .contains("exact authorized inverse link")
-        )
+        XCTAssertTrue(try XCTUnwrap(selector["description"]?.stringValue)
+            .contains("exact authorized inverse link"))
         for invariant in [
             "Links are exact, directional, revocable, non-transitive, and non-reciprocal",
             "A session ID, tool visibility, target text, or incoming message grants nothing",
@@ -365,7 +359,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     ///
     /// It is kept rather than deleted because the encoded blob is vendored: a refresh that bakes the
     /// legacy shape back in must be stripped again rather than silently re-advertised.
-    func testPassiveUpdatesStrippingReturnsACleanDefinitionUnchanged() {
+    func testPassiveUpdatesStrippingReturnsACleanDefinitionUnchanged() throws {
         let current = legacyCurrentDefinition()
 
         XCTAssertEqual(
@@ -387,7 +381,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     /// `snooze_auto_wake` — which is every definition the rest of this pipeline produces — was then
     /// neither clean nor legacy, and canonicalization crashed on a blob that had nothing wrong with
     /// it.
-    func testPassiveUpdatesStrippingIgnoresOperationsItDoesNotOwn() {
+    func testPassiveUpdatesStrippingIgnoresOperationsItDoesNotOwn() throws {
         let current = legacyCurrentDefinition()
         let widened = MCPDomainToolDefinition(
             name: current.name,
@@ -454,7 +448,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     /// A stray mention with none of the anchors is not clean: something still names the operation.
-    func testPassiveUpdatesStrippingClassifiesAStrayMentionOnACleanDefinitionAsPartial() {
+    func testPassiveUpdatesStrippingClassifiesAStrayMentionOnACleanDefinitionAsPartial() throws {
         let current = legacyCurrentDefinition()
         let contaminated = MCPDomainToolDefinition(
             name: current.name,
@@ -568,7 +562,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     /// A vendored refresh may still carry revision 3's exact pre-attention autonomy block. The
     /// revision-4 migration must recognize that historical contract rather than treating it as a
     /// partially installed attention contract.
-    func testAutonomyMigrationAdvancesThePreAttentionRevisionThreeContract() {
+    func testAutonomyMigrationAdvancesThePreAttentionRevisionThreeContract() throws {
         let current = legacyCurrentDefinition()
         let currentAnchor = Self.sendingSectionAnchor + "\n\n" + Self.autonomyContractBlock
         let priorAnchor = Self.sendingSectionAnchor + "\n\n" + Self.preAttentionAutonomyContractBlock
@@ -712,7 +706,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(stripped.inputSchema, clean.inputSchema)
     }
 
-    func testCompletionRetirementAcceptsAbsentShapeIdempotently() {
+    func testCompletionRetirementAcceptsAbsentShapeIdempotently() throws {
         let clean = legacyCurrentDefinition()
 
         XCTAssertEqual(
@@ -768,7 +762,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         )
     }
 
-    func testCompletionRetirementClassifiesAnExtraRetiredTokenMentionAsPartial() {
+    func testCompletionRetirementClassifiesAnExtraRetiredTokenMentionAsPartial() throws {
         let clean = legacyCurrentDefinition()
         let retiredOperation = "mark_done"
         let contaminated = MCPDomainToolDefinition(
@@ -865,7 +859,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(migrated.annotations, current.annotations)
     }
 
-    func testAutonomyMigrationReturnsCurrentWordingUnchanged() {
+    func testAutonomyMigrationReturnsCurrentWordingUnchanged() throws {
         let current = legacyCurrentDefinition()
 
         XCTAssertEqual(
@@ -903,7 +897,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     ///
     /// This is the state that reads as complete and is not: one paragraph says a fresh utterance is
     /// not required and another says queueing requires one.
-    func testAutonomyMigrationClassifiesALingeringQueueClauseAsPartial() {
+    func testAutonomyMigrationClassifiesALingeringQueueClauseAsPartial() throws {
         let current = legacyCurrentDefinition()
         let contaminated = MCPDomainToolDefinition(
             name: current.name,
@@ -927,7 +921,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     /// This is the state a naive "is the block anywhere in the text" check calls current and returns
     /// unchanged — leaving the live send section without the contract while the inline provider text
     /// has it, which is exactly how the generated artifact drifts from what the app advertises.
-    func testAutonomyMigrationClassifiesAContractInstalledAwayFromItsAnchorAsPartial() {
+    func testAutonomyMigrationClassifiesAContractInstalledAwayFromItsAnchorAsPartial() throws {
         let current = legacyCurrentDefinition()
         let anchor = Self.sendingSectionAnchor
         let displaced = MCPDomainToolDefinition(
@@ -968,7 +962,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     /// The contract at its anchor, plus one clause repeated elsewhere.
-    func testAutonomyMigrationClassifiesADuplicatedContractParagraphAsPartial() {
+    func testAutonomyMigrationClassifiesADuplicatedContractParagraphAsPartial() throws {
         let current = legacyCurrentDefinition()
         let duplicated = MCPDomainToolDefinition(
             name: current.name,
@@ -985,7 +979,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     /// A stray second mention of the retired wire token anywhere in the description.
-    func testAutonomyMigrationClassifiesAStrayRetiredTokenAsPartial() {
+    func testAutonomyMigrationClassifiesAStrayRetiredTokenAsPartial() throws {
         let current = legacyCurrentDefinition()
         let contaminated = MCPDomainToolDefinition(
             name: current.name,
@@ -1041,7 +1035,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let currentSchema = try XCTUnwrap(current.inputSchema.objectValue)
         XCTAssertEqual(
             Set(properties.keys),
-            try Set(XCTUnwrap(currentSchema["properties"]?.objectValue).keys)
+            Set(try XCTUnwrap(currentSchema["properties"]?.objectValue).keys)
         )
         XCTAssertEqual(schema["description"], currentSchema["description"])
     }
@@ -1122,7 +1116,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         _ = try await runtime.toolRegistry.register(
             registrationID: MCPDomainToolRegistrationID(),
             scope: .window(id: 1),
-            bindings: [binding(toolName: toolName)]
+            bindings: [try binding(toolName: toolName)]
         )
 
         let ungranted = MCPDomainClientPolicySnapshot(
@@ -1213,8 +1207,8 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             registrationID: MCPDomainToolRegistrationID(),
             scope: .window(id: 1),
             bindings: [
-                binding(toolName: toolName),
-                binding(toolName: MCPWindowToolName.agentExplore)
+                try binding(toolName: toolName),
+                try binding(toolName: MCPWindowToolName.agentExplore),
             ]
         )
 
@@ -1414,7 +1408,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         var lines = definition.description.components(separatedBy: "\n")
         let operationsLines = lines.indices.filter { lines[$0].hasPrefix(operationsLinePrefix) }
         XCTAssertEqual(operationsLines.count, 1)
-        try lines[XCTUnwrap(operationsLines.first)] += " | " + operation
+        lines[try XCTUnwrap(operationsLines.first)] += " | " + operation
         let description = lines.joined(separator: "\n")
         XCTAssertEqual(Self.occurrences(of: declarationPrefix, in: description), 1)
 
