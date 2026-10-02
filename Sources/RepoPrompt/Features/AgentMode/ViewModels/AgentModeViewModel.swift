@@ -744,6 +744,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     private lazy var runService: AgentModeRunService = makeRunService()
+
+    /// Materializes the lazy run service so its terminal-commit barrier is installed before a
+    /// run that bypasses `runService.startRun` (overseer native compaction) reaches settlement.
+    func ensureRunServiceMaterializedForRunStart() {
+        _ = runService
+    }
+
     private let sessionLifecycleAuthority = AgentSessionLifecycleAuthority()
     var modelRouterSettingsStore: GlobalSettingsStore = .shared
     var modelRouterRuntime: AgentTaskRouterRuntime?
@@ -763,7 +770,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
 
-    private var isRestoringState = false
+    var isRestoringState = false
     private var activeUISyncSuppressionDepth = 0
     private var isActiveUISyncSuppressed: Bool {
         activeUISyncSuppressionDepth > 0
@@ -1023,6 +1030,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_syncComposerCallCount: Int = 0
         var test_syncRuntimeMetricsCallCount: Int = 0
         var test_syncRunInteractionCallCount: Int = 0
+        var test_statusPillsSnapshotBuildCount: Int = 0
         var test_workspaceManager: WorkspaceManagerViewModel? {
             workspaceManager
         }
@@ -2616,6 +2624,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexActiveAgentRunWaitQuery: CodexAgentRunWaitQuery? = nil,
             testCodexActiveAgentRunWaitDrain: CodexAgentRunWaitDrain? = nil,
             testCodexLeaseRoutingTimeoutMs: Int? = nil,
+            testCodexRouteOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true },
             testCodexIdleShutdownDelayNanos: UInt64? = nil,
             testCodexStallWatchdogPollIntervalNanos: UInt64? = nil,
             testCodexStallWatchdogProbeThreshold: TimeInterval? = nil,
@@ -2687,6 +2696,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
                 codexControllerFactory: codexControllerFactory,
                 connectionPolicyInstaller: connectionPolicyInstaller,
+                routeOwnerValidator: testCodexRouteOwnerValidator,
                 shouldManageCodexTooling: shouldManageCodexTooling,
                 codexCapabilitiesForLaunch: testCodexCapabilitiesForLaunch,
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
@@ -6342,7 +6352,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func handleObservedMCPStateChange(for session: TabSession) {
+    func handleObservedMCPStateChange(for session: TabSession) {
         guard !session.terminalCommitInProgress else { return }
         // Terminal waiter publication is owned exclusively by AgentRunTerminalCommitBarrier.
         // Legacy/special-purpose state changes without a canonical revision must not race it.
@@ -9392,9 +9402,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         session.selectedAgent = normalized.agent
         session.selectedModelRaw = normalized.modelRaw
-        if normalized.agent == .claudeCode {
-            // A reused MCP tab must not turn an earlier selection into an implicit
-            // Claude pin when this request did not specify an effort.
+        if normalized.agent.usesClaudeNativeRuntime {
+            // All native providers preserve an explicit pin and clear a previous/inherited pin
+            // when this request omits effort, symmetrically with the normalization exemption below.
             session.selectedReasoningEffortRaw = reasoningEffortRaw
         } else if let reasoningEffortRaw {
             session.selectedReasoningEffortRaw = reasoningEffortRaw
@@ -9405,8 +9415,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // MCP-controlled session (sub-agent or top-level).
         _ = refreshMCPPermissionProfileIfNeeded(for: session)
         // Codex normalization clears reasoning effort for every non-Codex provider.
-        // Claude MCP effort is a separate session pin and must survive configuration.
-        if session.selectedAgent != .claudeCode {
+        // Native MCP effort is a separate session pin and must survive configuration, including
+        // explicit overseer lane selections for compatible native agents.
+        if !session.selectedAgent.usesClaudeNativeRuntime {
             codexCoordinator.normalizeCodexSelectionForSession(
                 session,
                 preservingExplicitEffort: reasoningEffortRaw != nil

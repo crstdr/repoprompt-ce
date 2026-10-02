@@ -3511,7 +3511,7 @@ extension MCPServerViewModel {
             "Retry the tool call once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart this Agent Mode run."
     }
 
-    private static func hint(_ hint: TabContextHint, matches context: TabContextSnapshot) -> Bool {
+    static func hint(_ hint: TabContextHint, matches context: TabContextSnapshot) -> Bool {
         guard hint.tabID == context.tabID else { return false }
         if let workspaceID = hint.workspaceID, context.workspaceID != workspaceID { return false }
         if let windowID = hint.windowID, context.windowID != windowID { return false }

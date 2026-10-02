@@ -1248,6 +1248,9 @@ final class MCPServerViewModel: ObservableObject {
                     message: message,
                     operation: operation
                 )
+            },
+            resolveModelObserverEndpoint: { [self] metadata in
+                await resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata)
             }
         )
     }
@@ -1268,9 +1271,16 @@ final class MCPServerViewModel: ObservableObject {
     /// Current dashboard snapshot (updated via event-driven notifications)
     @Published private(set) var dashboard: MCPService.DashboardSnapshot? {
         didSet {
+            refreshDashboardCloseSafetyProjection()
             recomputeCloseSafetyState()
         }
     }
+
+    // Derived only when the dashboard source changes, not on tool registration/completion.
+    private var dashboardLiveWindowConnections = 0
+    private var dashboardLiveUnboundConnections = 0
+    private var dashboardWindowExecutionCount = 0
+    private var dashboardWindowToolName: String?
 
     @Published private(set) var closeSafetyState: WindowMCPCloseSafetyState = .inactive
 
@@ -1349,11 +1359,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Returns the newest active tool name for this exact window.
     @MainActor
     var windowActiveToolName: String? {
-        let dashboardScope = dashboard?.connections
-            .flatMap(\.activeToolScopes)
-            .filter { $0.windowID == windowID }
-            .max(by: { $0.sequence < $1.sequence })
-        return dashboardScope?.toolName ?? activeToolName
+        dashboardWindowToolName ?? activeToolName
     }
 
     /// True when any tool is actively running for this window.
@@ -1421,7 +1427,10 @@ final class MCPServerViewModel: ObservableObject {
         guard let self else {
             throw MCPError.internalError("Window deallocated while executing \(name)")
         }
-        return try await runTool(name, freshnessPolicy: freshnessPolicy) { [weak self] in
+        return try await runTool(
+            name, freshnessPolicy: freshnessPolicy,
+            modelOnly: ServerNetworkManager.isMemoryOnlyModelCall(toolName: name, arguments: args)
+        ) { [weak self] in
             guard let self else {
                 throw MCPError.internalError("Window deallocated during \(name)")
             }
@@ -2328,13 +2337,30 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    private func dashboardConnectionsForThisWindow() -> [MCPService.DashboardConnection] {
-        guard let dashboard else { return [] }
-        let allowNilWindow = !isMultiWindowModeEffectivelyActive
-        return dashboard.connections.filter { connection in
-            connection.windowID == windowID || (allowNilWindow && connection.windowID == nil)
+    private func refreshDashboardCloseSafetyProjection() {
+        dashboardLiveWindowConnections = 0
+        dashboardLiveUnboundConnections = 0
+        dashboardWindowExecutionCount = 0
+        var newest: ConnectionDashboardActiveToolScope?
+        for connection in dashboard?.connections ?? [] {
+            if connection.state == .ready || connection.state == .waiting {
+                if connection.windowID == windowID { dashboardLiveWindowConnections += 1 }
+                if connection.windowID == nil { dashboardLiveUnboundConnections += 1 }
+            }
+            for scope in connection.activeToolScopes where scope.windowID == windowID {
+                dashboardWindowExecutionCount += 1
+                if newest.map({ scope.sequence > $0.sequence }) ?? true { newest = scope }
+            }
         }
+        dashboardWindowToolName = newest?.toolName
     }
+
+    #if DEBUG
+        @MainActor
+        func debugSetDashboardForTesting(_ snapshot: MCPService.DashboardSnapshot?) {
+            dashboard = snapshot
+        }
+    #endif
 
     @MainActor
     private func recomputeCloseSafetyState() {
@@ -2343,23 +2369,9 @@ final class MCPServerViewModel: ObservableObject {
             return
         }
 
-        let connections = dashboardConnectionsForThisWindow()
-        let liveConnections = connections.filter { connection in
-            switch connection.state {
-            case .ready, .waiting:
-                true
-            case .setup, .failed, .cancelled, .unknown:
-                false
-            }
-        }
-        let liveConnectionCount = liveConnections.count
-        let dashboardActiveExecutionCount = dashboard?.connections.reduce(into: 0) { count, connection in
-            count += connection.activeToolScopes.count(where: { $0.windowID == windowID })
-        } ?? 0
-        var activeExecutionCount = max(
-            activeToolExecutionsByID.count,
-            dashboardActiveExecutionCount
-        )
+        let liveConnectionCount = dashboardLiveWindowConnections
+            + (isMultiWindowModeEffectivelyActive ? 0 : dashboardLiveUnboundConnections)
+        var activeExecutionCount = max(activeToolExecutionsByID.count, dashboardWindowExecutionCount)
         let activeTool = windowActiveToolName
         if activeExecutionCount == 0, activeTool != nil {
             activeExecutionCount = 1
@@ -3722,6 +3734,7 @@ final class MCPServerViewModel: ObservableObject {
     private func runTool<T>(
         _ name: String,
         freshnessPolicy: MCPToolFreshnessPolicy,
+        modelOnly: Bool = false,
         body: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         #if DEBUG || EDIT_FLOW_PERF
@@ -3780,7 +3793,18 @@ final class MCPServerViewModel: ObservableObject {
         // This ensures non-tab-scoped tools (like get_file_tree, file_search) can
         // trigger context binding, preventing "live mode" drift in parallel runs
         let metadata = await captureRequestMetadata()
-        let resolvedContext = try? resolveTabContextSnapshot(
+        let modelRoute: ServerNetworkManager.CachedModelRunRoute?
+        if modelOnly {
+            guard let connectionID = metadata.connectionID,
+                  let route = await ServerNetworkManager.shared.cachedModelRunRoute(connectionID: connectionID),
+                  metadata.windowID == route.windowID,
+                  cachedModelObserverEndpoint(connectionID: connectionID, route: route, hint: metadata.tabContextHint) != nil
+            else { throw MCPError.invalidParams(ServerNetworkManager.modelRouteUnavailableMessage) }
+            modelRoute = route
+        } else {
+            modelRoute = nil
+        }
+        let resolvedContext = modelOnly ? nil : try? resolveTabContextSnapshot(
             from: metadata,
             toolName: name
         )
@@ -3790,7 +3814,8 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         let shouldTrackActiveTool = await shouldTrackActiveTool(for: metadata)
-        let executionRunID = await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext)
+        let executionRunID = modelOnly ? modelRoute?.runID
+            : await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext)
         let indexedRunID = shouldRegisterRunToolExecution(toolName: name)
             ? executionRunID
             : nil
@@ -7664,5 +7689,48 @@ private extension WorkspaceCodemapStructureExecutionPhase {
         case .render: .getCodeStructureRender
         case .assembly: .getCodeStructureAssembly
         }
+    }
+}
+
+extension MCPServerViewModel {
+    /// set_model alone must not use the generic resolver's rehydration, tab binding, mirroring,
+    /// or persistence. Only an already-installed exact run route may identify its caller.
+    @MainActor
+    func resolveAgentSessionLinkModelObserverEndpoint(
+        metadata: RequestMetadata,
+        network: ServerNetworkManager = .shared
+    ) async -> DomainAgentSessionLinkEndpointIdentity? {
+        guard let connectionID = metadata.connectionID,
+              let route = await network.cachedModelRunRoute(connectionID: connectionID),
+              metadata.windowID == route.windowID else { return nil }
+        return cachedModelObserverEndpoint(connectionID: connectionID, route: route, hint: metadata.tabContextHint)
+    }
+
+    @MainActor
+    func cachedModelObserverEndpoint(
+        connectionID: UUID,
+        route: ServerNetworkManager.CachedModelRunRoute,
+        hint: TabContextHint? = nil
+    ) -> DomainAgentSessionLinkEndpointIdentity? {
+        guard let window = WindowStatesManager.shared.modelRoutingWindow(withID: route.windowID),
+              window.mcpServer === self,
+              connectionIDToRunID[connectionID] == route.runID,
+              connectionIDByRunID[route.runID] == connectionID,
+              let context = tabContextByConnectionID[connectionID],
+              context.runID == route.runID, context.windowID == route.windowID,
+              context.workspaceID == route.workspaceID, context.tabID == route.tabID,
+              hint.map({ Self.hint($0, matches: context) }) ?? true,
+              let sessionID = context.activeAgentSessionID,
+              let identity = window.agentModeViewModel.agentSessionLinkModelIdentity(
+                  workspaceID: route.workspaceID, tabID: route.tabID, sessionID: sessionID
+              ) else { return nil }
+        guard let endpoint = identity.monitorEndpoint(windowID: route.windowID) else { return nil }
+        if let token = ServerNetworkManager.currentToolDispatchAuthorization?.windowIdentity?.modelRouteToken {
+            guard token.connectionID == connectionID, token.runID == route.runID,
+                  token.routingAuthorityGeneration == route.routingAuthorityGeneration,
+                  token.connectionLifecycleGeneration == route.connectionLifecycleGeneration,
+                  token.observerEndpoint == endpoint else { return nil }
+        }
+        return endpoint
     }
 }
