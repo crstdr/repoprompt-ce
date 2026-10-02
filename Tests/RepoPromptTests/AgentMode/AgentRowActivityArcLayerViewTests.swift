@@ -29,18 +29,17 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         XCTAssertFalse(rotation.isRemovedOnCompletion)
     }
 
-    /// A hidden window keeps no layer arc at all: `AgentRowRunningIndicator` swaps to the still
-    /// shape so no window commit ever has to walk a live animation.
-    func testHiddenWindowKeepsNoAnimation() {
-        let visible = hostIndicator(isWindowPresentationVisible: true, reduceMotion: false)
-        let hidden = hostIndicator(isWindowPresentationVisible: false, reduceMotion: false)
-        defer {
-            visible.window.close()
-            hidden.window.close()
+    /// The fork wrapper retains upstream's layer-backed arc while pausing decorative motion.
+    func testRunningIndicatorPausesForHiddenWindowsAndReduceMotion() throws {
+        for (visible, reduceMotion, animates) in [(true, false, true), (false, false, false), (true, true, false)] {
+            let hosted = hostIndicator(isWindowPresentationVisible: visible, reduceMotion: reduceMotion)
+            defer { hosted.window.close() }
+            let arc = try XCTUnwrap(arcViews(in: hosted.host).first)
+            XCTAssertEqual(
+                arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey) != nil,
+                animates
+            )
         }
-
-        XCTAssertEqual(arcViews(in: visible.host).count, 1, "the visible running row renders the layer-backed arc")
-        XCTAssertTrue(arcViews(in: hidden.host).isEmpty, "a hidden window keeps no animation at all")
     }
 
     /// SwiftUI draws in y-down space, so `rotationEffect(.degrees(+360))` spins clockwise and
@@ -213,5 +212,36 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
     private func arcViews(in view: NSView) -> [AgentRowActivityArcLayerView] {
         let own: [AgentRowActivityArcLayerView] = (view as? AgentRowActivityArcLayerView).map { [$0] } ?? []
         return own + view.subviews.flatMap { arcViews(in: $0) }
+    }
+}
+
+/// Tests the real CALayer playback boundary without creating a window or hosting SwiftUI.
+@MainActor
+final class AgentRowActivityArcVisibilityTests: XCTestCase {
+    func testHidingStopsRotationAndShowingRestartsOnlyWhileAttached() throws {
+        let arc = AgentRowActivityArcLayerView(frame: NSRect(x: 0, y: 0, width: 15, height: 15))
+        arc.updateAnimation(isAttachedToWindow: true)
+        let rotation = try XCTUnwrap(arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey))
+        arc.updateAnimation(isAttachedToWindow: true)
+        XCTAssertTrue(arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey) === rotation)
+
+        arc.isPresentationVisible = false
+        arc.updateAnimation(isAttachedToWindow: true)
+        XCTAssertNil(arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey))
+        XCTAssertEqual(arc.arcLayer.strokeEnd, 0.7, "the same arc remains visible, standing still")
+        XCTAssertEqual(arc.intrinsicContentSize, NSSize(width: 15, height: 15))
+
+        arc.isPresentationVisible = true
+        arc.updateAnimation(isAttachedToWindow: false)
+        XCTAssertNil(arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey))
+        arc.updateAnimation(isAttachedToWindow: true)
+        let resumed = try XCTUnwrap(
+            arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey) as? CABasicAnimation
+        )
+        XCTAssertEqual(resumed.keyPath, "transform.rotation.z")
+        XCTAssertEqual(resumed.duration, 1)
+        XCTAssertEqual(resumed.repeatCount, .infinity)
+        arc.updateAnimation(isAttachedToWindow: false)
+        XCTAssertNil(arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey))
     }
 }

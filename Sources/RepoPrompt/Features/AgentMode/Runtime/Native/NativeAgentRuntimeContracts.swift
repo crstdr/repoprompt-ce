@@ -27,7 +27,7 @@ protocol NativeAgentRuntimeControlling: Actor {
     /// Begins fallback only if the failed application is still current, consuming its intent.
     func applyModelAndEffortWithProof(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure) async throws -> NativeAgentRuntimeConfigurationApplication
     /// Turn-scoped Auto application; fallback consumes only a still-current failure token.
-    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> Bool
+    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> NativeAgentRuntimeTurnConfigurationOutcome
     func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID
     /// Maintenance commands intentionally do not require an ordinary-turn configuration proof.
     func sendUserMessage(_ text: String) async throws -> UUID
@@ -37,31 +37,6 @@ protocol NativeAgentRuntimeControlling: Actor {
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
-}
-
-/// Ephemeral controller-owned receipt, never persisted or inferred from a Void update.
-/// The lifetime prevents reset generation counters from reviving an old process's receipt.
-struct NativeAgentRuntimeConfigurationProof: Equatable {
-    let lifetime: UUID
-    let intentGeneration: UInt64
-    let requestGeneration: UInt64
-}
-
-/// Ephemeral failure authority for one controller lifetime/intent, never an application receipt.
-struct NativeAgentRuntimeConfigurationFailure: Error, LocalizedError {
-    let underlyingError: any Error
-    let lifetime: UUID
-    let intentGeneration: UInt64
-    let requestGeneration: UInt64
-    var errorDescription: String? {
-        underlyingError.localizedDescription
-    }
-}
-
-enum NativeAgentRuntimeConfigurationApplication: Equatable {
-    case applied(NativeAgentRuntimeConfigurationProof)
-    case superseded
-    case notReady
 }
 
 extension NativeAgentRuntimeControlling {
@@ -78,10 +53,10 @@ extension NativeAgentRuntimeControlling {
 
     /// Runtimes must implement failure-token ownership to support conditional fallback.
     /// A legacy Void update alone cannot authorize restoring a failed turn's configuration.
-    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> Bool {
-        guard replacingFailure == nil else { return false }
+    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> NativeAgentRuntimeTurnConfigurationOutcome {
+        guard replacingFailure == nil else { return .superseded }
         try await applyModelAndEffort(model: model, effortLevel: effortLevel)
-        return true
+        return .applied
     }
 
     func sendUserMessage(_: String, configuration _: NativeAgentRuntimeConfigurationProof) async throws -> UUID {

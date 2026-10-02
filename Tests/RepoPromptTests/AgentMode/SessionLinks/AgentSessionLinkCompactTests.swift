@@ -1,4 +1,5 @@
 import Foundation
+@testable import RepoPromptApp
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
@@ -1311,4 +1312,30 @@ actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
     }
 
     func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) {}
+}
+
+/// Actor-owned fake receipt state. Every application intent supersedes earlier receipts, even
+/// identical values. Tests that replace a process rotate its lifetime rather than reuse counters.
+struct SessionLinkNativeConfigurationFixture {
+    private var lifetime = UUID()
+    private var generation: UInt64 = 0
+    private var current: NativeAgentRuntimeConfigurationProof?
+
+    mutating func apply() -> NativeAgentRuntimeConfigurationApplication {
+        generation &+= 1
+        let proof = NativeAgentRuntimeConfigurationProof(
+            lifetime: lifetime, intentGeneration: generation, requestGeneration: generation
+        )
+        current = proof
+        return .applied(proof)
+    }
+
+    mutating func replaceProcess() {
+        lifetime = UUID()
+        current = nil
+    }
+
+    func validate(_ proof: NativeAgentRuntimeConfigurationProof) throws {
+        guard current == proof else { throw NativeAgentRuntimeControllerError.configurationNotCurrent }
+    }
 }

@@ -1059,7 +1059,7 @@ package actor DomainAgentSessionLinkAuthority {
     /// Lifecycle-only cleanup: an active grant or newer input keeps its generation fence.
     package func forgetLocalInput(_ input: DomainAgentSessionLinkWaitInput) -> Bool {
         guard localInputGenerations[input.endpoint] == input.generation,
-              outboundLinksByEndpoint[input.endpoint]?.isEmpty ?? true else { return false }
+              !hasActiveOutboundLink(observerEndpoint: input.endpoint) else { return false }
         localInputGenerations.removeValue(forKey: input.endpoint)
         return true
     }

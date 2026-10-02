@@ -3,6 +3,57 @@ import Foundation
 import XCTest
 
 final class AgentSessionLanePolicyTests: XCTestCase {
+    @MainActor
+    func testSharedWarmCompletionDoesNotInvalidateAlreadyAdvertisedModels() async throws {
+        let registry = AgentACPModelRegistry.shared
+        let catalogue = AgentAdvertisedModelCatalog.shared
+        let availability = AgentModelCatalog.AvailabilityContext(openCodeAvailable: true)
+        registry.test_reset(providerID: .openCode)
+        defer { registry.test_reset(providerID: .openCode) }
+        let option = AgentModelOption(
+            rawValue: "warm-race-model", displayName: "Warm race", description: nil,
+            isPlaceholderDefault: false, isProviderDefault: false
+        )
+        XCTAssertTrue(registry.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(options: [option], currentModelRaw: option.rawValue), for: .openCode
+        ))
+        registry.test_clearMemoryPreservingStore(providerID: .openCode)
+        let firstGate = ACPWarmCompletionGate()
+        let secondGate = ACPWarmCompletionGate()
+        let firstParked = expectation(description: "First waiter loaded the shared warm task")
+        let secondParked = expectation(description: "Second waiter loaded the shared warm task")
+        let first = Task {
+            await registry.warmStandardStoreIfNeeded(beforeCompleting: {
+                firstParked.fulfill()
+                await firstGate.wait()
+            })
+        }
+        await fulfillment(of: [firstParked], timeout: 5)
+        let second = Task {
+            await registry.warmStandardStoreIfNeeded(beforeCompleting: {
+                secondParked.fulfill()
+                await secondGate.wait()
+            })
+        }
+        await fulfillment(of: [secondParked], timeout: 5)
+        await firstGate.open()
+        await first.value
+        let options = AgentModelCatalog.options(for: .openCode, availability: availability)
+        XCTAssertTrue(options.contains { $0.rawValue == option.rawValue })
+        XCTAssertNoThrow(try catalogue.selection("openCode:warm-race-model", availability: availability))
+        let generationAfterAdvertising = catalogue.productionGeneration(for: .openCode)
+        await secondGate.open()
+        await second.value
+        XCTAssertEqual(
+            catalogue.productionGeneration(for: .openCode), generationAfterAdvertising,
+            "The second waiter must not invalidate the first waiter's newly advertised catalogue"
+        )
+        XCTAssertNoThrow(
+            try catalogue.selection("openCode:warm-race-model", availability: availability),
+            "A model just advertised without source changes must remain admissible"
+        )
+    }
+
     func testExplicitModelUsesAdvertisedFullIDWithoutRoleSubstitution() throws {
         let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true, grokBuildAvailable: true)
         // Use the production producer, not another list of accepted models.
@@ -35,42 +86,75 @@ final class AgentSessionLanePolicyTests: XCTestCase {
     func testACPResetInvalidatesProducerThatReadBeforeMemoryWasCleared() throws {
         let registry = AgentACPModelRegistry.shared
         let catalogue = AgentAdvertisedModelCatalog.shared
-        let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true)
-        registry.test_reset(providerID: .cursor)
-        defer { registry.test_reset(providerID: .cursor) }
+        let availability = AgentModelCatalog.AvailabilityContext(openCodeAvailable: true)
+        registry.test_reset(providerID: .openCode)
+        defer { registry.test_reset(providerID: .openCode) }
         let option = AgentModelOption(
             rawValue: "reset-race-model", displayName: "Reset race", description: nil,
             isPlaceholderDefault: false, isProviderDefault: false
         )
         for preserveStore in [false, true] {
             XCTAssertTrue(registry.updateDiscoveredModels(
-                ACPDiscoveredSessionModels(options: [option], currentModelRaw: option.rawValue), for: .cursor
+                ACPDiscoveredSessionModels(options: [option], currentModelRaw: option.rawValue), for: .openCode
             ))
             var producerGeneration: UInt64 = 0
             var producerOptions: [AgentModelOption] = []
             let beforeClear = {
                 // Deterministically interleave a real producer after the first invalidation,
                 // while the old registry snapshot is still readable.
-                producerGeneration = catalogue.productionGeneration(for: .cursor)
-                producerOptions = AgentModelCatalog.options(for: .cursor, availability: availability)
+                producerGeneration = catalogue.productionGeneration(for: .openCode)
+                producerOptions = AgentModelCatalog.options(for: .openCode, availability: availability)
                 XCTAssertTrue(producerOptions.contains { $0.rawValue == option.rawValue })
                 do {
-                    _ = try catalogue.selection("cursor:reset-race-model", availability: availability)
+                    _ = try catalogue.selection("openCode:reset-race-model", availability: availability)
                 } catch {
                     XCTFail("Interleaved producer should publish the still-readable snapshot: \(error)")
                 }
             }
             if preserveStore {
-                registry.test_clearMemoryPreservingStore(providerID: .cursor, beforeClearingMemory: beforeClear)
+                registry.test_clearMemoryPreservingStore(providerID: .openCode, beforeClearingMemory: beforeClear)
             } else {
-                registry.test_reset(providerID: .cursor, beforeClearingMemory: beforeClear)
+                registry.test_reset(providerID: .openCode, beforeClearingMemory: beforeClear)
             }
-            XCTAssertNil(registry.resolvedSnapshot(for: .cursor))
-            XCTAssertThrowsError(try catalogue.selection("cursor:reset-race-model", availability: availability))
+            XCTAssertNil(registry.resolvedSnapshot(for: .openCode))
+            XCTAssertThrowsError(try catalogue.selection("openCode:reset-race-model", availability: availability))
             XCTAssertFalse(
-                catalogue.record(producerOptions, for: .cursor, generation: producerGeneration),
+                catalogue.record(producerOptions, for: .openCode, generation: producerGeneration),
                 "A paused producer must not republish the removed snapshot after reset"
             )
+        }
+    }
+
+    func testBackendConfigurationChangeInvalidatesAdmissionAndFencesPausedProducers() throws {
+        let catalogue = AgentAdvertisedModelCatalog.shared
+        let agents: [AgentProviderKind] = [.claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        let availability = AgentModelCatalog.AvailabilityContext(
+            zaiConfigured: true, kimiConfigured: true, customClaudeCompatibleConfigured: true
+        )
+        let option = AgentModelOption(
+            rawValue: "claude-opus-5-5", displayName: "Model", description: nil,
+            isPlaceholderDefault: false, isProviderDefault: false
+        )
+        let generations = Dictionary(uniqueKeysWithValues: agents.map {
+            ($0, catalogue.productionGeneration(for: $0))
+        })
+        defer { agents.forEach { catalogue.invalidate($0) } }
+        for agent in agents {
+            XCTAssertTrue(try catalogue.record([option], for: agent, generation: XCTUnwrap(generations[agent])))
+            XCTAssertNoThrow(try catalogue.selection("\(agent.rawValue):\(option.rawValue)", availability: availability))
+        }
+
+        let suiteName = "backend-admission-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        // A separate store exercises the process-wide invalidator without changing real preferences.
+        ClaudeCodeCompatibleBackendStore(defaults: defaults).saveConfig(ClaudeCodeCompatibleBackendID.custom.defaultPreset)
+
+        for agent in agents {
+            XCTAssertThrowsError(try catalogue.selection("\(agent.rawValue):\(option.rawValue)", availability: availability)) {
+                XCTAssertEqual($0 as? AgentAdvertisedModelCatalog.AdmissionError, .catalogueUnavailable)
+            }
+            XCTAssertFalse(try catalogue.record([option], for: agent, generation: XCTUnwrap(generations[agent])))
         }
     }
 
@@ -343,5 +427,21 @@ final class AgentSessionLanePolicyTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? AgentSessionLanePolicy.RoleResolutionError, .roleUnavailable)
         }
+    }
+}
+
+private actor ACPWarmCompletionGate {
+    private var isOpen = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func open() {
+        isOpen = true
+        continuation?.resume()
+        continuation = nil
     }
 }

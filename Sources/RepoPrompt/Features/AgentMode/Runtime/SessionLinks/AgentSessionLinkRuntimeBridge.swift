@@ -16,6 +16,40 @@ import RepoPromptInstrumentation
 // around every suspension point; nothing here authorizes anything the authority did not lease; and
 // unlink/revocation is the hard gate with no attention exception.
 
+struct AgentSessionLinkModelReceipt {
+    let modelID: String
+    let modelRaw: String
+    let reasoningEffortRaw: String?
+    let changed: Bool
+}
+
+enum AgentSessionLinkModelOutcome {
+    case accepted(AgentSessionLinkModelReceipt)
+    case blocked(AgentSessionLinkSendFailure)
+    case invalid(String)
+}
+
+extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkModelAvailability(windowID _: Int) -> AgentModelCatalog.AvailabilityContext {
+        .none
+    }
+
+    func agentSessionLinkModelCandidate(
+        for _: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkEndpointCandidate? {
+        nil
+    }
+
+    func agentSessionLinkPerformSetModel(
+        to _: AgentSessionLinkEndpointCandidate,
+        modelID _: String,
+        liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+        reauthorize _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkModelOutcome {
+        .blocked(.endpointHost)
+    }
+}
+
 // MARK: - Observation token
 
 /// Retains one target-scoped Combine observation. Teardown is always explicit: an implicit `deinit`
@@ -6074,6 +6108,16 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     // MARK: - Configuration-only model selection
+
+    nonisolated static var invalidModelIDMessage: String {
+        AgentAdvertisedModelCatalog.AdmissionError.invalidID.message
+    }
+
+    nonisolated static func isValidModelID(_ raw: String) -> Bool {
+        guard let id = AgentModelSelectionID.parse(raw), id.rawValue == raw,
+              AgentProviderKind(rawValue: id.agentRaw) != nil else { return false }
+        return true
+    }
 
     private func modelEndpoints(for lease: DomainAgentSessionLinkLease) -> AgentSessionLinkEndpointCandidate? {
         guard !isFrozenForTermination, !Task.isCancelled, let host,

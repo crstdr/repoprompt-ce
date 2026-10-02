@@ -18386,8 +18386,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor, .antigravity:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
         case .codexExec, .grokBuild, .devin:
-            return text
+            // These transports deliver pixels natively but no file path, so the agent could not
+            // otherwise name the image in ask_oracle `images`.
+            return renderAttachmentPathNote(text: text, attachments: attachments)
         }
+    }
+
+    static let attachmentPathNoteHeader =
+        "Attached image files (to share one with the Oracle, pass its path in ask_oracle `images`):"
+
+    private func renderAttachmentPathNote(text: String, attachments: [AgentImageAttachment]) -> String {
+        let paths = attachments.compactMap { attachment -> String? in
+            guard case let .localFile(path) = attachment.source else { return nil }
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard !paths.isEmpty else { return text }
+        let note = ([Self.attachmentPathNoteHeader] + paths.map { "- \($0)" }).joined(separator: "\n")
+        return text.isEmpty ? note : text + "\n\n" + note
     }
 
     private func renderAtPathAttachmentMessage(text: String, attachments: [AgentImageAttachment]) -> String {

@@ -1380,6 +1380,12 @@ final class ClaudeAgentModeCoordinator {
                         )
                     }
                 }
+                // A landed Auto write still needs restoration, even when it cannot authorize a turn.
+                if application == .appliedButSuperseded, let appliedAutoEffort,
+                   sessionOwnsClaudeController(controller, for: session), appliedAutoEffortByTabID[session.tabID] == nil
+                {
+                    appliedAutoEffortByTabID[session.tabID] = (controllerID, appliedAutoEffort)
+                }
                 guard configurationIsCurrent() else { return .superseded }
                 guard autoEffort == nil || autoEffortSelection?.isCurrent(
                     provider: session.selectedAgent,
@@ -1397,7 +1403,7 @@ final class ClaudeAgentModeCoordinator {
                 switch application {
                 case let .applied(proof):
                     configurationProof = proof
-                case .superseded, .notReady:
+                case .appliedButSuperseded, .superseded, .notReady:
                     return recordSendFailure(
                         "Claude model configuration is not current or ready. No message was sent; retry the turn.",
                         session: session,

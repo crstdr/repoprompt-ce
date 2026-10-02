@@ -920,7 +920,7 @@ class WindowState: ObservableObject {
     }
 
     private func installPresentationVisibilityObservers(for window: NSWindow) {
-        guard presentationVisibilityObservedWindow !== window else { return }
+        guard !isClosing, presentationVisibilityObservedWindow !== window else { return }
         removePresentationVisibilityObservers()
         presentationVisibilityObservedWindow = window
 
@@ -932,6 +932,7 @@ class WindowState: ObservableObject {
         }
         for publisher in publishers {
             publisher
+                .receive(on: RunLoop.main)
                 .sink { [weak self, weak window] _ in
                     guard let self, let window else { return }
                     schedulePresentationVisibilityUpdate(from: window)
