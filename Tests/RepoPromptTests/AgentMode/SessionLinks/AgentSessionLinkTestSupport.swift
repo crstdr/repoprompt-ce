@@ -278,10 +278,18 @@ final class LifecycleRecorder: @unchecked Sendable {
 
 final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     private let recorder: LifecycleRecorder
+    private let resumeGate: TestReleaseFence?
+    private let snapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus?
     private(set) var hasActiveThread = false
 
-    init(recorder: LifecycleRecorder) {
+    init(
+        recorder: LifecycleRecorder,
+        resumeGate: TestReleaseFence? = nil,
+        snapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus? = nil
+    ) {
         self.recorder = recorder
+        self.resumeGate = resumeGate
+        self.snapshotLatestTurnStatus = snapshotLatestTurnStatus
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -325,6 +333,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
         reasoningEffort: String?,
         serviceTier _: String?
     ) async throws -> CodexNativeSessionController.SessionRef {
+        await resumeGate?.enterAndWait()
         hasActiveThread = true
         return CodexNativeSessionController.SessionRef(
             conversationID: "lifecycle",
@@ -346,7 +355,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
             runtimeStatus: .idle,
             currentTurnID: nil,
             activeTurnIDs: [],
-            latestTurnStatus: nil
+            latestTurnStatus: snapshotLatestTurnStatus
         )
     }
 
@@ -377,7 +386,9 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
         return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
     }
 
-    func compactThread() async throws {}
+    func compactThread() async throws {
+        recorder.record("codex:compact")
+    }
 
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil
