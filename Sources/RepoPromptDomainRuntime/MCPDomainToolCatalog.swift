@@ -32,7 +32,7 @@ package enum MCPWindowToolName {
     package static let agentRun = "agent_run"
     package static let agentManage = "agent_manage"
     package static let agentSessionLink = "agent_session_link"
-    package static let agentSelf = "agent_self"
+    package static let agentSelf = "self_compact"
     package static let history = "history"
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
@@ -232,6 +232,12 @@ package struct MCPDomainToolCatalogEntry: Hashable, Sendable {
 }
 
 package enum MCPDomainToolCatalog {
+    package static func canonicalCallName(for name: String) -> String {
+        // Hidden backwards-compatibility support only; agent_self will be deprecated.
+        // Resolve before policy/admission, never by adding an advertised catalog entry.
+        name == "agent_self" ? MCPWindowToolName.agentSelf : name
+    }
+
     package static let entries: [MCPDomainToolCatalogEntry] = [
         .init(name: MCPGlobalToolName.appSettings, scope: .application, capability: .appSettings, admissionClass: .exclusive, operationPolicy: .init(
             operations: ["list", "get", "set", "options"],

@@ -541,7 +541,7 @@ actor ServerNetworkManager {
         "discover_workspace_context": "workspace_context"
     ]
     nonisolated static func canonicalToolName(for name: String) -> String {
-        toolNameAliases[name] ?? name
+        MCPDomainToolCatalog.canonicalCallName(for: toolNameAliases[name] ?? name)
     }
 
     nonisolated static func admissionClass(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {
