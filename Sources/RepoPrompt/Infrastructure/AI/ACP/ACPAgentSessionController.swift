@@ -3826,6 +3826,10 @@ actor ACPAgentSessionController {
             }
             return filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
         }
+        // Generic provider IDs cannot turn an explicitly persistent kind into one-time consent.
+        let scopedOptions = sessionScoped || provider.providerID == .grokBuild ? filteredOptions : filteredOptions.filter {
+            normalizedPermissionOptionValue($0.kind) != "allow_always"
+        }
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
         case .openCode, .cursor, .antigravity:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
@@ -3834,11 +3838,11 @@ actor ACPAgentSessionController {
         case .devin:
             []
         }
-        if let preferred = optionID(for: filteredOptions, preferences: preferences) {
+        if let preferred = optionID(for: scopedOptions, preferences: preferences) {
             return preferred
         }
         return optionID(
-            for: filteredOptions,
+            for: scopedOptions,
             preferences: sessionScoped ? [.kind("allow_always"), .kind("allow_once")] : [.kind("allow_once")]
         )
     }
@@ -3907,10 +3911,7 @@ actor ACPAgentSessionController {
         return [
             .optionID("once"),
             .optionID("allow_once"),
-            .kind("allow_once"),
-            .optionID("always"),
-            .optionID("allow_always"),
-            .kind("allow_always")
+            .kind("allow_once")
         ]
     }
 
