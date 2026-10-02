@@ -1958,10 +1958,8 @@ package enum MCPDomainCanonicalToolDefinitions {
                     ["change", "idle", "sendable"]
                 ),
                 "timeout_seconds": .object([
-                    "description": .string("[wait] 0-60 seconds; default 60; 0 polls."),
-                    "type": .string("number"),
-                    "minimum": .int(0),
-                    "maximum": .int(60)
+                    "description": .string("[wait] Max seconds; default 60; 0 polls immediately."),
+                    "type": .string("number")
                 ]),
                 "from": enumStringSchema(
                     "[read] Fresh page origin: tail (default/newest) or start (oldest).",

@@ -16,35 +16,6 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         MCPDomainCanonicalToolDefinitions.test_agentSessionLinkLegacyCurrentDefinition()
     }
 
-    func testWaitCapCatalogBudget() throws {
-        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
-        var schema = try XCTUnwrap(definition.inputSchema.objectValue)
-        var properties = try XCTUnwrap(schema["properties"]?.objectValue)
-        let timeout = try XCTUnwrap(properties["timeout_seconds"]?.objectValue)
-        XCTAssertEqual(timeout["minimum"], .int(0))
-        XCTAssertEqual(timeout["maximum"], .int(60))
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        func bytes(_ schema: Value) throws -> Int {
-            definition.description.utf8.count + (try encoder.encode(schema)).count
-        }
-        let after = try bytes(definition.inputSchema)
-        // Reconstruct the complete delivered 7ba4b7d3 entry, not just changed strings.
-        schema["description"] = .string(try XCTUnwrap(schema["description"]?.stringValue)
-            .replacingOccurrences(of: " Local input cancels older waits.", with: ""))
-        properties["timeout_seconds"] = .object([
-            "description": .string("[wait] Max seconds; default 60; 0 polls immediately."),
-            "type": .string("number")
-        ])
-        schema["properties"] = .object(properties)
-        let before = try bytes(.object(schema))
-        // TokenCalculationService's UTF-8 estimate, not a provider tokenizer.
-        let beforeTokens = Int(Double(before) / 4 * 1.05)
-        let afterTokens = Int(Double(after) / 4 * 1.05)
-        print("WAIT_CATALOG_BUDGET beforeBytes=\(before) afterBytes=\(after) beforeTokens=\(beforeTokens) afterTokens=\(afterTokens) delta=\(afterTokens - beforeTokens)")
-        XCTAssertLessThanOrEqual(afterTokens - beforeTokens, 20)
-    }
-
     // MARK: - Canonical catalog
 
     func testModelSelectionMigrationFullEntryBudgetAndConvergence() throws {
