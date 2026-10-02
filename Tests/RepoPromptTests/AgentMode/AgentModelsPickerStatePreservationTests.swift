@@ -366,3 +366,175 @@ final class StableMenuLifetimeTests: XCTestCase {
         XCTAssertNil(window.stableMenuPresenter.openMenu)
     }
 }
+
+/// `StableMenuContextRegion` is the row's right-click path: it presents through the
+/// window-scoped presenter, so a re-render of the hosting row must not tear down the
+/// open context menu (the regression Cristian reported with SwiftUI `.contextMenu`,
+/// reproduced red as `testContextMenuSurvivesRowRerender` before the conversion).
+@MainActor
+final class StableMenuContextMenuTests: XCTestCase {
+    private struct RegionRow: View {
+        let tick: Int
+        var body: some View {
+            Text("row \(tick)")
+                .frame(width: 160, height: 40)
+                .overlay(StableMenuContextRegion(anchor: StableMenuAnchor()) {
+                    [.action("Pinned") {}]
+                })
+        }
+    }
+
+    private var window: NSWindow!
+    private var hosting: NSHostingView<RegionRow>!
+    private var trackedMenu: NSMenu?
+    private var sawEnd = false
+    private var endedByTeardown = false
+    private var teardownOnOpen: (() -> Void)?
+    private var teardownAtGrace = false
+
+    override func tearDown() {
+        teardownOnOpen = nil
+        trackedMenu = nil
+        hosting = nil
+        window = nil
+        super.tearDown()
+    }
+
+    @objc private func began(_ note: Notification) {
+        MainActor.assumeIsolated {
+            guard let menu = note.object as? NSMenu,
+                  menu === window.stableMenuPresenter.openMenu
+            else { return }
+            trackedMenu = menu
+            if !teardownAtGrace {
+                teardownOnOpen?()
+            }
+            let timer = Timer(
+                timeInterval: 0.1, target: self,
+                selector: #selector(graceElapsed(_:)), userInfo: nil, repeats: false
+            )
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    @objc private func ended(_ note: Notification) {
+        MainActor.assumeIsolated {
+            if let trackedMenu, (note.object as? NSMenu) === trackedMenu {
+                sawEnd = true
+            }
+        }
+    }
+
+    @objc private func graceElapsed(_: Timer) {
+        MainActor.assumeIsolated {
+            if teardownAtGrace {
+                teardownOnOpen?()
+                let verify = Timer(
+                    timeInterval: 0.05, target: self,
+                    selector: #selector(verifiedAfterTeardown(_:)), userInfo: nil, repeats: false
+                )
+                RunLoop.main.add(verify, forMode: .common)
+            } else {
+                finishObservation()
+            }
+        }
+    }
+
+    @objc private func verifiedAfterTeardown(_: Timer) {
+        MainActor.assumeIsolated {
+            finishObservation()
+        }
+    }
+
+    private var finished = false
+
+    /// Records whether AppKit already ended tracking before our cleanup cancels it —
+    /// that is the teardown signal; asserting `sawEnd` after `cancelTracking` would be
+    /// contaminated by our own dismissal.
+    private func finishObservation() {
+        endedByTeardown = sawEnd || window.stableMenuPresenter.openMenu == nil
+        window.stableMenuPresenter.openMenu?.cancelTracking()
+        finished = true
+    }
+
+    /// Sends a right-click into the hosted row region. The region consumes the down
+    /// event in its monitor and presents on the next main-queue turn; `popUp` then
+    /// blocks until tracking ends, so teardown runs from inside the tracking
+    /// callbacks and the loop below only drives the runloop until tracking settles.
+    private func rightClickRow(atGrace: Bool = false, teardown: @escaping () -> Void) {
+        window = NSWindow(
+            contentRect: NSRect(x: 100, y: 100, width: 200, height: 60),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        hosting = NSHostingView(rootView: RegionRow(tick: 0))
+        window.contentView = hosting
+        window.makeKeyAndOrderFront(nil)
+        hosting.layoutSubtreeIfNeeded()
+        defer { window.close() }
+
+        teardownOnOpen = teardown
+        teardownAtGrace = atGrace
+        defer { teardownOnOpen = nil }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(began(_:)),
+            name: NSMenu.didBeginTrackingNotification, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(ended(_:)),
+            name: NSMenu.didEndTrackingNotification, object: nil
+        )
+        defer { NotificationCenter.default.removeObserver(self) }
+
+        let point = NSPoint(x: 100, y: 30)
+        guard let down = NSEvent.mouseEvent(
+            with: .rightMouseDown, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 0
+        ), let up = NSEvent.mouseEvent(
+            with: .rightMouseUp, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 0
+        ) else {
+            XCTFail("could not synthesize right-click events")
+            return
+        }
+        NSApp.sendEvent(down)
+        NSApp.sendEvent(up)
+
+        let deadline = Date().addingTimeInterval(3)
+        while !finished, Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+    }
+
+    /// The reproduction's contract on the converted path: re-rendering the host row
+    /// mid-track must not tear down the open context menu. (The SwiftUI `.contextMenu`
+    /// variant of this scenario — `testContextMenuSurvivesRowRerender`, run during
+    /// development — went red before the conversion.)
+    func testContextMenuSurvivesHostRerender() {
+        _ = NSApplication.shared
+        rightClickRow { [self] in
+            hosting.rootView = RegionRow(tick: 1)
+        }
+        XCTAssertNotNil(trackedMenu, "context menu never began tracking")
+        XCTAssertFalse(endedByTeardown, "open context menu was torn down by the row re-render")
+    }
+
+    func testContextMenuClosesWithWindow() {
+        _ = NSApplication.shared
+        rightClickRow(atGrace: true) { [self] in
+            NotificationCenter.default.post(
+                name: NSWindow.willCloseNotification, object: window
+            )
+        }
+        XCTAssertNotNil(trackedMenu, "context menu never began tracking")
+        XCTAssertTrue(
+            endedByTeardown,
+            "window close must release the presented context menu mid-track"
+        )
+        XCTAssertNil(window.stableMenuPresenter.openMenu)
+    }
+}

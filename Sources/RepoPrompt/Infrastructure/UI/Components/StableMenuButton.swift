@@ -252,7 +252,7 @@ extension NSMenu {
 /// click time. The open menu's lifetime is owned by the window's `StableMenuPresenter`,
 /// so tearing down or rebuilding the trigger cannot dismiss it mid-track.
 @MainActor
-private final class StableMenuAnchor: ObservableObject {
+final class StableMenuAnchor: ObservableObject {
     weak var view: NSView?
 }
 
@@ -288,7 +288,37 @@ final class StableMenuPresenter: NSObject, NSMenuDelegate {
     /// survives the anchor leaving its window.
     func present(_ items: [StableMenuItem], from anchorView: NSView?) {
         guard !items.isEmpty, let anchorView, let window = anchorView.window else { return }
+        let menu = beginOpenMenu(items, in: window)
 
+        let popupPoint = NSPoint(x: 0, y: anchorView.bounds.height + 2)
+        let windowPoint = anchorView.convert(popupPoint, to: nil)
+        let screenPoint = window.convertToScreen(NSRect(origin: windowPoint, size: .zero)).origin
+        menu.popUp(positioning: nil, at: screenPoint, in: nil)
+        finishOpenMenu(menu)
+    }
+
+    /// Presents `items` as a right-click context menu whose top corner sits at
+    /// `screenPoint` — the click position. Screen anchoring (`in: nil`) keeps tracking
+    /// unbound from any source view: a view-anchored popup's tracking session
+    /// dismisses itself on the source view's next layout, which is the re-render
+    /// teardown this path exists to prevent. Ownership matches `present(_:from:)` —
+    /// the presenter retains the menu for the duration of tracking and window close
+    /// cancels it.
+    func presentContextMenu(
+        _ items: [StableMenuItem],
+        atScreenPoint screenPoint: NSPoint,
+        in window: NSWindow
+    ) {
+        guard !items.isEmpty else { return }
+        let menu = beginOpenMenu(items, in: window)
+        menu.popUp(positioning: nil, at: screenPoint, in: nil)
+        finishOpenMenu(menu)
+    }
+
+    /// Builds the immutable item tree, takes ownership for tracking, and arms the
+    /// window-close observer. `closeOpenMenu` runs first so a reentrant presentation
+    /// releases the previous observer token instead of overwriting it.
+    private func beginOpenMenu(_ items: [StableMenuItem], in window: NSWindow) -> NSMenu {
         closeOpenMenu()
         let menu = NSMenu.stableMenu(from: items, fontPreset: FontScalePreset.current)
         menu.delegate = self
@@ -302,15 +332,13 @@ final class StableMenuPresenter: NSObject, NSMenuDelegate {
                 self?.closeOpenMenu()
             }
         }
+        return menu
+    }
 
-        let popupPoint = NSPoint(x: 0, y: anchorView.bounds.height + 2)
-        let windowPoint = anchorView.convert(popupPoint, to: nil)
-        let screenPoint = window.convertToScreen(NSRect(origin: windowPoint, size: .zero)).origin
-        menu.popUp(positioning: nil, at: screenPoint, in: nil)
-
-        // `popUp` is synchronous: tracking has ended by now. `menuDidClose` clears
-        // `openMenu` when tracking ran; this line covers the case where tracking
-        // never began (for example, no usable user session in a test host).
+    /// `popUp` is synchronous: tracking has ended by the time it returns.
+    /// `menuDidClose` clears `openMenu` when tracking ran; this covers the case where
+    /// tracking never began (for example, no usable user session in a test host).
+    private func finishOpenMenu(_ menu: NSMenu) {
         if openMenu === menu {
             releaseMenu()
         }
@@ -332,8 +360,142 @@ final class StableMenuPresenter: NSObject, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        print("CTX-DBG close match=\(openMenu === menu)")
+        Thread.callStackSymbols.prefix(22).forEach { print("CTX-DBG \($0)") }
         guard openMenu === menu else { return }
         releaseMenu()
+    }
+}
+
+/// Right-click target that presents a `StableMenuItem` context menu through the
+/// window-scoped `StableMenuPresenter`. Used instead of SwiftUI `.contextMenu` on
+/// surfaces whose menus a re-render dismantled mid-tracking: the presenter owns the
+/// `NSMenu`, so host-view rebuilds cannot close it and window close still can.
+///
+/// Claiming hits directly would shadow the content underneath, so the region instead
+/// listens through an app-local event monitor: a right mouse down or Control-click
+/// landing inside the region's bounds is consumed and answered with the menu, and
+/// every other event passes through untouched.
+@MainActor
+final class StableMenuContextView: NSView {
+    /// Evaluated per click; callers pass a snapshot-frozen builder.
+    var itemsProvider: () -> [StableMenuItem] = { [] }
+    private var contextClickMonitor: Any?
+
+    /// Never hit: the overlay covers the content but must not shadow its clicks —
+    /// context clicks are intercepted by the event monitor before dispatch instead.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    /// Installs the event monitor. Called by `StableMenuContextRegion` on mount.
+    func arm() {
+        guard contextClickMonitor == nil else { return }
+        contextClickMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.rightMouseDown, .leftMouseDown]
+        ) { [weak self] event in
+            guard let self else { return event }
+            return MainActor.assumeIsolated { self.handleContextClick(event) }
+        }
+    }
+
+    /// Removes the event monitor. Called on dismantle and when the view leaves its
+    /// window.
+    func disarm() {
+        guard let monitor = contextClickMonitor else { return }
+        contextClickMonitor = nil
+        NSEvent.removeMonitor(monitor)
+    }
+
+    deinit {
+        if let monitor = contextClickMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            disarm()
+        }
+    }
+
+    /// Returns `nil` (consuming the event) after scheduling presentation, or the
+    /// event unchanged so normal dispatch continues.
+    ///
+    /// Presentation is deferred one turn so the blocking `popUp` does not run inside
+    /// an event-monitor callback.
+    private func handleContextClick(_ event: NSEvent) -> NSEvent? {
+        let isContextClick = event.type == .rightMouseDown
+            || (event.type == .leftMouseDown && event.modifierFlags.contains(.control))
+        guard isContextClick,
+              window != nil,
+              event.window === window,
+              !isHidden,
+              bounds.contains(convert(event.locationInWindow, from: nil))
+        else { return event }
+        let items = itemsProvider()
+        guard !items.isEmpty else { return event }
+        let windowPoint = event.locationInWindow
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                self?.present(items, at: windowPoint)
+            }
+        }
+        return nil
+    }
+
+    /// VoiceOver's "Show Menu" action — presents at the region's own corner since
+    /// there is no pointer position to anchor to.
+    override func accessibilityPerformShowMenu() -> Bool {
+        presentAtRegionOrigin()
+        return true
+    }
+
+    /// Presents the context menu at the region's upper-left on screen. Used by the
+    /// VoiceOver path where no click position exists.
+    func presentAtRegionOrigin() {
+        let items = itemsProvider()
+        guard !items.isEmpty else { return }
+        present(items, at: convert(NSPoint(x: bounds.minX, y: bounds.maxY), to: nil))
+    }
+
+    private func present(_ items: [StableMenuItem], at windowPoint: NSPoint) {
+        guard let window else { return }
+        let screenPoint = window.convertToScreen(
+            NSRect(origin: windowPoint, size: .zero)
+        ).origin
+        window.stableMenuPresenter.presentContextMenu(
+            items,
+            atScreenPoint: screenPoint,
+            in: window
+        )
+    }
+}
+
+/// Hosts a `StableMenuContextView` over the wrapped content's full bounds. The item
+/// provider is re-evaluated at each click so callers can pass a hover-frozen snapshot
+/// builder. `anchor` exposes the backing view for accessibility-driven presentation.
+@MainActor
+struct StableMenuContextRegion: NSViewRepresentable {
+    let anchor: StableMenuAnchor
+    let items: () -> [StableMenuItem]
+
+    func makeNSView(context: Context) -> StableMenuContextView {
+        let view = StableMenuContextView()
+        view.itemsProvider = items
+        view.arm()
+        anchor.view = view
+        return view
+    }
+
+    func updateNSView(_ nsView: StableMenuContextView, context: Context) {
+        nsView.itemsProvider = items
+        anchor.view = nsView
+    }
+
+    static func dismantleNSView(_ nsView: StableMenuContextView, coordinator: ()) {
+        nsView.disarm()
     }
 }
 
