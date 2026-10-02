@@ -330,7 +330,9 @@ private struct BulkActionChipLabel: View {
     }
 
     private var foreground: Color {
-        if isDestructive { return .red }
+        if isDestructive {
+            return .red
+        }
         return isHovered ? Color(NSColor.labelColor) : .secondary
     }
 
@@ -613,7 +615,7 @@ struct AgentModeSessionsListView: View {
                         }
 
                         let creator = session.sessionID.flatMap {
-                            agentModeVM.agentSessionLinkLaneCreator(for: $0)
+                            agentModeVM.agentSidebarLaneCreator(tabID: session.tabID, expectedSessionID: $0)
                         }
 
                         AgentSessionRow(
@@ -625,8 +627,7 @@ struct AgentModeSessionsListView: View {
                             onOpenCreator: {
                                 guard let targetSessionID = session.sessionID,
                                       let creatorSessionID = creator?.sessionID,
-                                      agentModeVM.agentSessionLinkLaneCreatorSessionID(for: targetSessionID)
-                                      == creatorSessionID
+                                      agentModeVM.agentSessionLinkLaneCreatorSessionID(tabID: session.tabID, expectedSessionID: targetSessionID) == creatorSessionID
                                 else { return }
                                 Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
                             },
@@ -869,6 +870,7 @@ struct AgentModeSessionsListView: View {
                                     selectionState: selectionState,
                                     renderedOrder: snapshot.renderedSelectionOrder,
                                     agentModeVM: agentModeVM,
+                                    creatorDisplayNames: agentModeVM.sidebarCreatorDisplayNames,
                                     promptManager: promptManager
                                 )
                             }
@@ -918,7 +920,9 @@ struct AgentModeSessionsListView: View {
                 renderedOrder: selectionRenderIdentity.renderedOrder,
                 workspaceID: selectionRenderIdentity.workspaceID
             )
-            if snapshot.renderedSelectionOrder.isEmpty { showingBulkDeleteConfirmation = false }
+            if snapshot.renderedSelectionOrder.isEmpty {
+                showingBulkDeleteConfirmation = false
+            }
         }
     }
 
@@ -1047,7 +1051,9 @@ struct AgentModeSessionsListView: View {
                 }
             }
 
-            if let notice = selectionState.notice { bulkNotice(notice) }
+            if let notice = selectionState.notice {
+                bulkNotice(notice)
+            }
         }
         .padding(.horizontal, bulkBarInnerHorizontalPadding)
         .padding(.vertical, bulkBarInnerVerticalPadding)
@@ -1550,6 +1556,7 @@ struct ArchivedSessionsList: View {
     let selectionState: AgentSidebarSelectionState
     let renderedOrder: [AgentSidebarSelectionIdentity]
     let agentModeVM: AgentModeViewModel
+    let creatorDisplayNames: [UUID: String]
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject private var fontScale = FontScaleManager.shared
 
@@ -1604,7 +1611,12 @@ struct ArchivedSessionsList: View {
                 )
                 let stashedSessionID = sessionIDByStashedTabID[stashed.id]
                 let creator = stashedSessionID.flatMap {
-                    agentModeVM.agentSessionLinkLaneCreator(for: $0)
+                    agentModeVM.agentSidebarLaneCreator(
+                        tabID: stashed.tab.id,
+                        expectedSessionID: $0,
+                        names: creatorDisplayNames,
+                        archived: true
+                    )
                 }
                 AgentStashedSessionRow(
                     stashed: stashed,
@@ -1612,7 +1624,7 @@ struct ArchivedSessionsList: View {
                     onOpenCreator: {
                         guard let stashedSessionID,
                               let creatorSessionID = creator?.sessionID,
-                              agentModeVM.agentSessionLinkLaneCreatorSessionID(for: stashedSessionID) == creatorSessionID
+                              agentModeVM.agentSessionLinkLaneCreatorSessionID(tabID: stashed.tab.id, expectedSessionID: stashedSessionID) == creatorSessionID
                         else { return }
                         Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
                     },

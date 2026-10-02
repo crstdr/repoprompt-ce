@@ -1333,7 +1333,7 @@ struct AgentMonitorPillProps: Equatable {
     /// `nil` means the endpoint is not currently an eligible target (or this is a synthesized local
     /// placeholder). A non-nil empty value means there is neither an eligible observer to add nor an
     /// existing relationship to unlink, so the sidebar renders no management surface.
-    let sidebarOversightMenu: AgentSidebarOversightMenuProps?
+    var sidebarOversightMenu: AgentSidebarOversightMenuProps?
     let outbound: [Outbound]
     let inbound: [Inbound]
     let recentNotices: [Notice]

@@ -826,6 +826,16 @@ extension AgentModeViewModel {
         // view performs from ever addressing a different incarnation than the rows it is showing.
         var props = agentSessionLinkOverlayingAutoWakePolicy(props, endpoint: endpoint)
         props.endpoint = endpoint
+        // A suspended bridge pass may carry an older creator name. Settle against the latest
+        // synchronous UI source at publication, without touching the agent-facing projections.
+        if props.sidebarOversightMenu != nil {
+            let creatorID = agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+                ? agentSessionLinkLaneCreatorSessionID(tabID: endpoint.tabID, expectedSessionID: endpoint.sessionID) : nil
+            props.sidebarOversightMenu?.creatorSessionID = creatorID
+            props.sidebarOversightMenu?.createdByLabel = creatorID.map {
+                sidebarCreatorDisplayNames[$0] ?? agentSessionLinkLocalCreatorLabel(creatorID: $0)
+            }
+        }
         // One tab of one window holds at most one live incarnation
         // (`agentSessionLinkObserverEndpoint(tabID:)` resolves exactly one), so any *other* entry
         // filed under this tab is a superseded incarnation that nothing can read again. Collecting it
@@ -843,12 +853,24 @@ extension AgentModeViewModel {
         }
     }
 
+    /// Names also invalidate archived/unlinked consumers whose exact projection props are equal.
+    func agentSessionLinkPublishCreatorNames(_ names: [UUID: String]) {
+        guard names != sidebarCreatorDisplayNames else { return }
+        agentSessionLinkMutateProjectionStorage(creatorNames: names) { stored in
+            for endpoint in stored.keys {
+                guard let creatorID = stored[endpoint]?.sidebarOversightMenu?.creatorSessionID else { continue }
+                stored[endpoint]?.sidebarOversightMenu?.createdByLabel = names[creatorID]
+                    ?? agentSessionLinkLocalCreatorLabel(creatorID: creatorID)
+            }
+        }
+    }
+
     /// Applies one logical exact-projection storage transaction and publishes one presentation
     /// invalidation only after every write and removal is visible.
     ///
     /// This is the sole mutation boundary for `monitorPillPropsByEndpoint`. The status-pill snapshot
     /// is synchronized before the notification so every consumer can immediately re-read the same
-    /// completed state. Equal replacements are true no-ops and publish nothing.
+    /// completed state. Equal props and equal creator names are true no-ops and publish nothing.
     ///
     /// The snapshot's only storage-derived field is `monitor`. The full snapshot (Model Router
     /// availability, execution location, ...) is rebuilt only when the published `monitor` differs
@@ -858,13 +880,20 @@ extension AgentModeViewModel {
     /// already the completed state, and the rebuild is skipped for every other endpoint's refresh.
     /// The notification is posted for every changed transaction exactly as before.
     private func agentSessionLinkMutateProjectionStorage(
+        creatorNames: [UUID: String]? = nil,
         _ mutation: (inout [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps]) -> Void
     ) {
         var updated = monitorPillPropsByEndpoint
         mutation(&updated)
-        guard updated != monitorPillPropsByEndpoint else { return }
+        let propsChanged = updated != monitorPillPropsByEndpoint
+        guard propsChanged || creatorNames.map({ $0 != sidebarCreatorDisplayNames }) == true else { return }
+        if let creatorNames {
+            sidebarCreatorDisplayNames = creatorNames
+        }
         monitorPillPropsByEndpoint = updated
-        agentSessionLinkReconcileOversightColourSlots()
+        if propsChanged {
+            agentSessionLinkReconcileOversightColourSlots()
+        }
         syncStatusPillsUIStateIfMonitorStale()
         NotificationCenter.default.post(
             name: .agentSessionLinkOverseerProjectionDidChange,

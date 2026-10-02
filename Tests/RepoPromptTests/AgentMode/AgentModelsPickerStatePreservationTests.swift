@@ -2,6 +2,7 @@ import AppKit
 import Combine
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
+import SwiftUI
 import XCTest
 
 @MainActor
@@ -179,8 +180,12 @@ final class AgentModelsPickerStatePreservationTests: XCTestCase {
 
     private func actionItem(titled title: String, in menu: NSMenu) -> NSMenuItem? {
         for item in menu.items {
-            if item.title == title, item.action != nil { return item }
-            if let submenu = item.submenu, let match = actionItem(titled: title, in: submenu) { return match }
+            if item.title == title, item.action != nil {
+                return item
+            }
+            if let submenu = item.submenu, let match = actionItem(titled: title, in: submenu) {
+                return match
+            }
         }
         return nil
     }
@@ -193,5 +198,439 @@ final class AgentModelsPickerStatePreservationTests: XCTestCase {
                 DispatchQueue.main.async { continuation.resume() }
             }
         }
+    }
+}
+
+/// Lifecycle contract of the window-scoped `StableMenuPresenter`: the presented `NSMenu`
+/// is screen-anchored and owned outside the trigger's view state, so tearing down
+/// the hosted `StableMenuButton` mid-track must not dismiss it — that was the
+/// sidebar oversight menu's disappearing-list defect. Closing the presenting
+/// window must still release the menu so a gone window cannot orphan it.
+/// A transparent `StableMenuButton` label must still receive clicks — the
+/// oversight mark's clear overlay depends on it (regression: `Color.clear`
+/// alone produces no hit region, so the eye mark's menu never opened).
+@MainActor
+final class StableMenuClickTargetTests: XCTestCase {
+    private struct MarkRow: View {
+        let onMarkTap: () -> Void
+        var body: some View {
+            HStack(spacing: 4) {
+                Image(systemName: "eye.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .accessibilityHidden(true)
+                    .overlay {
+                        StableMenuButton(
+                            items: { [.action("Pinned") {}] },
+                            triggerStyle: .plain,
+                            onOpen: { onMarkTap() }
+                        ) { Color.clear.contentShape(Rectangle()) }
+                    }
+                    .fixedSize()
+                Text("title")
+            }
+            .frame(width: 200, height: 40)
+            .contentShape(Rectangle())
+            .onTapGesture {}
+        }
+    }
+
+    func testClearLabelMarkButtonReceivesClick() {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(x: 200, y: 200, width: 200, height: 40),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        var markTapped = false
+        let hosting = NSHostingView(rootView: MarkRow(onMarkTap: { markTapped = true }))
+        window.contentView = hosting
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        hosting.layoutSubtreeIfNeeded()
+
+        // Locate the mark's hit region: the anchor view sits inside the overlay.
+        var target: NSView?
+        func walk(_ v: NSView) {
+            if NSStringFromClass(type(of: v)).contains("FocusRing") { target = v }
+            v.subviews.forEach(walk)
+        }
+        walk(hosting)
+        let point = target.map { $0.convert(NSPoint(x: $0.bounds.midX, y: $0.bounds.midY), to: nil) }
+            ?? NSPoint(x: 100, y: 20)
+
+        guard let down = NSEvent.mouseEvent(
+            with: .leftMouseDown, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 0
+        ), let up = NSEvent.mouseEvent(
+            with: .leftMouseUp, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 1, clickCount: 1, pressure: 0
+        ) else { return XCTFail("could not synthesize click") }
+        window.sendEvent(down)
+        // The action presents synchronously during dispatch; cancel tracking on the
+        // next turn so the test does not wait out the tracking session.
+        DispatchQueue.main.async {
+            window.stableMenuPresenter.openMenu?.cancelTracking()
+        }
+        window.sendEvent(up)
+        XCTAssertTrue(markTapped, "transparent-label mark button did not receive the click")
+        window.stableMenuPresenter.openMenu?.cancelTracking()
+    }
+}
+
+@MainActor
+final class StableMenuLifetimeTests: XCTestCase {
+    private struct TriggerRow: View {
+        let showsTrigger: Bool
+        var body: some View {
+            if showsTrigger {
+                StableMenuButton(
+                    items: { [.action("Pinned") {}] },
+                    label: { Text("Trigger") }
+                )
+            }
+        }
+    }
+
+    private var window: NSWindow!
+    private var hosting: NSHostingView<TriggerRow>!
+    private var trackedMenu: NSMenu?
+    /// Whether `openMenu` was released while tracking — observed on a runloop beat
+    /// after the teardown, so it reflects mid-track release, not `present`'s
+    /// post-`popUp` cleanup.
+    private var releasedDuringTracking = false
+    /// Whether the post-teardown observation actually ran. If teardown ends
+    /// tracking early, `popUp` returns before the verify timer fires — requiring
+    /// this flag keeps an early dismissal from satisfying the survival asserts.
+    private var observationCompleted = false
+    private var teardownOnOpen: (() -> Void)?
+    private var teardownAtGrace = false
+    private var pendingTimers: [Timer] = []
+
+    override func tearDown() {
+        pendingTimers.forEach { $0.invalidate() }
+        pendingTimers = []
+        teardownOnOpen = nil
+        trackedMenu = nil
+        hosting = nil
+        window = nil
+        super.tearDown()
+    }
+
+    private func schedule(_ interval: TimeInterval, selector: Selector) {
+        let timer = Timer(
+            timeInterval: interval, target: self,
+            selector: selector, userInfo: nil, repeats: false
+        )
+        pendingTimers.append(timer)
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    /// The button's `.background` anchor is the only bare `NSView` in the hosted tree.
+    private func findAnchor(in view: NSView) -> NSView? {
+        if type(of: view) == NSView.self {
+            return view
+        }
+        for subview in view.subviews {
+            if let found = findAnchor(in: subview) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    @objc private func menuBeganTracking(_ note: Notification) {
+        MainActor.assumeIsolated {
+            guard let menu = note.object as? NSMenu,
+                  menu === window.stableMenuPresenter.openMenu
+            else { return }
+            trackedMenu = menu
+            if !teardownAtGrace {
+                teardownOnOpen?()
+            }
+            schedule(0.1, selector: #selector(graceElapsed(_:)))
+        }
+    }
+
+    /// Fires on the next common-mode beat after teardown so the assertion reads the
+    /// post-teardown tracking state rather than cleanup inside `present`. The
+    /// fallback `cancelTracking` keeps `popUp` from hanging if a teardown did not
+    /// end tracking.
+    @objc private func graceElapsed(_: Timer) {
+        MainActor.assumeIsolated {
+            if teardownAtGrace {
+                teardownOnOpen?()
+                schedule(0.05, selector: #selector(verifiedAfterTeardown(_:)))
+            } else {
+                finishTrackingObservation()
+            }
+        }
+    }
+
+    @objc private func verifiedAfterTeardown(_: Timer) {
+        MainActor.assumeIsolated {
+            finishTrackingObservation()
+        }
+    }
+
+    private func finishTrackingObservation() {
+        releasedDuringTracking = window.stableMenuPresenter.openMenu == nil
+        observationCompleted = true
+        window.stableMenuPresenter.openMenu?.cancelTracking()
+    }
+
+    /// Hosts the trigger, presents through the shared presenter at the mounted
+    /// anchor, and runs `teardown` once tracking begins. `popUp` is synchronous, so
+    /// all state is settled when it returns.
+    private func presentHostedMenu(atGrace: Bool = false, teardown: @escaping () -> Void) {
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 60),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        hosting = NSHostingView(rootView: TriggerRow(showsTrigger: true))
+        window.contentView = hosting
+        window.orderFrontRegardless()
+        hosting.layoutSubtreeIfNeeded()
+        defer { window.close() }
+
+        guard let anchor = findAnchor(in: hosting) else {
+            XCTFail("StableMenuAnchorView did not mount a backing NSView")
+            return
+        }
+        teardownOnOpen = teardown
+        teardownAtGrace = atGrace
+        defer { teardownOnOpen = nil }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(menuBeganTracking(_:)),
+            name: NSMenu.didBeginTrackingNotification, object: nil
+        )
+        defer { NotificationCenter.default.removeObserver(self) }
+
+        window.stableMenuPresenter.present([.action("Pinned") {}], from: anchor)
+    }
+
+    func testPresentedMenuSurvivesTriggerUnmount() {
+        _ = NSApplication.shared
+        presentHostedMenu { [self] in
+            // The sidebar invalidation analogue: the conditional gate flips and the
+            // whole `StableMenuButton` subtree (anchor view and view-scoped state)
+            // is dismantled while its menu is tracking.
+            hosting.rootView = TriggerRow(showsTrigger: false)
+            hosting.layoutSubtreeIfNeeded()
+        }
+        XCTAssertNotNil(trackedMenu, "presented menu never began tracking")
+        XCTAssertTrue(
+            observationCompleted,
+            "observation must run inside tracking — an early teardown-induced close cannot satisfy the survival assert"
+        )
+        XCTAssertFalse(
+            releasedDuringTracking,
+            "menu tracking was cancelled when the trigger subtree unmounted"
+        )
+        XCTAssertNil(window.stableMenuPresenter.openMenu)
+    }
+
+    func testPresentedMenuClosesWithWindow() {
+        _ = NSApplication.shared
+        presentHostedMenu(atGrace: true) { [self] in
+            // Closing the presenting window posts `willClose`; driving the
+            // notification directly exercises the same cancellation path without
+            // destroying a window inside AppKit's tracking loop.
+            NotificationCenter.default.post(
+                name: NSWindow.willCloseNotification, object: window
+            )
+        }
+        XCTAssertNotNil(trackedMenu, "presented menu never began tracking")
+        XCTAssertTrue(
+            observationCompleted,
+            "observation must run inside tracking — an early close cannot satisfy the mid-track release assert"
+        )
+        XCTAssertTrue(
+            releasedDuringTracking,
+            "window close must release the menu mid-track, not only at popUp return"
+        )
+        XCTAssertNil(window.stableMenuPresenter.openMenu)
+    }
+}
+
+/// `StableMenuContextRegion` is the row's right-click path: it presents through the
+/// window-scoped presenter, so a re-render of the hosting row must not tear down the
+/// open context menu (the regression Cristian reported with SwiftUI `.contextMenu`,
+/// reproduced red as `testContextMenuSurvivesRowRerender` before the conversion).
+@MainActor
+final class StableMenuContextMenuTests: XCTestCase {
+    private struct RegionRow: View {
+        let tick: Int
+        var body: some View {
+            Text("row \(tick)")
+                .frame(width: 160, height: 40)
+                .overlay(StableMenuContextRegion(anchor: StableMenuAnchor()) {
+                    [.action("Pinned") {}]
+                })
+        }
+    }
+
+    private var window: NSWindow!
+    private var hosting: NSHostingView<RegionRow>!
+    private var trackedMenu: NSMenu?
+    private var sawEnd = false
+    private var endedByTeardown = false
+    private var teardownOnOpen: (() -> Void)?
+    private var teardownAtGrace = false
+    private var pendingTimers: [Timer] = []
+
+    override func tearDown() {
+        pendingTimers.forEach { $0.invalidate() }
+        pendingTimers = []
+        teardownOnOpen = nil
+        trackedMenu = nil
+        hosting = nil
+        window = nil
+        super.tearDown()
+    }
+
+    private func schedule(_ interval: TimeInterval, selector: Selector) {
+        let timer = Timer(
+            timeInterval: interval, target: self,
+            selector: selector, userInfo: nil, repeats: false
+        )
+        pendingTimers.append(timer)
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    @objc private func began(_ note: Notification) {
+        MainActor.assumeIsolated {
+            guard let menu = note.object as? NSMenu,
+                  menu === window.stableMenuPresenter.openMenu
+            else { return }
+            trackedMenu = menu
+            if !teardownAtGrace {
+                teardownOnOpen?()
+            }
+            schedule(0.1, selector: #selector(graceElapsed(_:)))
+        }
+    }
+
+    @objc private func ended(_ note: Notification) {
+        MainActor.assumeIsolated {
+            if let trackedMenu, (note.object as? NSMenu) === trackedMenu {
+                sawEnd = true
+            }
+        }
+    }
+
+    @objc private func graceElapsed(_: Timer) {
+        MainActor.assumeIsolated {
+            if teardownAtGrace {
+                teardownOnOpen?()
+                schedule(0.05, selector: #selector(verifiedAfterTeardown(_:)))
+            } else {
+                finishObservation()
+            }
+        }
+    }
+
+    @objc private func verifiedAfterTeardown(_: Timer) {
+        MainActor.assumeIsolated {
+            finishObservation()
+        }
+    }
+
+    private var finished = false
+
+    /// Records whether AppKit already ended tracking before our cleanup cancels it —
+    /// that is the teardown signal; asserting `sawEnd` after `cancelTracking` would be
+    /// contaminated by our own dismissal.
+    private func finishObservation() {
+        endedByTeardown = sawEnd || window.stableMenuPresenter.openMenu == nil
+        window.stableMenuPresenter.openMenu?.cancelTracking()
+        finished = true
+    }
+
+    /// Sends a right-click into the hosted row region. The region consumes the down
+    /// event in its monitor and presents on the next main-queue turn; `popUp` then
+    /// blocks until tracking ends, so teardown runs from inside the tracking
+    /// callbacks and the loop below only drives the runloop until tracking settles.
+    private func rightClickRow(atGrace: Bool = false, teardown: @escaping () -> Void) {
+        window = NSWindow(
+            contentRect: NSRect(x: 100, y: 100, width: 200, height: 60),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        hosting = NSHostingView(rootView: RegionRow(tick: 0))
+        window.contentView = hosting
+        window.makeKeyAndOrderFront(nil)
+        hosting.layoutSubtreeIfNeeded()
+        defer { window.close() }
+
+        teardownOnOpen = teardown
+        teardownAtGrace = atGrace
+        defer { teardownOnOpen = nil }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(began(_:)),
+            name: NSMenu.didBeginTrackingNotification, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(ended(_:)),
+            name: NSMenu.didEndTrackingNotification, object: nil
+        )
+        defer { NotificationCenter.default.removeObserver(self) }
+
+        let point = NSPoint(x: 100, y: 30)
+        guard let down = NSEvent.mouseEvent(
+            with: .rightMouseDown, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 0
+        ), let up = NSEvent.mouseEvent(
+            with: .rightMouseUp, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 0
+        ) else {
+            XCTFail("could not synthesize right-click events")
+            return
+        }
+        NSApp.sendEvent(down)
+        NSApp.sendEvent(up)
+
+        let deadline = Date().addingTimeInterval(3)
+        while !finished, Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+    }
+
+    /// The reproduction's contract on the converted path: re-rendering the host row
+    /// mid-track must not tear down the open context menu. (The SwiftUI `.contextMenu`
+    /// variant of this scenario — `testContextMenuSurvivesRowRerender`, run during
+    /// development — went red before the conversion.)
+    func testContextMenuSurvivesHostRerender() {
+        _ = NSApplication.shared
+        rightClickRow { [self] in
+            hosting.rootView = RegionRow(tick: 1)
+        }
+        XCTAssertNotNil(trackedMenu, "context menu never began tracking")
+        XCTAssertFalse(endedByTeardown, "open context menu was torn down by the row re-render")
+    }
+
+    func testContextMenuClosesWithWindow() {
+        _ = NSApplication.shared
+        rightClickRow(atGrace: true) { [self] in
+            NotificationCenter.default.post(
+                name: NSWindow.willCloseNotification, object: window
+            )
+        }
+        XCTAssertNotNil(trackedMenu, "context menu never began tracking")
+        XCTAssertTrue(
+            endedByTeardown,
+            "window close must release the presented context menu mid-track"
+        )
+        XCTAssertNil(window.stableMenuPresenter.openMenu)
     }
 }
