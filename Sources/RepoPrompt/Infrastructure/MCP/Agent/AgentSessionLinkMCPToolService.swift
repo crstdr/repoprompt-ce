@@ -70,16 +70,6 @@ struct AgentSessionLinkMCPToolService {
     """
 
     static let defaultWaitTimeoutSeconds: TimeInterval = 60
-    static func resolvedWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        do {
-            let seconds = try AgentMCPToolHelpers.parseTimeoutSeconds(value) ?? defaultWaitTimeoutSeconds
-            guard seconds <= defaultWaitTimeoutSeconds else { throw MCPError.invalidParams("") }
-            return seconds
-        } catch {
-            throw MCPError.invalidParams("timeout_seconds must be in 0...60 seconds.")
-        }
-    }
-
     static let listDefaultMaxItems = 32
     static let listMaximumMaxItems = 100
 
@@ -96,9 +86,9 @@ struct AgentSessionLinkMCPToolService {
             _ operation: @escaping HeartbeatOperation
         ) async throws -> Value
 
+    var captureWaitInput: () -> DomainAgentSessionLinkWaitInput? = { AgentSessionLinkWaitCallOrigin.current }
     // Deliberately fail-closed by default: never fall back to the generic recovery resolver.
     var resolveModelObserverEndpoint: (RequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity? = { _ in nil }
-    var captureWaitInput: () -> DomainAgentSessionLinkWaitInput? = { AgentSessionLinkWaitCallOrigin.current }
     var bridge: AgentSessionLinkRuntimeBridge = .shared
 
     // MARK: - Entry point
@@ -181,10 +171,9 @@ struct AgentSessionLinkMCPToolService {
 
     static func parseModelID(_ value: Value?) throws -> String {
         guard case let .string(raw)? = value,
-              let id = AgentModelSelectionID.parse(raw), id.rawValue == raw,
-              AgentProviderKind(rawValue: id.agentRaw) != nil
+              AgentSessionLinkRuntimeBridge.isValidModelID(raw)
         else {
-            throw MCPError.invalidParams(AgentAdvertisedModelCatalog.AdmissionError.invalidID.message)
+            throw MCPError.invalidParams(AgentSessionLinkRuntimeBridge.invalidModelIDMessage)
         }
         return raw
     }
@@ -840,12 +829,13 @@ struct AgentSessionLinkMCPToolService {
     // MARK: - wait
 
     private func executeWait(args: [String: Value]) async throws -> Value {
-        let timeoutSeconds = try Self.resolvedWaitTimeoutSeconds(args["timeout_seconds"])
-        let observerInput = captureWaitInput()
+        let timeoutSeconds = try AgentMCPToolHelpers.parseTimeoutSeconds(args["timeout_seconds"])
+            ?? Self.defaultWaitTimeoutSeconds
+        let capturedInput = captureWaitInput()
         let observerEndpoint = try await resolveCallerEndpointIdentity()
-        guard let observerInput, observerInput.endpoint == observerEndpoint else {
-            throw MCPError.invalidParams("Observer route changed. Retry wait from the current Agent session.")
-        }
+        // Rehydration may resolve an endpoint unavailable at capture time. Preserve upstream wait
+        // admission, without borrowing another endpoint's local-input cancellation generation.
+        let observerInput = capturedInput.flatMap { $0.endpoint == observerEndpoint ? $0 : nil }
         let metadata = await captureRequestMetadata()
         let request = try Self.parseTargets(args)
         let predicate = try Self.parsePredicate(args["until"])

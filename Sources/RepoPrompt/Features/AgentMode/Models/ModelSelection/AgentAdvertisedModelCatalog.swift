@@ -4,7 +4,16 @@ import Foundation
 /// Producers refresh this index while building ordinary picker/list_agents options. A cold or
 /// invalidated index fails closed; an oversight request must not warm it on the caller's behalf.
 final class AgentAdvertisedModelCatalog: @unchecked Sendable {
-    static let shared = AgentAdvertisedModelCatalog()
+    static let shared: AgentAdvertisedModelCatalog = {
+        let catalogue = AgentAdvertisedModelCatalog()
+        ClaudeCodeCompatibleBackendStore.setConfigurationChangeHandler { [weak catalogue] in
+            for agent in [AgentProviderKind.claudeCodeGLM, .kimiCode, .customClaudeCompatible] {
+                catalogue?.invalidate(agent)
+            }
+        }
+        return catalogue
+    }()
+
     private let lock = NSLock()
     private struct Entry {
         let option: AgentModelOption

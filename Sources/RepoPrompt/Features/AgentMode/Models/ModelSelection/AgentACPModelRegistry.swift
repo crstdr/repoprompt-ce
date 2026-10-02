@@ -58,7 +58,7 @@ final class AgentACPModelRegistry {
         snapshotFromMemory(for: providerID)
     }
 
-    func warmStandardStoreIfNeeded() async {
+    func warmStandardStoreIfNeeded(beforeCompleting: (@Sendable () async -> Void)? = nil) async {
         let plan: StandardStoreWarmPlan? = lock.withLock {
             guard !didWarmStandardStore else { return nil }
 
@@ -80,9 +80,11 @@ final class AgentACPModelRegistry {
 
         guard let plan else { return }
         let loadedSnapshots = await plan.task.value
+        // Per-call scheduling seam for the shared-task completion race regression.
+        if let beforeCompleting { await beforeCompleting() }
 
         lock.withLock {
-            guard plan.generation == standardStoreWarmGeneration else { return }
+            guard !didWarmStandardStore, plan.generation == standardStoreWarmGeneration else { return }
             for providerID in loadedSnapshots.keys {
                 invalidateAdvertisedModels(for: providerID)
             }

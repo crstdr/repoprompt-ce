@@ -2025,49 +2025,19 @@ struct AgentSessionRow: View {
 struct AgentRowActivityArc: View {
     var tint: Color = .accentColor
 
+    @Environment(\.windowIsPresentationVisible) private var isWindowPresentationVisible
+
     var body: some View {
-        // Render-server rotation: no per-frame SwiftUI render, window layout, or commit on main.
-        AgentRowAnimatedActivityArc(tint: tint)
+        // Spun by the render server (see `AgentRowActivityArcLayerView`): a SwiftUI `repeatForever`
+        // rotation here re-rendered the row's whole window on the main thread every frame.
+        AgentRowAnimatedActivityArc(tint: tint, isPresentationVisible: isWindowPresentationVisible)
             .frame(width: AgentRowActivityArcLayerView.diameter, height: AgentRowActivityArcLayerView.diameter)
             .accessibilityElement()
             .accessibilityLabel(AgentRowRunningIndicator.accessibilityLabelText)
     }
 }
 
-/// The arc's geometry and accessibility, shared by the animated and still presentations so
-/// swapping between them never changes the row's layout or what VoiceOver announces.
-private struct AgentRowActivityArcShape: View {
-    var tint: Color
-
-    var body: some View {
-        Circle()
-            .trim(from: 0.0, to: 0.7)
-            .stroke(
-                tint.opacity(0.75),
-                style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
-            )
-            .frame(width: 15, height: 15)
-            .accessibilityLabel(AgentRowRunningIndicator.accessibilityLabelText)
-    }
-}
-
-/// Whether a running row's arc may animate.
-///
-/// The arc animates only while its window is presented on screen and Reduce Motion is off. A hidden
-/// window keeps no animation at all (so other commits never have to walk one), and Reduce Motion asks
-/// for none. Otherwise the row shows the same arc standing still: running stays visible and
-/// labelled, it just stops spinning.
-enum AgentRowActivityIndicatorMode: Equatable {
-    case animated
-    case still
-
-    static func resolve(isWindowPresentationVisible: Bool, reduceMotion: Bool) -> Self {
-        isWindowPresentationVisible && !reduceMotion ? .animated : .still
-    }
-}
-
-/// The running row's status glyph. Switching modes swaps the view, so the animated arc's layer
-/// animation is installed again whenever the window becomes visible.
+/// The running row's status glyph. The layer owner pauses decorative motion in hidden windows.
 struct AgentRowRunningIndicator: View {
     static let accessibilityLabelText = "Running"
 
@@ -2081,19 +2051,11 @@ struct AgentRowRunningIndicator: View {
         self.reduceMotionOverride = reduceMotionOverride
     }
 
-    @Environment(\.windowIsPresentationVisible) private var isWindowPresentationVisible
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        switch AgentRowActivityIndicatorMode.resolve(
-            isWindowPresentationVisible: isWindowPresentationVisible,
-            reduceMotion: reduceMotionOverride ?? reduceMotion
-        ) {
-        case .animated:
-            AgentRowActivityArc(tint: tint)
-        case .still:
-            AgentRowActivityArcShape(tint: tint)
-        }
+        AgentRowActivityArc(tint: tint)
+            .environment(\.accessibilityReduceMotion, reduceMotionOverride ?? reduceMotion)
     }
 }
 
