@@ -769,11 +769,11 @@ struct AgentSessionLinkMCPToolService {
     private func executeWait(args: [String: Value]) async throws -> Value {
         let timeoutSeconds = try AgentMCPToolHelpers.parseTimeoutSeconds(args["timeout_seconds"])
             ?? Self.defaultWaitTimeoutSeconds
-        let observerInput = captureWaitInput()
+        let capturedInput = captureWaitInput()
         let observerEndpoint = try await resolveCallerEndpointIdentity()
-        guard let observerInput, observerInput.endpoint == observerEndpoint else {
-            throw MCPError.invalidParams("Observer route changed. Retry wait from the current Agent session.")
-        }
+        // Rehydration may resolve an endpoint unavailable at capture time. Preserve upstream wait
+        // admission, without borrowing another endpoint's local-input cancellation generation.
+        let observerInput = capturedInput.flatMap { $0.endpoint == observerEndpoint ? $0 : nil }
         let metadata = await captureRequestMetadata()
         let request = try Self.parseTargets(args)
         let predicate = try Self.parsePredicate(args["until"])

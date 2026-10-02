@@ -5,17 +5,6 @@ import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import SwiftUI
 
-enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
-    case auto = "Auto"
-    case files = "Full"
-    case selected = "Selected"
-    case none = "None"
-
-    var id: String {
-        rawValue
-    }
-}
-
 /// Errors that can occur when publishing git diff artifacts
 enum GitArtifactPublishError: LocalizedError {
     case noActiveWorkspace
@@ -7548,9 +7537,4 @@ enum PromptError: Error {
 
 enum AIResponseError: Error {
     case invalidData
-}
-
-enum FilePathDisplay: String, CaseIterable {
-    case full = "Full"
-    case relative = "Relative"
 }
