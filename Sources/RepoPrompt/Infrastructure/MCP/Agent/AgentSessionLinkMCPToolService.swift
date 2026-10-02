@@ -70,16 +70,6 @@ struct AgentSessionLinkMCPToolService {
     """
 
     static let defaultWaitTimeoutSeconds: TimeInterval = 60
-    static func resolvedWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        do {
-            let seconds = try AgentMCPToolHelpers.parseTimeoutSeconds(value) ?? defaultWaitTimeoutSeconds
-            guard seconds <= defaultWaitTimeoutSeconds else { throw MCPError.invalidParams("") }
-            return seconds
-        } catch {
-            throw MCPError.invalidParams("timeout_seconds must be in 0...60 seconds.")
-        }
-    }
-
     static let listDefaultMaxItems = 32
     static let listMaximumMaxItems = 100
 
@@ -777,7 +767,8 @@ struct AgentSessionLinkMCPToolService {
     // MARK: - wait
 
     private func executeWait(args: [String: Value]) async throws -> Value {
-        let timeoutSeconds = try Self.resolvedWaitTimeoutSeconds(args["timeout_seconds"])
+        let timeoutSeconds = try AgentMCPToolHelpers.parseTimeoutSeconds(args["timeout_seconds"])
+            ?? Self.defaultWaitTimeoutSeconds
         let observerInput = captureWaitInput()
         let observerEndpoint = try await resolveCallerEndpointIdentity()
         guard let observerInput, observerInput.endpoint == observerEndpoint else {

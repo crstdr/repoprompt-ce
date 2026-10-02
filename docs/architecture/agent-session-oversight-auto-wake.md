@@ -230,13 +230,12 @@ fence releases the uncommitted reservation without delivery.
 
 ### Inspecting and answering prompts
 
-Observational `wait` accepts 0–60 seconds (default 60; 0 polls); larger values are
-rejected without narrowing the shared timeout parser. Accepted local composer input advances
+Accepted local composer input advances
 an in-memory generation for the exact observer endpoint and cancels its older waits, including
 requests delayed between routing and admission. New-generation waits may park in the same run.
 Authority release precedes Claude/ACP's MCP-idle gate and Codex's steering drain. This affects
 neither managed/cross-session input nor mutations or child providers. A route snapshot just after
-the input bump may still park; the 60-second cap bounds that residual race. Cancellation uses the
+the input bump may still park. Cancellation uses the
 existing result with metadata-only `wake_reason: local_user_input` and re-fenced survivor rows.
 
 Managed `poll` and `wait` may return the target's current pending approval, permission, MCP

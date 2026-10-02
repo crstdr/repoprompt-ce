@@ -108,7 +108,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                         )
                     ),
                     "until": .string(description: "[wait] change (default), idle, or sendable. Use sendable before send; idle is insufficient.", enum: ["change", "idle", "sendable"]),
-                    "timeout_seconds": .number(description: "[wait] 0-60 seconds; default 60; 0 polls.", minimum: 0, maximum: 60),
+                    "timeout_seconds": .number(description: "[wait] Max seconds; default 60; 0 polls immediately."),
                     "from": .string(description: "[read] Fresh page origin: tail (default/newest) or start (oldest).", enum: ["tail", "start"]),
                     "max_items": .integer(description: "[list, read] Item limit: list 32 default, read 30; max 100."),
                     "max_output_bytes": .integer(description: "[read] Approximate pre-JSON UTF-8 limit; default 8000, max 20000."),

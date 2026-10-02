@@ -1936,9 +1936,7 @@
             "type" : "string"
           },
           "timeout_seconds" : {
-            "description" : "[wait] 0-60 seconds; default 60; 0 polls.",
-            "maximum" : 60,
-            "minimum" : 0,
+            "description" : "[wait] Max seconds; default 60; 0 polls immediately.",
             "type" : "number"
           },
           "until" : {
