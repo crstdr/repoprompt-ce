@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptProcess
 
 final actor ClaudeNativeProcessSessionController {
     private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"
@@ -425,7 +426,9 @@ final actor ClaudeNativeProcessSessionController {
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
         do {
-            _ = try await applyModelAndEffortForTurn(model: model, effortLevel: effortLevel, replacingFailure: nil)
+            guard try await applyModelAndEffortForTurn(model: model, effortLevel: effortLevel, replacingFailure: nil) == .applied else {
+                throw ControllerError.invalidControlResponse("Flag settings application was superseded")
+            }
         } catch let failure as NativeAgentRuntimeConfigurationFailure {
             // Live picker updates retain the existing, unwrapped error contract.
             throw failure.underlyingError
@@ -436,14 +439,14 @@ final actor ClaudeNativeProcessSessionController {
         model: String?,
         effortLevel: ClaudeCodeEffortLevel?,
         replacingFailure: NativeAgentRuntimeConfigurationFailure?
-    ) async throws -> Bool {
+    ) async throws -> NativeAgentRuntimeTurnConfigurationOutcome {
         if let failure = replacingFailure {
             guard failure.lifetime == configurationLifetime,
                   failure.intentGeneration == latestFlagSettingsIntentGeneration,
                   failure.requestGeneration == flagSettingsRequestGeneration
-            else { return false }
+            else { return .superseded }
         }
-        guard hasActiveSession, !isShuttingDown else { return false }
+        guard hasActiveSession, !isShuttingDown else { return .superseded }
         // No actor suspension between failure-token validation and consuming its intent.
         latestFlagSettingsIntentGeneration &+= 1
         let intentGeneration = latestFlagSettingsIntentGeneration
@@ -451,8 +454,8 @@ final actor ClaudeNativeProcessSessionController {
         var requestGeneration = flagSettingsRequestGeneration
         do {
             let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
-            guard lifetime == configurationLifetime, intentGeneration == latestFlagSettingsIntentGeneration else { return false }
-            guard hasActiveSession, !isShuttingDown else { return false }
+            guard lifetime == configurationLifetime, intentGeneration == latestFlagSettingsIntentGeneration else { return .superseded }
+            guard hasActiveSession, !isShuttingDown else { return .superseded }
             if liveFlagSettingsRequiresProcessRestart(for: resolved.launchEnvironment) {
                 writeRawEventLogRecord(kind: "session.flagSettingsDeferred", payload: [
                     "reason": "launch_environment_changed", "model": model ?? NSNull()
@@ -465,7 +468,7 @@ final actor ClaudeNativeProcessSessionController {
                 writeRawEventLogRecord(kind: "session.flagSettingsPending", payload: [
                     "settings": resolved.request?["settings"] ?? NSNull()
                 ] as [String: Any])
-                return true // Preserve initialization's existing drain of the stored request.
+                return .applied // Preserve initialization's existing drain of the stored request.
             }
             if let request = resolved.request {
                 let result = try await sendControlRequest(request: request, timeoutSeconds: 5.0)
@@ -473,15 +476,16 @@ final actor ClaudeNativeProcessSessionController {
                     "settings": request["settings"] ?? NSNull(), "response": result, "source": "live_update"
                 ] as [String: Any])
             }
-            return lifetime == configurationLifetime
-                && intentGeneration == latestFlagSettingsIntentGeneration
-                && requestGeneration == flagSettingsRequestGeneration
-                && hasActiveSession && !isShuttingDown
+            guard lifetime == configurationLifetime, hasActiveSession, !isShuttingDown else { return .superseded }
+            if intentGeneration == latestFlagSettingsIntentGeneration, requestGeneration == flagSettingsRequestGeneration {
+                return .applied
+            }
+            return resolved.request == nil ? .superseded : .appliedButSuperseded
         } catch {
             guard lifetime == configurationLifetime,
                   intentGeneration == latestFlagSettingsIntentGeneration,
                   requestGeneration == flagSettingsRequestGeneration
-            else { return false }
+            else { return .superseded }
             let failure = NativeAgentRuntimeConfigurationFailure(
                 underlyingError: error, lifetime: lifetime,
                 intentGeneration: intentGeneration, requestGeneration: requestGeneration
@@ -1719,6 +1723,10 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     #if DEBUG
+        func test_handleConfigurationStdoutChunk(_ data: Data) async {
+            await handleStdoutChunk(data)
+        }
+
         func test_installConfigurationTransport(
             controlRequest: @escaping @Sendable ([String: Any]) async throws -> [String: Any],
             write: @escaping @Sendable (Data) throws -> Void

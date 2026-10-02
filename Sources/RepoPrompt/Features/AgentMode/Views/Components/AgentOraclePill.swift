@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptInstrumentation
 import SwiftUI
 
 // MARK: - Oracle Pill
@@ -91,12 +92,7 @@ enum AgentOraclePillLogic {
             let sameAgentLegacyRunMatches = renderable.filter { matchesAgent($0) && $0.agentModeSessionID != nil && $0.agentModeRunID == nil }
             if !sameAgentLegacyRunMatches.isEmpty { return sameAgentLegacyRunMatches }
 
-            if let activeAgentSessionID,
-               renderable.contains(where: { $0.agentModeSessionID == activeAgentSessionID })
-            {
-                return []
-            }
-            return renderable.filter(isUnownedLegacy)
+            // A new process run must not hide completed Oracle results from the same agent session.
         }
 
         if let activeAgentSessionID {
@@ -229,6 +225,7 @@ enum AgentOraclePillLogic {
 /// Pill that appears when there are oracle chat sessions for the current tab.
 /// More prominent when streaming. Clicking opens a wide popover with chat transcript.
 struct AgentOraclePill: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     @ObservedObject var oracleViewModel: OracleViewModel
     let windowID: Int
     let currentTabID: UUID?
@@ -339,7 +336,7 @@ struct AgentOraclePill: View {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.oracle")
+            let _ = perfRecorder.increment("ui.body.statusPills.oracle")
         #endif
         Group {
             if hasAnySessions {

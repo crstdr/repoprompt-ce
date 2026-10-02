@@ -63,7 +63,7 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         try await controller.applyModelAndEffort(model: model, effortLevel: effortLevel)
     }
 
-    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> Bool {
+    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> NativeAgentRuntimeTurnConfigurationOutcome {
         try await controller.applyModelAndEffortForTurn(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure)
     }
 

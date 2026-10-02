@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 // The window-local host surface for oversight: candidates, exact projections, and observation.
 //
@@ -109,7 +110,7 @@ extension AgentModeViewModel {
             #if DEBUG
                 // A stale workspace owner completing a level it no longer owns is the exact race the
                 // fence exists for, so it is worth one line even though nothing changed.
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "oversight.discovery",
                     fields: [
                         "state": "stale_owner_ignored",
@@ -123,7 +124,7 @@ extension AgentModeViewModel {
         }
         agentSessionLinkDiscoveryCompletedGeneration = epoch.generation
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.discovery",
                 fields: [
                     "state": "current_owner_complete",
@@ -831,6 +832,14 @@ extension AgentModeViewModel {
     /// This is the sole mutation boundary for `monitorPillPropsByEndpoint`. The status-pill snapshot
     /// is synchronized before the notification so every consumer can immediately re-read the same
     /// completed state. Equal replacements are true no-ops and publish nothing.
+    ///
+    /// The snapshot's only storage-derived field is `monitor`. The full snapshot (Model Router
+    /// availability, execution location, ...) is rebuilt only when the published `monitor` differs
+    /// from its live derivation or belongs to another tab — which covers a change to the current
+    /// tab's entry, a rebind whose new incarnation has no entry yet, and any current-tab presentation
+    /// change still waiting on its own coalesced UI refresh. Otherwise the published snapshot is
+    /// already the completed state, and the rebuild is skipped for every other endpoint's refresh.
+    /// The notification is posted for every changed transaction exactly as before.
     private func agentSessionLinkMutateProjectionStorage(
         _ mutation: (inout [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps]) -> Void
     ) {
@@ -838,7 +847,7 @@ extension AgentModeViewModel {
         mutation(&updated)
         guard updated != monitorPillPropsByEndpoint else { return }
         monitorPillPropsByEndpoint = updated
-        syncStatusPillsUIState()
+        syncStatusPillsUIStateIfMonitorStale()
         NotificationCenter.default.post(
             name: .agentSessionLinkOverseerProjectionDidChange,
             object: self

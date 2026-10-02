@@ -1316,9 +1316,16 @@ final class ClaudeAgentModeCoordinator {
                let desiredEffort = autoEffort ?? (appliedAutoEffortByTabID[session.tabID] == nil ? nil : manualEffort)
             {
                 do {
-                    guard try await controller.applyModelAndEffortForTurn(
+                    let application = try await controller.applyModelAndEffortForTurn(
                         model: effectiveClaudeModel(for: session), effortLevel: desiredEffort, replacingFailure: nil
-                    ) else {
+                    )
+                    // A landed Auto write still needs restoration, even when it cannot authorize a turn.
+                    if application == .appliedButSuperseded, autoEffort != nil,
+                       sessionOwnsClaudeController(controller, for: session), appliedAutoEffortByTabID[session.tabID] == nil
+                    {
+                        appliedAutoEffortByTabID[session.tabID] = (controllerID, desiredEffort)
+                    }
+                    guard application == .applied else {
                         return recordSendFailure("Claude effort application was superseded. No message was sent; retry the turn.", session: session, intent: intent)
                     }
                     if autoEffort != nil {
@@ -1341,7 +1348,7 @@ final class ClaudeAgentModeCoordinator {
                     do {
                         guard try await controller.applyModelAndEffortForTurn(
                             model: effectiveClaudeModel(for: session), effortLevel: manualEffort, replacingFailure: failure
-                        ) else {
+                        ) == .applied else {
                             return recordSendFailure("Claude effort fallback was superseded. No message was sent; retry the turn.", session: session, intent: intent)
                         }
                         appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
