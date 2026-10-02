@@ -1503,7 +1503,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
 
     /// When the creator is the row's only overseer the Overseen-by header collapses to
     /// "Created and overseen by" and no separate Created-by section renders.
-    func testCreatorSoleOverseerCollapsesOverseenByHeader() throws {
+    func testCreatorSoleOverseerCollapsesOverseenByHeader() {
         let creatorSessionID = UUID()
         let creatorEndpoint = endpoint(1)
         let creator = AgentSidebarOversightMenuProps.PeerOption(
@@ -1530,7 +1530,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         XCTAssertTrue(titles.contains("Created and overseen by"))
         XCTAssertFalse(titles.contains("Overseen by"))
         XCTAssertFalse(titles.contains("Created by"))
-        XCTAssertEqual(titles.filter { $0 == "Creator" }.count, 1)
+        XCTAssertEqual(titles.count(where: { $0 == "Creator" }), 1)
     }
 
     /// The outbound direction unlink passes the row as observer and the peer as target —
