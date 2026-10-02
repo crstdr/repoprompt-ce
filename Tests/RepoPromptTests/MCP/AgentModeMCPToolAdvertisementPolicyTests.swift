@@ -1,5 +1,6 @@
 import MCP
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
 import XCTest
 
 final class AgentModeMCPToolAdvertisementPolicyTests: XCTestCase {

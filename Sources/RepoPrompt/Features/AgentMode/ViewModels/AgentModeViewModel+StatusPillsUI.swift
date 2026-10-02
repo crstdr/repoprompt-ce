@@ -27,6 +27,14 @@ extension AgentModeViewModel {
         ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
+    /// Preserve notify-time monitor freshness without rebuilding for unrelated endpoint updates.
+    func syncStatusPillsUIStateIfMonitorStale() {
+        let published = ui.statusPills.snapshot
+        if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
+            syncStatusPillsUIState()
+        }
+    }
+
     /// Persistent projection for the primary execution root. The initial intent
     /// remains deferred until first send; committed bindings remain visible afterward.
     func executionLocationProps(tabID: UUID?) -> AgentExecutionLocationProps? {

@@ -4303,6 +4303,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 }
             case .detachedAfterCommit:
                 fixture.host.afterSendCommit = { [bridge = fixture.bridge] in
+                    // The bridge's weak attachment becomes nil when this temporary host dies.
                     bridge.attach(host: FakeEndpointHost())
                 }
             case .missingAtEntry:

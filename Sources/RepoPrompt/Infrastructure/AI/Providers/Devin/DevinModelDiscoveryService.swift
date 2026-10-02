@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcess
 
 actor DevinModelDiscoveryService {
     static let shared = DevinModelDiscoveryService()
@@ -101,7 +102,7 @@ actor DevinModelDiscoveryService {
     }
 
     private static func runThrowawaySession(_ config: DevinAgentConfig) async throws -> Int? {
-        let provider = DevinACPAgentProvider(config: config)
+        let provider = DevinACPAgentProvider(config: config, isolateForeignMCPImports: true)
         let request = ACPRunRequest(
             agentKind: .devin,
             modelString: nil,
