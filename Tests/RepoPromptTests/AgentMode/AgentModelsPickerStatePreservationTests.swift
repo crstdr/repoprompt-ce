@@ -227,15 +227,31 @@ final class StableMenuLifetimeTests: XCTestCase {
     /// after the teardown, so it reflects mid-track release, not `present`'s
     /// post-`popUp` cleanup.
     private var releasedDuringTracking = false
+    /// Whether the post-teardown observation actually ran. If teardown ends
+    /// tracking early, `popUp` returns before the verify timer fires — requiring
+    /// this flag keeps an early dismissal from satisfying the survival asserts.
+    private var observationCompleted = false
     private var teardownOnOpen: (() -> Void)?
     private var teardownAtGrace = false
+    private var pendingTimers: [Timer] = []
 
     override func tearDown() {
+        pendingTimers.forEach { $0.invalidate() }
+        pendingTimers = []
         teardownOnOpen = nil
         trackedMenu = nil
         hosting = nil
         window = nil
         super.tearDown()
+    }
+
+    private func schedule(_ interval: TimeInterval, selector: Selector) {
+        let timer = Timer(
+            timeInterval: interval, target: self,
+            selector: selector, userInfo: nil, repeats: false
+        )
+        pendingTimers.append(timer)
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     /// The button's `.background` anchor is the only bare `NSView` in the hosted tree.
@@ -260,11 +276,7 @@ final class StableMenuLifetimeTests: XCTestCase {
             if !teardownAtGrace {
                 teardownOnOpen?()
             }
-            let timer = Timer(
-                timeInterval: 0.1, target: self,
-                selector: #selector(graceElapsed(_:)), userInfo: nil, repeats: false
-            )
-            RunLoop.main.add(timer, forMode: .common)
+            schedule(0.1, selector: #selector(graceElapsed(_:)))
         }
     }
 
@@ -276,11 +288,7 @@ final class StableMenuLifetimeTests: XCTestCase {
         MainActor.assumeIsolated {
             if teardownAtGrace {
                 teardownOnOpen?()
-                let verify = Timer(
-                    timeInterval: 0.05, target: self,
-                    selector: #selector(verifiedAfterTeardown(_:)), userInfo: nil, repeats: false
-                )
-                RunLoop.main.add(verify, forMode: .common)
+                schedule(0.05, selector: #selector(verifiedAfterTeardown(_:)))
             } else {
                 finishTrackingObservation()
             }
@@ -295,6 +303,7 @@ final class StableMenuLifetimeTests: XCTestCase {
 
     private func finishTrackingObservation() {
         releasedDuringTracking = window.stableMenuPresenter.openMenu == nil
+        observationCompleted = true
         window.stableMenuPresenter.openMenu?.cancelTracking()
     }
 
@@ -341,6 +350,10 @@ final class StableMenuLifetimeTests: XCTestCase {
             hosting.layoutSubtreeIfNeeded()
         }
         XCTAssertNotNil(trackedMenu, "presented menu never began tracking")
+        XCTAssertTrue(
+            observationCompleted,
+            "observation must run inside tracking — an early teardown-induced close cannot satisfy the survival assert"
+        )
         XCTAssertFalse(
             releasedDuringTracking,
             "menu tracking was cancelled when the trigger subtree unmounted"
@@ -359,6 +372,10 @@ final class StableMenuLifetimeTests: XCTestCase {
             )
         }
         XCTAssertNotNil(trackedMenu, "presented menu never began tracking")
+        XCTAssertTrue(
+            observationCompleted,
+            "observation must run inside tracking — an early close cannot satisfy the mid-track release assert"
+        )
         XCTAssertTrue(
             releasedDuringTracking,
             "window close must release the menu mid-track, not only at popUp return"
@@ -391,13 +408,25 @@ final class StableMenuContextMenuTests: XCTestCase {
     private var endedByTeardown = false
     private var teardownOnOpen: (() -> Void)?
     private var teardownAtGrace = false
+    private var pendingTimers: [Timer] = []
 
     override func tearDown() {
+        pendingTimers.forEach { $0.invalidate() }
+        pendingTimers = []
         teardownOnOpen = nil
         trackedMenu = nil
         hosting = nil
         window = nil
         super.tearDown()
+    }
+
+    private func schedule(_ interval: TimeInterval, selector: Selector) {
+        let timer = Timer(
+            timeInterval: interval, target: self,
+            selector: selector, userInfo: nil, repeats: false
+        )
+        pendingTimers.append(timer)
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     @objc private func began(_ note: Notification) {
@@ -409,11 +438,7 @@ final class StableMenuContextMenuTests: XCTestCase {
             if !teardownAtGrace {
                 teardownOnOpen?()
             }
-            let timer = Timer(
-                timeInterval: 0.1, target: self,
-                selector: #selector(graceElapsed(_:)), userInfo: nil, repeats: false
-            )
-            RunLoop.main.add(timer, forMode: .common)
+            schedule(0.1, selector: #selector(graceElapsed(_:)))
         }
     }
 
@@ -429,11 +454,7 @@ final class StableMenuContextMenuTests: XCTestCase {
         MainActor.assumeIsolated {
             if teardownAtGrace {
                 teardownOnOpen?()
-                let verify = Timer(
-                    timeInterval: 0.05, target: self,
-                    selector: #selector(verifiedAfterTeardown(_:)), userInfo: nil, repeats: false
-                )
-                RunLoop.main.add(verify, forMode: .common)
+                schedule(0.05, selector: #selector(verifiedAfterTeardown(_:)))
             } else {
                 finishObservation()
             }

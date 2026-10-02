@@ -360,8 +360,6 @@ final class StableMenuPresenter: NSObject, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
-        print("CTX-DBG close match=\(openMenu === menu)")
-        Thread.callStackSymbols.prefix(22).forEach { print("CTX-DBG \($0)") }
         guard openMenu === menu else { return }
         releaseMenu()
     }
@@ -420,6 +418,13 @@ final class StableMenuContextView: NSView {
         }
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil {
+            arm()
+        }
+    }
+
     /// Returns `nil` (consuming the event) after scheduling presentation, or the
     /// event unchanged so normal dispatch continues.
     ///
@@ -428,11 +433,15 @@ final class StableMenuContextView: NSView {
     private func handleContextClick(_ event: NSEvent) -> NSEvent? {
         let isContextClick = event.type == .rightMouseDown
             || (event.type == .leftMouseDown && event.modifierFlags.contains(.control))
+        let point = convert(event.locationInWindow, from: nil)
         guard isContextClick,
               window != nil,
               event.window === window,
-              !isHidden,
-              bounds.contains(convert(event.locationInWindow, from: nil))
+              !isHiddenOrHasHiddenAncestor,
+              // `visibleRect` folds in clip-view clipping: a row scrolled out of a
+              // non-lazy sidebar VStack keeps its bounds but has no visible slice,
+              // so it must not steal clicks belonging to the content drawn there.
+              visibleRect.contains(point)
         else { return event }
         let items = itemsProvider()
         guard !items.isEmpty else { return event }

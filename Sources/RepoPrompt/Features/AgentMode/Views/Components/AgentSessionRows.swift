@@ -1169,7 +1169,7 @@ struct AgentSessionRow: View {
             }
             .accessibilityHidden(true)
         )
-        .accessibilityAction(named: "Show context menu") {
+        .accessibilityAction(.showMenu) {
             (contextMenuAnchor.view as? StableMenuContextView)?.presentAtRegionOrigin()
         }
         .onHover { hovered in
