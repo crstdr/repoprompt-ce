@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptDomainRuntime
 
 /// The shared UI confirmation gate for user-created oversight links.
 ///

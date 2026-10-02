@@ -1629,7 +1629,8 @@ struct ArchivedSessionsList: View {
                     onDelete: { deleteArchived(stashed) },
                     sessionIDCopyAction: .systemClipboard(
                         sessionID: sessionIDByStashedTabID[stashed.id]
-                    )
+                    ),
+                    metrics: AgentStashedSessionRowMetrics(fontPreset: fontPreset)
                 )
             }
             if hasMore {

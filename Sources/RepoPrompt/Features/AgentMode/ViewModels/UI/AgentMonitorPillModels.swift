@@ -11,27 +11,6 @@ import RepoPromptDomainRuntime
 // cannot inherit a predecessor's role or rows; and nothing here reads the passive queue or wake
 // state directly — snooze and selection arrive already projected.
 
-// MARK: - Identifier formatting
-
-/// Short display form for an Agent session ID.
-///
-/// The full canonical UUID remains available through the row's tooltip, accessibility value, and
-/// Copy Session ID actions. The compact form is retained for fallback task names, previews, inbound
-/// labels, notices, and attribution.
-enum AgentMonitorSessionIDFormatter {
-    private static let baseTokenLength = 4
-
-    static func short(_ sessionID: UUID) -> String {
-        token(sessionID, endLength: baseTokenLength)
-    }
-
-    private static func token(_ sessionID: UUID, endLength: Int) -> String {
-        let raw = sessionID.uuidString
-        guard raw.count > endLength * 2 else { return raw }
-        return "\(raw.prefix(endLength))…\(raw.suffix(endLength))"
-    }
-}
-
 // MARK: - Status
 
 /// Safe, agent-neutral status projection for one overseen endpoint.

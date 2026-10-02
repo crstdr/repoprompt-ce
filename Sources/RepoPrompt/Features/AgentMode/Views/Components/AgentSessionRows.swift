@@ -326,10 +326,12 @@ struct AgentSessionRow: View {
         )
     }
 
-    /// The single oversight menu, shared by the mark click, the no-role hover affordance and
-    /// the row's context menu — one builder and one props model feed all three surfaces.
-    /// Builds from the supplied value rather than resolving live so the context menu can pass
-    /// a snapshot frozen at hover and keep its item count stable while open.
+    /// The single oversight menu, feeding the row's context menu — the mark click and
+    /// no-role hover affordance present the same item tree through the native
+    /// `StableMenuButton` (`sidebarOversightMenuItems`) instead, so a sidebar
+    /// invalidation cannot repopulate their open NSMenu mid-browse. This builder reads
+    /// the supplied value rather than resolving live so the context menu can pass a
+    /// snapshot frozen at hover and keep its item count stable while open.
     ///
     /// Shape (approved 2026-10-01): `Overseeing:`/`Overseen by:` jump lists over the linked
     /// rows, then the `Oversee new ▸`/`Oversee by ▸` candidate submenus, then `Unlink ▸`.
@@ -454,6 +456,47 @@ struct AgentSessionRow: View {
                 )
             )
         }
+    }
+
+    /// Resolves the live props and builds the item tree once per menu activation —
+    /// `StableMenuButton` evaluates `items:` on click inside AppKit's main-thread action
+    /// dispatch, so `assumeIsolated` matches the resolver's `@MainActor` contract without a
+    /// Task hop. `allowsDirectMutations` repeats the render-time mount gate: it closes the
+    /// small window where a click lands between a mode flip and the re-render that removes
+    /// the trigger; the action handlers then revalidate exact endpoints as before.
+    private func sidebarOversightStableMenuItems() -> [StableMenuItem] {
+        MainActor.assumeIsolated {
+            guard allowsDirectMutations, let menu = resolveSidebarOversightMenu?() else { return [] }
+            return sidebarOversightMenuItems(menu)
+        }
+    }
+
+    private func sidebarOversightMenuItems(
+        _ menu: AgentSidebarOversightMenuProps
+    ) -> [StableMenuItem] {
+        Self.sidebarOversightMenuItems(
+            menu,
+            busyKeys: sidebarOversightBusyKeys,
+            actions: AgentSidebarOversightMenuActions(
+                openLinkedSession: { openLinkedSession($0) },
+                openCreator: onOpenCreator,
+                addInbound: { addSidebarOversight($0, menu: menu) },
+                addOutbound: { addOutboundOversight($0, menu: menu) },
+                unlink: { observerEndpoint, targetEndpoint, reference in
+                    stopSidebarOversightLink(
+                        observerEndpoint: observerEndpoint,
+                        targetEndpoint: targetEndpoint,
+                        reference: reference
+                    )
+                },
+                presentChooseTargetSheet: {
+                    presentOversightSessionIDSheet(.chooseTarget, menu: menu)
+                },
+                presentChooseOverseerSheet: {
+                    presentOversightSessionIDSheet(.chooseOverseer, menu: menu)
+                }
+            )
+        )
     }
 
     /// One jump item under a linked section — the peer's display label plus the link arrow;
@@ -1005,13 +1048,16 @@ struct AgentSessionRow: View {
     }
 
     /// Grey hover affordance on rows with no persistent oversight mark. It opens the same
-    /// Oversee-by lane menu the overseen/provenance mark opens.
+    /// Oversee-by lane menu the overseen/provenance mark opens — through the retained AppKit
+    /// menu, so an `isHovered` flip or a sidebar invalidation while browsing cannot tear it
+    /// down mid-tracking.
     private func sidebarOversightHoverMenu(
         _ menu: AgentSidebarOversightMenuProps
     ) -> some View {
-        Menu {
-            sidebarOversightMenuContent(menu)
-        } label: {
+        StableMenuButton(
+            items: sidebarOversightStableMenuItems,
+            triggerStyle: .plain
+        ) {
             Image(systemName: AgentOversightUICopy.manageOversightIcon)
                 .font(.system(size: 11))
                 .foregroundColor(
@@ -1020,8 +1066,6 @@ struct AgentSessionRow: View {
                         : .secondary
                 )
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
         .fixedSize()
         .onHover { isSidebarOversightMenuHovered = $0 }
         .hoverTooltip(AgentOversightUICopy.manageOversightTooltip)
@@ -1091,20 +1135,21 @@ struct AgentSessionRow: View {
         interactive: Bool
     ) -> some View {
         if interactive, let menu {
-            // A macOS Menu template-renders its label image, which would flatten the palette
+            // A menu label image template-renders, which would flatten the palette
             // colours (and the two-tone/count colours) to the control tint — and to white on
             // selected rows. The coloured glyph therefore stays ordinary content underneath a
-            // clear-label Menu that owns the same hit target; the glyph itself never hit-tests.
+            // clear-label StableMenuButton that owns the same hit target; the glyph itself
+            // never hit-tests. The AppKit menu also survives the SwiftUI invalidations that
+            // repopulated — and dismissed — the live SwiftUI Menu mid-browse.
             oversightMarkGlyph
                 .accessibilityHidden(true)
                 .overlay {
-                    Menu {
-                        sidebarOversightMenuContent(menu)
-                    } label: {
+                    StableMenuButton(
+                        items: sidebarOversightStableMenuItems,
+                        triggerStyle: .plain
+                    ) {
                         Color.clear
                     }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
                     .accessibilityLabel(tooltip)
                     .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
                 }

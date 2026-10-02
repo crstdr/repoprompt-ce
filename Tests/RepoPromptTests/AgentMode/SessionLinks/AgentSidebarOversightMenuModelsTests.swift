@@ -1288,3 +1288,275 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         XCTAssertFalse(row(role: .none, interactive: true).showsDisabledOversightContextSubmenus)
     }
 }
+
+@MainActor
+final class AgentSidebarOversightStableMenuTests: XCTestCase {
+    private func endpoint(_ seed: Int) -> DomainAgentSessionLinkEndpointIdentity {
+        DomainAgentSessionLinkEndpointIdentity(
+            windowID: seed,
+            workspaceID: UUID(uuidString: "10000000-0000-0000-0000-00000000000A")!,
+            tabID: UUID(),
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1
+        )
+    }
+
+    private func peer(
+        _ label: String,
+        seed: Int,
+        relationship: AgentSidebarOversightMenuProps.Relationship = .available
+    ) -> AgentSidebarOversightMenuProps.PeerOption {
+        AgentSidebarOversightMenuProps.PeerOption(
+            peerEndpoint: endpoint(seed),
+            peerSessionID: UUID(),
+            displayName: label,
+            providerDisplayName: nil,
+            menuLabel: label,
+            fullIdentityDescription: "identity \(label)",
+            relationship: relationship
+        )
+    }
+
+    private func link(_ seed: Int) -> DomainAgentSessionLinkReference {
+        DomainAgentSessionLinkReference(linkID: UUID(), generation: UInt64(seed))
+    }
+
+    private func props(
+        observerOptions: [AgentSidebarOversightMenuProps.PeerOption] = [],
+        targetOptions: [AgentSidebarOversightMenuProps.PeerOption] = [],
+        createdByLabel: String? = nil,
+        creatorSessionID: UUID? = nil,
+        targetIneligibleReason: String? = nil,
+        observerIneligibleReason: String? = nil
+    ) -> AgentSidebarOversightMenuProps {
+        let targetEndpoint = endpoint(0)
+        return AgentSidebarOversightMenuProps(
+            targetEndpoint: targetEndpoint,
+            targetSessionID: targetEndpoint.sessionID,
+            targetDisplayName: "Row",
+            observerOptions: observerOptions,
+            createdByLabel: createdByLabel,
+            targetOptions: targetOptions,
+            targetIneligibleReason: targetIneligibleReason,
+            observerIneligibleReason: observerIneligibleReason,
+            inboundObserverNames: [],
+            inboundObserverSessionIDs: [],
+            outboundTargetNames: [],
+            creatorSessionID: creatorSessionID
+        )
+    }
+
+    /// Fires the item's AppKit action through the menu, the same dispatch the presenter
+    /// relies on (`NSMenu.stableMenu` + `performActionForItem`).
+    private func fire(_ item: NSMenuItem) {
+        _ = NSApplication.shared
+        guard let owner = item.menu else {
+            XCTFail("item is not attached to a menu")
+            return
+        }
+        owner.performActionForItem(at: owner.index(of: item))
+    }
+
+    private func submenu(_ title: String, in menu: NSMenu, file: StaticString = #filePath, line: UInt = #line) throws -> NSMenu {
+        try XCTUnwrap(
+            menu.items.first { $0.title == title }?.submenu,
+            "expected submenu \(title)",
+            file: file,
+            line: line
+        )
+    }
+
+    func testLinkedRowShapeMatchesApprovedOrder() {
+        let target = peer("Target", seed: 1, relationship: .linked(reference: link(11), peerCurrentlyEligible: true))
+        let observer = peer("Observer", seed: 2, relationship: .linked(reference: link(12), peerCurrentlyEligible: true))
+        let creatorID = UUID()
+        let menuProps = props(
+            observerOptions: [observer, peer("Candidate", seed: 3)],
+            targetOptions: [target, peer("Other", seed: 4)],
+            createdByLabel: "Creator",
+            creatorSessionID: creatorID
+        )
+
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            menuProps,
+            busyKeys: [],
+            actions: .init()
+        ))
+
+        let titles = menu.items.map(\.title)
+        XCTAssertEqual(titles, [
+            "Overseeing", "Target",
+            "Overseen by", "Observer",
+            "Created by", "Creator",
+            "",
+            "Oversee new", "Oversee by",
+            "",
+            "Unlink"
+        ])
+        XCTAssertTrue(menu.items[6].isSeparatorItem)
+        XCTAssertTrue(menu.items[9].isSeparatorItem)
+        XCTAssertFalse(menu.items[0].isEnabled)
+        XCTAssertEqual(menu.items[0].accessibilityHelp(), nil)
+    }
+
+    func testOverseeNewItemsAndDisabledReason() throws {
+        let candidateItem = peer("Session B", seed: 1)
+        let menuProps = props(targetOptions: [candidateItem])
+        var added: [AgentSidebarOversightMenuProps.TargetOption] = []
+        var chooseTargetCount = 0
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            menuProps,
+            busyKeys: [],
+            actions: .init(
+                addOutbound: { added.append($0) },
+                presentChooseTargetSheet: { chooseTargetCount += 1 }
+            )
+        ))
+
+        let overseeNew = try submenu("Oversee new", in: menu)
+        XCTAssertEqual(overseeNew.items.map(\.title), ["Session B", "", "Session ID…"])
+        XCTAssertTrue(overseeNew.items[0].isEnabled)
+        XCTAssertTrue(overseeNew.items[1].isSeparatorItem)
+        XCTAssertTrue(overseeNew.items[2].isEnabled)
+        XCTAssertEqual(overseeNew.items[0].accessibilityHelp(), "identity Session B")
+
+        fire(overseeNew.items[0])
+        XCTAssertEqual(added.map(\.peerEndpoint), [candidateItem.peerEndpoint])
+
+        fire(overseeNew.items[2])
+        XCTAssertEqual(chooseTargetCount, 1)
+    }
+
+    func testOverseeByInboundActionAndIneligibleReason() throws {
+        let candidateItem = peer("Overseer", seed: 1)
+        let menuProps = props(observerOptions: [candidateItem])
+        var added: [AgentSidebarOversightMenuProps.ObserverOption] = []
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            menuProps,
+            busyKeys: [],
+            actions: .init(addInbound: { added.append($0) })
+        ))
+
+        let overseeBy = try submenu("Oversee by", in: menu)
+        XCTAssertEqual(overseeBy.items.map(\.title), ["Overseer", "", "Session ID…"])
+        fire(overseeBy.items[0])
+        XCTAssertEqual(added.map(\.peerEndpoint), [candidateItem.peerEndpoint])
+
+        let blocked = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            props(observerOptions: [candidateItem], targetIneligibleReason: "Not eligible"),
+            busyKeys: [],
+            actions: .init()
+        ))
+        let blockedBy = try submenu("Oversee by", in: blocked)
+        XCTAssertEqual(blockedBy.items.map(\.title), ["Not eligible", "Overseer", "", "Session ID…"])
+        XCTAssertFalse(blockedBy.items[0].isEnabled)
+        // Parity with the SwiftUI builder: the candidate itself stays enabled; only the
+        // reason row and the Session-ID item are disabled by an inbound eligibility reason.
+        XCTAssertTrue(blockedBy.items[1].isEnabled)
+        XCTAssertFalse(blockedBy.items[3].isEnabled)
+    }
+
+    func testEmptyDirectionFallsBackToMessageItem() throws {
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            props(),
+            busyKeys: [],
+            actions: .init()
+        ))
+        let titles = menu.items.map(\.title)
+        XCTAssertEqual(titles, ["Manage session oversight", "Oversee new", "Oversee by"])
+
+        let overseeNew = try submenu("Oversee new", in: menu)
+        XCTAssertEqual(overseeNew.items.map(\.title), ["No sessions to oversee", "", "Session ID…"])
+        XCTAssertFalse(overseeNew.items[0].isEnabled)
+
+        let overseeBy = try submenu("Oversee by", in: menu)
+        XCTAssertEqual(overseeBy.items.map(\.title), ["No eligible overseers", "", "Session ID…"])
+    }
+
+    func testUnlinkSubmenuFiresExactReference() throws {
+        let reference = link(7)
+        let linkedObserver = peer(
+            "Overseer",
+            seed: 1,
+            relationship: .linked(reference: reference, peerCurrentlyEligible: true)
+        )
+        let menuProps = props(observerOptions: [linkedObserver])
+        var unlinked: [(DomainAgentSessionLinkEndpointIdentity, DomainAgentSessionLinkEndpointIdentity, DomainAgentSessionLinkReference)] = []
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            menuProps,
+            busyKeys: [],
+            actions: .init(unlink: { unlinked.append(($0, $1, $2)) })
+        ))
+
+        let unlink = try submenu("Unlink", in: menu)
+        XCTAssertEqual(unlink.items.map(\.title), ["Overseen by", "Overseer"])
+        XCTAssertFalse(unlink.items[0].isEnabled)
+        XCTAssertEqual(unlink.items[1].accessibilityLabel(), "Unlink \"Overseer\"")
+
+        fire(unlink.items[1])
+        XCTAssertEqual(unlinked.count, 1)
+        XCTAssertEqual(unlinked[0].0, linkedObserver.peerEndpoint)
+        XCTAssertEqual(unlinked[0].1, menuProps.targetEndpoint)
+        XCTAssertEqual(unlinked[0].2, reference)
+    }
+
+    func testBusyKeyFreezesItemDisabledWithHourglass() throws {
+        let candidateItem = peer("Session B", seed: 1)
+        let menuProps = props(targetOptions: [candidateItem])
+        let busy: Set<AgentSidebarOversightActionKey> = [
+            .add(
+                observerEndpoint: menuProps.targetEndpoint,
+                targetEndpoint: candidateItem.peerEndpoint
+            )
+        ]
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            menuProps,
+            busyKeys: busy,
+            actions: .init()
+        ))
+
+        let overseeNew = try submenu("Oversee new", in: menu)
+        let item = overseeNew.items[0]
+        XCTAssertFalse(item.isEnabled)
+        XCTAssertNotNil(item.image)
+        XCTAssertEqual(item.accessibilityValue() as? String, "In progress")
+    }
+
+    func testJumpItemRoutesPeerEndpoint() {
+        let target = peer("Target", seed: 1, relationship: .linked(reference: link(1), peerCurrentlyEligible: true))
+        var opened: [DomainAgentSessionLinkEndpointIdentity] = []
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            props(targetOptions: [target]),
+            busyKeys: [],
+            actions: .init(openLinkedSession: { opened.append($0) })
+        ))
+
+        let jumpItem = menu.items[1]
+        XCTAssertEqual(jumpItem.title, "Target")
+        XCTAssertEqual(jumpItem.accessibilityHelp(), "Opens \"Target\"")
+        fire(jumpItem)
+        XCTAssertEqual(opened, [target.peerEndpoint])
+    }
+
+    func testSubmenuAccessibilityValuesCarryCounts() throws {
+        let target = peer("T", seed: 1, relationship: .linked(reference: link(1), peerCurrentlyEligible: true))
+        let observer = peer("O", seed: 2, relationship: .linked(reference: link(2), peerCurrentlyEligible: true))
+        let menuProps = props(
+            observerOptions: [observer, peer("C", seed: 3)],
+            targetOptions: [target]
+        )
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            menuProps,
+            busyKeys: [],
+            actions: .init()
+        ))
+
+        let overseeNewItem = try XCTUnwrap(menu.items.first { $0.title == "Oversee new" })
+        XCTAssertEqual(overseeNewItem.accessibilityValue() as? String, "Overseeing 1; 0 available")
+        let overseeByItem = try XCTUnwrap(menu.items.first { $0.title == "Oversee by" })
+        XCTAssertEqual(overseeByItem.accessibilityValue() as? String, "Overseen by 1; 1 available")
+        let unlinkItem = try XCTUnwrap(menu.items.first { $0.title == "Unlink" })
+        XCTAssertEqual(unlinkItem.accessibilityValue() as? String, "2 linked")
+    }
+}
