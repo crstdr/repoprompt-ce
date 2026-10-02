@@ -76,16 +76,22 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     func testWaitServesRehydratedObserverWithoutCapturedOrigin() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
-        var service = fixture.service
         var endpointRehydrated = false
-        service.captureWaitInput = {
-            XCTAssertFalse(endpointRehydrated)
-            return nil
-        }
-        service.resolveObserverEndpoint = { _, _ in
-            endpointRehydrated = true
-            return fixture.observer.domainEndpoint
-        }
+        let service = AgentSessionLinkMCPToolService(
+            toolName: fixture.service.toolName,
+            captureRequestMetadata: fixture.service.captureRequestMetadata,
+            requireTargetWindow: fixture.service.requireTargetWindow,
+            resolveObserverEndpoint: { _, _ in
+                endpointRehydrated = true
+                return fixture.observer.domainEndpoint
+            },
+            withHeartbeat: fixture.service.withHeartbeat,
+            captureWaitInput: {
+                XCTAssertFalse(endpointRehydrated)
+                return nil
+            },
+            bridge: fixture.bridge
+        )
         let result = try await Self.executeObject(service, args: [
             "op": .string("wait"), "session_id": .string(fixture.target.sessionID.uuidString),
             "timeout_seconds": .int(0)
