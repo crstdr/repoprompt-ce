@@ -1501,6 +1501,38 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         XCTAssertEqual(unlinked[0].2, reference)
     }
 
+    /// When the creator is the row's only overseer the Overseen-by header collapses to
+    /// "Created and overseen by" and no separate Created-by section renders.
+    func testCreatorSoleOverseerCollapsesOverseenByHeader() throws {
+        let creatorSessionID = UUID()
+        let creatorEndpoint = endpoint(1)
+        let creator = AgentSidebarOversightMenuProps.PeerOption(
+            peerEndpoint: creatorEndpoint,
+            peerSessionID: creatorSessionID,
+            displayName: "Creator",
+            providerDisplayName: nil,
+            menuLabel: "Creator",
+            fullIdentityDescription: "identity Creator",
+            relationship: .linked(reference: link(5), peerCurrentlyEligible: true)
+        )
+        let menuProps = props(
+            observerOptions: [creator],
+            createdByLabel: "Creator",
+            creatorSessionID: creatorSessionID
+        )
+
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            menuProps,
+            busyKeys: [],
+            actions: .init()
+        ))
+        let titles = menu.items.map(\.title)
+        XCTAssertTrue(titles.contains("Created and overseen by"))
+        XCTAssertFalse(titles.contains("Overseen by"))
+        XCTAssertFalse(titles.contains("Created by"))
+        XCTAssertEqual(titles.filter { $0 == "Creator" }.count, 1)
+    }
+
     /// The outbound direction unlink passes the row as observer and the peer as target —
     /// the reverse of the inbound arm — so the runtime bridge fences the right link.
     func testUnlinkOutboundDispatchesRowAsObserver() throws {

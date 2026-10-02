@@ -8,7 +8,7 @@ import Foundation
 /// feature-layer or UI type. `persistentBindingGeneration` is deliberately a `UUID?` rather than a
 /// counter so an unexpected `nil` fails closed instead of comparing equal to another unbound
 /// endpoint.
-package struct DomainAgentSessionLinkEndpointIdentity: Hashable {
+package struct DomainAgentSessionLinkEndpointIdentity: Hashable, Sendable {
     package let windowID: Int
     package let workspaceID: UUID
     package let tabID: UUID
@@ -40,7 +40,7 @@ package struct DomainAgentSessionLinkEndpointIdentity: Hashable {
 
 // MARK: - Capabilities and grants
 
-package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable {
+package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable, Sendable {
     case poll
     case wait
     case read
@@ -54,14 +54,14 @@ package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable {
         .poll,
         .wait,
         .read,
-        .sendWhenIdle
+        .sendWhenIdle,
     ]
 
     /// The default capability set for newly reserved links.
     package static let managed: Set<DomainAgentSessionLinkCapability> = version1.union([.manage])
 }
 
-package struct DomainAgentSessionLinkGrant: Identifiable, Hashable {
+package struct DomainAgentSessionLinkGrant: Identifiable, Hashable, Sendable {
     package let id: UUID
     package let generation: UInt64
     package let observer: DomainAgentSessionLinkEndpointIdentity
@@ -87,7 +87,7 @@ package struct DomainAgentSessionLinkGrant: Identifiable, Hashable {
 }
 
 /// Stable identity of one link generation. A revoked reference never resurrects.
-package struct DomainAgentSessionLinkReference: Hashable {
+package struct DomainAgentSessionLinkReference: Hashable, Sendable {
     package let linkID: UUID
     package let generation: UInt64
 
@@ -99,13 +99,13 @@ package struct DomainAgentSessionLinkReference: Hashable {
 
 // MARK: - Sanitized observation snapshot
 
-package enum DomainAgentSessionLinkStatus: String, CaseIterable, Hashable {
+package enum DomainAgentSessionLinkStatus: String, CaseIterable, Hashable, Sendable {
     case idle
     case running
     case awaitingUser = "awaiting_user"
 }
 
-package enum DomainAgentSessionLinkPendingInteractionKind: String, CaseIterable, Hashable {
+package enum DomainAgentSessionLinkPendingInteractionKind: String, CaseIterable, Hashable, Sendable {
     case approval
     case question
     case input
@@ -120,7 +120,7 @@ package enum DomainAgentSessionLinkTextBudget {
     package static let waitingOnSummaryMaxBytes = 280
     package static let idempotencyKeyMaxBytes = 200
     package static let messageDigestMaxBytes = 200
-    package static let messageMaxBytes = 16000
+    package static let messageMaxBytes = 16_000
 
     /// Collapses control characters/whitespace runs and caps the result at `maxBytes` UTF-8 bytes
     /// without ever splitting a Unicode scalar.
@@ -163,7 +163,7 @@ package enum DomainAgentSessionLinkTextBudget {
 ///
 /// It intentionally carries no interaction identifiers or bodies, no raw provider events, no run
 /// identifiers, no filesystem/worktree paths, and no diagnostics.
-package struct DomainAgentSessionWaitingOn: Hashable {
+package struct DomainAgentSessionWaitingOn: Hashable, Sendable {
     package let summary: String
     package let declaredAt: Date
 
@@ -181,9 +181,9 @@ package struct DomainAgentSessionWaitingOn: Hashable {
 /// provider usage its context ring already shows. Numbers only: no provider payload, model name, or
 /// free-form text. A usage update alone does not publish a snapshot, so the value can lag the
 /// provider; it confers no authority, and `nil` means unknown, never empty.
-package struct DomainAgentSessionContextLoad: Hashable {
+package struct DomainAgentSessionContextLoad: Hashable, Sendable {
     /// How the usage was obtained, mirroring the app's existing context-usage confidence labels.
-    package enum Confidence: String, CaseIterable, Hashable {
+    package enum Confidence: String, CaseIterable, Hashable, Sendable {
         /// Provider-reported context occupancy for the latest request.
         case exact
         /// A provider figure that is not a direct occupancy report, such as prompt tokens.
@@ -220,8 +220,8 @@ package struct DomainAgentSessionContextLoad: Hashable {
 
 /// Derived target state for passive oversight. Blocker names are internal and opaque on the wire;
 /// only an empty versus non-empty list is contractual. Counts come from the target view model's child census.
-package struct DomainAgentSessionLaneBoard: Hashable {
-    package enum RunOutcome: String, Hashable {
+package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
+    package enum RunOutcome: String, Hashable, Sendable {
         case none
         case running
         case awaitingUser = "awaiting_user"
@@ -230,7 +230,7 @@ package struct DomainAgentSessionLaneBoard: Hashable {
         case failed
     }
 
-    package enum FailureReason: String, Hashable {
+    package enum FailureReason: String, Hashable, Sendable {
         case processCrash = "process_crash"
         case timeout
         case agentError = "agent_error"
@@ -267,7 +267,7 @@ package struct DomainAgentSessionLaneBoard: Hashable {
     )
 }
 
-package struct DomainAgentSessionObservationSnapshot: Hashable {
+package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
     package let sessionID: UUID
     package let displayName: String?
     package let providerDisplayName: String?
@@ -331,7 +331,7 @@ package struct DomainAgentSessionObservationSnapshot: Hashable {
 }
 
 /// One authorized target row: sanitized snapshot plus the successor wait cursor.
-package struct DomainAgentSessionLinkTargetState: Hashable {
+package struct DomainAgentSessionLinkTargetState: Hashable, Sendable {
     package let sessionID: UUID
     package let linkID: UUID
     package let linkGeneration: UInt64
@@ -358,7 +358,7 @@ package struct DomainAgentSessionLinkTargetState: Hashable {
 
 // MARK: - Inventory
 
-package struct DomainAgentSessionLinkInventoryItem: Hashable {
+package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
     package let linkID: UUID
     package let generation: UInt64
     package let observerSessionID: UUID
@@ -396,7 +396,7 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable {
 }
 
 /// Deterministically ordered inventory for one endpoint.
-package struct DomainAgentSessionLinkInventory: Hashable {
+package struct DomainAgentSessionLinkInventory: Hashable, Sendable {
     package let sessionID: UUID
     /// Advances only when this observer's grant membership changes.
     package let linkSetRevision: UInt64
@@ -415,14 +415,12 @@ package struct DomainAgentSessionLinkInventory: Hashable {
         self.items = items
     }
 
-    package var isEmpty: Bool {
-        items.isEmpty
-    }
+    package var isEmpty: Bool { items.isEmpty }
 }
 
 // MARK: - Revocation
 
-package enum DomainAgentSessionLinkRevocationReason: String, CaseIterable, Hashable {
+package enum DomainAgentSessionLinkRevocationReason: String, CaseIterable, Hashable, Sendable {
     case userRequested = "user_requested"
     case observerEndpointInvalidated = "observer_endpoint_invalidated"
     case targetEndpointInvalidated = "target_endpoint_invalidated"
@@ -441,7 +439,7 @@ package enum DomainAgentSessionLinkRevocationReason: String, CaseIterable, Hasha
     case appTerminating = "app_terminating"
 }
 
-package struct DomainAgentSessionLinkRevocationNotice: Hashable {
+package struct DomainAgentSessionLinkRevocationNotice: Hashable, Sendable {
     package let linkID: UUID
     package let generation: UInt64
     package let observerSessionID: UUID
@@ -501,7 +499,7 @@ package struct DomainAgentSessionLinkRevocationNotice: Hashable {
 /// live in more than one window at once, so a host that resolved the other side of a link by UUID
 /// would render — and attribute — the wrong incarnation. Available target-menu choices also need
 /// the authority's exact current outbound observers from that same membership snapshot.
-package struct DomainAgentSessionLinkEndpointProjectionInputs: Equatable {
+package struct DomainAgentSessionLinkEndpointProjectionInputs: Equatable, Sendable {
     /// Grants where this exact incarnation is the observer.
     package let outbound: DomainAgentSessionLinkInventory
     /// Grants where this exact incarnation is the target.
@@ -535,7 +533,7 @@ package struct DomainAgentSessionLinkEndpointProjectionInputs: Equatable {
 
 // MARK: - Errors
 
-package enum DomainAgentSessionLinkError: String, Error, Equatable {
+package enum DomainAgentSessionLinkError: String, Error, Equatable, Sendable {
     case noActiveLink = "no_active_link"
     case capabilityDenied = "capability_denied"
     case linkRevoked = "link_revoked"
@@ -554,7 +552,7 @@ package enum DomainAgentSessionLinkError: String, Error, Equatable {
 
 /// A reserved-but-not-yet-active link. The app bridge must seed an initial snapshot before the link
 /// becomes visible to any tool operation, so `poll` can never race an uninitialized active link.
-package struct DomainAgentSessionLinkPendingReservation: Hashable {
+package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
     package let linkID: UUID
     package let generation: UInt64
     package let observer: DomainAgentSessionLinkEndpointIdentity
@@ -610,7 +608,7 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable {
 /// so the role survives abandonment or lifecycle invalidation of an earlier elected reservation. The
 /// app bridge must own the target observation and its serial publication chain if and only if this
 /// flag is true.
-package struct DomainAgentSessionLinkActivation: Hashable {
+package struct DomainAgentSessionLinkActivation: Hashable, Sendable {
     package let grant: DomainAgentSessionLinkGrant
     package let installsTargetObservation: Bool
     /// The observer's complete outbound inventory *as of this activation*, for that exact
@@ -635,7 +633,7 @@ package struct DomainAgentSessionLinkActivation: Hashable {
     }
 }
 
-package enum DomainAgentSessionLinkReservationDisposition: Equatable {
+package enum DomainAgentSessionLinkReservationDisposition: Equatable, Sendable {
     /// `collateralRevocations` carries links the reservation itself revoked — today, a stale target
     /// incarnation's inbound links. They are returned rather than left to the change feed alone
     /// because that feed is lossy by design (`bufferingNewest`), and these revocations belong to
@@ -649,7 +647,7 @@ package enum DomainAgentSessionLinkReservationDisposition: Equatable {
     case rejected(DomainAgentSessionLinkReservationRejection)
 }
 
-package enum DomainAgentSessionLinkReservationRejection: String, Equatable {
+package enum DomainAgentSessionLinkReservationRejection: String, Equatable, Sendable {
     case shuttingDown = "shutting_down"
     case selfMonitor = "self_monitor"
     case observerBindingUnresolved = "observer_binding_unresolved"
@@ -659,7 +657,7 @@ package enum DomainAgentSessionLinkReservationRejection: String, Equatable {
     case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
-package enum DomainAgentSessionLinkActivationDisposition: Equatable {
+package enum DomainAgentSessionLinkActivationDisposition: Equatable, Sendable {
     case activated(DomainAgentSessionLinkActivation)
     case rejected(DomainAgentSessionLinkActivationRejection)
 
@@ -674,7 +672,7 @@ package enum DomainAgentSessionLinkActivationDisposition: Equatable {
     }
 }
 
-package enum DomainAgentSessionLinkActivationRejection: String, Equatable {
+package enum DomainAgentSessionLinkActivationRejection: String, Equatable, Sendable {
     case shuttingDown = "shutting_down"
     case unknownReservation = "unknown_reservation"
     case endpointDrift = "endpoint_drift"
@@ -683,7 +681,7 @@ package enum DomainAgentSessionLinkActivationRejection: String, Equatable {
     case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
-package enum DomainAgentSessionLinkRevocationDisposition: Equatable {
+package enum DomainAgentSessionLinkRevocationDisposition: Equatable, Sendable {
     case revoked(DomainAgentSessionLinkRevocationNotice)
     /// The exact link generation was already terminal, or a newer generation now owns the pair.
     case notFound
@@ -691,7 +689,7 @@ package enum DomainAgentSessionLinkRevocationDisposition: Equatable {
 
 // MARK: - Target publication
 
-package enum DomainAgentSessionLinkTargetChangeDisposition: Equatable {
+package enum DomainAgentSessionLinkTargetChangeDisposition: Equatable, Sendable {
     case accepted(changeSequence: UInt64)
     case unchanged(changeSequence: UInt64)
     /// A late or out-of-order publication that must never regress the high-water mark.
@@ -706,7 +704,7 @@ package enum DomainAgentSessionLinkTargetChangeDisposition: Equatable {
 ///
 /// A lease is not durable authority: the caller must still revalidate both live endpoint identities
 /// before it reads or mutates target state.
-package struct DomainAgentSessionLinkLease: Hashable {
+package struct DomainAgentSessionLinkLease: Hashable, Sendable {
     package let leaseID: UUID
     package let runtimeID: UUID
     package let runtimeGeneration: UInt64
@@ -746,7 +744,7 @@ package struct DomainAgentSessionLinkLease: Hashable {
 
 // MARK: - Wait
 
-package enum DomainAgentSessionLinkWaitPredicate: String, CaseIterable, Hashable {
+package enum DomainAgentSessionLinkWaitPredicate: String, CaseIterable, Hashable, Sendable {
     case change
     /// Mirrors the published `status`/`pending_interaction_kind` pair: the target stopped and is not
     /// holding an interaction. It does **not** promise the target will accept a send.
@@ -761,7 +759,7 @@ package enum DomainAgentSessionLinkWaitPredicate: String, CaseIterable, Hashable
     case sendable
 }
 
-package struct DomainAgentSessionLinkWaitRequest: Hashable {
+package struct DomainAgentSessionLinkWaitRequest: Hashable, Sendable {
     package let lease: DomainAgentSessionLinkLease
     /// Omitting a cursor snapshots current state and waits for the next qualifying event.
     package let cursor: String?
@@ -772,7 +770,7 @@ package struct DomainAgentSessionLinkWaitRequest: Hashable {
     }
 }
 
-package enum DomainAgentSessionLinkWaitOutcome: Equatable {
+package enum DomainAgentSessionLinkWaitOutcome: Equatable, Sendable {
     case changed(sessionID: UUID)
     case idle(sessionID: UUID)
     case revoked(DomainAgentSessionLinkRevocationNotice)
@@ -797,7 +795,7 @@ package enum DomainAgentSessionLinkWaitOutcome: Equatable {
     }
 }
 
-package struct DomainAgentSessionLinkWaitResult: Equatable {
+package struct DomainAgentSessionLinkWaitResult: Equatable, Sendable {
     package let outcome: DomainAgentSessionLinkWaitOutcome
     /// Successor cursors for every authorized target, in request order.
     package let targets: [DomainAgentSessionLinkTargetState]
@@ -812,14 +810,14 @@ package struct DomainAgentSessionLinkWaitResult: Equatable {
 
 // MARK: - Read cursors
 
-package enum DomainAgentSessionLinkReadDirection: String, CaseIterable, Hashable {
+package enum DomainAgentSessionLinkReadDirection: String, CaseIterable, Hashable, Sendable {
     case tail
     case start
 }
 
 /// A stable transcript anchor. `sourceItemsRevision` is a non-authoritative diagnostic hint only; it
 /// never determines cursor validity.
-package struct DomainAgentSessionLinkReadAnchor: Hashable {
+package struct DomainAgentSessionLinkReadAnchor: Hashable, Sendable {
     package let itemID: String
     package let sequenceIndex: Int
     package let sourceItemsRevision: UInt64?
@@ -831,7 +829,7 @@ package struct DomainAgentSessionLinkReadAnchor: Hashable {
     }
 }
 
-package struct DomainAgentSessionLinkReadCursorState: Hashable {
+package struct DomainAgentSessionLinkReadCursorState: Hashable, Sendable {
     package let handle: String
     package let linkID: UUID
     package let linkGeneration: UInt64
@@ -856,7 +854,7 @@ package struct DomainAgentSessionLinkReadCursorState: Hashable {
     }
 }
 
-package enum DomainAgentSessionLinkReadCursorDisposition: Equatable {
+package enum DomainAgentSessionLinkReadCursorDisposition: Equatable, Sendable {
     case resolved(DomainAgentSessionLinkReadCursorState)
     /// Invalid runtime/link/endpoint generation, or an evicted handle. Never attaches to a re-link.
     case expired
@@ -864,7 +862,7 @@ package enum DomainAgentSessionLinkReadCursorDisposition: Equatable {
 
 // MARK: - Send reservations
 
-package struct DomainAgentSessionLinkSendReservation: Hashable {
+package struct DomainAgentSessionLinkSendReservation: Hashable, Sendable {
     package let id: UUID
     package let linkID: UUID
     package let linkGeneration: UInt64
@@ -892,7 +890,7 @@ package struct DomainAgentSessionLinkSendReservation: Hashable {
     }
 }
 
-package enum DomainAgentSessionLinkDeliveryState: String, CaseIterable, Hashable {
+package enum DomainAgentSessionLinkDeliveryState: String, CaseIterable, Hashable, Sendable {
     case persisted
     case runStarted = "run_started"
     case runStartFailed = "run_start_failed"
@@ -908,7 +906,7 @@ package enum DomainAgentSessionLinkDeliveryState: String, CaseIterable, Hashable
     case deliveredToWaitingInstruction = "delivered_to_waiting_instruction"
 }
 
-package struct DomainAgentSessionLinkSendReceipt: Hashable {
+package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
     package let targetSessionID: UUID
     package let targetItemID: String
     package let acceptedAt: Date
@@ -951,7 +949,7 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable {
     }
 }
 
-package enum DomainAgentSessionLinkSendReservationDisposition: Equatable {
+package enum DomainAgentSessionLinkSendReservationDisposition: Equatable, Sendable {
     case reserved(DomainAgentSessionLinkSendReservation)
     /// Same key, same digest, already settled: replay the exact stored receipt.
     case duplicate(DomainAgentSessionLinkSendReceipt)
@@ -986,7 +984,7 @@ package enum DomainAgentSessionLinkSendReservationDisposition: Equatable {
 ///
 /// Nothing here is a promise about a *future* call: `unused` only means the ledger held no outcome
 /// at the instant it was read, and admission is still decided by `beginSend` at delivery time.
-package enum DomainAgentSessionLinkSendLedgerProbe: Equatable {
+package enum DomainAgentSessionLinkSendLedgerProbe: Equatable, Sendable {
     case unused
     /// Same key, same digest, already settled with a receipt.
     case duplicate(DomainAgentSessionLinkSendReceipt)
@@ -999,7 +997,7 @@ package enum DomainAgentSessionLinkSendLedgerProbe: Equatable {
     case rejected(DomainAgentSessionLinkError)
 }
 
-package enum DomainAgentSessionLinkSendCommitDisposition: Equatable {
+package enum DomainAgentSessionLinkSendCommitDisposition: Equatable, Sendable {
     /// The authorization linearization fence was won before manual revocation.
     case committed
     case linkRevoked
@@ -1013,8 +1011,8 @@ package enum DomainAgentSessionLinkSendCommitDisposition: Equatable {
 // MARK: - Change events
 
 /// Identity/revision-only change feed. Consumers refetch an authoritative snapshot.
-package struct DomainAgentSessionLinkChangeEvent: Hashable {
-    package enum Kind: String, CaseIterable, Hashable {
+package struct DomainAgentSessionLinkChangeEvent: Hashable, Sendable {
+    package enum Kind: String, CaseIterable, Hashable, Sendable {
         case activated
         case revoked
         case targetStateChanged = "target_state_changed"
@@ -1052,7 +1050,7 @@ package struct DomainAgentSessionLinkChangeEvent: Hashable {
 
 // MARK: - Diagnostics
 
-package struct DomainAgentSessionLinkAuthoritySnapshot: Equatable {
+package struct DomainAgentSessionLinkAuthoritySnapshot: Equatable, Sendable {
     package let runtimeGeneration: UInt64
     package let authorityRevision: UInt64
     package let isDraining: Bool
