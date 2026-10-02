@@ -58,7 +58,7 @@ final class WindowStatePresentationVisibilityTests: XCTestCase {
         await state.tearDown()
     }
 
-    func testCloseStopsObservingPresentationVisibility() async {
+    func testCloseStopsObservingPresentationVisibility() async throws {
         #if DEBUG
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -86,7 +86,7 @@ final class WindowStatePresentationVisibilityTests: XCTestCase {
     /// A deferred WindowAccessor callback can deliver the first attach after `beginClose()` has
     /// already run. Because `beginClose` is idempotent, observers installed by that late attach would
     /// never be removed; the closed state must refuse the attach instead.
-    func testLateAttachAfterBeginCloseInstallsNoPresentationObservers() async {
+    func testLateAttachAfterBeginCloseInstallsNoPresentationObservers() async throws {
         #if DEBUG
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

@@ -3486,47 +3486,6 @@ extension MCPServerViewModel {
         return endpoint
     }
 
-    /// set_model alone must not use the generic resolver's rehydration, tab binding, mirroring,
-    /// or persistence. Only an already-installed exact run route may identify its caller.
-    @MainActor
-    func resolveAgentSessionLinkModelObserverEndpoint(
-        metadata: RequestMetadata,
-        network: ServerNetworkManager = .shared
-    ) async -> DomainAgentSessionLinkEndpointIdentity? {
-        guard let connectionID = metadata.connectionID,
-              let route = await network.cachedModelRunRoute(connectionID: connectionID),
-              metadata.windowID == route.windowID else { return nil }
-        return cachedModelObserverEndpoint(connectionID: connectionID, route: route, hint: metadata.tabContextHint)
-    }
-
-    @MainActor
-    func cachedModelObserverEndpoint(
-        connectionID: UUID,
-        route: ServerNetworkManager.CachedModelRunRoute,
-        hint: TabContextHint? = nil
-    ) -> DomainAgentSessionLinkEndpointIdentity? {
-        guard let window = WindowStatesManager.shared.modelRoutingWindow(withID: route.windowID),
-              window.mcpServer === self,
-              connectionIDToRunID[connectionID] == route.runID,
-              connectionIDByRunID[route.runID] == connectionID,
-              let context = tabContextByConnectionID[connectionID],
-              context.runID == route.runID, context.windowID == route.windowID,
-              context.workspaceID == route.workspaceID, context.tabID == route.tabID,
-              hint.map({ Self.hint($0, matches: context) }) ?? true,
-              let sessionID = context.activeAgentSessionID,
-              let identity = window.agentModeViewModel.agentSessionLinkModelIdentity(
-                  workspaceID: route.workspaceID, tabID: route.tabID, sessionID: sessionID
-              ) else { return nil }
-        guard let endpoint = identity.monitorEndpoint(windowID: route.windowID) else { return nil }
-        if let token = ServerNetworkManager.currentToolDispatchAuthorization?.windowIdentity?.modelRouteToken {
-            guard token.connectionID == connectionID, token.runID == route.runID,
-                  token.routingAuthorityGeneration == route.routingAuthorityGeneration,
-                  token.connectionLifecycleGeneration == route.connectionLifecycleGeneration,
-                  token.observerEndpoint == endpoint else { return nil }
-        }
-        return endpoint
-    }
-
     nonisolated static func tabContextRoutingErrorMessage(
         toolName: String,
         runPurpose: MCPRunPurpose? = nil

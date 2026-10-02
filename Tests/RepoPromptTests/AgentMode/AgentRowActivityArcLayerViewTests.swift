@@ -29,18 +29,17 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         XCTAssertFalse(rotation.isRemovedOnCompletion)
     }
 
-    /// The fork wrapper retains upstream's layer-backed arc while pausing hidden-window motion.
-    func testHiddenWindowKeepsNoAnimation() throws {
-        let visible = hostIndicator(isWindowPresentationVisible: true, reduceMotion: false)
-        let hidden = hostIndicator(isWindowPresentationVisible: false, reduceMotion: false)
-        defer {
-            visible.window.close()
-            hidden.window.close()
+    /// The fork wrapper retains upstream's layer-backed arc while pausing decorative motion.
+    func testRunningIndicatorPausesForHiddenWindowsAndReduceMotion() throws {
+        for (visible, reduceMotion, animates) in [(true, false, true), (false, false, false), (true, true, false)] {
+            let hosted = hostIndicator(isWindowPresentationVisible: visible, reduceMotion: reduceMotion)
+            defer { hosted.window.close() }
+            let arc = try XCTUnwrap(arcViews(in: hosted.host).first)
+            XCTAssertEqual(
+                arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey) != nil,
+                animates
+            )
         }
-
-        XCTAssertEqual(arcViews(in: visible.host).count, 1, "the visible running row renders the layer-backed arc")
-        let hiddenArc = try XCTUnwrap(arcViews(in: hidden.host).first)
-        XCTAssertNil(hiddenArc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey))
     }
 
     /// SwiftUI draws in y-down space, so `rotationEffect(.degrees(+360))` spins clockwise and

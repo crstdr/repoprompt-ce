@@ -2024,13 +2024,15 @@ struct AgentSessionRow: View {
 ///   should not out-shout it.
 struct AgentRowActivityArc: View {
     var tint: Color = .accentColor
+    var reduceMotionOverride: Bool?
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.windowIsPresentationVisible) private var isWindowPresentationVisible
 
     var body: some View {
         // Spun by the render server (see `AgentRowActivityArcLayerView`): a SwiftUI `repeatForever`
         // rotation here re-rendered the row's whole window on the main thread every frame.
-        AgentRowAnimatedActivityArc(tint: tint, isPresentationVisible: isWindowPresentationVisible)
+        AgentRowAnimatedActivityArc(tint: tint, isPresentationVisible: isWindowPresentationVisible && !(reduceMotionOverride ?? reduceMotion))
             .frame(width: AgentRowActivityArcLayerView.diameter, height: AgentRowActivityArcLayerView.diameter)
             .accessibilityElement()
             .accessibilityLabel(AgentRowRunningIndicator.accessibilityLabelText)
@@ -2051,11 +2053,8 @@ struct AgentRowRunningIndicator: View {
         self.reduceMotionOverride = reduceMotionOverride
     }
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
     var body: some View {
-        AgentRowActivityArc(tint: tint)
-            .environment(\.accessibilityReduceMotion, reduceMotionOverride ?? reduceMotion)
+        AgentRowActivityArc(tint: tint, reduceMotionOverride: reduceMotionOverride)
     }
 }
 

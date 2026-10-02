@@ -6796,6 +6796,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 deferPublicationUntilRouting: true,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback,
+                forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
                 startupClaimToken: claimToken
