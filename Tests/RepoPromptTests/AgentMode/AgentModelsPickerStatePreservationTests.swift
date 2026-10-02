@@ -2,6 +2,7 @@ import AppKit
 import Combine
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
+import SwiftUI
 import XCTest
 
 @MainActor
@@ -179,8 +180,12 @@ final class AgentModelsPickerStatePreservationTests: XCTestCase {
 
     private func actionItem(titled title: String, in menu: NSMenu) -> NSMenuItem? {
         for item in menu.items {
-            if item.title == title, item.action != nil { return item }
-            if let submenu = item.submenu, let match = actionItem(titled: title, in: submenu) { return match }
+            if item.title == title, item.action != nil {
+                return item
+            }
+            if let submenu = item.submenu, let match = actionItem(titled: title, in: submenu) {
+                return match
+            }
         }
         return nil
     }
@@ -193,5 +198,171 @@ final class AgentModelsPickerStatePreservationTests: XCTestCase {
                 DispatchQueue.main.async { continuation.resume() }
             }
         }
+    }
+}
+
+/// Lifecycle contract of the window-scoped `StableMenuPresenter`: the presented `NSMenu`
+/// is screen-anchored and owned outside the trigger's view state, so tearing down
+/// the hosted `StableMenuButton` mid-track must not dismiss it — that was the
+/// sidebar oversight menu's disappearing-list defect. Closing the presenting
+/// window must still release the menu so a gone window cannot orphan it.
+@MainActor
+final class StableMenuLifetimeTests: XCTestCase {
+    private struct TriggerRow: View {
+        let showsTrigger: Bool
+        var body: some View {
+            if showsTrigger {
+                StableMenuButton(
+                    items: { [.action("Pinned") {}] },
+                    label: { Text("Trigger") }
+                )
+            }
+        }
+    }
+
+    private var window: NSWindow!
+    private var hosting: NSHostingView<TriggerRow>!
+    private var trackedMenu: NSMenu?
+    /// Whether `openMenu` was released while tracking — observed on a runloop beat
+    /// after the teardown, so it reflects mid-track release, not `present`'s
+    /// post-`popUp` cleanup.
+    private var releasedDuringTracking = false
+    private var teardownOnOpen: (() -> Void)?
+    private var teardownAtGrace = false
+
+    override func tearDown() {
+        teardownOnOpen = nil
+        trackedMenu = nil
+        hosting = nil
+        window = nil
+        super.tearDown()
+    }
+
+    /// The button's `.background` anchor is the only bare `NSView` in the hosted tree.
+    private func findAnchor(in view: NSView) -> NSView? {
+        if type(of: view) == NSView.self {
+            return view
+        }
+        for subview in view.subviews {
+            if let found = findAnchor(in: subview) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    @objc private func menuBeganTracking(_ note: Notification) {
+        MainActor.assumeIsolated {
+            guard let menu = note.object as? NSMenu,
+                  menu === window.stableMenuPresenter.openMenu
+            else { return }
+            trackedMenu = menu
+            if !teardownAtGrace {
+                teardownOnOpen?()
+            }
+            let timer = Timer(
+                timeInterval: 0.1, target: self,
+                selector: #selector(graceElapsed(_:)), userInfo: nil, repeats: false
+            )
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    /// Fires on the next common-mode beat after teardown so the assertion reads the
+    /// post-teardown tracking state rather than cleanup inside `present`. The
+    /// fallback `cancelTracking` keeps `popUp` from hanging if a teardown did not
+    /// end tracking.
+    @objc private func graceElapsed(_: Timer) {
+        MainActor.assumeIsolated {
+            if teardownAtGrace {
+                teardownOnOpen?()
+                let verify = Timer(
+                    timeInterval: 0.05, target: self,
+                    selector: #selector(verifiedAfterTeardown(_:)), userInfo: nil, repeats: false
+                )
+                RunLoop.main.add(verify, forMode: .common)
+            } else {
+                finishTrackingObservation()
+            }
+        }
+    }
+
+    @objc private func verifiedAfterTeardown(_: Timer) {
+        MainActor.assumeIsolated {
+            finishTrackingObservation()
+        }
+    }
+
+    private func finishTrackingObservation() {
+        releasedDuringTracking = window.stableMenuPresenter.openMenu == nil
+        window.stableMenuPresenter.openMenu?.cancelTracking()
+    }
+
+    /// Hosts the trigger, presents through the shared presenter at the mounted
+    /// anchor, and runs `teardown` once tracking begins. `popUp` is synchronous, so
+    /// all state is settled when it returns.
+    private func presentHostedMenu(atGrace: Bool = false, teardown: @escaping () -> Void) {
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 60),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        hosting = NSHostingView(rootView: TriggerRow(showsTrigger: true))
+        window.contentView = hosting
+        window.orderFrontRegardless()
+        hosting.layoutSubtreeIfNeeded()
+        defer { window.close() }
+
+        guard let anchor = findAnchor(in: hosting) else {
+            XCTFail("StableMenuAnchorView did not mount a backing NSView")
+            return
+        }
+        teardownOnOpen = teardown
+        teardownAtGrace = atGrace
+        defer { teardownOnOpen = nil }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(menuBeganTracking(_:)),
+            name: NSMenu.didBeginTrackingNotification, object: nil
+        )
+        defer { NotificationCenter.default.removeObserver(self) }
+
+        window.stableMenuPresenter.present([.action("Pinned") {}], from: anchor)
+    }
+
+    func testPresentedMenuSurvivesTriggerUnmount() {
+        _ = NSApplication.shared
+        presentHostedMenu { [self] in
+            // The sidebar invalidation analogue: the conditional gate flips and the
+            // whole `StableMenuButton` subtree (anchor view and view-scoped state)
+            // is dismantled while its menu is tracking.
+            hosting.rootView = TriggerRow(showsTrigger: false)
+            hosting.layoutSubtreeIfNeeded()
+        }
+        XCTAssertNotNil(trackedMenu, "presented menu never began tracking")
+        XCTAssertFalse(
+            releasedDuringTracking,
+            "menu tracking was cancelled when the trigger subtree unmounted"
+        )
+        XCTAssertNil(window.stableMenuPresenter.openMenu)
+    }
+
+    func testPresentedMenuClosesWithWindow() {
+        _ = NSApplication.shared
+        presentHostedMenu(atGrace: true) { [self] in
+            // Closing the presenting window posts `willClose`; driving the
+            // notification directly exercises the same cancellation path without
+            // destroying a window inside AppKit's tracking loop.
+            NotificationCenter.default.post(
+                name: NSWindow.willCloseNotification, object: window
+            )
+        }
+        XCTAssertNotNil(trackedMenu, "presented menu never began tracking")
+        XCTAssertTrue(
+            releasedDuringTracking,
+            "window close must release the menu mid-track, not only at popUp return"
+        )
+        XCTAssertNil(window.stableMenuPresenter.openMenu)
     }
 }

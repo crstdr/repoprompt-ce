@@ -4,8 +4,9 @@ import SwiftUI
 /// A SwiftUI-labelled button that presents an AppKit `NSMenu`.
 ///
 /// Use this instead of SwiftUI `Menu` for long-lived model pickers that sit in highly
-/// reactive views. AppKit owns menu tracking, so unrelated SwiftUI invalidations do
-/// not tear down the open picker.
+/// reactive views. AppKit owns menu tracking, the open menu is screen-anchored, and a
+/// shared presenter retains it — so unrelated SwiftUI invalidations and even removal
+/// of this button's view do not tear down the open picker.
 struct StableMenuButton<Label: View>: View {
     enum TriggerStyle {
         case automatic
@@ -18,7 +19,7 @@ struct StableMenuButton<Label: View>: View {
     let onOpen: @MainActor () -> Void
     @ViewBuilder let label: () -> Label
 
-    @StateObject private var presenter = StableMenuPresenter()
+    @StateObject private var anchor = StableMenuAnchor()
 
     init(
         items: @escaping () -> [StableMenuItem],
@@ -46,12 +47,14 @@ struct StableMenuButton<Label: View>: View {
     private var button: some View {
         Button {
             onOpen()
-            presenter.present(items())
+            if let view = anchor.view {
+                view.window?.stableMenuPresenter.present(items(), from: view)
+            }
         } label: {
             label()
         }
         .background(
-            StableMenuAnchorView(presenter: presenter)
+            StableMenuAnchorView(anchor: anchor)
                 .allowsHitTesting(false)
         )
     }
@@ -245,27 +248,92 @@ extension NSMenu {
     }
 }
 
+/// Per-button mount state used only to locate the trigger's on-screen position at
+/// click time. The open menu's lifetime is owned by the window's `StableMenuPresenter`,
+/// so tearing down or rebuilding the trigger cannot dismiss it mid-track.
 @MainActor
-private final class StableMenuPresenter: NSObject, ObservableObject, NSMenuDelegate {
-    weak var anchorView: NSView?
-    private var retainedMenu: NSMenu?
+private final class StableMenuAnchor: ObservableObject {
+    weak var view: NSView?
+}
 
-    func present(_ items: [StableMenuItem]) {
-        guard !items.isEmpty else { return }
-        guard let anchorView else { return }
+private var stableMenuPresenterKey = 0
 
-        retainedMenu?.cancelTracking()
+extension NSWindow {
+    /// The presenter owning this window's open `StableMenuButton` menu. Window-scoped
+    /// rather than view-scoped so a trigger that unmounts mid-track cannot release the
+    /// tracking menu — and window teardown can still dismiss it.
+    var stableMenuPresenter: StableMenuPresenter {
+        if let existing = objc_getAssociatedObject(self, &stableMenuPresenterKey) as? StableMenuPresenter {
+            return existing
+        }
+        let presenter = StableMenuPresenter()
+        objc_setAssociatedObject(self, &stableMenuPresenterKey, presenter, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        return presenter
+    }
+}
+
+/// Owner of the one AppKit menu currently tracking for `StableMenuButton` on a given
+/// window. Retention lives on the window rather than in view-scoped state, so trigger
+/// teardown cannot release the menu or break tracking.
+@MainActor
+final class StableMenuPresenter: NSObject, NSMenuDelegate {
+    /// The menu currently presented, retained for the duration of tracking.
+    /// Exposed for tests that need to assert lifetime across trigger teardown.
+    private(set) var openMenu: NSMenu?
+    private var windowCloseObserver: NSObjectProtocol?
+
+    /// Presents `items` with its top corner at `anchorView`'s lower-left on-screen
+    /// position, resolved once at click time. The `in: nil` popup interprets the
+    /// point in screen coordinates, so tracking is not bound to the anchor view and
+    /// survives the anchor leaving its window.
+    func present(_ items: [StableMenuItem], from anchorView: NSView?) {
+        guard !items.isEmpty, let anchorView, let window = anchorView.window else { return }
+
+        closeOpenMenu()
         let menu = NSMenu.stableMenu(from: items, fontPreset: FontScalePreset.current)
         menu.delegate = self
-        retainedMenu = menu
+        openMenu = menu
+        windowCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: window,
+            queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.closeOpenMenu()
+            }
+        }
 
         let popupPoint = NSPoint(x: 0, y: anchorView.bounds.height + 2)
-        menu.popUp(positioning: nil, at: popupPoint, in: anchorView)
+        let windowPoint = anchorView.convert(popupPoint, to: nil)
+        let screenPoint = window.convertToScreen(NSRect(origin: windowPoint, size: .zero)).origin
+        menu.popUp(positioning: nil, at: screenPoint, in: nil)
+
+        // `popUp` is synchronous: tracking has ended by now. `menuDidClose` clears
+        // `openMenu` when tracking ran; this line covers the case where tracking
+        // never began (for example, no usable user session in a test host).
+        if openMenu === menu {
+            releaseMenu()
+        }
+    }
+
+    /// Cancels any in-flight tracking and releases the retained menu. Used when the
+    /// owning window closes so an orphaned menu cannot linger.
+    func closeOpenMenu() {
+        openMenu?.cancelTracking()
+        releaseMenu()
+    }
+
+    private func releaseMenu() {
+        openMenu = nil
+        if let observer = windowCloseObserver {
+            windowCloseObserver = nil
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     func menuDidClose(_ menu: NSMenu) {
-        guard retainedMenu === menu else { return }
-        retainedMenu = nil
+        guard openMenu === menu else { return }
+        releaseMenu()
     }
 }
 
@@ -283,20 +351,20 @@ private final class StableMenuActionBox: NSObject {
 
 @MainActor
 private struct StableMenuAnchorView: NSViewRepresentable {
-    @ObservedObject var presenter: StableMenuPresenter
+    let anchor: StableMenuAnchor
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
-        presenter.anchorView = view
+        anchor.view = view
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        presenter.anchorView = nsView
+        anchor.view = nsView
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: ()) {
-        // Do not cancel tracking here. SwiftUI may rebuild the trigger while the AppKit
-        // menu is open; retaining the menu through `StableMenuPresenter` is the point.
+        // Intentionally empty: the presented menu is screen-anchored and owned by the
+        // window's `StableMenuPresenter`, so dismantling the trigger must not touch it.
     }
 }
