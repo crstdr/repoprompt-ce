@@ -27,7 +27,7 @@
     "app_target_swift_lines": 653523,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1076,
-    "first_party_swift_lines": 756120,
+    "first_party_swift_lines": 756118,
     "tests_sleep_calls": 67,
     "tests_testable_import_app_files": 340
   }
