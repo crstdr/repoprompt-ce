@@ -121,27 +121,8 @@ final class WindowStatePresentationVisibilityTests: XCTestCase {
         ))
     }
 
-    func testRunningArcAnimatesOnlyWhileVisibleAndMotionIsAllowed() {
-        XCTAssertEqual(
-            AgentRowActivityIndicatorMode.resolve(isWindowPresentationVisible: true, reduceMotion: false),
-            .animated
-        )
-        XCTAssertEqual(
-            AgentRowActivityIndicatorMode.resolve(isWindowPresentationVisible: false, reduceMotion: false),
-            .still
-        )
-        XCTAssertEqual(
-            AgentRowActivityIndicatorMode.resolve(isWindowPresentationVisible: true, reduceMotion: true),
-            .still
-        )
-        XCTAssertEqual(
-            AgentRowActivityIndicatorMode.resolve(isWindowPresentationVisible: false, reduceMotion: true),
-            .still
-        )
-    }
-
-    /// The still mode renders `AgentRowActivityArcShape` and the animated mode its layer-backed twin;
-    /// both take the same 15 pt frame and the same shared "Running" label, so the swap cannot change
+    /// Hidden and visible presentations use the same layer-backed arc and shared Running label;
+    /// both take the same 15 pt frame, so the visibility transition cannot change
     /// layout or what VoiceOver announces. SwiftUI does not materialize its accessibility tree for an
     /// off-screen test host, so the label is pinned through the shared constant; the layout is
     /// measured in a real hosting view.
