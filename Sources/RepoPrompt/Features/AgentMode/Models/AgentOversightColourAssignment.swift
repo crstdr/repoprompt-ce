@@ -44,10 +44,23 @@ struct AgentSessionOversightRole: Equatable {
     /// Derives the role from one published monitor projection. Inbound rows are deduplicated by
     /// overseer session (a duplicated incarnation shares one group) and sorted by link creation,
     /// so `overseers.first` is always the overseer whose colour the mark wears.
+    /// Link rows reduced to what role derivation needs — keeps this file off ViewModels-layer
+    /// pill props so the layering index stays clean.
+    struct OverseerLink {
+        var observerSessionID: UUID
+        var displayName: String
+        var linkID: UUID
+        var linkCreatedAt: Date?
+    }
+
+    struct OverseeingLink {
+        var displayName: String
+    }
+
     @MainActor
     static func make(
-        inbound: [AgentMonitorPillProps.Inbound],
-        outbound: [AgentMonitorPillProps.Outbound],
+        inbound: [OverseerLink],
+        outbound: [OverseeingLink],
         ownSessionID: UUID,
         slot: (UUID) -> Int
     ) -> AgentSessionOversightRole {

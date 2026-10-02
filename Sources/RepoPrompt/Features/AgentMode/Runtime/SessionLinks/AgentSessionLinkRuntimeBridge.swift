@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import RepoPromptDomainRuntime
@@ -88,6 +89,11 @@ struct AgentSessionLinkForkInheritanceSummary: Equatable {
 protocol AgentSessionLinkEndpointHost: AnyObject {
     /// All live compose-tab/session bindings across every non-closing window.
     func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate]
+
+    /// The `NSWindow` hosting a logical window ID, for alerts that should present as a sheet.
+    /// Lets Feature-layer UI reach a concrete window without touching App-layer types directly.
+    /// Default `nil` — hosts that do not own real windows present app-modally instead.
+    func agentSessionLinkSheetWindow(windowID: Int) -> NSWindow?
 
     func agentSessionLinkModelAvailability(windowID: Int) -> AgentModelCatalog.AvailabilityContext
 
@@ -508,6 +514,10 @@ extension AgentSessionLinkEndpointHost {
     func agentSessionLinkLaneCreatorLabel(
         for _: DomainAgentSessionLinkEndpointIdentity
     ) -> String? {
+        nil
+    }
+
+    func agentSessionLinkSheetWindow(windowID _: Int) -> NSWindow? {
         nil
     }
 
@@ -990,6 +1000,18 @@ final class AgentSessionLinkRuntimeBridge {
             self.continuation = nil
             continuation.resume(returning: completed)
         }
+    }
+
+    /// App-wide live candidates through the installed host, for Feature-layer callers that must
+    /// resolve a peer's live name without reaching the App-layer session store directly.
+    func agentSessionLinkAppWideCandidates() -> [AgentSessionLinkEndpointCandidate] {
+        host?.agentSessionLinkCandidates() ?? []
+    }
+
+    /// `NSWindow` for a logical window ID through the installed host — nil when absent or no host.
+    func agentSessionLinkSheetWindow(windowID: Int?) -> NSWindow? {
+        guard let windowID else { return nil }
+        return host?.agentSessionLinkSheetWindow(windowID: windowID)
     }
 
     private let authority: DomainAgentSessionLinkAuthority

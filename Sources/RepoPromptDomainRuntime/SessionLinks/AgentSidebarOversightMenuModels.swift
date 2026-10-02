@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptDomainRuntime
 
 /// Exact two-direction relationship choices rendered by one active Agent sidebar row.
 ///
@@ -11,8 +10,8 @@ import RepoPromptDomainRuntime
 /// `targetOptions` is the outbound direction (who this row oversees). Both carry linked
 /// entries even when the peer is temporarily missing or ineligible, so the user can always
 /// unlink a stale relationship.
-struct AgentSidebarOversightMenuProps: Equatable {
-    enum Relationship: Equatable {
+package struct AgentSidebarOversightMenuProps: Equatable {
+    package enum Relationship: Equatable {
         case available
         case linked(
             reference: DomainAgentSessionLinkReference,
@@ -22,31 +21,49 @@ struct AgentSidebarOversightMenuProps: Equatable {
 
     /// One exact peer incarnation in either direction. `peerEndpoint` is the other end of the
     /// link: the observer for `observerOptions`, the target for `targetOptions`.
-    struct PeerOption: Identifiable, Equatable {
-        let peerEndpoint: DomainAgentSessionLinkEndpointIdentity
-        let peerSessionID: UUID
-        let displayName: String
-        let providerDisplayName: String?
-        let menuLabel: String
-        let fullIdentityDescription: String
-        let relationship: Relationship
+    package struct PeerOption: Identifiable, Equatable {
+        package let peerEndpoint: DomainAgentSessionLinkEndpointIdentity
+        package let peerSessionID: UUID
+        package let displayName: String
+        package let providerDisplayName: String?
+        package let menuLabel: String
+        package let fullIdentityDescription: String
+        package let relationship: Relationship
 
-        var id: DomainAgentSessionLinkEndpointIdentity {
+        package init(
+            peerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+            peerSessionID: UUID,
+            displayName: String,
+            providerDisplayName: String?,
+            menuLabel: String,
+            fullIdentityDescription: String,
+            relationship: Relationship
+        ) {
+            self.peerEndpoint = peerEndpoint
+            self.peerSessionID = peerSessionID
+            self.displayName = displayName
+            self.providerDisplayName = providerDisplayName
+            self.menuLabel = menuLabel
+            self.fullIdentityDescription = fullIdentityDescription
+            self.relationship = relationship
+        }
+
+        package var id: DomainAgentSessionLinkEndpointIdentity {
             peerEndpoint
         }
 
         /// Compatibility spelling for the inbound direction (the peer is an observer).
-        var observerEndpoint: DomainAgentSessionLinkEndpointIdentity {
+        package var observerEndpoint: DomainAgentSessionLinkEndpointIdentity {
             peerEndpoint
         }
 
         /// Compatibility spelling for the outbound direction (the peer is a target).
-        var targetEndpoint: DomainAgentSessionLinkEndpointIdentity {
+        package var targetEndpoint: DomainAgentSessionLinkEndpointIdentity {
             peerEndpoint
         }
     }
 
-    init(
+    package init(
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID,
         targetDisplayName: String,
@@ -74,94 +91,94 @@ struct AgentSidebarOversightMenuProps: Equatable {
         self.creatorSessionID = creatorSessionID
     }
 
-    typealias ObserverOption = PeerOption
-    typealias TargetOption = PeerOption
+    package typealias ObserverOption = PeerOption
+    package typealias TargetOption = PeerOption
 
     /// The row's own exact endpoint. It is the *target* for `observerOptions` and the
     /// *observer* for `targetOptions`.
-    let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
-    let targetSessionID: UUID
-    let targetDisplayName: String
+    package let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+    package let targetSessionID: UUID
+    package let targetDisplayName: String
 
     /// Oversee-by list: linked observers retained for unlinking, plus available candidates
     /// that already hold an outbound link (the existing-overseer rule, enforced again at Add).
-    let observerOptions: [PeerOption]
+    package let observerOptions: [PeerOption]
     /// Oversee list: linked targets retained for unlinking, plus eligible target candidates.
     /// Empty when the row cannot currently observe (see `observerIneligibleReason`).
-    let targetOptions: [PeerOption]
+    package let targetOptions: [PeerOption]
 
     /// Why the row cannot currently accept a new inbound link, or `nil` when it can.
     /// Rendered greyed-out in the Oversee-by menu instead of hiding the menu.
-    let targetIneligibleReason: String?
+    package let targetIneligibleReason: String?
     /// Why the row cannot currently observe other sessions, or `nil` when it can. Includes
     /// the persistence blocker (it wins over lifecycle eligibility, matching `canAddReason`).
-    var observerIneligibleReason: String?
+    package var observerIneligibleReason: String?
 
     /// Display names of the row's current overseers / targets, for the row mark tooltips.
     /// Derived from the authority inventories, so they remain correct even when the menu
     /// options are momentarily empty.
-    let inboundObserverNames: [String]
-    let inboundObserverSessionIDs: [UUID]
-    let outboundTargetNames: [String]
+    package let inboundObserverNames: [String]
+    package let inboundObserverSessionIDs: [UUID]
+    package let outboundTargetNames: [String]
 
-    var createdByLabel: String?
-    var creatorSessionID: UUID?
+    package var createdByLabel: String?
+    package var creatorSessionID: UUID?
 
-    var linkedObservers: [ObserverOption] {
+    package var linkedObservers: [ObserverOption] {
         observerOptions.filter {
             if case .linked = $0.relationship { return true }
             return false
         }
     }
 
-    var availableObservers: [ObserverOption] {
+    package var availableObservers: [ObserverOption] {
         observerOptions.filter { $0.relationship == .available }
     }
 
-    var linkedTargets: [TargetOption] {
+    package var linkedTargets: [TargetOption] {
         targetOptions.filter {
             if case .linked = $0.relationship { return true }
             return false
         }
     }
 
-    var availableTargets: [TargetOption] {
+    package var availableTargets: [TargetOption] {
         targetOptions.filter { $0.relationship == .available }
     }
 
     /// True when the row's creator still holds an inbound link — the Overseen-by section
     /// collapses to `Created and overseen by:` when it is the row's only overseer.
-    var creatorIsOverseer: Bool {
+    package var creatorIsOverseer: Bool {
         creatorSessionID != nil
             && linkedObservers.contains { $0.peerSessionID == creatorSessionID }
     }
 
-    var creatorIsSoleOverseer: Bool {
+    package var creatorIsSoleOverseer: Bool {
         creatorIsOverseer && linkedObservers.count == 1
     }
 
     /// The separate `Created by:` section appears only when the creator is not (or no
     /// longer) an overseer — otherwise it is already in the Overseen-by list.
-    var showsCreatedBySection: Bool {
+    package var showsCreatedBySection: Bool {
         createdByLabel != nil && creatorSessionID != nil && !creatorIsOverseer
     }
 
-    var hasInbound: Bool {
+    package var hasInbound: Bool {
         !linkedObservers.isEmpty || !inboundObserverNames.isEmpty
     }
 
-    var isOverseer: Bool {
+    package var isOverseer: Bool {
         !outboundTargetNames.isEmpty
     }
 
-    var isEmpty: Bool {
+    package var isEmpty: Bool {
         observerOptions.isEmpty && targetOptions.isEmpty
     }
 
     /// Returns a copy whose observer-eligibility reason has been overlaid, used by
     /// `AgentMonitorPillProps.withPersistence` so the persistence blocker reaches the
     /// sidebar's inverse menu with the same precedence it has on the pill's Add control.
-    func withObserverIneligibleReason(_ reason: String?) -> AgentSidebarOversightMenuProps {
+    package func withObserverIneligibleReason(_ reason: String?) -> AgentSidebarOversightMenuProps {
         guard reason != observerIneligibleReason else { return self }
         var copy = self
         copy.observerIneligibleReason = reason
@@ -171,31 +188,35 @@ struct AgentSidebarOversightMenuProps: Equatable {
 
 /// User-facing failure text for the sidebar's pasted-ID resolvers. The resolvers speak plain
 /// message strings (existing resolver and eligibility copy); this wrapper lets `Result` carry them.
-struct AgentOversightResolutionMessage: Error, Equatable {
-    let message: String
+package struct AgentOversightResolutionMessage: Error, Equatable {
+    package let message: String
+
+    package init(message: String) {
+        self.message = message
+    }
 }
 
 /// Resolution outcome for the sidebar Session-ID sheets. `.alreadyLinked` means the pair is
 /// already linked in this direction: the sheet closes silently — no dialog, no message.
-enum AgentOversightSessionIDResolution: Equatable {
+package enum AgentOversightSessionIDResolution: Equatable {
     case candidate(AgentSessionLinkEndpointCandidate)
     case alreadyLinked
 }
 
 /// Result of one exact sidebar relationship action.
-enum AgentSidebarOversightActionOutcome: Equatable {
+package enum AgentSidebarOversightActionOutcome: Equatable {
     case changed
     case alreadyInRequestedState
     case failed(message: String)
 
-    var failureMessage: String? {
+    package var failureMessage: String? {
         guard case let .failed(message) = self else { return nil }
         return message
     }
 }
 
 /// Exact row-local busy identity. Unrelated relationships may mutate concurrently.
-enum AgentSidebarOversightActionKey: Hashable {
+package enum AgentSidebarOversightActionKey: Hashable {
     case add(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -219,7 +240,7 @@ enum AgentSidebarOversightActionKey: Hashable {
 /// sorts first, then the rest by folded display name; the outbound list additionally keeps its
 /// linked (ticked) entries first. Ineligible directions produce a greyed reason instead of a
 /// hidden menu.
-enum AgentSidebarOversightMenuProjection {
+package enum AgentSidebarOversightMenuProjection {
     private struct Seed {
         let peerEndpoint: DomainAgentSessionLinkEndpointIdentity
         let peerSessionID: UUID
@@ -248,7 +269,7 @@ enum AgentSidebarOversightMenuProjection {
 
     private static let foldingLocale = Locale(identifier: "en_US_POSIX")
 
-    static func make(
+    package static func make(
         target: AgentSessionLinkEndpointCandidate,
         inputs: DomainAgentSessionLinkEndpointProjectionInputs,
         candidates: [AgentSessionLinkEndpointCandidate],

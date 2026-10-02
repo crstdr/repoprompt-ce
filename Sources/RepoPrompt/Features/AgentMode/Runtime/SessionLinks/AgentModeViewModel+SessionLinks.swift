@@ -936,8 +936,15 @@ extension AgentModeViewModel {
         }
         let allocator = agentOversightColourAllocator
         return AgentSessionOversightRole.make(
-            inbound: props.inbound,
-            outbound: props.outbound,
+            inbound: props.inbound.map {
+                .init(
+                    observerSessionID: $0.observerSessionID,
+                    displayName: $0.displayName,
+                    linkID: $0.linkID,
+                    linkCreatedAt: $0.linkCreatedAt
+                )
+            },
+            outbound: props.outbound.map { .init(displayName: $0.displayName) },
             ownSessionID: props.sessionID ?? expectedSessionID,
             slot: { allocator.slot(for: $0) }
         )

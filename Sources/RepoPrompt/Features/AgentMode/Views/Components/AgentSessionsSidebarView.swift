@@ -585,8 +585,8 @@ struct AgentModeSessionsListView: View {
                                     )
                                 }
                             }
-                        // Hoisted into locals so the row's long memberwise call stays inside the
-                        // type-checker's time budget.
+                        // Hoisted into locals so the row's long memberwise call stays
+                        // inside the type-checker's time budget.
                         let resolveOverseerCandidate: (@MainActor (String) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)? = {
                             raw in
                             guard let rowSessionID = session.sessionID else {
@@ -726,8 +726,17 @@ struct AgentModeSessionsListView: View {
                             },
                             resolveOverseerSessionIDCandidate: resolveOverseerCandidate,
                             resolveTargetSessionIDCandidate: resolveTargetCandidate,
-                            onOpenLinkedSession: { route in
-                                Task { await AppDeepLinkRouter.shared.route(agentSession: route) }
+                            onOpenLinkedSession: { endpoint in
+                                Task {
+                                    await AppDeepLinkRouter.shared.route(
+                                        agentSession: AgentSessionDeepLinkRoute(
+                                            windowID: endpoint.windowID,
+                                            workspaceID: endpoint.workspaceID,
+                                            tabID: endpoint.tabID,
+                                            sessionID: endpoint.sessionID
+                                        )
+                                    )
+                                }
                             },
                             sessionIDCopyAction: .systemClipboard(sessionID: session.sessionID)
                         )
@@ -1640,7 +1649,8 @@ struct ArchivedSessionsList: View {
                     onDelete: { deleteArchived(stashed) },
                     sessionIDCopyAction: .systemClipboard(
                         sessionID: sessionIDByStashedTabID[stashed.id]
-                    )
+                    ),
+                    metrics: AgentStashedSessionRowMetrics(fontPreset: fontPreset)
                 )
             }
             if hasMore {
@@ -1658,5 +1668,23 @@ struct ArchivedSessionsList: View {
             }
         }
         .padding(.top, fontPreset.scaledClamped(4, max: 6))
+    }
+}
+
+// MARK: - Stashed Row Metrics
+
+extension AgentStashedSessionRowMetrics {
+    /// The sidebar owns the App-layer font managers; the row file itself stays free of them.
+    init(fontPreset: FontScalePreset) {
+        rowMinHeight = fontPreset.scaledClamped(30, min: 30, max: 40)
+        rowHorizontalPadding = fontPreset.scaledClamped(10, max: 14)
+        rowVerticalPadding = fontPreset.scaledClamped(6, max: 8)
+        rowCornerRadius = fontPreset.scaledClamped(16, max: 20)
+        rowSpacing = fontPreset.scaledClamped(8, max: 11)
+        titlePinSpacing = fontPreset.scaledClamped(6, max: 8)
+        titleVStackSpacing = fontPreset.scaledClamped(2, max: 3)
+        leadingIconSize = fontPreset.scaledClamped(12, max: 15)
+        pinIconSize = fontPreset.scaledClamped(10, max: 13)
+        titleFont = fontPreset.swiftUIFont(sizeAtNormal: 13)
     }
 }

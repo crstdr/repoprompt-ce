@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptDomainRuntime
 
 /// The shared UI confirmation gate for user-created oversight links.
 ///
@@ -75,10 +76,8 @@ enum AgentOversightLinkConfirmation {
         _ alert: NSAlert,
         windowID: Int?
     ) async -> NSApplication.ModalResponse {
-        let window = windowID.flatMap { id in
-            WindowStatesManager.shared.allWindows
-                .first(where: { $0.windowID == id })?.nsWindow
-        }
+        let window = AgentSessionLinkRuntimeBridge.shared
+            .agentSessionLinkSheetWindow(windowID: windowID)
         guard let window, !window.isSheet, window.attachedSheet == nil else {
             return alert.runModal()
         }

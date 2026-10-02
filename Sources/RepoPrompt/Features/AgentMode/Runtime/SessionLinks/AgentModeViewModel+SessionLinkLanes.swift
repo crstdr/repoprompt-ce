@@ -226,7 +226,7 @@ extension AgentModeViewModel {
         // Names resolve app-wide like the candidate lists: a creator live in any window names
         // itself even when this window's index has no entry for it yet. The persisted index and
         // then the compact ID follow for non-live or truly unknown sessions.
-        if let liveName = WindowStatesManager.shared.agentSessionLinkCandidates()
+        if let liveName = AgentSessionLinkRuntimeBridge.shared.agentSessionLinkAppWideCandidates()
             .first(where: { $0.sessionID == creatorID })?.resolvedDisplayName
         {
             return liveName
