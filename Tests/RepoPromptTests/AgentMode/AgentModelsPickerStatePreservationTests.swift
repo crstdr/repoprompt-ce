@@ -206,6 +206,81 @@ final class AgentModelsPickerStatePreservationTests: XCTestCase {
 /// the hosted `StableMenuButton` mid-track must not dismiss it — that was the
 /// sidebar oversight menu's disappearing-list defect. Closing the presenting
 /// window must still release the menu so a gone window cannot orphan it.
+/// A transparent `StableMenuButton` label must still receive clicks — the
+/// oversight mark's clear overlay depends on it (regression: `Color.clear`
+/// alone produces no hit region, so the eye mark's menu never opened).
+@MainActor
+final class StableMenuClickTargetTests: XCTestCase {
+    private struct MarkRow: View {
+        let onMarkTap: () -> Void
+        var body: some View {
+            HStack(spacing: 4) {
+                Image(systemName: "eye.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .accessibilityHidden(true)
+                    .overlay {
+                        StableMenuButton(
+                            items: { [.action("Pinned") {}] },
+                            triggerStyle: .plain,
+                            onOpen: { onMarkTap() }
+                        ) { Color.clear.contentShape(Rectangle()) }
+                    }
+                    .fixedSize()
+                Text("title")
+            }
+            .frame(width: 200, height: 40)
+            .contentShape(Rectangle())
+            .onTapGesture { }
+        }
+    }
+
+    func testClearLabelMarkButtonReceivesClick() {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(x: 200, y: 200, width: 200, height: 40),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        var markTapped = false
+        let hosting = NSHostingView(rootView: MarkRow(onMarkTap: { markTapped = true }))
+        window.contentView = hosting
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        hosting.layoutSubtreeIfNeeded()
+
+        // Locate the mark's hit region: the anchor view sits inside the overlay.
+        var target: NSView?
+        func walk(_ v: NSView) {
+            if NSStringFromClass(type(of: v)).contains("FocusRing") { target = v }
+            v.subviews.forEach(walk)
+        }
+        walk(hosting)
+        let point = target.map { $0.convert(NSPoint(x: $0.bounds.midX, y: $0.bounds.midY), to: nil) }
+            ?? NSPoint(x: 100, y: 20)
+
+        guard let down = NSEvent.mouseEvent(
+            with: .leftMouseDown, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 0
+        ), let up = NSEvent.mouseEvent(
+            with: .leftMouseUp, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 1, clickCount: 1, pressure: 0
+        ) else { return XCTFail("could not synthesize click") }
+        window.sendEvent(down)
+        // The action presents synchronously during dispatch; cancel tracking on the
+        // next turn so the test does not wait out the tracking session.
+        DispatchQueue.main.async {
+            window.stableMenuPresenter.openMenu?.cancelTracking()
+        }
+        window.sendEvent(up)
+        XCTAssertTrue(markTapped, "transparent-label mark button did not receive the click")
+        window.stableMenuPresenter.openMenu?.cancelTracking()
+    }
+}
+
 @MainActor
 final class StableMenuLifetimeTests: XCTestCase {
     private struct TriggerRow: View {

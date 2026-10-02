@@ -911,7 +911,10 @@ struct AgentSessionRow: View {
                         items: sidebarOversightStableMenuItems,
                         triggerStyle: .plain
                     ) {
-                        Color.clear
+                        // `Color.clear` produces no hit region, which left the
+                        // mark's overlay button unclickable — the explicit shape
+                        // keeps it transparent AND clickable.
+                        Color.clear.contentShape(Rectangle())
                     }
                     .accessibilityLabel(tooltip)
                     .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
