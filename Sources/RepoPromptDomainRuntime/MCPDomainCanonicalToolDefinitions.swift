@@ -1335,7 +1335,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                 )
             let oldStartDescription = "Pass `detach: true` to return immediately."
             let currentStartDescription = oldStartDescription
-                + " Start: setup ≤150s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
+                + " Start: setup ≤900s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
             let startDescription = description.contains(currentStartDescription)
                 ? description
                 : description.replacingOccurrences(of: oldStartDescription, with: currentStartDescription)

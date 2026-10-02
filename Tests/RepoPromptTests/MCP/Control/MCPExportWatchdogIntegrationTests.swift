@@ -63,8 +63,8 @@ import XCTest
                         ])
                     }
                     try await preserveGate.waitUntilEntered(count: 1)
-                    try await clock.waitForSleeper(expected: .seconds(150))
-                    try await clock.advanceSleeper(expected: .seconds(150))
+                    try await clock.waitForSleeper(expected: .seconds(900))
+                    try await clock.advanceSleeper(expected: .seconds(900))
                     try await clock.waitForSleeper(expected: .seconds(5))
                     try await clock.advanceSleeper(expected: .seconds(5))
                     let payload = try await Self.toolResultObject(task.value)
@@ -100,7 +100,7 @@ import XCTest
                 let server = fixture.contextA.window.mcpServer
                 let clock = MCPExportWatchdogManualClock()
                 server.test_shouldPreserveAgentRunSourceBinding = { _, _ in
-                    try? await clock.advanceWithoutSleepers(by: .seconds(150))
+                    try? await clock.advanceWithoutSleepers(by: .seconds(900))
                     return false
                 }
                 do {
@@ -290,8 +290,8 @@ import XCTest
                         ])
                     }
                     try await gate.waitUntilEntered(count: 1)
-                    try await clock.waitForSleeper(expected: .seconds(150))
-                    try await clock.advanceSleeper(expected: .seconds(150))
+                    try await clock.waitForSleeper(expected: .seconds(900))
+                    try await clock.advanceSleeper(expected: .seconds(900))
                     try await clock.waitForSleeper(expected: .seconds(5))
                     try await clock.advanceSleeper(expected: .seconds(5))
                     let payload = try await Self.toolResultObject(task.value)

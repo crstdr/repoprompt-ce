@@ -22,7 +22,7 @@ final class DirectHeadlessCompositionTests: XCTestCase {
 
     func testEffectiveHeadlessCatalogAdvertisesStartDeadlineExactlyOnce() throws {
         let run = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentRun))
-        let sentence = "Start: setup ≤150s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
+        let sentence = "Start: setup ≤900s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
         XCTAssertEqual(run.description.components(separatedBy: sentence).count - 1, 1)
     }
 
