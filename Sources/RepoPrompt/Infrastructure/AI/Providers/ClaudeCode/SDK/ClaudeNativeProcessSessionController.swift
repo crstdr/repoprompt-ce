@@ -549,6 +549,7 @@ final actor ClaudeNativeProcessSessionController {
             }
             guard lifetime == configurationLifetime else { return .superseded }
             guard hasActiveSession, isInitialized, !isShuttingDown else { return .notReady }
+            if resolved.request != nil { appliedConfigurationProof = nil }
             guard intentGeneration == latestFlagSettingsIntentGeneration,
                   requestGeneration == flagSettingsRequestGeneration
             else { return resolved.request == nil ? .superseded : .appliedButSuperseded }

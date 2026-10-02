@@ -244,7 +244,14 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             XCTAssertEqual(superseded, .appliedButSuperseded)
             XCTAssertEqual(writes.count, 0)
             guard case let .applied(proof) = latest else { return XCTFail("Latest application must be current") }
-            _ = try await controller.sendUserMessage("current", configuration: proof)
+            do {
+                _ = try await controller.sendUserMessage("tainted", configuration: proof)
+                XCTFail("A landed stale write must invalidate even the newer proof")
+            } catch NativeAgentRuntimeControllerError.configurationNotCurrent {}
+            XCTAssertEqual(writes.count, 0)
+            guard case let .applied(restored) = try await controller.applyModelAndEffortWithProof(model: "A", effortLevel: .high)
+            else { return XCTFail("The next turn must re-establish its configuration") }
+            _ = try await controller.sendUserMessage("current", configuration: restored)
             XCTAssertEqual(writes.count, 1)
         }
     }

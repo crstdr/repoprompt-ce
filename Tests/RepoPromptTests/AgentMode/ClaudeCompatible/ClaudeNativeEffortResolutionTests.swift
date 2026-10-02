@@ -409,6 +409,54 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         try assertLastAppliedEffort(applied, equals: "high")
     }
 
+    @MainActor
+    func testSupersededLandedAutoWriteRestoresAfterSuccessfulNewerPicker() async throws {
+        let controller = controller()
+        let autoGate = ApplicationGate()
+        let controls = Writes()
+        let applied = Writes()
+        let writes = Writes()
+        await controller.test_installConfigurationTransport(controlRequest: { request in
+            let data = try JSONSerialization.data(withJSONObject: request)
+            controls.append(data)
+            if (request["settings"] as? [String: Any])?["effortLevel"] as? String == "low" {
+                await autoGate.pause()
+            }
+            applied.append(data)
+            return [:]
+        }, write: { writes.append($0) })
+        let (coordinator, session, intent) = fixture(controller)
+        let auto = Task {
+            await coordinator.sendClaudeNativeMessage(
+                session: session, text: "Superseded Auto turn", attachments: [], intent: intent,
+                allowsCatalogRouteControllerRecovery: false,
+                autoEffortSelection: .init(
+                    provider: .claudeCode, selectedModelRaw: session.selectedModelRaw,
+                    manualEffortRaw: "high", effortRaw: "low"
+                )
+            )
+        }
+        defer { auto.cancel()
+            autoGate.resume()
+        }
+        try await autoGate.waitUntilEntered()
+        await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test.newer-picker")
+        try assertLastAppliedEffort(applied, equals: "high")
+        autoGate.resume()
+        let outcome = await auto.value
+        guard case .failed = outcome else { return XCTFail("Superseded Auto must not send: \(outcome)") }
+        XCTAssertEqual(writes.count, 0)
+        try assertLastAppliedEffort(applied, equals: "low")
+        let manual = await coordinator.sendClaudeNativeMessage(
+            session: session, text: "Manual turn", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        XCTAssertEqual(manual, .sent)
+        XCTAssertEqual(controls.count, 3, "A landed but superseded Auto write still needs manual restoration")
+        XCTAssertEqual(writes.count, 1)
+        try assertLastAppliedEffort(applied, equals: "high")
+    }
+
     private func assertLastAppliedEffort(_ applied: Writes, equals expected: String) throws {
         let data = try XCTUnwrap(applied.line(at: applied.count - 1))
         let request = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
