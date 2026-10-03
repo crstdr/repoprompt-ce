@@ -15,7 +15,7 @@ final class AgentModeMCPToolAdvertisementPolicyTests: XCTestCase {
         defer { server.stopServiceObservation() }
         let tools = await server.windowMCPTools
         let run = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentRun })
-        let sentence = "Start: setup ≤150s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
+        let sentence = "Start: setup ≤900s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
         XCTAssertEqual(run.description.components(separatedBy: sentence).count - 1, 1)
     }
 
