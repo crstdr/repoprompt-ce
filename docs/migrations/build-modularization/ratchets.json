@@ -1,12 +1,12 @@
 {
-  "description": "Build-modularization ratchet baselines. Ratcheted metrics may only decrease; regenerate with `python3 Scripts/modularization_metrics.py update` after an improving slice. Explicitly approved creation/activation repair requires a minimal +88-line allowance after current-main integration, setting the app-line ceiling to 651794 with unchanged 2000-line headroom. Explicitly approved hidden agent_self compatibility adds exactly +25 to the app-line baseline, setting the final ceiling to 651819; existing headroom and all other metrics are unchanged.",
+  "description": "Upstream sync 2026-10-03: upstream a877f1ea baselines plus the existing fork b73d3f03 delta over its last upstream merge base da5bf805; fork zero app-line headroom retained. Hidden agent_self compatibility carries the same explicitly approved +25 app-line baseline adjustment as upstream PR #1178 at 84fbbac3; all other fork baseline values and headroom metadata are retained.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
     "tests_testable_import_app_files",
     "app_static_shared_declarations"
   ],
-  "app_target_swift_lines_headroom": 2000,
+  "app_target_swift_lines_headroom": 0,
   "tracked": [
     "app_target_swift_lines",
     "app_shared_accessor_uses",
@@ -20,15 +20,15 @@
     "app_files_over_2000_lines": 53,
     "app_files_over_5000_lines": 17,
     "app_largest_cycle_components": 64,
-    "app_share_permille": 868,
-    "app_shared_accessor_uses": 1218,
+    "app_share_permille": 864,
+    "app_shared_accessor_uses": 1256,
     "app_static_shared_declarations": 94,
-    "app_target_swift_files": 1126,
-    "app_target_swift_lines": 649819,
+    "app_target_swift_files": 1139,
+    "app_target_swift_lines": 653624,
     "app_userdefaults_standard_uses": 234,
-    "app_wrong_way_file_edges": 1079,
-    "first_party_swift_lines": 747202,
-    "tests_sleep_calls": 59,
-    "tests_testable_import_app_files": 332
+    "app_wrong_way_file_edges": 1076,
+    "first_party_swift_lines": 756106,
+    "tests_sleep_calls": 67,
+    "tests_testable_import_app_files": 340
   }
 }

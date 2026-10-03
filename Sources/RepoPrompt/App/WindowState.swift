@@ -240,6 +240,9 @@ class WindowState: ObservableObject {
     /// decorative animation in hidden windows. `true` until an attached window is sampled.
     @Published private(set) var isPresentationVisible: Bool = true
 
+    /// Test seam for the on-screen sample; production reads the attached `NSWindow`.
+    var presentationVisibilitySampler: @MainActor (NSWindow) -> Bool = WindowPresentationVisibility.sample
+
     private var presentationVisibilityCancellables = Set<AnyCancellable>()
     private weak var presentationVisibilityObservedWindow: NSWindow?
 
@@ -803,7 +806,9 @@ class WindowState: ObservableObject {
             schedulePresentationVisibilityUpdate(from: nil)
             return
         }
-        guard let window else { return }
+        // A deferred WindowAccessor callback can deliver the first attach after `beginClose()`;
+        // reinstalling observers then would leak them, since `beginClose` is idempotent.
+        guard let window, !isClosing else { return }
 
         if nsWindow === window {
             configureWindowChrome(for: window)
@@ -941,6 +946,12 @@ class WindowState: ObservableObject {
         presentationVisibilityObservedWindow = nil
     }
 
+    #if DEBUG
+        var debugPresentationVisibilityObserverCount: Int {
+            presentationVisibilityCancellables.count
+        }
+    #endif
+
     /// Samples after a yield so a notification delivered mid-update never publishes in place, and
     /// only for the window still attached; `nil` (detached) restores the unknown-is-visible default.
     private func schedulePresentationVisibilityUpdate(from window: NSWindow?) {
@@ -953,7 +964,7 @@ class WindowState: ObservableObject {
             let visible: Bool
             if let window {
                 guard nsWindow === window else { return }
-                visible = WindowPresentationVisibility.sample(window)
+                visible = presentationVisibilitySampler(window)
             } else {
                 guard nsWindow == nil else { return }
                 visible = true
@@ -2573,6 +2584,7 @@ class WindowState: ObservableObject {
         // memory and prevent stale windows from multiplying catalog snapshot work.
         domainWorkspacePresentationBridge?.stop()
         await mcpServer.unregisterDomainRoutingWindow()
+        mcpServer.stopServiceObservation()
 
         // App-level termination already coordinates agent/session and MCP shutdown.
         // Skip duplicate per-window teardown work on quit so close latency stays bounded.

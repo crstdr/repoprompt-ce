@@ -875,6 +875,39 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         )
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:send"))
     }
+
+    /// A stopped compaction must stay cancelled: the watchdog observes the terminal state
+    /// and never resurrects or retries the compact request.
+    func testStoppedCodexCompactionDoesNotResurrectThroughTheStallWatchdog() async throws {
+        let fixture = try makeFixture(
+            agent: .codexExec,
+            codexStallWatchdogProbeThreshold: 0.05,
+            codexStallWatchdogRecoveryThreshold: 0.25,
+            codexStallWatchdogPollIntervalNanos: 10_000_000,
+            codexSnapshotLatestTurnStatus: .completed
+        )
+        fixture.session.codexConversationID = "lifecycle"
+
+        let outcome = await compact(fixture)
+
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("Expected an accepted Codex compaction, got \(outcome)")
+        }
+        XCTAssertEqual(delivery.deliveryState, .runStarted)
+        XCTAssertEqual(fixture.session.runState, .running)
+
+        await fixture.viewModel.cancelAgentRun(tabID: fixture.tabID)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+
+        // Well past the probe + recovery bound; the lane must remain cancelled.
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        XCTAssertEqual(
+            fixture.codexRecorder.events.count(where: { $0 == "codex:compact" }),
+            1,
+            "A stopped compaction is never retried"
+        )
+    }
 }
 
 /// The raw provider-command lane of the Claude coordinator, driven directly.

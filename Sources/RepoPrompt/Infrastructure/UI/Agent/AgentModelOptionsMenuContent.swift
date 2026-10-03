@@ -1,5 +1,21 @@
 import SwiftUI
 
+enum AgentModelMenuTitle {
+    static func displayName(for option: AgentModelOption, agentKind: AgentProviderKind) -> String {
+        guard agentKind == .devin else { return option.displayName }
+        return devinDisplayName(rawValue: option.rawValue, baseName: option.displayName)
+    }
+
+    static func displayName(for model: AIModel) -> String {
+        guard case let .devinCustom(rawValue) = model else { return model.displayName }
+        return devinDisplayName(rawValue: rawValue, baseName: model.displayName)
+    }
+
+    private static func devinDisplayName(rawValue: String, baseName: String) -> String {
+        DevinModelCatalog.current.entry(matching: rawValue)?.option.displayName ?? baseName
+    }
+}
+
 enum AgentModelSelectionWarningVisuals {
     static let iconSystemName = "bolt.fill"
     static let warningTooltip = "Fast Codex model selected: uses your usage limits about 2× faster."
@@ -145,7 +161,10 @@ struct AgentModelOptionsMenuContent: View {
         } label: {
             let showsWarning = AgentModelSelectionWarningVisuals.showsWarning(agent: agentKind, rawModel: option.rawValue)
             HStack {
-                warningAwareMenuLabel(title: title ?? option.displayName, showsWarning: showsWarning)
+                warningAwareMenuLabel(
+                    title: title ?? AgentModelMenuTitle.displayName(for: option, agentKind: agentKind),
+                    showsWarning: showsWarning
+                )
                 if selectedAgent == agentKind, AgentModelCatalog.modelOptionIsSelected(
                     optionRaw: option.rawValue,
                     selectedRaw: selectedModelRaw,
@@ -426,7 +445,7 @@ enum AgentModelStableMenuItems {
         onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
     ) -> StableMenuItem {
         StableMenuItem.action(
-            title ?? option.displayName,
+            title ?? AgentModelMenuTitle.displayName(for: option, agentKind: agentKind),
             isSelected: selectedAgent == agentKind && AgentModelCatalog.modelOptionIsSelected(
                 optionRaw: option.rawValue,
                 selectedRaw: selectedModelRaw,

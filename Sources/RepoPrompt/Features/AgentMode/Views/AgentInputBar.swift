@@ -966,7 +966,7 @@ struct AgentComposerView: View, Equatable {
             agentKind: agent
         )
         return StableMenuItem.action(
-            title ?? model.displayName,
+            title ?? AgentModelMenuTitle.displayName(for: model, agentKind: agent),
             isEnabled: true,
             isSelected: isSelected,
             imageSystemName: AgentModelSelectionWarningVisuals.stableMenuImageSystemName(agent: agent, rawModel: model.rawValue),

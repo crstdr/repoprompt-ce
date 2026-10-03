@@ -291,7 +291,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
     }
 
-    func testWithdrawnManagementAtTheFenceDeliversNothing() async throws {
+    func testMissingManagementAtTheFenceDeliversNothing() async throws {
         let fixture = try makeFixture()
         makeRunning(fixture)
 

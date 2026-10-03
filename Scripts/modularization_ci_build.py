@@ -8,8 +8,10 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
+from ci_app_test_runner import isolated_suite_environment
 from modularization_ci_artifact import test_source_hashes
 from swift_imports import sources_import_module
 from ci_test_coverage import listed_tests, validate_targets
@@ -94,8 +96,12 @@ def main() -> int:
         print('CI shard direct XCTest runner cannot run Swift Testing; add a separate runner before introducing it',
               file=sys.stderr)
         return 1
-    listing = subprocess.run(['swift', 'test', 'list', '--skip-build'], cwd=ROOT,
-                             capture_output=True, text=True)
+    # Listing loads the test bundle and runs its sandbox preflight constructor.
+    # Keep compilation in the developer environment; isolate only discovery.
+    with tempfile.TemporaryDirectory(prefix='rpce-ci-test-list-') as directory:
+        listing = subprocess.run(['swift', 'test', 'list', '--skip-build'], cwd=ROOT,
+                                 capture_output=True, text=True,
+                                 env=isolated_suite_environment(Path(directory), 'list'))
     if listing.returncode:
         print(listing.stderr, file=sys.stderr)
         return listing.returncode

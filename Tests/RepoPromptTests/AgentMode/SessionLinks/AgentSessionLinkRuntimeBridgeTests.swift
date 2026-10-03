@@ -56,6 +56,24 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             async throws -> AgentSessionLaneHostCreationOutcome
         )?
         var laneProvenance: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
+        var creatorLabelLookupCount = 0
+        var creatorNameConsumers: [AgentModeViewModel] = []
+        var creatorNameSnapshot: [UUID: String] = [:]
+
+        func agentSessionLinkPublishCreatorNames(_ names: [UUID: String]) {
+            creatorNameSnapshot = names
+            for consumer in creatorNameConsumers {
+                consumer.agentSessionLinkPublishCreatorNames(names)
+            }
+        }
+
+        func agentSessionLinkLaneCreatorLabel(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity
+        ) -> String? {
+            creatorLabelLookupCount += 1
+            return "Fallback creator"
+        }
+
         var hiddenBindingsBySessionID: [UUID: Int] = [:]
         var activeChildSessionIDsByParent: [UUID: Set<UUID>] = [:]
         var persistedActiveChildSessionIDsByParent: [UUID: Set<UUID>] = [:]
@@ -418,6 +436,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
         ) async -> AgentSessionLinkStopTransactionOutcome {
             stopRequests.append((candidate, request))
+            let admissionLiveness = liveness()
+            stopLivenessReadings.append(admissionLiveness)
+            guard admissionLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
             if routeStopToInteractionViewModel, let interactionViewModel {
                 return await interactionViewModel.agentSessionLinkPerformStop(
                     to: candidate, request: request, liveness: liveness,
@@ -425,9 +446,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                     withdrawInbound: withdrawInbound, commitAuthorization: commitAuthorization
                 )
             }
-            let admissionLiveness = liveness()
-            stopLivenessReadings.append(admissionLiveness)
-            guard admissionLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
             await beforeSendCommit?()
             let commit = await commitAuthorization()
             sendCommitOutcomes.append(commit)
@@ -2061,7 +2079,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         XCTAssertEqual(menu.availableObservers.map(\.observerEndpoint), [availableObserver.domainEndpoint])
         XCTAssertTrue(menu.linkedObservers.allSatisfy { option in
-            guard case .linked(_, observerCurrentlyEligible: true) = option.relationship else {
+            guard case .linked(_, peerCurrentlyEligible: true) = option.relationship else {
                 return false
             }
             return true
@@ -2074,6 +2092,322 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fixture.host.publishedPropsByEndpoint[fixture.observer.domainEndpoint]?
                 .outbound.first?.targetEndpoint,
             fixture.target.domainEndpoint
+        )
+    }
+
+    func testRepeatedCreatorRowReadsDoNotDiscoverCandidates() async throws {
+        let viewModel = AgentModeViewModel(
+            testWindowID: 92,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let tabID = UUID()
+        let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: viewModel, tabID: tabID, name: "Row read fixture")
+        defer { withExtendedLifetime(manager) {} }
+        let session = viewModel.session(for: tabID)
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let creator = makeCandidate(windowID: 93, displayName: "Remote creator")
+        session.createdByOverseerSessionID = creator.sessionID
+        let host = FakeEndpointHost()
+        host.candidates = [creator]
+        host.creatorNameConsumers = [viewModel]
+        AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        AgentSessionLinkRuntimeBridge.shared.noteCandidateReadinessChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        let readsBefore = host.candidateReadCount
+        for _ in 0 ..< 100 {
+            XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.label, "Remote creator")
+            XCTAssertEqual(viewModel.agentSidebarLaneCreator(
+                tabID: tabID,
+                expectedSessionID: sessionID,
+                names: viewModel.sidebarCreatorDisplayNames,
+                archived: true
+            )?.sessionID, creator.sessionID)
+        }
+        XCTAssertEqual(
+            host.candidateReadCount,
+            readsBefore,
+            "Settled row reads must not enumerate app-wide candidates"
+        )
+    }
+
+    func testCreatorNameSourceRenameCloseAndReappearanceArePresentationOnly() async {
+        let fixture = makeFixture()
+        fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        let reads = fixture.host.candidateReadCount
+        fixture.bridge.noteCreatorNameSourceChanged(windowID: fixture.observer.windowID, sources: [
+            fixture.observer.tabID: .init(
+                workspaceID: fixture.observer.workspaceID,
+                sessionID: fixture.observer.sessionID,
+                name: "  Renamed creator  "
+            )
+        ])
+        XCTAssertEqual(fixture.host.creatorNameSnapshot[fixture.observer.sessionID], "Renamed creator")
+        XCTAssertEqual(fixture.host.candidateReadCount, reads, "A name delta must not reconstruct candidates")
+        // Close immediately, before a deferred rebuild can see the renamed source.
+        fixture.host.candidates = [fixture.target]
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        XCTAssertEqual(fixture.host.creatorNameSnapshot[fixture.observer.sessionID], "Renamed creator")
+        XCTAssertEqual(
+            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?
+                .sidebarOversightMenu?.createdByLabel,
+            "Renamed creator"
+        )
+        XCTAssertTrue(fixture.host.publishedPromptInventories.isEmpty)
+        let replacement = makeCandidate(
+            windowID: 3,
+            sessionID: fixture.observer.sessionID,
+            displayName: "Live replacement"
+        )
+        fixture.host.candidates = [replacement, fixture.target]
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        XCTAssertEqual(fixture.host.creatorNameSnapshot[replacement.sessionID], "Live replacement")
+    }
+
+    func testCreatorSoleLinkedObserverNameDeltaRepaintsMenuWithoutAuthorityOrPassiveChanges() async throws {
+        let fixture = makeFixture()
+        fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        guard case .added = await addLink(fixture) else { return XCTFail("setup link failed") }
+        await fixture.bridge.test_settleProjections()
+        let before = try XCTUnwrap(fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint])
+        XCTAssertTrue(try XCTUnwrap(before.sidebarOversightMenu).creatorIsOverseer)
+        XCTAssertEqual(before.sidebarOversightMenu?.linkedObservers.map(\.displayName), ["Planning"])
+        let authorityBefore = await fixture.authority.snapshot()
+        let inventoriesBefore = fixture.host.publishedInventoriesByEndpoint
+        let passiveBefore = fixture.host.passiveNoticePublicationCount
+        let renamed = makeCandidate(
+            windowID: fixture.observer.windowID,
+            sessionID: fixture.observer.sessionID,
+            workspaceID: fixture.observer.workspaceID,
+            tabID: fixture.observer.tabID,
+            persistentBindingGeneration: fixture.observer.persistentBindingGeneration,
+            bindingTransitionGeneration: fixture.observer.bindingTransitionGeneration,
+            displayName: "Renamed sole overseer"
+        )
+        fixture.host.candidates = [renamed, fixture.target]
+        let readsBefore = fixture.host.candidateReadCount
+        fixture.bridge.noteCreatorNameSourceChanged(windowID: renamed.windowID, sources: [
+            renamed.tabID: .init(workspaceID: renamed.workspaceID, sessionID: renamed.sessionID, name: "Renamed sole overseer")
+        ])
+        XCTAssertEqual(fixture.host.candidateReadCount, readsBefore, "The source delta must not discover candidates inline")
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        let after = try XCTUnwrap(fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint])
+        let menu = try XCTUnwrap(after.sidebarOversightMenu)
+        XCTAssertTrue(menu.creatorIsOverseer)
+        XCTAssertEqual(menu.linkedObservers.map(\.displayName), ["Renamed sole overseer"])
+        XCTAssertEqual(menu.inboundObserverNames, ["Renamed sole overseer"])
+        XCTAssertEqual(after.inbound.map(\.displayName), ["Renamed sole overseer"])
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint, inventoriesBefore)
+        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, passiveBefore)
+        let authorityAfter = await fixture.authority.snapshot()
+        XCTAssertEqual(authorityAfter, authorityBefore)
+    }
+
+    func testCreatorFiftyRowsAcrossThreeWindowConsumersHaveBoundedSettledReads() async throws {
+        let consumers = (1 ... 3).map { id in
+            AgentModeViewModel(
+                testWindowID: 90 + id,
+                testWorkspacePath: FileManager.default.currentDirectoryPath,
+                codexControllerFactory: { _, _, _, _, _, _ in
+                    LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                },
+                connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                mcpServerEnabler: { true }
+            )
+        }
+        let host = FakeEndpointHost()
+        let creators = (0 ..< 3).map { makeCandidate(windowID: 91 + $0, displayName: "Creator \($0)") }
+        host.candidates = creators
+        host.creatorNameConsumers = consumers
+        var rows: [(AgentModeViewModel, UUID, UUID, String)] = []
+        for index in 0 ..< 50 {
+            let consumer = consumers[index % 3]
+            let tabID = UUID()
+            let sessionID = UUID()
+            let session = consumer.session(for: tabID)
+            _ = consumer.test_installPersistentSessionBinding(
+                sessionID: sessionID,
+                on: session,
+                updateWorkspaceMetadata: false
+            )
+            session.createdByOverseerSessionID = creators[index % 3].sessionID
+            rows.append((consumer, tabID, sessionID, "Creator \(index % 3)"))
+        }
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        bridge.noteCandidateReadinessChanged()
+        await bridge.test_settleMonitorProjectionRefresh()
+        let readsBefore = host.candidateReadCount
+        // Predeclared generous Debug budget: 30 trials of 50 active + 50 archive memory reads,
+        // each trial under one second. These are in-process consumers without workspace managers
+        // or registered windows: this measures the bounded label getter, not owner updates or UI.
+        // Both active/archive getters now avoid the lifecycle/menu workspace walk entirely.
+        var durations: [Double] = []
+        for _ in 0 ..< 30 {
+            let start = Date.timeIntervalSinceReferenceDate
+            for (consumer, tabID, sessionID, name) in rows {
+                XCTAssertEqual(consumer.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.label, name)
+                XCTAssertEqual(consumer.agentSidebarLaneCreator(
+                    tabID: tabID,
+                    expectedSessionID: sessionID,
+                    names: consumer.sidebarCreatorDisplayNames,
+                    archived: true
+                )?.label, name)
+            }
+            durations.append(Date.timeIntervalSinceReferenceDate - start)
+        }
+        XCTAssertEqual(host.candidateReadCount, readsBefore)
+        XCTAssertLessThan(try XCTUnwrap(durations.max()), 1.0)
+        let sorted = durations.sorted()
+        print("CREATOR_ROW_MEMORY_STRESS trials=30 rows=50 consumers=3 median_ms=\(sorted[15] * 1000) p95_ms=\(sorted[28] * 1000) additional_candidate_reads=\(host.candidateReadCount - readsBefore)")
+    }
+
+    func testCreatorKnownTabProvenancePreservesFreshAndHydratedNilAndIndexOwnership() throws {
+        let viewModel = AgentModeViewModel(
+            testWindowID: 92, testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, mcpServerEnabler: { true }
+        )
+        let tabID = UUID()
+        let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: viewModel, tabID: tabID, name: "Provenance")
+        defer { withExtendedLifetime(manager) {} }
+        let workspace = try XCTUnwrap(manager.activeWorkspace)
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+        let sessionID = UUID()
+        let indexedCreator = UUID()
+        let freshCreator = UUID()
+        let entry = AgentSessionIndexEntry(
+            id: sessionID, tabID: tabID, name: "Archived lane", savedAt: Date(timeIntervalSince1970: 0),
+            itemCount: 0, autoEditEnabled: false, createdByOverseerSessionID: indexedCreator,
+            hasUnknownConversationContent: false, isMCPOriginated: false,
+            worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+        )
+        viewModel.test_installSessionIndexSnapshot([sessionID: entry], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+        let first = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: first, updateWorkspaceMetadata: false)
+        first.createdByOverseerSessionID = freshCreator
+        first.hasLoadedPersistedState = false
+        XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
+        let secondTabID = UUID()
+        let second = viewModel.session(for: secondTabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second, updateWorkspaceMetadata: false)
+        second.createdByOverseerSessionID = indexedCreator
+        // Both same-UUID live rows must read their own tab, not whichever dictionary value is first.
+        XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
+        XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: secondTabID, expectedSessionID: sessionID)?.sessionID, indexedCreator)
+        first.hasLoadedPersistedState = true
+        first.createdByOverseerSessionID = nil
+        XCTAssertNil(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID))
+        viewModel.test_removeSession(tabID: tabID)
+        XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID, archived: true)?.sessionID, indexedCreator)
+        viewModel.test_setActiveWorkspaceIDForSessionIndex(UUID())
+        XCTAssertNil(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID, archived: true))
+    }
+
+    func testCreatorWorkspaceReplacementSignalsArchiveAndFencesLatePublication() async throws {
+        let viewModel = AgentModeViewModel(
+            testWindowID: 92, testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, mcpServerEnabler: { true }
+        )
+        let tabID = UUID()
+        let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: viewModel, tabID: tabID, name: "Name owner")
+        defer { withExtendedLifetime(manager) {} }
+        let session = viewModel.session(for: tabID)
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        session.createdByOverseerSessionID = sessionID
+        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+        let creator = makeCandidate(
+            windowID: manager.promptViewModel.windowID,
+            sessionID: sessionID,
+            workspaceID: endpoint.workspaceID,
+            tabID: tabID,
+            displayName: "Original"
+        )
+        let host = FakeEndpointHost()
+        host.candidates = [creator]
+        host.creatorNameConsumers = [viewModel]
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        bridge.noteCandidateReadinessChanged()
+        await bridge.test_settleMonitorProjectionRefresh()
+        var notifications = 0
+        let token = NotificationCenter.default.addObserver(
+            forName: .agentSessionLinkOverseerProjectionDidChange,
+            object: viewModel,
+            queue: nil
+        ) { _ in notifications += 1 }
+        defer { NotificationCenter.default.removeObserver(token) }
+        let reads = host.candidateReadCount
+        let propsBefore = viewModel.monitorPillPropsByEndpoint
+        // Exercise whole-array reload/sync replacement, not an explicit rename notification.
+        var replacement = manager.workspaces
+        replacement[0].composeTabs[0].name = "Reloaded creator"
+        manager.workspaces = replacement
+        XCTAssertEqual(host.candidateReadCount, reads)
+        XCTAssertEqual(viewModel.monitorPillPropsByEndpoint, propsBefore)
+        XCTAssertEqual(notifications, 1, "Archived/unlinked rows need a settled signal even with equal exact props")
+        XCTAssertEqual(viewModel.agentSidebarLaneCreator(
+            tabID: tabID,
+            expectedSessionID: sessionID,
+            names: viewModel.sidebarCreatorDisplayNames,
+            archived: true
+        )?.label, "Reloaded creator")
+        let menu = AgentSidebarOversightMenuProps(
+            targetEndpoint: endpoint,
+            targetSessionID: sessionID,
+            targetDisplayName: "Lane",
+            observerOptions: [],
+            createdByLabel: "Stale async name",
+            creatorSessionID: sessionID
+        )
+        let stale = AgentMonitorPillProps(
+            sessionID: sessionID,
+            endpoint: endpoint,
+            sidebarOversightMenu: menu,
+            outbound: [],
+            inbound: [],
+            recentNotices: [],
+            canAddReason: nil
+        )
+        viewModel.agentSessionLinkPublishProjection(stale, to: endpoint)
+        XCTAssertEqual(viewModel.monitorPillPropsByEndpoint[endpoint]?.sidebarOversightMenu?.createdByLabel, "Reloaded creator")
+        session.hasLoadedPersistedState = true
+        session.createdByOverseerSessionID = nil
+        viewModel.agentSessionLinkPublishProjection(stale, to: endpoint)
+        XCTAssertNil(viewModel.monitorPillPropsByEndpoint[endpoint]?.sidebarOversightMenu?.creatorSessionID)
+        // Same UUID, new incarnation cannot inherit the old exact menu.
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: nil, on: session, updateWorkspaceMetadata: false)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: false)
+        XCTAssertNil(viewModel.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
+    }
+
+    func testCreatorProjectionUsesSuppliedLiveNamesWithoutFallbackDiscovery() async throws {
+        let fixture = makeFixture()
+        fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        let menu = try XCTUnwrap(
+            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
+        )
+        XCTAssertEqual(menu.createdByLabel, "Planning")
+        XCTAssertEqual(
+            fixture.host.creatorLabelLookupCount,
+            0,
+            "Supplied live creator names must not trigger fallback discovery"
         )
     }
 
@@ -2114,7 +2448,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
         )
         XCTAssertEqual(menu.linkedObservers.map(\.observerEndpoint), [fixture.observer.domainEndpoint])
-        guard case .linked(_, observerCurrentlyEligible: false) = menu.linkedObservers.first?.relationship else {
+        guard case .linked(_, peerCurrentlyEligible: false) = menu.linkedObservers.first?.relationship else {
             return XCTFail("the unavailable linked observer must remain visible for unlink")
         }
         XCTAssertEqual(
