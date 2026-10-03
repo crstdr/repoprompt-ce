@@ -103,6 +103,7 @@ enum WindowStateCompositionFactory {
             windowID: windowID,
             settingsManager: settingsManager,
             storedPromptPersistence: storedPromptPersistence,
+            refreshAvailableModelsOnInit: loadStoredAPISettingsDataOnInit,
             perfRecorder: AppAgentModePerfRecorder()
         )
 
