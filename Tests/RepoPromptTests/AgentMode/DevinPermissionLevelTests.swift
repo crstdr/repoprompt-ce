@@ -320,7 +320,9 @@ final class DevinPermissionLevelTests: XCTestCase {
         )
         let request = makeRequest(workspacePath: directory.path, launchPermissionMode: "auto")
 
-        let support = try await provider.support(for: request)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await provider.support(for: request)
+        }
         XCTAssertEqual(support, .supported)
         let launch = try provider.makeLaunchConfiguration(for: request)
 
@@ -715,8 +717,10 @@ final class DevinPermissionLevelTests: XCTestCase {
             )
             let shouldApprove = ["git", "git-input-update", "manage_selection", "corroborated"].contains(scenario)
             do {
-                let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
-                for try await _ in stream {}
+                try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                    let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
+                    for try await _ in stream {}
+                }
                 XCTAssertTrue(shouldApprove, scenario)
             } catch {
                 XCTAssertFalse(shouldApprove, "\(scenario): \(error)")
