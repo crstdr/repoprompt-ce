@@ -1391,12 +1391,10 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             "Overseen by", "Observer",
             "Created by", "Creator",
             "",
-            "Oversee new", "Oversee by",
-            "",
-            "Unlink"
+            "Oversee new", "Oversee by", "Unlink"
         ])
         XCTAssertTrue(menu.items[6].isSeparatorItem)
-        XCTAssertTrue(menu.items[9].isSeparatorItem)
+        XCTAssertFalse(menu.items[9].isSeparatorItem)
         XCTAssertFalse(menu.items[0].isEnabled)
         XCTAssertEqual(menu.items[0].accessibilityHelp(), nil)
     }
@@ -1652,8 +1650,28 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         for index in 1 ... 9 {
             XCTAssertTrue(titles.contains { $0.contains("Hosted peer \(index)") }, "Missing peer \(index)")
         }
+        let unlinkIndex = try XCTUnwrap(titles.firstIndex(of: AgentOversightUICopy.unlinkTitle))
+        XCTAssertEqual(titles[unlinkIndex - 1], AgentOversightUICopy.overseeByTitle)
+        XCTAssertTrue(menu.items[unlinkIndex + 1].isSeparatorItem)
+        XCTAssertEqual(titles[unlinkIndex + 2], "Select chat")
         XCTAssertTrue(titles.contains("Stash chat for later"), "Opening must also capture current standard callbacks")
         XCTAssertEqual(try menuProps(in: fixture), props, "Opening alone must not mutate the settled relationship presentation")
+    }
+
+    func testColdRightClickShowsLoadingSubmenusBeforeProjectionReady() async throws {
+        let fixture = try await makeFixture(peerCount: 2)
+        let endpoint = try menuProps(in: fixture).targetEndpoint
+        fixture.vm.agentSessionLinkPublishProjection(.empty, to: endpoint)
+        XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(
+            tabID: fixture.tabs[0].id, expectedSessionID: endpoint.sessionID
+        ))
+
+        let menu = try await open(in: fixture)
+        for title in [AgentOversightUICopy.overseeNewTitle, AgentOversightUICopy.overseeByTitle] {
+            let submenu = try XCTUnwrap(menu.items.first { $0.title == title }?.submenu)
+            XCTAssertEqual(submenu.items.map(\.title), ["Loading…"])
+            XCTAssertFalse(submenu.items[0].isEnabled)
+        }
     }
 
     func testColdControlClickShowsInboundOnly() async throws {
@@ -1670,9 +1688,13 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
 
     func testColdAccessibilityOpeningShowsLinklessLiveChoices() async throws {
         let fixture = try await makeFixture(peerCount: 2)
+        let props = try menuProps(in: fixture)
+        XCTAssertTrue(props.linkedTargets.isEmpty)
+        XCTAssertTrue(props.linkedObservers.isEmpty)
         let menu = try await open(in: fixture, via: .accessibility)
         let targets = try XCTUnwrap(menu.items.first { $0.title == AgentOversightUICopy.overseeNewTitle }?.submenu)
         XCTAssertTrue(targets.items.contains { $0.title.contains("Hosted peer 1") && $0.isEnabled })
+        XCTAssertFalse(targets.items.contains { $0.title == "Loading…" })
         XCTAssertNotNil(menu.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
         XCTAssertFalse(menu.items.contains { $0.title == AgentOversightUICopy.overseeingSectionLabel })
         XCTAssertFalse(menu.items.contains { $0.title == AgentOversightUICopy.overseenBySectionLabel })
