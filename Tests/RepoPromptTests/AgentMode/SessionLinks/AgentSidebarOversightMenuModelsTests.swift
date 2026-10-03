@@ -1656,6 +1656,22 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertEqual(try menuProps(in: fixture), props, "Opening alone must not mutate the settled relationship presentation")
     }
 
+    func testColdRightClickShowsLoadingSubmenusBeforeProjectionReady() async throws {
+        let fixture = try await makeFixture(peerCount: 2)
+        let endpoint = try menuProps(in: fixture).targetEndpoint
+        fixture.vm.agentSessionLinkPublishProjection(.empty, to: endpoint)
+        XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(
+            tabID: fixture.tabs[0].id, expectedSessionID: endpoint.sessionID
+        ))
+
+        let menu = try await open(in: fixture)
+        for title in [AgentOversightUICopy.overseeNewTitle, AgentOversightUICopy.overseeByTitle] {
+            let submenu = try XCTUnwrap(menu.items.first { $0.title == title }?.submenu)
+            XCTAssertEqual(submenu.items.map(\.title), ["Loading…"])
+            XCTAssertFalse(submenu.items[0].isEnabled)
+        }
+    }
+
     func testColdControlClickShowsInboundOnly() async throws {
         let fixture = try await makeFixture(peerCount: 2)
         try await add(from: 1, to: 0, in: fixture)
@@ -1670,9 +1686,13 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
 
     func testColdAccessibilityOpeningShowsLinklessLiveChoices() async throws {
         let fixture = try await makeFixture(peerCount: 2)
+        let props = try menuProps(in: fixture)
+        XCTAssertTrue(props.linkedTargets.isEmpty)
+        XCTAssertTrue(props.linkedObservers.isEmpty)
         let menu = try await open(in: fixture, via: .accessibility)
         let targets = try XCTUnwrap(menu.items.first { $0.title == AgentOversightUICopy.overseeNewTitle }?.submenu)
         XCTAssertTrue(targets.items.contains { $0.title.contains("Hosted peer 1") && $0.isEnabled })
+        XCTAssertFalse(targets.items.contains { $0.title == "Loading…" })
         XCTAssertNotNil(menu.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
         XCTAssertFalse(menu.items.contains { $0.title == AgentOversightUICopy.overseeingSectionLabel })
         XCTAssertFalse(menu.items.contains { $0.title == AgentOversightUICopy.overseenBySectionLabel })
