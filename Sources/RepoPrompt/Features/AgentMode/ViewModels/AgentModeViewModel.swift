@@ -5096,6 +5096,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         sessionID: UUID?
     ) {
+        // Native row providers capture the UUID from the sidebar's cached row.
+        // Publish identity changes even when no index refresh is in flight.
+        syncSidebarUIState(refresh: true, reason: .sessionList)
         guard let token = activeSessionIndexRefreshToken,
               sessionIndexStore.isOwnerCurrent(token.owner),
               activeSessionIndexRefreshValidTabIDs.contains(tabID)
