@@ -313,6 +313,14 @@ struct AgentSessionRow: View {
 
     private func currentContextMenuSnapshot() -> ContextMenuSnapshot {
         let menu = presentableSidebarOversightMenu
+        var unavailableReason = sidebarOversightUnavailableReason
+        if unavailableReason == nil,
+           resolveSidebarOversightMenu != nil,
+           onAddSidebarOversight != nil,
+           onStopSidebarOversight != nil
+        {
+            unavailableReason = AgentOversightUICopy.oversightLoadingMessage
+        }
         return ContextMenuSnapshot(
             isInteractionEnabled: isInteractionEnabled,
             showsSelectionPresentation: showsSelectionPresentation,
@@ -321,7 +329,7 @@ struct AgentSessionRow: View {
             hasOnDismissAttention: onDismissAttention != nil,
             sidebarOversightMenu: menu,
             sidebarOversightUnavailableReason: allowsDirectMutations && menu == nil
-                ? sidebarOversightUnavailableReason : nil
+                ? unavailableReason : nil
         )
     }
 
@@ -524,7 +532,7 @@ struct AgentSessionRow: View {
         }
     }
 
-    /// The two Oversee submenus for an ID-less row as stable items: the submenu labels stay
+    /// The two Oversee submenus for a loading or ID-less row: the submenu labels stay
     /// enabled so the reason is discoverable, while the only item inside each is the
     /// disabled explanation.
     private func sidebarOversightUnavailableMenuItems(reason: String) -> [StableMenuItem] {
