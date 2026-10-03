@@ -1,5 +1,5 @@
 {
-  "description": "Upstream sync 2026-10-03: upstream a877f1ea baselines plus the existing fork b73d3f03 delta over its last upstream merge base da5bf805; fork zero app-line headroom retained.",
+  "description": "Upstream sync 2026-10-03: upstream a877f1ea baselines plus the existing fork b73d3f03 delta over its last upstream merge base da5bf805; fork zero app-line headroom retained. Refreshed manifest target decode-cache reuse on fork main e715603d: measured app-target lines 653784 plus exactly this feature's own 36 lines, for 653820; zero headroom and no other ratchet raised.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -24,10 +24,10 @@
     "app_shared_accessor_uses": 1256,
     "app_static_shared_declarations": 94,
     "app_target_swift_files": 1139,
-    "app_target_swift_lines": 653784,
+    "app_target_swift_lines": 653820,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1076,
-    "first_party_swift_lines": 757260,
+    "first_party_swift_lines": 757296,
     "tests_sleep_calls": 67,
     "tests_testable_import_app_files": 340
   }
