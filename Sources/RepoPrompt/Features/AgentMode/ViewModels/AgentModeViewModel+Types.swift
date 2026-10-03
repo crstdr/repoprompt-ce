@@ -583,6 +583,8 @@ extension AgentModeViewModel {
     struct CodexComputerUseActivation: Equatable {
         let id: UUID
         let createdAt: Date
+        let binding: AgentPersistentSessionBindingIdentity?
+        let bindingTransitionGeneration: UInt64
     }
 
     struct NativeSlashPreparedUserTurn: Equatable {
