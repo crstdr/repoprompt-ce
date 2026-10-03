@@ -286,7 +286,7 @@ struct AgentSelfCompactState: Codable, Equatable {
               active?.id == dispatchID.requestID,
               active?.phase == .dispatchingNote
         else { return false }
-        active?.phase = .parked
+        park(reason: .definitiveNonAttempt)
         active?.noteDispatchStarted = false
         return true
     }
@@ -302,7 +302,7 @@ struct AgentSelfCompactState: Codable, Equatable {
                 completionVerified: active?.acpCompletionUnverified != true && active?.compactTurnSucceeded == true
             )
         } else {
-            active?.phase = .parked
+            park(reason: .transportNotAttempted)
         }
         return true
     }
@@ -366,7 +366,7 @@ struct AgentSelfCompactState: Codable, Equatable {
             if attempt.compactTurnSucceeded != true || attempt.acpCompletionUnverified == true {
                 active?.acpCompletionUnverified = true
             }
-            active?.phase = .parked
+            park(reason: .runtimeTeardown)
         }
         return true
     }
@@ -395,10 +395,25 @@ struct AgentSelfCompactState: Codable, Equatable {
         return phase != .parked
     }
 
-    /// Automatic wakes stay blocked for every live attempt, including a parked note, so RepoPrompt
-    /// does not manufacture a prompt while a continuation is still owed.
+    /// Periodic wakes stay blocked for every live attempt. Notification wakes may carry a verified,
+    /// unattempted parked note after the app-side owner fence has been checked.
     var blocksAutomaticWake: Bool {
         active != nil
+    }
+
+    /// Runtime evidence only: decoded attempts are reconciled to inert recovery before admission.
+    var verifiedParkedNoteOwner: AgentSelfCompactOwner? {
+        guard let attempt = active, attempt.phase == .parked,
+              attempt.compactTurnSucceeded == true, attempt.acpCompletionUnverified != true,
+              !attempt.noteDispatchStarted
+        else { return nil }
+        return attempt.owner
+    }
+
+    mutating func park(reason: AgentSelfCompactParkingReason) {
+        guard let attempt = active else { return }
+        active?.phase = .parked
+        AgentSelfCompactDiagnostics.parked(requestID: attempt.id, reason: reason)
     }
 
     /// Reading the frame does not consume it; only final provider acknowledgment can do that.

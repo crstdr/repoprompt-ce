@@ -113,7 +113,9 @@ extension AgentModeViewModel {
             || readiness.hasPendingUserInputRequest || readiness.hasPendingApproval
             || readiness.hasPendingPermissionsRequest || readiness.hasPendingMCPElicitationRequest
             || readiness.hasPendingApplyEditsReview || readiness.hasPendingWorktreeMergeReview
-        if hasInteraction { return .blocked(reason: "pending_interaction") }
+        if hasInteraction {
+            return .blocked(reason: "pending_interaction")
+        }
         guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness) == .ready,
               !Self.agentSessionLinkCompactHasQueuedProviderWork(session)
         else { return .blocked(reason: "busy") }
@@ -302,7 +304,7 @@ extension AgentModeViewModel {
         )
     }
 
-    private func agentSelfCompactOwnerIsCurrent(
+    func agentSelfCompactOwnerIsCurrent(
         _ owner: AgentSelfCompactOwner,
         session: TabSession
     ) -> Bool {
@@ -316,6 +318,13 @@ extension AgentModeViewModel {
             && endpoint.persistentBindingGeneration == owner.persistentBindingGeneration
             && endpoint.bindingTransitionGeneration == owner.bindingTransitionGeneration
             && !agentSelfCompactHasCompetingWriter(session, sessionID: owner.sessionID)
+    }
+
+    /// Only event-driven wakes can carry this note; periodic prompting remains excluded.
+    func agentSelfCompactBlocksNotificationWake(_ session: TabSession) -> Bool {
+        guard session.selfCompactState.blocksAutomaticWake else { return false }
+        guard let owner = session.selfCompactState.verifiedParkedNoteOwner else { return true }
+        return !agentSelfCompactOwnerIsCurrent(owner, session: session)
     }
 
     private func agentSelfCompactDispatchNative(
@@ -437,35 +446,50 @@ extension AgentModeViewModel {
         session: TabSession,
         stillAdmissible: @escaping @MainActor () -> Bool
     ) async -> Bool {
-        guard stillAdmissible(), let owner = session.selfCompactState.active?.owner,
-              let target = makeComposerSubmitTarget(tabID: owner.tabID, session: session),
+        func refused(_ reason: AgentSelfCompactNoteRefusal) -> Bool {
+            AgentSelfCompactDiagnostics.noteRefused(requestID: requestID, reason: reason)
+            return false
+        }
+        guard stillAdmissible(), let owner = session.selfCompactState.active?.owner else {
+            return refused(.admissionChanged)
+        }
+        guard let target = makeComposerSubmitTarget(tabID: owner.tabID, session: session),
               target.route == .existingAgentSession,
               target.expectedSourceAgentSessionID == owner.sessionID
-        else { return false }
+        else { return refused(.composerTarget) }
         let submit = AgentComposerSubmitAttempt(
             id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
         )
         guard case let .claimed(claim) = claimComposerSubmitAttempt(
             submit, requireActiveTabOwnership: false
-        ) else { return false }
+        ) else { return refused(.composerClaim) }
         defer { releaseComposerSubmitClaim(claim) }
         let ready: @MainActor () -> Bool = { [weak self] in
-            guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
-                  !Self.agentSessionLinkCompactHasQueuedProviderWork(session),
-                  agentSelfCompactOwnerIsCurrent(owner, session: session),
-                  workspaceManager?.activeWorkspace?.id == owner.workspaceID
-            else { return false }
-            return AgentSessionLinkDeliveryReadiness.evaluate(
+            guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim) else {
+                return refused(.admissionChanged)
+            }
+            guard !Self.agentSessionLinkCompactHasQueuedProviderWork(session) else {
+                return refused(.queuedProviderWork)
+            }
+            guard agentSelfCompactOwnerIsCurrent(owner, session: session) else {
+                return refused(.ownerChanged)
+            }
+            guard workspaceManager?.activeWorkspace?.id == owner.workspaceID else {
+                return refused(.workspaceChanged)
+            }
+            guard AgentSessionLinkDeliveryReadiness.evaluate(
                 snapshot: Self.agentSelfCompactNoteReadinessSnapshot(session: session, requestID: requestID)
-            ) == .ready
+            ) == .ready else { return refused(.deliveryReadiness) }
+            return true
         }
         guard ready(), let note = session.selfCompactState.active?.note else { return false }
         var state = session.selfCompactState
         state.active?.phase = .dispatchingNote
         session.selfCompactState = state
-        guard case .success = await flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID),
-              ready()
-        else { return false }
+        guard case .success = await flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID) else {
+            return refused(.requiredSave)
+        }
+        guard ready() else { return false }
         let recorder = AgentRunStartOutcomeRecorder()
         _ = await startAgentRun(
             tabID: owner.tabID,
@@ -473,7 +497,7 @@ extension AgentModeViewModel {
             directStartOptions: .selfCompactNote(requestID: requestID),
             startOutcome: recorder
         )
-        return recorder.outcome.didStart
+        return recorder.outcome.didStart || refused(.runNotStarted)
     }
 
     /// Assistant and tool rows appended after the ACP compact command was issued. Nil when this

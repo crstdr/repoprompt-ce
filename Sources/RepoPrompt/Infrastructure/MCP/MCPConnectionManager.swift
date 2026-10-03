@@ -753,7 +753,9 @@ actor ServerNetworkManager {
     private let defaultDomainHost: MCPDomainHost
     private var domainHost: MCPDomainHost {
         #if DEBUG
-            if let runtime = AppDomainRuntimeComposition.shared.runtimeForTesting { return runtime.domainHost }
+            if let runtime = AppDomainRuntimeComposition.shared.runtimeForTesting {
+                return runtime.domainHost
+            }
         #endif
         return defaultDomainHost
     }
@@ -2568,7 +2570,10 @@ actor ServerNetworkManager {
     ) async -> Bool {
         guard await AppDomainRuntimeComposition.shared.isActive(identity.catalogRegistrationHandle) else { return false }
         if let token = identity.modelRouteToken,
-           await cachedModelCatalogRouteToken(connectionID: token.connectionID) != token { return false }
+           await cachedModelCatalogRouteToken(connectionID: token.connectionID) != token
+        {
+            return false
+        }
         return await MainActor.run {
             let window = identity.modelRouteToken != nil ? WindowStatesManager.shared.modelRoutingWindow(withID: identity.windowID)
                 : WindowStatesManager.shared.window(withID: identity.windowID)
@@ -4095,7 +4100,9 @@ actor ServerNetworkManager {
     ) async -> UUID? {
         // Completion must retain the original call attribution without invoking the generic
         // cold-route recovery sweep after a disconnect or handover.
-        if modelOnly { return callTimeRunID }
+        if modelOnly {
+            return callTimeRunID
+        }
         if let callTimeRunID {
             if MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(toolName),
                let completionTimeRunID = await runIDForConnection(connectionID),
@@ -12594,6 +12601,9 @@ actor ServerNetworkManager {
                     requestID: $0.requestID
                 )
             }
+            let retirementOperationID = responseDeliveryRequestToken.flatMap {
+                MCPExportResponseDeliveryDeadlineRegistry.shared.retirementOperation(for: $0)
+            }
             #if DEBUG
                 let transportTimelineIdentity = MCPRequestTimelineRegistry.shared.claimToolRequest(
                     connectionID: connectionID.uuidString,
@@ -14015,7 +14025,11 @@ actor ServerNetworkManager {
                                                 return try await EditFlowPerf.measure(
                                                     EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
                                                     EditFlowPerf.Dimensions(toolName: toolName),
-                                                    operation: { try await operation(providerEntryBridge) }
+                                                    operation: {
+                                                        try await AgentSessionLinkCatalogDiagnostics.$retirementOperationID.withValue(retirementOperationID) {
+                                                            try await operation(providerEntryBridge)
+                                                        }
+                                                    }
                                                 )
                                             }
                                             guard let promptExportMutationObservation else {
@@ -14691,7 +14705,9 @@ actor ServerNetworkManager {
                                     )
                                 }
                                 #if DEBUG
-                                    if await self.debugForceResolvedToolMissingForTesting?() == true { resolvedTool = nil }
+                                    if await self.debugForceResolvedToolMissingForTesting?() == true {
+                                        resolvedTool = nil
+                                    }
                                 #endif
                                 if let resolvedTool {
                                     let toolDef = resolvedTool.definition
@@ -15630,9 +15646,9 @@ actor ServerNetworkManager {
         blocks.compactMap { block -> String? in
             switch block {
             case .text(text: let text, annotations: _, _meta: _):
-                return text
+                text
             default:
-                return nil
+                nil
             }
         }.joined(separator: "\n")
     }

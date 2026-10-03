@@ -262,12 +262,14 @@ extension AgentModeViewModel {
         let subtreeTabIDs = Set(promptManager.currentComposeTabs.compactMap { tab in
             tab.activeAgentSessionID.map { descendantSessionIDs.contains($0) } == true ? tab.id : nil
         }).union([endpoint.tabID])
+        AgentSessionLinkCatalogDiagnostics.retirement(.stash, .started)
         let report = await promptManager.stashComposeTabs(
             withIDs: subtreeTabIDs,
             isMutationContextCurrent: canRetire,
             postPreflightValidation: canRetire,
             expandCascade: true
         )
+        AgentSessionLinkCatalogDiagnostics.retirement(.stash, .returned)
         guard report.rejections.isEmpty,
               report.removedComposeTabIDs.contains(endpoint.tabID),
               workspaceManager?.activeWorkspace?.stashedTabs.contains(where: {
@@ -278,10 +280,14 @@ extension AgentModeViewModel {
         didStash(report.removedComposeTabIDs)
         // The retirement activation claim stays held by the bridge until this canonical save
         // settles, so another window cannot reload the pre-stash binding in the meantime.
-        let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
-            workspaceID: endpoint.workspaceID,
-            source: WorkspaceSaveSource("oversightLaneRetirement")
-        )
+        AgentSessionLinkCatalogDiagnostics.retirement(.canonicalSave, .started)
+        let persistence = await AgentSessionLinkCatalogDiagnostics.$retirementCanonicalSave.withValue(true) {
+            await workspaceManager.pollAndSaveStateWithOutcomeAsync(
+                workspaceID: endpoint.workspaceID,
+                source: WorkspaceSaveSource("oversightLaneRetirement")
+            )
+        }
+        AgentSessionLinkCatalogDiagnostics.retirement(.canonicalSave, .returned)
         return persistence.acceptedForLifecycleAdmission
     }
 }

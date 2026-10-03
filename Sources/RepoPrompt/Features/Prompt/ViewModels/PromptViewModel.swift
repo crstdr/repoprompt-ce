@@ -2655,9 +2655,18 @@ class PromptViewModel: ObservableObject {
         if reason != .stash {
             deleteGitDataForClosingTabs(tabIDs: tabIDs)
         }
+        let retirementOperationID = reason == .stash ? AgentSessionLinkCatalogDiagnostics.retirementOperationID : nil
+        AgentSessionLinkCatalogDiagnostics.retirement(.cleanup, .started, operationID: retirementOperationID)
+        AgentSessionLinkCatalogDiagnostics.retirement(.cleanupWillClose, .started, operationID: retirementOperationID)
         await notifyComposeTabsWillClose(tabIDs, reason: reason)
+        AgentSessionLinkCatalogDiagnostics.retirement(.cleanupWillClose, .returned, operationID: retirementOperationID)
+        AgentSessionLinkCatalogDiagnostics.retirement(.cleanupRouting, .started, operationID: retirementOperationID)
         await cleanupMCPStateForClosingTabs(tabIDs)
+        AgentSessionLinkCatalogDiagnostics.retirement(.cleanupRouting, .returned, operationID: retirementOperationID)
+        AgentSessionLinkCatalogDiagnostics.retirement(.cleanupDidRemove, .started, operationID: retirementOperationID)
         let issues = await notifyComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
+        AgentSessionLinkCatalogDiagnostics.retirement(.cleanupDidRemove, .returned, operationID: retirementOperationID)
+        AgentSessionLinkCatalogDiagnostics.retirement(.cleanup, .returned, operationID: retirementOperationID)
         #if DEBUG
             for tabID in tabIDs {
                 perfRecorder.markSidebarDeleteFullCleanupComplete(
@@ -4180,9 +4189,14 @@ class PromptViewModel: ObservableObject {
 
         let previousActiveID = manager.workspaces[index].activeComposeTabID
         manager.workspaces[index].composeTabs = tabs
+        let retirementOperationID = reason == .stash ? AgentSessionLinkCatalogDiagnostics.retirementOperationID : nil
+        // This marks the in-memory stash/removal, not a durability acknowledgement.
+        AgentSessionLinkCatalogDiagnostics.retirement(.stashProjection, .committed, operationID: retirementOperationID)
 
         if tabs.isEmpty {
+            AgentSessionLinkCatalogDiagnostics.retirement(.replacementTab, .started, operationID: retirementOperationID)
             await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
+            AgentSessionLinkCatalogDiagnostics.retirement(.replacementTab, .returned, operationID: retirementOperationID)
             loadComposeTabsFromWorkspace(manager.workspaces[index])
             onProjectionRemovalCommitted?(tabsBeingClosed)
             #if DEBUG
@@ -4228,6 +4242,7 @@ class PromptViewModel: ObservableObject {
            let newActiveID,
            let tab = tabs.first(where: { $0.id == newActiveID })
         {
+            AgentSessionLinkCatalogDiagnostics.retirement(.activation, .started, operationID: retirementOperationID)
             await withComposeTabActivationSnapshotSuspended(targetTabID: newActiveID, manager: manager) {
                 manager.workspaces[index].activeComposeTabID = newActiveID
                 activeComposeTabID = newActiveID
@@ -4235,6 +4250,7 @@ class PromptViewModel: ObservableObject {
                     await manager.applyComposeTabState(tab)
                 }
             }
+            AgentSessionLinkCatalogDiagnostics.retirement(.activation, .returned, operationID: retirementOperationID)
         } else {
             manager.workspaces[index].activeComposeTabID = newActiveID
             activeComposeTabID = newActiveID

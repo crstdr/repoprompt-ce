@@ -274,6 +274,8 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var pendingRequests: Set<Token> = []
     private var deadlines: [Token: Deadline] = [:]
+    /// Diagnostics only; these tokens never install a retirement deadline or alter delivery.
+    private var retirementOperations: [Token: UUID] = [:]
 
     private init() {}
 
@@ -288,6 +290,7 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
         let hadNewline = frame.last == UInt8(ascii: "\n")
         guard let json = try? JSONSerialization.jsonObject(with: frame) else { return frame }
         var recordedTokens: [Token] = []
+        var recordedRetirementTokens: [Token] = []
 
         func annotate(_ value: Any) -> Any {
             if var object = value as? [String: Any] {
@@ -298,7 +301,10 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
                       let requestedToolName = params["name"] as? String
                 else { return object }
                 let canonicalToolName = ServerNetworkManager.canonicalToolName(for: requestedToolName)
-                guard canonicalToolName == "prompt" || canonicalToolName == "workspace_context" else {
+                let operation = ((params["arguments"] as? [String: Any])?["op"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                let isRetirement = canonicalToolName == "agent_session_link" && operation == "retire_lane"
+                guard canonicalToolName == "prompt" || canonicalToolName == "workspace_context" || isRetirement else {
                     return object
                 }
                 var arguments: [String: Any] = [:]
@@ -316,11 +322,13 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
                 ]
                 params["arguments"] = arguments
                 object["params"] = params
-                recordedTokens.append(Token(
+                let token = Token(
                     connectionID: connectionID,
                     connectionGeneration: connectionGeneration,
                     requestID: requestID
-                ))
+                )
+                recordedTokens.append(token)
+                if isRetirement { recordedRetirementTokens.append(token) }
                 return object
             }
             if let batch = value as? [Any] {
@@ -334,7 +342,12 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
               var encoded = try? JSONSerialization.data(withJSONObject: annotated, options: [.sortedKeys])
         else { return frame }
         if hadNewline { encoded.append(UInt8(ascii: "\n")) }
-        lock.withLock { pendingRequests.formUnion(recordedTokens) }
+        lock.withLock {
+            pendingRequests.formUnion(recordedTokens)
+            for token in recordedRetirementTokens {
+                retirementOperations[token] = UUID()
+            }
+        }
         return encoded
     }
 
@@ -367,6 +380,27 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
         return lock.withLock {
             guard pendingRequests.remove(token) != nil else { return nil }
             return token
+        }
+    }
+
+    func retirementOperation(for token: Token) -> UUID? {
+        lock.withLock { retirementOperations[token] }
+    }
+
+    func retirementOperations(
+        forServerFrame frame: Data,
+        connectionID: String,
+        connectionGeneration: UInt64
+    ) -> [UUID] {
+        let responseIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
+            frame, direction: .serverToClient
+        ).compactMap(\.id)
+        return lock.withLock {
+            responseIDs.compactMap {
+                retirementOperations[Token(
+                    connectionID: connectionID, connectionGeneration: connectionGeneration, requestID: $0
+                )]
+            }
         }
     }
 
@@ -421,11 +455,14 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
         ).compactMap(\.id)
         lock.withLock {
             for requestID in responseIDs {
-                deadlines.removeValue(forKey: Token(
+                let token = Token(
                     connectionID: connectionID,
                     connectionGeneration: connectionGeneration,
                     requestID: requestID
-                ))
+                )
+                deadlines.removeValue(forKey: token)
+                retirementOperations.removeValue(forKey: token)
+                pendingRequests.remove(token)
             }
         }
     }
@@ -437,6 +474,10 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
                     || $0.connectionGeneration != connectionGeneration
             }
             deadlines = deadlines.filter {
+                $0.key.connectionID != connectionID
+                    || $0.key.connectionGeneration != connectionGeneration
+            }
+            retirementOperations = retirementOperations.filter {
                 $0.key.connectionID != connectionID
                     || $0.key.connectionGeneration != connectionGeneration
             }
@@ -772,6 +813,12 @@ public actor UnixSocketMCPTransport: Transport {
             return
         }
         let framed = preparedFrame.data
+        // Capture before writeAll: a failed write can remove all connection-owned registry state.
+        let retirementOperations = timelineConnectionID.map {
+            MCPExportResponseDeliveryDeadlineRegistry.shared.retirementOperations(
+                forServerFrame: framed, connectionID: $0, connectionGeneration: timelineConnectionGeneration
+            )
+        } ?? []
         let responseDeadline: MCPExportResponseDeliveryDeadlineRegistry.Deadline? = if let timelineConnectionID {
             MCPExportResponseDeliveryDeadlineRegistry.shared.deadline(
                 forServerFrame: framed,
@@ -849,6 +896,9 @@ public actor UnixSocketMCPTransport: Transport {
             try enforceResponseDeliveryDeadline(responseDeadline, framedByteCount: framed.count)
             // Encoding proves the SDK produced a response frame; this boundary proves the
             // transport began attempting the write, which distinguishes a later stall or close.
+            for operationID in retirementOperations {
+                AgentSessionLinkCatalogDiagnostics.retirement(.replyWrite, .started, operationID: operationID)
+            }
             emitResponseWriteTrace(phase: "transport_write_started")
             let writeOutcome = try writeAll(
                 framed,
@@ -856,6 +906,9 @@ public actor UnixSocketMCPTransport: Transport {
                 sealPolicy: preparedFrame.sealPolicy
             )
             guard writeOutcome == .delivered else {
+                for operationID in retirementOperations {
+                    AgentSessionLinkCatalogDiagnostics.retirement(.replyWrite, .failed, operationID: operationID)
+                }
                 emitResponseWriteTrace(
                     phase: "watchdog_inflight_response_preempted",
                     terminalReason: "tool_execution_watchdog"
@@ -871,6 +924,9 @@ public actor UnixSocketMCPTransport: Transport {
             }
             // writeAll may close the transport before returning. Keep the response identities
             // captured before the write so terminal failure still joins to its invocation.
+            for operationID in retirementOperations {
+                AgentSessionLinkCatalogDiagnostics.retirement(.replyWrite, .failed, operationID: operationID)
+            }
             emitResponseWriteTrace(
                 phase: "transport_write_failed",
                 terminalReason: firstCloseSnapshot?.cause.rawValue ?? "app_uds_send_failed"
@@ -886,6 +942,9 @@ public actor UnixSocketMCPTransport: Transport {
                 connectionID: timelineConnectionID,
                 connectionGeneration: timelineConnectionGeneration
             )
+        }
+        for operationID in retirementOperations {
+            AgentSessionLinkCatalogDiagnostics.retirement(.replyWrite, .returned, operationID: operationID)
         }
         emitResponseWriteTrace(phase: "transport_write_completed")
         #if DEBUG

@@ -66,6 +66,71 @@ enum AgentSessionLinkCatalogDiagnostics {
         }
     }
 
+    /// Retirement entry point: agent_session_link retire_lane. Local, release-capable markers
+    /// contain only a fresh opaque operation UUID and closed phase/transition enums. The socket
+    /// owner carries the same UUID through its existing transport request-identity seam.
+    enum RetirementStage: String, Equatable {
+        case service = "retire_lane.service"
+        case stash = "retire_lane.stash"
+        case stashProjection = "retire_lane.stash_projection"
+        case replacementTab = "retire_lane.replacement_tab"
+        case activation = "retire_lane.activation"
+        case cleanup = "retire_lane.cleanup"
+        case cleanupWillClose = "retire_lane.cleanup_will_close"
+        case cleanupRouting = "retire_lane.cleanup_routing"
+        case cleanupDidRemove = "retire_lane.cleanup_did_remove"
+        case canonicalSave = "retire_lane.canonical_save"
+        case recovery = "retire_lane.recovery"
+        case workingPublication = "retire_lane.working_publication"
+        case save = "retire_lane.save"
+        case domainSave = "retire_lane.domain_save"
+        case flush = "retire_lane.flush"
+        case replyWrite = "retire_lane.reply_write"
+    }
+
+    enum RetirementTransition: String, Equatable {
+        case started
+        // Returned means the await settled, not that persistence/retirement succeeded.
+        case returned
+        case committed
+        case failed
+    }
+
+    struct RetirementRecord: Equatable {
+        let operationID: UUID
+        let stage: RetirementStage
+        let transition: RetirementTransition
+
+        var renderedLine: String {
+            "operation=\(operationID.uuidString) stage=\(stage.rawValue) transition=\(transition.rawValue)"
+        }
+    }
+
+    @TaskLocal static var retirementOperationID: UUID?
+    /// Only the explicitly awaited canonical save is traced, not autosaves spawned by stash.
+    @TaskLocal static var retirementCanonicalSave = false
+    #if DEBUG
+        @TaskLocal static var retirementTestSink: (@Sendable (RetirementRecord) -> Void)?
+    #endif
+
+    static func retirement(
+        _ stage: RetirementStage,
+        _ transition: RetirementTransition,
+        operationID: UUID? = retirementOperationID
+    ) {
+        guard let operationID else { return }
+        let record = RetirementRecord(operationID: operationID, stage: stage, transition: transition)
+        logger.notice("\(record.renderedLine, privacy: .public)")
+        #if DEBUG
+            retirementTestSink?(record)
+        #endif
+    }
+
+    static func retirementPersistence(_ stage: RetirementStage, _ transition: RetirementTransition) {
+        guard retirementCanonicalSave else { return }
+        retirement(stage, transition)
+    }
+
     private static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "RepoPrompt",
         category: "AgentSessionLinkCatalog"

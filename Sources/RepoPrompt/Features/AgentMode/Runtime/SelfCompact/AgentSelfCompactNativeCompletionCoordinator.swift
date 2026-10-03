@@ -73,7 +73,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
                 // continuation parked for the next ordinary send rather than dropping it into
                 // recovery; a late command terminal no longer matches and never sends it.
                 current.active?.acpCompletionUnverified = true
-                current.active?.phase = .parked
+                current.park(reason: .nativeDeadline)
             }
             store(current)
         }
@@ -111,7 +111,9 @@ final class AgentSelfCompactNativeCompletionCoordinator {
               attempt.compactRunAttemptID == revision.ownership.attemptID
         else { return }
         guard case .accepted(successorEpoch: nil) = publication else {
-            if case .rejected = publication { return }
+            if case .rejected = publication {
+                return
+            }
             deadlineTask?.cancel()
             state.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
             store(state)
@@ -124,7 +126,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             return
         }
         guard revision.successorKind == nil else {
-            state.active?.phase = .parked
+            state.park(reason: .successorClaimed)
             store(state)
             return
         }
@@ -216,7 +218,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         if let owner = attempt.owner, !isCurrentOwner(owner) {
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
         } else {
-            state.active?.phase = .parked
+            state.park(reason: .ordinaryInput)
         }
         store(state)
     }
@@ -300,7 +302,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             return
         }
         state.active?.acpCompletionUnverified = true
-        state.active?.phase = .parked
+        state.park(reason: .acpCompletionUnverified)
         acpTeardownSettled = nil
         store(state)
     }
@@ -325,7 +327,9 @@ final class AgentSelfCompactNativeCompletionCoordinator {
                 store(state)
                 return
             }
-            if teardownSettled() { break }
+            if teardownSettled() {
+                break
+            }
             await sleep(.milliseconds(100))
             guard !Task.isCancelled else { return }
             await Task.yield()
@@ -340,7 +344,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             return
         }
         guard teardownSettled() else {
-            state.active?.phase = .parked
+            state.park(reason: .teardownDeadline)
             store(state)
             return
         }
@@ -359,7 +363,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             if !isCurrentOwner(owner) {
                 state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             } else {
-                state.active?.phase = .parked
+                state.park(reason: .noteStartRefused)
             }
             store(state)
         }

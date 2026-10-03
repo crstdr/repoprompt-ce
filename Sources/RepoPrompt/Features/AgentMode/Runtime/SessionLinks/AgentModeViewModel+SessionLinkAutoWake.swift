@@ -453,7 +453,9 @@ extension AgentModeViewModel {
         // cancellation" would be a lie in both directions. Let it settle instead — unless this is one
         // of the coordinator's own pre-dispatch decisions, which provably retracts nothing.
         guard attempt.phase != .dispatching || reason.definitivelyNoPhysicalCall else { return }
-        if attempt.phase == .cancelledBeforeDispatch, !reason.definitivelyNoPhysicalCall { return }
+        if attempt.phase == .cancelledBeforeDispatch, !reason.definitivelyNoPhysicalCall {
+            return
+        }
         if attempt.phase == .preparingDispatch, !reason.definitivelyNoPhysicalCall {
             // Preparation owns the only finalizer that can prove the transport was never called.
             // Mark cancellation intent, but do not cancel that finalizer out from under the attempt.
@@ -764,7 +766,9 @@ extension AgentModeViewModel {
         else { return false }
         if attempt.isPeriodic {
             guard attempt.periodicProducerDispatchID == dispatchID else { return false }
-            if attempt.phase == .cancelledBeforeDispatch { return false }
+            if attempt.phase == .cancelledBeforeDispatch {
+                return false
+            }
             guard attempt.phase == .preparingDispatch || attempt.phase == .dispatching else { return false }
             if attempt.phase == .preparingDispatch {
                 guard agentSessionLinkPeriodicWakeIsEligible(session, endpoint: attempt.observerEndpoint),
@@ -1034,7 +1038,9 @@ extension AgentModeViewModel {
         else {
             return
         }
-        if attempt.isPeriodic, attempt.periodicProducerDispatchID != dispatchID { return }
+        if attempt.isPeriodic, attempt.periodicProducerDispatchID != dispatchID {
+            return
+        }
         attempt.task?.cancel()
         session.oversight.pendingAutoWake = nil
         session.monitorObservationSignal.send(())
@@ -1061,7 +1067,9 @@ extension AgentModeViewModel {
         }
         // Periodic producers may still enter the existing Codex fallback/auth recovery path.
         // Keep their identity until acceptance or proven producer settlement, without suppression.
-        if attempt.isPeriodic { return }
+        if attempt.isPeriodic {
+            return
+        }
         agentSessionLinkSettleAmbiguousAutoWake(attempt, session: session)
     }
 
@@ -1278,12 +1286,28 @@ extension AgentModeViewModel {
         guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
             return
         }
-        _ = resumeWaitingInstructionContinuation(
+        // The continuation is also a physical acceptance boundary. Carry the note first, just as
+        // native/ACP provider sends do; never consume either receipt before the resume succeeds.
+        let carry = AgentSelfCompactParkedPrefix.prepare(claim.fragment, session: session) {}
+        if let noteID = carry.dispatchID {
+            guard AgentSelfCompactParkedPrefix.markAttempted(noteID, session: session) else { return }
+        }
+        let accepted = resumeWaitingInstructionContinuation(
             session: session,
-            providerText: claim.fragment,
+            providerText: carry.text,
             claim: claim,
             origin: .laneUpdateAutoWake(wakeID: wakeID)
         )
+        if let noteID = carry.dispatchID {
+            if accepted {
+                AgentSelfCompactParkedPrefix.markAccepted(noteID, session: session)
+            } else {
+                var state = session.selfCompactState
+                _ = state.noteDefinitivelyNotAttempted(noteID)
+                session.selfCompactState = state
+            }
+            scheduleSave(for: session)
+        }
     }
 
     // MARK: - Routine wake interval
@@ -1351,7 +1375,9 @@ extension AgentModeViewModel {
         }
         // Including a tombstone: the slot is the single reservation, and a manual request must never
         // promote, replace, or race the identity that fences an in-flight provider call.
-        if session.oversight.pendingAutoWake != nil { return .alreadyWaking }
+        if session.oversight.pendingAutoWake != nil {
+            return .alreadyWaking
+        }
         guard agentSessionLinkAutoWakeRoute(session) != nil else { return .sessionBusy }
         guard agentSessionLinkPromptContext(for: session)?.epoch.allowsSupplement == true else {
             return .notReady
@@ -1832,7 +1858,7 @@ extension AgentModeViewModel {
             && !session.bindingTransitionInProgress
             && !session.terminalCommitInProgress
             && !session.mcpFollowUpRunPending
-            && !session.selfCompactState.blocksAutomaticWake
+            && !agentSelfCompactBlocksNotificationWake(session)
             && !session.isComposerSubmissionInFlight
             && !session.isPreparingInitialWorktree
             && !session.isChangingExecutionLocation
@@ -2023,7 +2049,9 @@ extension AgentModeViewModel {
             guard promptEligible() else { return .suppress(.promptIneligible) }
             // The user asked for this one explicitly, so it is neither a routine nor an attention
             // basis and must not be re-derived from queue state that deliberately did not admit it.
-            if isManual { return .admit(.manual) }
+            if isManual {
+                return .admit(.manual)
+            }
             if let occurrence = requiredAttentionOccurrence(
                 fingerprint: fingerprint,
                 suppressed: suppressed
@@ -2098,7 +2126,9 @@ extension AgentModeViewModel {
             suppressed: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
         ) -> Bool {
             guard hasAdmissionBasis else { return false }
-            if isManual { return true }
+            if isManual {
+                return true
+            }
             guard let suppressed else { return true }
             return admissionFingerprint(suppressed) != admissionFingerprint(fingerprint)
         }
