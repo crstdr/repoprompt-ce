@@ -343,7 +343,7 @@ package enum AgentSessionLinkResolveFailure: String, Error, Equatable {
         case .malformedIdentifier:
             "That isn’t a valid session ID. Paste the full ID copied from a session."
         case .notFound:
-            "No open eligible session has this ID."
+            "No open session has this ID. Open that session’s chat, then try again."
         case .ambiguous:
             "That session is open in more than one window. Close the duplicate before overseeing it."
         case .loading:
