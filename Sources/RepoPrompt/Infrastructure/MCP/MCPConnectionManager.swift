@@ -3645,7 +3645,7 @@ actor ServerNetworkManager {
         return true
     }
 
-    /// Returns the exact route/policy/connection token used to qualify a server-observed catalog.
+    /// Returns exact actor-owned route/policy/connection proof, independently of catalog discovery.
     func authoritativeRunCatalogRouteToken(
         runID: UUID,
         windowID: Int,

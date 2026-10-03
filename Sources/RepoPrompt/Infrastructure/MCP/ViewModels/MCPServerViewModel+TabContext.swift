@@ -960,11 +960,11 @@ extension MCPServerViewModel {
             && tabContextByConnectionID[connectionID]?.tabID == expectedTabID
     }
 
-    /// Final synchronous fence for a catalog-qualified provider dispatch.
+    /// Final synchronous mapping fence for an actor-qualified provider dispatch.
     ///
     /// The server actor already qualified the token's policy and connection lifecycle. This
     /// MainActor check closes the remaining handover interval by requiring that the exact
-    /// connection observed by `tools/list` still owns the bidirectional route at composition time.
+    /// qualified connection still owns the bidirectional route at composition time; no list is needed.
     @MainActor
     func hasCurrentRunCatalogRouteToken(
         _ token: AgentSessionLinkRunCatalogRouteToken,
