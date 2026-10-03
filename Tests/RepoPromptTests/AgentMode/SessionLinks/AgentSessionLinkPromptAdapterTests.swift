@@ -1,5 +1,7 @@
 import Foundation
+import MCP
 import RepoPromptSecureStorage
+import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -1608,11 +1610,13 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let inventory: MonitorInventoryPublisher
         /// Retained: the view model holds its workspace manager weakly.
         let workspaceManager: WorkspaceManagerViewModel
+        let mcpServer: MCPServerViewModel?
     }
 
     private func makeFixture(
         agent: AgentProviderKind,
-        claudeController: MonitorFakeNativeController? = nil
+        claudeController: MonitorFakeNativeController? = nil,
+        withMCPServer: Bool = false
     ) throws -> Fixture {
         let tabID = UUID()
         // A real run resolves its workspace before it reaches a provider, so the runner-level suites
@@ -1621,8 +1625,9 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let keyManager = KeyManager(
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
         )
+        let aiQueriesService = AIQueriesService(keyManager: keyManager)
         let apiSettings = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            aiQueriesService: aiQueriesService,
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )
@@ -1647,6 +1652,33 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         manager.workspaces = [workspace]
         manager.activeWorkspace = workspace
 
+        let mcpServer: MCPServerViewModel? = if withMCPServer {
+            MCPServerViewModel(
+                service: MCPService(
+                    hostBootstrapOperation: {},
+                    controllerStartOperation: {},
+                    controllerFullShutdownOperation: {}
+                ),
+                promptVM: prompt,
+                oracleVM: OracleViewModel(
+                    aiQueriesService: aiQueriesService,
+                    promptViewModel: prompt,
+                    workspaceManager: manager,
+                    chatData: ChatDataService()
+                ),
+                workspaceManager: manager,
+                windowID: 1,
+                workspaceSearch: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                    throw MCPError.internalError("search is not used by route removal tests")
+                },
+                ensureGitDataRootLoaded: { _, _ in
+                    throw MCPError.internalError("Git-data loading is not used by route removal tests")
+                }
+            )
+        } else {
+            nil
+        }
+
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
@@ -1657,7 +1689,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 { _, _, _, _ in controller }
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
-            mcpServerEnabler: { true }
+            mcpServerEnabler: { true },
+            testMCPServer: mcpServer
         )
         retained.append(viewModel)
         viewModel.workspaceManager = manager
@@ -1680,7 +1713,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 observerSessionID: sessionID,
                 tabID: tabID
             ),
-            workspaceManager: manager
+            workspaceManager: manager,
+            mcpServer: mcpServer
         )
     }
 
@@ -1789,6 +1823,121 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             dispatchID: .claudeNativeSend(projection.runID)
         )
         MonitorSupplementAssertions.assertCarriesNoSupplement(next.text)
+    }
+
+    func testClaudeConnectionRemovalDuringConfigurationRefusesAndPreservesMessage() async throws {
+        try await assertClaudeClosedConnectionDuringConfiguration(pauseTermination: false)
+    }
+
+    func testClaudeTerminalConnectionDuringConfigurationRefusesAndPreservesMessage() async throws {
+        try await assertClaudeClosedConnectionDuringConfiguration(pauseTermination: true)
+    }
+
+    private func assertClaudeClosedConnectionDuringConfiguration(pauseTermination: Bool) async throws {
+        #if DEBUG
+            let controller = MonitorFakeNativeController()
+            let fixture = try makeFixture(agent: .claudeCode, claudeController: controller, withMCPServer: true)
+            let server = try XCTUnwrap(fixture.mcpServer)
+            fixture.inventory.publish(revision: 0, targetCount: 0)
+            fixture.session.installRunID(UUID())
+            fixture.session.claudeController = controller
+            let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.removing-route")
+            let seed = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "seed", attachments: [],
+                intent: intent, allowsCatalogRouteControllerRecovery: false
+            )
+            XCTAssertEqual(seed, .sent)
+            fixture.inventory.publish(revision: 1, targetCount: 1)
+            let runID = try XCTUnwrap(fixture.session.runID)
+            let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+            let connectionID = UUID()
+            let manager = ServerNetworkManager.shared
+            let removalGate = CatalogAuthorityGate()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: connectionID,
+                connection: MonitorRemovalConnection(gate: removalGate, pauseTermination: pauseTermination)
+            )
+            let state = await manager.debugDirectAdmissionStateForTesting(connectionID: connectionID)
+            let token = try AgentSessionLinkRunCatalogRouteToken(
+                runID: runID, observerEndpoint: endpoint, connectionID: connectionID,
+                routingAuthorityGeneration: 1,
+                connectionLifecycleGeneration: XCTUnwrap(state.connectionLifecycleGeneration)
+            )
+            try server.bindTabForConnection(
+                connectionID: connectionID, clientName: nil, tabID: fixture.tabID,
+                workspaceID: XCTUnwrap(fixture.workspaceManager.activeWorkspaceID),
+                windowID: endpoint.windowID, runID: runID
+            )
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in token }
+            // Exercise the production final fence, not a simulated route-current boolean.
+            fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in
+                server.hasCurrentRunCatalogRouteToken(candidate, expectedTabID: tabID)
+            }
+            XCTAssertTrue(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            let configurationGate = CatalogAuthorityGate()
+            await controller.setConfigurationGate(configurationGate)
+            addTeardownBlock { @MainActor in
+                await configurationGate.open()
+                await removalGate.open()
+                await manager.debugRemoveConnection(connectionID)
+                server.stopServiceObservation()
+            }
+            let confirmed = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
+            fixture.session.appendItem(confirmed)
+            let rawDraft = "preserve removing-route input"
+            fixture.viewModel.storeDraftText(for: fixture.tabID, rawDraft)
+            XCTAssertEqual(
+                fixture.viewModel.submitUserTurn(
+                    text: rawDraft.trimmingCharacters(in: .whitespacesAndNewlines),
+                    tabID: fixture.tabID, rawDraftText: rawDraft
+                ),
+                .submitted
+            )
+            fixture.viewModel.storeDraftText(for: fixture.tabID, "")
+            await configurationGate.waitUntilEntered()
+            let removal = Task {
+                if pauseTermination {
+                    await manager.terminateConnection(connectionID, reason: .runCompleted)
+                } else {
+                    await manager.removeConnection(connectionID)
+                }
+            }
+            // Hold either terminal commitment BEFORE removal, or removal BEFORE mapping cleanup.
+            await removalGate.waitUntilEntered()
+            let removalHasBegun = await manager.debugHasConnectionRemovalOperation(for: connectionID)
+            XCTAssertEqual(removalHasBegun, !pauseTermination)
+            XCTAssertTrue(server.hasCurrentRunRouteMapping(
+                runID: runID, connectionID: connectionID, expectedTabID: fixture.tabID
+            ), "retained mappings must reproduce the unsafe cleanup interval")
+            XCTAssertFalse(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            await configurationGate.open()
+            try await AsyncTestWait.waitUntil("removing-route refusal or physical send") {
+                let refused = await MainActor.run {
+                    fixture.session.items.contains {
+                        $0.kind == .error && $0.text.contains("[route:configuration-fence]")
+                    }
+                }
+                if refused { return true }
+                return await controller.sentCount > 1
+            }
+            let sent = await controller.sentMessages
+            XCTAssertEqual(sent, ["seed"], "removal must cause definite no-call, not an uncertain write")
+            XCTAssertEqual(
+                fixture.session.items.filter { $0.kind == .user }.map(\.text),
+                [confirmed.text, rawDraft],
+                "native refusal preserves the unsent message in the transcript for retry"
+            )
+            XCTAssertTrue(fixture.session.items.contains {
+                $0.kind == .error && $0.text.contains("No provider message was sent")
+            })
+            XCTAssertNil(fixture.viewModel.agentSessionLinkPromptClaimStore.test_lastAcceptedRevision(
+                observerSessionID: fixture.sessionID
+            ))
+            await removalGate.open()
+            await removal.value
+        #else
+            throw XCTSkip("Connection lifecycle diagnostics require DEBUG helpers.")
+        #endif
     }
 
     func testClaudeFirstLinkDuringConfigurationRequiresCurrentRoute() async throws {
@@ -2514,6 +2663,59 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 }
 
 // MARK: - Non-Codex fakes
+
+private actor MonitorRemovalConnection: MCPServerConnection {
+    let gate: CatalogAuthorityGate
+    let pauseTermination: Bool
+
+    init(gate: CatalogAuthorityGate, pauseTermination: Bool) {
+        self.gate = gate
+        self.pauseTermination = pauseTermination
+    }
+
+    nonisolated var isFilesystemBacked: Bool {
+        false
+    }
+
+    nonisolated var connectionFolderURL: URL? {
+        nil
+    }
+
+    nonisolated var capabilityToken: String? {
+        nil
+    }
+
+    func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
+    func stop() async {}
+    func abortForExecutionWatchdog(context _: MCPExecutionWatchdogTerminalContext) async {}
+    func notifyToolListChanged() async {}
+    func connectionState() -> ConnectionStateSnapshot {
+        .ready
+    }
+
+    func isViableForRetention() -> Bool {
+        true
+    }
+
+    func secondsSinceLastActivity() async -> TimeInterval {
+        0
+    }
+
+    func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
+        nil
+    }
+
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        if !pauseTermination { _ = await gate.requirement() }
+        return nil
+    }
+
+    func terminate(reason _: TerminationReason, message _: String?) async {
+        if pauseTermination { _ = await gate.requirement() }
+    }
+
+    func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
+}
 
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private var configuration = SessionLinkNativeConfigurationFixture()
