@@ -158,10 +158,8 @@ struct AgentSessionRow: View {
 
     // MARK: - Context Menu Snapshot
 
-    /// Snapshot of the conditions that control context menu item visibility,
-    /// captured on hover. Using a snapshot prevents AppKit from observing a
-    /// mid-layout item-count change (which triggers an NSRangeException when
-    /// NSContextMenuImpl measures row heights for items that were just removed).
+    /// Captured once at accepted native opening, not on hover. The presenter materializes
+    /// an independent NSMenu, so subsequent row updates cannot change its item count.
     private struct ContextMenuSnapshot {
         var isInteractionEnabled: Bool
         var showsSelectionPresentation: Bool
@@ -177,19 +175,10 @@ struct AgentSessionRow: View {
         var sidebarOversightUnavailableReason: String?
     }
 
-    @State private var menuSnapshot = ContextMenuSnapshot(
-        isInteractionEnabled: true,
-        showsSelectionPresentation: false,
-        hasAttentionRunState: false,
-        hasOnStash: false,
-        hasOnDismissAttention: false,
-        sidebarOversightMenu: nil,
-        sidebarOversightUnavailableReason: nil
-    )
     @StateObject private var contextMenuAnchor = StableMenuAnchor()
 
     /// The oversight menu as it should appear, or nil when the section must not be offered.
-    /// Evaluated at hover so the context menu's item count cannot change while it is open.
+    /// Reads the stored exact projection only when a menu is opened.
     ///
     /// Ineligible or empty directions render a greyed reason inside the menu rather than hiding
     /// it, so a non-nil projection is always presentable when the action callbacks exist.
@@ -210,6 +199,20 @@ struct AgentSessionRow: View {
         allowsDirectMutations
             && sidebarOversightUnavailableReason != nil
             && presentableSidebarOversightMenu == nil
+    }
+
+    private func currentContextMenuSnapshot() -> ContextMenuSnapshot {
+        let menu = presentableSidebarOversightMenu
+        return ContextMenuSnapshot(
+            isInteractionEnabled: isInteractionEnabled,
+            showsSelectionPresentation: showsSelectionPresentation,
+            hasAttentionRunState: attentionRunState != nil,
+            hasOnStash: onStash != nil,
+            hasOnDismissAttention: onDismissAttention != nil,
+            sidebarOversightMenu: menu,
+            sidebarOversightUnavailableReason: allowsDirectMutations && menu == nil
+                ? sidebarOversightUnavailableReason : nil
+        )
     }
 
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -365,7 +368,7 @@ struct AgentSessionRow: View {
     /// The whole right-click menu as an immutable item tree for `StableMenuContextRegion`:
     /// the oversight section reuses the same builder the mark and hover menus present, and
     /// the standard row actions mirror the removed `.contextMenu` item-for-item. The builder
-    /// reads the hover-frozen snapshot so the presented menu matches what the user saw.
+    /// reads the opening snapshot; later projection updates apply only to the next opening.
     private func sidebarContextMenuItems(_ snapshot: ContextMenuSnapshot) -> [StableMenuItem] {
         MainActor.assumeIsolated {
             var items: [StableMenuItem] = []
@@ -1130,7 +1133,7 @@ struct AgentSessionRow: View {
         // close still can. The hit gate passes every non-context event through untouched.
         .overlay(
             StableMenuContextRegion(anchor: contextMenuAnchor) {
-                sidebarContextMenuItems(menuSnapshot)
+                sidebarContextMenuItems(currentContextMenuSnapshot())
             }
             .accessibilityHidden(true)
         )
@@ -1139,24 +1142,9 @@ struct AgentSessionRow: View {
         }
         .onHover { hovered in
             isHovered = hovered
-            if hovered {
-                menuSnapshot = ContextMenuSnapshot(
-                    isInteractionEnabled: isInteractionEnabled,
-                    showsSelectionPresentation: showsSelectionPresentation,
-                    hasAttentionRunState: attentionRunState != nil,
-                    hasOnStash: onStash != nil,
-                    hasOnDismissAttention: onDismissAttention != nil,
-                    sidebarOversightMenu: presentableSidebarOversightMenu,
-                    sidebarOversightUnavailableReason: showsDisabledOversightContextSubmenus
-                        ? sidebarOversightUnavailableReason
-                        : nil
-                )
-            }
         }
-        // Deliberately does not refresh `menuSnapshot`: an endpoint rebind while the menu is open
-        // would change its item count, which is the crash the snapshot exists to prevent. Stale
-        // presentation is safe because Add re-resolves current eligibility, while Stop is
-        // exact-endpoint and generation-reference qualified.
+        // Presentation is frozen in the independent native menu. Endpoint changes reset only
+        // feedback; Add re-resolves eligibility and Stop remains generation-reference qualified.
         .onChange(of: sidebarOversightTargetEndpoint) { previous, current in
             guard previous != current else { return }
             resetSidebarOversightPresentation()
