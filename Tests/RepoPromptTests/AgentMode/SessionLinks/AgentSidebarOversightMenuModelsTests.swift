@@ -1633,6 +1633,23 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
 
     private enum Opening { case rightClick, controlClick, accessibility }
 
+    @MainActor private final class SubmenuOpeningObserver: NSObject, NSMenuDelegate {
+        let delegate: NSMenuDelegate?
+        var onOpen: (NSMenu) -> Void = { _ in }
+
+        init(delegate: NSMenuDelegate?) {
+            self.delegate = delegate
+        }
+
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            delegate?.menuNeedsUpdate?(menu)
+        }
+
+        func menuWillOpen(_ menu: NSMenu) {
+            onOpen(menu)
+        }
+    }
+
     func testColdRightClickShowsEightOutboundAndInbound() async throws {
         let fixture = try await makeFixture()
         for index in 1 ... 8 {
@@ -1658,7 +1675,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertEqual(try menuProps(in: fixture), props, "Opening alone must not mutate the settled relationship presentation")
     }
 
-    func testColdRightClickShowsLoadingSubmenusBeforeProjectionReady() async throws {
+    func testColdRightClickShowsUnavailableSubmenusBeforeProjectionReady() async throws {
         let fixture = try await makeFixture(peerCount: 2)
         let endpoint = try menuProps(in: fixture).targetEndpoint
         fixture.vm.agentSessionLinkPublishProjection(.empty, to: endpoint)
@@ -1669,7 +1686,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let menu = try await open(in: fixture)
         for title in [AgentOversightUICopy.overseeNewTitle, AgentOversightUICopy.overseeByTitle] {
             let submenu = try XCTUnwrap(menu.items.first { $0.title == title }?.submenu)
-            XCTAssertEqual(submenu.items.map(\.title), ["Loading…"])
+            XCTAssertEqual(submenu.items.map(\.title), ["Not available yet — reopen this menu"])
             XCTAssertFalse(submenu.items[0].isEnabled)
         }
     }
@@ -1730,6 +1747,136 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let stopped = try await open(in: fixture)
         XCTAssertFalse(stopped.items.contains { $0.title == AgentOversightUICopy.overseeingSectionLabel })
         XCTAssertTrue(linked.items.contains { $0.title == AgentOversightUICopy.overseeingSectionLabel }, "Previous menu remains a value snapshot")
+    }
+
+    func testColdProviderReadsReadyProjectionOnReopenWithoutRemount() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let otherWindow = try await makeFixture(peerCount: 1)
+        try await add(from: 0, to: 1, in: otherWindow)
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        let props = try menuProps(in: fixture)
+        let observerEndpoint = try menuProps(in: otherWindow).targetEndpoint
+        let observer = try XCTUnwrap(props.availableObservers.first { $0.peerEndpoint == observerEndpoint })
+        let region = try mountedRegion(in: fixture)
+        let originalProvider = region.itemsProvider
+
+        fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+        let cold = NSMenu.stableMenu(from: originalProvider())
+        let coldSubmenu = try XCTUnwrap(cold.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
+        XCTAssertEqual(coldSubmenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        XCTAssertEqual(try menuProps(in: fixture).targetEndpoint, props.targetEndpoint)
+        let reopened = NSMenu.stableMenu(from: originalProvider())
+        let reopenedSubmenu = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
+        XCTAssertTrue(reopenedSubmenu.items.contains { $0.title == observer.menuLabel && $0.isEnabled })
+        XCTAssertEqual(coldSubmenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+        XCTAssertTrue(try mountedRegion(in: fixture) === region, "The original mounted provider must recover without remount or reassignment")
+    }
+
+    func testSubmenuUpdateReadsReadyProjectionWithoutReopeningRoot() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let otherWindow = try await makeFixture(peerCount: 1)
+        try await add(from: 0, to: 1, in: otherWindow)
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        let props = try menuProps(in: fixture)
+        let peerEndpoint = try menuProps(in: otherWindow).targetEndpoint
+        let observer = try XCTUnwrap(props.availableObservers.first { $0.peerEndpoint == peerEndpoint })
+        let target = try XCTUnwrap(props.availableTargets.first { $0.peerEndpoint == peerEndpoint })
+        let readyProjection = try XCTUnwrap(fixture.vm.monitorPillPropsByEndpoint[props.targetEndpoint])
+        fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+
+        var observed = false
+        _ = try await open(in: fixture, whileTracking: { root in
+            let rootItems = root.items
+            let directions = [
+                (AgentOversightUICopy.overseeNewTitle, target.menuLabel),
+                (AgentOversightUICopy.overseeByTitle, observer.menuLabel)
+            ]
+            fixture.vm.agentSessionLinkPublishProjection(readyProjection, to: props.targetEndpoint)
+            for (title, peerLabel) in directions {
+                guard let submenu = root.items.first(where: { $0.title == title })?.submenu else {
+                    XCTFail("Missing \(title) submenu")
+                    continue
+                }
+                XCTAssertEqual(submenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+                let updater = submenu.delegate
+                XCTAssertNotNil(updater, "The native submenu must retain its updater independently of the row")
+                // Exercise the AppKit pre-tracking callback for this submenu, not a new
+                // root provider or a SwiftUI root replacement.
+                updater?.menuNeedsUpdate?(submenu)
+                XCTAssertEqual(submenu.items.count { $0.title == peerLabel && $0.isEnabled }, 1)
+                let parent = root.items.first { $0.submenu === submenu }
+                XCTAssertNotEqual(parent?.accessibilityValue() as? String, AgentOversightUICopy.oversightMenuUnavailableMessage)
+
+                fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+                updater?.menuNeedsUpdate?(submenu)
+                XCTAssertEqual(submenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+                XCTAssertFalse(submenu.items[0].isEnabled)
+                XCTAssertEqual(parent?.accessibilityValue() as? String, AgentOversightUICopy.oversightMenuUnavailableMessage)
+                fixture.vm.agentSessionLinkPublishProjection(readyProjection, to: props.targetEndpoint)
+                updater?.menuNeedsUpdate?(submenu)
+                XCTAssertEqual(submenu.items.count { $0.title == peerLabel && $0.isEnabled }, 1)
+            }
+            XCTAssertEqual(root.items.count, rootItems.count)
+            XCTAssertTrue(zip(root.items, rootItems).allSatisfy { $0 === $1 }, "Root identity and structure must not change during submenu refresh")
+            XCTAssertTrue(fixture.window.stableMenuPresenter.openMenu === root)
+            observed = true
+        })
+        XCTAssertTrue(observed)
+        XCTAssertNil(fixture.window.stableMenuPresenter.openMenu)
+    }
+
+    func testNativeSubmenuReadsReadyProjectionWithoutReopeningRoot() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let props = try menuProps(in: fixture)
+        let target = try XCTUnwrap(props.availableTargets.first)
+        let readyProjection = try XCTUnwrap(fixture.vm.monitorPillPropsByEndpoint[props.targetEndpoint])
+        fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+        var observer: SubmenuOpeningObserver?
+        var timeout: Timer?
+        var openings = 0
+        defer { timeout?.invalidate() }
+
+        func postKey(_ code: UInt16, character: String) {
+            guard let event = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: fixture.window.windowNumber, context: nil, characters: character,
+                charactersIgnoringModifiers: character, isARepeat: false, keyCode: code
+            ) else { return XCTFail("Could not create menu navigation event") }
+            NSApp.postEvent(event, atStart: false)
+        }
+
+        _ = try await open(in: fixture, cancelAfterOpening: false, whileTracking: { root in
+            guard let submenu = root.items.first(where: { $0.title == AgentOversightUICopy.overseeNewTitle })?.submenu else {
+                XCTFail("Missing candidate submenu")
+                return root.cancelTracking()
+            }
+            let rootItems = root.items
+            fixture.vm.agentSessionLinkPublishProjection(readyProjection, to: props.targetEndpoint)
+            let forwarding = SubmenuOpeningObserver(delegate: submenu.delegate)
+            observer = forwarding
+            submenu.delegate = forwarding
+            forwarding.onOpen = { child in
+                openings += 1
+                XCTAssertTrue(child.items.contains { $0.title == target.menuLabel && $0.isEnabled })
+                XCTAssertTrue(zip(root.items, rootItems).allSatisfy { $0 === $1 })
+                XCTAssertTrue(fixture.window.stableMenuPresenter.openMenu === root)
+                root.cancelTracking()
+            }
+            let watchdog = Timer(timeInterval: 1, repeats: false) { _ in
+                MainActor.assumeIsolated { root.cancelTracking() }
+            }
+            timeout = watchdog
+            RunLoop.main.add(watchdog, forMode: .common)
+            postKey(125, character: "\u{F701}")
+            postKey(124, character: "\u{F703}")
+        })
+        withExtendedLifetime(observer) {}
+        XCTAssertEqual(openings, 1, "AppKit must display the submenu while the original root tracks")
     }
 
     func testTrackedMenuSurvivesProjectionReplacementAndSidebarRerender() async throws {
@@ -1864,17 +2011,19 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
 
     private func open(
         in fixture: Fixture, via opening: Opening = .rightClick,
+        cancelAfterOpening: Bool = true,
         whileTracking: ((NSMenu) -> Void)? = nil
     ) async throws -> NSMenu {
-        fixture.host.layoutSubtreeIfNeeded()
-        func regions(in view: NSView) -> [StableMenuContextView] {
-            (view as? StableMenuContextView).map { [$0] } ?? view.subviews.flatMap { regions(in: $0) }
-        }
-        let mountedRegions = regions(in: fixture.host).filter { !$0.visibleRect.isEmpty }
-        XCTAssertEqual(mountedRegions.count, 1, "The actual sidebar search must leave only the intended row region")
-        let region = try XCTUnwrap(mountedRegions.first, "Real sidebar must mount its native row region")
+        let region = try mountedRegion(in: fixture)
         let finished = expectation(description: "Native tracking observed and intentionally ended")
         var tracked: NSMenu?
+        let ended = NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: nil) { note in
+            MainActor.assumeIsolated {
+                guard !cancelAfterOpening, let menu = note.object as? NSMenu, menu === tracked else { return }
+                finished.fulfill()
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(ended) }
         let token = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: nil) { note in
             MainActor.assumeIsolated {
                 guard let menu = note.object as? NSMenu, menu === fixture.window.stableMenuPresenter.openMenu else { return }
@@ -1882,8 +2031,10 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 let timer = Timer(timeInterval: 0.05, repeats: false) { _ in
                     MainActor.assumeIsolated {
                         whileTracking?(menu)
-                        menu.cancelTracking()
-                        finished.fulfill()
+                        if cancelAfterOpening {
+                            menu.cancelTracking()
+                            finished.fulfill()
+                        }
                     }
                 }
                 RunLoop.main.add(timer, forMode: .common)
@@ -1905,5 +2056,15 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         }
         await fulfillment(of: [finished], timeout: 3)
         return try XCTUnwrap(tracked, "Actual native opening must track a menu")
+    }
+
+    private func mountedRegion(in fixture: Fixture) throws -> StableMenuContextView {
+        fixture.host.layoutSubtreeIfNeeded()
+        func regions(in view: NSView) -> [StableMenuContextView] {
+            (view as? StableMenuContextView).map { [$0] } ?? view.subviews.flatMap { regions(in: $0) }
+        }
+        let mountedRegions = regions(in: fixture.host).filter { !$0.visibleRect.isEmpty }
+        XCTAssertEqual(mountedRegions.count, 1, "The actual sidebar search must leave only the intended row region")
+        return try XCTUnwrap(mountedRegions.first, "Real sidebar must mount its native row region")
     }
 }

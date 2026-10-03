@@ -68,12 +68,12 @@ enum StableMenuItemStyle: Equatable {
 struct StableMenuItem {
     private enum Kind {
         case action(() -> Void)
-        case submenu([StableMenuItem])
+        case submenu([StableMenuItem], (@MainActor () -> StableMenuItem)?)
         case separator
         case header
     }
 
-    private let kind: Kind
+    private var kind: Kind
     let title: String
     let isEnabled: Bool
     let isSelected: Bool
@@ -142,7 +142,7 @@ struct StableMenuItem {
     ) -> StableMenuItem {
         StableMenuItem(
             title: title,
-            kind: .submenu(items),
+            kind: .submenu(items, nil),
             imageSystemName: imageSystemName,
             style: style,
             accessibilityLabel: accessibilityLabel,
@@ -161,6 +161,20 @@ struct StableMenuItem {
 
     static var separator: StableMenuItem {
         StableMenuItem(title: "", kind: .separator, isEnabled: false)
+    }
+
+    var submenuItems: [StableMenuItem]? {
+        guard case let .submenu(items, _) = kind else { return nil }
+        return items
+    }
+
+    /// Opt-in refresh at AppKit's pre-tracking update boundary. The parent item and
+    /// root menu remain fixed; model publications never mutate a tracked submenu.
+    func refreshingSubmenu(_ items: @escaping @MainActor () -> StableMenuItem) -> StableMenuItem {
+        guard case let .submenu(initialItems, _) = kind else { return self }
+        var item = self
+        item.kind = .submenu(initialItems, items)
+        return item
     }
 
     fileprivate func makeMenuItem(fontPreset: FontScalePreset = .current) -> NSMenuItem {
@@ -185,11 +199,20 @@ struct StableMenuItem {
             configureTitle(on: item, fontPreset: fontPreset)
             configureAccessibility(on: item)
             return item
-        case let .submenu(childItems):
+        case let .submenu(childItems, itemsProvider):
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             item.isEnabled = isEnabled
             item.state = isSelected ? .on : .off
             item.submenu = NSMenu.stableMenu(from: childItems, fontPreset: fontPreset)
+            if let itemsProvider, let submenu = item.submenu {
+                let updater = MainActor.assumeIsolated {
+                    StableSubmenuUpdater(items: itemsProvider, fontPreset: fontPreset)
+                }
+                submenu.delegate = updater
+                // NSMenu does not retain its delegate. Its lifetime follows this submenu,
+                // independent of SwiftUI trigger updates or teardown during root tracking.
+                objc_setAssociatedObject(submenu, &stableSubmenuUpdaterKey, updater, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            }
             configureImage(on: item)
             configureTitle(on: item, fontPreset: fontPreset)
             configureAccessibility(on: item)
@@ -234,6 +257,30 @@ struct StableMenuItem {
             attributes[.foregroundColor] = NSColor.systemOrange
         }
         item.attributedTitle = NSAttributedString(string: title, attributes: attributes)
+    }
+}
+
+private var stableSubmenuUpdaterKey = 0
+
+@MainActor
+private final class StableSubmenuUpdater: NSObject, NSMenuDelegate {
+    private let items: @MainActor () -> StableMenuItem
+    private let fontPreset: FontScalePreset
+
+    init(items: @escaping @MainActor () -> StableMenuItem, fontPreset: FontScalePreset) {
+        self.items = items
+        self.fontPreset = fontPreset
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        let updatedItem = items()
+        if let parent = menu.supermenu?.items.first(where: { $0.submenu === menu }) {
+            parent.setAccessibilityValue(updatedItem.accessibilityValue)
+        }
+        menu.removeAllItems()
+        for item in updatedItem.submenuItems ?? [] {
+            menu.addItem(item.makeMenuItem(fontPreset: fontPreset))
+        }
     }
 }
 
@@ -315,7 +362,7 @@ final class StableMenuPresenter: NSObject, NSMenuDelegate {
         finishOpenMenu(menu)
     }
 
-    /// Builds the immutable item tree, takes ownership for tracking, and arms the
+    /// Builds the fixed root item tree, takes ownership for tracking, and arms the
     /// window-close observer. `closeOpenMenu` runs first so a reentrant presentation
     /// releases the previous observer token instead of overwriting it.
     private func beginOpenMenu(_ items: [StableMenuItem], in window: NSWindow) -> NSMenu {
