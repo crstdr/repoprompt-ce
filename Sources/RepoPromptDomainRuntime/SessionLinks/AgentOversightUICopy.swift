@@ -98,6 +98,8 @@ package enum AgentOversightUICopy {
     /// Disabled reason shown in the Oversee-by / Oversee-new context submenus on a row whose chat
     /// has no session ID yet (fresh chat before the first send). Approved by Cristian 2026-10-01.
     package static let oversightAvailableAfterFirstMessage = "Available after the first message"
+    /// Placeholder while the exact sidebar oversight projection is being restored.
+    package static let oversightLoadingMessage = "Loading…"
 
     /// VoiceOver hint on a linked/creator jump item: selecting it opens that session.
     package static func openHint(_ displayName: String) -> String {

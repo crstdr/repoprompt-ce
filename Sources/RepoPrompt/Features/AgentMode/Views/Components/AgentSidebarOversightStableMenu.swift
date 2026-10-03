@@ -160,7 +160,6 @@ extension AgentSessionRow {
         ))
 
         if hasLinkedSections {
-            items.append(.separator)
             var unlinkItems: [StableMenuItem] = []
             if !menu.linkedTargets.isEmpty {
                 unlinkItems.append(.header(AgentOversightUICopy.overseeingSectionLabel))
