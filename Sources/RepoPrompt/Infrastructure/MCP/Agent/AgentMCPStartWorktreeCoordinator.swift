@@ -444,6 +444,7 @@ struct AgentMCPStartWorktreeCoordinator {
     ) async throws {
         let runner = CLIProcessRunner(config: CLIProcessConfiguration(
             command: "git",
+            processPurpose: .tool,
             workingDirectory: repository.rootPath,
             enableDebugLogging: false
         ))
