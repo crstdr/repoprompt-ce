@@ -2,7 +2,6 @@ import Foundation
 
 extension Notification.Name {
     static let codexGoalSupportDidChange = Notification.Name("RepoPrompt.codexGoalSupportDidChange")
-    static let codexComputerUseAvailabilityDidChange = Notification.Name("RepoPrompt.codexComputerUseAvailabilityDidChange")
 }
 
 private enum CodexNativeFeatureGate: Hashable {
@@ -130,24 +129,10 @@ enum CodexGoalSupport {
 
 enum CodexComputerUseWorkflow {
     static let commandName = "computer-use"
-    static let disabledMessage = "Turn on Computer Use in Codex Agent Permissions before using /computer-use."
+    static let disabledMessage = "Codex computer-use is currently disabled in RepoPrompt because it requires additional computer permissions/accessibility setup."
 
-    @MainActor
     static var isEnabled: Bool {
-        GlobalSettingsStore.shared.codexComputerUseEnabled()
-    }
-
-    static func isEligible(globalEnabled: Bool, isCodex: Bool, isMCPRelated: Bool, hasActiveLink: Bool) -> Bool {
-        globalEnabled && isCodex && !isMCPRelated && !hasActiveLink
-    }
-
-    static func explicitRequestArguments(in text: String) -> String? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let command = "/computer-use"
-        guard trimmed.lowercased().hasPrefix(command) else { return nil }
-        let suffix = trimmed.dropFirst(command.count)
-        guard suffix.isEmpty || suffix.first?.isWhitespace == true else { return nil }
-        return suffix.trimmingCharacters(in: .whitespacesAndNewlines)
+        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: false)
     }
 
     #if DEBUG
