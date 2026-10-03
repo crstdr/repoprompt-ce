@@ -1612,6 +1612,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func selectModel(rawModel: String) {
+        if rawModel == selectedModelRaw, selectedAgent.usesClaudeTooling,
+           let session = activeSession, canSelectModel(rawModel, for: session),
+           let effort = ClaudeModelSpecifier(raw: rawModel).explicitEffortLevel
+        {
+            setClaudeEffortLevel(effort)
+        }
         selectedModelRaw = rawModel
     }
 
@@ -4640,6 +4646,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            let indexEntry = ownerValidatedSessionIndex[sessionID]
         {
             seedUnhydratedSession(newSession, from: indexEntry)
+        } else if explicitActiveSessionID(for: tabID) == nil, newSession.selectedAgent.usesClaudeTooling {
+            newSession.selectedClaudeEffortRaw = newSession.selectedClaudeEffortRaw ?? providerBindingService.claudeEffortLevel(
+                forModelRaw: newSession.selectedModelRaw,
+                agentKind: newSession.selectedAgent
+            ).rawValue
         }
         if let draft = tabDraftText.removeValue(forKey: tabID) {
             newSession.draftText = draft
@@ -4923,6 +4934,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.selectedAgent = normalizedSelection.agent
         session.selectedModelRaw = normalizedSelection.modelRaw
         session.selectedReasoningEffortRaw = indexEntry.agentReasoningEffortRaw
+        session.selectedClaudeEffortRaw = session.selectedAgent.usesClaudeTooling
+            ? indexEntry.agentReasoningEffortRaw : nil
         session.acpModelParameterSelections = indexEntry.acpModelParameterSelections
         session.createdByOverseerSessionID = indexEntry.createdByOverseerSessionID
         session.autoEditEnabled = indexEntry.autoEditEnabled
@@ -5903,6 +5916,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         session.runState = payload.normalizedRunState
+        restoreClaudeEffort(from: agentSession, to: session)
         session.providerSessionID = agentSession.providerSessionID
         session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
@@ -8374,7 +8388,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             itemCount: max(session.transcriptCanonicalVisibleRowCount, session.items.count),
             agentKindRaw: session.selectedAgent.rawValue,
             agentModelRaw: session.selectedModelRaw,
-            agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
+            agentReasoningEffortRaw: session.persistedReasoningEffortRaw,
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.oversight.autoWakeOnUpdates,
             agentSessionLinkAutoWakeTargetSessionIDs: session.oversight.autoWakeTargetSessionIDs,
@@ -9406,6 +9420,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // All native providers preserve an explicit pin and clear a previous/inherited pin
             // when this request omits effort, symmetrically with the normalization exemption below.
             session.selectedReasoningEffortRaw = reasoningEffortRaw
+            session.selectedClaudeEffortRaw = reasoningEffortRaw
         } else if let reasoningEffortRaw {
             session.selectedReasoningEffortRaw = reasoningEffortRaw
         }
@@ -11871,6 +11886,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let nextControlsBinding = providerBindingService.controlsBinding(
             selectedAgent: session.selectedAgent,
             selectedModelRaw: session.selectedModelRaw,
+            claudeEffortLevel: session.selectedAgent.usesClaudeTooling
+                ? claudeCoordinator.currentClaudeEffortLevel(for: session) : nil,
             permissionProfile: session.permissionProfile,
             isSubagent: usesSubagentPolicy,
             externallyManagedReason: externallyManagedReason
@@ -15636,7 +15653,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             lastUserMessageAt: lastUserMessageAt,
             agentKind: session.selectedAgent.rawValue,
             agentModel: session.selectedModelRaw,
-            agentReasoningEffort: session.selectedReasoningEffortRaw,
+            agentReasoningEffort: session.persistedReasoningEffortRaw,
             acpModelParameterSelections: session.acpModelParameterSelections,
             lastRunState: session.runState.rawValue,
             providerSessionID: session.providerSessionID,
