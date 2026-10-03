@@ -962,9 +962,9 @@ extension MCPServerViewModel {
 
     /// Final synchronous mapping fence for an actor-qualified provider dispatch.
     ///
-    /// The server actor already qualified the token's policy and connection lifecycle. This
-    /// MainActor check closes the remaining handover interval by requiring that the exact
-    /// qualified connection still owns the bidirectional route at composition time; no list is needed.
+    /// Recheck the actor's live lifecycle/removal state synchronously as well as both mapping
+    /// directions: cleanup can suspend after removal starts but before mappings are retracted.
+    /// Neither this fence nor its lifecycle read depends on catalog/tool-list freshness.
     @MainActor
     func hasCurrentRunCatalogRouteToken(
         _ token: AgentSessionLinkRunCatalogRouteToken,
@@ -976,6 +976,7 @@ extension MCPServerViewModel {
                 connectionID: token.connectionID,
                 expectedTabID: expectedTabID
             )
+            && ServerNetworkManager.shared.hasLiveProviderInputConnection(token)
     }
 
     /// Proactively removes all cached tab-context state for a closing tab while preserving window affinity.

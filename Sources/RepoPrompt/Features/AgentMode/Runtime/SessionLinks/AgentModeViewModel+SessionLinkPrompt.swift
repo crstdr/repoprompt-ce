@@ -148,8 +148,8 @@ extension AgentModeViewModel {
         )
     }
 
-    /// The async query proves route/policy/lifecycle authority; this synchronous final fence checks
-    /// that the exact connection it qualified still owns both MainActor mapping directions.
+    /// The async query proves route/policy authority; this synchronous final fence checks that
+    /// the qualified connection is still live, not removing, and owns both mapping directions.
     func agentSessionLinkHasCurrentProviderInputRoute(
         for session: TabSession,
         qualification: ProviderInputRouteReadiness
