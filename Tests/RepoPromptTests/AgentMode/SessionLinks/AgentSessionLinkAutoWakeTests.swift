@@ -125,9 +125,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             guard case let .laneUpdateAutoWake(wakeID) = response.origin else {
                 return XCTFail("expected an event-driven wake")
             }
-            XCTAssertTrue(response.text.hasPrefix(AgentSelfCompactNoteEnvelope.frame("continue safely") + "\n\n"))
-            XCTAssertTrue(response.text.contains("<repoprompt_session_oversight_status_changes"))
-            XCTAssertEqual(response.text.components(separatedBy: "<note>").count - 1, 1)
+            let text = try XCTUnwrap(response.text)
+            XCTAssertTrue(text.hasPrefix(AgentSelfCompactNoteEnvelope.frame("continue safely") + "\n\n"))
+            XCTAssertTrue(text.contains("<repoprompt_session_oversight_status_changes"))
+            XCTAssertEqual(text.components(separatedBy: "<note>").count - 1, 1)
             XCTAssertEqual(fixture.session.selfCompactState.latest?.requestID, noteID.requestID)
             XCTAssertEqual(fixture.session.selfCompactState.latest?.noteDelivery, .prepended)
             XCTAssertEqual(fixture.session.selfCompactState.latest?.completionVerified, true)
