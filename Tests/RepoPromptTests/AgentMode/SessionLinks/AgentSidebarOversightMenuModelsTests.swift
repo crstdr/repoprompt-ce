@@ -1749,6 +1749,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             }
         }
         let state = WindowState()
+        addTeardownBlock {
+            await state.tearDown()
+        }
         await state.workspaceManager.awaitInitialized()
         let tabs = (0 ... peerCount).map { index in
             ComposeTabState(
@@ -1778,6 +1781,11 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             }
         }
         WindowStatesManager.shared.registerWindowState(state)
+        addTeardownBlock {
+            await MainActor.run {
+                WindowStatesManager.shared.unregisterWindowState(state)
+            }
+        }
         await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
         vm.syncSidebarUIState(refresh: true, reason: .runState, sidebarTabs: tabs)
         // Use the real sidebar search owner to isolate the clicked row. Peers stay live in the
@@ -1792,15 +1800,13 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertEqual(projection.pagedSessions.map(\.tabID), [tabs[0].id], "Real search must isolate the intended row, not a sibling")
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: sidebar(for: state, tabID: tabs[0].id))
-        window.contentView = host
         addTeardownBlock {
             await MainActor.run {
                 window.close()
-                WindowStatesManager.shared.unregisterWindowState(state)
             }
-            await state.tearDown()
         }
+        let host = NSHostingView(rootView: sidebar(for: state, tabID: tabs[0].id))
+        window.contentView = host
         window.makeKeyAndOrderFront(nil)
         host.layoutSubtreeIfNeeded()
         await Task.yield()
