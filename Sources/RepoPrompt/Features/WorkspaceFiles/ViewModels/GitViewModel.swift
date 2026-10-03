@@ -540,6 +540,7 @@ final class GitViewModel: ObservableObject {
 
     func shutdownForWindowClose() async {
         prepareForWindowClose()
+        await statusActor.shutdown()
         let tasks = pendingWindowCloseTasks
         for task in tasks {
             await task.value
@@ -549,6 +550,10 @@ final class GitViewModel: ObservableObject {
     }
 
     #if DEBUG
+        var test_statusActor: GitStatusActor {
+            statusActor
+        }
+
         var test_hasGitContextRefreshTask: Bool {
             gitContextRefreshTask != nil
         }

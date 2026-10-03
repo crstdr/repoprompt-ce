@@ -388,6 +388,93 @@ final class JujutsuSnapshotPolicyTests: XCTestCase {
     }
 }
 
+#if DEBUG
+    final class GitStatusShutdownTests: XCTestCase {
+        func testShutdownDrainsObserverRefreshBeforeReturningAndSuppressesLateSnapshot() async throws {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("status-shutdown-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(".jj"), withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let statsEntered = expectation(description: "Repository stats refresh is suspended")
+            let drainEntered = expectation(description: "Shutdown waits for the observer-owned refresh")
+            let gate = StatsGate(entered: statsEntered)
+            let runner = JJCommandRunner { arguments, _, _ in
+                let command = arguments.first == "--ignore-working-copy" ? Array(arguments.dropFirst()) : arguments
+                if command.prefix(2) == ["diff", "--summary"] {
+                    return ("M App.swift\n", "", 0)
+                }
+                if command.prefix(2) == ["diff", "--stat"] {
+                    await gate.waitIfArmed()
+                    return ("App.swift | 1 +\n1 file changed, 1 insertion(+), 0 deletions(-)\n", "", 0)
+                }
+                return ("", "", 0)
+            }
+            let status = GitStatusActor(vcsService: VCSService(jjRunner: runner))
+            _ = await status.updateRoots([root.path])
+            await status.setSelectedRoot(root.path)
+            let initialSnapshot = await status.test_latestSnapshot
+            let initial = try XCTUnwrap(initialSnapshot)
+            XCTAssertEqual(initial.backendKind, .jujutsu)
+            await status.test_setRefreshDrainStarted { drainEntered.fulfill() }
+
+            await gate.arm()
+            // This is the untracked observer-style refresh, not the actor's polling task.
+            let refresh = Task { await status.refresh(trigger: .explicitRefresh) }
+            await fulfillment(of: [statsEntered], timeout: 2)
+            let shutdown = Task {
+                await status.shutdown()
+                await gate.recordShutdownFinished()
+            }
+            await fulfillment(of: [drainEntered], timeout: 2)
+            await gate.release()
+            let lateResult = await refresh.value
+            await shutdown.value
+
+            let afterClose = await status.test_latestSnapshot
+            let completionOrder = await gate.completionOrder
+            XCTAssertNil(lateResult)
+            XCTAssertEqual(afterClose?.generation, initial.generation)
+            XCTAssertEqual(completionOrder, ["stats_finished", "shutdown_finished"])
+            await status.test_setRefreshDrainStarted(nil)
+        }
+
+        private actor StatsGate {
+            private let entered: XCTestExpectation
+            private var isArmed = false
+            private var continuation: CheckedContinuation<Void, Never>?
+            private(set) var completionOrder: [String] = []
+
+            init(entered: XCTestExpectation) {
+                self.entered = entered
+            }
+
+            func arm() {
+                isArmed = true
+            }
+
+            func waitIfArmed() async {
+                guard isArmed else { return }
+                await withCheckedContinuation { continuation in
+                    self.continuation = continuation
+                    entered.fulfill()
+                }
+                completionOrder.append("stats_finished")
+            }
+
+            func release() {
+                isArmed = false
+                continuation?.resume()
+                continuation = nil
+            }
+
+            func recordShutdownFinished() {
+                completionOrder.append("shutdown_finished")
+            }
+        }
+    }
+#endif
+
 private actor JJInvocationLog {
     private(set) var invocations: [[String]] = []
 
