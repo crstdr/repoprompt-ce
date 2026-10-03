@@ -1728,6 +1728,98 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertNil(fixture.vm.session(for: fixture.tabs[0].id).activeAgentSessionID)
     }
 
+    func testIDlessMountedRowReadsInstalledBindingOnFreshNativeOpening() async throws {
+        let fixture = try await makeFixture(peerCount: 1, idless: true)
+        let otherWindow = try await makeFixture(peerCount: 1)
+        try await add(from: 0, to: 1, in: otherWindow)
+        let region = try mountedRegion(in: fixture)
+        let cold = try await open(in: fixture)
+        XCTAssertFalse(try XCTUnwrap(cold.items.first { $0.title == "Copy Session ID" }).isEnabled)
+
+        let session = fixture.vm.session(for: fixture.tabs[0].id)
+        let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
+        let firstID = UUID()
+        XCTAssertNotNil(fixture.vm.test_installPersistentSessionBinding(
+            sessionID: firstID, on: session, compareAndSetInWorkspaceID: workspaceID
+        ))
+        session.items = [AgentChatItem(kind: .user, text: "First bound fixture message")]
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        await settleHostedPublication(in: fixture)
+
+        let input = try XCTUnwrap(fixture.state.promptManager.sidebarWorkspaceSnapshot)
+        XCTAssertEqual(fixture.vm.agentChatsSidebarSessions(for: input.composeTabs).first {
+            $0.tabID == fixture.tabs[0].id
+        }?.sessionID, firstID, "The sidebar row cache must publish the installed binding")
+        let props = try XCTUnwrap(fixture.vm.agentSidebarOversightMenuProps(
+            tabID: fixture.tabs[0].id, expectedSessionID: firstID
+        ))
+        let observerEndpoint = try menuProps(in: otherWindow).targetEndpoint
+        let observer = try XCTUnwrap(props.availableObservers.first { $0.peerEndpoint == observerEndpoint })
+        let target = try XCTUnwrap(props.availableTargets.first { $0.peerEndpoint == observerEndpoint })
+        XCTAssertTrue(try mountedRegion(in: fixture) === region, "Binding must update the existing native row provider")
+        let bound = try await open(in: fixture)
+        XCTAssertTrue(try XCTUnwrap(bound.items.first { $0.title == "Copy Session ID" }).isEnabled)
+        for (title, label) in [
+            (AgentOversightUICopy.overseeNewTitle, target.menuLabel),
+            (AgentOversightUICopy.overseeByTitle, observer.menuLabel)
+        ] {
+            let submenu = try XCTUnwrap(bound.items.first { $0.title == title }?.submenu)
+            XCTAssertTrue(submenu.items.contains { $0.title == label && $0.isEnabled })
+        }
+
+        // A retained provider belongs to this exact incarnation, not whatever UUID
+        // later occupies the same visible tab. Fresh openings must acquire the new one.
+        let oldProvider = region.itemsProvider
+        let oldCopyTarget = try XCTUnwrap(fixture.vm.agentSessionCopyIDTarget(
+            tabID: fixture.tabs[0].id, sessionID: firstID, tabName: fixture.tabs[0].name
+        ))
+        let replacementID = UUID()
+        XCTAssertNotNil(fixture.vm.test_installPersistentSessionBinding(
+            sessionID: replacementID, on: session, compareAndSetInWorkspaceID: workspaceID
+        ))
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        await settleHostedPublication(in: fixture)
+        var copiedIDs: [String] = []
+        XCTAssertFalse(fixture.vm.copyAgentSessionID(target: oldCopyTarget, copyToClipboard: { copiedIDs.append($0) }))
+        XCTAssertTrue(copiedIDs.isEmpty, "The old row must never copy its replaced UUID")
+        let stale = NSMenu.stableMenu(from: oldProvider())
+        for title in [AgentOversightUICopy.overseeNewTitle, AgentOversightUICopy.overseeByTitle] {
+            let submenu = try XCTUnwrap(stale.items.first { $0.title == title }?.submenu)
+            XCTAssertFalse(submenu.items.contains { $0.isEnabled }, "The old provider must not acquire the replacement's oversight authority")
+        }
+        XCTAssertTrue(try mountedRegion(in: fixture) === region)
+        let replacement = try await open(in: fixture)
+        XCTAssertTrue(try XCTUnwrap(replacement.items.first { $0.title == "Copy Session ID" }).isEnabled)
+        for (title, label) in [
+            (AgentOversightUICopy.overseeNewTitle, target.menuLabel),
+            (AgentOversightUICopy.overseeByTitle, observer.menuLabel)
+        ] {
+            let submenu = try XCTUnwrap(replacement.items.first { $0.title == title }?.submenu)
+            XCTAssertTrue(submenu.items.contains { $0.title == label && $0.isEnabled }, "The fresh root must capture the replacement UUID")
+        }
+        let newCopyTarget = try XCTUnwrap(fixture.vm.agentSessionCopyIDTarget(
+            tabID: fixture.tabs[0].id, sessionID: replacementID, tabName: fixture.tabs[0].name
+        ))
+        XCTAssertTrue(fixture.vm.copyAgentSessionID(target: newCopyTarget, copyToClipboard: { copiedIDs.append($0) }))
+        XCTAssertEqual(copiedIDs, [replacementID.uuidString])
+    }
+
+    private func settleHostedPublication(in fixture: Fixture) async {
+        // Drain the publication/layout boundary without replacing rootView or forcing
+        // a sidebar refresh; either would conceal the stale capture under investigation.
+        let settled = expectation(description: "Hosted binding publication reached the main run loop")
+        RunLoop.main.perform {
+            MainActor.assumeIsolated {
+                fixture.host.layoutSubtreeIfNeeded()
+                settled.fulfill()
+            }
+        }
+        await fulfillment(of: [settled], timeout: 3)
+        fixture.host.layoutSubtreeIfNeeded()
+    }
+
     func testReopeningWithoutHoverReadsChangedRelationships() async throws {
         let fixture = try await makeFixture(peerCount: 2)
         let before = try await open(in: fixture)
