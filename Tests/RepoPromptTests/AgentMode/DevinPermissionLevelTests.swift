@@ -358,9 +358,9 @@ final class DevinPermissionLevelTests: XCTestCase {
         })
         let config = DevinAgentConfig(commandName: "devin", includeRepoPromptMCPServer: false)
 
-        let initialSupport = try await resolver.probeSupport(for: config)
+        let initialSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         XCTAssertEqual(initialSupport, .supported)
-        let secondProbe = Task { try await resolver.probeSupport(for: config) }
+        let secondProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
         await gate.waitForSecondCall()
         let resolved = Result { try resolver.resolvedLaunch(for: config) }
         await gate.releaseSecondCall()

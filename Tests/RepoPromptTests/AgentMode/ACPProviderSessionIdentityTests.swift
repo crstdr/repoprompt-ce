@@ -14,7 +14,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             commandPath: scriptURL.path,
             environment: ["ACP_RUNTIME_SESSION_ID": "cursor-runtime-id"]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
         let stream = await controller.currentEventsStream()
 
         let bootstrap = try await controller.bootstrap()
@@ -44,7 +44,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             commandPath: scriptURL.path,
             environment: ["ACP_RECORD_PATH": recordURL.path]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -74,7 +74,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                 "ACP_RUNTIME_SESSION_ID": "fresh-runtime-id"
             ]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -113,7 +113,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                 builds: builds
             )
             let request = makeRunRequest(agentKind: .cursor, workspacePath: workspace.path)
-            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5))
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5), allowsProviderProcessLaunchForTesting: true)
             let bootstrap = try await controller.bootstrap()
             let image = AITransientImage(bytes: Data([1, 2, 3]), mediaType: .png, title: nil)
             let supported = capability == "{\"image\":true}"
@@ -200,7 +200,8 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
-            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5)
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
         )
         _ = try await controller.bootstrap()
         do {
@@ -233,7 +234,8 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: makeRunRequest(agentKind: .cursor, workspacePath: workspace.path),
-            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5)
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
         )
         _ = try await controller.bootstrap()
         do { try await controller.prompt(AgentMessage(userMessage: "transport failure"))

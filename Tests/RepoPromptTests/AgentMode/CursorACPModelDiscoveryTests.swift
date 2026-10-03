@@ -13,7 +13,7 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
         let client = CursorACPControllerModelDiscoveryClient(
             providerFactory: { _, _ in provider },
             controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
+                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             }
         )
 
@@ -43,7 +43,8 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
                 try ACPAgentSessionController(
                     provider: provider,
                     runRequest: request,
-                    requestTimeouts: .init(bootstrapSeconds: 1, operationalSeconds: 0.05)
+                    requestTimeouts: .init(bootstrapSeconds: 1, operationalSeconds: 0.05),
+                    allowsProviderProcessLaunchForTesting: true
                 )
             }
         )
