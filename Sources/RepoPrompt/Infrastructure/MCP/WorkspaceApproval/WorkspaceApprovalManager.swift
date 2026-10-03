@@ -67,6 +67,9 @@ public final class WorkspaceApprovalManager: ObservableObject {
         ))
         switch result {
         case let .approved(alwaysAllow):
+            if alwaysAllow {
+                addAutoApproval(clientID: request.clientID, operation: request.operation)
+            }
             return .approved(alwaysAllow: alwaysAllow)
         case .timeout:
             return .timeout
@@ -82,12 +85,18 @@ public final class WorkspaceApprovalManager: ObservableObject {
         Task { await broker.cancel(requestID: requestID) }
     }
 
-    public func resolveApproval(allow: Bool, alwaysAllow: Bool = false) {
-        guard let request = pendingRequest else { return }
-        if allow, alwaysAllow {
-            addAutoApproval(clientID: request.clientID, operation: request.operation)
-        }
-        let requestID = request.id
+    public func resolveApproval(
+        requestID: UUID,
+        respondingWindowID: Int,
+        allow: Bool,
+        alwaysAllow: Bool = false
+    ) {
+        guard pendingRequest?.id == requestID,
+              WorkspaceApprovalPresentationPolicy.shouldPresent(
+                  targetWindowID: presentedTargetWindowID,
+                  inWindowID: respondingWindowID
+              )
+        else { return }
         clearPresentedRequestIfMatching(requestID)
         Task {
             await broker.resolve(
