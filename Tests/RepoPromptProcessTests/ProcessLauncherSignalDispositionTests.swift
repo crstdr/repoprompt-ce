@@ -152,7 +152,8 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
                 "IFS= read -r _; kill -TERM \"$$\"; printf '%s\\n' 'child-survived-SIGTERM'"
             ],
             environment: ProcessInfo.processInfo.environment,
-            workingDirectory: nil
+            workingDirectory: nil,
+            purpose: .tool
         )
     }
 
@@ -212,5 +213,51 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
         process.standardError = output
         try process.run()
         return (process, input, output)
+    }
+}
+
+/// Exercises the real launch boundary with a harmless shell fixture, never a provider CLI.
+final class ProviderProcessLaunchPolicyTests: XCTestCase {
+    func testProviderSpawnIsRefusedBeforeExecutingTheCommand() throws {
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: marker) }
+        XCTAssertThrowsError(try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "touch \"$1\"", "fixture", marker.path],
+            environment: [:],
+            workingDirectory: nil,
+            purpose: .provider
+        )) { error in
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testBufferedAndStreamingProvidersRefuseBeforeCommandResolution() async throws {
+        let runner = CLIProcessRunner(config: .init(command: "missing-provider-for-refusal-test"))
+        do {
+            _ = try await runner.run(args: [], stdin: nil, outputMode: .none, timeout: 1)
+            XCTFail("A provider must not run without explicit XCTest opt-in")
+        } catch {
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+        }
+        do {
+            _ = try await runner.runStreaming(args: [], stdin: nil, outputMode: .none, timeout: 1)
+            XCTFail("A streaming provider must not run without explicit XCTest opt-in")
+        } catch {
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+        }
+    }
+
+    func testFixtureProcessOptInDoesNotEscapeItsTaskScope() async throws {
+        let runner = CLIProcessRunner(config: .init(command: "/bin/sh", shellLookupMode: .disabled))
+        let result = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await runner.run(args: ["-c", "printf fixture-ok"], stdin: nil, outputMode: .none, timeout: 2)
+        }
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(String(data: result.stdout, encoding: .utf8), "fixture-ok")
+        XCTAssertThrowsError(try ProviderProcessLaunchPolicy.check()) { error in
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal)
+        }
     }
 }
