@@ -101,7 +101,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     func testRoutineAndAttentionWakeCarryVerifiedParkedNoteBeforeUpdatesOnce() async throws {
         for basis in ["routine", "attention", "manual"] {
-            let fixture = try makeFixture()
+            let fixture = try makeFixture(fenceProviderLaunch: true)
             try publishInventory(fixture, revision: 1)
             fixture.session.oversight.autoWakeOnUpdates = basis == "routine"
             let waiting = Task { @MainActor in
@@ -118,7 +118,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let attention = Self.attentionRequest(0)
             try publishLane(
                 fixture, linkSetRevision: 1, queueRevision: 1,
-                targetIndices: basis == "routine" ? [0] : [], laneIndices: [0],
+                targetIndices: basis == "attention" ? [] : [0], laneIndices: [0],
                 attentionRequests: basis == "attention" ? [attention] : []
             )
             if basis == "manual" {
@@ -146,7 +146,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testNotificationWakeRetainsUnverifiedAttemptedAndForeignOwnerCompactGates() throws {
-        let fixture = try makeFixture()
+        let fixture = try makeFixture(fenceProviderLaunch: true)
         _ = try installVerifiedParkedNote(fixture)
         let verified = fixture.session.selfCompactState
         for phase in AgentSelfCompactAttempt.Phase.allCases where phase != .parked {
@@ -183,7 +183,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     func testFailedParkedNoteWakePreservesNoteAndUnacknowledgedUpdatesWithoutAmbiguousRetry() throws {
         for attempted in [false, true] {
-            let fixture = try makeFixture()
+            let fixture = try makeFixture(fenceProviderLaunch: true)
             try publishInventory(fixture, revision: 1)
             fixture.session.oversight.autoWakeOnUpdates = true
             fixture.session.runState = .running // Drive the physical seam deterministically below.
@@ -4786,7 +4786,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let workspaceManager: WorkspaceManagerViewModel
     }
 
-    private func makeFixture(catalogReady: Bool = true) throws -> Fixture {
+    private func makeFixture(catalogReady: Bool = true, fenceProviderLaunch: Bool = false) throws -> Fixture {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
@@ -4798,9 +4798,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             acpProviderFactory: { _, _ in
                 AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: "/usr/bin/false")
             },
-            acpControllerFactory: { _, _ in
-                XCTFail("Provider-neutral wake fixtures must not launch even a fake ACP process")
-                throw CancellationError()
+            acpControllerFactory: { provider, request in
+                if fenceProviderLaunch {
+                    XCTFail("Parked-note wake fixtures must not launch even a fake ACP process")
+                    throw CancellationError()
+                }
+                return try ACPAgentSessionController(provider: provider, runRequest: request)
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true }
