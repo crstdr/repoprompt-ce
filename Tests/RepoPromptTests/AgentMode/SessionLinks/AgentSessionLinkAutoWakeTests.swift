@@ -100,10 +100,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testRoutineAndAttentionWakeCarryVerifiedParkedNoteBeforeUpdatesOnce() async throws {
-        for attentionOnly in [false, true] {
+        for basis in ["routine", "attention", "manual"] {
             let fixture = try makeFixture()
             try publishInventory(fixture, revision: 1)
-            fixture.session.oversight.autoWakeOnUpdates = !attentionOnly
+            fixture.session.oversight.autoWakeOnUpdates = basis == "routine"
             let waiting = Task { @MainActor in
                 try await fixture.viewModel.waitForNextUserInstruction(
                     tabID: fixture.tabID, prompt: "What next?", timeoutSeconds: 5
@@ -118,9 +118,13 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let attention = Self.attentionRequest(0)
             try publishLane(
                 fixture, linkSetRevision: 1, queueRevision: 1,
-                targetIndices: attentionOnly ? [] : [0], laneIndices: [0],
-                attentionRequests: attentionOnly ? [attention] : []
+                targetIndices: basis == "routine" ? [0] : [], laneIndices: [0],
+                attentionRequests: basis == "attention" ? [attention] : []
             )
+            if basis == "manual" {
+                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+                XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+            }
             let response = try await waiting.value
             guard case let .laneUpdateAutoWake(wakeID) = response.origin else {
                 return XCTFail("expected an event-driven wake")
@@ -4789,6 +4793,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            acpProviderFactory: { _, _ in
+                AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: "/usr/bin/false")
+            },
+            acpControllerFactory: { _, _ in
+                XCTFail("Provider-neutral wake fixtures must not launch even a fake ACP process")
+                throw CancellationError()
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true }

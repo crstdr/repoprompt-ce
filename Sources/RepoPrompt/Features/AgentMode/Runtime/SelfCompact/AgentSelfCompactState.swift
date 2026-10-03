@@ -286,7 +286,7 @@ struct AgentSelfCompactState: Codable, Equatable {
               active?.id == dispatchID.requestID,
               active?.phase == .dispatchingNote
         else { return false }
-        park(reason: .definitiveNonAttempt)
+        active?.phase = .parked
         active?.noteDispatchStarted = false
         return true
     }
@@ -302,7 +302,7 @@ struct AgentSelfCompactState: Codable, Equatable {
                 completionVerified: active?.acpCompletionUnverified != true && active?.compactTurnSucceeded == true
             )
         } else {
-            park(reason: .transportNotAttempted)
+            active?.phase = .parked
         }
         return true
     }
@@ -366,7 +366,7 @@ struct AgentSelfCompactState: Codable, Equatable {
             if attempt.compactTurnSucceeded != true || attempt.acpCompletionUnverified == true {
                 active?.acpCompletionUnverified = true
             }
-            park(reason: .runtimeTeardown)
+            active?.phase = .parked
         }
         return true
     }
@@ -408,12 +408,6 @@ struct AgentSelfCompactState: Codable, Equatable {
               !attempt.noteDispatchStarted
         else { return nil }
         return attempt.owner
-    }
-
-    mutating func park(reason: AgentSelfCompactParkingReason) {
-        guard let attempt = active else { return }
-        active?.phase = .parked
-        AgentSelfCompactDiagnostics.parked(requestID: attempt.id, reason: reason)
     }
 
     /// Reading the frame does not consume it; only final provider acknowledgment can do that.

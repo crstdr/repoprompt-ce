@@ -10681,9 +10681,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if allowRetainedAgentAdmissionRecoveryRetry,
            agentAdmissionRecoveryOwnsWorkspace(wsID)
         {
-            AgentSessionLinkCatalogDiagnostics.retirementPersistence(.recovery, .started)
             _ = await domainAuthorityAdmissionIssue(for: wsID)
-            AgentSessionLinkCatalogDiagnostics.retirementPersistence(.recovery, .returned)
         }
         guard !agentAdmissionRecoveryOwnsWorkspace(wsID) else {
             return .rejected(
@@ -10701,10 +10699,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard needsOwnWorkingPublicationResolution(workspaceID: wsID) else {
                 return .notRequired(workspaceID: wsID)
             }
-            AgentSessionLinkCatalogDiagnostics.retirementPersistence(.workingPublication, .started)
-            let resolution = await resolveUnsavedWorkingPublication(workspaceID: wsID, source: source)
-            AgentSessionLinkCatalogDiagnostics.retirementPersistence(.workingPublication, .returned)
-            switch resolution {
+            switch await resolveUnsavedWorkingPublication(workspaceID: wsID, source: source) {
             case .converged:
                 return .persisted(workspaceID: wsID, stateVersion: cur)
             case let .convergenceFailed(category):
@@ -10760,14 +10755,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return workspacePersistenceOutcomeOverrideForTesting
             }
         #endif
-        AgentSessionLinkCatalogDiagnostics.retirementPersistence(.save, .started)
         let saveResult = await saveWorkspaceAsync(
             workspaceID: wsID,
             fileURL: fileURL,
             source: source,
             ownSaveFence: ownSaveFence
         )
-        AgentSessionLinkCatalogDiagnostics.retirementPersistence(.save, .returned)
         let savedStateVersion: Int
         switch saveResult {
         case let .success(version):
@@ -10786,9 +10779,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 category: failure.category
             )
         }
-        AgentSessionLinkCatalogDiagnostics.retirementPersistence(.flush, .started)
         await WorkspaceDiskWriter.shared.flush(url: fileURL)
-        AgentSessionLinkCatalogDiagnostics.retirementPersistence(.flush, .returned)
         guard workspace(withID: wsID) != nil else {
             return .rejected(reason: "workspace_changed_after_save")
         }
@@ -14161,8 +14152,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Publications at or before this point are included in the model this save persists.
         let publicationGenerationAtStart = workingPublicationGenerationByWorkspaceID[workspaceID, default: 0]
         if domainWorkspaceAuthorityClient != nil {
-            AgentSessionLinkCatalogDiagnostics.retirementPersistence(.domainSave, .started)
-            defer { AgentSessionLinkCatalogDiagnostics.retirementPersistence(.domainSave, .returned) }
             do {
                 let result = try await persistWorkspaceThroughDomainAuthority(
                     workspaces[initialIndex],
@@ -14197,9 +14186,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 ))
             }
         }
-        AgentSessionLinkCatalogDiagnostics.retirementPersistence(.flush, .started)
         await WorkspaceDiskWriter.shared.flush(url: fileURL)
-        AgentSessionLinkCatalogDiagnostics.retirementPersistence(.flush, .returned)
         guard !Task.isCancelled,
               isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspaceID)
         else {

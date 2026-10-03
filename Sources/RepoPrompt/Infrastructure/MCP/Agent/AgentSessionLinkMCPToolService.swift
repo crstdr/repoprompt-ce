@@ -657,27 +657,16 @@ struct AgentSessionLinkMCPToolService {
     }
 
     private func executeRetireLane(args: [String: Value]) async throws -> Value {
-        let operationID = AgentSessionLinkCatalogDiagnostics.retirementOperationID ?? UUID()
-        return try await AgentSessionLinkCatalogDiagnostics.$retirementOperationID.withValue(operationID) {
-            AgentSessionLinkCatalogDiagnostics.retirement(.service, .started)
-            do {
-                let observerEndpoint = try await resolveCallerEndpointIdentity()
-                let targetSessionID = try Self.parseSingleSessionID(args["session_id"], op: "retire_lane")
-                let outcome = await bridge.retireLane(
-                    observerEndpoint: observerEndpoint,
-                    targetSessionID: targetSessionID
-                )
-                if case .notRetired(_, .denied) = outcome {
-                    throw Self.denialError(targetSessionID: targetSessionID)
-                }
-                let result = AgentSessionLaneMCPToolService.render(outcome)
-                AgentSessionLinkCatalogDiagnostics.retirement(.service, .returned)
-                return result
-            } catch {
-                AgentSessionLinkCatalogDiagnostics.retirement(.service, .failed)
-                throw error
-            }
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        let targetSessionID = try Self.parseSingleSessionID(args["session_id"], op: "retire_lane")
+        let outcome = await bridge.retireLane(
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        )
+        if case .notRetired(_, .denied) = outcome {
+            throw Self.denialError(targetSessionID: targetSessionID)
         }
+        return AgentSessionLaneMCPToolService.render(outcome)
     }
 
     private func executeList(args: [String: Value]) async throws -> Value {

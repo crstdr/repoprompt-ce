@@ -929,9 +929,7 @@ terminal spend outcomes, and receipt of an `agent_session_link` tool call.
 The diagnostic API is typed. Fields are closed enums, booleans, bounded revision/generation values,
 and one-way hashes used only to correlate run, tab, and connection lifecycles. It never accepts or
 records prompts, transcript text, tool arguments or results, workspace/session names, paths, raw UUIDs,
-URLs, credentials, provider payloads, or arbitrary error strings. Retirement correlation uses only a
-fresh, diagnostic-only operation UUID (never a session, tab, run, workspace, or connection UUID).
-The broad Agent Mode performance
+URLs, credentials, provider payloads, or arbitrary error strings. The broad Agent Mode performance
 logger and raw provider-event capture remain DEBUG-only and opt-in.
 
 This channel observes existing authority; it does not add a refresh receipt, retry loop, timer, queue,
@@ -954,17 +952,3 @@ phase, dispatch certainty and settlement without awaiting another snapshot or ho
 Inspect that existing identity; never blindly repeat `start` after a timeout. Accepted or
 uncertain submission is not discarded/deactivated by start failure. Standalone wait/poll,
 steer, filesystem leases and transport cancellation retain their existing contracts.
-
-### Retirement phases
-
-The same `AgentSessionLinkCatalog` OSLog owner records `agent_session_link(op: "retire_lane")`
-service entry/return, in-memory stash commit, replacement/activation, post-projection cleanup owners,
-and the explicitly awaited canonical recovery/save/flush. A task-local diagnostic context excludes
-stash-triggered background autosaves from the canonical-save markers. `returned` means an await
-settled, not that retirement or durability succeeded; `committed` marks only the in-memory projection.
-
-The existing socket request-identity annotation/claim seam correlates these phases to reply-write
-start/return/failure with a generated opaque operation UUID. JSON-RPC request IDs and connection
-identity remain internal and are never included in these records. Correlation is removed on response
-delivery or connection teardown. Socket write return proves bytes were written, not that the provider
-consumed them. This adds no retirement timeout, retry, or lifecycle/fencing change.
