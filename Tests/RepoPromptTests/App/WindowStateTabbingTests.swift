@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
 import SwiftUI
 import XCTest
 
@@ -52,6 +53,7 @@ final class WindowStateTabbingTests: XCTestCase {
         private var originalAutoStart: Bool?
         private var originalGitMode: String?
         private var windows: [WindowState] = []
+        private var providerFixtures: [ProviderFixture] = []
 
         override func setUp() async throws {
             try await super.setUp()
@@ -70,6 +72,11 @@ final class WindowStateTabbingTests: XCTestCase {
                 await state.tearDown()
             }
             windows.removeAll()
+            for fixture in providerFixtures {
+                await assertNoProviderWork(fixture)
+                await fixture.polling.shutdown()
+            }
+            providerFixtures.removeAll()
             if let originalAutoStart {
                 GlobalSettingsStore.shared.setMCPAutoStart(originalAutoStart, commit: false)
                 if let originalGitMode {
@@ -152,8 +159,18 @@ final class WindowStateTabbingTests: XCTestCase {
 
         private func openPollingWindow(clock: PollClock) async -> (WindowState, NSWindow, GitStatusActor) {
             UserDefaults.standard.set(GitDiffInclusionMode.none.rawValue, forKey: "gitDiffInclusionMode")
-            let state = WindowState()
+            let storage = TestSecureStorageBackend()
+            let client = NoProcessModelClient()
+            let polling = CodexModelPollingService(client: client)
+            let state = WindowState(
+                codexModelPollingService: polling,
+                loadStoredAPISettingsDataOnInit: false,
+                keyManager: KeyManager(secureService: SecureKeysService(secureStorage: storage))
+            )
+            let fixture = ProviderFixture(state: state, storage: storage, client: client, polling: polling)
+            providerFixtures.append(fixture)
             windows.append(state)
+            await assertNoProviderWork(fixture)
             let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
                 styleMask: [.titled, .closable],
@@ -170,10 +187,47 @@ final class WindowStateTabbingTests: XCTestCase {
         }
 
         private func close(_ state: WindowState) async {
+            if let fixture = providerFixtures.first(where: { $0.state === state }) {
+                await assertNoProviderWork(fixture)
+            }
             state.attachWindow(nil)
             state.beginClose()
             await state.tearDown()
             windows.removeAll { $0 === state }
+        }
+
+        private func assertNoProviderWork(_ fixture: ProviderFixture) async {
+            let api = fixture.state.apiSettingsViewModel
+            XCTAssertNil(api.test_initialLoadTask, "No initial provider-discovery task may be scheduled")
+            XCTAssertFalse(api.test_hasFinishedInitialStoredDataLoad, "Prompt must not initiate a settings/model refresh")
+            XCTAssertFalse(api.test_hasContextBuilderProviderValidationTask)
+            XCTAssertFalse(api.isDiscoveringDevinModels)
+            XCTAssertFalse(api.test_hasCodexModelsSubscriptionTask)
+            XCTAssertFalse(fixture.state.contextBuilderAgentViewModel.test_hasCodexModelsSubscriptionTask)
+            XCTAssertEqual(fixture.storage.calls, [], "The fixture must not load provider credentials")
+            let subscribers = await fixture.polling.test_subscriberCount()
+            let requests = await fixture.client.requests
+            XCTAssertEqual(subscribers, 0, "No provider model polling may be scheduled")
+            XCTAssertEqual(requests, 0, "No provider process request may be scheduled")
+        }
+
+        private struct ProviderFixture {
+            let state: WindowState
+            let storage: TestSecureStorageBackend
+            let client: NoProcessModelClient
+            let polling: CodexModelPollingService
+        }
+
+        private actor NoProcessModelClient: CodexModelListingClient {
+            private(set) var requests = 0
+
+            func listModels(limit _: Int) async throws -> [CodexAppServerClient.RemoteModel] {
+                requests += 1
+                XCTFail("Window polling fixtures must not request provider discovery")
+                return []
+            }
+
+            func stop() async {}
         }
 
         private actor PollClock {
