@@ -10,7 +10,7 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
         let gate = StartEnvelopeGate()
         let operation = Task {
             try await MCPToolExecutionWatchdog.execute(
-                deadline: .seconds(150), cancellationGrace: .seconds(5),
+                deadline: .seconds(900), cancellationGrace: .seconds(5),
                 cleanupDisposition: .detachAndSettle, startScope: scope, environment: clock.environment
             ) {
                 try scope.enterReturn()
@@ -38,7 +38,7 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
             let gate = StartEnvelopeGate()
             let task = Task {
                 try await MCPToolExecutionWatchdog.execute(
-                    deadline: .seconds(150), cancellationGrace: .seconds(5),
+                    deadline: .seconds(900), cancellationGrace: .seconds(5),
                     cleanupDisposition: .detachAndSettle, startScope: scope, environment: clock.environment
                 ) {
                     try scope.enterReturn()
@@ -76,7 +76,7 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
         let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: environment)
         let task = Task {
             try await MCPToolExecutionWatchdog.execute(
-                deadline: .seconds(150), cancellationGrace: .seconds(5),
+                deadline: .seconds(900), cancellationGrace: .seconds(5),
                 cleanupDisposition: .detachAndSettle, startScope: scope, environment: environment
             ) {
                 try scope.enterReturn()
@@ -116,7 +116,7 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
         let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: environment)
         let task = Task {
             try await MCPToolExecutionWatchdog.execute(
-                deadline: .seconds(150), cancellationGrace: .seconds(5),
+                deadline: .seconds(900), cancellationGrace: .seconds(5),
                 cleanupDisposition: .detachAndSettle, startScope: scope, environment: environment
             ) {
                 try scope.enterReturn()
@@ -145,9 +145,9 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
     func testSemanticBudgetStartsAfterSetupAndLateTransitionsCannotExtendIt() async throws {
         let clock = MCPExportWatchdogManualClock()
         let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
-        try await clock.advanceWithoutSleepers(by: .seconds(149))
-        XCTAssertEqual(try scope.enterSemanticWait(seconds: 300), .seconds(449))
-        XCTAssertEqual(scope.deadline.instant, .seconds(474))
+        try await clock.advanceWithoutSleepers(by: .seconds(899))
+        XCTAssertEqual(try scope.enterSemanticWait(seconds: 300), .seconds(1199))
+        XCTAssertEqual(scope.deadline.instant, .seconds(1224))
         try await clock.advanceWithoutSleepers(by: .seconds(325))
         XCTAssertThrowsError(try scope.enterReturn())
         XCTAssertThrowsError(try scope.beginDispatch())
@@ -161,7 +161,7 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
         let gate = StartEnvelopeGate()
         let task = Task {
             try await MCPToolExecutionWatchdog.execute(
-                deadline: .seconds(150), cancellationGrace: .seconds(5),
+                deadline: .seconds(900), cancellationGrace: .seconds(5),
                 cleanupDisposition: .detachAndSettle, startScope: scope, environment: clock.environment
             ) {
                 await gate.wait()
@@ -172,8 +172,8 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
             }
         }
         defer { Task { await gate.release() } }
-        try await clock.waitForSleeper(expected: .seconds(150))
-        try await clock.advanceSleeper(expected: .seconds(150))
+        try await clock.waitForSleeper(expected: .seconds(900))
+        try await clock.advanceSleeper(expected: .seconds(900))
         try await clock.waitForSleeper(expected: .seconds(5))
         try await clock.advanceSleeper(expected: .seconds(5))
         do { _ = try await task.value
@@ -191,7 +191,7 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
         let clock = MCPExportWatchdogManualClock()
         let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
         let setupRevision = scope.deadline.revision
-        try await clock.advanceWithoutSleepers(by: .seconds(149))
+        try await clock.advanceWithoutSleepers(by: .seconds(899))
         _ = try scope.enterSemanticWait(seconds: 300)
         try await clock.advanceWithoutSleepers(by: .seconds(1))
         XCTAssertFalse(scope.expire(revision: setupRevision))
@@ -269,7 +269,7 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
         let gate = StartEnvelopeGate()
         let task = Task {
             try await MCPToolExecutionWatchdog.execute(
-                deadline: .seconds(150), cancellationGrace: .seconds(5),
+                deadline: .seconds(900), cancellationGrace: .seconds(5),
                 cleanupDisposition: .detachAndSettle, startScope: scope, environment: clock.environment
             ) {
                 await gate.wait()
@@ -279,7 +279,7 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
             }
         }
         defer { Task { await gate.release() } }
-        try await clock.waitForSleeper(expected: .seconds(150))
+        try await clock.waitForSleeper(expected: .seconds(900))
         task.cancel()
         do { _ = try await task.value
             XCTFail("Expected cancellation")
@@ -295,7 +295,7 @@ final class AgentRunStartEnvelopeTests: XCTestCase {
         let task = Task {
             await gate.wait()
             return try await MCPToolExecutionWatchdog.execute(
-                deadline: .seconds(150), cancellationGrace: .seconds(5),
+                deadline: .seconds(900), cancellationGrace: .seconds(5),
                 cleanupDisposition: .detachAndSettle, startScope: scope, environment: clock.environment
             ) {
                 XCTFail("Pre-cancelled start launched work")
