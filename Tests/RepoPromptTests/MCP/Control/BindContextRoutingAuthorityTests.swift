@@ -7,6 +7,38 @@ import XCTest
 final class BindContextRoutingAuthorityTests: XCTestCase {
     #if DEBUG
         @MainActor
+        func testLegacySelfPolicyAndServiceRefusalsUseRequestedName() async throws {
+            let window = try await makeWindow(activeWorkspace: workspace(
+                name: "Self Compatibility", root: "/tmp/repoprompt-self-compatibility", contextID: UUID()
+            ))
+            _ = installWindows([window])
+            let enabled = await window.mcpServer.setWindowToolsEnabled(true)
+            XCTAssertTrue(enabled)
+            addTeardownBlock { @MainActor in
+                _ = await window.mcpServer.setWindowToolsEnabled(false)
+            }
+            let connection = try await makeProductionMCPConnection()
+            addTeardownBlock { await connection.cleanup() }
+            for name in ["agent_self", "self_compact"] {
+                let result = try await connection.client.callTool(name: name, arguments: ["op": .string("context")])
+                XCTAssertEqual(result.isError, true)
+                XCTAssertEqual(toolText(result), "Tool '\(name)' is only available during discovery or agent mode runs.")
+            }
+            await ServerNetworkManager.shared.debugSetAdditionalTools(
+                for: connection.connectionID, additionalTools: ["self_compact"]
+            )
+            for name in ["agent_self", "self_compact"] {
+                let result = try await connection.client.callTool(name: name, arguments: [
+                    "op": .string("context"), "_rawJSON": .bool(true)
+                ])
+                let error = MCPError.invalidParams("\(name) is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access.")
+                let expected = ServerNetworkManager.toolErrorResult(rawJSON: true, message: "Error: \(error)")
+                XCTAssertEqual(result.isError, true)
+                XCTAssertEqual(toolText(result), toolText((content: expected.content, isError: expected.isError)))
+            }
+        }
+
+        @MainActor
         func testExplicitBindThenContextIDRoutedToolUsesSameCompositeContext() async throws {
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("repoprompt-bind-routing-\(UUID().uuidString)", isDirectory: true)

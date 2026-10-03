@@ -338,10 +338,10 @@ package actor DirectHeadlessMCPService {
             return ListTools.Result(tools: tools)
         }
 
-        await server.withMethodHandler(CallTool.self) { params in
+        let callToolHandler: @Sendable (CallTool.Parameters) async throws -> CallTool.Result = { params in
             let toolName = MCPDomainToolCatalog.canonicalCallName(for: params.name)
             guard visibleNames.contains(toolName) else {
-                return Self.errorResult("Tool is unavailable for this client policy: \(toolName)")
+                return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
             }
             do {
                 let arguments = try Self.validatedCallArguments(
@@ -371,6 +371,11 @@ package actor DirectHeadlessMCPService {
                 return Self.successResult(result)
             } catch {
                 return Self.errorResult(String(describing: error))
+            }
+        }
+        await server.withMethodHandler(CallTool.self) { params in
+            try await MCPDomainSelfToolCallContext.withRequestedName(params.name) {
+                try await callToolHandler(params)
             }
         }
     }

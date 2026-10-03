@@ -1490,7 +1490,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         executeAgentSelf: { [weak self] args in
             guard let self else {
-                throw MCPError.internalError("Window deallocated while executing self_compact")
+                throw MCPError.internalError("Window deallocated while executing \(MCPDomainSelfToolCallContext.displayName)")
             }
             return try await agentSelfToolService.execute(args: args)
         },

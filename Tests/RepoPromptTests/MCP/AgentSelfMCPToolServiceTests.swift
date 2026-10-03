@@ -31,19 +31,85 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
             ["op": .string("compact"), "note": .string("continue"), "idempotency_key": .string("key")]
         ] {
             let canonicalResult = try await canonical.binding(args)
-            let legacyResult = try await legacy.binding(args)
+            let legacyResult = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
+                try await legacy.binding(args)
+            }
             XCTAssertEqual(legacyResult, canonicalResult)
         }
 
         fixture.origin = nil
-        for binding in [canonical.binding, legacy.binding] {
+        for (name, binding) in [("self_compact", canonical.binding), ("agent_self", legacy.binding)] {
             do {
-                _ = try await binding(["op": .string("context")])
+                _ = try await MCPDomainSelfToolCallContext.withRequestedName(name) {
+                    try await binding(["op": .string("context")])
+                }
                 XCTFail("Alias must not manufacture calling-session authority")
             } catch let error as MCPError {
-                XCTAssertEqual(error, AgentSelfMCPToolService.unavailableError)
+                XCTAssertEqual(error, .invalidParams("\(name) is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access."))
             }
         }
+    }
+
+    func testLegacyErrorsAndDisabledPrecedencePreserveValidationAndCallerText() async throws {
+        let fixture = Fixture()
+        let cases: [([String: Value], String)] = [
+            ([:], "op is required: context or compact."),
+            (["op": .string("self_compact")], "Unknown agent_self op 'self_compact'."),
+            (["op": .string("context"), "self_compact": .null], "context does not support 'self_compact'."),
+            (["op": .string("context"), "session_id": .string("target")], "context does not support 'session_id'."),
+            (["op": .string("compact")], "compact note is required as a string."),
+            (["op": .string("compact"), "note": .string(" ")], "compact note must not be empty or whitespace-only."),
+            (["op": .string("compact"), "note": .string("a\u{0000}b")], "compact note contains a disallowed control character."),
+            (["op": .string("compact"), "note": .string(String(repeating: "x", count: 8193))], "compact note is 8193 UTF-8 bytes; maximum 8192."),
+            (["op": .string("compact"), "note": .string("continue")], "compact idempotency_key is required (1...200 UTF-8 bytes).")
+        ]
+        for enabled in [true, false] {
+            fixture.enabled = enabled
+            for (args, message) in cases {
+                let legacyMessage = message.hasPrefix("Unknown") ? message : "agent_self " + message
+                do {
+                    _ = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
+                        try await fixture.execute(args)
+                    }
+                    XCTFail("Legacy validation must precede disabled refusal")
+                } catch let error as MCPError {
+                    XCTAssertEqual(error, .invalidParams(legacyMessage))
+                }
+                do {
+                    _ = try await fixture.execute(args)
+                    XCTFail("Expected canonical refusal")
+                } catch let error as MCPError {
+                    let canonicalMessage = message.hasPrefix("Unknown")
+                        ? "Unknown self_compact op 'self_compact'." : "self_compact " + message
+                    XCTAssertEqual(error, .invalidParams(enabled ? canonicalMessage : "self_compact is disabled."))
+                }
+            }
+        }
+        for args: [String: Value] in [
+            ["op": .string("context")],
+            ["op": .string("compact"), "note": .string("continue"), "idempotency_key": .string("key")]
+        ] {
+            do {
+                _ = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
+                    try await fixture.execute(args)
+                }
+                XCTFail("Valid legacy calls must still be disabled")
+            } catch let error as MCPError {
+                XCTAssertEqual(error, .invalidParams("agent_self is disabled."))
+            }
+        }
+        fixture.origin = nil
+        do {
+            _ = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
+                try await fixture.execute(["op": .string("compact")])
+            }
+            XCTFail("Legacy authority refusal must still precede compact validation/disabling")
+        } catch let error as MCPError {
+            XCTAssertEqual(error, .invalidParams("agent_self is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access."))
+        }
+        XCTAssertEqual(fixture.reads, 0)
+        XCTAssertEqual(fixture.schedules, 0)
+        XCTAssertFalse(MCPDomainSelfToolCallContext.isLegacyAlias, "Legacy presentation must not leak to subsequent calls")
     }
 
     func testDisabledSelfToolCannotReadOrSchedule() async throws {

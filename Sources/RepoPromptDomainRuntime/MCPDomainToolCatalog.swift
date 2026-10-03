@@ -231,11 +231,29 @@ package struct MCPDomainToolCatalogEntry: Hashable, Sendable {
     }
 }
 
+/// Transport-owned compatibility context; never an argument or an authority grant.
+package enum MCPDomainSelfToolCallContext {
+    @TaskLocal package static var isLegacyAlias = false
+
+    package static var displayName: String {
+        isLegacyAlias ? MCPDomainToolCatalog.legacyAgentSelfName : MCPWindowToolName.agentSelf
+    }
+
+    package static func withRequestedName<T>(
+        _ name: String,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await $isLegacyAlias.withValue(name == MCPDomainToolCatalog.legacyAgentSelfName, operation: operation)
+    }
+}
+
 package enum MCPDomainToolCatalog {
+    // Hidden backwards-compatibility support only; agent_self will be deprecated.
+    package static let legacyAgentSelfName = "agent_self"
+
     package static func canonicalCallName(for name: String) -> String {
-        // Hidden backwards-compatibility support only; agent_self will be deprecated.
         // Resolve before policy/admission, never by adding an advertised catalog entry.
-        name == "agent_self" ? MCPWindowToolName.agentSelf : name
+        name == legacyAgentSelfName ? MCPWindowToolName.agentSelf : name
     }
 
     package static let entries: [MCPDomainToolCatalogEntry] = [
