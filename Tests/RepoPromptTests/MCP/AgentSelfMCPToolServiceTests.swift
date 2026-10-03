@@ -222,6 +222,55 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
         XCTAssertTrue(recoveryDetail?.contains("explicit recovery") == true)
     }
 
+    func testLegacyLifecycleContextAndDuplicateOutcomesPreserveStatusAndRecoveryText() async throws {
+        let fixture = Fixture()
+        let requestID = UUID()
+        let recoveryNote = "Continue with the literal self_compact reference in my note."
+        let statuses: [AgentSelfCompactStatus] = [
+            .init(
+                requestID: requestID,
+                phase: "acpSettling",
+                outcome: nil,
+                completionVerified: nil,
+                noteDelivery: nil,
+                recoveryNote: nil
+            ),
+            .init(
+                requestID: requestID,
+                phase: nil,
+                outcome: .recoveryRequired,
+                completionVerified: false,
+                noteDelivery: .deliveryUnknown,
+                recoveryNote: recoveryNote
+            ),
+            .init(
+                requestID: requestID,
+                phase: "parked",
+                outcome: .completionUnverified,
+                completionVerified: false,
+                noteDelivery: .parked,
+                recoveryNote: recoveryNote
+            )
+        ]
+        for status in statuses {
+            fixture.snapshot = .init(context: nil, selfCompact: status)
+            fixture.forcedAdmission = .duplicate(requestID: requestID, status: status)
+            for args: [String: Value] in [
+                ["op": .string("context")],
+                ["op": .string("compact"), "note": .string("continue"), "idempotency_key": .string("key")]
+            ] {
+                let canonical = try await fixture.execute(args)
+                let legacy = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
+                    try await fixture.execute(args)
+                }
+                XCTAssertEqual(legacy, canonical)
+                XCTAssertEqual(legacy["self_compact"]?.objectValue?["recovery_note"], status.recoveryNote.map(Value.string) ?? .null)
+                XCTAssertNil(legacy["agent_self"], "The existing status field is not a tool-name echo")
+            }
+        }
+        XCTAssertEqual(fixture.schedules, 0)
+    }
+
     func testNativeUnverifiedAndPersistenceWarningReasonHaveProviderNeutralGuidance() async throws {
         let fixture = Fixture()
         fixture.snapshot = .init(context: nil, selfCompact: .init(

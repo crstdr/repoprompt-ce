@@ -50,6 +50,34 @@ final class AgentSelfToolCatalogPolicyTests: XCTestCase {
         }
     }
 
+    func testConcurrentLegacyLifecycleProjectionIsIsolatedAndDoesNotRewriteCallerText() async throws {
+        let failure = MCPDomainHostError.staleRegistration(toolName: "self_compact")
+        async let legacy = MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
+            await Task.yield()
+            return String(describing: MCPDomainSelfToolCallContext.errorForPresentation(failure))
+        }
+        async let canonical = MCPDomainSelfToolCallContext.withRequestedName("self_compact") {
+            await Task.yield()
+            return String(describing: MCPDomainSelfToolCallContext.errorForPresentation(failure))
+        }
+        let (legacyText, canonicalText) = await (legacy, canonical)
+        XCTAssertEqual(legacyText, String(describing: MCPDomainHostError.staleRegistration(toolName: "agent_self")))
+        XCTAssertEqual(canonicalText, String(describing: failure))
+        await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
+            let callerError = MCPError.invalidParams("Keep the caller's literal self_compact text.")
+            XCTAssertEqual(MCPDomainSelfToolCallContext.errorForPresentation(callerError) as? MCPError, callerError)
+            let unrelated = MCPDomainHostError.staleRegistration(toolName: "read_file")
+            XCTAssertEqual(MCPDomainSelfToolCallContext.errorForPresentation(unrelated) as? MCPDomainHostError, unrelated)
+            let contract = MCPToolExecutionDispatchError.missingContract(toolName: "self_compact")
+            XCTAssertEqual(
+                MCPDomainSelfToolCallContext.errorForPresentation(contract) as? MCPToolExecutionDispatchError,
+                .missingContract(toolName: "agent_self")
+            )
+        }
+        XCTAssertFalse(MCPDomainSelfToolCallContext.isLegacyAlias)
+        XCTAssertEqual(failure, .staleRegistration(toolName: "self_compact"), "The host's authoritative error is not changed")
+    }
+
     func testSelfToolGrantedToAllAgentProfilesIncludingExploreButNotDirectOrDiscovery() {
         let name = "self_compact"
         for profile in MCPClientToolPolicyProfile.allCases {

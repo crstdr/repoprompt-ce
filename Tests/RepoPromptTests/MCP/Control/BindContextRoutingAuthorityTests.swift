@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class BindContextRoutingAuthorityTests: XCTestCase {
@@ -33,6 +34,60 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
                 ])
                 let error = MCPError.invalidParams("\(name) is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access.")
                 let expected = ServerNetworkManager.toolErrorResult(rawJSON: true, message: "Error: \(error)")
+                XCTAssertEqual(result.isError, true)
+                XCTAssertEqual(toolText(result), toolText((content: expected.content, isError: expected.isError)))
+            }
+        }
+
+        @MainActor
+        func testLegacySelfLifecycleErrorsUseRequestedNameWithoutChangingCanonicalIdentity() async throws {
+            let window = try await makeWindow(activeWorkspace: workspace(
+                name: "Self Lifecycle Compatibility", root: "/tmp/repoprompt-self-lifecycle", contextID: UUID()
+            ))
+            _ = installWindows([window])
+            let enabled = await window.mcpServer.setWindowToolsEnabled(true)
+            XCTAssertTrue(enabled)
+            addTeardownBlock { @MainActor in
+                _ = await window.mcpServer.setWindowToolsEnabled(false)
+                await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(toolName: "self_compact", operation: nil)
+            }
+            let connection = try await makeProductionMCPConnection()
+            addTeardownBlock { await connection.cleanup() }
+            await ServerNetworkManager.shared.debugSetAdditionalTools(
+                for: connection.connectionID, additionalTools: ["self_compact"]
+            )
+            let errors: [(String) -> MCPDomainHostError] = [
+                { .unknownTool($0) },
+                { .scopeUnavailable(toolName: $0, scope: .window(id: window.windowID)) },
+                { .staleRegistration(toolName: $0) }
+            ]
+            for makeError in errors {
+                let canonicalError = makeError("self_compact")
+                await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(toolName: "self_compact") {
+                    throw canonicalError
+                }
+                for name in ["agent_self", "self_compact"] {
+                    for rawJSON in [false, true] {
+                        let result = try await connection.client.callTool(name: name, arguments: [
+                            "op": .string("context"), "_rawJSON": .bool(rawJSON)
+                        ])
+                        let expected = ServerNetworkManager.toolErrorResult(rawJSON: rawJSON, message: "Error: \(makeError(name))")
+                        XCTAssertEqual(result.isError, true)
+                        XCTAssertEqual(toolText(result), toolText((content: expected.content, isError: expected.isError)))
+                    }
+                }
+            }
+            await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(toolName: "self_compact") {
+                throw MCPToolExecutionDispatchError.missingContract(toolName: "self_compact")
+            }
+            for name in ["agent_self", "self_compact"] {
+                let result = try await connection.client.callTool(name: name, arguments: [
+                    "op": .string("context"), "_rawJSON": .bool(true)
+                ])
+                let expected = ServerNetworkManager.executionContractToolErrorResult(
+                    rawJSON: true, code: "tool_execution_contract_missing",
+                    message: "No declared execution contract exists for MCP tool '\(name)'."
+                )
                 XCTAssertEqual(result.isError, true)
                 XCTAssertEqual(toolText(result), toolText((content: expected.content, isError: expected.isError)))
             }

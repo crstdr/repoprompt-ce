@@ -370,7 +370,7 @@ package actor DirectHeadlessMCPService {
                 ))
                 return Self.successResult(result)
             } catch {
-                return Self.errorResult(String(describing: error))
+                return Self.errorResult(String(describing: MCPDomainSelfToolCallContext.errorForPresentation(error)))
             }
         }
         await server.withMethodHandler(CallTool.self) { params in

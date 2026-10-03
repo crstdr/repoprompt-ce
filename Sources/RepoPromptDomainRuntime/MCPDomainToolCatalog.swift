@@ -239,6 +239,26 @@ package enum MCPDomainSelfToolCallContext {
         isLegacyAlias ? MCPDomainToolCatalog.legacyAgentSelfName : MCPWindowToolName.agentSelf
     }
 
+    package static func displayName(for toolName: String) -> String {
+        isLegacyAlias && toolName == MCPWindowToolName.agentSelf ? MCPDomainToolCatalog.legacyAgentSelfName : toolName
+    }
+
+    /// Project typed lifecycle failures only at the response boundary; routing errors retain canonical identity.
+    package static func errorForPresentation(_ error: Error) -> Error {
+        guard isLegacyAlias else { return error }
+        return switch error {
+        case let MCPDomainHostError.unknownTool(name):
+            MCPDomainHostError.unknownTool(displayName(for: name))
+        case let MCPDomainHostError.scopeUnavailable(name, scope):
+            MCPDomainHostError.scopeUnavailable(toolName: displayName(for: name), scope: scope)
+        case let MCPDomainHostError.staleRegistration(name):
+            MCPDomainHostError.staleRegistration(toolName: displayName(for: name))
+        case let MCPToolExecutionDispatchError.missingContract(name):
+            MCPToolExecutionDispatchError.missingContract(toolName: displayName(for: name))
+        default: error
+        }
+    }
+
     package static func withRequestedName<T>(
         _ name: String,
         operation: () async throws -> T

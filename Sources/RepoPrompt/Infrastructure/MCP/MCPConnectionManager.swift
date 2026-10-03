@@ -12603,7 +12603,7 @@ actor ServerNetworkManager {
                         "retryable": .bool(false),
                         "mutation_state": .string("not_applied"),
                         "operation_id": .string(promptExportOperationID),
-                        "tool": .string(toolName)
+                        "tool": .string(responseToolName)
                     ]
                 )
             }
@@ -12668,7 +12668,7 @@ actor ServerNetworkManager {
                             "retryable": .bool(true),
                             "mutation_state": .string("not_applied"),
                             "operation_id": .string(promptExportOperationID),
-                            "tool": .string(toolName),
+                            "tool": .string(responseToolName),
                             "cancellation_origin": .string(promptExportExecutionEnvelope.cancellationOrigin.rawValue),
                             "settlement": .string("admission_timeout")
                         ]
@@ -12769,7 +12769,7 @@ actor ServerNetworkManager {
                                     )
                             )
                         }
-                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: error.localizedDescription)
+                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: MCPDomainSelfToolCallContext.errorForPresentation(error).localizedDescription)
                     }
                 }
             }
@@ -14331,7 +14331,7 @@ actor ServerNetworkManager {
                                         errorMetadata = [:]
                                     case let MCPToolExecutionDispatchError.missingContract(missingToolName):
                                         code = "tool_execution_contract_missing"
-                                        message = "No declared execution contract exists for MCP tool '\(missingToolName)'."
+                                        message = "No declared execution contract exists for MCP tool '\(MCPDomainSelfToolCallContext.displayName(for: missingToolName))'."
                                         outcome = "executionContractMissing"
                                         shouldForceDisconnect = false
                                         errorMetadata = [:]
@@ -14397,7 +14397,7 @@ actor ServerNetworkManager {
                                             "retryable": .bool(true),
                                             "mutation_state": .string("not_applied"),
                                             "operation_id": .string(promptExportOperationID),
-                                            "tool": .string(toolName),
+                                            "tool": .string(responseToolName),
                                             "cancellation_origin": .string(
                                                 promptExportExecutionEnvelope?.cancellationOrigin.rawValue
                                                     ?? MCPToolExecutionCancellationOrigin.serverExportEnvelope.rawValue
@@ -14413,7 +14413,7 @@ actor ServerNetworkManager {
                                             "cancellation_origin": .string(MCPToolExecutionCancellationOrigin.watchdogDeadline.rawValue),
                                             "settlement": .string(settlement.rawValue)
                                         ].merging(
-                                            promptExportMutationObservation?.errorMetadata(toolName: toolName) ?? [:],
+                                            promptExportMutationObservation?.errorMetadata(toolName: responseToolName) ?? [:],
                                             uniquingKeysWith: { _, authorityValue in authorityValue }
                                         )
                                     case MCPToolExecutionWatchdogError.executionDetached:
@@ -14439,7 +14439,7 @@ actor ServerNetworkManager {
                                             "cancellation_origin": .string(MCPToolExecutionCancellationOrigin.watchdogDeadline.rawValue),
                                             "settlement": .string("force_disconnect")
                                         ].merging(
-                                            promptExportMutationObservation?.errorMetadata(toolName: toolName) ?? [:],
+                                            promptExportMutationObservation?.errorMetadata(toolName: responseToolName) ?? [:],
                                             uniquingKeysWith: { _, authorityValue in authorityValue }
                                         )
                                     case let protectedError as DomainProtectedMutationError
@@ -14453,7 +14453,7 @@ actor ServerNetworkManager {
                                             "mutation_state": .string(settlement.state.rawValue),
                                             "retryable": .bool(false),
                                             "operation_id": .string(settlement.operationID),
-                                            "tool": .string(toolName),
+                                            "tool": .string(responseToolName),
                                             "settlement": .string("error")
                                         ]
                                     default:
@@ -14464,7 +14464,7 @@ actor ServerNetworkManager {
                                     var errorJSONObject: [String: Value] = [
                                         "code": .string(code),
                                         "error": .string(message),
-                                        "tool": .string(toolName)
+                                        "tool": .string(responseToolName)
                                     ]
                                     for (key, value) in errorMetadata {
                                         errorJSONObject[key] = value
@@ -14812,7 +14812,7 @@ actor ServerNetworkManager {
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
                                                         EditFlowPerf.Dimensions(toolName: toolName)
                                                     ) {
-                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
+                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(MCPDomainSelfToolCallContext.errorForPresentation(error).localizedDescription), "tool": .string(responseToolName)]))
                                                     }
                                                     let eventObserverCount = await EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
@@ -14840,7 +14840,7 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
                                             )
                                             return handlerResult(
-                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)"),
+                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(MCPDomainSelfToolCallContext.errorForPresentation(error))"),
                                                 outcome: "dispatchError"
                                             )
                                         }
@@ -14958,7 +14958,7 @@ actor ServerNetworkManager {
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
                                                         EditFlowPerf.Dimensions(toolName: toolName)
                                                     ) {
-                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
+                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(MCPDomainSelfToolCallContext.errorForPresentation(error).localizedDescription), "tool": .string(responseToolName)]))
                                                     }
                                                     let eventObserverCount = await EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
@@ -14986,7 +14986,7 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
                                             )
                                             return handlerResult(
-                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)"),
+                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(MCPDomainSelfToolCallContext.errorForPresentation(error))"),
                                                 outcome: "dispatchError"
                                             )
                                         }
