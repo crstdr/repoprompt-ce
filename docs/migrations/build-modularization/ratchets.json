@@ -1,5 +1,5 @@
 {
-  "description": "Fork sidebar/menu/performance integration atop sync/upstream-20261002b: exact measured metrics, no additional app-target line headroom. Feature/upstream baseline is unchanged. Approved untracked-stat cache adds exactly its own +98 app-target lines (653511 to 653609), with zero headroom and no other ratchet raised.",
+  "description": "Upstream sync 2026-10-03: upstream a877f1ea baselines plus the existing fork b73d3f03 delta over its last upstream merge base da5bf805; fork zero app-line headroom retained. Approved untracked-stat cache adds exactly its own +98 app-target lines (653599 to 653697), with zero headroom and no other ratchet raised.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -24,7 +24,7 @@
     "app_shared_accessor_uses": 1256,
     "app_static_shared_declarations": 94,
     "app_target_swift_files": 1139,
-    "app_target_swift_lines": 653609,
+    "app_target_swift_lines": 653697,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1076,
     "first_party_swift_lines": 756106,
