@@ -1391,12 +1391,10 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             "Overseen by", "Observer",
             "Created by", "Creator",
             "",
-            "Oversee new", "Oversee by",
-            "",
-            "Unlink"
+            "Oversee new", "Oversee by", "Unlink"
         ])
         XCTAssertTrue(menu.items[6].isSeparatorItem)
-        XCTAssertTrue(menu.items[9].isSeparatorItem)
+        XCTAssertFalse(menu.items[9].isSeparatorItem)
         XCTAssertFalse(menu.items[0].isEnabled)
         XCTAssertEqual(menu.items[0].accessibilityHelp(), nil)
     }
@@ -1652,6 +1650,10 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         for index in 1 ... 9 {
             XCTAssertTrue(titles.contains { $0.contains("Hosted peer \(index)") }, "Missing peer \(index)")
         }
+        let unlinkIndex = try XCTUnwrap(titles.firstIndex(of: AgentOversightUICopy.unlinkTitle))
+        XCTAssertEqual(titles[unlinkIndex - 1], AgentOversightUICopy.overseeByTitle)
+        XCTAssertTrue(menu.items[unlinkIndex + 1].isSeparatorItem)
+        XCTAssertEqual(titles[unlinkIndex + 2], "Select chat")
         XCTAssertTrue(titles.contains("Stash chat for later"), "Opening must also capture current standard callbacks")
         XCTAssertEqual(try menuProps(in: fixture), props, "Opening alone must not mutate the settled relationship presentation")
     }
