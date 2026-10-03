@@ -550,10 +550,6 @@ final class GitViewModel: ObservableObject {
     }
 
     #if DEBUG
-        var test_statusActor: GitStatusActor {
-            statusActor
-        }
-
         var test_hasGitContextRefreshTask: Bool {
             gitContextRefreshTask != nil
         }

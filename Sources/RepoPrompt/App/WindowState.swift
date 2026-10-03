@@ -577,15 +577,13 @@ class WindowState: ObservableObject {
 
         convenience init(
             codexModelPollingService: CodexModelPollingService,
-            loadStoredAPISettingsDataOnInit: Bool,
-            keyManager: KeyManager? = nil
+            loadStoredAPISettingsDataOnInit: Bool
         ) {
             self.init(
                 contextBuilderProviderFactory: nil,
                 loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
                 codexModelPollingService: codexModelPollingService,
-                domainRuntimeOverride: nil,
-                keyManager: keyManager
+                domainRuntimeOverride: nil
             )
         }
 
