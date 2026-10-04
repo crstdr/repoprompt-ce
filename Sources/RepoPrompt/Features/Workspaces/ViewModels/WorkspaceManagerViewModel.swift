@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import Foundation
 import os
 import RepoPromptDomainRuntime
@@ -108,6 +109,25 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
     private var cachedWorkspacesByKey: [WorkspaceFileDecodeCacheKey: WorkspaceModel] = [:]
     private var scheduledNormalizationSaveKeys: Set<WorkspaceFileDecodeCacheKey> = []
 
+    /// Digest-keyed decode cache: `decodeWorkspace(documentBytes:)` is a pure
+    /// function of the input bytes, so identical document payloads (the same
+    /// workspace projected into N windows, or a file whose metadata changed but
+    /// whose contents did not) decode once process-wide instead of once per
+    /// consumer. Entries are LRU-evicted past the entry/byte bounds.
+    private struct DigestCachedDecode {
+        let workspace: WorkspaceModel
+        let normalizationRequiresSave: Bool
+        let inputByteCount: Int
+    }
+
+    private var cachedDecodesByDigest: [String: DigestCachedDecode] = [:]
+    private var decodeOrder: [String] = [] // oldest first (LRU)
+    private var cachedDecodeInputBytes = 0
+    private var decodeCacheEntryLimit = 128
+    private var decodeCacheByteLimit = 64 * 1024 * 1024
+    private var decodeCacheHits = 0
+    private var decodeCacheMisses = 0
+
     private init() {}
 
     fileprivate func loadWorkspace(at fileURL: URL) throws -> WorkspaceFileCachedLoadResult {
@@ -149,12 +169,87 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
     fileprivate static func decodeWorkspace(
         documentBytes: Data
     ) throws -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool) {
-        var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: documentBytes)
-        let decodedRequiresSave = workspace.normalizationRequiresSave
-        let normalized = workspace.normalizeComposeTabInvariants()
-        let normalizationRequiresSave = decodedRequiresSave || normalized || workspace.normalizationRequiresSave
-        workspace.normalizationRequiresSave = normalizationRequiresSave
-        return (workspace, normalizationRequiresSave)
+        let digest = Data(SHA256.hash(data: documentBytes))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        if let cached = shared.cachedDecode(for: digest) {
+            return cached
+        }
+        // The decode is only memoizable when it is a pure function of the
+        // bytes: custom decoders and normalization synthesize UUID()/Date()
+        // fallbacks for missing fields, and those results must stay
+        // per-document (identical bytes at two files must keep independent
+        // synthesized identities).
+        let recorder = WorkspaceDecodeSynthesis.Recorder()
+        let decoded = try WorkspaceDecodeSynthesis.$recorder.withValue(recorder) {
+            var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: documentBytes)
+            let decodedRequiresSave = workspace.normalizationRequiresSave
+            let normalized = workspace.normalizeComposeTabInvariants()
+            let normalizationRequiresSave = decodedRequiresSave
+                || normalized || workspace.normalizationRequiresSave
+            workspace.normalizationRequiresSave = normalizationRequiresSave
+            return (
+                workspace: workspace,
+                normalizationRequiresSave: normalizationRequiresSave
+            )
+        }
+        if !recorder.occurred {
+            shared.storeDecoded(
+                decoded.workspace,
+                normalizationRequiresSave: decoded.normalizationRequiresSave,
+                digest: digest,
+                inputByteCount: documentBytes.count
+            )
+        }
+        return (decoded.workspace, decoded.normalizationRequiresSave)
+    }
+
+    private func cachedDecode(
+        for digest: String
+    ) -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let hit = cachedDecodesByDigest[digest] else {
+            decodeCacheMisses += 1
+            return nil
+        }
+        decodeCacheHits += 1
+        decodeOrder.removeAll { $0 == digest }
+        decodeOrder.append(digest)
+        return (hit.workspace, hit.normalizationRequiresSave)
+    }
+
+    private func storeDecoded(
+        _ workspace: WorkspaceModel,
+        normalizationRequiresSave: Bool,
+        digest: String,
+        inputByteCount: Int
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        // A single document larger than the byte budget is never cached —
+        // eviction could not bound memory for it anyway.
+        guard inputByteCount <= decodeCacheByteLimit else { return }
+        if let existing = cachedDecodesByDigest[digest] {
+            cachedDecodeInputBytes -= existing.inputByteCount
+            decodeOrder.removeAll { $0 == digest }
+        }
+        cachedDecodesByDigest[digest] = DigestCachedDecode(
+            workspace: workspace,
+            normalizationRequiresSave: normalizationRequiresSave,
+            inputByteCount: inputByteCount
+        )
+        decodeOrder.append(digest)
+        cachedDecodeInputBytes += inputByteCount
+        while cachedDecodesByDigest.count > decodeCacheEntryLimit
+            || cachedDecodeInputBytes > decodeCacheByteLimit,
+            let oldest = decodeOrder.first
+        {
+            decodeOrder.removeFirst()
+            if let evicted = cachedDecodesByDigest.removeValue(forKey: oldest) {
+                cachedDecodeInputBytes -= evicted.inputByteCount
+            }
+        }
     }
 
     fileprivate func metadataKey(for fileURL: URL) throws -> WorkspaceFileDecodeCacheKey {
@@ -207,6 +302,55 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
             defer { lock.unlock() }
             cachedWorkspacesByKey.removeAll()
             scheduledNormalizationSaveKeys.removeAll()
+            cachedDecodesByDigest.removeAll()
+            decodeOrder.removeAll()
+            cachedDecodeInputBytes = 0
+            decodeCacheHits = 0
+            decodeCacheMisses = 0
+        }
+
+        func digestDecodeStatsForTesting() -> (
+            entries: Int, orderCount: Int, inputBytes: Int, hits: Int, misses: Int
+        ) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (
+                cachedDecodesByDigest.count,
+                decodeOrder.count,
+                cachedDecodeInputBytes,
+                decodeCacheHits,
+                decodeCacheMisses
+            )
+        }
+
+        func setDecodeCacheLimitsForTesting(maxEntries: Int, maxInputBytes: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            decodeCacheEntryLimit = maxEntries
+            decodeCacheByteLimit = maxInputBytes
+        }
+
+        func decodeCacheLimitsForTesting() -> (maxEntries: Int, maxInputBytes: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (decodeCacheEntryLimit, decodeCacheByteLimit)
+        }
+
+        /// Exercises the existing-key replacement path in `storeDecoded`
+        /// deterministically — concurrent cold misses in production can store
+        /// the same digest twice, and the accounting must charge it once.
+        func storeDecodedForTesting(
+            workspace: WorkspaceModel,
+            normalizationRequiresSave: Bool,
+            digest: String,
+            inputByteCount: Int
+        ) {
+            storeDecoded(
+                workspace,
+                normalizationRequiresSave: normalizationRequiresSave,
+                digest: digest,
+                inputByteCount: inputByteCount
+            )
         }
     #endif
 }
@@ -273,18 +417,22 @@ enum PersistentFolderOpenResolution {
 }
 
 @MainActor
-private final class PendingPersistentWorkspaceCreation {
-    let workspaceID: UUID
+final class PendingPersistentWorkspaceCreation {
+    let workspace: WorkspaceModel
+    var workspaceID: UUID {
+        workspace.id
+    }
+
     let operationID: UUID
     private let creationTask: Task<DomainCommandOutcome, Error>
     private var joinWaiters: [UUID: CheckedContinuation<DomainCommandOutcome, Error>] = [:]
 
-    init(
-        workspaceID: UUID,
+    fileprivate init(
+        workspace: WorkspaceModel,
         operationID: UUID,
         creationTask: Task<DomainCommandOutcome, Error>
     ) {
-        self.workspaceID = workspaceID
+        self.workspace = workspace
         self.operationID = operationID
         self.creationTask = creationTask
     }
@@ -313,6 +461,21 @@ private final class PendingPersistentWorkspaceCreation {
                 self?.cancelJoin(waiterID)
             }
         }
+    }
+
+    /// The retained task, not a later catalog/local-model lookup, is the creation receipt.
+    func publishedWorkspace() async throws -> WorkspaceModel {
+        let outcome = try await join()
+        guard WorkspaceManagerViewModel.isSuccessfulDomainOutcome(outcome) else {
+            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
+        }
+        guard outcome.operationID == operationID,
+              outcome.workspace?.document.workspaceID == workspaceID
+        else {
+            throw PersistentWorkspaceCreationError.unexpectedOutcome(workspaceID, operationID)
+        }
+        try Task.checkCancellation()
+        return workspace
     }
 
     private func finishJoin(
@@ -359,6 +522,23 @@ final class PendingPersistentWorkspacePublication: Equatable {
 
     func join() async throws -> DomainCommandOutcome {
         try await creation.join()
+    }
+}
+
+private enum PersistentWorkspaceCreationError: LocalizedError {
+    case authorityUnavailable
+    case missingHandle(UUID)
+    case unexpectedOutcome(UUID, UUID)
+
+    var errorDescription: String? {
+        switch self {
+        case .authorityUnavailable:
+            "Persistent workspace creation authority is unavailable."
+        case let .missingHandle(workspaceID):
+            "Workspace \(workspaceID) has no expected authority creation handle."
+        case let .unexpectedOutcome(workspaceID, operationID):
+            "Workspace \(workspaceID) creation operation \(operationID) returned an unexpected authority identity."
+        }
     }
 }
 
@@ -831,8 +1011,34 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces.enumerated().map { ($1.id, $0) },
                 uniquingKeysWith: { _, last in last }
             )
+            // Derived only on mutation; exact model-routing reads never sweep or repair state.
+            // An ambiguous workspace or tab is deliberately unresolvable, not last-wins.
+            modelRoutingTabIndexes = Dictionary(
+                workspaces.map { workspace in
+                    (workspace.id, Dictionary(
+                        workspace.composeTabs.enumerated().map { ($1.id, $0) },
+                        uniquingKeysWith: { _, _ in -1 }
+                    ))
+                },
+                uniquingKeysWith: { _, _ in [:] }
+            )
             refreshSelectionMirrorContextRevision()
         }
+    }
+
+    private var modelRoutingTabIndexes: [UUID: [UUID: Int]] = [:]
+
+    /// Exact active-workspace binding. Missing, ambiguous, or stale indexes fail closed.
+    func modelRoutingTab(workspaceID: UUID, tabID: UUID) -> ComposeTabState? {
+        guard activeWorkspaceID == workspaceID,
+              let workspaceIndex = workspaceIndexMap[workspaceID],
+              workspaces.indices.contains(workspaceIndex),
+              workspaces[workspaceIndex].id == workspaceID,
+              let tabIndex = modelRoutingTabIndexes[workspaceID]?[tabID],
+              workspaces[workspaceIndex].composeTabs.indices.contains(tabIndex),
+              workspaces[workspaceIndex].composeTabs[tabIndex].id == tabID
+        else { return nil }
+        return workspaces[workspaceIndex].composeTabs[tabIndex]
     }
 
     @Published private(set) var domainWorkspaceAuthorityIssue: DomainWorkspaceAuthorityIssue?
@@ -992,6 +1198,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         /// Observes explicit root assignment before persistence or lifecycle work can suspend.
         var rootEditDidApplyHandlerForTesting: (@MainActor (UUID, WorkspaceSaveSource) async -> Void)?
 
+        /// Per-instance creation fault/suspension seam; never replaces a successful authority outcome.
+        var persistentWorkspaceCreationWillExecuteHandlerForTesting:
+            (@MainActor (UUID, UUID) async throws -> Void)?
         private var workspaceSavePreparationDidFinishHandlerForTesting:
             (@Sendable (UUID, URL, Int) async -> Void)?
         private var workspaceSaveAfterAuthoritySnapshotHandlerForTesting:
@@ -4440,14 +4649,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         for workspace: WorkspaceModel,
         operationID: UUID,
         creationTask: Task<DomainCommandOutcome, Error>
-    ) {
+    ) -> PendingPersistentWorkspaceCreation? {
         if let existing = pendingPersistentWorkspaceCreationsByWorkspaceID[workspace.id] {
             // A live creation retains ownership of the workspace identity until it completes.
-            guard existing.operationID == operationID else { return }
-            return
+            guard existing.operationID == operationID else { return nil }
+            return existing
         }
         let creation = PendingPersistentWorkspaceCreation(
-            workspaceID: workspace.id,
+            workspace: workspace,
             operationID: operationID,
             creationTask: creationTask
         )
@@ -4472,6 +4681,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 creation: creation
             )
         }
+        return creation
     }
 
     private func removePendingPersistentWorkspacePublications(operationID: UUID) {
@@ -4486,7 +4696,25 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @discardableResult
     func createWorkspace(name: String, repoPaths: [String], ephemeral: Bool = false, savedInLibrary: Bool = true) -> WorkspaceModel {
+        beginWorkspaceCreation(name: name, repoPaths: repoPaths, ephemeral: ephemeral, savedInLibrary: savedInLibrary).workspace
+    }
+
+    /// Capture the exact creation in the same actor turn, before notifications or any await.
+    /// Legacy/UI callers keep their synchronous model API; authority callers cannot use it as a receipt.
+    func createPersistentWorkspace(name: String, repoPaths: [String], savedInLibrary: Bool = true) throws -> PendingPersistentWorkspaceCreation {
+        guard domainWorkspaceAuthorityClient != nil else {
+            throw PersistentWorkspaceCreationError.authorityUnavailable
+        }
+        let started = beginWorkspaceCreation(name: name, repoPaths: repoPaths, ephemeral: false, savedInLibrary: savedInLibrary)
+        guard let creation = started.creation else {
+            throw PersistentWorkspaceCreationError.missingHandle(started.workspace.id)
+        }
+        return creation
+    }
+
+    private func beginWorkspaceCreation(name: String, repoPaths: [String], ephemeral: Bool, savedInLibrary: Bool) -> (workspace: WorkspaceModel, creation: PendingPersistentWorkspaceCreation?) {
         var newWorkspace = WorkspaceModel(name: name, repoPaths: repoPaths, isSavedWorkspace: savedInLibrary)
+        var retainedCreation: PendingPersistentWorkspaceCreation?
 
         // Mark as ephemeral if needed
         newWorkspace.isEphemeral = ephemeral
@@ -4497,6 +4725,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             let creationTask = Task<DomainCommandOutcome, Error> { @MainActor [self] in
                 defer { removePendingPersistentWorkspacePublications(operationID: operationID) }
                 do {
+                    #if DEBUG
+                        try await persistentWorkspaceCreationWillExecuteHandlerForTesting?(newWorkspace.id, operationID)
+                    #endif
                     _ = try ensureWorkspaceDirectoryExists(for: newWorkspace)
                     let result = try await persistWorkspaceThroughDomainAuthority(
                         newWorkspace,
@@ -4526,7 +4757,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                     throw error
                 }
             }
-            registerPendingPersistentWorkspacePublications(
+            retainedCreation = registerPendingPersistentWorkspacePublications(
                 for: newWorkspace,
                 operationID: operationID,
                 creationTask: creationTask
@@ -4582,10 +4813,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
 
-        return newWorkspace
+        return (newWorkspace, retainedCreation)
     }
 
-    /// Wait for the target's own creation before taking the window's switch lease.
+    /// Drain creation for teardown only. This nonthrowing API does not authorize activation.
     func finishWorkspaceCreation(workspaceIDs: Set<UUID>) async {
         for workspaceID in workspaceIDs {
             if let creation = pendingPersistentWorkspaceCreationsByWorkspaceID[workspaceID] {
@@ -4593,6 +4824,22 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
             await workspaceCreationTasksByID[workspaceID]?.value
         }
+    }
+
+    private func workspaceCreationBarrierResult(workspaceID: UUID) async -> WorkspaceSwitchResult? {
+        if let creation = pendingPersistentWorkspaceCreationsByWorkspaceID[workspaceID] {
+            do {
+                _ = try await creation.publishedWorkspace()
+            } catch {
+                let message = "Workspace \(creation.workspaceID) creation operation \(creation.operationID) did not complete successfully: \(error.localizedDescription)"
+                return error is CancellationError ? .cancelled(message) : .blocked(message)
+            }
+        }
+        await workspaceCreationTasksByID[workspaceID]?.value
+        guard !Task.isCancelled else {
+            return .cancelled("Workspace switch to \(workspaceID) was cancelled before activation.")
+        }
+        return nil
     }
 
     // MARK: - Switch
@@ -5004,7 +5251,9 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
-        await finishWorkspaceCreation(workspaceIDs: [newWorkspace.id])
+        if let creationResult = await workspaceCreationBarrierResult(workspaceID: newWorkspace.id) {
+            return userVisibleWorkspaceSwitchResult(creationResult)
+        }
         let currentBeforeAdmission = workspace(withID: newWorkspace.id)
         if newWorkspace.consolidatedIntoWorkspaceID != nil
             || currentBeforeAdmission?.consolidatedIntoWorkspaceID != nil
@@ -5601,7 +5850,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard deletionToken?.isActive ?? true else {
             return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out.")
         }
-        await finishWorkspaceCreation(workspaceIDs: [newWorkspace.id])
+        if let creationResult = await workspaceCreationBarrierResult(workspaceID: newWorkspace.id) {
+            return creationResult
+        }
         guard deletionToken?.isActive ?? true else {
             return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out.")
         }
@@ -6876,7 +7127,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    private static func isSuccessfulDomainOutcome(_ outcome: DomainCommandOutcome) -> Bool {
+    fileprivate static func isSuccessfulDomainOutcome(_ outcome: DomainCommandOutcome) -> Bool {
         outcome.disposition == .applied
             || outcome.disposition == .unchanged
             || outcome.disposition == .deduplicated
@@ -16398,5 +16649,48 @@ class WorkspaceManagerViewModel: ObservableObject {
         } catch {
             print("Warning: Could not remove RepoPrompt-Backup folder: \(error)")
         }
+    }
+}
+
+@MainActor
+extension WorkspaceManagerViewModel: WorkspaceSelectionHost {
+    var activeSelectionWorkspace: WorkspaceSelectionWorkspace? {
+        activeWorkspace.map { workspace in
+            WorkspaceSelectionWorkspace(
+                id: workspace.id,
+                activeComposeTabID: workspace.activeComposeTabID,
+                firstComposeTabID: workspace.composeTabs.first?.id
+            )
+        }
+    }
+
+    func selectionTab(for identity: WorkspaceSelectionIdentity) -> WorkspaceSelectionTab? {
+        composeTab(for: identity).map { WorkspaceSelectionTab(id: $0.id, selection: $0.selection) }
+    }
+
+    func storeSelection(
+        _ selection: StoredSelection,
+        modifiedAt: Date,
+        for identity: WorkspaceSelectionIdentity
+    ) -> Bool {
+        guard var tab = composeTab(for: identity) else { return false }
+        tab.selection = selection
+        tab.lastModified = modifiedAt
+        return updateComposeTabStoredOnly(tab, inWorkspaceID: identity.workspaceID)
+    }
+
+    func committedSelectionRevision(for identity: WorkspaceSelectionIdentity) -> UInt64 {
+        selectionRevisionForMCP(workspaceID: identity.workspaceID, tabID: identity.tabID)
+    }
+}
+
+@MainActor
+extension WorkspaceManagerViewModel: WorkspaceSearchReadinessProviding {
+    func waitForSearchReadiness(timeout: Duration) async throws -> WorkspaceSearchReadinessTicket {
+        try await awaitWorkspaceSearchReadiness(timeout: timeout)
+    }
+
+    nonisolated func validateSearchReadiness(_ ticket: WorkspaceSearchReadinessTicket) throws {
+        try validateWorkspaceSearchReadinessSnapshot(ticket)
     }
 }

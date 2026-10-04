@@ -1,6 +1,16 @@
 import Foundation
 
 enum AgentModelCatalog {
+    static func cursorEffortOption(_ option: AgentModelOption, configID: String, valueRaw: String) -> AgentModelOption? {
+        guard let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: option.rawValue),
+              let raw = specifier.replacing(configID: configID, valueRaw: valueRaw) else { return nil }
+        return CursorAIModelCatalog.option(matching: raw)
+    }
+
+    static func cursorSelectionIsAvailable(_ raw: String) -> Bool {
+        CursorAIModelCatalog.option(matching: raw) != nil
+    }
+
     struct AvailabilityContext: Equatable {
         let claudeCodeAvailable: Bool
         let codexAvailable: Bool
@@ -351,11 +361,34 @@ enum AgentModelCatalog {
         )
     }
 
+    /// Producing canonical options also refreshes the memory-only admission index. Capture its
+    /// generation before reading provider snapshots so a concurrent invalidation defeats old work.
+    /// Window-local Codex overrides are picker projections, not the list_agents catalogue.
     static func options(
         for agentKind: AgentProviderKind,
         availability: AvailabilityContext = .current,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
         includeClaudeEffortVariants: Bool = true
+    ) -> [AgentModelOption] {
+        let generation = AgentAdvertisedModelCatalog.shared.productionGeneration(for: agentKind)
+        let result = uncachedOptions(
+            for: agentKind, availability: availability, codexDynamicModels: codexDynamicModels,
+            includeClaudeEffortVariants: includeClaudeEffortVariants
+        )
+        if includeClaudeEffortVariants,
+           agentKind != .codexExec || codexDynamicModels == nil,
+           isAgentAvailable(agentKind, availability: availability)
+        {
+            AgentAdvertisedModelCatalog.shared.record(result, for: agentKind, generation: generation)
+        }
+        return result
+    }
+
+    private static func uncachedOptions(
+        for agentKind: AgentProviderKind,
+        availability: AvailabilityContext,
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]?,
+        includeClaudeEffortVariants: Bool
     ) -> [AgentModelOption] {
         guard isAgentAvailable(agentKind, availability: availability) else { return [] }
         if agentKind == .cursor {

@@ -7363,11 +7363,21 @@ actor GitService {
         return "\(action) couldn’t launch git-lfs from RepoPrompt’s subprocess environment. If git-lfs is installed, restart RepoPrompt and make sure it’s available from your login shell PATH.\n\nRaw error: \(rawMessage)"
     }
 
+    /// The exact environment this instance's Git subprocesses inherit (memoized on first use).
+    func preparedProcessEnvironment() async -> [String: String] {
+        await processEnvironment()
+    }
+
     private func processEnvironment() async -> [String: String] {
         if let preparedBaseProcessEnvironment {
             return preparedBaseProcessEnvironment
         }
         let shellEnvironment = await CLIEnvironmentCache.shared.environment(enableLogging: false)
+        // Another first-use caller may have prepared the environment while this one was suspended;
+        // the first prepared environment wins so every caller observes the same snapshot.
+        if let preparedBaseProcessEnvironment {
+            return preparedBaseProcessEnvironment
+        }
         let environment = Self.mergedProcessEnvironment(
             baseEnvironment: inheritedProcessEnvironment,
             shellEnvironment: shellEnvironment
@@ -8682,15 +8692,15 @@ actor GitService {
                 break
             }
             sawData = true
-            for byte in data {
-                if byte == 0 {
-                    return (nil, nil)
+            let isText = data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                for byte in bytes {
+                    if byte == 0 { return false }
+                    if byte == 0x0A { lineCount += 1 }
                 }
-                if byte == 0x0A {
-                    lineCount += 1
-                }
-                lastByte = byte
+                lastByte = bytes.last
+                return true
             }
+            guard isText else { return (nil, nil) }
         }
 
         if sawData {

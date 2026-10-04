@@ -60,6 +60,60 @@ User decision, 2026-09-29. The whole remaining modularization is **at most 10 PR
 - **Critical path.** In lane P, PR 4 → PR 6 → PR 9 → PR 10 would be the critical path (≈ 43 agent-days after PR 2 at midpoints). Moving PR 9 behind PR 8 shortens that to ≈ 35.
 - **Conflict.** PR 8 rewrites the provider references that PR 9's runtime carve-outs also touch (10 runtime files [M]). Running PR 9 second removes that conflict instead of managing it.
 
+### Revised order after PR 2 (2026-10-01): seams for headless first
+
+User decision: "seam, then port." The in-app seam PRs that headless depends on move ahead of the platform moves. The ten-PR ceiling is unchanged; only the numbering after PR 2 changes.
+
+| New # | Milestone | Old # | Hard deps (merged) | Lane | Headless seam delivered |
+| --- | --- | --- | --- | --- | --- |
+| 3 | WorkspaceContext prep: invert WorkspaceContext → Features/VM edges (S8/S9/S17), read-only root-scoped snapshot (C1/C2) | 4 | 2 | P | X8 (d) |
+| 4 | MCP server prep: S5 invocation-context values, S6 `ToolInvocationContext`, admission/settlement seam (D1–D3) | 6 | 2 (soft: 3) | P | X8 (a)(b)(c) |
+| 5 | Platform: FileSystem + `IgnoreMatcher`, VCS queries, CodeMap persistence, settings core + ignore facet (B1–B4) | 3 | 2 | M | X8 (e)(f)(g) |
+| 6 | WorkspaceContext move (C3) | 5 | 3, 5 | M | — (build/test time) |
+| 7 | MCP server move (D4) | 7 | 4, 6 | M | — (build/test time) |
+| 8 | AI: contracts + providers (E1/E2) | 8 | 2 | AI | — |
+| 9 | Agent runtime prep (F1–F3) | 9 | 8 | AI | session-host contract |
+| 10 | Agent runtime move + exit (F4, X) | 10 | 7, 9 | M | — |
+
+- **DomainRuntime.** It is already its own target. Its seam is a guardrail, not a PR: no app dependency, and nothing moves out of it. That is enforced by the T1 edge matrix shipped in PR 2.
+- **Why the WorkspaceContext move still waits for Platform.** Index readiness on `7d9cecd2` shows the WorkspaceContext set (101 files) has 126 outbound file references into FileSystem and VCS. Its Features/MCP-ViewModel edges, which PR 3 removes, number about 40.
+- **Claims lists.** Each PR publishes its file claims before it moves or substantially edits any file. The PR-triage overseer sequences open contributor PRs against them.
+
+### PR 4 bounded implementation contract (2026-10-02)
+
+The approved in-app prep uses one new `Infrastructure/MCP/MCPInvocationContext.swift`
+for S5 value declarations and the Sendable S6 carrier. Existing args-only canonical
+bindings remain unchanged: the app ingress scopes the captured packet around the
+DomainRuntime host, and window adapters capture it before their first suspension.
+The existing VM retains live file-authority capture/validation and the atomic
+lifetime mutation fence. Explicit `trustedLocal` compatibility is separate from
+network authorization; a missing network packet is never local authorization.
+
+D3 consumes the existing DomainRuntime admission/settlement values and moves only
+the app client-policy value projection into `MCPToolAdmissionPolicy`. DomainRuntime
+continues owning permits, request identities, cancellation, settlement, delivery,
+and replay. No additional wire-ID deduplication or headless signature change.
+
+The nonthrowing metadata compatibility helper is **not an authorization boundary**:
+absent metadata can classify as administrative in compatibility code. Safety relies
+on mandatory binder/read ingress and the preserved scoped, explicit packet through
+the structured Host Task, runTool/start gate and heartbeat. Carrier-free MCPService
+getters return nil, never live successor metadata. No throwing-signature expansion
+into unclaimed callers or production admission weakening is included.
+
+Local source gates are green on the v8 freeze: broad ticket
+`c6cb5b47-e9e3-4aad-8f6c-42285c5a1296` executed 4,142 tests, with 4,140 passed,
+0 failed and 2 skipped; DomainRuntime 268 and MCPCore 66 passed. Exact regressions
+6, affected 195, repaired exact 11 and affected three-suite 78 passed. Final v8
+format/lint/guardrails passed with no source drift. The prior broad-v7 failure
+(4,129 passed, 11 failed, 2 skipped) remains historical evidence, not erased.
+
+Final acceptance still requires **final-head `make dev-build`**, thorough live CE
+MCP E2E (approval/denial, multiwindow, cancellation, replay), and headless
+initialize/list/read-only coverage; debug packaging/runtime checks are **NOT_RUN**.
+No lifecycle occurs without separate explicit approval through the overseer. The
+local v8 receipt does not certify integration onto a newer main.
+
 ### Soft conflicts and churn rules
 
 | Pair | Overlap | Rule |
@@ -206,7 +260,7 @@ AI                        [==== 8 ====][===== 9 =====]
 | --- | --- | --- |
 | `tests_testable_import_app_files` (non-increasing) | T1 | The regex is exact. Every test move lowers the baseline in the same PR |
 | `app_files_over_2000_lines` | T1 | Exact line counts |
-| `app_target_swift_lines` as a ceiling | T1 | Baseline plus a fixed headroom for feature work; each move PR lowers the ceiling by what it moved |
+| `app_target_swift_lines` advisory reference | T1 (advisory since 2026-10-03) | Baseline plus unchanged headroom is reported, not gated; numeric baselines and all other gates remain unchanged (see ledger policy) |
 | Import check `error` and the allowed-edge matrix | T1 | Covers the existing targets; each new target adds its row in its move PR |
 | Placement guardrail ("new files for a moved family go in its module") | T1, then extended by each move PR | This is the main "no new code in the old app" lever |
 | Per-target guardrails: no SwiftUI/AppKit in logic targets, no `RepoPromptApp` import, `bundle_main_allowed_roots` | Each target's move PR | P0.6 checklist |

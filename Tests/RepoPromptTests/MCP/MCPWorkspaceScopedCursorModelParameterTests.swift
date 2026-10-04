@@ -5,6 +5,33 @@ import XCTest
 
 @MainActor
 final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [.init(rawValue: "grok-4.6", displayName: "Grok 4.6", description: nil, isDefault: true)],
+                currentModelRaw: "grok-4.6",
+                modelParameterSets: [.init(baseModelRaw: "grok-4.6", parameters: [
+                    .init(kind: .thinking, configID: "effort", displayName: "Effort", choices: [
+                        .init(rawValue: "low", displayName: "Low"),
+                        .init(rawValue: "medium", displayName: "Medium"),
+                        .init(rawValue: "high", displayName: "High")
+                    ], currentValueRaw: "low"),
+                    .init(kind: .speed, configID: "fast", displayName: "Speed", choices: [
+                        .init(rawValue: "false", displayName: "Standard"),
+                        .init(rawValue: "true", displayName: "Fast")
+                    ], currentValueRaw: "false")
+                ])]
+            ), for: .cursor
+        )
+    }
+
+    override func tearDown() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        super.tearDown()
+    }
+
     func testFixtureRootsUseUniqueUUIDPaths() throws {
         let first = try makeFixture()
         defer { first.cleanup() }
@@ -718,7 +745,67 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         XCTAssertNil(session.mcpControlContext)
     }
 
-    func testAgentManageListCreateAndResumeUseReleaseCatalogMetadata() async throws {
+    func testListAgentsPublishesUnpersistedLiveCodexCatalogueNotWindowOverride() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let window = try await makeWindow(name: "Live Codex catalogue", root: fixture.root)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let api = window.apiSettingsViewModel
+        api.isCursorConnected = false
+        api.isClaudeCodeConnected = false
+        api.isCodexConnected = true
+        api.isOpenCodeConnected = false
+        api.isGrokBuildConnected = false
+        api.compatibleBackendSecretPresence = [:]
+        let registry = AgentCodexModelRegistry.shared
+        let catalogue = AgentAdvertisedModelCatalog.shared
+        let originalModels = registry.currentLiveModels()
+        let persistenceKey = "CodexDynamicModelRecords"
+        let originalPersistence = UserDefaults.standard.object(forKey: persistenceKey)
+        defer {
+            registry.updateLiveModels(originalModels)
+            UserDefaults.standard.set(originalPersistence, forKey: persistenceKey)
+            catalogue.invalidate(.codexExec)
+        }
+        func model(_ name: String) -> CodexAppServerClient.RemoteModel {
+            .init(
+                id: name,
+                model: name,
+                displayName: name,
+                description: "",
+                isDefault: true,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil
+            )
+        }
+        registry.updateLiveModels([model("live-unpersisted-codex")])
+        // Remove persistence AFTER publishing the live snapshot: list_agents must use memory.
+        UserDefaults.standard.removeObject(forKey: persistenceKey)
+        catalogue.invalidate(.codexExec)
+        let service = makeManageService(window: window, openCodeOneShotObservationProvider: { _, _, _ in
+            XCTFail("This Codex-only discovery test must not probe a provider")
+            throw CocoaError(.featureUnsupported)
+        })
+        let listed = try await service.execute(args: ["op": .string("list_agents")])
+        let agents = try XCTUnwrap(listed.objectValue?["agents"]?.arrayValue)
+        let ids = agents.flatMap { agent in
+            agent.objectValue?["models"]?.arrayValue?.compactMap { $0.objectValue?["model_id"]?.stringValue } ?? []
+        }
+        XCTAssertTrue(ids.contains("codexExec:live-unpersisted-codex"))
+        XCTAssertEqual(
+            try catalogue.selection("codexExec:live-unpersisted-codex", availability: api.agentModeAvailabilityContext).storedModelRaw,
+            "live-unpersisted-codex"
+        )
+        _ = AgentModelCatalog.options(
+            for: .codexExec, availability: api.agentModeAvailabilityContext,
+            codexDynamicModels: [model("window-only-codex")]
+        )
+        XCTAssertThrowsError(try catalogue.selection("codexExec:window-only-codex", availability: api.agentModeAvailabilityContext))
+        XCTAssertNoThrow(try catalogue.selection("codexExec:live-unpersisted-codex", availability: api.agentModeAvailabilityContext))
+        XCTAssertNil(UserDefaults.standard.object(forKey: persistenceKey), "Discovery must not need a persisted copy")
+    }
+
+    func testAgentManageListCreateAndResumeUseRuntimeCatalogMetadata() async throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
         let window = try await makeWindow(name: "Cursor MCP", root: fixture.root)
@@ -761,7 +848,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         XCTAssertEqual(resumedParameters.compactMap { $0.objectValue?["base_model"]?.stringValue }, ["grok-4.6", "grok-4.6"])
     }
 
-    func testAgentRunStartRejectsUnknownReleaseCatalogParameter() async throws {
+    func testAgentRunStartRejectsUnknownRuntimeCatalogParameter() async throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
         let window = try await makeWindow(name: "Cursor MCP Run", root: fixture.root)
@@ -787,6 +874,20 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let window = try await makeWindow(name: "Cursor MCP Successful Run", root: fixture.root)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         var stagedSelections: [ACPModelParameterSelection] = []
+        // Runtime membership is authoritative; this success fixture must advertise the
+        // canonical target of the legacy Composer alias rather than rely on static entries.
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [.init(rawValue: "composer-2.5", displayName: "Composer 2.5", description: nil, isDefault: true)],
+                currentModelRaw: "composer-2.5",
+                modelParameterSets: [.init(baseModelRaw: "composer-2.5", parameters: [
+                    .init(kind: .speed, configID: "fast", displayName: "Speed", choices: [
+                        .init(rawValue: "false", displayName: "Standard"),
+                        .init(rawValue: "true", displayName: "Fast")
+                    ], currentValueRaw: "false")
+                ])]
+            ), for: .cursor
+        )
         let service = makeRunService(
             window: window,
             successfulStart: true,
