@@ -152,11 +152,8 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
 ///   the worklist. Other interactive pairs remain owned by the ordinary interactive path.
 /// - It is *reason-aware*: it distinguishes "the window topology we expected was fully observed" from
 ///   "we gave up waiting", and only the former lets an absent session be classified as gone.
-/// - It is *not a controller*: there is no timer, no polling, no debounce, and no perpetual
-///   desired-state enforcement. A dirty flag is drained by one retained MainActor task, and an entry
-///   that has nothing to do simply waits for process lifetime. The one proactive step is a single
-///   passive load request per saved endpoint whose background tab is described but not hydrated —
-///   without it a saved pair whose tabs the user never reopens would never be restored at all.
+/// - It is *not a controller*: one MainActor task drains events, without timers or polling.
+///   Described background endpoints receive bounded passive hydration requests.
 ///
 /// Each automatic entry may reserve once, with one fresh allowance per exact captured window close.
 /// Other lifecycle revocation ends the entry permanently; no-reference waiting pairs are not rearmed.
@@ -224,8 +221,7 @@ final class AgentSessionOversightLaunchCoordinator {
     // MARK: State
 
     private weak var delegate: (any AgentSessionOversightLaunchCoordinatorDelegate)?
-    /// Stable pair order, extended only by exact close capture. Serial processing keeps a pass
-    /// deterministic; roughly ten windows never justify parallel reservation.
+    /// Stable, serial pair order; extended only by exact close capture.
     private var launchPairOrder: [AgentSessionOversightIntent] = []
     private var entries: [AgentSessionOversightIntent: Entry] = [:]
 
@@ -238,8 +234,7 @@ final class AgentSessionOversightLaunchCoordinator {
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
-    /// Sessions already asked to hydrate; only exact close-captured endpoint closure rearms them.
-    /// A terminal load must not be retried in a loop as the pass re-runs on every event.
+    /// Hydration dedupe; only captured endpoint closure rearms requests, never ordinary events.
     private var hydrationRequestedSessionIDs: Set<UUID> = []
 
     init(
@@ -395,8 +390,7 @@ final class AgentSessionOversightLaunchCoordinator {
         if entry.assertionGeneration != generation {
             entry.closedReferences.removeAll()
         }
-        // Retiring predecessor bookkeeping can still be present during a successor's close.
-        // History fences its cleanup; it must not become the successor's current parked owner.
+        // Historical cleanup ownership cannot replace the successor's current parked owner.
         if entry.closedReferences.contains(reference), entry.parkedReference != reference { return }
         entry.assertionGeneration = generation
         entry.parkedReference = reference
@@ -411,8 +405,7 @@ final class AgentSessionOversightLaunchCoordinator {
         markDirty()
     }
 
-    /// A later endpoint close can follow reference teardown. Rearm only already captured pairs,
-    /// using current descriptors so even reopened, still-background tabs have an exact window.
+    /// Rearm captured pairs after later closes, using current descriptors even for background tabs.
     func noteWindowClosing(windowID: Int) {
         guard !isFrozen, let host = delegate?.launchCoordinatorHost else { return }
         let closingSessions = Set(
@@ -965,8 +958,7 @@ final class AgentSessionOversightLaunchCoordinator {
             // removal that follows is expected-token.
             await delegate.launchCoordinatorRevoke(reference: reference)
         }
-        // Audit revocation is runtime-only. This owner removes its token after rechecking that close
-        // parking or an interactive successor did not displace it during the authority hop.
+        // Runtime-only revocation: recheck durable ownership after the authority hop.
         guard let settled = entries[pair], settled.token != nil,
               settled.reference == entry.reference, settled.state == .terminal(reason),
               settled.assertionGeneration == entry.assertionGeneration,
