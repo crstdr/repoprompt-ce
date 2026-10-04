@@ -187,6 +187,7 @@ struct AgentSessionRow: View {
     /// Re-resolves the exact current target projection whenever SwiftUI materializes either menu.
     /// A frozen props value would make an available observer actionable after it closed or rebound.
     var resolveSidebarOversightMenu: (@MainActor () -> AgentSidebarOversightMenuProps?)?
+    var diagnoseSidebarOversightMenuUnavailable: (@MainActor () -> Void)?
     /// Non-nil when the row could host oversight but lacks a bound session ID (a fresh chat
     /// before the first send, or any ID-less row): the context menu then offers the Oversee-by
     /// and Oversee submenus containing only this disabled reason.
@@ -312,6 +313,9 @@ struct AgentSessionRow: View {
 
     private func currentContextMenuSnapshot() -> ContextMenuSnapshot {
         let menu = presentableSidebarOversightMenu
+        if allowsDirectMutations, menu == nil {
+            diagnoseSidebarOversightMenuUnavailable?()
+        }
         var unavailableReason = sidebarOversightUnavailableReason
         if unavailableReason == nil,
            resolveSidebarOversightMenu != nil,
@@ -504,6 +508,9 @@ struct AgentSessionRow: View {
                 else { return item }
                 return item.refreshingSubmenu {
                     guard let menu = presentableSidebarOversightMenu else {
+                        if allowsDirectMutations {
+                            diagnoseSidebarOversightMenuUnavailable?()
+                        }
                         let reason = sidebarOversightUnavailableReason
                             ?? AgentOversightUICopy.oversightMenuUnavailableMessage
                         return .submenu(item.title, accessibilityValue: reason, items: [.message(reason)])

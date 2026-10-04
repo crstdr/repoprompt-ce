@@ -701,6 +701,12 @@ struct AgentModeSessionsListView: View {
                             onDismissAttention: dismissAttentionAction,
                             onCopySessionID: copySessionIDAction,
                             resolveSidebarOversightMenu: sidebarOversightMenuResolver,
+                            diagnoseSidebarOversightMenuUnavailable: {
+                                _ = agentModeVM.agentSidebarOversightMenuProps(
+                                    tabID: session.tabID, expectedSessionID: session.sessionID,
+                                    diagnoseUnavailable: true
+                                )
+                            },
                             sidebarOversightUnavailableReason: session.sessionID == nil
                                 ? AgentOversightUICopy.oversightAvailableAfterFirstMessage
                                 : nil,

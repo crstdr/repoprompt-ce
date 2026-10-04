@@ -3,7 +3,7 @@ import Foundation
 import OSLog
 import RepoPromptInstrumentation
 
-/// Low-volume, always-on local diagnostics for oversight catalog convergence.
+/// Low-volume, always-on local diagnostics for oversight catalog convergence and menu availability.
 /// Accepts only closed enums, booleans, generations, revisions, and hashed identifiers.
 enum AgentSessionLinkCatalogDiagnostics {
     enum Presence: String, Equatable {
@@ -70,6 +70,20 @@ enum AgentSessionLinkCatalogDiagnostics {
         subsystem: Bundle.main.bundleIdentifier ?? "RepoPrompt",
         category: "AgentSessionLinkCatalog"
     )
+
+    /// Native menu opening only; the caller applies the shared per-row/minute limit.
+    static func sidebarMenuUnavailable(
+        reason: AgentSessionLinkMenuGuard, windowID: Int, tabID: UUID,
+        expectedSessionID: UUID?, currentSessionID: UUID?
+    ) {
+        let tab = hashedID(tabID)
+        let expected = hashedID(expectedSessionID)
+        let current = hashedID(currentSessionID)
+        let sameUUID = currentSessionID != nil && expectedSessionID == currentSessionID
+        logger.notice(
+            "event=sidebar-menu-unavailable guard=\(reason.rawValue, privacy: .public) window=\(windowID, privacy: .public) tab=\(tab, privacy: .public) expected=\(expected, privacy: .public) current=\(current, privacy: .public) same_uuid=\(sameUUID)"
+        )
+    }
 
     #if DEBUG
         private final class TestCapture: @unchecked Sendable {
@@ -210,6 +224,11 @@ enum AgentSessionLinkCatalogDiagnostics {
 struct AppAgentSessionLinkCatalogEventSink: AgentSessionLinkCatalogEventSink {
     func record(_ event: AgentSessionLinkCatalogEvent) {
         switch event {
+        case let .sidebarMenuUnavailable(reason, windowID, tabID, expectedSessionID, currentSessionID):
+            AgentSessionLinkCatalogDiagnostics.sidebarMenuUnavailable(
+                reason: reason, windowID: windowID, tabID: tabID,
+                expectedSessionID: expectedSessionID, currentSessionID: currentSessionID
+            )
         case let .catalogPublished(runID, tabID, connectionID, revision, routingGeneration, lifecycleGeneration, routePresent, catalog, outbound):
             AgentSessionLinkCatalogDiagnostics.catalogPublished(
                 runID: runID,

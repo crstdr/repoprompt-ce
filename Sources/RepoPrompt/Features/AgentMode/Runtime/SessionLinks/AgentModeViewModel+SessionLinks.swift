@@ -985,20 +985,31 @@ extension AgentModeViewModel {
     /// an in-place rebind from inheriting either the enclosing projection or its target menu.
     func agentSidebarOversightMenuProps(
         tabID: UUID,
-        expectedSessionID: UUID
+        expectedSessionID: UUID?,
+        diagnoseUnavailable: Bool = false
     ) -> AgentSidebarOversightMenuProps? {
-        guard let endpoint = agentSidebarOversightTargetEndpoint(
-            tabID: tabID,
-            expectedSessionID: expectedSessionID
-        ),
-            let props = monitorPillPropsByEndpoint[endpoint],
-            props.endpoint == endpoint,
-            let menu = props.sidebarOversightMenu,
-            menu.targetEndpoint == endpoint,
-            menu.targetSessionID == expectedSessionID
-        else {
+        let currentSessionID = sessions[tabID]?.activeAgentSessionID
+        func unavailable(_ reason: AgentSessionLinkMenuGuard) -> AgentSidebarOversightMenuProps? {
+            if diagnoseUnavailable {
+                let now = ProcessInfo.processInfo.systemUptime
+                sidebarOversightMenuDiagnosticTimes = sidebarOversightMenuDiagnosticTimes.filter { now - $0.value < 60 }
+                if sidebarOversightMenuDiagnosticTimes[tabID] == nil {
+                    sidebarOversightMenuDiagnosticTimes[tabID] = now
+                    catalogDiagnosticsSink.record(.sidebarMenuUnavailable(
+                        reason: reason, windowID: windowID, tabID: tabID,
+                        expectedSessionID: expectedSessionID, currentSessionID: currentSessionID
+                    ))
+                }
+            }
             return nil
         }
+        guard let expectedID = expectedSessionID, currentSessionID != nil else { return unavailable(.sessionUUIDMissing) }
+        guard let endpoint = agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: expectedID)
+        else { return unavailable(.endpointMissing) }
+        guard let props = monitorPillPropsByEndpoint[endpoint] else { return unavailable(.projectionMissing) }
+        guard props.endpoint == endpoint else { return unavailable(.enclosingEndpointMismatch) }
+        guard let menu = props.sidebarOversightMenu else { return unavailable(.innerMenuNil) }
+        guard menu.targetEndpoint == endpoint, menu.targetSessionID == expectedID else { return unavailable(.targetMismatch) }
         // The stored projection carries lifecycle-only eligibility; overlay the shared
         // persistence blocker so the inverse menu's greyed reason matches the pill's Add reason.
         return menu.withObserverIneligibleReason(
