@@ -318,7 +318,6 @@ final class DomainWorkspacePresentationBridge {
     private var subscriptionRunID: UUID?
     private var lastPublicationSequence: UInt64 = 0
     private var projectedDigests: [UUID: String] = [:]
-    private var projectedHealth: [UUID: DomainAuthorityHealth] = [:]
     private var projectedModels: [UUID: WorkspaceModel] = [:]
     /// Manager reconciliation generation the caches above were committed against; nil until this
     /// run's first accepted full reconciliation. A mismatch (manager-owned reload or cleanup) forces
@@ -354,7 +353,6 @@ final class DomainWorkspacePresentationBridge {
         subscriptionTask = nil
         acceptedReconciliationGeneration = nil
         projectedDigests.removeAll(keepingCapacity: false)
-        projectedHealth.removeAll(keepingCapacity: false)
         projectedModels.removeAll(keepingCapacity: false)
         #if DEBUG
             projectionCheckpoint = nil
@@ -551,16 +549,6 @@ final class DomainWorkspacePresentationBridge {
         subscriptionRunID = runID
         subscriptionTask = Task { [weak self, client] in
             let subscription = await client.store.subscribe()
-            guard subscription.snapshot.isBootstrapped else {
-                // Readiness gate: never project or create Default before bootstrap. Surface a retryable
-                // failure instead of permanent loading.
-                if let self, isCurrentRun(runID) {
-                    workspaceManager?.reportDomainCatalogFailure(
-                        .notBootstrapped, snapshot: subscription.snapshot, attempt: initialAttempt
-                    )
-                }
-                return
-            }
             if let self, isCurrentRun(runID) {
                 await projectInitial(subscription.snapshot, attempt: initialAttempt, runID: runID)
             }
@@ -707,7 +695,6 @@ final class DomainWorkspacePresentationBridge {
         // complete. The outcome does not depend on re-encoding the model to compare digests.
         projectedModels[workspaceID] = model
         projectedDigests[workspaceID] = workspace.document.contentDigest
-        projectedHealth[workspaceID] = workspace.health
         lastPublicationSequence = event.sequence
         didApplyProjection(runID: runID, publicationSequence: event.sequence, application: .selfEchoBaseline)
         return true
@@ -739,7 +726,6 @@ final class DomainWorkspacePresentationBridge {
         let nextDigests = Dictionary(uniqueKeysWithValues: records.map {
             ($0.document.workspaceID, $0.document.contentDigest)
         })
-        let nextHealth = Dictionary(uniqueKeysWithValues: records.map { ($0.document.workspaceID, $0.health) })
         let baselineGeneration = acceptedReconciliationGeneration
             .flatMap { $0 == manager.domainCatalogReconciliationGeneration ? $0 : nil }
         var cacheIsTrusted = baselineGeneration != nil && !manager.requiresFullCatalogReconciliation
@@ -752,7 +738,7 @@ final class DomainWorkspacePresentationBridge {
                 attempt: attempt
             ) {
             case let .accepted(receipt):
-                commitAccepted(receipt, digests: nextDigests, health: nextHealth, runID: runID)
+                commitAccepted(receipt, digests: nextDigests, runID: runID)
                 return nil
             case .rejected(.fullProjectionRequired):
                 cacheIsTrusted = false
@@ -792,19 +778,17 @@ final class DomainWorkspacePresentationBridge {
         guard case let .accepted(receipt) = result else { return result.rejection }
         guard isCurrentRun(runID) else { return nil }
         projectedModels = nextModels
-        commitAccepted(receipt, digests: nextDigests, health: nextHealth, runID: runID)
+        commitAccepted(receipt, digests: nextDigests, runID: runID)
         return nil
     }
 
     private func commitAccepted(
         _ receipt: DomainCatalogApplicationReceipt,
         digests: [UUID: String],
-        health: [UUID: DomainAuthorityHealth],
         runID: UUID
     ) {
         guard isCurrentRun(runID) else { return }
         projectedDigests = digests
-        projectedHealth = health
         lastPublicationSequence = receipt.publicationSequence
         acceptedReconciliationGeneration = receipt.reconciliationGeneration
         didApplyProjection(runID: runID, publicationSequence: receipt.publicationSequence, application: .catalog(receipt))

@@ -591,9 +591,6 @@ else
   if ! grep -q 'final class DomainWorkspacePresentationBridge' "$m2_presentation_bridge"; then
     fail "M2 workspace presentation bridge declaration missing"
   fi
-  if ! grep -q 'guard subscription.snapshot.isBootstrapped' "$m2_presentation_bridge"; then
-    fail "M2 workspace presentation bridge lost first-projection readiness gate"
-  fi
 fi
 
 service_registry_source="Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift"

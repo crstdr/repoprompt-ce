@@ -7649,7 +7649,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard applied else { return .rejected(.stalePublication) }
         // Synchronous reconciliation subscribers may close, cancel, or resolve a newer attempt.
         if let rejection = catalogReadRejection(snapshot, attempt: attempt) { return .rejected(rejection) }
-        let completeness = catalogCompleteness(of: snapshot, attempt: attempt)
+        let completeness = catalogCompleteness(of: snapshot)
         // Scoped clearance: only the failure/issue that existed when this attempt began, never a newer
         // report with the same kind or payload. Command and record-health issues keep their owners.
         let current = workspaceChooserPresentation.failure
@@ -7838,8 +7838,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Aggregate health and member availability, evaluated after reconciliation was admitted.
     private func catalogCompleteness(
-        of snapshot: DomainWorkspaceCatalogSnapshot,
-        attempt: DomainCatalogAttempt
+        of snapshot: DomainWorkspaceCatalogSnapshot
     ) -> DomainCatalogCompleteness {
         let kind: WorkspaceChooserFailure.Kind
         if snapshot.health != .writable {
@@ -7849,7 +7848,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         } else {
             return .complete
         }
-        return .incomplete(makeChooserFailure(kind, snapshot: snapshot, attempt: attempt, legacyIssue: nil))
+        return .incomplete(makeChooserFailure(kind, snapshot: snapshot, legacyIssue: nil))
     }
 
     // MARK: Catalog failure identity (#1142)
@@ -7917,7 +7916,7 @@ class WorkspaceManagerViewModel: ObservableObject {
               isOrderedAfterResolvedCatalogAttempt(sequence, attempt)
         else { return false }
         setChooserFailure(makeChooserFailure(
-            kind, snapshot: snapshot, attempt: attempt, legacyIssue: currentProjectionIssueWitness
+            kind, snapshot: snapshot, legacyIssue: currentProjectionIssueWitness
         ))
         return true
     }
@@ -7926,7 +7925,6 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func makeChooserFailure(
         _ kind: WorkspaceChooserFailure.Kind,
         snapshot: DomainWorkspaceCatalogSnapshot?,
-        attempt: DomainCatalogAttempt,
         legacyIssue: DomainProjectionIssueWitness?
     ) -> WorkspaceChooserFailure {
         domainCatalogFailureReportVersion += 1
@@ -7936,7 +7934,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             kind: kind,
             publicationSequence: snapshot?.publicationSequence ?? lastDomainProjectionSequence,
             catalogRevision: snapshot?.catalogRevision ?? domainWorkspaceCatalogRevision,
-            attemptGeneration: attempt.generation,
             reportVersion: domainCatalogFailureReportVersion,
             legacyIssue: legacyIssue
         )

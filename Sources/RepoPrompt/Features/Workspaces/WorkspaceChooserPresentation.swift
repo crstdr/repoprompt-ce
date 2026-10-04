@@ -234,14 +234,6 @@ struct WorkspaceChooserFailure: Equatable {
         /// Diagnostic for logs/tests only; never rendered.
         case modelProjection(String)
         case catalogChangedDuringRefresh
-
-        /// Incompleteness of an accepted catalog, as opposed to a rejected attempt.
-        var isIncompleteness: Bool {
-            switch self {
-            case .authorityUnavailable, .unavailableMembers: true
-            case .notBootstrapped, .modelProjection, .catalogChangedDuringRefresh: false
-            }
-        }
     }
 
     /// Stable across equivalent reports so identity churn does not republish equal content.
@@ -249,8 +241,7 @@ struct WorkspaceChooserFailure: Equatable {
     let kind: Kind
     let publicationSequence: UInt64
     let catalogRevision: UInt64
-    /// Attempt and report version of the latest equivalent report; clearance must match the version.
-    var attemptGeneration: UInt64 = 0
+    /// Report version of the latest equivalent report; clearance must match the version.
     var reportVersion: UInt64 = 0
     /// Actual (possibly deduplicated) legacy projection issue published for this report.
     var legacyIssue: DomainProjectionIssueWitness?

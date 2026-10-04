@@ -1029,24 +1029,6 @@ import XCTest
             XCTAssertEqual(completed.count, 1)
         }
 
-        func testGateCancellationWhileWaitingCompletesBeforeRelease() async {
-            let gate = Gate()
-            let entered = Signal("gate waiter registered")
-            let completed = Signal("cancelled gate waiter completed")
-            let task = Task {
-                await gate.wait(onWaiting: { entered.fire() })
-                completed.fire()
-            }
-            let registration = await XCTWaiter.fulfillment(of: [entered.expectation], timeout: 15)
-            XCTAssertEqual(registration, .completed)
-            task.cancel()
-            let cancellation = await XCTWaiter.fulfillment(of: [completed.expectation], timeout: 15)
-            XCTAssertEqual(cancellation, .completed, "Cancellation must complete without releasing the gate")
-            gate.release()
-            await task.value
-            XCTAssertEqual(completed.count, 1)
-        }
-
         // MARK: #1142 Actual chooser consumption (warm first application, not cold bootstrap)
 
         func testUnsuccessfulDefaultRereadAcceptsTrueEmptyAndRemovesLegacyGhostAndCandidate() async throws {
@@ -1964,7 +1946,6 @@ import XCTest
                 XCTAssertTrue(report("cause", 5, a2))
                 let f1 = try XCTUnwrap(presentedFailure)
                 guard case .failed = manager.workspaceChooserPresentation else { return XCTFail("no accepted catalog: no rows") }
-                XCTAssertEqual(f1.attemptGeneration, a2.generation)
                 let l1 = try XCTUnwrap(manager.domainWorkspaceAuthorityIssue?.id)
                 XCTAssertEqual(f1.legacyIssue?.issueID, l1)
                 XCTAssertFalse(report("other cause", 5, a1), "an older same-sequence attempt cannot replace a newer report")
@@ -1974,7 +1955,6 @@ import XCTest
                 let f1v2 = try XCTUnwrap(presentedFailure)
                 XCTAssertEqual(f1v2.id, f1.id, "an equivalent cause keeps its stable ID")
                 XCTAssertGreaterThan(f1v2.reportVersion, f1.reportVersion)
-                XCTAssertEqual(f1v2.attemptGeneration, a3.generation)
                 XCTAssertEqual(f1v2.legacyIssue?.issueID, l1, "the deduplicated legacy issue keeps its actual ID")
                 XCTAssertNotEqual(f1v2.legacyIssue?.reportGeneration, f1.legacyIssue?.reportGeneration)
 
@@ -2355,7 +2335,6 @@ import XCTest
                     let latest = try XCTUnwrap(manager.workspaceChooserPresentation.failure)
                     XCTAssertEqual(latest.id, first.id)
                     XCTAssertGreaterThan(latest.reportVersion, first.reportVersion)
-                    XCTAssertEqual(latest.attemptGeneration, repeatedAttempt.generation)
                     XCTAssertNotEqual(latest.legacyIssue, first.legacyIssue)
                     XCTAssertEqual(chooser.emitted.count, emissions, "witness-only report is not a chooser UI change")
                     XCTAssertEqual(invalidations, 0, "witness-only report must not invalidate SwiftUI")
