@@ -820,6 +820,120 @@ private func workspaceSavePreparationDecision(
     return .retry(nextRemainingCount: remainingRetryCount - 1)
 }
 
+struct WorkspaceChooserFailure: Equatable {
+    enum Kind: Equatable {
+        case notBootstrapped
+        case authorityUnavailable(DomainAuthorityHealth)
+        case unavailableMembers(Set<UUID>)
+        /// Diagnostic for logs/tests only; never rendered.
+        case modelProjection(String)
+        case catalogChangedDuringRefresh
+    }
+
+    /// Stable across equivalent reports so identity churn does not republish equal content.
+    let id: UUID
+    let kind: Kind
+    let publicationSequence: UInt64
+    let catalogRevision: UInt64
+    /// Report version of the latest equivalent report; clearance must match the version.
+    var reportVersion: UInt64 = 0
+    /// Actual (possibly deduplicated) legacy projection issue published for this report.
+    var legacyIssue: DomainProjectionIssueWitness?
+    var recovery: WorkspaceChooserRecovery = .idle
+}
+
+/// A `.projectionFailure` issue as it stood: ID plus the report generation, which advances on every
+/// report even when the issue publisher deduplicates content and keeps the existing ID.
+struct DomainProjectionIssueWitness: Equatable {
+    let issueID: UUID
+    let reportGeneration: UInt64
+}
+
+/// Captured before an attempt's first await. Orders its success/failure (sequence, then generation)
+/// and scopes what it may clear to the failure and projection issue that existed when it began.
+struct DomainCatalogAttempt: Equatable {
+    struct FailureWitness: Equatable {
+        let id: UUID
+        let reportVersion: UInt64
+    }
+
+    let generation: UInt64
+    let failureWitness: FailureWitness?
+    let projectionIssueWitness: DomainProjectionIssueWitness?
+}
+
+enum WorkspaceChooserRecovery: Equatable {
+    case idle
+    case retrying(UUID)
+
+    var isRetrying: Bool {
+        if case .retrying = self { return true }
+        return false
+    }
+}
+
+/// Chooser completeness of an accepted reconciliation. Only `.complete` certifies ordinary readiness.
+enum DomainCatalogCompleteness: Equatable {
+    case complete
+    case incomplete(WorkspaceChooserFailure)
+
+    var failure: WorkspaceChooserFailure? {
+        if case let .incomplete(failure) = self { failure } else { nil }
+    }
+}
+
+enum DomainCatalogProjection {
+    case full([WorkspaceModel])
+    /// Valid only against the manager's current accepted reconciliation generation.
+    case metadata(baselineGeneration: UInt64)
+}
+
+/// Bridge callers take canonical roots from snapshot metadata; manager reload/cleanup callers keep
+/// their freshly decoded models' roots, matching their pre-#1142 behavior.
+enum DomainCatalogRootMapPolicy {
+    case snapshotMetadata
+    case decodedModels
+}
+
+/// Proof that the manager accepted a reconciliation; completeness is a separate fact.
+struct DomainCatalogApplicationReceipt: Equatable {
+    enum Kind: Equatable {
+        case full
+        case metadata
+    }
+
+    let kind: Kind
+    let publicationSequence: UInt64
+    let catalogRevision: UInt64
+    let reconciliationGeneration: UInt64
+    let completeness: DomainCatalogCompleteness
+}
+
+enum DomainCatalogRejection: Equatable {
+    case closing
+    case cancelled
+    case stalePublication
+    case staleCatalogRevision
+    case reentrant
+    /// An older attempt resolving after a newer one at the same (or a later) sequence.
+    case superseded
+    case fullProjectionRequired
+    case invalidCatalog(String)
+}
+
+enum DomainCatalogApplicationResult: Equatable {
+    case accepted(DomainCatalogApplicationReceipt)
+    case rejected(DomainCatalogRejection)
+
+    var receipt: DomainCatalogApplicationReceipt? {
+        if case let .accepted(receipt) = self { receipt } else { nil }
+    }
+
+    var rejection: DomainCatalogRejection? {
+        if case let .rejected(reason) = self { reason } else { nil }
+    }
+}
+
 /// The main WorkspaceManager, refactored to store each WorkspaceModel
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
 @MainActor
