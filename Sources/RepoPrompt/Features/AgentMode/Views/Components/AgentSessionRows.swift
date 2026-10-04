@@ -187,6 +187,8 @@ struct AgentSessionRow: View {
     /// Re-resolves the exact current target projection whenever SwiftUI materializes either menu.
     /// A frozen props value would make an available observer actionable after it closed or rebound.
     var resolveSidebarOversightMenu: (@MainActor () -> AgentSidebarOversightMenuProps?)?
+    var diagnoseSidebarOversightMenuUnavailable: (@MainActor () -> Void)?
+    var prepareSidebarOversightMenu: (@MainActor () -> Void)?
     /// Non-nil when the row could host oversight but lacks a bound session ID (a fresh chat
     /// before the first send, or any ID-less row): the context menu then offers the Oversee-by
     /// and Oversee submenus containing only this disabled reason.
@@ -276,9 +278,8 @@ struct AgentSessionRow: View {
         var hasAttentionRunState: Bool
         var hasOnStash: Bool
         var hasOnDismissAttention: Bool
-        /// Frozen for the same reason as the flags above: the oversight section's item count
-        /// depends on this list, so resolving it live while the menu is open reintroduces the
-        /// removed-item measurement crash.
+        /// Freezes root relationship sections. Only the two candidate submenus resolve
+        /// again at their own AppKit pre-tracking update boundary.
         var sidebarOversightMenu: AgentSidebarOversightMenuProps?
         /// Frozen alongside the menu for the same reason — an ID gaining a session mid-menu
         /// must not swap a disabled pair for a live section while the menu is open.
@@ -312,14 +313,18 @@ struct AgentSessionRow: View {
     }
 
     private func currentContextMenuSnapshot() -> ContextMenuSnapshot {
+        if allowsDirectMutations { prepareSidebarOversightMenu?() }
         let menu = presentableSidebarOversightMenu
+        if allowsDirectMutations, menu == nil {
+            diagnoseSidebarOversightMenuUnavailable?()
+        }
         var unavailableReason = sidebarOversightUnavailableReason
         if unavailableReason == nil,
            resolveSidebarOversightMenu != nil,
            onAddSidebarOversight != nil,
            onStopSidebarOversight != nil
         {
-            unavailableReason = AgentOversightUICopy.oversightLoadingMessage
+            unavailableReason = AgentOversightUICopy.oversightMenuUnavailableMessage
         }
         return ContextMenuSnapshot(
             isInteractionEnabled: isInteractionEnabled,
@@ -483,10 +488,11 @@ struct AgentSessionRow: View {
         )
     }
 
-    /// The whole right-click menu as an immutable item tree for `StableMenuContextRegion`:
+    /// The right-click menu's fixed root tree for `StableMenuContextRegion`:
     /// the oversight section reuses the same builder the mark and hover menus present, and
     /// the standard row actions mirror the removed `.contextMenu` item-for-item. The builder
-    /// reads the opening snapshot; later projection updates apply only to the next opening.
+    /// reads the opening snapshot. Candidate submenus read live props when AppKit asks
+    /// to update them, without replacing or changing the root items mid-track.
     private func sidebarContextMenuItems(_ snapshot: ContextMenuSnapshot) -> [StableMenuItem] {
         MainActor.assumeIsolated {
             var items: [StableMenuItem] = []
@@ -496,6 +502,24 @@ struct AgentSessionRow: View {
             } else if let reason = snapshot.sidebarOversightUnavailableReason {
                 items += sidebarOversightUnavailableMenuItems(reason: reason)
                 items.append(.separator)
+            }
+
+            items = items.map { item in
+                guard item.title == AgentOversightUICopy.overseeNewTitle
+                    || item.title == AgentOversightUICopy.overseeByTitle
+                else { return item }
+                return item.refreshingSubmenu {
+                    if allowsDirectMutations { prepareSidebarOversightMenu?() }
+                    guard let menu = presentableSidebarOversightMenu else {
+                        if allowsDirectMutations {
+                            diagnoseSidebarOversightMenuUnavailable?()
+                        }
+                        let reason = sidebarOversightUnavailableReason
+                            ?? AgentOversightUICopy.oversightMenuUnavailableMessage
+                        return .submenu(item.title, accessibilityValue: reason, items: [.message(reason)])
+                    }
+                    return sidebarOversightMenuItems(menu).first { $0.title == item.title } ?? item
+                }
             }
 
             guard !snapshot.showsSelectionPresentation else { return items }
@@ -532,7 +556,7 @@ struct AgentSessionRow: View {
         }
     }
 
-    /// The two Oversee submenus for a loading or ID-less row: the submenu labels stay
+    /// The two Oversee submenus for an unavailable or ID-less row: the labels stay
     /// enabled so the reason is discoverable, while the only item inside each is the
     /// disabled explanation.
     private func sidebarOversightUnavailableMenuItems(reason: String) -> [StableMenuItem] {

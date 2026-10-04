@@ -9,6 +9,16 @@ import XCTest
 final class DevinPermissionLevelTests: XCTestCase {
     private typealias Level = DevinAgentToolPreferences.PermissionLevel
 
+    func testDefaultDiscoveryRefusesBeforeInstalledProviderSupportProbe() async {
+        // Exercise the real discovery runner, not a replacement controller factory.
+        let service = DevinModelDiscoveryService(isInstalled: { true })
+        let outcome = await service.discoverIfNeeded()
+        guard case let .failed(message) = outcome else {
+            return XCTFail("Default discovery must refuse before querying the installed provider")
+        }
+        XCTAssertTrue(message.hasPrefix("Provider process launch refused under XCTest."), message)
+    }
+
     // MARK: - PermissionLevel
 
     func testPickerOrderIsProviderDefaultFirstAndFullApprovalLast() {

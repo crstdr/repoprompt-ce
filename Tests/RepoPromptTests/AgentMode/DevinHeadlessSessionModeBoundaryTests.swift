@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptProcess
 import XCTest
 
 /// Exercises the real headless stream path against a scripted Devin CLI, so the session-mode
@@ -256,6 +257,12 @@ final class DevinHeadlessSessionModeBoundaryTests: XCTestCase {
                         config: config,
                         extraEnvironment: ["ACP_RECORD_PATH": recordPath]
                     )
+                },
+                controllerFactory: { provider, request, diagnosticSink in
+                    try ACPAgentSessionController(
+                        provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                        allowsProviderProcessLaunchForTesting: true
+                    )
                 }
             )
         }
@@ -412,7 +419,9 @@ private struct EnvForwardingDevinProvider: ACPAgentProvider {
     }
 
     func support(for request: ACPRunRequest) async throws -> ACPSupportResult {
-        try await inner.support(for: request)
+        try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await inner.support(for: request)
+        }
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {

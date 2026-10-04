@@ -3,6 +3,7 @@ import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import SwiftUI
 import XCTest
 
@@ -1618,6 +1619,50 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
     }
 }
 
+/// Records entry into the forbidden hydration boundary, separately from provider factories.
+private struct SidebarHydrationRecorder: WorkspaceRestorePerfRecording {
+    let attempts: LifecycleRecorder
+    private let fallback = NoopWorkspaceRestorePerfRecorder()
+    var isEnabled: Bool {
+        true
+    }
+
+    func timestampMSIfEnabled() -> Double? {
+        fallback.timestampMS()
+    }
+
+    func timestampMS() -> Double {
+        fallback.timestampMS()
+    }
+
+    func elapsedMS(since startMS: Double) -> Double {
+        fallback.elapsedMS(since: startMS)
+    }
+
+    func formatMS(_ value: Double) -> String {
+        fallback.formatMS(value)
+    }
+
+    func formatElapsedMS(since startMS: Double) -> String {
+        fallback.formatElapsedMS(since: startMS)
+    }
+
+    func shortID(_ id: UUID?) -> String {
+        fallback.shortID(id)
+    }
+
+    @MainActor func nextAgentActivationTrueCount() -> Int {
+        0
+    }
+
+    func log(_: @autoclosure () -> String) {}
+    func event(_ name: String, fields: [String: String]) {
+        if name == "agentSessionHydration.loadTask" {
+            attempts.record(fields["outcome"] ?? "unknown")
+        }
+    }
+}
+
 /// Full sidebar construction and native opening, not supplied-props item-builder coverage.
 @MainActor
 final class AgentSidebarHostedContextMenuTests: XCTestCase {
@@ -1626,12 +1671,32 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let tabs: [ComposeTabState]
         let host: NSHostingView<AgentModeSessionsSidebarView>
         let window: NSWindow
+        let providerAttempts: LifecycleRecorder
+        let hydrationAttempts: LifecycleRecorder
         var vm: AgentModeViewModel {
             state.agentModeViewModel
         }
     }
 
+    private enum UnexpectedProviderLaunch: Error { case refused }
     private enum Opening { case rightClick, controlClick, accessibility }
+
+    @MainActor private final class SubmenuOpeningObserver: NSObject, NSMenuDelegate {
+        let delegate: NSMenuDelegate?
+        var onOpen: (NSMenu) -> Void = { _ in }
+
+        init(delegate: NSMenuDelegate?) {
+            self.delegate = delegate
+        }
+
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            delegate?.menuNeedsUpdate?(menu)
+        }
+
+        func menuWillOpen(_ menu: NSMenu) {
+            onOpen(menu)
+        }
+    }
 
     func testColdRightClickShowsEightOutboundAndInbound() async throws {
         let fixture = try await makeFixture()
@@ -1658,7 +1723,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertEqual(try menuProps(in: fixture), props, "Opening alone must not mutate the settled relationship presentation")
     }
 
-    func testColdRightClickShowsLoadingSubmenusBeforeProjectionReady() async throws {
+    func testColdRightClickShowsUnavailableSubmenusBeforeProjectionReady() async throws {
         let fixture = try await makeFixture(peerCount: 2)
         let endpoint = try menuProps(in: fixture).targetEndpoint
         fixture.vm.agentSessionLinkPublishProjection(.empty, to: endpoint)
@@ -1669,7 +1734,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let menu = try await open(in: fixture)
         for title in [AgentOversightUICopy.overseeNewTitle, AgentOversightUICopy.overseeByTitle] {
             let submenu = try XCTUnwrap(menu.items.first { $0.title == title }?.submenu)
-            XCTAssertEqual(submenu.items.map(\.title), ["Loading…"])
+            XCTAssertEqual(submenu.items.map(\.title), ["Not available yet — reopen this menu"])
             XCTAssertFalse(submenu.items[0].isEnabled)
         }
     }
@@ -1711,6 +1776,98 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertNil(fixture.vm.session(for: fixture.tabs[0].id).activeAgentSessionID)
     }
 
+    func testIDlessMountedRowReadsInstalledBindingOnFreshNativeOpening() async throws {
+        let fixture = try await makeFixture(peerCount: 1, idless: true)
+        let otherWindow = try await makeFixture(peerCount: 1)
+        try await add(from: 0, to: 1, in: otherWindow)
+        let region = try mountedRegion(in: fixture)
+        let cold = try await open(in: fixture)
+        XCTAssertFalse(try XCTUnwrap(cold.items.first { $0.title == "Copy Session ID" }).isEnabled)
+
+        let session = fixture.vm.session(for: fixture.tabs[0].id)
+        let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
+        let firstID = UUID()
+        XCTAssertNotNil(fixture.vm.test_installPersistentSessionBinding(
+            sessionID: firstID, on: session, compareAndSetInWorkspaceID: workspaceID
+        ))
+        session.items = [AgentChatItem(kind: .user, text: "First bound fixture message")]
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        await settleHostedPublication(in: fixture)
+
+        let input = try XCTUnwrap(fixture.state.promptManager.sidebarWorkspaceSnapshot)
+        XCTAssertEqual(fixture.vm.agentChatsSidebarSessions(for: input.composeTabs).first {
+            $0.tabID == fixture.tabs[0].id
+        }?.sessionID, firstID, "The sidebar row cache must publish the installed binding")
+        let props = try XCTUnwrap(fixture.vm.agentSidebarOversightMenuProps(
+            tabID: fixture.tabs[0].id, expectedSessionID: firstID
+        ))
+        let observerEndpoint = try menuProps(in: otherWindow).targetEndpoint
+        let observer = try XCTUnwrap(props.availableObservers.first { $0.peerEndpoint == observerEndpoint })
+        let target = try XCTUnwrap(props.availableTargets.first { $0.peerEndpoint == observerEndpoint })
+        XCTAssertTrue(try mountedRegion(in: fixture) === region, "Binding must update the existing native row provider")
+        let bound = try await open(in: fixture)
+        XCTAssertTrue(try XCTUnwrap(bound.items.first { $0.title == "Copy Session ID" }).isEnabled)
+        for (title, label) in [
+            (AgentOversightUICopy.overseeNewTitle, target.menuLabel),
+            (AgentOversightUICopy.overseeByTitle, observer.menuLabel)
+        ] {
+            let submenu = try XCTUnwrap(bound.items.first { $0.title == title }?.submenu)
+            XCTAssertTrue(submenu.items.contains { $0.title == label && $0.isEnabled })
+        }
+
+        // A retained provider belongs to this exact incarnation, not whatever UUID
+        // later occupies the same visible tab. Fresh openings must acquire the new one.
+        let oldProvider = region.itemsProvider
+        let oldCopyTarget = try XCTUnwrap(fixture.vm.agentSessionCopyIDTarget(
+            tabID: fixture.tabs[0].id, sessionID: firstID, tabName: fixture.tabs[0].name
+        ))
+        let replacementID = UUID()
+        XCTAssertNotNil(fixture.vm.test_installPersistentSessionBinding(
+            sessionID: replacementID, on: session, compareAndSetInWorkspaceID: workspaceID
+        ))
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        await settleHostedPublication(in: fixture)
+        var copiedIDs: [String] = []
+        XCTAssertFalse(fixture.vm.copyAgentSessionID(target: oldCopyTarget, copyToClipboard: { copiedIDs.append($0) }))
+        XCTAssertTrue(copiedIDs.isEmpty, "The old row must never copy its replaced UUID")
+        let stale = NSMenu.stableMenu(from: oldProvider())
+        for title in [AgentOversightUICopy.overseeNewTitle, AgentOversightUICopy.overseeByTitle] {
+            let submenu = try XCTUnwrap(stale.items.first { $0.title == title }?.submenu)
+            XCTAssertFalse(submenu.items.contains { $0.isEnabled }, "The old provider must not acquire the replacement's oversight authority")
+        }
+        XCTAssertTrue(try mountedRegion(in: fixture) === region)
+        let replacement = try await open(in: fixture)
+        XCTAssertTrue(try XCTUnwrap(replacement.items.first { $0.title == "Copy Session ID" }).isEnabled)
+        for (title, label) in [
+            (AgentOversightUICopy.overseeNewTitle, target.menuLabel),
+            (AgentOversightUICopy.overseeByTitle, observer.menuLabel)
+        ] {
+            let submenu = try XCTUnwrap(replacement.items.first { $0.title == title }?.submenu)
+            XCTAssertTrue(submenu.items.contains { $0.title == label && $0.isEnabled }, "The fresh root must capture the replacement UUID")
+        }
+        let newCopyTarget = try XCTUnwrap(fixture.vm.agentSessionCopyIDTarget(
+            tabID: fixture.tabs[0].id, sessionID: replacementID, tabName: fixture.tabs[0].name
+        ))
+        XCTAssertTrue(fixture.vm.copyAgentSessionID(target: newCopyTarget, copyToClipboard: { copiedIDs.append($0) }))
+        XCTAssertEqual(copiedIDs, [replacementID.uuidString])
+    }
+
+    private func settleHostedPublication(in fixture: Fixture) async {
+        // Drain the publication/layout boundary without replacing rootView or forcing
+        // a sidebar refresh; either would conceal the stale capture under investigation.
+        let settled = expectation(description: "Hosted binding publication reached the main run loop")
+        RunLoop.main.perform {
+            MainActor.assumeIsolated {
+                fixture.host.layoutSubtreeIfNeeded()
+                settled.fulfill()
+            }
+        }
+        await fulfillment(of: [settled], timeout: 3)
+        fixture.host.layoutSubtreeIfNeeded()
+    }
+
     func testReopeningWithoutHoverReadsChangedRelationships() async throws {
         let fixture = try await makeFixture(peerCount: 2)
         let before = try await open(in: fixture)
@@ -1730,6 +1887,271 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let stopped = try await open(in: fixture)
         XCTAssertFalse(stopped.items.contains { $0.title == AgentOversightUICopy.overseeingSectionLabel })
         XCTAssertTrue(linked.items.contains { $0.title == AgentOversightUICopy.overseeingSectionLabel }, "Previous menu remains a value snapshot")
+    }
+
+    func testMenuOpeningLeavesColdPersistedRowUnloaded() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let tabID = fixture.tabs[0].id
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
+        let provider = try mountedRegion(in: fixture).itemsProvider
+        let persisted = fixture.vm.session(for: tabID)
+        persisted.selectedAgent = .devin
+        persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
+        persisted.providerSessionID = "hosted-existing-acp-session"
+        await fixture.vm.flushSave(for: tabID)
+        // Keep ordinary active-chat ownership away from this cold menu target.
+        fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
+        fixture.vm.test_removeSession(tabID: tabID)
+        let hydrationBefore = fixture.hydrationAttempts.events
+        fixture.vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        _ = provider()
+        await settleHostedPublication(in: fixture)
+        XCTAssertNil(fixture.vm.sessions[tabID], "Opening a menu must not mount or hydrate a persisted row")
+        XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: menu repair must not enter hydration")
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Cold persisted rows must not request a provider")
+    }
+
+    func testMenuOpeningRepairsLoadedNilBindingWithoutHydration() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let tabID = fixture.tabs[0].id
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let session = fixture.vm.session(for: tabID)
+        let region = try mountedRegion(in: fixture)
+        let provider = region.itemsProvider
+        session.selectedAgent = .devin
+        session.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
+        session.providerSessionID = "hosted-existing-acp-session"
+        XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive)
+        await fixture.vm.flushSave(for: tabID)
+        let retired = try menuProps(in: fixture).targetEndpoint
+        let items = session.items
+        let revision = session.sourceItemsRevision
+        await fixture.vm.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+        fixture.vm.test_publishTranscriptPresentation(tabID: tabID)
+        let presentation = fixture.vm.activeTranscriptPresentation
+        let hydrationBefore = fixture.hydrationAttempts.events
+        XCTAssertFalse(presentation.visibleRows.isEmpty, "Exercise an already-displayed active transcript")
+        await recoverByOpening(provider, in: fixture, sessionID: sessionID) {
+            session.testInstallPersistentSessionBinding(sessionID: nil)
+            XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
+        }
+        XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive, "Menu recovery must not acquire discovery interest")
+        XCTAssertTrue(fixture.vm.sessions[tabID] === session, "Repair the retained entry through its normal binding installer")
+        let menu = try menuProps(in: fixture)
+        XCTAssertEqual(menu.targetSessionID, sessionID)
+        XCTAssertNotEqual(menu.targetEndpoint, retired)
+        let reopened = NSMenu.stableMenu(from: provider())
+        let choices = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
+        XCTAssertNotEqual(choices.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+        XCTAssertTrue(try mountedRegion(in: fixture) === region)
+        XCTAssertEqual(fixture.vm.activeTranscriptPresentation.visibleRows, presentation.visibleRows)
+        XCTAssertEqual(fixture.vm.activeTranscriptPresentation.visibleBlocks, presentation.visibleBlocks)
+        XCTAssertFalse(fixture.vm.activeTranscriptPresentation.bindingsHydrated, "Presentation must not inherit retired hydration authority")
+        XCTAssertEqual(session.sourceItemsRevision, revision, "Identity repair must not replace loaded content")
+        XCTAssertEqual(session.items.map(\.text), items.map(\.text))
+        XCTAssertNil(session.persistedLoadTask)
+        XCTAssertTrue(session.hasLoadedPersistedState)
+        XCTAssertFalse(session.qualifiedRestorationReadiness.isAuthoritative, "A repaired identity cannot earn hydration proof")
+        XCTAssertEqual(session.selectedAgent, .devin)
+        XCTAssertEqual(session.providerSessionID, "hosted-existing-acp-session")
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: identity repair must not enter hydration")
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Nil-binding repair must not resume a provider")
+    }
+
+    func testSidebarPreparationRejectsStaleClaimsAndInProgressRebinding() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let hydrationBefore = fixture.hydrationAttempts.events
+        let vm = fixture.vm
+        let tabID = fixture.tabs[0].id
+        let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let session = vm.session(for: tabID)
+        XCTAssertTrue(AgentSessionLinkRuntimeBridge.shared.canPrepareSidebarSession(.init(
+            windowID: fixture.state.windowID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
+        )), "This registered fixture must exercise the binding guards, not fail host qualification")
+        session.testInstallPersistentSessionBinding(sessionID: nil)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: UUID(), workspaceID: workspaceID)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: UUID())
+        XCTAssertNil(session.activeAgentSessionID)
+        session.items.append(AgentChatItem(kind: .user, text: "Unsaved retained change"))
+        session.isDirty = true
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID)
+        XCTAssertEqual(session.items.last?.text, "Unsaved retained change")
+        XCTAssertNil(session.persistedLoadTask, "Dirty retained state must not be overwritten by disk hydration")
+        session.isDirty = false
+        session.hasLoadedPersistedState = false
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID, "Cold retained state must not be rebound or hydrated")
+        XCTAssertNil(session.persistedLoadTask)
+        session.hasLoadedPersistedState = true
+        let ownership = session.beginRunAttempt(source: "hosted-fixture")
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID, "Idle run ownership still blocks repair")
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        _ = session.endRunAttempt(ifCurrent: ownership, source: "hosted-fixture")
+        let transition = session.beginPersistentBindingTransition()
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID, "Never replace an in-progress transition")
+        session.finishPersistentBindingTransition(generation: transition)
+        let replacementID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: replacementID)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertEqual(session.activeAgentSessionID, replacementID, "Never steal a conflicting live binding")
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: refused repair must not enter hydration")
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Refused repair must not request a provider")
+    }
+
+    private func recoverByOpening(
+        _ provider: () -> [StableMenuItem], in fixture: Fixture, sessionID: UUID,
+        invalidate: () -> Void
+    ) async {
+        let installed = expectation(description: "Normal binding installer publishes recovery")
+        let token = NotificationCenter.default.publisher(for: .agentSessionBindingDidChange)
+            .filter { note in
+                note.object as? AgentModeViewModel === fixture.vm
+                    && note.userInfo?["tabID"] as? UUID == fixture.tabs[0].id
+                    && note.userInfo?["sessionID"] as? UUID == sessionID
+            }
+            .prefix(1).sink { _ in installed.fulfill() }
+        defer { token.cancel() }
+        invalidate() // Observe before synchronous sidebar publication can remount the entry.
+        _ = provider() // Retained native opening must schedule the preparation itself.
+        await fulfillment(of: [installed], timeout: 3)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        await settleHostedPublication(in: fixture)
+    }
+
+    func testColdProviderReadsReadyProjectionOnReopenWithoutRemount() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let otherWindow = try await makeFixture(peerCount: 1)
+        try await add(from: 0, to: 1, in: otherWindow)
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        let props = try menuProps(in: fixture)
+        let observerEndpoint = try menuProps(in: otherWindow).targetEndpoint
+        let observer = try XCTUnwrap(props.availableObservers.first { $0.peerEndpoint == observerEndpoint })
+        let region = try mountedRegion(in: fixture)
+        let originalProvider = region.itemsProvider
+
+        fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+        let cold = NSMenu.stableMenu(from: originalProvider())
+        let coldSubmenu = try XCTUnwrap(cold.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
+        XCTAssertEqual(coldSubmenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        XCTAssertEqual(try menuProps(in: fixture).targetEndpoint, props.targetEndpoint)
+        let reopened = NSMenu.stableMenu(from: originalProvider())
+        let reopenedSubmenu = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
+        XCTAssertTrue(reopenedSubmenu.items.contains { $0.title == observer.menuLabel && $0.isEnabled })
+        XCTAssertEqual(coldSubmenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+        XCTAssertTrue(try mountedRegion(in: fixture) === region, "The original mounted provider must recover without remount or reassignment")
+    }
+
+    func testSubmenuUpdateReadsReadyProjectionWithoutReopeningRoot() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let otherWindow = try await makeFixture(peerCount: 1)
+        try await add(from: 0, to: 1, in: otherWindow)
+        AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        let props = try menuProps(in: fixture)
+        let peerEndpoint = try menuProps(in: otherWindow).targetEndpoint
+        let observer = try XCTUnwrap(props.availableObservers.first { $0.peerEndpoint == peerEndpoint })
+        let target = try XCTUnwrap(props.availableTargets.first { $0.peerEndpoint == peerEndpoint })
+        let readyProjection = try XCTUnwrap(fixture.vm.monitorPillPropsByEndpoint[props.targetEndpoint])
+        fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+
+        var observed = false
+        _ = try await open(in: fixture, whileTracking: { root in
+            let rootItems = root.items
+            let directions = [
+                (AgentOversightUICopy.overseeNewTitle, target.menuLabel),
+                (AgentOversightUICopy.overseeByTitle, observer.menuLabel)
+            ]
+            fixture.vm.agentSessionLinkPublishProjection(readyProjection, to: props.targetEndpoint)
+            for (title, peerLabel) in directions {
+                guard let submenu = root.items.first(where: { $0.title == title })?.submenu else {
+                    XCTFail("Missing \(title) submenu")
+                    continue
+                }
+                XCTAssertEqual(submenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+                let updater = submenu.delegate
+                XCTAssertNotNil(updater, "The native submenu must retain its updater independently of the row")
+                // Exercise the AppKit pre-tracking callback for this submenu, not a new
+                // root provider or a SwiftUI root replacement.
+                updater?.menuNeedsUpdate?(submenu)
+                XCTAssertEqual(submenu.items.count { $0.title == peerLabel && $0.isEnabled }, 1)
+                let parent = root.items.first { $0.submenu === submenu }
+                XCTAssertNotEqual(parent?.accessibilityValue() as? String, AgentOversightUICopy.oversightMenuUnavailableMessage)
+
+                fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+                updater?.menuNeedsUpdate?(submenu)
+                XCTAssertEqual(submenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+                XCTAssertFalse(submenu.items[0].isEnabled)
+                XCTAssertEqual(parent?.accessibilityValue() as? String, AgentOversightUICopy.oversightMenuUnavailableMessage)
+                fixture.vm.agentSessionLinkPublishProjection(readyProjection, to: props.targetEndpoint)
+                updater?.menuNeedsUpdate?(submenu)
+                XCTAssertEqual(submenu.items.count { $0.title == peerLabel && $0.isEnabled }, 1)
+            }
+            XCTAssertEqual(root.items.count, rootItems.count)
+            XCTAssertTrue(zip(root.items, rootItems).allSatisfy { $0 === $1 }, "Root identity and structure must not change during submenu refresh")
+            XCTAssertTrue(fixture.window.stableMenuPresenter.openMenu === root)
+            observed = true
+        })
+        XCTAssertTrue(observed)
+        XCTAssertNil(fixture.window.stableMenuPresenter.openMenu)
+    }
+
+    func testNativeSubmenuReadsReadyProjectionWithoutReopeningRoot() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let props = try menuProps(in: fixture)
+        let target = try XCTUnwrap(props.availableTargets.first)
+        let readyProjection = try XCTUnwrap(fixture.vm.monitorPillPropsByEndpoint[props.targetEndpoint])
+        fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+        var observer: SubmenuOpeningObserver?
+        var timeout: Timer?
+        var openings = 0
+        defer { timeout?.invalidate() }
+
+        func postKey(_ code: UInt16, character: String) {
+            guard let event = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: fixture.window.windowNumber, context: nil, characters: character,
+                charactersIgnoringModifiers: character, isARepeat: false, keyCode: code
+            ) else { return XCTFail("Could not create menu navigation event") }
+            NSApp.postEvent(event, atStart: false)
+        }
+
+        _ = try await open(in: fixture, cancelAfterOpening: false, whileTracking: { root in
+            guard let submenu = root.items.first(where: { $0.title == AgentOversightUICopy.overseeNewTitle })?.submenu else {
+                XCTFail("Missing candidate submenu")
+                return root.cancelTracking()
+            }
+            let rootItems = root.items
+            fixture.vm.agentSessionLinkPublishProjection(readyProjection, to: props.targetEndpoint)
+            let forwarding = SubmenuOpeningObserver(delegate: submenu.delegate)
+            observer = forwarding
+            submenu.delegate = forwarding
+            forwarding.onOpen = { child in
+                openings += 1
+                XCTAssertTrue(child.items.contains { $0.title == target.menuLabel && $0.isEnabled })
+                XCTAssertTrue(zip(root.items, rootItems).allSatisfy { $0 === $1 })
+                XCTAssertTrue(fixture.window.stableMenuPresenter.openMenu === root)
+                root.cancelTracking()
+            }
+            let watchdog = Timer(timeInterval: 1, repeats: false) { _ in
+                MainActor.assumeIsolated { root.cancelTracking() }
+            }
+            timeout = watchdog
+            RunLoop.main.add(watchdog, forMode: .common)
+            postKey(125, character: "\u{F701}")
+            postKey(124, character: "\u{F703}")
+        })
+        withExtendedLifetime(observer) {}
+        XCTAssertEqual(openings, 1, "AppKit must display the submenu while the original root tracks")
     }
 
     func testTrackedMenuSurvivesProjectionReplacementAndSidebarRerender() async throws {
@@ -1770,9 +2192,51 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 else { UserDefaults.standard.removeObject(forKey: key) }
             }
         }
-        let state = WindowState()
+        let providerAttempts = LifecycleRecorder()
+        let hydrationAttempts = LifecycleRecorder()
+        let state = WindowState(
+            agentModeViewModelFactory: { windowID, prompt, manager, server in
+                let vm = AgentModeViewModel(
+                    testWindowID: windowID,
+                    codexControllerFactory: { _, _, _, _, _, _ in
+                        providerAttempts.record("codex")
+                        return LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                    },
+                    claudeControllerFactory: { _, _, _, _ in
+                        providerAttempts.record("claude")
+                        return MonitorFakeNativeController()
+                    },
+                    headlessProviderFactory: { _, _ in
+                        providerAttempts.record("headless")
+                        return AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+                    },
+                    acpProviderFactory: { _, _ in
+                        providerAttempts.record("acp-provider")
+                        throw UnexpectedProviderLaunch.refused
+                    },
+                    acpControllerFactory: { _, _ in
+                        providerAttempts.record("acp-controller")
+                        throw UnexpectedProviderLaunch.refused
+                    },
+                    connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                    mcpRunRoutingCleaner: { _, _, _ in },
+                    mcpServerEnabler: { false },
+                    testMCPServer: server,
+                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore,
+                    testRestorePerfRecorder: SidebarHydrationRecorder(attempts: hydrationAttempts)
+                )
+                vm.promptManager = prompt
+                vm.workspaceManager = manager
+                return vm
+            },
+            contextBuilderProviderFactory: { _, _, _, _ in
+                providerAttempts.record("context-builder")
+                return AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+            }
+        )
         addTeardownBlock {
             await state.tearDown()
+            XCTAssertTrue(providerAttempts.events.isEmpty, "Hosted menu fixtures must never request a provider: \(providerAttempts.events)")
         }
         await state.workspaceManager.awaitInitialized()
         let tabs = (0 ... peerCount).map { index in
@@ -1791,6 +2255,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertEqual(switched, .switched)
         state.promptManager.loadComposeTabsFromWorkspace(workspace)
         let vm = state.agentModeViewModel
+        await vm.handleWorkspaceSwitch(workspace)
         vm.test_setCurrentTabIDOverride(tabs[0].id)
         _ = await vm.ensureSessionReady(tabID: tabs[0].id)
         XCTAssertEqual(vm.sidebarRuntimeWorkspaceID, workspace.id)
@@ -1832,7 +2297,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         window.makeKeyAndOrderFront(nil)
         host.layoutSubtreeIfNeeded()
         await Task.yield()
-        return Fixture(state: state, tabs: tabs, host: host, window: window)
+        return Fixture(state: state, tabs: tabs, host: host, window: window, providerAttempts: providerAttempts, hydrationAttempts: hydrationAttempts)
     }
 
     private func sidebar(for state: WindowState, tabID: UUID) -> AgentModeSessionsSidebarView {
@@ -1864,17 +2329,19 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
 
     private func open(
         in fixture: Fixture, via opening: Opening = .rightClick,
+        cancelAfterOpening: Bool = true,
         whileTracking: ((NSMenu) -> Void)? = nil
     ) async throws -> NSMenu {
-        fixture.host.layoutSubtreeIfNeeded()
-        func regions(in view: NSView) -> [StableMenuContextView] {
-            (view as? StableMenuContextView).map { [$0] } ?? view.subviews.flatMap { regions(in: $0) }
-        }
-        let mountedRegions = regions(in: fixture.host).filter { !$0.visibleRect.isEmpty }
-        XCTAssertEqual(mountedRegions.count, 1, "The actual sidebar search must leave only the intended row region")
-        let region = try XCTUnwrap(mountedRegions.first, "Real sidebar must mount its native row region")
+        let region = try mountedRegion(in: fixture)
         let finished = expectation(description: "Native tracking observed and intentionally ended")
         var tracked: NSMenu?
+        let ended = NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: nil) { note in
+            MainActor.assumeIsolated {
+                guard !cancelAfterOpening, let menu = note.object as? NSMenu, menu === tracked else { return }
+                finished.fulfill()
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(ended) }
         let token = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: nil) { note in
             MainActor.assumeIsolated {
                 guard let menu = note.object as? NSMenu, menu === fixture.window.stableMenuPresenter.openMenu else { return }
@@ -1882,8 +2349,10 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 let timer = Timer(timeInterval: 0.05, repeats: false) { _ in
                     MainActor.assumeIsolated {
                         whileTracking?(menu)
-                        menu.cancelTracking()
-                        finished.fulfill()
+                        if cancelAfterOpening {
+                            menu.cancelTracking()
+                            finished.fulfill()
+                        }
                     }
                 }
                 RunLoop.main.add(timer, forMode: .common)
@@ -1905,5 +2374,15 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         }
         await fulfillment(of: [finished], timeout: 3)
         return try XCTUnwrap(tracked, "Actual native opening must track a menu")
+    }
+
+    private func mountedRegion(in fixture: Fixture) throws -> StableMenuContextView {
+        fixture.host.layoutSubtreeIfNeeded()
+        func regions(in view: NSView) -> [StableMenuContextView] {
+            (view as? StableMenuContextView).map { [$0] } ?? view.subviews.flatMap { regions(in: $0) }
+        }
+        let mountedRegions = regions(in: fixture.host).filter { !$0.visibleRect.isEmpty }
+        XCTAssertEqual(mountedRegions.count, 1, "The actual sidebar search must leave only the intended row region")
+        return try XCTUnwrap(mountedRegions.first, "Real sidebar must mount its native row region")
     }
 }

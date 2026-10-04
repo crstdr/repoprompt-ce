@@ -2,9 +2,37 @@ import Foundation
 import os
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptProcess
 import XCTest
 
 final class ACPProviderSessionIdentityTests: XCTestCase {
+    func testACPBootstrapRefusesDevinNewAndColdResumeWithoutFixtureOptIn() async throws {
+        // Hydration can request a fresh controller for a persisted provider session;
+        // neither that identity nor discovery is permission to start a provider in XCTest.
+        for resumeID in [nil, "persisted-devin-session"] as [String?] {
+            let workspace = try makeTemporaryDirectory()
+            let recordURL = workspace.appendingPathComponent("requests.jsonl")
+            let provider = try FakeACPProvider(
+                providerID: .devin,
+                commandPath: makeFakeACPServerScript().path,
+                environment: ["ACP_RECORD_PATH": recordURL.path]
+            )
+            let request = makeRunRequest(agentKind: .devin, workspacePath: workspace.path, resumeSessionID: resumeID)
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+            do {
+                _ = try await controller.bootstrap()
+                XCTFail("Discovery and cold resume must fail closed without an explicit fixture permit")
+            } catch {
+                XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+            }
+            let identity = await controller.currentProviderSessionIdentity()
+            XCTAssertNil(identity.runtimeSessionID)
+            XCTAssertEqual(identity.loadSessionID, resumeID)
+            await controller.shutdown()
+            XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL.path), "Refusal must precede ACP initialization")
+        }
+    }
+
     func testCursorNewSessionPublishesRuntimeIDAsVerifiedLoadID() async throws {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try makeFakeACPServerScript()

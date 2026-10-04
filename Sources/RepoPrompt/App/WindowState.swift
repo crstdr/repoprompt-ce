@@ -490,10 +490,13 @@ class WindowState: ObservableObject {
 
     func beginClose() {
         guard !isClosing else { return }
+        let manager = windowStatesManager ?? WindowStatesManager.shared
+        if !manager.isTerminating {
+            AgentSessionLinkRuntimeBridge.shared.noteOversightWindowClosing(windowID: windowID)
+        }
         isClosing = true
         failUnstartedCommandsForWindowClose()
 
-        let manager = windowStatesManager ?? WindowStatesManager.shared
         if !manager.isTerminating {
             manager.markWindowAsExplicitlyClosing(windowID: windowID)
         }
@@ -546,6 +549,19 @@ class WindowState: ObservableObject {
     }
 
     #if DEBUG
+        convenience init(
+            agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory,
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory
+        ) {
+            self.init(
+                contextBuilderProviderFactory: contextBuilderProviderFactory,
+                loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: nil,
+                agentModeViewModelFactory: agentModeViewModelFactory
+            )
+        }
+
         convenience init(
             contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
             domainRuntime: MCPDomainRuntime,
@@ -619,7 +635,8 @@ class WindowState: ObservableObject {
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         domainRuntimeOverride: MCPDomainRuntime?,
-        keyManager injectedKeyManager: KeyManager? = nil
+        keyManager injectedKeyManager: KeyManager? = nil,
+        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -643,7 +660,8 @@ class WindowState: ObservableObject {
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            agentModeViewModelFactory: agentModeViewModelFactory
         )
 
         workspaceFileContextStore = composition.workspaceFileContextStore

@@ -42,6 +42,17 @@ fences remain in place without importing a native pre-discovery requirement into
 Catalog observations and `tools/list_changed` remain discovery/usability signals. This changes no
 MCP tool name, schema, operation, caller identity or per-call authorization contract.
 
+## Same-process window reopen
+
+Window close still revokes live authority, leases, queues, and wakes. Before teardown, the runtime
+bridge captures only reference-backed saved pairs in the existing launch coordinator. Its current
+parked reference owns restoration or an already-admitted Unlink; historical closed references only
+fence late cleanup. Exact endpoints, durable token, and assertion generation fence both paths.
+Parking survives transient hydration and sequential closes until a valid restoration proof enters
+the ordinary establishment path. Unlink and committed deletion forget intent; failed removal uses
+the existing cleanup warning/retry. Parking is process-local, preserves no capabilities, and adds no
+UI or MCP state; cold launch keeps its existing restoration policy.
+
 ## Configuration-only model selection
 
 `set_model(session_id, model_id)` requires the exact original **Manage** lease and a fully idle,
