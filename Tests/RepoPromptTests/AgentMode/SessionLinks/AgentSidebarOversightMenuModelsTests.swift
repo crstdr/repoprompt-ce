@@ -1880,6 +1880,10 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let retired = try menuProps(in: fixture).targetEndpoint
         let items = session.items
         let revision = session.sourceItemsRevision
+        await fixture.vm.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+        fixture.vm.test_publishTranscriptPresentation(tabID: tabID)
+        let presentation = fixture.vm.activeTranscriptPresentation
+        XCTAssertFalse(presentation.visibleRows.isEmpty, "Exercise an already-displayed active transcript")
         await recoverByOpening(provider, in: fixture, sessionID: sessionID) {
             session.testInstallPersistentSessionBinding(sessionID: nil)
             XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
@@ -1893,6 +1897,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let choices = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
         XCTAssertNotEqual(choices.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
         XCTAssertTrue(try mountedRegion(in: fixture) === region)
+        XCTAssertEqual(fixture.vm.activeTranscriptPresentation.visibleRows, presentation.visibleRows)
+        XCTAssertEqual(fixture.vm.activeTranscriptPresentation.visibleBlocks, presentation.visibleBlocks)
+        XCTAssertFalse(fixture.vm.activeTranscriptPresentation.bindingsHydrated, "Presentation must not inherit retired hydration authority")
         XCTAssertEqual(session.sourceItemsRevision, revision, "Identity repair must not replace loaded content")
         XCTAssertEqual(session.items.map(\.text), items.map(\.text))
         XCTAssertNil(session.persistedLoadTask)

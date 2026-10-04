@@ -5156,6 +5156,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ = installPersistentSessionBinding(
             sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
         )
+        if currentTabID == session.tabID {
+            publishTranscriptPresentation(from: session)
+        }
     }
 
     private enum PersistentSessionBindingMutationTarget {
