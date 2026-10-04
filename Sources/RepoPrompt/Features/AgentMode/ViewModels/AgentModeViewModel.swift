@@ -599,6 +599,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ///
     /// Written only by `AgentModeViewModel+SessionLinks`; nothing else should mutate it.
     var monitorPillPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
+    /// Temporary live-menu diagnostic (remove after diagnosis); monotonic timestamps per row.
+    var sidebarOversightMenuDiagnosticTimes: [UUID: TimeInterval] = [:]
     var sidebarCreatorDisplayNames: [UUID: String] = [:]
 
     /// In-memory palette-slot assignments for overseer sessions, reconciled inside the
