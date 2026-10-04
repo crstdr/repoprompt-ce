@@ -1190,9 +1190,7 @@ final class AgentTabSession: ObservableObject {
     var pendingCodexComputerUseActivation: AgentModeViewModel.CodexComputerUseActivation?
     var codexControllerFeatureState: CodexControllerFeatureState?
     var wantsCodexComputerUseForNextTurn: Bool {
-        guard let activation = pendingCodexComputerUseActivation else { return false }
-        return activation.binding == persistentSessionBindingIdentity
-            && activation.bindingTransitionGeneration == bindingTransitionGeneration
+        pendingCodexComputerUseActivation != nil
     }
 
     var claudeController: (any NativeAgentRuntimeControlling)?
@@ -1486,8 +1484,6 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func beginPersistentBindingTransition() -> UInt64 {
-        // Computer-control consent belongs to this exact session incarnation, not its reusable tab.
-        pendingCodexComputerUseActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
         // incoming incarnation.
         restorationReadiness = .unbound
