@@ -5137,6 +5137,36 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshSessionListCache(for: workspace, owner: token.owner)
     }
 
+    /// Passive preparation outside resolver/view-body reads; saved identity authorizes only hydration.
+    func prepareSidebarOversightSession(tabID: UUID, sessionID: UUID, workspaceID: UUID, allowMount: Bool = true) async {
+        if let session = sessions[tabID], session.activeAgentSessionID == sessionID, session.hasLoadedPersistedState { return }
+        guard allowMount || sessions[tabID] != nil else { return }
+        guard !Task.isCancelled, workspaceManager?.activeWorkspaceID == workspaceID,
+              agentSessionLinkComposeTabDescriptors().contains(where: {
+                  $0.tabID == tabID && $0.sessionID == sessionID && $0.workspaceID == workspaceID
+              }),
+              AgentSessionLinkRuntimeBridge.shared.canPrepareSidebarSession(.init(
+                  windowID: windowID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
+              )),
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+        else { return }
+        if let session = sessions[tabID] {
+            guard !session.bindingTransitionInProgress,
+                  session.activeAgentSessionID == nil || session.activeAgentSessionID == sessionID
+            else { return }
+            guard !bindingHasSynchronousOwnership(session), !session.isDirty else { return }
+            if session.activeAgentSessionID == nil {
+                session.hasLoadedPersistedState = false
+                _ = installPersistentSessionBinding(
+                    sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: true
+                )
+            }
+        }
+        // Hydration only: applying active UI bindings would acquire provider discovery interest.
+        await loadSessionFromDisk(for: session(for: tabID))
+    }
+
     private enum PersistentSessionBindingMutationTarget {
         case runtimeOnly
         case compareAndSet(workspaceID: UUID)

@@ -1841,6 +1841,112 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertTrue(linked.items.contains { $0.title == AgentOversightUICopy.overseeingSectionLabel }, "Previous menu remains a value snapshot")
     }
 
+    func testMenuOpeningRecoversPersistedRowWithMissingRuntimeEntry() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let tabID = fixture.tabs[0].id
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let region = try mountedRegion(in: fixture)
+        let provider = region.itemsProvider
+        await fixture.vm.flushSave(for: tabID)
+        let oldCopyTarget = try XCTUnwrap(fixture.vm.agentSessionCopyIDTarget(
+            tabID: tabID, sessionID: sessionID, tabName: "Fixture"
+        ))
+        await recoverByOpening(provider, in: fixture, sessionID: sessionID) {
+            fixture.vm.test_removeSession(tabID: tabID)
+        }
+        let menu = try menuProps(in: fixture)
+        XCTAssertEqual(menu.targetSessionID, sessionID)
+        XCTAssertNotEqual(menu.targetEndpoint.persistentBindingGeneration, oldCopyTarget.persistentBindingGeneration)
+        XCTAssertFalse(fixture.vm.copyAgentSessionID(target: oldCopyTarget), "Retired actions must not inherit repaired authority")
+        let reopened = NSMenu.stableMenu(from: provider())
+        let choices = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeNewTitle }?.submenu)
+        XCTAssertTrue(choices.items.contains { $0.isEnabled && $0.title.contains("Hosted peer 1") })
+        XCTAssertTrue(try mountedRegion(in: fixture) === region)
+    }
+
+    func testMenuOpeningRecoversPersistedRowWithNilRuntimeBinding() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let tabID = fixture.tabs[0].id
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let session = fixture.vm.session(for: tabID)
+        let region = try mountedRegion(in: fixture)
+        let provider = region.itemsProvider
+        session.selectedAgent = .cursor
+        XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive)
+        await fixture.vm.flushSave(for: tabID)
+        let retired = try menuProps(in: fixture).targetEndpoint
+        await recoverByOpening(provider, in: fixture, sessionID: sessionID) {
+            session.testInstallPersistentSessionBinding(sessionID: nil)
+            XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
+        }
+        XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive, "Menu recovery must not acquire discovery interest")
+        XCTAssertTrue(fixture.vm.sessions[tabID] === session, "Repair the retained entry through its normal binding installer")
+        let menu = try menuProps(in: fixture)
+        XCTAssertEqual(menu.targetSessionID, sessionID)
+        XCTAssertNotEqual(menu.targetEndpoint, retired)
+        let reopened = NSMenu.stableMenu(from: provider())
+        let choices = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
+        XCTAssertNotEqual(choices.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+        XCTAssertTrue(try mountedRegion(in: fixture) === region)
+    }
+
+    func testSidebarPreparationRejectsStaleClaimsAndInProgressRebinding() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let vm = fixture.vm
+        let tabID = fixture.tabs[0].id
+        let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let session = vm.session(for: tabID)
+        XCTAssertTrue(AgentSessionLinkRuntimeBridge.shared.canPrepareSidebarSession(.init(
+            windowID: fixture.state.windowID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
+        )), "This registered fixture must exercise the binding guards, not fail host qualification")
+        session.testInstallPersistentSessionBinding(sessionID: nil)
+        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: UUID(), workspaceID: workspaceID)
+        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: UUID())
+        XCTAssertNil(session.activeAgentSessionID)
+        session.items.append(AgentChatItem(kind: .user, text: "Unsaved retained change"))
+        session.isDirty = true
+        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID)
+        XCTAssertEqual(session.items.last?.text, "Unsaved retained change")
+        XCTAssertNil(session.persistedLoadTask, "Dirty retained state must not be overwritten by disk hydration")
+        session.isDirty = false
+        let ownership = session.beginRunAttempt(source: "hosted-fixture")
+        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID, "Idle run ownership still blocks repair")
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        _ = session.endRunAttempt(ifCurrent: ownership, source: "hosted-fixture")
+        let transition = session.beginPersistentBindingTransition()
+        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID, "Never replace an in-progress transition")
+        session.finishPersistentBindingTransition(generation: transition)
+        let replacementID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: replacementID)
+        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertEqual(session.activeAgentSessionID, replacementID, "Never steal a conflicting live binding")
+    }
+
+    private func recoverByOpening(
+        _ provider: () -> [StableMenuItem], in fixture: Fixture, sessionID: UUID,
+        invalidate: () -> Void
+    ) async {
+        let installed = expectation(description: "Normal binding installer publishes recovery")
+        let token = NotificationCenter.default.publisher(for: .agentSessionBindingDidChange)
+            .filter { note in
+                note.object as? AgentModeViewModel === fixture.vm
+                    && note.userInfo?["tabID"] as? UUID == fixture.tabs[0].id
+                    && note.userInfo?["sessionID"] as? UUID == sessionID
+            }
+            .prefix(1).sink { _ in installed.fulfill() }
+        defer { token.cancel() }
+        invalidate() // Observe before synchronous sidebar publication can remount the entry.
+        _ = provider() // Retained native opening must schedule the preparation itself.
+        await fulfillment(of: [installed], timeout: 3)
+        if let load = fixture.vm.sessions[fixture.tabs[0].id]?.persistedLoadTask { await load.value }
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        await settleHostedPublication(in: fixture)
+    }
+
     func testColdProviderReadsReadyProjectionOnReopenWithoutRemount() async throws {
         let fixture = try await makeFixture(peerCount: 1)
         let otherWindow = try await makeFixture(peerCount: 1)
