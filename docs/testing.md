@@ -55,8 +55,13 @@ A focused green run is evidence for the named contract, not a substitute for ful
 
 ## Provider subprocess isolation
 
-Provider CLI launches fail closed under XCTest, including release-mode test bundles. Inject
-controller/provider doubles rather than relying on an installed CLI. Intentional fixture-process
+Provider CLI launches fail closed in processes hosting the XCTest runtime, including nested
+XCTest runners and release-mode test bundles. Detection does not inspect user arguments or
+inherited XCTest environment variables, so those production inputs cannot cause a refusal.
+**Separate non-XCTest child processes spawned by tests are not guarded.** Such fixtures must
+use synthetic commands or injected provider doubles, never an installed provider CLI.
+
+Inject controller/provider doubles rather than relying on an installed CLI. Intentional fixture-process
 tests can set `allowsProviderProcessLaunchForTesting: true` on their `CLIProcessConfiguration`
 or `ACPAgentSessionController`, or scope a launch/probe with
 `ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true)`. These opt-ins are local
