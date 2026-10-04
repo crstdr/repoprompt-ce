@@ -5137,11 +5137,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshSessionListCache(for: workspace, owner: token.owner)
     }
 
-    /// Passive preparation outside resolver/view-body reads; saved identity authorizes only hydration.
-    func prepareSidebarOversightSession(tabID: UUID, sessionID: UUID, workspaceID: UUID, allowMount: Bool = true) async {
-        if let session = sessions[tabID], session.activeAgentSessionID == sessionID, session.hasLoadedPersistedState { return }
-        guard allowMount || sessions[tabID] != nil else { return }
-        guard !Task.isCancelled, workspaceManager?.activeWorkspaceID == workspaceID,
+    /// Identity-only preparation of already-loaded state. Never mounts, hydrates, or resumes.
+    /// A repaired binding remains pending: menu activity cannot earn restoration authority.
+    func prepareSidebarOversightSession(tabID: UUID, sessionID: UUID, workspaceID: UUID) {
+        guard let session = sessions[tabID], session.activeAgentSessionID == nil,
+              session.hasLoadedPersistedState, session.persistedLoadTask == nil,
+              !session.bindingTransitionInProgress, !bindingHasSynchronousOwnership(session), !session.isDirty,
+              !Task.isCancelled, workspaceManager?.activeWorkspaceID == workspaceID,
               agentSessionLinkComposeTabDescriptors().contains(where: {
                   $0.tabID == tabID && $0.sessionID == sessionID && $0.workspaceID == workspaceID
               }),
@@ -5151,20 +5153,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
               !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
         else { return }
-        if let session = sessions[tabID] {
-            guard !session.bindingTransitionInProgress,
-                  session.activeAgentSessionID == nil || session.activeAgentSessionID == sessionID
-            else { return }
-            guard !bindingHasSynchronousOwnership(session), !session.isDirty else { return }
-            if session.activeAgentSessionID == nil {
-                session.hasLoadedPersistedState = false
-                _ = installPersistentSessionBinding(
-                    sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: true
-                )
-            }
-        }
-        // Hydration only: applying active UI bindings would acquire provider discovery interest.
-        await loadSessionFromDisk(for: session(for: tabID))
+        _ = installPersistentSessionBinding(
+            sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
+        )
     }
 
     private enum PersistentSessionBindingMutationTarget {

@@ -1843,37 +1843,27 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertTrue(linked.items.contains { $0.title == AgentOversightUICopy.overseeingSectionLabel }, "Previous menu remains a value snapshot")
     }
 
-    func testMenuOpeningRecoversPersistedRowWithMissingRuntimeEntry() async throws {
+    func testMenuOpeningLeavesColdPersistedRowUnloaded() async throws {
         let fixture = try await makeFixture(peerCount: 1)
         let tabID = fixture.tabs[0].id
         let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
-        let region = try mountedRegion(in: fixture)
-        let provider = region.itemsProvider
+        let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
+        let provider = try mountedRegion(in: fixture).itemsProvider
         let persisted = fixture.vm.session(for: tabID)
         persisted.selectedAgent = .devin
         persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
         persisted.providerSessionID = "hosted-existing-acp-session"
         await fixture.vm.flushSave(for: tabID)
-        let oldCopyTarget = try XCTUnwrap(fixture.vm.agentSessionCopyIDTarget(
-            tabID: tabID, sessionID: sessionID, tabName: "Fixture"
-        ))
-        await recoverByOpening(provider, in: fixture, sessionID: sessionID) {
-            fixture.vm.test_removeSession(tabID: tabID)
-        }
-        let menu = try menuProps(in: fixture)
-        XCTAssertEqual(menu.targetSessionID, sessionID)
-        XCTAssertNotEqual(menu.targetEndpoint.persistentBindingGeneration, oldCopyTarget.persistentBindingGeneration)
-        XCTAssertFalse(fixture.vm.copyAgentSessionID(target: oldCopyTarget), "Retired actions must not inherit repaired authority")
-        let reopened = NSMenu.stableMenu(from: provider())
-        let choices = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeNewTitle }?.submenu)
-        XCTAssertTrue(choices.items.contains { $0.isEnabled && $0.title.contains("Hosted peer 1") })
-        XCTAssertTrue(try mountedRegion(in: fixture) === region)
-        XCTAssertEqual(fixture.vm.sessions[tabID]?.selectedAgent, .devin)
-        XCTAssertEqual(fixture.vm.sessions[tabID]?.providerSessionID, "hosted-existing-acp-session")
-        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Persisted ACP hydration must not resume a provider")
+        fixture.vm.test_removeSession(tabID: tabID)
+        fixture.vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        _ = provider()
+        await settleHostedPublication(in: fixture)
+        XCTAssertNil(fixture.vm.sessions[tabID], "Opening a menu must not mount or hydrate a persisted row")
+        XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Cold persisted rows must not request a provider")
     }
 
-    func testMenuOpeningRecoversPersistedRowWithNilRuntimeBinding() async throws {
+    func testMenuOpeningRepairsLoadedNilBindingWithoutHydration() async throws {
         let fixture = try await makeFixture(peerCount: 1)
         let tabID = fixture.tabs[0].id
         let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
@@ -1886,6 +1876,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive)
         await fixture.vm.flushSave(for: tabID)
         let retired = try menuProps(in: fixture).targetEndpoint
+        let items = session.items
+        let revision = session.sourceItemsRevision
         await recoverByOpening(provider, in: fixture, sessionID: sessionID) {
             session.testInstallPersistentSessionBinding(sessionID: nil)
             XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
@@ -1899,6 +1891,11 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let choices = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
         XCTAssertNotEqual(choices.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
         XCTAssertTrue(try mountedRegion(in: fixture) === region)
+        XCTAssertEqual(session.sourceItemsRevision, revision, "Identity repair must not replace loaded content")
+        XCTAssertEqual(session.items.map(\.text), items.map(\.text))
+        XCTAssertNil(session.persistedLoadTask)
+        XCTAssertTrue(session.hasLoadedPersistedState)
+        XCTAssertFalse(session.qualifiedRestorationReadiness.isAuthoritative, "A repaired identity cannot earn hydration proof")
         XCTAssertEqual(session.selectedAgent, .devin)
         XCTAssertEqual(session.providerSessionID, "hosted-existing-acp-session")
         XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Nil-binding repair must not resume a provider")
@@ -1915,28 +1912,33 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             windowID: fixture.state.windowID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
         )), "This registered fixture must exercise the binding guards, not fail host qualification")
         session.testInstallPersistentSessionBinding(sessionID: nil)
-        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: UUID(), workspaceID: workspaceID)
-        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: UUID())
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: UUID(), workspaceID: workspaceID)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: UUID())
         XCTAssertNil(session.activeAgentSessionID)
         session.items.append(AgentChatItem(kind: .user, text: "Unsaved retained change"))
         session.isDirty = true
-        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
         XCTAssertNil(session.activeAgentSessionID)
         XCTAssertEqual(session.items.last?.text, "Unsaved retained change")
         XCTAssertNil(session.persistedLoadTask, "Dirty retained state must not be overwritten by disk hydration")
         session.isDirty = false
+        session.hasLoadedPersistedState = false
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID, "Cold retained state must not be rebound or hydrated")
+        XCTAssertNil(session.persistedLoadTask)
+        session.hasLoadedPersistedState = true
         let ownership = session.beginRunAttempt(source: "hosted-fixture")
-        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
         XCTAssertNil(session.activeAgentSessionID, "Idle run ownership still blocks repair")
         XCTAssertEqual(session.activeRunOwnership, ownership)
         _ = session.endRunAttempt(ifCurrent: ownership, source: "hosted-fixture")
         let transition = session.beginPersistentBindingTransition()
-        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
         XCTAssertNil(session.activeAgentSessionID, "Never replace an in-progress transition")
         session.finishPersistentBindingTransition(generation: transition)
         let replacementID = UUID()
         session.testInstallPersistentSessionBinding(sessionID: replacementID)
-        await vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
         XCTAssertEqual(session.activeAgentSessionID, replacementID, "Never steal a conflicting live binding")
     }
 
@@ -1956,7 +1958,6 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         invalidate() // Observe before synchronous sidebar publication can remount the entry.
         _ = provider() // Retained native opening must schedule the preparation itself.
         await fulfillment(of: [installed], timeout: 3)
-        if let load = fixture.vm.sessions[fixture.tabs[0].id]?.persistedLoadTask { await load.value }
         await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
         await settleHostedPublication(in: fixture)
     }
@@ -2190,6 +2191,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertEqual(switched, .switched)
         state.promptManager.loadComposeTabsFromWorkspace(workspace)
         let vm = state.agentModeViewModel
+        await vm.handleWorkspaceSwitch(workspace)
         vm.test_setCurrentTabIDOverride(tabs[0].id)
         _ = await vm.ensureSessionReady(tabID: tabs[0].id)
         XCTAssertEqual(vm.sidebarRuntimeWorkspaceID, workspace.id)
