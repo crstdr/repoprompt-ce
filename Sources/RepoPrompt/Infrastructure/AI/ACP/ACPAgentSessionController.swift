@@ -510,7 +510,9 @@ actor ACPAgentSessionController {
         }
 
         func test_waitForSteeringInterruptEntry() async {
-            if testSteeringInterruptEntered { return }
+            if testSteeringInterruptEntered {
+                return
+            }
             await withCheckedContinuation { testSteeringInterruptEntryWaiter = $0 }
         }
 
@@ -866,7 +868,9 @@ actor ACPAgentSessionController {
             settlePromptTurn(promptTurnID, result: .failure(error))
             // Local admission refused before construction or transport; the connection is intact.
             if refusedUnsupportedImages {
-                if state == .promptRunning { state = .sessionOpen }
+                if state == .promptRunning {
+                    state = .sessionOpen
+                }
                 throw error
             }
             if error is CancellationError {
@@ -1260,6 +1264,28 @@ actor ACPAgentSessionController {
             }
             throw error
         }
+    }
+
+    /// Cursor persists bracket overrides in existing model strings; ACP uses separate model/config calls.
+    func applyCursorModelSelection(
+        _ raw: String,
+        overrides: [CursorAIModelCatalog.ModelSpecifier.Override] = []
+    ) async throws {
+        let specifier = try CursorAIModelCatalog.ModelSpecifier(raw: raw)
+        try await setSessionModel(specifier.baseModelRaw)
+        var encoded = raw
+        for override in overrides {
+            guard let updated = try CursorAIModelCatalog.ModelSpecifier(raw: encoded).replacing(configID: override.configID, valueRaw: override.valueRaw) else {
+                throw CursorAIModelCatalog.ModelSpecifier.invalid(override.configID)
+            }
+            encoded = updated
+        }
+        let values = try CursorAIModelCatalog.ModelSpecifier(raw: encoded).selections(in: currentDiscoveredSessionModels())
+        let selections = values.map {
+            ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw)
+        }
+        let report = try await applySessionModelParameterSelections(selections)
+        try report.validateNoSkippedSelections()
     }
 
     func restoreOpenedSessionMode(reportFailure: Bool = false) async throws {
@@ -2073,8 +2099,12 @@ actor ACPAgentSessionController {
             guard var name = (command["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
                 continue
             }
-            if name.hasPrefix("/") { name.removeFirst() }
-            if !name.isEmpty { names.insert(name) }
+            if name.hasPrefix("/") {
+                name.removeFirst()
+            }
+            if !name.isEmpty {
+                names.insert(name)
+            }
         }
         let snapshot = AdvertisedCommands(sessionID: paramsSessionID, names: names)
         advertisedCommandsState.withLock { $0 = snapshot }

@@ -82,14 +82,109 @@ enum CursorAIModelCatalog {
         projectedOptions(from: resolvedSnapshot())
     }
 
+    /// Persisted Cursor overrides use bracket syntax, while wire model/config calls stay separate.
+    struct ModelSpecifier {
+        struct Override {
+            let configID: String
+            let valueRaw: String
+        }
+
+        let baseModelRaw: String
+        let overrides: [Override]
+
+        init(raw: String) throws {
+            // An advertised model ID may itself contain brackets; never parse that exact ID.
+            if CursorAIModelCatalog.options.contains(where: { $0.rawValue == raw }) || !raw.contains("[") {
+                baseModelRaw = raw
+                overrides = []
+                return
+            }
+            guard let start = raw.firstIndex(of: "["), raw.hasSuffix("]") else { throw Self.invalid(raw) }
+            baseModelRaw = String(raw[..<start])
+            let body = raw[raw.index(after: start) ..< raw.index(before: raw.endIndex)]
+            var parsed: [Override] = []
+            var ids = Set<String>()
+            for pair in body.split(separator: ",", omittingEmptySubsequences: false) {
+                let parts = pair.split(separator: "=", omittingEmptySubsequences: false)
+                guard parts.count == 2, Self.canEncode(String(parts[0])), Self.canEncode(String(parts[1])),
+                      ids.insert(String(parts[0])).inserted else { throw Self.invalid(raw) }
+                parsed.append(.init(configID: String(parts[0]), valueRaw: String(parts[1])))
+            }
+            guard !baseModelRaw.isEmpty, !baseModelRaw.contains("]"), !parsed.isEmpty else { throw Self.invalid(raw) }
+            overrides = parsed
+        }
+
+        static func canEncode(_ raw: String) -> Bool {
+            !raw.isEmpty && !raw.contains(where: { "[]=,".contains($0) || $0.isWhitespace })
+        }
+
+        static func invalid(_ raw: String) -> NSError {
+            NSError(domain: "CursorModelSelection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unsupported Cursor model selection: \(raw)"])
+        }
+
+        struct ValidatedOverride {
+            let baseModelRaw: String
+            let kind: ACPModelParameterKind
+            let configID: String
+            let valueRaw: String
+        }
+
+        func selections(in snapshot: ACPDiscoveredSessionModels?, excludingConfigIDs: Set<String> = [], supersededKinds: Set<ACPModelParameterKind> = [], ignoringUnavailable: Bool = false) throws -> [ValidatedOverride] {
+            let inherited = overrides.filter { !excludingConfigIDs.contains($0.configID) }
+            guard !inherited.isEmpty else { return [] }
+            let identity = CursorAIModelCatalog.canonicalIdentity(baseModelRaw)
+            guard identity != AgentModel.cursorAuto.rawValue,
+                  let set = snapshot?.modelParameterSets.first(where: { CursorAIModelCatalog.canonicalIdentity($0.baseModelRaw) == identity })
+            else { throw Self.invalid(baseModelRaw) }
+            return try inherited.compactMap { override in
+                guard let definition = set.definition(configID: override.configID) else {
+                    if ignoringUnavailable {
+                        return nil
+                    }
+                    throw Self.invalid("\(override.configID)=\(override.valueRaw)")
+                }
+                if supersededKinds.contains(definition.kind) {
+                    return nil
+                }
+                guard definition.choices.contains(where: { $0.rawValue == override.valueRaw }) else {
+                    if ignoringUnavailable {
+                        return nil
+                    }
+                    throw Self.invalid("\(override.configID)=\(override.valueRaw)")
+                }
+                return .init(baseModelRaw: set.baseModelRaw, kind: definition.kind, configID: definition.configID, valueRaw: override.valueRaw)
+            }
+        }
+
+        func replacing(configID: String, valueRaw: String?) -> String? {
+            guard Self.canEncode(configID), valueRaw.map(Self.canEncode) ?? true else { return nil }
+            var values = overrides.filter { $0.configID != configID }
+            if let valueRaw {
+                values.append(.init(configID: configID, valueRaw: valueRaw))
+            }
+            return values.isEmpty ? baseModelRaw : baseModelRaw + "[" + values.map { "\($0.configID)=\($0.valueRaw)" }.joined(separator: ",") + "]"
+        }
+    }
+
     static func contains(modelRaw: String) -> Bool {
         option(matching: modelRaw) != nil
     }
 
     static func option(matching modelRaw: String) -> AgentModelOption? {
+        if let specifier = try? ModelSpecifier(raw: modelRaw), !specifier.overrides.isEmpty,
+           let base = option(matching: specifier.baseModelRaw),
+           let selections = try? specifier.selections(in: resolvedSnapshot())
+        {
+            let labels = selections.map { selection in
+                parameterSet(for: base.rawValue)?.definition(configID: selection.configID)?.choices.first(where: { $0.rawValue == selection.valueRaw })?.displayName ?? selection.valueRaw
+            }
+            return AgentModelOption(rawValue: modelRaw, displayName: base.displayName + " · " + labels.joined(separator: " · "), description: base.description, isDefault: false)
+        }
         let identity = canonicalIdentity(modelRaw)
         guard !identity.isEmpty else { return nil }
-        if identity == autoIdentity { return autoOption }
+        if identity == autoIdentity {
+            return autoOption
+        }
         guard let snapshot = resolvedSnapshot(),
               let discovered = discoveredOption(matching: identity, in: snapshot)
         else {
@@ -99,7 +194,8 @@ enum CursorAIModelCatalog {
     }
 
     static func parameterSet(for modelRaw: String) -> ACPModelParameterSet? {
-        let identity = canonicalIdentity(modelRaw)
+        let baseModelRaw = (try? ModelSpecifier(raw: modelRaw).baseModelRaw) ?? modelRaw
+        let identity = canonicalIdentity(baseModelRaw)
         guard !identity.isEmpty, identity != autoIdentity else { return nil }
         guard let snapshot = resolvedSnapshot(),
               let discovered = discoveredOption(matching: identity, in: snapshot)
