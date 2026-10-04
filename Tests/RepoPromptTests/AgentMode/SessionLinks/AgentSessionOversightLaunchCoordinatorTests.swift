@@ -18,10 +18,11 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     /// topology reason. The focused bridge tests elsewhere rely on the protocol defaults instead.
     private final class FakeHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
-        /// Answers by call index so a test can make an endpoint drift at one exact point between the
-        /// coordinator's classification and the shared establishment path's own resolution.
-        var candidatesByCall: ((Int) -> [AgentSessionLinkEndpointCandidate])?
-        private(set) var candidateCallCount = 0
+        /// Drift only after the coordinator's descriptor-backed classification snapshot. Bootstrap
+        /// presentation reads candidates too, so a raw call index is not an establishment boundary.
+        var candidatesAfterClassification: [AgentSessionLinkEndpointCandidate]?
+        private var classificationSnapshotPending = false
+        private(set) var classificationHandoffCount = 0
         var descriptors: [AgentSessionLinkComposeTabDescriptor] = []
         var discovery: [AgentSessionLinkDiscoveryState] = []
         var topology: AgentSessionOversightRestoreTopologyState = .completeAllEntriesConsumed
@@ -40,12 +41,19 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         }
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
-            candidateCallCount += 1
-            return candidatesByCall?(candidateCallCount) ?? candidates
+            let snapshot = candidates
+            if classificationSnapshotPending, let successor = candidatesAfterClassification {
+                classificationSnapshotPending = false
+                candidatesAfterClassification = nil
+                classificationHandoffCount += 1
+                candidates = successor
+            }
+            return snapshot
         }
 
         func agentSessionLinkComposeTabDescriptors() -> [AgentSessionLinkComposeTabDescriptor] {
-            descriptors
+            classificationSnapshotPending = candidatesAfterClassification != nil
+            return descriptors
         }
 
         func agentSessionLinkDiscoveryStates() -> [AgentSessionLinkDiscoveryState] {
@@ -716,16 +724,16 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             "The identity must be unchanged, or the resolver would have caught this on its own."
         )
         fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
-        // Call 1 is the coordinator's classification; every later call is the shared path resolving.
-        fixture.host.candidatesByCall = { call in
-            call == 1 ? [observer, target] : [observer, rehydrating]
-        }
+        fixture.host.candidates = [observer, target]
+        fixture.host.candidatesAfterClassification = [observer, rehydrating]
 
         await fixture.bridge.bootstrapIntentStore(fixture.store)
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let restored = await isRestored(fixture)
         XCTAssertFalse(restored, "An unproven incarnation must never be reauthorized.")
+        XCTAssertEqual(fixture.host.classificationHandoffCount, 1)
+        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
         XCTAssertEqual(
             fixture.bridge.test_launchEntryState(for: pair),
             .terminal(.activationFailed)
@@ -750,9 +758,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
                 ? withReadiness(observer, .terminal(observerToken, .loadFailed)) : observer
             fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
             // Classification sees completed payloads; the shared path sees their supersession.
-            fixture.host.candidatesByCall = { call in
-                call == 1 ? [observer, target] : [currentObserver, superseded]
-            }
+            fixture.host.candidates = [observer, target]
+            fixture.host.candidatesAfterClassification = [currentObserver, superseded]
 
             await fixture.bridge.bootstrapIntentStore(fixture.store)
             await fixture.bridge.test_settleLaunchReconciliation()
@@ -760,6 +767,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             let restored = await isRestored(fixture)
             let token = await fixture.store.token(for: pair)
             XCTAssertFalse(restored)
+            XCTAssertEqual(fixture.host.classificationHandoffCount, 1)
             XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
             XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
             XCTAssertNotNil(token)
