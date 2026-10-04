@@ -15223,7 +15223,7 @@ actor ServerNetworkManager {
                 ) else {
                     return await MCPAgentRunStartExecutionScope.$current.withValue(nil) { await requestBody(params) }
                 }
-                let environment = await toolExecutionWatchdogEnvironment
+                let environment = await self.toolExecutionWatchdogEnvironment
                 let scope = MCPAgentRunStartExecutionScope(connectionID: connectionID, environment: environment)
                 return await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
                     do {
