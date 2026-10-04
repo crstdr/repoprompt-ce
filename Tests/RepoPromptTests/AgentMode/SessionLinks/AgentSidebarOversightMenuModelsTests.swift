@@ -3,6 +3,7 @@ import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import SwiftUI
 import XCTest
 
@@ -1618,6 +1619,50 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
     }
 }
 
+/// Records entry into the forbidden hydration boundary, separately from provider factories.
+private struct SidebarHydrationRecorder: WorkspaceRestorePerfRecording {
+    let attempts: LifecycleRecorder
+    private let fallback = NoopWorkspaceRestorePerfRecorder()
+    var isEnabled: Bool {
+        true
+    }
+
+    func timestampMSIfEnabled() -> Double? {
+        fallback.timestampMS()
+    }
+
+    func timestampMS() -> Double {
+        fallback.timestampMS()
+    }
+
+    func elapsedMS(since startMS: Double) -> Double {
+        fallback.elapsedMS(since: startMS)
+    }
+
+    func formatMS(_ value: Double) -> String {
+        fallback.formatMS(value)
+    }
+
+    func formatElapsedMS(since startMS: Double) -> String {
+        fallback.formatElapsedMS(since: startMS)
+    }
+
+    func shortID(_ id: UUID?) -> String {
+        fallback.shortID(id)
+    }
+
+    @MainActor func nextAgentActivationTrueCount() -> Int {
+        0
+    }
+
+    func log(_: @autoclosure () -> String) {}
+    func event(_ name: String, fields: [String: String]) {
+        if name == "agentSessionHydration.loadTask" {
+            attempts.record(fields["outcome"] ?? "unknown")
+        }
+    }
+}
+
 /// Full sidebar construction and native opening, not supplied-props item-builder coverage.
 @MainActor
 final class AgentSidebarHostedContextMenuTests: XCTestCase {
@@ -1626,11 +1671,14 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let tabs: [ComposeTabState]
         let host: NSHostingView<AgentModeSessionsSidebarView>
         let window: NSWindow
+        let providerAttempts: LifecycleRecorder
+        let hydrationAttempts: LifecycleRecorder
         var vm: AgentModeViewModel {
             state.agentModeViewModel
         }
     }
 
+    private enum UnexpectedProviderLaunch: Error { case refused }
     private enum Opening { case rightClick, controlClick, accessibility }
 
     @MainActor private final class SubmenuOpeningObserver: NSObject, NSMenuDelegate {
@@ -1841,6 +1889,141 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertTrue(linked.items.contains { $0.title == AgentOversightUICopy.overseeingSectionLabel }, "Previous menu remains a value snapshot")
     }
 
+    func testMenuOpeningLeavesColdPersistedRowUnloaded() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let tabID = fixture.tabs[0].id
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
+        let provider = try mountedRegion(in: fixture).itemsProvider
+        let persisted = fixture.vm.session(for: tabID)
+        persisted.selectedAgent = .devin
+        persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
+        persisted.providerSessionID = "hosted-existing-acp-session"
+        await fixture.vm.flushSave(for: tabID)
+        // Keep ordinary active-chat ownership away from this cold menu target.
+        fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
+        fixture.vm.test_removeSession(tabID: tabID)
+        let hydrationBefore = fixture.hydrationAttempts.events
+        fixture.vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        _ = provider()
+        await settleHostedPublication(in: fixture)
+        XCTAssertNil(fixture.vm.sessions[tabID], "Opening a menu must not mount or hydrate a persisted row")
+        XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: menu repair must not enter hydration")
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Cold persisted rows must not request a provider")
+    }
+
+    func testMenuOpeningRepairsLoadedNilBindingWithoutHydration() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let tabID = fixture.tabs[0].id
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let session = fixture.vm.session(for: tabID)
+        let region = try mountedRegion(in: fixture)
+        let provider = region.itemsProvider
+        session.selectedAgent = .devin
+        session.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
+        session.providerSessionID = "hosted-existing-acp-session"
+        XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive)
+        await fixture.vm.flushSave(for: tabID)
+        let retired = try menuProps(in: fixture).targetEndpoint
+        let items = session.items
+        let revision = session.sourceItemsRevision
+        await fixture.vm.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+        fixture.vm.test_publishTranscriptPresentation(tabID: tabID)
+        let presentation = fixture.vm.activeTranscriptPresentation
+        let hydrationBefore = fixture.hydrationAttempts.events
+        XCTAssertFalse(presentation.visibleRows.isEmpty, "Exercise an already-displayed active transcript")
+        await recoverByOpening(provider, in: fixture, sessionID: sessionID) {
+            session.testInstallPersistentSessionBinding(sessionID: nil)
+            XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
+        }
+        XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive, "Menu recovery must not acquire discovery interest")
+        XCTAssertTrue(fixture.vm.sessions[tabID] === session, "Repair the retained entry through its normal binding installer")
+        let menu = try menuProps(in: fixture)
+        XCTAssertEqual(menu.targetSessionID, sessionID)
+        XCTAssertNotEqual(menu.targetEndpoint, retired)
+        let reopened = NSMenu.stableMenu(from: provider())
+        let choices = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
+        XCTAssertNotEqual(choices.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
+        XCTAssertTrue(try mountedRegion(in: fixture) === region)
+        XCTAssertEqual(fixture.vm.activeTranscriptPresentation.visibleRows, presentation.visibleRows)
+        XCTAssertEqual(fixture.vm.activeTranscriptPresentation.visibleBlocks, presentation.visibleBlocks)
+        XCTAssertFalse(fixture.vm.activeTranscriptPresentation.bindingsHydrated, "Presentation must not inherit retired hydration authority")
+        XCTAssertEqual(session.sourceItemsRevision, revision, "Identity repair must not replace loaded content")
+        XCTAssertEqual(session.items.map(\.text), items.map(\.text))
+        XCTAssertNil(session.persistedLoadTask)
+        XCTAssertTrue(session.hasLoadedPersistedState)
+        XCTAssertFalse(session.qualifiedRestorationReadiness.isAuthoritative, "A repaired identity cannot earn hydration proof")
+        XCTAssertEqual(session.selectedAgent, .devin)
+        XCTAssertEqual(session.providerSessionID, "hosted-existing-acp-session")
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: identity repair must not enter hydration")
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Nil-binding repair must not resume a provider")
+    }
+
+    func testSidebarPreparationRejectsStaleClaimsAndInProgressRebinding() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let hydrationBefore = fixture.hydrationAttempts.events
+        let vm = fixture.vm
+        let tabID = fixture.tabs[0].id
+        let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let session = vm.session(for: tabID)
+        XCTAssertTrue(AgentSessionLinkRuntimeBridge.shared.canPrepareSidebarSession(.init(
+            windowID: fixture.state.windowID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
+        )), "This registered fixture must exercise the binding guards, not fail host qualification")
+        session.testInstallPersistentSessionBinding(sessionID: nil)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: UUID(), workspaceID: workspaceID)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: UUID())
+        XCTAssertNil(session.activeAgentSessionID)
+        session.items.append(AgentChatItem(kind: .user, text: "Unsaved retained change"))
+        session.isDirty = true
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID)
+        XCTAssertEqual(session.items.last?.text, "Unsaved retained change")
+        XCTAssertNil(session.persistedLoadTask, "Dirty retained state must not be overwritten by disk hydration")
+        session.isDirty = false
+        session.hasLoadedPersistedState = false
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID, "Cold retained state must not be rebound or hydrated")
+        XCTAssertNil(session.persistedLoadTask)
+        session.hasLoadedPersistedState = true
+        let ownership = session.beginRunAttempt(source: "hosted-fixture")
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID, "Idle run ownership still blocks repair")
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        _ = session.endRunAttempt(ifCurrent: ownership, source: "hosted-fixture")
+        let transition = session.beginPersistentBindingTransition()
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertNil(session.activeAgentSessionID, "Never replace an in-progress transition")
+        session.finishPersistentBindingTransition(generation: transition)
+        let replacementID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: replacementID)
+        vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
+        XCTAssertEqual(session.activeAgentSessionID, replacementID, "Never steal a conflicting live binding")
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: refused repair must not enter hydration")
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Refused repair must not request a provider")
+    }
+
+    private func recoverByOpening(
+        _ provider: () -> [StableMenuItem], in fixture: Fixture, sessionID: UUID,
+        invalidate: () -> Void
+    ) async {
+        let installed = expectation(description: "Normal binding installer publishes recovery")
+        let token = NotificationCenter.default.publisher(for: .agentSessionBindingDidChange)
+            .filter { note in
+                note.object as? AgentModeViewModel === fixture.vm
+                    && note.userInfo?["tabID"] as? UUID == fixture.tabs[0].id
+                    && note.userInfo?["sessionID"] as? UUID == sessionID
+            }
+            .prefix(1).sink { _ in installed.fulfill() }
+        defer { token.cancel() }
+        invalidate() // Observe before synchronous sidebar publication can remount the entry.
+        _ = provider() // Retained native opening must schedule the preparation itself.
+        await fulfillment(of: [installed], timeout: 3)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        await settleHostedPublication(in: fixture)
+    }
+
     func testColdProviderReadsReadyProjectionOnReopenWithoutRemount() async throws {
         let fixture = try await makeFixture(peerCount: 1)
         let otherWindow = try await makeFixture(peerCount: 1)
@@ -2009,9 +2192,51 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 else { UserDefaults.standard.removeObject(forKey: key) }
             }
         }
-        let state = WindowState()
+        let providerAttempts = LifecycleRecorder()
+        let hydrationAttempts = LifecycleRecorder()
+        let state = WindowState(
+            agentModeViewModelFactory: { windowID, prompt, manager, server in
+                let vm = AgentModeViewModel(
+                    testWindowID: windowID,
+                    codexControllerFactory: { _, _, _, _, _, _ in
+                        providerAttempts.record("codex")
+                        return LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                    },
+                    claudeControllerFactory: { _, _, _, _ in
+                        providerAttempts.record("claude")
+                        return MonitorFakeNativeController()
+                    },
+                    headlessProviderFactory: { _, _ in
+                        providerAttempts.record("headless")
+                        return AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+                    },
+                    acpProviderFactory: { _, _ in
+                        providerAttempts.record("acp-provider")
+                        throw UnexpectedProviderLaunch.refused
+                    },
+                    acpControllerFactory: { _, _ in
+                        providerAttempts.record("acp-controller")
+                        throw UnexpectedProviderLaunch.refused
+                    },
+                    connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                    mcpRunRoutingCleaner: { _, _, _ in },
+                    mcpServerEnabler: { false },
+                    testMCPServer: server,
+                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore,
+                    testRestorePerfRecorder: SidebarHydrationRecorder(attempts: hydrationAttempts)
+                )
+                vm.promptManager = prompt
+                vm.workspaceManager = manager
+                return vm
+            },
+            contextBuilderProviderFactory: { _, _, _, _ in
+                providerAttempts.record("context-builder")
+                return AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+            }
+        )
         addTeardownBlock {
             await state.tearDown()
+            XCTAssertTrue(providerAttempts.events.isEmpty, "Hosted menu fixtures must never request a provider: \(providerAttempts.events)")
         }
         await state.workspaceManager.awaitInitialized()
         let tabs = (0 ... peerCount).map { index in
@@ -2030,6 +2255,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertEqual(switched, .switched)
         state.promptManager.loadComposeTabsFromWorkspace(workspace)
         let vm = state.agentModeViewModel
+        await vm.handleWorkspaceSwitch(workspace)
         vm.test_setCurrentTabIDOverride(tabs[0].id)
         _ = await vm.ensureSessionReady(tabID: tabs[0].id)
         XCTAssertEqual(vm.sidebarRuntimeWorkspaceID, workspace.id)
@@ -2071,7 +2297,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         window.makeKeyAndOrderFront(nil)
         host.layoutSubtreeIfNeeded()
         await Task.yield()
-        return Fixture(state: state, tabs: tabs, host: host, window: window)
+        return Fixture(state: state, tabs: tabs, host: host, window: window, providerAttempts: providerAttempts, hydrationAttempts: hydrationAttempts)
     }
 
     private func sidebar(for state: WindowState, tabID: UUID) -> AgentModeSessionsSidebarView {

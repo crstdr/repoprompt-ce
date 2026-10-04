@@ -1288,6 +1288,13 @@ final class AgentSessionLinkRuntimeBridge {
         noteTopologyMayHaveChanged()
     }
 
+    /// Qualifies passive row preparation without inventing an endpoint or accepting duplicate claims.
+    func canPrepareSidebarSession(_ descriptor: AgentSessionLinkComposeTabDescriptor) -> Bool {
+        guard !isFrozenForTermination, let host else { return false }
+        let claims = host.agentSessionLinkComposeTabDescriptors().filter { $0.sessionID == descriptor.sessionID }
+        return claims == [descriptor]
+    }
+
     /// Subscribes to the authoritative persistent-binding seam.
     ///
     /// `sessions.didSet` only sees a tab appearing or disappearing; it cannot see a tab that stays

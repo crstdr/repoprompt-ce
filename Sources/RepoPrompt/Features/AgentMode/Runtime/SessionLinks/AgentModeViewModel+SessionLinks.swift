@@ -988,7 +988,8 @@ extension AgentModeViewModel {
         expectedSessionID: UUID?,
         diagnoseUnavailable: Bool = false
     ) -> AgentSidebarOversightMenuProps? {
-        let currentSessionID = sessions[tabID]?.activeAgentSessionID
+        let session = sessions[tabID]
+        let currentSessionID = session?.activeAgentSessionID
         func unavailable(_ reason: AgentSessionLinkMenuGuard) -> AgentSidebarOversightMenuProps? {
             if diagnoseUnavailable {
                 let now = ProcessInfo.processInfo.systemUptime
@@ -997,7 +998,9 @@ extension AgentModeViewModel {
                     sidebarOversightMenuDiagnosticTimes[tabID] = now
                     catalogDiagnosticsSink.record(.sidebarMenuUnavailable(
                         reason: reason, windowID: windowID, tabID: tabID,
-                        expectedSessionID: expectedSessionID, currentSessionID: currentSessionID
+                        expectedSessionID: expectedSessionID, currentSessionID: currentSessionID,
+                        tabPresent: session != nil,
+                        bindingNil: session != nil && session?.persistentSessionBindingIdentity == nil
                     ))
                 }
             }

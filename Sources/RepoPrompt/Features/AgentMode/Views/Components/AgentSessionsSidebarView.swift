@@ -617,6 +617,14 @@ struct AgentModeSessionsListView: View {
                         let creator = session.sessionID.flatMap {
                             agentModeVM.agentSidebarLaneCreator(tabID: session.tabID, expectedSessionID: $0)
                         }
+                        let prepareOversight: @MainActor () -> Void = {
+                            guard let sessionID = session.sessionID, let workspaceID = snapshot.workspaceID,
+                                  agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+                            else { return }
+                            agentModeVM.prepareSidebarOversightSession(
+                                tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID
+                            )
+                        }
 
                         AgentSessionRow(
                             title: session.title,
@@ -707,6 +715,7 @@ struct AgentModeSessionsListView: View {
                                     diagnoseUnavailable: true
                                 )
                             },
+                            prepareSidebarOversightMenu: prepareOversight,
                             sidebarOversightUnavailableReason: session.sessionID == nil
                                 ? AgentOversightUICopy.oversightAvailableAfterFirstMessage
                                 : nil,
@@ -747,6 +756,7 @@ struct AgentModeSessionsListView: View {
                             },
                             sessionIDCopyAction: .systemClipboard(sessionID: session.sessionID)
                         )
+                        .task(id: session.sessionID) { prepareOversight() }
                     }
 
                     if snapshot.hasMoreSessions {
