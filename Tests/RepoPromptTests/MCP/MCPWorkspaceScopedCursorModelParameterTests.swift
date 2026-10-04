@@ -833,7 +833,9 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
                 XCTAssertEqual(row["recommended_model_id"]?.stringValue, autoID, role)
                 XCTAssertNotNil(row["model_id"]?.stringValue, role)
             }
-            if rolesOnly { XCTAssertNil(roleList.objectValue?["agents"]) }
+            if rolesOnly {
+                XCTAssertNil(roleList.objectValue?["agents"])
+            }
         }
 
         CursorDiscoveredCatalogTestSupport.seedStandardCatalog()
@@ -873,7 +875,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         XCTAssertEqual(resumedParameters.compactMap { $0.objectValue?["base_model"]?.stringValue }, ["grok-4.6", "grok-4.6"])
     }
 
-    func testAgentRunStartRejectsUnknownReleaseCatalogParameter() async throws {
+    func testAgentRunStartRejectsUnknownRuntimeCatalogParameter() async throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
         let window = try await makeWindow(name: "Cursor MCP Run", root: fixture.root)
@@ -899,6 +901,20 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let window = try await makeWindow(name: "Cursor MCP Successful Run", root: fixture.root)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         var stagedSelections: [ACPModelParameterSelection] = []
+        // Runtime membership is authoritative; this success fixture must advertise the
+        // canonical target of the legacy Composer alias rather than rely on static entries.
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [.init(rawValue: "composer-2.5", displayName: "Composer 2.5", description: nil, isDefault: true)],
+                currentModelRaw: "composer-2.5",
+                modelParameterSets: [.init(baseModelRaw: "composer-2.5", parameters: [
+                    .init(kind: .speed, configID: "fast", displayName: "Speed", choices: [
+                        .init(rawValue: "false", displayName: "Standard"),
+                        .init(rawValue: "true", displayName: "Fast")
+                    ], currentValueRaw: "false")
+                ])]
+            ), for: .cursor
+        )
         let service = makeRunService(
             window: window,
             successfulStart: true,

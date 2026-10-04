@@ -57,7 +57,7 @@ struct AgentSessionLinkListCursor: Equatable {
 /// observer session UUID solely to disambiguate an already-authorized inbound grant.
 @MainActor
 struct AgentSessionLinkMCPToolService {
-    typealias RequestMetadata = MCPServerViewModel.RequestMetadata
+    typealias RequestMetadata = MCPRequestMetadata
     typealias HeartbeatOperation = AgentRunMCPToolService.HeartbeatOperation
     typealias ObserverEndpointResolver = AgentSessionTargetOperationGuard.ObserverEndpointResolver
 
@@ -649,7 +649,7 @@ struct AgentSessionLinkMCPToolService {
             resolveDestination: {
                 AgentSessionLaneMCPToolService.resolveDestination(
                     workspaceSelector: workspaceSelector, callerWindow: callerWindow
-                ).map { (windowID: $0.windowID, workspaceID: $0.workspaceID) }
+                ).map { (windowID: $0.windowID, workspaceID: $0.workspaceID, workspaceName: $0.workspaceName) }
             }
         )
         if receipt.reason == .denied { throw Self.unavailableError }
