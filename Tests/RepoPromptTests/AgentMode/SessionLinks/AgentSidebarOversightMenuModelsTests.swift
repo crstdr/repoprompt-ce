@@ -3,6 +3,7 @@ import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import SwiftUI
 import XCTest
 
@@ -1618,6 +1619,50 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
     }
 }
 
+/// Records entry into the forbidden hydration boundary, separately from provider factories.
+private struct SidebarHydrationRecorder: WorkspaceRestorePerfRecording {
+    let attempts: LifecycleRecorder
+    private let fallback = NoopWorkspaceRestorePerfRecorder()
+    var isEnabled: Bool {
+        true
+    }
+
+    func timestampMSIfEnabled() -> Double? {
+        fallback.timestampMS()
+    }
+
+    func timestampMS() -> Double {
+        fallback.timestampMS()
+    }
+
+    func elapsedMS(since startMS: Double) -> Double {
+        fallback.elapsedMS(since: startMS)
+    }
+
+    func formatMS(_ value: Double) -> String {
+        fallback.formatMS(value)
+    }
+
+    func formatElapsedMS(since startMS: Double) -> String {
+        fallback.formatElapsedMS(since: startMS)
+    }
+
+    func shortID(_ id: UUID?) -> String {
+        fallback.shortID(id)
+    }
+
+    @MainActor func nextAgentActivationTrueCount() -> Int {
+        0
+    }
+
+    func log(_: @autoclosure () -> String) {}
+    func event(_ name: String, fields: [String: String]) {
+        if name == "agentSessionHydration.loadTask" {
+            attempts.record(fields["outcome"] ?? "unknown")
+        }
+    }
+}
+
 /// Full sidebar construction and native opening, not supplied-props item-builder coverage.
 @MainActor
 final class AgentSidebarHostedContextMenuTests: XCTestCase {
@@ -1627,6 +1672,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let host: NSHostingView<AgentModeSessionsSidebarView>
         let window: NSWindow
         let providerAttempts: LifecycleRecorder
+        let hydrationAttempts: LifecycleRecorder
         var vm: AgentModeViewModel {
             state.agentModeViewModel
         }
@@ -1857,11 +1903,13 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         // Keep ordinary active-chat ownership away from this cold menu target.
         fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
         fixture.vm.test_removeSession(tabID: tabID)
+        let hydrationBefore = fixture.hydrationAttempts.events
         fixture.vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
         _ = provider()
         await settleHostedPublication(in: fixture)
         XCTAssertNil(fixture.vm.sessions[tabID], "Opening a menu must not mount or hydrate a persisted row")
         XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: menu repair must not enter hydration")
         XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Cold persisted rows must not request a provider")
     }
 
@@ -1883,6 +1931,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         await fixture.vm.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
         fixture.vm.test_publishTranscriptPresentation(tabID: tabID)
         let presentation = fixture.vm.activeTranscriptPresentation
+        let hydrationBefore = fixture.hydrationAttempts.events
         XCTAssertFalse(presentation.visibleRows.isEmpty, "Exercise an already-displayed active transcript")
         await recoverByOpening(provider, in: fixture, sessionID: sessionID) {
             session.testInstallPersistentSessionBinding(sessionID: nil)
@@ -1907,11 +1956,13 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertFalse(session.qualifiedRestorationReadiness.isAuthoritative, "A repaired identity cannot earn hydration proof")
         XCTAssertEqual(session.selectedAgent, .devin)
         XCTAssertEqual(session.providerSessionID, "hosted-existing-acp-session")
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: identity repair must not enter hydration")
         XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Nil-binding repair must not resume a provider")
     }
 
     func testSidebarPreparationRejectsStaleClaimsAndInProgressRebinding() async throws {
         let fixture = try await makeFixture(peerCount: 1)
+        let hydrationBefore = fixture.hydrationAttempts.events
         let vm = fixture.vm
         let tabID = fixture.tabs[0].id
         let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
@@ -1949,6 +2000,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         session.testInstallPersistentSessionBinding(sessionID: replacementID)
         vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
         XCTAssertEqual(session.activeAgentSessionID, replacementID, "Never steal a conflicting live binding")
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: refused repair must not enter hydration")
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Refused repair must not request a provider")
     }
 
     private func recoverByOpening(
@@ -2140,6 +2193,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             }
         }
         let providerAttempts = LifecycleRecorder()
+        let hydrationAttempts = LifecycleRecorder()
         let state = WindowState(
             agentModeViewModelFactory: { windowID, prompt, manager, server in
                 let vm = AgentModeViewModel(
@@ -2168,7 +2222,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                     mcpRunRoutingCleaner: { _, _, _ in },
                     mcpServerEnabler: { false },
                     testMCPServer: server,
-                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore,
+                    testRestorePerfRecorder: SidebarHydrationRecorder(attempts: hydrationAttempts)
                 )
                 vm.promptManager = prompt
                 vm.workspaceManager = manager
@@ -2242,7 +2297,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         window.makeKeyAndOrderFront(nil)
         host.layoutSubtreeIfNeeded()
         await Task.yield()
-        return Fixture(state: state, tabs: tabs, host: host, window: window, providerAttempts: providerAttempts)
+        return Fixture(state: state, tabs: tabs, host: host, window: window, providerAttempts: providerAttempts, hydrationAttempts: hydrationAttempts)
     }
 
     private func sidebar(for state: WindowState, tabID: UUID) -> AgentModeSessionsSidebarView {
