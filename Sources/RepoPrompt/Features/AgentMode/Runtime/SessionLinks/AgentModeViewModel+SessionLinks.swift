@@ -1000,7 +1000,11 @@ extension AgentModeViewModel {
                         reason: reason, windowID: windowID, tabID: tabID,
                         expectedSessionID: expectedSessionID, currentSessionID: currentSessionID,
                         tabPresent: session != nil,
-                        bindingNil: session != nil && session?.persistentSessionBindingIdentity == nil
+                        bindingNil: session != nil && session?.persistentSessionBindingIdentity == nil,
+                        rowIsCurrentTab: currentTabID == tabID,
+                        vmIsRegisteredWindowVM: sidebarMenuIsRegisteredWindowVM(),
+                        runtimeEntryEverRemoved: sidebarRemovedRuntimeTabIDs.contains(tabID)
+                            ? true : (sidebarRuntimeRemovalHistoryOverflowed ? nil : false)
                     ))
                 }
             }
