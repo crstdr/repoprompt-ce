@@ -65,7 +65,10 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
         let workspace = try makeTestDirectory(name: "CursorRefreshTests")
         let provider = try CursorDiscoveryFakeProvider(commandPath: makeServerScript(in: workspace).path)
         let service = CursorACPModelPollingService(client: CursorACPControllerModelDiscoveryClient(
-            providerFactory: { _, _ in provider }
+            providerFactory: { _, _ in provider },
+            controllerFactory: { provider, request in
+                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+            }
         ))
         let result = await service.refreshCatalog(workspacePath: workspace.path)
         XCTAssertTrue(result.isReady)
@@ -262,7 +265,9 @@ private actor RetryingCursorDiscoveryClient: CursorACPModelDiscoveryClient {
 
     func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
         calls += 1
-        if calls == 1 { throw AIProviderError.invalidConfiguration(detail: "Discovery unavailable") }
+        if calls == 1 {
+            throw AIProviderError.invalidConfiguration(detail: "Discovery unavailable")
+        }
         return snapshot
     }
 }

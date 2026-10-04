@@ -1,6 +1,8 @@
 import Foundation
 
-/// Provider launches fail closed in XCTest, including release-mode test bundles.
+/// Provider launches fail closed in an in-process XCTest host, including nested test runners.
+/// Separate non-XCTest child processes are not guarded; user arguments and inherited test
+/// environment variables never establish test-host identity.
 /// Fixture-process tests opt in for one configured instance or task scope; no process-global
 /// environment toggle can authorize an unrelated test or a controller that lost its fake.
 package enum ProviderProcessLaunchPolicy {
@@ -12,16 +14,9 @@ package enum ProviderProcessLaunchPolicy {
         }
     }
 
-    private static let isXCTestProcess = ProcessInfo.processInfo.arguments.contains {
-        $0.lowercased().hasSuffix(".xctest") || $0.lowercased().contains(".xctest/")
-    }
-
-        || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
-        || ProcessInfo.processInfo.environment["XCTestSessionIdentifier"] != nil
-        || NSClassFromString("XCTestCase") != nil
-
     package static func check(allowsLaunchInTests: Bool = false) throws {
-        if isXCTestProcess, !allowsLaunchInTests, !allowsLaunchForTesting {
+        // Check at the launch boundary: XCTest can load after an earlier non-test lookup.
+        if NSClassFromString("XCTestCase") != nil, !allowsLaunchInTests, !allowsLaunchForTesting {
             throw Refusal()
         }
     }
