@@ -1,6 +1,5 @@
 import Combine
 import Foundation
-import OSLog
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
@@ -990,29 +989,27 @@ extension AgentModeViewModel {
         diagnoseUnavailable: Bool = false
     ) -> AgentSidebarOversightMenuProps? {
         let currentSessionID = sessions[tabID]?.activeAgentSessionID
-        func unavailable(_ reason: String) -> AgentSidebarOversightMenuProps? {
+        func unavailable(_ reason: AgentSessionLinkMenuGuard) -> AgentSidebarOversightMenuProps? {
             if diagnoseUnavailable {
                 let now = ProcessInfo.processInfo.systemUptime
                 sidebarOversightMenuDiagnosticTimes = sidebarOversightMenuDiagnosticTimes.filter { now - $0.value < 60 }
                 if sidebarOversightMenuDiagnosticTimes[tabID] == nil {
                     sidebarOversightMenuDiagnosticTimes[tabID] = now
-                    let expected = expectedSessionID.map { String($0.uuidString.prefix(8)) } ?? "nil"
-                    let current = currentSessionID.map { String($0.uuidString.prefix(8)) } ?? "nil"
-                    let window = windowID
-                    Logger(subsystem: "com.repoprompt.agents", category: "sidebar-oversight-menu").notice(
-                        "oversight_menu_unavailable guard=\(reason, privacy: .public) window=\(window, privacy: .public) tab=\(String(tabID.uuidString.prefix(8)), privacy: .public) expected=\(expected, privacy: .public) current=\(current, privacy: .public) same_uuid=\(currentSessionID != nil && expectedSessionID == currentSessionID)"
-                    )
+                    catalogDiagnosticsSink.record(.sidebarMenuUnavailable(
+                        reason: reason, windowID: windowID, tabID: tabID,
+                        expectedSessionID: expectedSessionID, currentSessionID: currentSessionID
+                    ))
                 }
             }
             return nil
         }
-        guard let expectedID = expectedSessionID, currentSessionID != nil else { return unavailable("session_uuid_missing") }
+        guard let expectedID = expectedSessionID, currentSessionID != nil else { return unavailable(.sessionUUIDMissing) }
         guard let endpoint = agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: expectedID)
-        else { return unavailable("endpoint_missing") }
-        guard let props = monitorPillPropsByEndpoint[endpoint] else { return unavailable("projection_missing") }
-        guard props.endpoint == endpoint else { return unavailable("enclosing_endpoint_mismatch") }
-        guard let menu = props.sidebarOversightMenu else { return unavailable("inner_menu_nil") }
-        guard menu.targetEndpoint == endpoint, menu.targetSessionID == expectedID else { return unavailable("target_mismatch") }
+        else { return unavailable(.endpointMissing) }
+        guard let props = monitorPillPropsByEndpoint[endpoint] else { return unavailable(.projectionMissing) }
+        guard props.endpoint == endpoint else { return unavailable(.enclosingEndpointMismatch) }
+        guard let menu = props.sidebarOversightMenu else { return unavailable(.innerMenuNil) }
+        guard menu.targetEndpoint == endpoint, menu.targetSessionID == expectedID else { return unavailable(.targetMismatch) }
         // The stored projection carries lifecycle-only eligibility; overlay the shared
         // persistence blocker so the inverse menu's greyed reason matches the pill's Add reason.
         return menu.withObserverIneligibleReason(
