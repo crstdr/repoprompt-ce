@@ -32,7 +32,8 @@ package enum AgentSessionLinkCatalogOutcome: String, Equatable, Sendable {
 package enum AgentSessionLinkCatalogEvent: Sendable {
     case sidebarMenuUnavailable(
         reason: AgentSessionLinkMenuGuard, windowID: Int, tabID: UUID,
-        expectedSessionID: UUID?, currentSessionID: UUID?
+        expectedSessionID: UUID?, currentSessionID: UUID?,
+        tabPresent: Bool, bindingNil: Bool
     )
     case catalogPublished(
         runID: UUID,

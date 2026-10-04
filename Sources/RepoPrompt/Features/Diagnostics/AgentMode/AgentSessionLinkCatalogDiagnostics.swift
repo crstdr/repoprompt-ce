@@ -74,14 +74,15 @@ enum AgentSessionLinkCatalogDiagnostics {
     /// Native menu opening only; the caller applies the shared per-row/minute limit.
     static func sidebarMenuUnavailable(
         reason: AgentSessionLinkMenuGuard, windowID: Int, tabID: UUID,
-        expectedSessionID: UUID?, currentSessionID: UUID?
+        expectedSessionID: UUID?, currentSessionID: UUID?,
+        tabPresent: Bool, bindingNil: Bool
     ) {
         let tab = hashedID(tabID)
         let expected = hashedID(expectedSessionID)
         let current = hashedID(currentSessionID)
         let sameUUID = currentSessionID != nil && expectedSessionID == currentSessionID
         logger.notice(
-            "event=sidebar-menu-unavailable guard=\(reason.rawValue, privacy: .public) window=\(windowID, privacy: .public) tab=\(tab, privacy: .public) expected=\(expected, privacy: .public) current=\(current, privacy: .public) same_uuid=\(sameUUID)"
+            "event=sidebar-menu-unavailable guard=\(reason.rawValue, privacy: .public) window=\(windowID, privacy: .public) tab=\(tab, privacy: .public) expected=\(expected, privacy: .public) current=\(current, privacy: .public) same_uuid=\(sameUUID) tab_present=\(tabPresent, privacy: .public) binding_nil=\(bindingNil, privacy: .public)"
         )
     }
 
@@ -224,10 +225,11 @@ enum AgentSessionLinkCatalogDiagnostics {
 struct AppAgentSessionLinkCatalogEventSink: AgentSessionLinkCatalogEventSink {
     func record(_ event: AgentSessionLinkCatalogEvent) {
         switch event {
-        case let .sidebarMenuUnavailable(reason, windowID, tabID, expectedSessionID, currentSessionID):
+        case let .sidebarMenuUnavailable(reason, windowID, tabID, expectedSessionID, currentSessionID, tabPresent, bindingNil):
             AgentSessionLinkCatalogDiagnostics.sidebarMenuUnavailable(
                 reason: reason, windowID: windowID, tabID: tabID,
-                expectedSessionID: expectedSessionID, currentSessionID: currentSessionID
+                expectedSessionID: expectedSessionID, currentSessionID: currentSessionID,
+                tabPresent: tabPresent, bindingNil: bindingNil
             )
         case let .catalogPublished(runID, tabID, connectionID, revision, routingGeneration, lifecycleGeneration, routePresent, catalog, outbound):
             AgentSessionLinkCatalogDiagnostics.catalogPublished(
