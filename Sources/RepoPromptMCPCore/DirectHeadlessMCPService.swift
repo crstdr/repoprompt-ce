@@ -343,21 +343,20 @@ package actor DirectHeadlessMCPService {
             return ListTools.Result(tools: tools)
         }
 
-        let callToolHandler: @Sendable (CallTool.Parameters) async throws -> CallTool.Result = { params in
-            let toolName = MCPDomainToolCatalog.canonicalCallName(for: params.name)
-            guard visibleNames.contains(toolName) else {
+        await server.withMethodHandler(CallTool.self) { params in
+            guard visibleNames.contains(params.name) else {
                 return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
             }
             do {
                 let arguments = try Self.validatedCallArguments(
-                    toolName: toolName,
+                    toolName: params.name,
                     arguments: params.arguments ?? [:]
                 )
-                let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(toolName)
+                let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(params.name)
                     ? .application
                     : .standalone(id: prepared.scopeID)
                 let resolution = try await prepared.runtime.domainHost.resolve(
-                    toolName: toolName,
+                    toolName: params.name,
                     scope: scope
                 )
                 let invocationID = UUID()
@@ -375,12 +374,7 @@ package actor DirectHeadlessMCPService {
                 ))
                 return Self.successResult(result)
             } catch {
-                return Self.errorResult(Self.wireMessage(for: MCPDomainSelfToolCallContext.errorForPresentation(error)))
-            }
-        }
-        await server.withMethodHandler(CallTool.self) { params in
-            try await MCPDomainSelfToolCallContext.withRequestedName(params.name) {
-                try await callToolHandler(params)
+                return Self.errorResult(Self.wireMessage(for: error))
             }
         }
     }

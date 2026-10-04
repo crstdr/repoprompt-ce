@@ -485,6 +485,7 @@ final class StableMenuContextView: NSView {
               window != nil,
               event.window === window,
               !isHiddenOrHasHiddenAncestor,
+              bounds.contains(point),
               // `visibleRect` folds in clip-view clipping: a row scrolled out of a
               // non-lazy sidebar VStack keeps its bounds but has no visible slice,
               // so it must not steal clicks belonging to the content drawn there.
