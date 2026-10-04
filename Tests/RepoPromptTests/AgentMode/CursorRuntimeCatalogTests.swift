@@ -116,7 +116,9 @@ final class CursorRuntimeCatalogTests: XCTestCase {
             ACPModelParameterIdentity(providerID: .cursor, baseModelRaw: raws[0], kind: .thinking),
             ACPModelParameterIdentity(providerID: .cursor, baseModelRaw: raws[1], kind: .thinking)
         )
-        XCTAssertEqual(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: raws[1])?.parameters.first?.configID, raws[0])
+        let canonical = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: raws[0])
+        XCTAssertEqual(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: raws[1]), canonical)
+        XCTAssertEqual(canonical?.parameters.first?.configID, raws.sorted().first)
     }
 
     func testBracketIdentityIsStableAcrossAdvertisementAndAutoNeverExposesParameters() {
