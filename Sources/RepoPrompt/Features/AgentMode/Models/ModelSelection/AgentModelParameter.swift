@@ -1,61 +1,5 @@
 import Foundation
 
-enum ACPModelParameterKind: String, Codable, Hashable, CaseIterable {
-    case thinking
-    case speed
-
-    var sortOrder: Int {
-        switch self {
-        case .thinking: 0
-        case .speed: 1
-        }
-    }
-}
-
-struct ACPModelParameterChoice: Codable, Hashable {
-    let rawValue: String
-    let displayName: String
-    let description: String?
-
-    init(rawValue: String, displayName: String, description: String? = nil) {
-        self.rawValue = rawValue
-        self.displayName = displayName
-        self.description = description
-    }
-}
-
-struct ACPModelParameterDefinition: Codable, Hashable {
-    let kind: ACPModelParameterKind
-    let configID: String
-    let displayName: String
-    let choices: [ACPModelParameterChoice]
-    let currentValueRaw: String
-
-    func choice(matching requestedValue: String) -> ACPModelParameterChoice? {
-        if let exact = choices.first(where: { $0.rawValue == requestedValue }) {
-            return exact
-        }
-        let matches = choices.filter {
-            $0.rawValue.caseInsensitiveCompare(requestedValue) == .orderedSame
-        }
-        return matches.count == 1 ? matches[0] : nil
-    }
-}
-
-struct ACPModelParameterSet: Codable, Hashable {
-    let baseModelRaw: String
-    let parameters: [ACPModelParameterDefinition]
-
-    func definition(configID: String) -> ACPModelParameterDefinition? {
-        parameters.first { $0.configID == configID }
-    }
-
-    func definition(kind: ACPModelParameterKind) -> ACPModelParameterDefinition? {
-        let matches = parameters.filter { $0.kind == kind }
-        return matches.count == 1 ? matches[0] : nil
-    }
-}
-
 struct ACPModelParameterSelection: Codable, Hashable {
     let providerID: ACPProviderID
     let baseModelRaw: String
@@ -175,7 +119,9 @@ enum ACPModelParameterResolver {
         return resolve(
             parameterSet: parameterSet,
             providerID: providerID,
-            persistedSelections: persistedSelections
+            persistedSelections: providerID == .cursor
+                ? effectiveSelections(providerID: providerID, selectedModelRaw: selectedModelRaw, persistedSelections: persistedSelections)
+                : persistedSelections
         )
     }
 
@@ -193,12 +139,11 @@ enum ACPModelParameterResolver {
             let saved = persistedSelections.last { selection in
                 selection.identity == definitionIdentity
             }
-            // OpenCode must show unsupported saved intent, not a default that the next run
-            // will never use. Cursor deliberately retains its existing display fallback.
+            // Show unsupported saved intent, not a default the next run will never use.
             let savedChoice = saved.flatMap { selection in
                 definition.choice(matching: selection.valueRaw)
                     ?? (
-                        providerID == .openCode || providerID == .devin
+                        providerID == .openCode || providerID == .devin || providerID == .cursor
                             ? ACPModelParameterChoice(rawValue: selection.valueRaw, displayName: selection.valueRaw)
                             : nil
                     )
@@ -277,10 +222,18 @@ enum ACPModelParameterResolver {
         selectedModelRaw: String,
         persistedSelections: [ACPModelParameterSelection]
     ) -> [ACPModelParameterSelection] {
-        ACPModelParameterSelection.selections(
+        var selections = persistedSelections
+        if providerID == .cursor,
+           let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: selectedModelRaw),
+           let encoded = try? specifier.selections(in: AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor), ignoringUnavailable: true)
+        {
+            // A later explicit chip/session write supersedes the model-string's inherited pin.
+            selections = ACPModelParameterSelection.normalized(encoded.map { ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw) } + persistedSelections)
+        }
+        return ACPModelParameterSelection.selections(
             for: providerID,
             activeBaseModelRaw: selectedModelRaw,
-            from: persistedSelections
+            from: selections
         )
     }
 }

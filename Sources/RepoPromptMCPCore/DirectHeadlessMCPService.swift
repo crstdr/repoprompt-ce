@@ -56,15 +56,18 @@ package actor DirectHeadlessMCPService {
     private let logger: Logger
     private let environment: [String: String]
     private let currentDirectory: URL
+    private let allowsProviderProcessLaunchForTesting: Bool
 
     package init(
         logger: Logger = Logger(label: "com.repoprompt.ce.mcp.headless"),
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        currentDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        currentDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        allowsProviderProcessLaunchForTesting: Bool = false
     ) {
         self.logger = logger
         self.environment = environment
         self.currentDirectory = currentDirectory
+        self.allowsProviderProcessLaunchForTesting = allowsProviderProcessLaunchForTesting
     }
 
     package func run() async throws {
@@ -211,7 +214,8 @@ package actor DirectHeadlessMCPService {
                 runtime: runtime,
                 context: context,
                 settingsStore: settingsStore,
-                environment: environment
+                environment: environment,
+                allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting
             )
             let oracleStore = DomainOracleConversationStore(
                 persistence: runtime.persistenceCoordinator,
@@ -339,20 +343,21 @@ package actor DirectHeadlessMCPService {
             return ListTools.Result(tools: tools)
         }
 
-        await server.withMethodHandler(CallTool.self) { params in
-            guard visibleNames.contains(params.name) else {
+        let callToolHandler: @Sendable (CallTool.Parameters) async throws -> CallTool.Result = { params in
+            let toolName = MCPDomainToolCatalog.canonicalCallName(for: params.name)
+            guard visibleNames.contains(toolName) else {
                 return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
             }
             do {
                 let arguments = try Self.validatedCallArguments(
-                    toolName: params.name,
+                    toolName: toolName,
                     arguments: params.arguments ?? [:]
                 )
-                let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(params.name)
+                let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(toolName)
                     ? .application
                     : .standalone(id: prepared.scopeID)
                 let resolution = try await prepared.runtime.domainHost.resolve(
-                    toolName: params.name,
+                    toolName: toolName,
                     scope: scope
                 )
                 let invocationID = UUID()
@@ -370,7 +375,12 @@ package actor DirectHeadlessMCPService {
                 ))
                 return Self.successResult(result)
             } catch {
-                return Self.errorResult(Self.wireMessage(for: error))
+                return Self.errorResult(Self.wireMessage(for: MCPDomainSelfToolCallContext.errorForPresentation(error)))
+            }
+        }
+        await server.withMethodHandler(CallTool.self) { params in
+            try await MCPDomainSelfToolCallContext.withRequestedName(params.name) {
+                try await callToolHandler(params)
             }
         }
     }

@@ -9,6 +9,16 @@ import XCTest
 final class DevinPermissionLevelTests: XCTestCase {
     private typealias Level = DevinAgentToolPreferences.PermissionLevel
 
+    func testDefaultDiscoveryRefusesBeforeInstalledProviderSupportProbe() async {
+        // Exercise the real discovery runner, not a replacement controller factory.
+        let service = DevinModelDiscoveryService(isInstalled: { true })
+        let outcome = await service.discoverIfNeeded()
+        guard case let .failed(message) = outcome else {
+            return XCTFail("Default discovery must refuse before querying the installed provider")
+        }
+        XCTAssertTrue(message.hasPrefix("Provider process launch refused under XCTest."), message)
+    }
+
     // MARK: - PermissionLevel
 
     func testPickerOrderIsProviderDefaultFirstAndFullApprovalLast() {
@@ -95,7 +105,7 @@ final class DevinPermissionLevelTests: XCTestCase {
             config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false)
         )
         let request = makeRequest(workspacePath: directory.path)
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
         do {
             _ = try await controller.bootstrap()
             try await controller.prompt(AgentMessage(userMessage: "Read roots"), request: request)
@@ -158,7 +168,8 @@ final class DevinPermissionLevelTests: XCTestCase {
                 commandName: executable.path,
                 includeRepoPromptMCPServer: false
             )),
-            runRequest: request
+            runRequest: request,
+            allowsProviderProcessLaunchForTesting: true
         )
         do {
             _ = try await controller.bootstrap()
@@ -275,7 +286,8 @@ final class DevinPermissionLevelTests: XCTestCase {
                 commandName: executable.path,
                 includeRepoPromptMCPServer: false
             )),
-            runRequest: request
+            runRequest: request,
+            allowsProviderProcessLaunchForTesting: true
         )
         do {
             _ = try await controller.bootstrap()
@@ -353,7 +365,8 @@ final class DevinPermissionLevelTests: XCTestCase {
                     commandName: executable.path,
                     includeRepoPromptMCPServer: false
                 )),
-                runRequest: request
+                runRequest: request,
+                allowsProviderProcessLaunchForTesting: true
             )
             do {
                 _ = try await controller.bootstrap()
@@ -655,7 +668,9 @@ final class DevinPermissionLevelTests: XCTestCase {
         )
         let request = makeRequest(workspacePath: directory.path)
 
-        let support = try await provider.support(for: request)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await provider.support(for: request)
+        }
         XCTAssertEqual(support, .supported)
         let launch = try provider.makeLaunchConfiguration(for: request)
 
@@ -693,9 +708,9 @@ final class DevinPermissionLevelTests: XCTestCase {
         })
         let config = DevinAgentConfig(commandName: "devin", includeRepoPromptMCPServer: false)
 
-        let initialSupport = try await resolver.probeSupport(for: config)
+        let initialSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         XCTAssertEqual(initialSupport, .supported)
-        let secondProbe = Task { try await resolver.probeSupport(for: config) }
+        let secondProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
         await gate.waitForSecondCall()
         let resolved = Result { try resolver.resolvedLaunch(for: config) }
         await gate.releaseSecondCall()
@@ -989,7 +1004,8 @@ final class DevinPermissionLevelTests: XCTestCase {
                 commandName: executable.path,
                 includeRepoPromptMCPServer: false
             )),
-            runRequest: request
+            runRequest: request,
+            allowsProviderProcessLaunchForTesting: true
         )
         do {
             _ = try await controller.bootstrap()
@@ -1240,8 +1256,10 @@ final class DevinPermissionLevelTests: XCTestCase {
             // A sparse permission cannot borrow the old MCP metadata after that update.
             let shouldApprove = ["git", "manage_selection", "corroborated"].contains(scenario)
             do {
-                let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
-                for try await _ in stream {}
+                try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                    let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
+                    for try await _ in stream {}
+                }
                 XCTAssertTrue(shouldApprove, scenario)
             } catch {
                 XCTAssertFalse(shouldApprove, "\(scenario): \(error)")

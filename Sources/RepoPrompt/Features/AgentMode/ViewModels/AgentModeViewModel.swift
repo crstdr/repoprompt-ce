@@ -478,6 +478,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
+            for tabID in oldValue.keys where sessions[tabID] == nil {
+                if sidebarRemovedRuntimeTabIDs.count < 128 {
+                    sidebarRemovedRuntimeTabIDs.insert(tabID)
+                } else if !sidebarRemovedRuntimeTabIDs.contains(tabID) {
+                    sidebarRuntimeRemovalHistoryOverflowed = true
+                }
+            }
             rebuildAgentSessionLinkSubagentCensus(reconcileLiveObservers: true)
             syncSidebarUIState(refresh: true, reason: .sessionList)
             // One eager revocation hook covering every live-session removal path (tab close, stash,
@@ -599,6 +606,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ///
     /// Written only by `AgentModeViewModel+SessionLinks`; nothing else should mutate it.
     var monitorPillPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
+    /// Temporary live-menu diagnostic (remove after diagnosis); monotonic timestamps per row.
+    var sidebarOversightMenuDiagnosticTimes: [UUID: TimeInterval] = [:]
+    var sidebarMenuIsRegisteredWindowVM: @MainActor () -> Bool? = { nil }
+    // Bounded tab-key history for this VM lifetime; saturation means unknown, never cold.
+    var sidebarRemovedRuntimeTabIDs: Set<UUID> = []
+    var sidebarRuntimeRemovalHistoryOverflowed = false
     var sidebarCreatorDisplayNames: [UUID: String] = [:]
 
     /// In-memory palette-slot assignments for overseer sessions, reconciled inside the
@@ -662,8 +675,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// Test-only synchronous route fence for synthetic Codex catalog projections.
         var test_agentSessionLinkCurrentRunCatalogRouteToken:
             ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)?
-        /// Test-only suspension point after async catalog readiness and before Codex's final route fence.
-        var test_agentSessionLinkAfterProviderInputCatalogReadiness: (() async -> Void)?
+        /// Test-only suspension point after async route qualification and before Codex's final route fence.
+        var test_agentSessionLinkAfterProviderInputRouteReadiness: (() async -> Void)?
     #endif
 
     /// Endpoints whose prompt inventory is fenced while one or more membership writes that will change
@@ -1623,7 +1636,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func selectModel(rawModel: String) {
+        if rawModel == selectedModelRaw, selectedAgent.usesClaudeTooling,
+           let session = activeSession, canSelectModel(rawModel, for: session),
+           let effort = ClaudeModelSpecifier(raw: rawModel).explicitEffortLevel
+        {
+            setClaudeEffortLevel(effort)
+        }
         selectedModelRaw = rawModel
+    }
+
+    func canMutateCursorComposerModel(expectedSession: TabSession?, expectedTabID: UUID?) -> Bool {
+        guard let expectedSession, let session = activeSession,
+              session === expectedSession, session.tabID == expectedTabID,
+              !session.runState.isActive, !isMCPControlled(tabID: session.tabID)
+        else { return false }
+        return canSelectAgentInCurrentChat(.cursor)
     }
 
     func selectACPModelParameter(
@@ -1690,6 +1717,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         guard updatedSelections != session.acpModelParameterSelections else { return }
         session.acpModelParameterSelections = updatedSelections
+        session.isDirty = true
+        scheduleSave(for: session.tabID)
+        syncComposerUIState()
+        syncRunInteractionUIState()
+    }
+
+    func clearCursorModelParameter(_ identity: ACPModelParameterIdentity) {
+        guard selectedAgent == .cursor, identity.providerID == .cursor,
+              identity.canonicalBaseModelRaw == ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: .cursor),
+              let session = activeSession, !session.runState.isActive,
+              !isMCPControlled(tabID: session.tabID)
+        else { return }
+        var clearedModel: String?
+        if let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: selectedModelRaw), !specifier.overrides.isEmpty,
+           let definition = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: selectedModelRaw)?.definition(kind: identity.kind)
+        {
+            clearedModel = specifier.replacing(configID: definition.configID, valueRaw: nil)
+        }
+        session.recordAcceptedACPModelParameterWrite(ACPModelParameterResolver.effectiveSelections(providerID: .cursor, selectedModelRaw: selectedModelRaw, persistedSelections: session.acpModelParameterSelections).filter { $0.identity == identity })
+        let updated = session.acpModelParameterSelections.filter { $0.identity != identity }
+        guard updated != session.acpModelParameterSelections || (clearedModel != nil && clearedModel != selectedModelRaw) else { return }
+        if let clearedModel {
+            // Removing an override is not a new model selection. Preserve the same base model
+            // even if connectivity changed while this menu was open.
+            isRestoringState = true
+            selectedModelRaw = clearedModel
+            isRestoringState = false
+            session.selectedModelRaw = clearedModel
+            persistLastUsedModelIfNeeded(agent: .cursor, modelRaw: clearedModel)
+        }
+        session.acpModelParameterSelections = updated
         session.isDirty = true
         scheduleSave(for: session.tabID)
         syncComposerUIState()
@@ -2316,13 +2374,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prependPendingHandoff: { [weak self] text, session in
                 self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
             },
-            ensureAgentSessionLinkProviderInputCatalogReady: { [weak self] session in
+            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session in
                 guard let self else { return .unavailable }
-                return await ensureProviderInputCatalogReady(for: session)
+                return await qualifyProviderInputRoute(for: session)
             },
-            hasCurrentAgentSessionLinkProviderInputCatalogRoute: { [weak self] session in
+            hasCurrentAgentSessionLinkProviderInputRoute: { [weak self] session, qualification in
                 guard let self else { return false }
-                return agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session)
+                return agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification)
             },
             decorateAgentSessionLinkPrompt: { [weak self] text, session, dispatchID in
                 guard let self else {
@@ -4653,6 +4711,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            let indexEntry = ownerValidatedSessionIndex[sessionID]
         {
             seedUnhydratedSession(newSession, from: indexEntry)
+        } else if explicitActiveSessionID(for: tabID) == nil, newSession.selectedAgent.usesClaudeTooling {
+            newSession.selectedClaudeEffortRaw = newSession.selectedClaudeEffortRaw ?? providerBindingService.claudeEffortLevel(
+                forModelRaw: newSession.selectedModelRaw,
+                agentKind: newSession.selectedAgent
+            ).rawValue
         }
         if let draft = tabDraftText.removeValue(forKey: tabID) {
             newSession.draftText = draft
@@ -4936,6 +4999,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.selectedAgent = normalizedSelection.agent
         session.selectedModelRaw = normalizedSelection.modelRaw
         session.selectedReasoningEffortRaw = indexEntry.agentReasoningEffortRaw
+        session.selectedClaudeEffortRaw = session.selectedAgent.usesClaudeTooling
+            ? indexEntry.agentReasoningEffortRaw : nil
         session.acpModelParameterSelections = indexEntry.acpModelParameterSelections
         session.createdByOverseerSessionID = indexEntry.createdByOverseerSessionID
         session.autoEditEnabled = indexEntry.autoEditEnabled
@@ -5096,6 +5161,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         sessionID: UUID?
     ) {
+        // Native row providers capture the UUID from the sidebar's cached row.
+        // Publish identity changes even when no index refresh is in flight.
+        syncSidebarUIState(refresh: true, reason: .sessionList)
         guard let token = activeSessionIndexRefreshToken,
               sessionIndexStore.isOwnerCurrent(token.owner),
               activeSessionIndexRefreshValidTabIDs.contains(tabID)
@@ -5117,6 +5185,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         refreshSessionListCache(for: workspace, owner: token.owner)
+    }
+
+    /// Identity-only preparation of already-loaded state. Never mounts, hydrates, or resumes.
+    /// A repaired binding remains pending: menu activity cannot earn restoration authority.
+    func prepareSidebarOversightSession(tabID: UUID, sessionID: UUID, workspaceID: UUID) {
+        guard let session = sessions[tabID], session.activeAgentSessionID == nil,
+              session.hasLoadedPersistedState, session.persistedLoadTask == nil,
+              !session.bindingTransitionInProgress, !bindingHasSynchronousOwnership(session), !session.isDirty,
+              !Task.isCancelled, workspaceManager?.activeWorkspaceID == workspaceID,
+              agentSessionLinkComposeTabDescriptors().contains(where: {
+                  $0.tabID == tabID && $0.sessionID == sessionID && $0.workspaceID == workspaceID
+              }),
+              AgentSessionLinkRuntimeBridge.shared.canPrepareSidebarSession(.init(
+                  windowID: windowID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
+              )),
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+        else { return }
+        _ = installPersistentSessionBinding(
+            sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
+        )
+        if currentTabID == session.tabID {
+            publishTranscriptPresentation(from: session)
+        }
     }
 
     private enum PersistentSessionBindingMutationTarget {
@@ -5916,6 +6008,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         session.runState = payload.normalizedRunState
+        restoreClaudeEffort(from: agentSession, to: session)
         session.providerSessionID = agentSession.providerSessionID
         session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
@@ -8404,7 +8497,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             itemCount: max(session.transcriptCanonicalVisibleRowCount, session.items.count),
             agentKindRaw: session.selectedAgent.rawValue,
             agentModelRaw: session.selectedModelRaw,
-            agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
+            agentReasoningEffortRaw: session.persistedReasoningEffortRaw,
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.oversight.autoWakeOnUpdates,
             agentSessionLinkAutoWakeTargetSessionIDs: session.oversight.autoWakeTargetSessionIDs,
@@ -9447,6 +9540,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // All native providers preserve an explicit pin and clear a previous/inherited pin
             // when this request omits effort, symmetrically with the normalization exemption below.
             session.selectedReasoningEffortRaw = reasoningEffortRaw
+            session.selectedClaudeEffortRaw = reasoningEffortRaw
         } else if let reasoningEffortRaw {
             session.selectedReasoningEffortRaw = reasoningEffortRaw
         }
@@ -11967,6 +12061,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let nextControlsBinding = providerBindingService.controlsBinding(
             selectedAgent: session.selectedAgent,
             selectedModelRaw: session.selectedModelRaw,
+            claudeEffortLevel: session.selectedAgent.usesClaudeTooling
+                ? claudeCoordinator.currentClaudeEffortLevel(for: session) : nil,
             permissionProfile: session.permissionProfile,
             isSubagent: usesSubagentPolicy,
             externallyManagedReason: externallyManagedReason
@@ -15732,7 +15828,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             lastUserMessageAt: lastUserMessageAt,
             agentKind: session.selectedAgent.rawValue,
             agentModel: session.selectedModelRaw,
-            agentReasoningEffort: session.selectedReasoningEffortRaw,
+            agentReasoningEffort: session.persistedReasoningEffortRaw,
             acpModelParameterSelections: session.acpModelParameterSelections,
             lastRunState: session.runState.rawValue,
             providerSessionID: session.providerSessionID,
@@ -16916,15 +17012,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func waitingInstructionReadinessErrorMessage(
-        _ readiness: ProviderInputCatalogReadiness
+        _ readiness: ProviderInputRouteReadiness
     ) -> String {
         switch readiness {
-        case .timedOut:
-            "RepoPrompt MCP catalog readiness timed out. Your instruction was restored."
         case .unavailable:
-            "RepoPrompt MCP catalog readiness was unavailable. Your instruction was restored."
+            "RepoPrompt MCP route qualification was unavailable. Your instruction was restored."
         case .superseded:
-            "RepoPrompt MCP catalog readiness changed before dispatch. Your instruction was restored."
+            "RepoPrompt MCP route qualification changed before dispatch. Your instruction was restored."
         case .cancelled:
             "The instruction was cancelled before provider dispatch and was restored."
         case .notRequired, .ready:
@@ -17064,8 +17158,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return
             }
 
-            let readiness = await ensureProviderInputCatalogReady(for: session)
-            guard readiness == .ready || readiness == .notRequired else {
+            let readiness = await qualifyProviderInputRoute(for: session)
+            guard readiness.allowsDispatch else {
                 agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 rollbackWaitingInstructionSubmission(
                     tabID: tabID,
@@ -17083,7 +17177,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
                 return
             }
-            guard readiness != .ready || agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) else {
+            guard agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness) else {
                 agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 rollbackWaitingInstructionSubmission(
                     tabID: tabID,
@@ -17097,7 +17191,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
                     stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
-                    message: "RepoPrompt MCP catalog routing changed before provider dispatch. Your instruction was restored."
+                    message: "RepoPrompt MCP routing changed before provider dispatch. Your instruction was restored."
                 )
                 return
             }

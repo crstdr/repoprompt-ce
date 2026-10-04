@@ -540,11 +540,13 @@ final class GitViewModel: ObservableObject {
 
     func shutdownForWindowClose() async {
         prepareForWindowClose()
+        await statusActor.shutdown()
         let tasks = pendingWindowCloseTasks
         for task in tasks {
             await task.value
         }
         pendingWindowCloseTasks.removeAll()
+        await statusActor.invalidateUntrackedStats()
     }
 
     #if DEBUG
