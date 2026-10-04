@@ -337,6 +337,7 @@ actor CodeMapRootManifestStore {
     nonisolated let rootURL: URL
     private let policy: CodeMapRootManifestStorePolicy
     private let hooks: CodeMapRootManifestStoreHooks
+    private let globalCodeMapsDisabled: @Sendable () async -> Bool
     private let lockAnchor: ManifestDirectoryDescriptor
     private let accessEpochSeconds: @Sendable () -> UInt64
     private let writerAuthorityStoreID = UUID()
@@ -369,6 +370,7 @@ actor CodeMapRootManifestStore {
         rootURL: URL,
         policy: CodeMapRootManifestStorePolicy = .default,
         hooks: CodeMapRootManifestStoreHooks = .none,
+        globalCodeMapsDisabled: @escaping @Sendable () async -> Bool = { false },
         accessEpochSeconds: @escaping @Sendable () -> UInt64 = {
             UInt64(max(0, Date().timeIntervalSince1970))
         }
@@ -384,6 +386,7 @@ actor CodeMapRootManifestStore {
         self.rootURL = rootURL
         self.policy = policy
         self.hooks = hooks
+        self.globalCodeMapsDisabled = globalCodeMapsDisabled
         self.accessEpochSeconds = accessEpochSeconds
         let lockAnchor = try Self.openRootParent(rootURL)
         try Self.lock(lockAnchor.rawValue, operation: "manifest-anchor-lock")
@@ -963,6 +966,7 @@ actor CodeMapRootManifestStore {
         mergeExisting: Bool = false,
         removingRepositoryRelativePaths: Set<String> = []
     ) async throws -> CodeMapRootManifestWriteResult {
+        guard await !globalCodeMapsDisabled(), !Task.isCancelled else { throw CancellationError() }
         #if DEBUG
             let debugAttemptStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
             let debugMutationCount = debugAddingSaturating(
@@ -992,6 +996,9 @@ actor CodeMapRootManifestStore {
         try await waitForRegenerationBackpressure(namespace: namespace, authority: authority)
         let layout = try Self.openLayout(rootURL: rootURL, create: false)
         await hooks.beforeMaintenanceLock()
+        // This is the last suspension before synchronous persistence/reconciliation. Once
+        // entered, its scan cannot be preempted; no subsequent publication is admitted on ON.
+        guard await !globalCodeMapsDisabled(), !Task.isCancelled else { throw CancellationError() }
         try Self.lock(lockAnchor.rawValue, operation: "manifest-anchor-lock")
         defer { Self.unlock(lockAnchor.rawValue) }
         guard Self.rootParentIsCurrent(lockAnchor, rootURL: rootURL),
