@@ -262,6 +262,11 @@ enum WindowStateCompositionFactory {
             restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
             perfRecorder: AppAgentModePerfRecorder()
         )
+        agentModeViewModel.sidebarMenuIsRegisteredWindowVM = { [weak agentModeViewModel] in
+            guard let agentModeViewModel,
+                  let registered = WindowStatesManager.shared.window(withID: windowID) else { return nil }
+            return registered.agentModeViewModel === agentModeViewModel
+        }
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]
         }

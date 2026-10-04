@@ -72,18 +72,22 @@ enum AgentSessionLinkCatalogDiagnostics {
     )
 
     /// Native menu opening only; the caller applies the shared per-row/minute limit.
+    @discardableResult
     static func sidebarMenuUnavailable(
         reason: AgentSessionLinkMenuGuard, windowID: Int, tabID: UUID,
         expectedSessionID: UUID?, currentSessionID: UUID?,
-        tabPresent: Bool, bindingNil: Bool
-    ) {
+        tabPresent: Bool, bindingNil: Bool,
+        rowIsCurrentTab: Bool, vmIsRegisteredWindowVM: Bool?, runtimeEntryEverRemoved: Bool?
+    ) -> String {
         let tab = hashedID(tabID)
         let expected = hashedID(expectedSessionID)
         let current = hashedID(currentSessionID)
         let sameUUID = currentSessionID != nil && expectedSessionID == currentSessionID
-        logger.notice(
-            "event=sidebar-menu-unavailable guard=\(reason.rawValue, privacy: .public) window=\(windowID, privacy: .public) tab=\(tab, privacy: .public) expected=\(expected, privacy: .public) current=\(current, privacy: .public) same_uuid=\(sameUUID) tab_present=\(tabPresent, privacy: .public) binding_nil=\(bindingNil, privacy: .public)"
-        )
+        let owner = vmIsRegisteredWindowVM.map(String.init) ?? "unknown"
+        let removed = runtimeEntryEverRemoved.map(String.init) ?? "unknown"
+        let line = "event=sidebar-menu-unavailable guard=\(reason.rawValue) window=\(windowID) tab=\(tab) expected=\(expected) current=\(current) same_uuid=\(sameUUID) tab_present=\(tabPresent) binding_nil=\(bindingNil) row_is_current_tab=\(rowIsCurrentTab) vm_is_registered_window_vm=\(owner) runtime_entry_ever_removed=\(removed)"
+        logger.notice("\(line, privacy: .public)")
+        return line
     }
 
     #if DEBUG
@@ -225,11 +229,13 @@ enum AgentSessionLinkCatalogDiagnostics {
 struct AppAgentSessionLinkCatalogEventSink: AgentSessionLinkCatalogEventSink {
     func record(_ event: AgentSessionLinkCatalogEvent) {
         switch event {
-        case let .sidebarMenuUnavailable(reason, windowID, tabID, expectedSessionID, currentSessionID, tabPresent, bindingNil):
+        case let .sidebarMenuUnavailable(reason, windowID, tabID, expectedSessionID, currentSessionID, tabPresent, bindingNil, rowIsCurrentTab, vmIsRegisteredWindowVM, runtimeEntryEverRemoved):
             AgentSessionLinkCatalogDiagnostics.sidebarMenuUnavailable(
                 reason: reason, windowID: windowID, tabID: tabID,
                 expectedSessionID: expectedSessionID, currentSessionID: currentSessionID,
-                tabPresent: tabPresent, bindingNil: bindingNil
+                tabPresent: tabPresent, bindingNil: bindingNil,
+                rowIsCurrentTab: rowIsCurrentTab, vmIsRegisteredWindowVM: vmIsRegisteredWindowVM,
+                runtimeEntryEverRemoved: runtimeEntryEverRemoved
             )
         case let .catalogPublished(runID, tabID, connectionID, revision, routingGeneration, lifecycleGeneration, routePresent, catalog, outbound):
             AgentSessionLinkCatalogDiagnostics.catalogPublished(

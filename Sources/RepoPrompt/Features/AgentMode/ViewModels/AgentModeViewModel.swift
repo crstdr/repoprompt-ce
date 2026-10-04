@@ -478,6 +478,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
+            for tabID in oldValue.keys where sessions[tabID] == nil {
+                if sidebarRemovedRuntimeTabIDs.count < 128 {
+                    sidebarRemovedRuntimeTabIDs.insert(tabID)
+                } else if !sidebarRemovedRuntimeTabIDs.contains(tabID) {
+                    sidebarRuntimeRemovalHistoryOverflowed = true
+                }
+            }
             rebuildAgentSessionLinkSubagentCensus(reconcileLiveObservers: true)
             syncSidebarUIState(refresh: true, reason: .sessionList)
             // One eager revocation hook covering every live-session removal path (tab close, stash,
@@ -601,6 +608,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var monitorPillPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
     /// Temporary live-menu diagnostic (remove after diagnosis); monotonic timestamps per row.
     var sidebarOversightMenuDiagnosticTimes: [UUID: TimeInterval] = [:]
+    var sidebarMenuIsRegisteredWindowVM: @MainActor () -> Bool? = { nil }
+    // Bounded tab-key history for this VM lifetime; saturation means unknown, never cold.
+    var sidebarRemovedRuntimeTabIDs: Set<UUID> = []
+    var sidebarRuntimeRemovalHistoryOverflowed = false
     var sidebarCreatorDisplayNames: [UUID: String] = [:]
 
     /// In-memory palette-slot assignments for overseer sessions, reconciled inside the
