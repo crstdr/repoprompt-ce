@@ -1953,9 +1953,6 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func queueFailedIntentCleanup(_ bookkeeping: ReferenceBookkeeping) {
         guard let token = bookkeeping.token else { return }
-        launchCoordinator?.noteRevocation(
-            pair: bookkeeping.pair, assertedAt: bookkeeping.assertionGeneration, preservesIntent: false
-        )
         launchCoordinatorIfNeeded().noteCleanupPending(
             pair: bookkeeping.pair, token: token, assertedAt: bookkeeping.assertionGeneration
         )
@@ -3252,10 +3249,8 @@ final class AgentSessionLinkRuntimeBridge {
             await revoke(reference: grantReference, settlesDurableIntent: false)
             return EstablishmentResult(outcome: .failed(.closing))
         }
-        // Third restoration fence, for the same reason the token has one: the grant is live from the
-        // instant activation committed, so a proof that stopped holding across that hop has to be
-        // revoked rather than left for a sweep that only looks at identity. Durable retirement remains
-        // with the coordinator, whose callback ownership may have been displaced by window close.
+        // Recheck proof after activation: revoke stale runtime authority immediately;
+        // the qualified coordinator retains durable retirement ownership.
         if let proof, !liveCandidatesStillMatch(proof) {
             await revoke(reference: grantReference, settlesDurableIntent: false)
             return EstablishmentResult(outcome: .failed(.rebinding))
@@ -3325,10 +3320,8 @@ final class AgentSessionLinkRuntimeBridge {
             )
             return EstablishmentResult(outcome: .failed(.closing))
         }
-        // The projection refresh, authority lookup, and advertisement invalidation above all
-        // suspend. Exact Add must not report success if either selected incarnation rebound, closed,
-        // or lost eligibility during that tail work. Restoration proofs get the same final fence;
-        // their runtime rollback leaves durable cleanup with the qualified coordinator owner.
+        // Recheck incarnations after projection/authority/advertisement hops. Runtime proof
+        // rollback leaves durable cleanup with the qualified coordinator.
         if let proof, !liveCandidatesStillMatch(proof) {
             await revoke(reference: grantReference, settlesDurableIntent: false)
             return EstablishmentResult(outcome: .failed(.rebinding))
@@ -3401,8 +3394,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     private static let staleRelationshipMessage = "That oversight relationship is no longer active."
 
-    /// Legacy UUID adapter. The grant or pre-suspension admission supplies exact endpoints;
-    /// the common Stop core performs every ownership check and mutation.
+    /// Legacy adapter: grant or pre-suspension admission supplies exact endpoints to the Stop core.
     func stopMonitorLink(
         observerSessionID: UUID,
         targetSessionID: UUID,
@@ -3429,11 +3421,8 @@ final class AgentSessionLinkRuntimeBridge {
         )
     }
 
-    /// Authority-qualified durable Stop for one exact observer-target relationship.
-    ///
-    /// Neither endpoint has to remain live. If close revokes the grant after invocation, only the
-    /// captured, still-parked ownership may retire its saved token; a successor is never substituted.
-    /// Durable removal commits before revocation, and both remain generation and pair qualified.
+    /// Commits durable removal before revoking the exact relationship. After close, only ownership
+    /// captured at invocation may retire its parked token; no successor can substitute.
     func stopMonitorLink(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
@@ -3541,11 +3530,8 @@ final class AgentSessionLinkRuntimeBridge {
             return .failed(message: Self.staleRelationshipMessage)
         }
 
-        // Never derived from the pair alone. A stale row for reference A can arrive long after the
-        // pair was stopped and re-added under token B; looking the pair up would find B, remove it,
-        // settle B's establishment, and revoke B's grants — a stale UI action terminating a newer
-        // explicit re-add. Only live bookkeeping or an admitted, still-parked close reference can
-        // supply ownership; missing evidence fails closed.
+        // Never infer ownership from UUIDs: a stale reference must not retire a newer re-add.
+        // Require live bookkeeping or an admitted, still-parked close reference.
         guard let intentStore else {
             #if DEBUG
                 if mapped == nil { logPairLane(pair: pair, outcome: "unmapped_reference") }
@@ -3652,8 +3638,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard !revoked, let admitted else { return }
         await withPairRetirementLane(admitted.pair) { [self] in
             let outcome = await performPairRetirement(pair: admitted.pair, reference: reference, admittedClose: admitted)
-            // The write suspended. Only this still-current parked owner may queue a retry;
-            // a successor or explicit reassertion must never inherit the failed removal.
+            // After the write hop, only its still-current parked owner may queue cleanup.
             if case .failed = outcome, launchCoordinator?.permitsCloseRetirement(
                 reference, pair: admitted.pair, token: admitted.token, assertedAt: admitted.assertionGeneration
             ) == true {
