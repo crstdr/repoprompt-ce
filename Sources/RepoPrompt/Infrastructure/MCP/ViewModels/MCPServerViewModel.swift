@@ -1318,7 +1318,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     private lazy var windowToolRuntime = MCPAppToolBinder(windowID: windowID) { [weak self, service = self.service, windowID = self.windowID] name, freshnessPolicy, args, implementation in
         guard let self else {
-            throw MCPError.internalError("Window deallocated while executing \(MCPDomainSelfToolCallContext.displayName(for: name))")
+            throw MCPError.internalError("Window deallocated while executing \(name)")
         }
         // Capture the one app-binding ingress before runTool or provider work can suspend.
         let invocationContext = try service.captureInvocationContext(toolName: name, expectedWindowID: windowID)
@@ -1327,7 +1327,7 @@ final class MCPServerViewModel: ObservableObject {
             modelOnly: ServerNetworkManager.isMemoryOnlyModelCall(toolName: name, arguments: args)
         ) { [weak self] in
             guard let self else {
-                throw MCPError.internalError("Window deallocated during \(MCPDomainSelfToolCallContext.displayName(for: name))")
+                throw MCPError.internalError("Window deallocated during \(name)")
             }
             return try await implementation(MCPAppToolInvocation(toolName: name, windowID: windowID, context: invocationContext), args)
         }
@@ -1388,7 +1388,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         executeAgentSelf: { [weak self] args in
             guard let self else {
-                throw MCPError.internalError("Window deallocated while executing \(MCPDomainSelfToolCallContext.displayName)")
+                throw MCPError.internalError("Window deallocated while executing self_compact")
             }
             return try await agentSelfToolService.execute(args: args)
         },
@@ -1402,11 +1402,11 @@ final class MCPServerViewModel: ObservableObject {
         },
         requireAgentModeConnection: { invocationContext, toolName in
             guard let connectionID = invocationContext.connectionID else {
-                throw MCPError.invalidParams("\(MCPDomainSelfToolCallContext.displayName(for: toolName)) requires an active MCP connection")
+                throw MCPError.invalidParams("\(toolName) requires an active MCP connection")
             }
             let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
             guard purpose == .agentModeRun else {
-                throw MCPError.invalidParams("\(MCPDomainSelfToolCallContext.displayName(for: toolName)) is only available during agent mode runs")
+                throw MCPError.invalidParams("\(toolName) is only available during agent mode runs")
             }
             return connectionID
         },
@@ -2007,7 +2007,7 @@ final class MCPServerViewModel: ObservableObject {
     private lazy var domainReadToolProvider = MCPDomainReadToolProvider(
         resolveContext: { [weak self] toolName, requirement in
             guard let self else {
-                throw MCPError.internalError("Window deallocated while resolving \(MCPDomainSelfToolCallContext.displayName(for: toolName)) context")
+                throw MCPError.internalError("Window deallocated while resolving \(toolName) context")
             }
             let invocationContext = try MCPInvocationContextBridge.require(toolName: toolName)
             #if DEBUG
@@ -2039,7 +2039,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         backend: MCPDomainReadToolBackend { [weak self] toolName, context, args, sideEffects in
             guard let self else {
-                throw MCPError.internalError("Window deallocated while executing \(MCPDomainSelfToolCallContext.displayName(for: toolName))")
+                throw MCPError.internalError("Window deallocated while executing \(toolName)")
             }
             // Capture before the app-context/MainActor lookup. Read-context IDs and host
             // invocation IDs are distinct; retain both rather than substituting one for the other.
@@ -2103,7 +2103,7 @@ final class MCPServerViewModel: ObservableObject {
                     sideEffects: sideEffects
                 )
             default:
-                throw MCPError.internalError("Unsupported domain read tool: \(MCPDomainSelfToolCallContext.displayName(for: toolName))")
+                throw MCPError.internalError("Unsupported domain read tool: \(toolName)")
             }
         },
         sideEffects: domainReadSideEffectCoordinator

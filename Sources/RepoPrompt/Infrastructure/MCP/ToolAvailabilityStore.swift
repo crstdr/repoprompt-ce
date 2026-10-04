@@ -2,7 +2,6 @@ import Combine
 import Foundation
 import Logging
 import MCP // For ServerNetworkManager.broadcastToolListChanged()
-import RepoPromptDomainRuntime
 import SwiftUI
 
 /// Shared runtime & persistence layer for per-tool enable/disable flags.
@@ -46,11 +45,13 @@ final class ToolAvailabilityStore: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         let saved = Set(defaults.stringArray(forKey: Self.defaultsKey) ?? [])
-        disabledTools = Set(saved.map { MCPDomainToolCatalog.canonicalCallName(for: $0) })
+        disabledTools = Set(saved.map { $0 == "agent_self" ? "self_compact" : $0 })
         globallySuppressedTools = Self.suppressedToolNames(
             codeMapsGloballyDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
         )
-        if disabledTools != saved { save() }
+        if disabledTools != saved {
+            save()
+        }
 
         GlobalSettingsStore.shared.$codeMapsGloballyDisabled
             .removeDuplicates()
@@ -86,7 +87,7 @@ final class ToolAvailabilityStore: ObservableObject {
 
     /// Returns `true` when the tool is *enabled* (not in the effective disabled set).
     func isEnabled(_ name: String) -> Bool {
-        !effectiveDisabledTools.contains(MCPDomainToolCatalog.canonicalCallName(for: name))
+        !effectiveDisabledTools.contains(name)
     }
 
     func globalSuppressionReason(for name: String) -> String? {
@@ -99,7 +100,6 @@ final class ToolAvailabilityStore: ObservableObject {
 
     /// Toggle tool availability and persist change.
     func toggle(_ name: String, enabled: Bool) async {
-        let name = MCPDomainToolCatalog.canonicalCallName(for: name)
         if enabled {
             disabledTools.remove(name)
         } else {
@@ -188,7 +188,9 @@ final class ToolAvailabilityStore: ObservableObject {
                 changed = true
             }
         }
-        if changed { save() } // only persist when needed
+        if changed {
+            save()
+        } // only persist when needed
     }
 
     private func save() {
