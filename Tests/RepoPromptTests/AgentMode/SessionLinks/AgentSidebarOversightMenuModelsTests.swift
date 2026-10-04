@@ -1854,6 +1854,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
         persisted.providerSessionID = "hosted-existing-acp-session"
         await fixture.vm.flushSave(for: tabID)
+        // Keep ordinary active-chat ownership away from this cold menu target.
+        fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
         fixture.vm.test_removeSession(tabID: tabID)
         fixture.vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
         _ = provider()
@@ -2172,7 +2174,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         )
         addTeardownBlock {
             await state.tearDown()
-            XCTAssertTrue(providerAttempts.events.isEmpty, "Hosted menu fixtures must never request a provider")
+            XCTAssertTrue(providerAttempts.events.isEmpty, "Hosted menu fixtures must never request a provider: \(providerAttempts.events)")
         }
         await state.workspaceManager.awaitInitialized()
         let tabs = (0 ... peerCount).map { index in
