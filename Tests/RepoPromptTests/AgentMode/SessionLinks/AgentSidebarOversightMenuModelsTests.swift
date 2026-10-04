@@ -1626,11 +1626,13 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let tabs: [ComposeTabState]
         let host: NSHostingView<AgentModeSessionsSidebarView>
         let window: NSWindow
+        let providerAttempts: LifecycleRecorder
         var vm: AgentModeViewModel {
             state.agentModeViewModel
         }
     }
 
+    private enum UnexpectedProviderLaunch: Error { case refused }
     private enum Opening { case rightClick, controlClick, accessibility }
 
     @MainActor private final class SubmenuOpeningObserver: NSObject, NSMenuDelegate {
@@ -1847,6 +1849,10 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
         let region = try mountedRegion(in: fixture)
         let provider = region.itemsProvider
+        let persisted = fixture.vm.session(for: tabID)
+        persisted.selectedAgent = .devin
+        persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
+        persisted.providerSessionID = "hosted-existing-acp-session"
         await fixture.vm.flushSave(for: tabID)
         let oldCopyTarget = try XCTUnwrap(fixture.vm.agentSessionCopyIDTarget(
             tabID: tabID, sessionID: sessionID, tabName: "Fixture"
@@ -1862,6 +1868,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let choices = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeNewTitle }?.submenu)
         XCTAssertTrue(choices.items.contains { $0.isEnabled && $0.title.contains("Hosted peer 1") })
         XCTAssertTrue(try mountedRegion(in: fixture) === region)
+        XCTAssertEqual(fixture.vm.sessions[tabID]?.selectedAgent, .devin)
+        XCTAssertEqual(fixture.vm.sessions[tabID]?.providerSessionID, "hosted-existing-acp-session")
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Persisted ACP hydration must not resume a provider")
     }
 
     func testMenuOpeningRecoversPersistedRowWithNilRuntimeBinding() async throws {
@@ -1871,7 +1880,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let session = fixture.vm.session(for: tabID)
         let region = try mountedRegion(in: fixture)
         let provider = region.itemsProvider
-        session.selectedAgent = .cursor
+        session.selectedAgent = .devin
+        session.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
+        session.providerSessionID = "hosted-existing-acp-session"
         XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive)
         await fixture.vm.flushSave(for: tabID)
         let retired = try menuProps(in: fixture).targetEndpoint
@@ -1888,6 +1899,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let choices = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
         XCTAssertNotEqual(choices.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
         XCTAssertTrue(try mountedRegion(in: fixture) === region)
+        XCTAssertEqual(session.selectedAgent, .devin)
+        XCTAssertEqual(session.providerSessionID, "hosted-existing-acp-session")
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Nil-binding repair must not resume a provider")
     }
 
     func testSidebarPreparationRejectsStaleClaimsAndInProgressRebinding() async throws {
@@ -2115,9 +2129,49 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 else { UserDefaults.standard.removeObject(forKey: key) }
             }
         }
-        let state = WindowState()
+        let providerAttempts = LifecycleRecorder()
+        let state = WindowState(
+            agentModeViewModelFactory: { windowID, prompt, manager, server in
+                let vm = AgentModeViewModel(
+                    testWindowID: windowID,
+                    codexControllerFactory: { _, _, _, _, _, _ in
+                        providerAttempts.record("codex")
+                        return LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                    },
+                    claudeControllerFactory: { _, _, _, _ in
+                        providerAttempts.record("claude")
+                        return MonitorFakeNativeController()
+                    },
+                    headlessProviderFactory: { _, _ in
+                        providerAttempts.record("headless")
+                        return AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+                    },
+                    acpProviderFactory: { _, _ in
+                        providerAttempts.record("acp-provider")
+                        throw UnexpectedProviderLaunch.refused
+                    },
+                    acpControllerFactory: { _, _ in
+                        providerAttempts.record("acp-controller")
+                        throw UnexpectedProviderLaunch.refused
+                    },
+                    connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                    mcpRunRoutingCleaner: { _, _, _ in },
+                    mcpServerEnabler: { false },
+                    testMCPServer: server,
+                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                )
+                vm.promptManager = prompt
+                vm.workspaceManager = manager
+                return vm
+            },
+            contextBuilderProviderFactory: { _, _, _, _ in
+                providerAttempts.record("context-builder")
+                return AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+            }
+        )
         addTeardownBlock {
             await state.tearDown()
+            XCTAssertTrue(providerAttempts.events.isEmpty, "Hosted menu fixtures must never request a provider")
         }
         await state.workspaceManager.awaitInitialized()
         let tabs = (0 ... peerCount).map { index in
@@ -2177,7 +2231,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         window.makeKeyAndOrderFront(nil)
         host.layoutSubtreeIfNeeded()
         await Task.yield()
-        return Fixture(state: state, tabs: tabs, host: host, window: window)
+        return Fixture(state: state, tabs: tabs, host: host, window: window, providerAttempts: providerAttempts)
     }
 
     private func sidebar(for state: WindowState, tabID: UUID) -> AgentModeSessionsSidebarView {

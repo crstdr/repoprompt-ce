@@ -68,6 +68,8 @@ struct WindowStateComposition {
 
 @MainActor
 enum WindowStateCompositionFactory {
+    typealias AgentModeViewModelFactory = (Int, PromptViewModel, WorkspaceManagerViewModel, MCPServerViewModel) -> AgentModeViewModel
+
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
@@ -82,7 +84,8 @@ enum WindowStateCompositionFactory {
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
-        modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil
+        modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil,
+        agentModeViewModelFactory: AgentModeViewModelFactory? = nil
     ) -> WindowStateComposition {
         WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
         WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())
@@ -246,7 +249,7 @@ enum WindowStateCompositionFactory {
         )
 
         // 13) Agent mode (for minimal agent UI)
-        let agentModeViewModel = AgentModeViewModel(
+        let agentModeViewModel = agentModeViewModelFactory?(windowID, promptManager, workspaceManager, mcpServer) ?? AgentModeViewModel(
             windowID: windowID,
             promptManager: promptManager,
             workspaceManager: workspaceManager,
