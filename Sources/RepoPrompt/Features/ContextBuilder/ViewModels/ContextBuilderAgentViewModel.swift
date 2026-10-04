@@ -1021,6 +1021,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     // MARK: - Dependencies
 
+    func cursorModelMenuItems() -> [StableMenuItem] {
+        promptManager.cursorContextBuilderMenuItems(options: modelOptions(for: .cursor), canApply: { [weak self] in self?.agentRunState.isRunning == false })
+    }
+
     private let promptManager: PromptViewModel
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private let mcpServer: MCPServerViewModel
@@ -1927,7 +1931,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     @MainActor
     func resolveMCPRunAuthority(
         identity: WorkspaceSelectionIdentity,
-        nestedTabContext: MCPServerViewModel.TabContextSnapshot,
+        nestedTabContext: MCPTabContextSnapshot,
         workspaceContext: ContextBuilderWorkspaceContext?,
         responseType: String?,
         oraclePreset: String?
@@ -2247,7 +2251,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                   let tab = manager.composeTab(with: tabID)
             else { throw ContextBuilderWorkspaceContextError.missingWorkspace }
             let identity = WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tabID)
-            var nested = MCPServerViewModel.TabContextSnapshot(
+            var nested = MCPTabContextSnapshot(
                 tabID: tabID,
                 windowID: mcpServer.windowID,
                 workspaceID: workspace.id,
