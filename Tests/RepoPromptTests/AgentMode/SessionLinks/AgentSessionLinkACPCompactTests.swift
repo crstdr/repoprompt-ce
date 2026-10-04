@@ -733,7 +733,9 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
             acpProviderFactory: { _, _ in provider },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
-                if let runID { await MCPRoutingWaiter.notifyRouted(runID: runID) }
+                if let runID {
+                    await MCPRoutingWaiter.notifyRouted(runID: runID)
+                }
             },
             mcpServerEnabler: { true }
         )
@@ -1136,7 +1138,9 @@ final class AgentSessionLinkACPBackgroundCompactionSettleTests: XCTestCase {
         let subscription = session.monitorReadinessChangePublisher.sink { [weak session] in
             guard let session else { return }
             transitions.append(session.isSettlingACPBackgroundCompaction)
-            if session.acpBackgroundCompactionSettlesAt == nil { lifted.fulfill() }
+            if session.acpBackgroundCompactionSettlesAt == nil {
+                lifted.fulfill()
+            }
         }
         defer { subscription.cancel() }
 

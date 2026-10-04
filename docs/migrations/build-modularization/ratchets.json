@@ -1,5 +1,5 @@
 {
-  "description": "Fork upstream sync 2026-10-04: exact measurements of merged fork ea25ab9b and upstream ef43e681, zero numeric headroom. Wrong-way file edges decrease 1076 to 1066 and app test-import files decrease 340 to 339. All recorded metrics equal the measured tree. Upstream App-line advisory behavior remains; this file grants no App-line headroom.",
+  "description": "Fork upstream sync 2026-10-04: exact measurements of merged fork ea25ab9b and upstream adb3fe4f, zero numeric headroom. Wrong-way file edges decrease 1076 to 1066 and app test-import files decrease 340 to 339. All recorded metrics equal the measured tree. Upstream App-line advisory behavior remains; this file grants no App-line headroom.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
