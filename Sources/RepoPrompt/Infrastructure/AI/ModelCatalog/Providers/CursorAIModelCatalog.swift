@@ -71,7 +71,10 @@ enum CursorAIModelCatalog {
     /// Never consults the registry: `AgentModelCatalog.canonicalModelRaw` and
     /// `ACPModelParameterIdentity` depend on this being identical before and after a cache warm.
     static func canonicalIdentity(_ modelRaw: String) -> String {
-        let normalized = ACPAIModelCatalog.normalizedCursorModelAlias(modelRaw)
+        // Bracket syntax is reserved for persisted overrides. Identity decoding is always
+        // registry-free, even if a provider later advertises that exact spelling as a wire ID.
+        let baseModelRaw = (try? ModelSpecifier(raw: modelRaw, advertisedModelIDs: []).baseModelRaw) ?? modelRaw
+        let normalized = ACPAIModelCatalog.normalizedCursorModelAlias(baseModelRaw)
         guard !normalized.isEmpty else { return "" }
         return legacyIdentityAliases[normalized] ?? normalized
     }
@@ -93,8 +96,12 @@ enum CursorAIModelCatalog {
         let overrides: [Override]
 
         init(raw: String) throws {
-            // An advertised model ID may itself contain brackets; never parse that exact ID.
-            if CursorAIModelCatalog.options.contains(where: { $0.rawValue == raw }) || !raw.contains("[") {
+            try self.init(raw: raw, advertisedModelIDs: Set(CursorAIModelCatalog.options.map(\.rawValue)))
+        }
+
+        init(raw: String, advertisedModelIDs: Set<String>) throws {
+            // Wire handling may respect a literal advertised ID, but identity passes an empty set.
+            if advertisedModelIDs.contains(raw) || !raw.contains("[") {
                 baseModelRaw = raw
                 overrides = []
                 return
@@ -171,31 +178,28 @@ enum CursorAIModelCatalog {
     }
 
     static func option(matching modelRaw: String) -> AgentModelOption? {
-        if let specifier = try? ModelSpecifier(raw: modelRaw), !specifier.overrides.isEmpty,
-           let base = option(matching: specifier.baseModelRaw),
-           let selections = try? specifier.selections(in: resolvedSnapshot())
-        {
-            let labels = selections.map { selection in
-                parameterSet(for: base.rawValue)?.definition(configID: selection.configID)?.choices.first(where: { $0.rawValue == selection.valueRaw })?.displayName ?? selection.valueRaw
-            }
-            return AgentModelOption(rawValue: modelRaw, displayName: base.displayName + " · " + labels.joined(separator: " · "), description: base.description, isDefault: false)
-        }
-        let identity = canonicalIdentity(modelRaw)
+        let snapshot = resolvedSnapshot()
+        let advertisedIDs = Set(snapshot?.options.map(\.rawValue) ?? [])
+        guard let specifier = try? ModelSpecifier(raw: modelRaw, advertisedModelIDs: advertisedIDs) else { return nil }
+        let identity = canonicalIdentity(specifier.baseModelRaw)
         guard !identity.isEmpty else { return nil }
         if identity == autoIdentity {
-            return autoOption
+            return specifier.overrides.isEmpty ? autoOption : nil
         }
-        guard let snapshot = resolvedSnapshot(),
-              let discovered = discoveredOption(matching: identity, in: snapshot)
-        else {
-            return nil
+        guard let snapshot, let discovered = discoveredOption(matching: identity, in: snapshot) else { return nil }
+        let base = projectedOption(discovered)
+        guard !specifier.overrides.isEmpty else { return base }
+        // Membership, validation, and labels all use this call's single captured snapshot.
+        guard let selections = try? specifier.selections(in: snapshot) else { return nil }
+        let parameters = snapshot.modelParameterSets.first { canonicalIdentity($0.baseModelRaw) == identity }
+        let labels = selections.map { selection in
+            parameters?.definition(configID: selection.configID)?.choices.first(where: { $0.rawValue == selection.valueRaw })?.displayName ?? selection.valueRaw
         }
-        return projectedOption(discovered)
+        return AgentModelOption(rawValue: modelRaw, displayName: base.displayName + " · " + labels.joined(separator: " · "), description: base.description, isDefault: false)
     }
 
     static func parameterSet(for modelRaw: String) -> ACPModelParameterSet? {
-        let baseModelRaw = (try? ModelSpecifier(raw: modelRaw).baseModelRaw) ?? modelRaw
-        let identity = canonicalIdentity(baseModelRaw)
+        let identity = canonicalIdentity(modelRaw)
         guard !identity.isEmpty, identity != autoIdentity else { return nil }
         guard let snapshot = resolvedSnapshot(),
               let discovered = discoveredOption(matching: identity, in: snapshot)

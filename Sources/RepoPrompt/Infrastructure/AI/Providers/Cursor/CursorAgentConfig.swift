@@ -16,7 +16,7 @@ struct CursorAgentConfig {
     let includeRepoPromptMCPServer: Bool
     let cleanupProjectMCPApproval: Bool
     let sessionModeID: String?
-    let modelOverrides: [CursorAIModelCatalog.ModelSpecifier.Override]
+    let modelParameterSelections: [ACPModelParameterSelection]
 
     var commandName: String {
         switch commandSelection {
@@ -35,7 +35,7 @@ struct CursorAgentConfig {
         includeRepoPromptMCPServer: Bool = true,
         cleanupProjectMCPApproval: Bool = true,
         sessionModeID: String? = nil,
-        modelOverrides: [CursorAIModelCatalog.ModelSpecifier.Override] = []
+        modelParameterSelections: [ACPModelParameterSelection] = []
     ) {
         commandSelection = commandName.map(CursorAgentCommandSelection.exact) ?? .automatic
         self.additionalPathHints = additionalPathHints
@@ -44,6 +44,6 @@ struct CursorAgentConfig {
         self.includeRepoPromptMCPServer = includeRepoPromptMCPServer
         self.cleanupProjectMCPApproval = cleanupProjectMCPApproval
         self.sessionModeID = sessionModeID
-        self.modelOverrides = modelOverrides
+        self.modelParameterSelections = modelParameterSelections
     }
 }

@@ -512,6 +512,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     func testRetiredInheritedEffortIsReplacedBeforeFreshValidationAndSpeedSurvivesProjection() throws {
+        seedCursorCatalog()
         let fresh = ACPDiscoveredSessionModels(
             options: CursorAIModelCatalog.options, currentModelRaw: "grok-4.6",
             modelParameterSets: [.init(baseModelRaw: "grok-4.6", parameters: [
@@ -620,7 +621,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertTrue(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
         viewModel.selectACPModelParameter(cursorEffortSelection(valueRaw: "high"))
         XCTAssertTrue(session.acpModelParameterSelections.isEmpty)
-        XCTAssertTrue(viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls.isEmpty)
+        XCTAssertEqual(viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls.map(\.displayName), ["Effort", "Speed"])
 
         installCursorFixture()
         session.runState = .idle
@@ -1569,6 +1570,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     private func installCursorFixture() {
+        CursorDiscoveredCatalogTestSupport.reset()
         seedCursorCatalog()
     }
 

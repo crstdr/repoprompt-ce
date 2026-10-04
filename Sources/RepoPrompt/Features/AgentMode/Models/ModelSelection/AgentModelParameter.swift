@@ -90,9 +90,6 @@ struct ACPModelParameterIdentity: Hashable {
         if providerID == .cursor {
             // Pure identity: a saved parameter pin must resolve to the same identity before and
             // after Cursor's discovery snapshot warms, so this never consults membership.
-            if let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: raw), !specifier.overrides.isEmpty {
-                return CursorAIModelCatalog.canonicalIdentity(specifier.baseModelRaw)
-            }
             return CursorAIModelCatalog.canonicalIdentity(raw)
         }
         return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -169,22 +166,9 @@ enum ACPModelParameterResolver {
     ) -> ACPModelParameterSet? {
         switch providerID {
         case .cursor:
-            if let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
-               snapshot.hasModelParameterMetadata
-            {
-                if let exact = snapshot.modelParameterSets.first(where: { $0.baseModelRaw == selectedModelRaw }) {
-                    return exact
-                }
-                let identity = ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: .cursor)
-                return snapshot.modelParameterSets.first {
-                    ACPModelParameterIdentity.canonicalBaseModelRaw($0.baseModelRaw, providerID: .cursor) == identity
-                }
-            }
-            // Legacy absence remains distinct from complete-empty metadata, but neither
-            // can supply effort choices without an advertised runtime parameter set.
-            return CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+            CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
         case .openCode:
-            return openCodeParameterSet(
+            openCodeParameterSet(
                 selectedModelRaw: selectedModelRaw,
                 workspacePath: workspacePath,
                 observation: openCodeParameters
@@ -192,7 +176,7 @@ enum ACPModelParameterResolver {
         case .devin:
             devinParameterSet(selectedModelRaw: selectedModelRaw)
         default:
-            return nil
+            nil
         }
     }
 
