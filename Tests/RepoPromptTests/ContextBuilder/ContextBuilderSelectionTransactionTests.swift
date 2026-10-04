@@ -5,6 +5,40 @@ import XCTest
 
 @MainActor
 final class ContextBuilderSelectionTransactionTests: XCTestCase {
+    func testCursorInitializeNamePromotesQueuedDiscoveryContext() async throws {
+        let fixture = try await makeFixture(name: "cursor-initialize-name")
+        defer { fixture.cleanup() }
+        let server = fixture.window.mcpServer
+        let selection = StoredSelection(selectedPaths: [fixture.fileA.path])
+        try await fixture.seedCanonical(selection)
+        let activeTabID = fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID
+        XCTAssertNotEqual(activeTabID, fixture.tabID)
+
+        // Queue through the provider hint, then promote with Cursor's observed initialize name.
+        // A route mapping alone is insufficient: the exact frozen run context must follow it.
+        try server.installFrozenTabContext(
+            clientID: nil,
+            clientName: XCTUnwrap(AgentProviderKind.cursor.mcpClientNameHint),
+            context: fixture.makeContext(selection: selection)
+        )
+        let token = try XCTUnwrap(server.registerPendingPolicyRunIDMapping(
+            connectionID: fixture.connectionID,
+            runID: fixture.runID,
+            windowID: fixture.window.windowID,
+            clientName: "Cursor"
+        ))
+        let promoted = try XCTUnwrap(token.promotedContext)
+        XCTAssertEqual(promoted.runID, fixture.runID)
+        XCTAssertEqual(promoted.windowID, fixture.window.windowID)
+        XCTAssertEqual(promoted.workspaceID, fixture.workspaceID)
+        XCTAssertEqual(promoted.tabID, fixture.tabID)
+        XCTAssertEqual(promoted.selection, selection)
+        XCTAssertEqual(fixture.boundContext?.selection, selection)
+        XCTAssertEqual(server.pendingContextQueueLength(clientName: "Cursor", windowID: fixture.window.windowID), 0)
+        XCTAssertEqual(server.contextBuilderFinalContextConnectionID(runID: fixture.runID), fixture.connectionID)
+        XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID, activeTabID)
+    }
+
     func testNamedTabKeepsItsNameAfterTasknamePromptMutation() async throws {
         for name in ["Care", "New Chat about support", "Untitled Chat about support"] {
             let fixture = try await makeFixture(name: "named-taskname")
