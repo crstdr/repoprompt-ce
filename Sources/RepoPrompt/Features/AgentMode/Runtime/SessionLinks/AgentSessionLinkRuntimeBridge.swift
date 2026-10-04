@@ -4435,6 +4435,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard let host else { return }
         let candidates = host.agentSessionLinkCandidates()
         settleCreatorNames(candidates)
+        NotificationCenter.default.post(name: .agentSessionLinkCandidatesDidChange, object: nil)
         requestMonitorProjectionRefresh(
             forExactObserverEndpoints: Set(candidates.map(\.domainEndpoint))
         )
