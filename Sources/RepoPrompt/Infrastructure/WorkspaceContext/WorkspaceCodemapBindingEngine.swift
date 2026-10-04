@@ -679,6 +679,7 @@ actor WorkspaceCodemapBindingEngine {
     private let globalCodeMapsDisabled: @Sendable () async -> Bool
     private var manifestPublicationDisabled = false
     private var globalDisableRefreshID = UUID()
+    private var globalDisableRefreshTask: Task<[Task<Void, Never>], Never>?
     private let manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter
     private let uptimeNanoseconds: @Sendable () -> UInt64
     private let accessEpochSeconds: @Sendable () -> UInt64
@@ -828,24 +829,34 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     func refreshGlobalCodeMapsDisabled() async {
-        // Read the actual setting, not a captured publisher value from an older toggle.
+        // Order setting reads/application across independent window observers. Callers
+        // must not resume setup while a newer refresh is still waiting to apply OFF.
         let refreshID = UUID()
         globalDisableRefreshID = refreshID
-        let disabled = await globalCodeMapsDisabled()
-        guard globalDisableRefreshID == refreshID,
-              manifestPublicationDisabled != disabled else { return }
-        manifestPublicationDisabled = disabled
-        if disabled {
-            for rootEpoch in Array(graphIndexJobs.keys) {
-                _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled, cancelRunning: true)
-            }
-            let tasks = cancelAllManifestWriters()
-            // Cancellation cannot preempt synchronous persistence already entered. Drain that
-            // work, while the admission fence prevents any following publication or retry.
-            for task in tasks {
-                await task.value
-            }
+        let predecessor = globalDisableRefreshTask
+        let refreshTask = Task {
+            if let predecessor { _ = await predecessor.value }
+            return await applyGlobalCodeMapsDisabled()
         }
+        globalDisableRefreshTask = refreshTask
+        let tasks = await refreshTask.value
+        if globalDisableRefreshID == refreshID { globalDisableRefreshTask = nil }
+        // Drain outside the ordered state update: OFF may resume while an ON-era
+        // synchronous transaction is finishing, without stale cleanup cancelling it.
+        for task in tasks {
+            await task.value
+        }
+    }
+
+    private func applyGlobalCodeMapsDisabled() async -> [Task<Void, Never>] {
+        let disabled = await globalCodeMapsDisabled()
+        guard manifestPublicationDisabled != disabled else { return [] }
+        manifestPublicationDisabled = disabled
+        guard disabled else { return [] }
+        for rootEpoch in Array(graphIndexJobs.keys) {
+            _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled, cancelRunning: true)
+        }
+        return cancelAllManifestWriters()
     }
 
     private func manifestPublicationIsEnabled() async -> Bool {

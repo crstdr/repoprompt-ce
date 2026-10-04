@@ -253,7 +253,6 @@ enum CodexToolSettingMutation: Equatable {
     case bashTool(enabled: Bool)
     case searchTool(enabled: Bool)
     case goalSupport(enabled: Bool)
-    case computerUse(enabled: Bool)
     case reasoningSummaries(enabled: Bool)
     case memories(enabled: Bool)
     case apps(enabled: Bool)
@@ -279,7 +278,6 @@ struct CodexToolSettingsBinding: Equatable {
     let bashToolEnabled: Bool
     let searchToolEnabled: Bool
     let goalSupportEnabled: Bool
-    let computerUseEnabled: Bool
     /// Controls Codex Agent Mode app-server reasoning summary config only; this is not a
     /// general model reasoning-effort preference.
     let reasoningSummariesEnabled: Bool

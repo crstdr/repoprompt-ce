@@ -274,6 +274,56 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         _ = try await waitForGraphCompletion(engine: engine, rootID: loadedSecond.id)
     }
 
+    func testGlobalReenableResumesWhenStoreAndEngineDeliveriesAreReordered() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root", files: ["Sources/Feature.swift": "struct ReenabledFeature {}\n"]
+        )
+        let disabled = CodemapLockedValues<Bool>()
+        disabled.append(false)
+        let fixture = try CodemapStoreFixture(
+            name: #function, globalCodeMapsDisabled: { disabled.values.last ?? false }
+        )
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let initial = await engine.accounting()
+
+        // The engine receives ON, but the store's ON delivery is held until after OFF.
+        // Its store flag therefore still says enabled even though its graph was cancelled.
+        disabled.append(true)
+        await engine.refreshGlobalCodeMapsDisabled()
+        disabled.append(false)
+        await store.setCodeMapsGloballyDisabled(false, settingsRevision: 2)
+        await store.setCodeMapsGloballyDisabled(true, settingsRevision: 1)
+        let enabled = await store.currentCodemapRootStatusUpdate()
+        XCTAssertFalse(enabled.roots.isEmpty)
+        XCTAssertTrue(enabled.roots.allSatisfy { !$0.isGenerationSuspended })
+        // Do not deliver the engine's OFF callback until work has actually resumed.
+        // Otherwise that callback would mask the independent-observer ordering bug.
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let resumed = await engine.accounting()
+        XCTAssertGreaterThan(resumed.counters.graphIndexRunsStarted, initial.counters.graphIndexRunsStarted)
+        await engine.refreshGlobalCodeMapsDisabled()
+
+        // Also cover the normal store ON transition followed by store OFF ahead of engine OFF.
+        disabled.append(true)
+        await store.setCodeMapsGloballyDisabled(true, settingsRevision: 3)
+        await engine.refreshGlobalCodeMapsDisabled()
+        disabled.append(false)
+        await store.setCodeMapsGloballyDisabled(false, settingsRevision: 4)
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let resumedAgain = await engine.accounting()
+        XCTAssertGreaterThan(resumedAgain.counters.graphIndexRunsStarted, resumed.counters.graphIndexRunsStarted)
+        await engine.refreshGlobalCodeMapsDisabled()
+    }
+
     func testPlainRootRequiresExplicitOptInAndRevokesOnDisable() async throws {
         let workspace = try PlainWorkspaceFixture(name: #function)
         try workspace.write("export interface OptedInType { id: string }\n", to: "src/OptedIn.ts")

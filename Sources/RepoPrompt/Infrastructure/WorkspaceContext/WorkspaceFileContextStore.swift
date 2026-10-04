@@ -10978,25 +10978,31 @@ actor WorkspaceFileContextStore {
             guard settingsRevision > codeMapsGlobalSettingRevision else { return }
             codeMapsGlobalSettingRevision = settingsRevision
         }
-        guard codeMapsGloballyDisabled != disabled else { return }
+        // An OFF delivery can overtake ON in this store while the process-wide engine
+        // already cancelled its graph. Even an unchanged enabled flag must resume work.
+        guard codeMapsGloballyDisabled != disabled || !disabled else { return }
         codeMapsGloballyDisabled = disabled
         let transitionID = UUID()
         codeMapsGlobalTransitionID = transitionID
         let epochs = rootStatesByID.map { rootID, state in
             WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
         }
-        if disabled {
-            // Fence every admission before suspending. The existing cleanup chain owns discovery,
-            // eligibility, setup, demand, graph-worker cancellation and root authority invalidation.
-            for rootEpoch in epochs {
-                codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
-                codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
-                _ = detachCodemapSession(rootEpoch: rootEpoch)
-                filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: rootEpoch)
-            }
+        // Retire stale handed-off launches on OFF too: the engine's independent ON
+        // observer may have cancelled them without this store ever receiving ON.
+        for rootEpoch in epochs {
+            codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
+            codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
+            _ = detachCodemapSession(rootEpoch: rootEpoch)
+            filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: rootEpoch)
         }
         publishCodemapRootStatusesIfChanged()
         await awaitCodemapCleanupFlights(rootIDs: Set(epochs.map(\.rootID)))
+        guard codeMapsGlobalTransitionID == transitionID, !codeMapsGloballyDisabled else { return }
+        // Re-enable the shared engine from the live setting before admitting setup;
+        // its subscription may deliver OFF after this window's subscription does.
+        if !epochs.isEmpty, let engine = try? codemapRuntimeProvider().bindingEngine() {
+            await engine.refreshGlobalCodeMapsDisabled()
+        }
         guard codeMapsGlobalTransitionID == transitionID, !codeMapsGloballyDisabled else { return }
         for rootEpoch in epochs {
             guard rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID else { continue }
