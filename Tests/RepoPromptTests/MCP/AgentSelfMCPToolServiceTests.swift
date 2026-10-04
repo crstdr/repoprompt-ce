@@ -6,7 +6,7 @@ import XCTest
 
 @MainActor
 final class AgentSelfMCPToolServiceTests: XCTestCase {
-    func testLegacyAliasDispatchesToSameServiceResultsAndAuthority() async throws {
+    func testRenamedToolDispatchesContextToCallingSession() async throws {
         let fixture = Fixture()
         let registry = MCPDomainToolRegistry()
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "self_compact"))
@@ -16,103 +16,37 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
                 try await .object(fixture.execute(args))
             }
         ])
-        let canonicalName = ServerNetworkManager.canonicalToolName(for: "self_compact")
-        let legacyName = ServerNetworkManager.canonicalToolName(for: "agent_self")
-        let canonicalCandidate = await registry.resolve(toolName: canonicalName, scope: scope)
-        let legacyCandidate = await registry.resolve(toolName: legacyName, scope: scope)
-        let canonical = try XCTUnwrap(canonicalCandidate)
-        let legacy = try XCTUnwrap(legacyCandidate)
-        XCTAssertEqual(legacy.handle, canonical.handle)
-        XCTAssertEqual(legacy.binding.definition, canonical.binding.definition)
+        let candidate = await registry.resolve(toolName: ServerNetworkManager.canonicalToolName(for: "self_compact"), scope: scope)
+        let tool = try XCTUnwrap(candidate)
+        let result = try await tool.binding(["op": .string("context")])
+        XCTAssertEqual(result.objectValue?["result"], .string("ok"))
+        XCTAssertEqual(fixture.reads, 1)
+        let legacy = await registry.resolve(toolName: ServerNetworkManager.canonicalToolName(for: "agent_self"), scope: scope)
+        XCTAssertNil(legacy)
+    }
 
-        fixture.forcedAdmission = .blocked(reason: "compact_already_pending")
-        for args: [String: Value] in [
-            ["op": .string("context")],
-            ["op": .string("compact"), "note": .string("continue"), "idempotency_key": .string("key")]
-        ] {
-            let canonicalResult = try await canonical.binding(args)
-            let legacyResult = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
-                try await legacy.binding(args)
-            }
-            XCTAssertEqual(legacyResult, canonicalResult)
-        }
-
-        fixture.origin = nil
-        for (name, binding) in [("self_compact", canonical.binding), ("agent_self", legacy.binding)] {
-            do {
-                _ = try await MCPDomainSelfToolCallContext.withRequestedName(name) {
-                    try await binding(["op": .string("context")])
-                }
-                XCTFail("Alias must not manufacture calling-session authority")
-            } catch let error as MCPError {
-                XCTAssertEqual(error, .invalidParams("\(name) is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access."))
-            }
+    func testRenamedToolKeepsSavedAvailability() async throws {
+        let suite = "self-compact-availability-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        for saved in [["read_file"], ["agent_self", "read_file"], ["self_compact", "read_file"], ["agent_self", "self_compact", "read_file"]] {
+            defaults.set(saved, forKey: "mcp.disabledTools")
+            let store = ToolAvailabilityStore(defaults: defaults)
+            let wasEnabled = saved == ["read_file"]
+            XCTAssertEqual(store.isEnabled("self_compact"), wasEnabled)
+            XCTAssertEqual(ToolAvailabilityStore(defaults: defaults).isEnabled("self_compact"), wasEnabled)
+            XCTAssertFalse(store.disabledTools.contains("agent_self"))
+            XCTAssertEqual(
+                Set(defaults.stringArray(forKey: "mcp.disabledTools") ?? []),
+                wasEnabled ? ["read_file"] : ["self_compact", "read_file"]
+            )
+            await store.toggle("self_compact", enabled: !wasEnabled)
+            XCTAssertEqual(ToolAvailabilityStore(defaults: defaults).isEnabled("self_compact"), !wasEnabled)
+            XCTAssertEqual(store.isEnabled("read_file"), false)
         }
     }
 
-    func testLegacyErrorsAndDisabledPrecedencePreserveValidationAndCallerText() async throws {
-        let fixture = Fixture()
-        let cases: [([String: Value], String)] = [
-            ([:], "op is required: context or compact."),
-            (["op": .string("self_compact")], "Unknown agent_self op 'self_compact'."),
-            (["op": .string("context"), "self_compact": .null], "context does not support 'self_compact'."),
-            (["op": .string("context"), "session_id": .string("target")], "context does not support 'session_id'."),
-            (["op": .string("compact")], "compact note is required as a string."),
-            (["op": .string("compact"), "note": .string(" ")], "compact note must not be empty or whitespace-only."),
-            (["op": .string("compact"), "note": .string("a\u{0000}b")], "compact note contains a disallowed control character."),
-            (["op": .string("compact"), "note": .string(String(repeating: "x", count: 8193))], "compact note is 8193 UTF-8 bytes; maximum 8192."),
-            (["op": .string("compact"), "note": .string("continue")], "compact idempotency_key is required (1...200 UTF-8 bytes).")
-        ]
-        for enabled in [true, false] {
-            fixture.enabled = enabled
-            for (args, message) in cases {
-                let legacyMessage = message.hasPrefix("Unknown") ? message : "agent_self " + message
-                do {
-                    _ = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
-                        try await fixture.execute(args)
-                    }
-                    XCTFail("Legacy validation must precede disabled refusal")
-                } catch let error as MCPError {
-                    XCTAssertEqual(error, .invalidParams(legacyMessage))
-                }
-                do {
-                    _ = try await fixture.execute(args)
-                    XCTFail("Expected canonical refusal")
-                } catch let error as MCPError {
-                    let canonicalMessage = message.hasPrefix("Unknown")
-                        ? "Unknown self_compact op 'self_compact'." : "self_compact " + message
-                    XCTAssertEqual(error, .invalidParams(enabled ? canonicalMessage : "self_compact is disabled."))
-                }
-            }
-        }
-        for args: [String: Value] in [
-            ["op": .string("context")],
-            ["op": .string("compact"), "note": .string("continue"), "idempotency_key": .string("key")]
-        ] {
-            do {
-                _ = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
-                    try await fixture.execute(args)
-                }
-                XCTFail("Valid legacy calls must still be disabled")
-            } catch let error as MCPError {
-                XCTAssertEqual(error, .invalidParams("agent_self is disabled."))
-            }
-        }
-        fixture.origin = nil
-        do {
-            _ = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
-                try await fixture.execute(["op": .string("compact")])
-            }
-            XCTFail("Legacy authority refusal must still precede compact validation/disabling")
-        } catch let error as MCPError {
-            XCTAssertEqual(error, .invalidParams("agent_self is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access."))
-        }
-        XCTAssertEqual(fixture.reads, 0)
-        XCTAssertEqual(fixture.schedules, 0)
-        XCTAssertFalse(MCPDomainSelfToolCallContext.isLegacyAlias, "Legacy presentation must not leak to subsequent calls")
-    }
-
-    func testDisabledSelfToolCannotReadOrSchedule() async throws {
+    func testDisabledSelfToolCannotReadOrSchedule() async {
         let fixture = Fixture()
         fixture.enabled = false
         for args: [String: Value] in [
@@ -121,26 +55,13 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
         ] {
             do {
                 _ = try await fixture.execute(args)
-                XCTFail("Disabled tool must reject both operations")
+                XCTFail("Disabled self_compact must not enter the calling session")
             } catch let error as MCPError {
                 XCTAssertEqual(error, .invalidParams("self_compact is disabled."))
-            }
+            } catch { XCTFail("\(error)") }
         }
         XCTAssertEqual(fixture.reads, 0)
         XCTAssertEqual(fixture.schedules, 0)
-    }
-
-    func testWindowCatalogAdvertisesOnlyCanonicalSelfTool() async {
-        let window = WindowState()
-        let enabled = await window.mcpServer.setWindowToolsEnabled(true)
-        XCTAssertTrue(enabled)
-        addTeardownBlock { @MainActor in
-            _ = await window.mcpServer.setWindowToolsEnabled(false)
-        }
-        let catalog = await AppDomainRuntimeComposition.shared.runtime.toolRegistry.snapshot()
-        XCTAssertTrue(catalog.toolNames.contains("self_compact"))
-        XCTAssertFalse(catalog.toolNames.contains("agent_self"))
-        XCTAssertFalse(ToolAvailabilityStore.shared.allTools.contains { $0.name == "agent_self" })
     }
 
     func testContextReturnsExactLoadAndStatusOrNull() async throws {
@@ -220,55 +141,6 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
         let recoveryDetail = recovery["self_compact"]?.objectValue?["detail"]?.stringValue
         XCTAssertTrue(recoveryDetail?.contains("not automatically retried") == true)
         XCTAssertTrue(recoveryDetail?.contains("explicit recovery") == true)
-    }
-
-    func testLegacyLifecycleContextAndDuplicateOutcomesPreserveStatusAndRecoveryText() async throws {
-        let fixture = Fixture()
-        let requestID = UUID()
-        let recoveryNote = "Continue with the literal self_compact reference in my note."
-        let statuses: [AgentSelfCompactStatus] = [
-            .init(
-                requestID: requestID,
-                phase: "acpSettling",
-                outcome: nil,
-                completionVerified: nil,
-                noteDelivery: nil,
-                recoveryNote: nil
-            ),
-            .init(
-                requestID: requestID,
-                phase: nil,
-                outcome: .recoveryRequired,
-                completionVerified: false,
-                noteDelivery: .deliveryUnknown,
-                recoveryNote: recoveryNote
-            ),
-            .init(
-                requestID: requestID,
-                phase: "parked",
-                outcome: .completionUnverified,
-                completionVerified: false,
-                noteDelivery: .parked,
-                recoveryNote: recoveryNote
-            )
-        ]
-        for status in statuses {
-            fixture.snapshot = .init(context: nil, selfCompact: status)
-            fixture.forcedAdmission = .duplicate(requestID: requestID, status: status)
-            for args: [String: Value] in [
-                ["op": .string("context")],
-                ["op": .string("compact"), "note": .string("continue"), "idempotency_key": .string("key")]
-            ] {
-                let canonical = try await fixture.execute(args)
-                let legacy = try await MCPDomainSelfToolCallContext.withRequestedName("agent_self") {
-                    try await fixture.execute(args)
-                }
-                XCTAssertEqual(legacy, canonical)
-                XCTAssertEqual(legacy["self_compact"]?.objectValue?["recovery_note"], status.recoveryNote.map(Value.string) ?? .null)
-                XCTAssertNil(legacy["agent_self"], "The existing status field is not a tool-name echo")
-            }
-        }
-        XCTAssertEqual(fixture.schedules, 0)
     }
 
     func testNativeUnverifiedAndPersistenceWarningReasonHaveProviderNeutralGuidance() async throws {
@@ -399,7 +271,9 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
                     return self.snapshot
                 },
                 scheduleCompact: { _, _, _, note, key in
-                    if let forcedAdmission = self.forcedAdmission { return forcedAdmission }
+                    if let forcedAdmission = self.forcedAdmission {
+                        return forcedAdmission
+                    }
                     var state = self.state
                     let reservation = state.reserve(note: note, idempotencyKey: key)
                     switch reservation {
@@ -419,43 +293,5 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
             let result = try await service.execute(args: args)
             return try XCTUnwrap(result.objectValue)
         }
-    }
-}
-
-@MainActor
-final class AgentSelfToolAvailabilityTests: XCTestCase {
-    func testLegacyDisabledSettingMigratesAndBothNamesShareToggleAcrossReload() async throws {
-        let suite = "self-tool-availability-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        for saved in [["agent_self", "read_file"], ["self_compact", "read_file"], ["agent_self", "self_compact", "read_file"]] {
-            defaults.set(saved, forKey: "mcp.disabledTools")
-            let store = ToolAvailabilityStore(defaults: defaults)
-            XCTAssertEqual(store.disabledTools, ["self_compact", "read_file"])
-            XCTAssertEqual(Set(defaults.stringArray(forKey: "mcp.disabledTools") ?? []), ["self_compact", "read_file"])
-            for name in ["self_compact", "agent_self"] {
-                XCTAssertFalse(store.isEnabled(name))
-                XCTAssertFalse(ToolAvailabilityStore(defaults: defaults).isEnabled(name))
-            }
-
-            await store.toggle("agent_self", enabled: true)
-            let enabled = ToolAvailabilityStore(defaults: defaults)
-            XCTAssertTrue(enabled.isEnabled("self_compact"))
-            XCTAssertTrue(enabled.isEnabled("agent_self"))
-            XCTAssertEqual(enabled.disabledTools, ["read_file"])
-            await enabled.toggle("self_compact", enabled: false)
-            XCTAssertFalse(ToolAvailabilityStore(defaults: defaults).isEnabled("agent_self"))
-        }
-    }
-
-    func testRenameDoesNotDisablePreviouslyEnabledTool() throws {
-        let suite = "self-tool-availability-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        defaults.set(["read_file"], forKey: "mcp.disabledTools")
-        let store = ToolAvailabilityStore(defaults: defaults)
-        XCTAssertTrue(store.isEnabled("self_compact"))
-        XCTAssertTrue(store.isEnabled("agent_self"))
-        XCTAssertEqual(store.disabledTools, ["read_file"])
     }
 }

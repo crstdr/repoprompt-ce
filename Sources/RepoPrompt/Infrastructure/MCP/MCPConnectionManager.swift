@@ -74,28 +74,9 @@ private extension Bundle {
 
 // MARK: - MCP Run Purpose
 
-/// Purpose of an MCP connection's run, used to route UI (e.g., ask_user) to the correct surface.
-public enum MCPRunPurpose: String, Sendable, Codable {
-    case discoverRun // Context Builder agent exploring codebase
-    case agentModeRun // Agent mode interactive session
-    case unknown // No policy or unspecified
-}
+public typealias MCPRunPurpose = RepoPromptShared.MCPRunPurpose
 
-/// Dispatcher-validated provenance for a one-shot hidden `_windowID` tool argument.
-/// This value is request-scoped only and must never be synthesized from sticky,
-/// persisted, or automatically selected window affinity.
-struct MCPExplicitWindowRoutingHint: @unchecked Sendable, Equatable {
-    enum Provenance: Equatable {
-        case hiddenWindowArgument
-    }
-
-    let connectionID: UUID
-    let toolName: String
-    let windowID: Int
-    let windowStateIdentity: ObjectIdentifier
-    let serverViewModelIdentity: ObjectIdentifier
-    let provenance: Provenance
-}
+typealias MCPExplicitWindowRoutingHint = RepoPromptShared.MCPExplicitWindowRoutingHint
 
 struct MCPRoutingWindowSnapshot: Equatable {
     let workspaceID: UUID?
@@ -541,7 +522,7 @@ actor ServerNetworkManager {
         "discover_workspace_context": "workspace_context"
     ]
     nonisolated static func canonicalToolName(for name: String) -> String {
-        MCPDomainToolCatalog.canonicalCallName(for: toolNameAliases[name] ?? name)
+        toolNameAliases[name] ?? name
     }
 
     nonisolated static func admissionClass(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {
@@ -1802,20 +1783,8 @@ actor ServerNetworkManager {
         let scopeID: UUID
     }
 
-    struct WindowToolDispatchIdentity: @unchecked Sendable {
-        let windowID: Int
-        let windowStateIdentity: ObjectIdentifier
-        let serverViewModelIdentity: ObjectIdentifier
-        let catalogRegistrationHandle: MCPDomainToolRegistrationHandle
-        var modelRouteToken: AgentSessionLinkRunCatalogRouteToken?
-    }
-
-    struct ToolDispatchAuthorization: @unchecked Sendable {
-        let connectionID: UUID
-        let connectionIdentity: ObjectIdentifier
-        let lifecycleGeneration: UInt64
-        let windowIdentity: WindowToolDispatchIdentity?
-    }
+    typealias WindowToolDispatchIdentity = MCPWindowToolDispatchIdentity
+    typealias ToolDispatchAuthorization = MCPToolDispatchAuthorization
 
     enum ToolDispatchAdmissionError: Error {
         case connectionTerminal
@@ -2504,6 +2473,33 @@ actor ServerNetworkManager {
         )
     }
 
+    func validateToolInvocationContext(
+        _ context: ToolInvocationContext,
+        expectedWindowID: Int,
+        expectedServerViewModelIdentity: ObjectIdentifier
+    ) async -> Bool {
+        switch context.origin {
+        case .trustedLocal:
+            return context.dispatchAuthorization == nil
+                && (context.metadata.windowID == nil || context.metadata.windowID == expectedWindowID)
+        case .network:
+            guard let authorization = context.dispatchAuthorization,
+                  context.connectionID == authorization.connectionID,
+                  context.metadata.invocationID == context.invocationID,
+                  isCurrentToolDispatchAuthorization(authorization),
+                  let windowIdentity = authorization.windowIdentity,
+                  windowIdentity.windowID == expectedWindowID,
+                  context.metadata.windowID == expectedWindowID
+            else { return false }
+            let windowIsCurrent = await isCurrentWindowToolDispatchIdentity(
+                windowIdentity,
+                expectedServerViewModelIdentity: expectedServerViewModelIdentity
+            )
+            // The MainActor/catalog check suspends; a disconnect may retire the connection meanwhile.
+            return windowIsCurrent && isCurrentToolDispatchAuthorization(authorization)
+        }
+    }
+
     private func isCurrentToolDispatchAuthorization(
         _ authorization: ToolDispatchAuthorization
     ) -> Bool {
@@ -3157,30 +3153,6 @@ actor ServerNetworkManager {
             )
             await notifyToolListChanged(connectionID: connectionID)
         }
-    }
-
-    private static func domainPolicySnapshot(
-        restricted: Set<String>,
-        additional: Set<String>,
-        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
-        allowsAgentExternalControlTools: Bool,
-        hasExactAgentSessionLinkGrant: Bool = false
-    ) -> MCPDomainClientPolicySnapshot {
-        let role: MCPClientTaskRole = switch taskLabelKind {
-        case .explore:
-            .explore
-        case .engineer, .pair, .design:
-            .engineer
-        case nil:
-            .direct
-        }
-        return MCPDomainClientPolicySnapshot(
-            restrictedToolNames: restricted,
-            additionalToolNames: additional,
-            role: role,
-            allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            hasExactAgentSessionLinkGrant: hasExactAgentSessionLinkGrant
-        )
     }
 
     private func agentSessionLinkCatalogDiagnosticContext(
@@ -3902,9 +3874,10 @@ actor ServerNetworkManager {
     /// context resolver, catalog discovery, persistent affinity or recovery helper is called.
     private func cachedModelCatalogRouteToken(connectionID: UUID) async -> AgentSessionLinkRunCatalogRouteToken? {
         guard let route = cachedModelRunRoute(connectionID: connectionID) else { return nil }
+        let admittedModelRouteToken = MCPInvocationContextBridge.current?.dispatchAuthorization?.windowIdentity?.modelRouteToken
         let endpoint = await MainActor.run {
             WindowStatesManager.shared.modelRoutingWindow(withID: route.windowID)?.mcpServer
-                .cachedModelObserverEndpoint(connectionID: connectionID, route: route)
+                .cachedModelObserverEndpoint(connectionID: connectionID, route: route, modelRouteToken: admittedModelRouteToken)
         }
         guard let endpoint, cachedModelRunRoute(connectionID: connectionID) == route else { return nil }
         return AgentSessionLinkRunCatalogRouteToken(
@@ -10861,7 +10834,7 @@ actor ServerNetworkManager {
             }
             let policy = effectivePolicyState(for: connectionID)
             let sessionLinkGrantSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
-            let domainPolicy = Self.domainPolicySnapshot(
+            let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
                 restricted: policy.restricted,
                 additional: policy.additional.union(
                     sessionLinkGrantSnapshot?.additionalGrants ?? []
@@ -12317,7 +12290,7 @@ actor ServerNetworkManager {
             }
             let policy = await effectivePolicyState(for: connectionID)
             let sessionLinkGrantSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
-            let domainPolicy = await Self.domainPolicySnapshot(
+            let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
                 restricted: policy.restricted,
                 additional: policy.additional.union(
                     sessionLinkGrantSnapshot?.additionalGrants ?? []
@@ -12392,7 +12365,7 @@ actor ServerNetworkManager {
         // ------------------------------------------------------------------
         //  tools/call  (UPDATED)
         // ------------------------------------------------------------------
-        let callToolHandler: @Sendable (CallTool.Parameters) async throws -> CallTool.Result = { [weak self] params in
+        await server.withMethodHandler(CallTool.self) { [weak self] params in
             guard let self else {
                 return CallTool.Result(
                     content: [MCP.Tool.Content.text(text: "Server unavailable", annotations: nil, _meta: nil)],
@@ -12402,7 +12375,6 @@ actor ServerNetworkManager {
 
             let originalName = params.name
             let toolName = Self.canonicalToolName(for: originalName)
-            let responseToolName = MCPDomainSelfToolCallContext.isLegacyAlias ? originalName : toolName
             connectionLog("tools/call received original=\(originalName) canonical=\(toolName) connection=\(connectionID)")
             if toolName == MCPWindowToolName.agentSessionLink {
                 let context = await agentSessionLinkCatalogDiagnosticContext(for: connectionID)
@@ -12598,12 +12570,12 @@ actor ServerNetworkManager {
                 return Self.executionContractToolErrorResult(
                     rawJSON: capturedRawJSON,
                     code: "tool_execution_invalid_envelope",
-                    message: "Tool '\(responseToolName)' received an invalid execution envelope.",
+                    message: "Tool '\(toolName)' received an invalid execution envelope.",
                     metadata: [
                         "retryable": .bool(false),
                         "mutation_state": .string("not_applied"),
                         "operation_id": .string(promptExportOperationID),
-                        "tool": .string(responseToolName)
+                        "tool": .string(toolName)
                     ]
                 )
             }
@@ -12663,12 +12635,12 @@ actor ServerNetworkManager {
                     return Self.executionContractToolErrorResult(
                         rawJSON: capturedRawJSON,
                         code: "tool_execution_admission_timeout",
-                        message: "Tool '\(responseToolName)' could not enter its provider while preserving the export execution envelope.",
+                        message: "Tool '\(toolName)' could not enter its provider while preserving the export execution envelope.",
                         metadata: [
                             "retryable": .bool(true),
                             "mutation_state": .string("not_applied"),
                             "operation_id": .string(promptExportOperationID),
-                            "tool": .string(responseToolName),
+                            "tool": .string(toolName),
                             "cancellation_origin": .string(promptExportExecutionEnvelope.cancellationOrigin.rawValue),
                             "settlement": .string("admission_timeout")
                         ]
@@ -12769,7 +12741,7 @@ actor ServerNetworkManager {
                                     )
                             )
                         }
-                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: MCPDomainSelfToolCallContext.errorForPresentation(error).localizedDescription)
+                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: error.localizedDescription)
                     }
                 }
             }
@@ -12798,7 +12770,7 @@ actor ServerNetworkManager {
                 let liveAdditional = effectivePolicy.additional.union(
                     liveSessionLinkGrant?.additionalGrants ?? []
                 )
-                let domainPolicy = Self.domainPolicySnapshot(
+                let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
                     restricted: effectivePolicy.restricted,
                     additional: liveAdditional,
                     taskLabelKind: effectivePolicy.taskLabelKind,
@@ -12821,7 +12793,7 @@ actor ServerNetworkManager {
                     #endif
                     // Identical to the ungranted-caller denial, so calling the hidden tool by name
                     // reveals nothing beyond "you have no oversight authority".
-                    return CallTool.Result.err("Tool '\(responseToolName)' is not available for this session.")
+                    return CallTool.Result.err("Tool '\(toolName)' is not available for this session.")
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant {
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
@@ -12829,7 +12801,7 @@ actor ServerNetworkManager {
                             "reason": "missing_additional_tool_grant"
                         ])
                     #endif
-                    return CallTool.Result.err("Tool '\(responseToolName)' is only available during discovery or agent mode runs.")
+                    return CallTool.Result.err("Tool '\(toolName)' is only available during discovery or agent mode runs.")
                 } catch {
                     // Early policy intentionally owns only explicit-grant gating.
                 }
@@ -12877,7 +12849,7 @@ actor ServerNetworkManager {
                 await self.effectivePolicyState(for: connectionID)
             }
             connectionLog("tools/call \(toolName): policy ready")
-            let preAdmissionDecision: MCPDomainPreAdmissionDecision
+            let preAdmissionDecision: MCPToolAdmissionDecision
             do {
                 let policyState = EditFlowPerf.begin(
                     EditFlowPerf.Stage.MCPToolCall.policyGating,
@@ -12890,7 +12862,7 @@ actor ServerNetworkManager {
                 let liveSessionLinkGrant = toolName == MCPWindowToolName.agentSessionLink
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
-                let domainPolicy = Self.domainPolicySnapshot(
+                let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
                     restricted: policy.restricted,
                     additional: policy.additional.union(
                         liveSessionLinkGrant?.additionalGrants ?? []
@@ -12905,7 +12877,7 @@ actor ServerNetworkManager {
                 )
             } catch MCPDomainCallPolicyDenial.restricted {
                 log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
-                return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(responseToolName)' is disabled for this connection.")
+                return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
             } catch MCPDomainCallPolicyDenial.roleUnavailable {
                 return Self.toolErrorResult(
                     rawJSON: capturedRawJSON,
@@ -12920,7 +12892,7 @@ actor ServerNetworkManager {
                 return Self.executionContractToolErrorResult(
                     rawJSON: capturedRawJSON,
                     code: "tool_execution_admission_unclassified",
-                    message: "No static admission classification exists for tool '\(responseToolName)'."
+                    message: "No static admission classification exists for tool '\(toolName)'."
                 )
             }
 
@@ -13076,7 +13048,7 @@ actor ServerNetworkManager {
                     return await finishRequestProgress(
                         Self.toolErrorResult(
                             rawJSON: capturedRawJSON,
-                            message: "Publication authority was lost after '\(responseToolName)' completed."
+                            message: "Publication authority was lost after '\(toolName)' completed."
                         )
                     )
                 }
@@ -13111,7 +13083,7 @@ actor ServerNetworkManager {
                             ?? Self.executionContractToolErrorResult(
                                 rawJSON: capturedRawJSON,
                                 code: "tool_execution_admission_timeout",
-                                message: "Tool '\(responseToolName)' could not enter its provider while preserving the export execution envelope."
+                                message: "Tool '\(toolName)' could not enter its provider while preserving the export execution envelope."
                             )
                     },
                     cancellationResult: {
@@ -13417,7 +13389,7 @@ actor ServerNetworkManager {
                                         return Self.executionContractToolErrorResult(
                                             rawJSON: capturedRawJSON,
                                             code: "tool_execution_mutation_resource_unresolved",
-                                            message: "The exclusive tool '\(responseToolName)' has no resolved window resource."
+                                            message: "The exclusive tool '\(toolName)' has no resolved window resource."
                                         )
                                     }
                                     do {
@@ -13459,7 +13431,7 @@ actor ServerNetworkManager {
                                         return Self.executionContractToolErrorResult(
                                             rawJSON: capturedRawJSON,
                                             code: "tool_execution_read_resource_unresolved",
-                                            message: "The small-read tool '\(responseToolName)' has no resolved window/store resource."
+                                            message: "The small-read tool '\(toolName)' has no resolved window/store resource."
                                         )
                                     }
                                     do {
@@ -13501,7 +13473,7 @@ actor ServerNetworkManager {
                                         return Self.executionContractToolErrorResult(
                                             rawJSON: capturedRawJSON,
                                             code: "tool_execution_read_resource_unresolved",
-                                            message: "The file-read tool '\(responseToolName)' has no resolved window/store resource."
+                                            message: "The file-read tool '\(toolName)' has no resolved window/store resource."
                                         )
                                     }
                                     do {
@@ -13722,7 +13694,8 @@ actor ServerNetworkManager {
                                 }
 
                                 @Sendable func dispatchResolvedProvider(
-                                    _ operation: @escaping @Sendable (PromptExportProviderEntryBridge?) async throws -> Value
+                                    _ operation: @escaping @Sendable (PromptExportProviderEntryBridge?, ToolInvocationContext) async throws -> Value,
+                                    invocationContext: ToolInvocationContext
                                 ) async throws -> Value {
                                     try promptExportExecutionEnvelope?.admissionDeadline.check()
                                     guard await self.isCurrentConnectionCallLimiterResolution(
@@ -13732,7 +13705,7 @@ actor ServerNetworkManager {
                                         throw ToolDispatchAdmissionError.connectionTerminal
                                     }
                                     try promptExportExecutionEnvelope?.admissionDeadline.check()
-                                    if let authorization = Self.currentToolDispatchAuthorization {
+                                    if let authorization = invocationContext.dispatchAuthorization {
                                         guard await self.isCurrentToolDispatchAuthorization(authorization) else {
                                             throw ToolDispatchAdmissionError.connectionTerminal
                                         }
@@ -13755,7 +13728,7 @@ actor ServerNetworkManager {
                                     if contract.cleanupDisposition == .detachAndSettle,
                                        toolName != MCPWindowToolName.fileActions
                                     {
-                                        guard let windowID = Self.currentToolDispatchAuthorization?.windowIdentity?.windowID else {
+                                        guard let windowID = invocationContext.dispatchAuthorization?.windowIdentity?.windowID else {
                                             throw MCPToolExecutionDispatchError.structureSettlementWindowUnresolved
                                         }
                                         switch self.codeStructureSettlementRegistry.admit(
@@ -13846,10 +13819,10 @@ actor ServerNetworkManager {
                                         correlation: lifecycleCorrelation,
                                         EditFlowPerf.Dimensions(
                                             toolName: toolName,
-                                            windowID: Self.currentToolDispatchAuthorization?.windowIdentity?.windowID,
+                                            windowID: invocationContext.dispatchAuthorization?.windowIdentity?.windowID,
                                             runID: observerRunIDForCallbacksFinal?.uuidString,
                                             providerActive: true,
-                                            networkScopeActive: Self.currentToolDispatchAuthorization?.windowIdentity != nil,
+                                            networkScopeActive: invocationContext.dispatchAuthorization?.windowIdentity != nil,
                                             permitActive: true,
                                             publicationPending: false,
                                             terminalBarrier: false
@@ -13865,7 +13838,7 @@ actor ServerNetworkManager {
                                             throw ToolDispatchAdmissionError.connectionTerminal
                                         }
                                         try promptExportExecutionEnvelope?.admissionDeadline.check()
-                                        if let authorization = Self.currentToolDispatchAuthorization {
+                                        if let authorization = invocationContext.dispatchAuthorization {
                                             guard await self.isCurrentToolDispatchAuthorization(authorization) else {
                                                 throw ToolDispatchAdmissionError.connectionTerminal
                                             }
@@ -13883,7 +13856,7 @@ actor ServerNetworkManager {
                                                 return try await EditFlowPerf.measure(
                                                     EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
                                                     EditFlowPerf.Dimensions(toolName: toolName),
-                                                    operation: { try await operation(providerEntryBridge) }
+                                                    operation: { try await operation(providerEntryBridge, invocationContext) }
                                                 )
                                             }
                                             guard let promptExportMutationObservation else {
@@ -13897,7 +13870,7 @@ actor ServerNetworkManager {
                                     }
 
                                     @Sendable func recordSynchronousSettlement(
-                                        _ providerSettlement: MCPToolExecutionSettlement
+                                        _ providerSettlement: MCPToolSettlementResult
                                     ) async {
                                         if let slot = settlementAdmission.slot,
                                            let noticeProjection = await self.takeCodeStructureSettlementLimitNoticeAfterSettlement(
@@ -13922,10 +13895,10 @@ actor ServerNetworkManager {
                                             EditFlowPerf.Dimensions(
                                                 toolName: toolName,
                                                 outcome: providerSettlement == .success ? "provider_completed" : outcome,
-                                                windowID: Self.currentToolDispatchAuthorization?.windowIdentity?.windowID,
+                                                windowID: invocationContext.dispatchAuthorization?.windowIdentity?.windowID,
                                                 runID: observerRunIDForCallbacksFinal?.uuidString,
                                                 providerActive: false,
-                                                networkScopeActive: Self.currentToolDispatchAuthorization?.windowIdentity != nil,
+                                                networkScopeActive: invocationContext.dispatchAuthorization?.windowIdentity != nil,
                                                 permitActive: true,
                                                 publicationPending: true,
                                                 terminalBarrier: false
@@ -13934,7 +13907,7 @@ actor ServerNetworkManager {
                                     }
 
                                     @Sendable func recordDetachedSettlement(
-                                        _ providerSettlement: MCPToolExecutionSettlement
+                                        _ providerSettlement: MCPToolSettlementResult
                                     ) async {
                                         if let slot = settlementAdmission.slot,
                                            let noticeProjection = await self.takeCodeStructureSettlementLimitNoticeAfterSettlement(
@@ -13980,7 +13953,7 @@ actor ServerNetworkManager {
                                     }
 
                                     @Sendable func recordAbandonedSettlement(
-                                        _ providerSettlement: MCPToolExecutionSettlement
+                                        _ providerSettlement: MCPToolSettlementResult
                                     ) async {
                                         MCPLifecycleDiagnostics.shared.record(.abandonedSettlement, connectionID: connectionID, invocationID: invocationID)
                                         if let slot = settlementAdmission.slot,
@@ -14010,7 +13983,7 @@ actor ServerNetworkManager {
                                     }
 
                                     @Sendable func recordForceDisconnectedSettlement(
-                                        _ providerSettlement: MCPToolExecutionSettlement
+                                        _ providerSettlement: MCPToolSettlementResult
                                     ) async {
                                         MCPLifecycleDiagnostics.shared.record(.forceDisconnectedSettlement, connectionID: connectionID, invocationID: invocationID)
                                         if let slot = settlementAdmission.slot,
@@ -14260,7 +14233,7 @@ actor ServerNetworkManager {
                                     // placeholder can cross the SDK handler boundary.
                                     Self.toolErrorResult(
                                         rawJSON: capturedRawJSON,
-                                        message: "Publication authority was lost after '\(responseToolName)' completed."
+                                        message: "Publication authority was lost after '\(toolName)' completed."
                                     )
                                 }
 
@@ -14331,7 +14304,7 @@ actor ServerNetworkManager {
                                         errorMetadata = [:]
                                     case let MCPToolExecutionDispatchError.missingContract(missingToolName):
                                         code = "tool_execution_contract_missing"
-                                        message = "No declared execution contract exists for MCP tool '\(MCPDomainSelfToolCallContext.displayName(for: missingToolName))'."
+                                        message = "No declared execution contract exists for MCP tool '\(missingToolName)'."
                                         outcome = "executionContractMissing"
                                         shouldForceDisconnect = false
                                         errorMetadata = [:]
@@ -14383,21 +14356,21 @@ actor ServerNetworkManager {
                                         errorMetadata = busyMetadata
                                     case MCPToolExecutionDispatchError.structureSettlementWindowUnresolved:
                                         code = "tool_execution_structure_settlement_window_unresolved"
-                                        message = "\(responseToolName) requires a resolved window before its settlement policy can be selected."
+                                        message = "\(toolName) requires a resolved window before its settlement policy can be selected."
                                         outcome = "executionStructureSettlementWindowUnresolved"
                                         shouldForceDisconnect = false
                                         errorMetadata = ["retryable": .bool(false)]
                                     case is MCPDomainAdmissionDeadline.Expired,
                                          MCPToolExecutionWatchdogError.admissionEnvelopeExpired:
                                         code = "tool_execution_admission_timeout"
-                                        message = "Tool '\(responseToolName)' could not enter its provider while preserving the export execution envelope."
+                                        message = "Tool '\(toolName)' could not enter its provider while preserving the export execution envelope."
                                         outcome = "executionAdmissionTimeout"
                                         shouldForceDisconnect = false
                                         errorMetadata = [
                                             "retryable": .bool(true),
                                             "mutation_state": .string("not_applied"),
                                             "operation_id": .string(promptExportOperationID),
-                                            "tool": .string(responseToolName),
+                                            "tool": .string(toolName),
                                             "cancellation_origin": .string(
                                                 promptExportExecutionEnvelope?.cancellationOrigin.rawValue
                                                     ?? MCPToolExecutionCancellationOrigin.serverExportEnvelope.rawValue
@@ -14406,22 +14379,22 @@ actor ServerNetworkManager {
                                         ]
                                     case let MCPToolExecutionWatchdogError.executionTimedOut(settlement):
                                         code = "tool_execution_timeout"
-                                        message = "Tool '\(responseToolName)' exceeded its \(selectedDeadlineDescription)-second execution contract and settled as \(settlement.rawValue) during cancellation grace."
+                                        message = "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract and settled as \(settlement.rawValue) during cancellation grace."
                                         outcome = "executionTimeout"
                                         shouldForceDisconnect = false
                                         errorMetadata = [
                                             "cancellation_origin": .string(MCPToolExecutionCancellationOrigin.watchdogDeadline.rawValue),
                                             "settlement": .string(settlement.rawValue)
                                         ].merging(
-                                            promptExportMutationObservation?.errorMetadata(toolName: responseToolName) ?? [:],
+                                            promptExportMutationObservation?.errorMetadata(toolName: toolName) ?? [:],
                                             uniquingKeysWith: { _, authorityValue in authorityValue }
                                         )
                                     case MCPToolExecutionWatchdogError.executionDetached:
                                         let mutationOutcomeMayStillReconcile = toolName == MCPWindowToolName.fileActions
                                         code = "tool_execution_timeout"
                                         message = mutationOutcomeMayStillReconcile
-                                            ? "Tool '\(responseToolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the mutation provider during grace, so it was detached for eventual reconciliation. Inspect the filesystem before issuing another mutation."
-                                            : "Tool '\(responseToolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the read-only provider during grace, so it was detached for eventual cleanup."
+                                            ? "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the mutation provider during grace, so it was detached for eventual reconciliation. Inspect the filesystem before issuing another mutation."
+                                            : "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the read-only provider during grace, so it was detached for eventual cleanup."
                                         outcome = "executionDetached"
                                         shouldForceDisconnect = false
                                         errorMetadata = [
@@ -14431,7 +14404,7 @@ actor ServerNetworkManager {
                                         ]
                                     case MCPToolExecutionWatchdogError.cleanupUnresponsive:
                                         code = "tool_execution_cleanup_unresponsive"
-                                        message = "Tool '\(responseToolName)' exceeded its \(selectedDeadlineDescription)-second execution contract and did not stop during cancellation grace. The MCP connection was force-disconnected."
+                                        message = "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract and did not stop during cancellation grace. The MCP connection was force-disconnected."
                                         outcome = "executionCleanupUnresponsive"
                                         shouldForceDisconnect = true
                                         errorMetadata = [
@@ -14439,7 +14412,7 @@ actor ServerNetworkManager {
                                             "cancellation_origin": .string(MCPToolExecutionCancellationOrigin.watchdogDeadline.rawValue),
                                             "settlement": .string("force_disconnect")
                                         ].merging(
-                                            promptExportMutationObservation?.errorMetadata(toolName: responseToolName) ?? [:],
+                                            promptExportMutationObservation?.errorMetadata(toolName: toolName) ?? [:],
                                             uniquingKeysWith: { _, authorityValue in authorityValue }
                                         )
                                     case let protectedError as DomainProtectedMutationError
@@ -14453,7 +14426,7 @@ actor ServerNetworkManager {
                                             "mutation_state": .string(settlement.state.rawValue),
                                             "retryable": .bool(false),
                                             "operation_id": .string(settlement.operationID),
-                                            "tool": .string(responseToolName),
+                                            "tool": .string(toolName),
                                             "settlement": .string("error")
                                         ]
                                     default:
@@ -14464,7 +14437,7 @@ actor ServerNetworkManager {
                                     var errorJSONObject: [String: Value] = [
                                         "code": .string(code),
                                         "error": .string(message),
-                                        "tool": .string(responseToolName)
+                                        "tool": .string(toolName)
                                     ]
                                     for (key, value) in errorMetadata {
                                         errorJSONObject[key] = value
@@ -14614,33 +14587,58 @@ actor ServerNetworkManager {
                                     } else {
                                         nil
                                     }
-                                    let resolvedOperation: @Sendable (PromptExportProviderEntryBridge?) async throws -> Value = { providerEntryBridge in
-                                        #if DEBUG
-                                            if let operation = await self.debugResolvedToolOperationOverrides[toolName] {
-                                                try providerEntryBridge?.providerWillEnter()
-                                                MCPLifecycleDiagnostics.shared.record(.providerEntered, connectionID: connectionID, invocationID: invocationID)
-                                                defer {
-                                                    MCPLifecycleDiagnostics.shared.record(.providerReturning, connectionID: connectionID, invocationID: invocationID)
-                                                }
-                                                return try await operation()
-                                            }
-                                        #endif
-                                        return try await self.domainHost.invoke(MCPDomainHostInvocation(
-                                            invocationID: invocationID,
+                                    let networkInvocationContext = await ToolInvocationContext(
+                                        origin: .network,
+                                        invocationID: invocationID,
+                                        requestID: validatedTransportDispatchIdentity?.requestID ?? resolvedRequestIdentity?.jsonRPCRequestID,
+                                        toolName: toolName,
+                                        metadata: MCPRequestMetadata(
                                             connectionID: connectionID,
-                                            resolution: resolvedTool,
-                                            arguments: effectiveArgs,
-                                            securityContext: invocationSecurityContext,
-                                            admittedContext: admittedDomainContext,
-                                            admissionDeadline: promptExportExecutionEnvelope?.admissionDeadline,
-                                            onProviderEntry: {
-                                                try providerEntryBridge?.providerWillEnter()
-                                                MCPLifecycleDiagnostics.shared.record(.providerEntered, connectionID: connectionID, invocationID: invocationID)
+                                            clientName: self.clientIdentifier(forConnection: connectionID),
+                                            windowID: chosenID,
+                                            runPurpose: self.runPurpose(for: connectionID),
+                                            tabContextHint: capturedTabContextHint.map {
+                                                MCPTabContextHint(tabID: $0.tabID, workspaceID: $0.workspaceID, windowID: $0.windowID)
                                             },
-                                            onProviderReturn: {
-                                                MCPLifecycleDiagnostics.shared.record(.providerReturning, connectionID: connectionID, invocationID: invocationID)
+                                            invocationID: invocationID,
+                                            requestID: validatedTransportDispatchIdentity?.requestID ?? resolvedRequestIdentity?.jsonRPCRequestID
+                                        ),
+                                        dispatchAuthorization: nil
+                                    )
+                                    let resolvedOperation: @Sendable (PromptExportProviderEntryBridge?, ToolInvocationContext) async throws -> Value = { providerEntryBridge, invocationContext in
+                                        let diagnosticAdapter = MCPInvocationDiagnosticAdapter()
+                                        return try await MCPInvocationContextBridge.$diagnosticSink.withValue({ failure in
+                                            diagnosticAdapter.report(failure)
+                                        }) {
+                                            try await MCPInvocationContextBridge.withInvocation(invocationContext) {
+                                                #if DEBUG
+                                                    if let operation = await self.debugResolvedToolOperationOverrides[toolName] {
+                                                        try providerEntryBridge?.providerWillEnter()
+                                                        MCPLifecycleDiagnostics.shared.record(.providerEntered, connectionID: connectionID, invocationID: invocationID)
+                                                        defer {
+                                                            MCPLifecycleDiagnostics.shared.record(.providerReturning, connectionID: connectionID, invocationID: invocationID)
+                                                        }
+                                                        return try await operation()
+                                                    }
+                                                #endif
+                                                return try await self.domainHost.invoke(MCPDomainHostInvocation(
+                                                    invocationID: invocationID,
+                                                    connectionID: connectionID,
+                                                    resolution: resolvedTool,
+                                                    arguments: effectiveArgs,
+                                                    securityContext: invocationSecurityContext,
+                                                    admittedContext: admittedDomainContext,
+                                                    admissionDeadline: promptExportExecutionEnvelope?.admissionDeadline,
+                                                    onProviderEntry: {
+                                                        try providerEntryBridge?.providerWillEnter()
+                                                        MCPLifecycleDiagnostics.shared.record(.providerEntered, connectionID: connectionID, invocationID: invocationID)
+                                                    },
+                                                    onProviderReturn: {
+                                                        MCPLifecycleDiagnostics.shared.record(.providerReturning, connectionID: connectionID, invocationID: invocationID)
+                                                    }
+                                                ))
                                             }
-                                        ))
+                                        }
                                     }
 
                                     // Window-scoped bindings retain exact registry generation ownership.
@@ -14669,6 +14667,10 @@ actor ServerNetworkManager {
                                             explicitWindowID: capturedWindowID,
                                             authorization: dispatchAuthorization
                                         )
+                                        let dispatchInvocationContext = networkInvocationContext.withDispatchAuthorization(
+                                            dispatchAuthorization,
+                                            explicitWindowRoutingHint: explicitWindowRoutingHint
+                                        )
                                         do {
                                             return try await self.withWindowToolOwnership(
                                                 windowID: ownershipWindowID,
@@ -14684,7 +14686,7 @@ actor ServerNetworkManager {
                                                             EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                             EditFlowPerf.Dimensions(toolName: toolName)
                                                         ) {
-                                                            try await dispatchResolvedProvider(resolvedOperation)
+                                                            try await dispatchResolvedProvider(resolvedOperation, invocationContext: dispatchInvocationContext)
                                                         }
                                                     }
                                                     releaseResourceAdmissionLeases(outcome: "provider_success")
@@ -14812,7 +14814,7 @@ actor ServerNetworkManager {
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
                                                         EditFlowPerf.Dimensions(toolName: toolName)
                                                     ) {
-                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(MCPDomainSelfToolCallContext.errorForPresentation(error).localizedDescription), "tool": .string(responseToolName)]))
+                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
                                                     }
                                                     let eventObserverCount = await EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
@@ -14840,7 +14842,7 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
                                             )
                                             return handlerResult(
-                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(MCPDomainSelfToolCallContext.errorForPresentation(error))"),
+                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)"),
                                                 outcome: "dispatchError"
                                             )
                                         }
@@ -14851,7 +14853,7 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
-                                                try await dispatchResolvedProvider(resolvedOperation)
+                                                try await dispatchResolvedProvider(resolvedOperation, invocationContext: networkInvocationContext)
                                             }
                                             releaseResourceAdmissionLeases(outcome: "provider_success")
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
@@ -14958,7 +14960,7 @@ actor ServerNetworkManager {
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
                                                         EditFlowPerf.Dimensions(toolName: toolName)
                                                     ) {
-                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(MCPDomainSelfToolCallContext.errorForPresentation(error).localizedDescription), "tool": .string(responseToolName)]))
+                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
                                                     }
                                                     let eventObserverCount = await EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
@@ -14986,7 +14988,7 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
                                             )
                                             return handlerResult(
-                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(MCPDomainSelfToolCallContext.errorForPresentation(error))"),
+                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)"),
                                                 outcome: "dispatchError"
                                             )
                                         }
@@ -15009,7 +15011,7 @@ actor ServerNetworkManager {
                                         EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
                                         EditFlowPerf.Dimensions(toolName: toolName)
                                     ) {
-                                        ToolOutputFormatter.rawJSONString(.object(["error": .string("Tool not found: \(responseToolName)"), "tool": .string(responseToolName)]))
+                                        ToolOutputFormatter.rawJSONString(.object(["error": .string("Tool not found: \(toolName)"), "tool": .string(toolName)]))
                                     }
                                     if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, modelOnly: isMemoryOnlyModelCall, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "final tool-not-found fallthrough") {
                                         let eventObserverCount = await EditFlowPerf.measure(
@@ -15038,7 +15040,7 @@ actor ServerNetworkManager {
                                 )
                                 log.error("Tool not found: \(toolName)")
                                 return handlerResult(
-                                    Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(responseToolName)"),
+                                    Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(toolName)"),
                                     outcome: "toolNotFound"
                                 )
                             } // TabContextHint TaskLocal wrapper
@@ -15047,11 +15049,6 @@ actor ServerNetworkManager {
                 } // withPermit wrapper
             } // LimiterEnvelope wrapper
             return await finalizeToolResult(result)
-        }
-        await server.withMethodHandler(CallTool.self) { params in
-            try await MCPDomainSelfToolCallContext.withRequestedName(params.name) {
-                try await callToolHandler(params)
-            }
         }
     }
 
