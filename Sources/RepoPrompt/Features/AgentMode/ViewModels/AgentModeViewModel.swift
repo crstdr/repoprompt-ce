@@ -1043,6 +1043,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
     #if DEBUG
+        var test_beforeRestorationHydrationAdmission: (@MainActor () async -> Void)?
+        var test_restorationHydrationTaskDidFinish: (@MainActor () -> Void)?
         var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)?
         var test_beforeFailedMCPControlRegistrationCleanup: (@MainActor () async -> Void)?
         var test_afterMCPApprovalStoreUpdate: (@MainActor () async -> Void)?
