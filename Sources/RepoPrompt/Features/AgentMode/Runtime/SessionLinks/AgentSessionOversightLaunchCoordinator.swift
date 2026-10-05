@@ -11,7 +11,7 @@ import RepoPromptInstrumentation
 // an intent is replayed against exact restoration-ready incarnations only, never against a UUID
 // match alone; restore never starts a run, publishes prompt inventory, or arms an Auto-wake by
 // itself — the bootstrap after restore goes through the ordinary publication path. The only
-// hydration it causes is a one-shot, passive transcript load of the background tabs a saved pair
+// hydration it causes is a passive transcript load of the background tabs a saved pair
 // is actually waiting on, so saved oversight comes back at launch instead of only after the user
 // happens to open every endpoint's tab.
 
@@ -234,8 +234,6 @@ final class AgentSessionOversightLaunchCoordinator {
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
-    /// Hydration dedupe; only captured endpoint closure rearms requests, never ordinary events.
-    private var hydrationRequestedSessionIDs: Set<UUID> = []
 
     init(
         delegate: (any AgentSessionOversightLaunchCoordinatorDelegate)? = nil,
@@ -380,8 +378,7 @@ final class AgentSessionOversightLaunchCoordinator {
         pair: AgentSessionOversightIntent,
         token: AgentSessionOversightIntentToken,
         assertedAt generation: UInt64,
-        reference: DomainAgentSessionLinkReference,
-        closedSessionIDs: Set<UUID>
+        reference: DomainAgentSessionLinkReference
     ) {
         guard !isFrozen else { return }
         var entry = entries[pair] ?? Entry(pair: pair, token: token)
@@ -401,24 +398,6 @@ final class AgentSessionOversightLaunchCoordinator {
         entry.targetEndpoint = nil
         entries[pair] = entry
         if !launchPairOrder.contains(pair) { launchPairOrder.append(pair) }
-        hydrationRequestedSessionIDs.subtract(closedSessionIDs)
-        markDirty()
-    }
-
-    /// Rearm captured pairs after later closes, using current descriptors even for background tabs.
-    func noteWindowClosing(windowID: Int) {
-        guard !isFrozen, let host = delegate?.launchCoordinatorHost else { return }
-        let closingSessions = Set(
-            host.agentSessionLinkComposeTabDescriptors()
-                .filter { $0.windowID == windowID }.map(\.sessionID)
-        )
-        let capturedSessions = Set(
-            entries.values.filter { $0.parkedReference != nil }
-                .flatMap { [$0.pair.observerSessionID, $0.pair.targetSessionID] }
-        )
-        let affected = closingSessions.intersection(capturedSessions)
-        guard !affected.isEmpty else { return }
-        hydrationRequestedSessionIDs.subtract(affected)
         markDirty()
     }
 
@@ -617,10 +596,6 @@ final class AgentSessionOversightLaunchCoordinator {
         entries.values.count { $0.didStartReservation }
     }
 
-    var requestedHydrationSessionIDs: Set<UUID> {
-        hydrationRequestedSessionIDs
-    }
-
     // MARK: Pass
 
     /// One reconciliation pass over the launch-loaded and close-captured worklist.
@@ -735,9 +710,8 @@ final class AgentSessionOversightLaunchCoordinator {
     /// Requests a passive load for every endpoint a waiting entry is blocked on only because its
     /// background tab has not been hydrated yet.
     ///
-    /// Bounded to saved endpoints, requested once until a captured endpoint's next close, and
-    /// only after every restore barrier has cleared (this runs inside the gated pass). A session that
-    /// is not described anywhere, is described more than once, or is being deleted is left alone:
+    /// Bounded to saved endpoints after restore barriers clear; the host deduplicates loads.
+    /// Undescribed, ambiguous, or deleted sessions are left alone:
     /// hydration could not make it restorable, and classification decides its fate as before.
     private func requestHydrationForWaitingEntries(
         descriptorCounts: [UUID: Int],
@@ -749,8 +723,7 @@ final class AgentSessionOversightLaunchCoordinator {
         for pair in launchPairOrder {
             guard entries[pair]?.state == .waiting || entries[pair]?.parkedReference != nil else { continue }
             for sessionID in [pair.observerSessionID, pair.targetSessionID] {
-                guard !hydrationRequestedSessionIDs.contains(sessionID),
-                      !registry.isPermanentlyDeleted(sessionID: sessionID),
+                guard !registry.isPermanentlyDeleted(sessionID: sessionID),
                       !registry.isDeletionInProgress(sessionID: sessionID),
                       (descriptorCounts[sessionID] ?? 0) == 1
                 else {
@@ -772,7 +745,6 @@ final class AgentSessionOversightLaunchCoordinator {
             }
         }
         guard !requested.isEmpty else { return }
-        hydrationRequestedSessionIDs.formUnion(requested)
         #if DEBUG
             restorePerfRecorder.event(
                 "oversight.hydrationRequested",
