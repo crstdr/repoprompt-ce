@@ -1926,6 +1926,37 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertTrue(fixture.providerAttempts.events.isEmpty)
     }
 
+    func testLoadedParentPublishesChildRunAndCleanupThroughRealBridge() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let parent = fixture.vm.session(for: fixture.tabs[1].id)
+        XCTAssertTrue(parent.hasLoadedPersistedState)
+        let parentID = try XCTUnwrap(parent.activeAgentSessionID)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.vm, tabID: parent.tabID)
+        let authority = AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
+        let hydrationBefore = fixture.hydrationAttempts.events
+        try await add(from: 0, to: 1, in: fixture)
+        let child = AgentModeViewModel.TabSession(tabID: UUID())
+        child.parentSessionID = parentID
+        child.runState = .running
+        XCTAssertNotNil(fixture.vm.test_installPersistentSessionBinding(sessionID: UUID(), on: child))
+        fixture.vm.test_installLiveSession(child)
+        try await AsyncTestWait.waitUntil("real bridge publishes running child") {
+            await authority.observationSnapshot(forTargetEndpoint: endpoint)?.board.subagentRunning == 1
+        }
+        child.runState = .completed
+        try await AsyncTestWait.waitUntil("real bridge publishes completed child") {
+            let board = await authority.observationSnapshot(forTargetEndpoint: endpoint)?.board
+            return board?.subagentRunning == 0 && board?.subagentFinished == 1
+        }
+        fixture.vm.test_removeSession(tabID: child.tabID)
+        try await AsyncTestWait.waitUntil("real bridge publishes child cleanup") {
+            let board = await authority.observationSnapshot(forTargetEndpoint: endpoint)?.board
+            return board?.subagentRunning == 0 && board?.subagentFinished == 0
+        }
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore)
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty)
+    }
+
     func testColdSidebarRejectsStaleIdentityAndRestrictedObservers() async throws {
         for restriction in ["child", "mcp-origin", "mcp-control"] {
             let fixture = try await makeFixture(peerCount: 1)
@@ -2660,7 +2691,7 @@ final class AgentSidebarMenuDiagnosticsTests: XCTestCase {
             guard case let .sidebarMenuUnavailable(reason, _, _, _, _, present, _, current, registered, removed) = try XCTUnwrap(sink.events.last) else {
                 return XCTFail("expected the unavailable event")
             }
-            XCTAssertEqual(reason, .sessionUUIDMissing)
+            XCTAssertEqual(reason, .endpointMissing, "A supplied row UUID without a management endpoint is not a missing UUID")
             XCTAssertFalse(present)
             XCTAssertEqual(current, selected)
             XCTAssertEqual(registered, expectedOwner)

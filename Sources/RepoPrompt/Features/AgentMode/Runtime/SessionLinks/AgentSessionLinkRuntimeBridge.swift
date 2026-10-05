@@ -3144,7 +3144,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard !isFrozenForTermination, let liveTarget = liveCandidates.first(where: { $0.domainEndpoint == targetEndpoint }),
               liveCandidates.contains(where: { $0.domainEndpoint == observerEndpoint }),
               liveCandidatesMatch(
-                  expectedEndpoints,
+                  .init(observer: observerEndpoint, target: targetEndpoint),
                   pair: pair,
                   candidates: liveCandidates
               )
