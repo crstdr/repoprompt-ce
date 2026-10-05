@@ -9,14 +9,17 @@ import XCTest
 final class DevinPermissionLevelTests: XCTestCase {
     private typealias Level = DevinAgentToolPreferences.PermissionLevel
 
-    func testDefaultDiscoveryRefusesBeforeInstalledProviderSupportProbe() async {
-        // Exercise the real discovery runner, not a replacement controller factory.
-        let service = DevinModelDiscoveryService(isInstalled: { true })
-        let outcome = await service.discoverIfNeeded()
-        guard case let .failed(message) = outcome else {
-            return XCTFail("Default discovery must refuse before querying the installed provider")
+    func testSupportProbeRefusesInstalledProviderExecutable() async throws {
+        // Keep Devin's required entry name, but resolve the link to a harmless installed shell.
+        let executable = try makeTestDirectory().appendingPathComponent("devin")
+        try FileManager.default.createSymbolicLink(atPath: executable.path, withDestinationPath: "/bin/sh")
+        let provider = DevinACPAgentProvider(config: .init(commandName: executable.path, includeRepoPromptMCPServer: false))
+        let request = ACPRunRequest(agentKind: .devin, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        let outcome = try await provider.support(for: request)
+        guard case let .unsupported(reason) = outcome else {
+            return XCTFail("Support probing must refuse an installed executable")
         }
-        XCTAssertTrue(message.hasPrefix("Provider process launch refused under XCTest."), message)
+        XCTAssertTrue(reason.hasPrefix("Provider process launch refused under XCTest:"), reason)
     }
 
     // MARK: - PermissionLevel

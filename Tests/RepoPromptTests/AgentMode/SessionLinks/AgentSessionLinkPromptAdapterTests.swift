@@ -2051,8 +2051,16 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testClaudeNativeLosingPreseededFakeRefusesRealProviderReplacement() async throws {
         let fake = MonitorFakeNativeController()
-        // Intentionally use the production factory to reproduce a fixture that loses its fake.
-        let coordinator = ClaudeAgentModeCoordinator(windowID: 1, workspacePathProvider: { _ in nil })
+        // Keep the real adapter/controller, but use a harmless installed executable.
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1, workspacePathProvider: { _ in nil },
+            claudeControllerFactory: { runID, tabID, windowID, settings in
+                let config = ClaudeCodeAgentConfig.agentMode(commandName: "/bin/sh")
+                return ClaudeCompatibleNativeSessionAdapter(runtimeConfig: ClaudeCompatiblePluginBridge.runtimeConfig(from: config, mode: .agentMode)) {
+                    ClaudeNativeProcessSessionController(runID: runID, tabID: tabID, windowID: windowID, workspacePath: settings.workspacePath, config: config)
+                }
+            }
+        )
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
@@ -2060,19 +2068,30 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         session.installRunID(UUID())
         session.claudeController = fake
         let intent = try claudeRunIntent(for: session, source: "test.claude.lost-fake-refusal")
-
-        let outcome = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
-
-        guard case let .failed(message) = outcome else {
-            return XCTFail("Losing a fake must refuse real provider launch, got \(outcome)")
+        let socketRoot = URL(fileURLWithPath: "/tmp").appendingPathComponent("rpce-guard-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: socketRoot, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: socketRoot) }
+        let socketURL = socketRoot.appendingPathComponent("bootstrap.sock")
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let manager = ServerNetworkManager.shared
+            await manager.stop()
+            try await manager.debugInstallBootstrapSocketURLOverride(socketURL)
+            await manager.start()
+            let outcome = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
+            if case let .failed(message) = outcome {
+                XCTAssertTrue(message.contains("Provider process launch refused under XCTest"), message)
+            } else {
+                XCTFail("Losing a fake must refuse real provider launch, got \(outcome)")
+            }
+            let shutdowns = await fake.shutdownCount
+            let sends = await fake.sentCount
+            XCTAssertEqual(shutdowns, 1, "Missing launch metadata must reproduce fake retirement")
+            XCTAssertEqual(sends, 0)
+            XCTAssertFalse(session.claudeController === fake)
+            await session.claudeController?.shutdown()
+            await manager.stop()
+            try await manager.debugRestoreBootstrapSocketURLOverride(expected: socketURL)
         }
-        XCTAssertTrue(message.contains("Provider process launch refused under XCTest"), message)
-        let shutdowns = await fake.shutdownCount
-        let sends = await fake.sentCount
-        XCTAssertEqual(shutdowns, 1, "Missing launch metadata must reproduce fake retirement")
-        XCTAssertEqual(sends, 0)
-        XCTAssertFalse(session.claudeController === fake)
-        await session.claudeController?.shutdown()
     }
 
     func testClaudeNativeMissingRouteRecoversBeforeDispatch() async throws {
