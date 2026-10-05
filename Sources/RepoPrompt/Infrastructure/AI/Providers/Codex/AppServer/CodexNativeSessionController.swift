@@ -9212,7 +9212,7 @@ final class CodexNativeSessionController {
         {
             effectiveEnabledNames.insert(Self.computerUseMCPServerName)
         }
-        return CodexOverrides.appServerMCPServerMap(
+        var overrides = CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,
             policy: .enableSelected(
                 enabledNormalizedNames: effectiveEnabledNames,
@@ -9220,6 +9220,11 @@ final class CodexNativeSessionController {
                 exceptBroken: []
             )
         )
+        // Optional servers can be omitted from the first turn while discovery is pending.
+        // Require only RepoPrompt for these app-owned threads; leave global/third-party policy alone.
+        let repoPromptKey = MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: MCPIntegrationHelper.repoPromptMCPServerName)
+        overrides["mcp_servers.\(repoPromptKey).required"] = true
+        return overrides
     }
 }
 
