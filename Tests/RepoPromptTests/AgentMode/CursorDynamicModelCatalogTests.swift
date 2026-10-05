@@ -22,6 +22,7 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
     }
 
