@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 /// The shared UI confirmation gate for user-created oversight links.
 ///

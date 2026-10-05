@@ -4,6 +4,7 @@ import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import SwiftUI
 import XCTest
 

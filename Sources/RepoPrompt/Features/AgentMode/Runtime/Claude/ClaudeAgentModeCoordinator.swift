@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import OSLog
+import RepoPromptSettingsCore
 
 @MainActor
 final class ClaudeAgentModeCoordinator {
@@ -2213,6 +2214,8 @@ final class ClaudeAgentModeCoordinator {
     }
 
     private func retainClaudeEffort(_ effort: ClaudeCodeEffortLevel, for session: AgentTabSession) {
+        // A cold persisted session is only an index projection, not a saveable payload.
+        guard session.activeAgentSessionID == nil || session.hasLoadedPersistedState else { return }
         guard session.selectedClaudeEffortRaw != effort.rawValue else { return }
         session.selectedClaudeEffortRaw = effort.rawValue
         session.isDirty = true

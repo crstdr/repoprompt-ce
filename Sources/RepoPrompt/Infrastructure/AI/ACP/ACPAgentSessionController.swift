@@ -3,6 +3,7 @@ import Foundation
 import os
 import RepoPromptFoundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 actor ACPAgentSessionController {
     struct RequestTimeouts {
@@ -2187,6 +2188,8 @@ actor ACPAgentSessionController {
             rawInput: rawInput,
             options: optionDictionaries
         )
+        let plainAllowOptionID = preferredAllowOptionID(for: options, sessionScoped: false)
+        let plainAllowOptions = options.filter { $0.optionID == plainAllowOptionID }
         let request = AgentApprovalRequest(
             requestID: .acp(id.displayValue),
             method: "session/request_permission",
@@ -2199,6 +2202,10 @@ actor ACPAgentSessionController {
             cwd: sessionConfiguration.workingDirectory,
             overseerOneTimeAllowAvailable: ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
                 options: options.map { (optionID: $0.optionID, kind: $0.kind) },
+                providerID: provider.providerID
+            ) != nil,
+            plainApproveAvailable: ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                options: plainAllowOptions.map { (optionID: $0.optionID, kind: $0.kind) },
                 providerID: provider.providerID
             ) != nil,
             details: approvalDetails(
@@ -3920,6 +3927,10 @@ actor ACPAgentSessionController {
             }
             return filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
         }
+        // Generic provider IDs cannot turn an explicitly persistent kind into one-time consent.
+        let scopedOptions = sessionScoped || provider.providerID == .grokBuild ? filteredOptions : filteredOptions.filter {
+            normalizedPermissionOptionValue($0.kind) != "allow_always"
+        }
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
         case .openCode, .cursor, .antigravity:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
@@ -3928,11 +3939,11 @@ actor ACPAgentSessionController {
         case .devin:
             []
         }
-        if let preferred = optionID(for: filteredOptions, preferences: preferences) {
+        if let preferred = optionID(for: scopedOptions, preferences: preferences) {
             return preferred
         }
         return optionID(
-            for: filteredOptions,
+            for: scopedOptions,
             preferences: sessionScoped ? [.kind("allow_always"), .kind("allow_once")] : [.kind("allow_once")]
         )
     }
@@ -4000,10 +4011,7 @@ actor ACPAgentSessionController {
         return [
             .optionID("once"),
             .optionID("allow_once"),
-            .kind("allow_once"),
-            .optionID("always"),
-            .optionID("allow_always"),
-            .kind("allow_always")
+            .kind("allow_once")
         ]
     }
 
