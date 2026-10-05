@@ -3,8 +3,11 @@ import CryptoKit
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import SwiftUI
 
@@ -6054,6 +6057,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // earned.
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.hasLoadedPersistedState = true
+        restoreClaudeEffort(from: agentSession, to: session)
 
         let autoEditEnabled = agentSession.autoEditEnabled
         let tabID = session.tabID
@@ -7159,7 +7163,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, includeAliases: Bool = true) -> [String] {
-        var labels = ["accept", "accept_for_session"]
+        var labels = approval.supportsPlainApprove ? ["accept", "accept_for_session"] : ["accept_for_session"]
         if approval.kind == .commandExecution {
             labels.append("accept_with_amendment")
         }
@@ -11572,6 +11576,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let decision: AgentApprovalDecision
             switch rawDecision {
             case "accept", "approve":
+                guard approval.supportsPlainApprove else {
+                    throw MCPError.invalidParams(
+                        "Plain approval is unavailable because this ACP request offers no selectable one-time allow option. Choose an explicit decision. No response was applied."
+                    )
+                }
                 decision = .accept
             case "accept_for_session", "always_allow", "approve_for_session":
                 decision = .acceptForSession

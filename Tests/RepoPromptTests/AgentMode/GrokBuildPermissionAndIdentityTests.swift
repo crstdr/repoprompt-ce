@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -31,6 +32,24 @@ final class GrokBuildPermissionAndIdentityTests: XCTestCase {
         // named "RepoPromptCE" on 2026-08-13.
         XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok-shell-RepoPromptCE"), "grok-shell")
         XCTAssertTrue(MCPClientIdentity.matches("grok-shell-RepoPromptCE", AgentProviderKind.grokBuild.mcpClientNameHint))
+    }
+
+    func testRuntimeClientHintAndToolTitlesUseIsolatedServerName() {
+        XCTAssertEqual(AgentProviderKind.grokBuild.mcpClientNameHint, "grok-shell-RepoPromptCEGrokRuntime")
+        XCTAssertEqual(RepoPromptMCPServerConfiguration.repoPrompt.name, "RepoPromptCE", "Other providers keep the shared name")
+        for tool in ["read_file", "ask_user"] {
+            let qualified = "RepoPromptCEGrokRuntime__\(tool)"
+            XCTAssertEqual(MCPIntegrationHelper.canonicalRepoPromptToolName(qualified), tool)
+            XCTAssertEqual(
+                ACPRuntimeEventParsing.normalizedToolName(from: ["title": qualified]),
+                "mcp__RepoPromptCE__\(tool)"
+            )
+            XCTAssertEqual(
+                MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: qualified, requestPayload: [:])?.normalizedToolName,
+                tool
+            )
+            XCTAssertFalse(MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix("RepoPromptCEGrokRuntimeOther__\(tool)"))
+        }
     }
 
     func testGrokShellFamilyRequiresSeparatorBoundary() {

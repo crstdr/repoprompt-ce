@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Immutable runtime configuration for the Devin ACP provider (`devin acp`).
 ///
