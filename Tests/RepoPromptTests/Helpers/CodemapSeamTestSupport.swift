@@ -27,6 +27,10 @@ final class CodemapLockedValues<Value: Sendable>: @unchecked Sendable {
     func append(_ value: Value) {
         lock.withLock { storage.append(value) }
     }
+
+    func takeFirst() -> Value? {
+        lock.withLock { storage.isEmpty ? nil : storage.removeFirst() }
+    }
 }
 
 /// Raised by the fixture's injected spawner when a Code Map collaborator attempts to launch a
@@ -59,6 +63,9 @@ final class CodemapStoreFixture: @unchecked Sendable {
         name: String,
         capabilityHooks: WorkspaceCodemapRootCapabilityServiceHooks = .none,
         enginePolicy: WorkspaceCodemapBindingEnginePolicy = .default,
+        engineHooks: WorkspaceCodemapBindingEngineHooks = .none,
+        manifestStoreHooks: CodeMapRootManifestStoreHooks = .none,
+        globalCodeMapsDisabled: @escaping @Sendable () async -> Bool = { false },
         graphPullPause: WorkspaceCodemapGraphPullPause = .production,
         overlay: WorkspaceCodemapLiveOverlay = WorkspaceCodemapLiveOverlay(),
         forbidCodeMapGitProcesses: Bool = false,
@@ -107,6 +114,8 @@ final class CodemapStoreFixture: @unchecked Sendable {
         let runtimeProvider = CodeMapArtifactRuntimeProvider {
             try runtimeTracker.record(CodeMapArtifactRuntime(
                 rootURL: resolvedArtifactRoot,
+                manifestStoreHooks: manifestStoreHooks,
+                globalCodeMapsDisabled: globalCodeMapsDisabled,
                 builder: CodeMapArtifactBuilderClient(execute: { input, ownerID, priority in
                     var decodedText: String?
                     if case let .decoded(source) = input.source.decodeResult {
@@ -140,7 +149,9 @@ final class CodemapStoreFixture: @unchecked Sendable {
                         catalogClient: registry.makeBindingCatalogClient(),
                         overlay: overlay,
                         policy: enginePolicy,
-                        graphPullPause: graphPullPause
+                        hooks: engineHooks,
+                        graphPullPause: graphPullPause,
+                        globalCodeMapsDisabled: globalCodeMapsDisabled
                     )
                 }
             ))
@@ -161,12 +172,13 @@ final class CodemapStoreFixture: @unchecked Sendable {
 
     /// Store that forces Code Map eligibility. Retained for the existing Git scenarios, whose
     /// contracts are about serving and not about admission.
-    func makeStore() -> WorkspaceFileContextStore {
+    func makeStore(codeMapsGloballyDisabled: Bool = false) -> WorkspaceFileContextStore {
         let runtimeProvider = runtimeProvider
         return WorkspaceFileContextStore(
             codemapRuntimeProvider: { try runtimeProvider.runtime() },
             codemapLocalGitClassificationProbe: .init { _ in .requiresGitPreflight },
-            codemapGitEligibilityProbe: .init { _ in .eligible }
+            codemapGitEligibilityProbe: .init { _ in .eligible },
+            codeMapsGloballyDisabled: codeMapsGloballyDisabled
         )
     }
 
