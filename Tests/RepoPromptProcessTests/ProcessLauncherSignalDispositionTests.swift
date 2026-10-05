@@ -319,7 +319,7 @@ final class ProviderProcessLaunchPolicyTests: XCTestCase {
 
     func testInstalledExecutablesRemainRefusedWithLegacyPermits() async throws {
         let marker = try makeTestDirectory().appendingPathComponent("must-not-run")
-        await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+        try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
             for path in ["/bin/sh", "/usr/local/bin/claude", "/opt/homebrew/bin/codex", "/usr/local/bin/devin", "/usr/local/bin/cursor-agent", "/usr/local/bin/grok", "/usr/local/bin/opencode"] {
                 XCTAssertThrowsError(try ProviderProcessLaunchPolicy.checkedExecutablePath(path)) { error in
                     XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal)
@@ -371,7 +371,7 @@ final class ProviderProcessLaunchPolicyTests: XCTestCase {
         let executable = try makeExecutableFixture()
         let link = executable.deletingLastPathComponent().appendingPathComponent("fixture-link")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: executable)
-        XCTAssertEqual(try ProviderProcessLaunchPolicy.checkedExecutablePath(link.path), executable.resolvingSymlinksInPath().path)
+        XCTAssertEqual(try ProviderProcessLaunchPolicy.checkedExecutablePath(link.path), try canonicalFixturePath(executable))
         try FileManager.default.removeItem(at: link)
         try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "/bin/sh")
         for path in [link.path, "/bin/../bin/sh", executable.deletingLastPathComponent().path, "claude"] {
@@ -380,7 +380,14 @@ final class ProviderProcessLaunchPolicyTests: XCTestCase {
             }
         }
         let bundleExecutable = try XCTUnwrap(Bundle(for: Self.self).executableURL)
-        XCTAssertEqual(try ProviderProcessLaunchPolicy.checkedExecutablePath(bundleExecutable.path), bundleExecutable.resolvingSymlinksInPath().path)
+        XCTAssertEqual(try ProviderProcessLaunchPolicy.checkedExecutablePath(bundleExecutable.path), try canonicalFixturePath(bundleExecutable))
+    }
+
+    private func canonicalFixturePath(_ url: URL) throws -> String {
+        // Foundation can shorten /private/var to /var; the launch boundary uses POSIX paths.
+        let resolved = try XCTUnwrap(realpath(url.path, nil))
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     private func makeExecutableFixture() throws -> URL {
