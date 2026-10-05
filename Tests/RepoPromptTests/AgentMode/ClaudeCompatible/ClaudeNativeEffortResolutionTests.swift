@@ -16,6 +16,208 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
         }
     }
 
+    private actor EffortRequests {
+        var levels: [String] = []
+        func record(_ level: String?) {
+            if let level {
+                levels.append(level)
+            }
+        }
+    }
+
+    @MainActor
+    private func withClaudeDefaults(_ body: () throws -> Void) rethrows {
+        let defaults = UserDefaults.standard
+        let keys = ["claudeCodeEffortLevel", "claudeCodeEffortLevelsByModelSlug"]
+        let previous = keys.map { defaults.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, previous) {
+                if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+            }
+        }
+        defaults.removeObject(forKey: keys[1])
+        ClaudeAgentToolPreferences.setEffortLevel(.high)
+        try body()
+    }
+
+    @MainActor
+    private func effortViewModel(windowID: Int = 1) -> AgentModeViewModel {
+        AgentModeViewModel(
+            testWindowID: windowID,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Effort selection tests must not start Codex")
+            },
+            claudeControllerFactory: { _, _, _, _ in
+                preconditionFailure("Effort selection tests must not start Claude")
+            },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "effort selection test") },
+            mcpServerEnabler: { false }
+        )
+    }
+
+    @MainActor
+    private func activeEffortSession(in viewModel: AgentModeViewModel) -> AgentTabSession {
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedModelRaw = "claude-opus-5-5"
+        viewModel.updateBindingsFromSession(session)
+        return session
+    }
+
+    @MainActor
+    func testClaudeEffortChangeKeepsOtherWindowSessionAndControlsUnchanged() {
+        withClaudeDefaults {
+            let first = effortViewModel()
+            let second = effortViewModel(windowID: 2)
+            let firstSession = activeEffortSession(in: first)
+            let secondSession = activeEffortSession(in: second)
+            defer {
+                firstSession.saveDebounceTask?.cancel()
+                secondSession.saveDebounceTask?.cancel()
+            }
+            XCTAssertEqual(second.claudeCoordinator.currentClaudeEffortLevel(for: secondSession), .high)
+            let settings = AgentProviderPermissionsSettingsViewModel(
+                bindingService: second.providerBindingService,
+                claudeEffortLevelProvider: { second.claudeCoordinator.currentClaudeEffortLevel(for: secondSession) }
+            )
+            XCTAssertEqual(settings.controlsBinding(for: .claude)?.claudeTools?.effortLevel, .high)
+
+            first.setClaudeEffortLevel(.low)
+            second.updatePermissionBindingState(from: secondSession, syncUI: false)
+
+            XCTAssertEqual(firstSession.persistedReasoningEffortRaw, "low")
+            XCTAssertEqual(secondSession.persistedReasoningEffortRaw, "high")
+            XCTAssertEqual(first.activeProviderControlsBinding?.claudeTools?.effortLevel, .low)
+            XCTAssertEqual(second.activeProviderControlsBinding?.claudeTools?.effortLevel, .high)
+            XCTAssertEqual(settings.controlsBinding(for: .claude)?.claudeTools?.effortLevel, .high)
+            XCTAssertEqual(second.claudeCoordinator.currentClaudeEffortLevel(for: secondSession), .high)
+            XCTAssertEqual(ClaudeAgentToolPreferences.effortLevel(
+                forModelRaw: "claude-opus-5-5", agentKind: .claudeCode
+            ), .low)
+        }
+    }
+
+    @MainActor
+    func testNewClaudeSessionUsesLastUsedDefaultWithoutChangingExistingSession() {
+        withClaudeDefaults {
+            let first = effortViewModel()
+            let second = effortViewModel(windowID: 2)
+            let existing = activeEffortSession(in: first)
+            let edited = activeEffortSession(in: second)
+            defer {
+                existing.saveDebounceTask?.cancel()
+                edited.saveDebounceTask?.cancel()
+            }
+            second.setClaudeEffortLevel(.low)
+
+            let newSession = first.session(for: UUID())
+            defer { newSession.saveDebounceTask?.cancel() }
+            XCTAssertEqual(first.claudeCoordinator.currentClaudeEffortLevel(for: newSession), .low)
+            XCTAssertEqual(first.claudeCoordinator.currentClaudeEffortLevel(for: existing), .high)
+        }
+    }
+
+    @MainActor
+    func testNewClaudeSessionPreservesExplicitEncodedEffortOverLastUsedDefault() {
+        withClaudeDefaults {
+            let viewModel = effortViewModel()
+            viewModel.selectedAgent = .claudeCode
+            viewModel.selectModel(rawModel: "claude-opus-5-5:low")
+            let session = viewModel.session(for: UUID())
+            defer { session.saveDebounceTask?.cancel() }
+
+            XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: session), .low)
+            XCTAssertEqual(session.persistedReasoningEffortRaw, "low")
+            XCTAssertEqual(ClaudeAgentToolPreferences.effortLevel(
+                forModelRaw: session.selectedModelRaw, agentKind: .claudeCode
+            ), .high)
+        }
+    }
+
+    @MainActor
+    func testRestoredClaudeEffortSurvivesChangedDefaultsAndEncodedModel() throws {
+        try withClaudeDefaults {
+            let persisted = AgentSession(
+                name: "Saved effort", agentKind: AgentProviderKind.claudeCode.rawValue,
+                agentModel: "claude-opus-5-5:high", agentReasoningEffort: "low"
+            )
+            let decoded = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(persisted))
+            let viewModel = effortViewModel()
+            let session = activeEffortSession(in: viewModel)
+            defer { session.saveDebounceTask?.cancel() }
+            session.selectedModelRaw = try XCTUnwrap(decoded.agentModel)
+            viewModel.restoreClaudeEffort(from: decoded, to: session)
+            viewModel.updatePermissionBindingState(from: session, syncUI: false)
+
+            XCTAssertEqual(session.persistedReasoningEffortRaw, "low")
+            XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: session), .low)
+            XCTAssertEqual(viewModel.activeProviderControlsBinding?.claudeTools?.effortLevel, .low)
+        }
+    }
+
+    @MainActor
+    func testLegacyClaudeSessionAdoptsDefaultOnceAndPersistsIt() throws {
+        try withClaudeDefaults {
+            let legacy = AgentSession(name: "Legacy effort", agentKind: AgentProviderKind.claudeCode.rawValue)
+            let viewModel = effortViewModel()
+            let session = activeEffortSession(in: viewModel)
+            defer { session.saveDebounceTask?.cancel() }
+            viewModel.restoreClaudeEffort(from: legacy, to: session)
+            XCTAssertEqual(session.persistedReasoningEffortRaw, "high")
+
+            ClaudeAgentToolPreferences.setEffortLevel(.low, forModelRaw: session.selectedModelRaw, agentKind: .claudeCode)
+            XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: session), .high)
+            let saved = AgentSession(name: "Adopted effort", agentReasoningEffort: session.persistedReasoningEffortRaw)
+            let restored = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(saved))
+            viewModel.restoreClaudeEffort(from: restored, to: session)
+            XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: session), .high)
+        }
+    }
+
+    @MainActor
+    func testClaudePickerOverridesEncodedEffortInBothControlsAndExecutionResolver() {
+        withClaudeDefaults {
+            let viewModel = effortViewModel()
+            let session = activeEffortSession(in: viewModel)
+            defer { session.saveDebounceTask?.cancel() }
+            viewModel.selectModel(rawModel: "claude-opus-5-5:high")
+            viewModel.setClaudeEffortLevel(.low)
+            XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: session), .low)
+            XCTAssertEqual(viewModel.activeProviderControlsBinding?.claudeTools?.effortLevel, .low)
+
+            viewModel.selectModel(rawModel: "claude-opus-5-5:high")
+            XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: session), .high)
+            XCTAssertEqual(viewModel.activeProviderControlsBinding?.claudeTools?.effortLevel, .high)
+        }
+    }
+
+    @MainActor
+    func testNativeConfigurationUsesSessionEffortRatherThanSharedOrEncodedEffort() async {
+        let requests = EffortRequests()
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
+            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
+            environmentResolver: FixedModelResolver()
+        )
+        await controller.test_installConfigurationTransport(controlRequest: { request in
+            await requests.record((request["settings"] as? [String: Any])?["effortLevel"] as? String)
+            return [:]
+        }, write: { _ in })
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1, workspacePathProvider: { _ in nil },
+            claudeControllerFactory: { _, _, _, _ in controller }
+        )
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedModelRaw = "claude-opus-5-5:high"
+        session.selectedClaudeEffortRaw = "low"
+        session.claudeController = controller
+
+        await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test.session-effort")
+        let levels = await requests.levels
+        XCTAssertEqual(levels, ["low"])
+    }
+
     func testTurnScopedEffortOverridesEncodedModelEffortInFlagSettings() async throws {
         let controller = ClaudeNativeProcessSessionController(
             runID: UUID(),
@@ -124,15 +326,39 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let session = await viewModel.ensureSessionReady(tabID: tabID)
         session.isMCPOriginated = true
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        viewModel.test_setCurrentTabIDOverride(UUID())
+        defer {
+            viewModel.test_setCurrentTabIDOverride(nil)
+            for session in viewModel.sessions.values {
+                session.saveDebounceTask?.cancel()
+            }
+        }
+        let savedFile = root.appendingPathComponent("effort-session.json")
+        viewModel.test_setAgentSessionSaver { saved, _, _ in
+            try JSONEncoder().encode(saved).write(to: savedFile, options: .atomic)
+            return savedFile
+        }
 
         try await viewModel.mcpConfigureSession(
             tabID: tabID,
             agentRaw: AgentProviderKind.claudeCode.rawValue,
-            modelRaw: "claude-opus-5-5:low",
+            modelRaw: "claude-opus-5-5",
             reasoningEffortRaw: "low"
         )
         XCTAssertEqual(session.selectedReasoningEffortRaw, "low")
-        XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: session), .low)
+        XCTAssertEqual(session.persistedReasoningEffortRaw, "low")
+        session.isDirty = true
+        await viewModel.flushSave(for: tabID)
+        let saved = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: savedFile))
+        XCTAssertEqual(saved.agentReasoningEffort, "low")
+        XCTAssertEqual(viewModel.ownerValidatedSessionIndex[sessionID]?.agentReasoningEffortRaw, "low")
+
+        viewModel.test_removeSession(tabID: tabID)
+        let restored = viewModel.session(for: tabID)
+        XCTAssertEqual(restored.persistedReasoningEffortRaw, "low")
+        viewModel.restoreClaudeEffort(from: saved, to: restored)
+        XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: restored), .low)
 
         try await viewModel.mcpConfigureSession(
             tabID: tabID,
@@ -140,7 +366,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             modelRaw: "claude-opus-5-5",
             reasoningEffortRaw: nil
         )
-        XCTAssertNil(session.selectedReasoningEffortRaw)
+        XCTAssertNil(restored.selectedReasoningEffortRaw)
     }
 }
 
