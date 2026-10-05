@@ -537,14 +537,10 @@ enum CodexRuntimeAuthority {
         executableURL: URL,
         environment: [String: String]
     ) -> String? {
-        do {
-            try ProviderProcessLaunchPolicy.check()
-        } catch {
-            return nil
-        }
+        guard let executable = try? ProviderProcessLaunchPolicy.checkedExecutablePath(executableURL.path) else { return nil }
         let process = Process()
         let output = Pipe()
-        process.executableURL = executableURL
+        process.executableURL = URL(fileURLWithPath: executable)
         process.environment = environment
         process.arguments = ["--version"]
         process.standardOutput = output

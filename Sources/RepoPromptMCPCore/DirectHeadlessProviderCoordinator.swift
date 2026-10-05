@@ -144,7 +144,6 @@ actor DirectHeadlessProviderCoordinator {
         carrierEnvironment: [String: String]? = nil
     ) async throws -> String {
         guard !isShuttingDown else { throw CancellationError() }
-        try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
         let descriptor = try resolveProvider(providerID)
         guard let executable = descriptor.executable else {
             throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")

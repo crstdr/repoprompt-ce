@@ -7,7 +7,7 @@ import RepoPromptShared
 import XCTest
 
 final class DirectHeadlessOracleGroupTests: XCTestCase {
-    func testDirectOracleWithoutFixturePermitRefusesProviderAndLeavesTripwireUntouched() async throws {
+    func testDirectOracleFixtureRunsWithoutPermit() async throws {
         let fixture = try Fixture(name: "provider-refusal")
         defer { fixture.cleanup() }
         let service = fixture.service(allowsProviderProcessLaunchForTesting: false)
@@ -17,16 +17,12 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             providerCoordinator: prepared.providerCoordinator,
             oracleAdapter: prepared.oracleAdapter
         )
-        do {
-            _ = try await invoke(
-                prepared: prepared, backend: backend, toolName: "ask_oracle",
-                arguments: ["message": .string("must not launch")]
-            )
-            XCTFail("An ordinary headless service must refuse provider startup under XCTest")
-        } catch {
-            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
-        }
-        XCTAssertTrue(try fixture.calls().isEmpty)
+        let result = try await invoke(
+            prepared: prepared, backend: backend, toolName: "ask_oracle",
+            arguments: ["message": .string("fixture request")]
+        )
+        XCTAssertEqual(result["response"] as? String, "response-0-default")
+        XCTAssertEqual(try fixture.calls().count, 1)
     }
 
     func testTwoAndFiveOracleStartsUsePhysicalLaneCarriersAndReturnLaneOrder() async throws {

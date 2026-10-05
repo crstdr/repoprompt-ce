@@ -796,9 +796,7 @@ final class DevinPermissionLevelTests: XCTestCase {
             config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false)
         )
         let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
-        let controller = try ACPAgentSessionController(
-            provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true
-        )
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
         do {
             _ = try await controller.bootstrap()
             try await controller.prompt(AgentMessage(userMessage: "Read roots"), request: request)
@@ -861,8 +859,7 @@ final class DevinPermissionLevelTests: XCTestCase {
                     commandName: executable.path,
                     includeRepoPromptMCPServer: false
                 )),
-                runRequest: request,
-                allowsProviderProcessLaunchForTesting: true
+                runRequest: request
             )
             do {
                 _ = try await controller.bootstrap()

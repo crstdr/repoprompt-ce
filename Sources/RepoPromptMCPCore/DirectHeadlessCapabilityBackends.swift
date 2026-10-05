@@ -1155,9 +1155,7 @@ enum DirectProcess {
         isProvider: Bool = true,
         allowsProviderProcessLaunchForTesting: Bool = false
     ) async throws -> String {
-        if isProvider {
-            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
-        }
+        let executable = try isProvider ? ProviderProcessLaunchPolicy.checkedExecutablePath(executable) : executable
         return try await DirectProcessInvocation(
             executable: executable,
             arguments: arguments,

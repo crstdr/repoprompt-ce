@@ -81,7 +81,7 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
 
     private func runSignalDispositionHelper() throws {
         // Nested XCTest runners must retain the same provider refusal as the outer host.
-        XCTAssertThrowsError(try ProviderProcessLaunchPolicy.check()) { error in
+        XCTAssertThrowsError(try ProviderProcessLaunchPolicy.checkedExecutablePath("/bin/sh")) { error in
             XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal)
         }
         guard let markerPath = ProcessInfo.processInfo.environment[HelperEnvironment.markerPath] else {
@@ -243,7 +243,7 @@ final class ProviderProcessLaunchPolicyTests: XCTestCase {
         }
         print("non-XCTest-host")
         do {
-            try ProviderProcessLaunchPolicy.check()
+            guard try ProviderProcessLaunchPolicy.checkedExecutablePath("/missing/provider") == "/missing/provider" else { exit(4) }
             print("provider-launch-allowed")
         } catch {
             print("provider-launch-refused")
@@ -317,46 +317,76 @@ final class ProviderProcessLaunchPolicyTests: XCTestCase {
         return try (process.terminationStatus, String(contentsOf: log, encoding: .utf8))
     }
 
-    func testProviderSpawnIsRefusedBeforeExecutingTheCommand() throws {
-        let marker = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: marker) }
-        XCTAssertThrowsError(try ProcessLauncher.spawn(
-            command: "/bin/sh",
-            arguments: ["-c", "touch \"$1\"", "fixture", marker.path],
-            environment: [:],
-            workingDirectory: nil,
-            purpose: .provider
-        )) { error in
-            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+    func testInstalledExecutablesRemainRefusedWithLegacyPermits() async throws {
+        let marker = try makeTestDirectory().appendingPathComponent("must-not-run")
+        await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            for path in ["/bin/sh", "/usr/local/bin/claude", "/opt/homebrew/bin/codex", "/usr/local/bin/devin", "/usr/local/bin/cursor-agent", "/usr/local/bin/grok", "/usr/local/bin/opencode"] {
+                XCTAssertThrowsError(try ProviderProcessLaunchPolicy.checkedExecutablePath(path)) { error in
+                    XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal)
+                }
+            }
+            XCTAssertThrowsError(try ProcessLauncher.spawn(
+                command: "/bin/sh", arguments: ["-c", "touch \"$1\"", "fixture", marker.path],
+                environment: [:], workingDirectory: nil, purpose: .provider,
+                allowsProviderProcessLaunchForTesting: true
+            )) { error in
+                XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal)
+            }
+            let runner = CLIProcessRunner(config: .init(command: "/bin/sh", allowsProviderProcessLaunchForTesting: true, shellLookupMode: .disabled))
+            do {
+                _ = try await runner.run(args: [], stdin: nil, outputMode: .none, timeout: 1)
+                XCTFail("An installed executable must be refused")
+            } catch { XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal) }
+            do {
+                _ = try await runner.runStreaming(args: [], stdin: nil, outputMode: .none, timeout: 1)
+                XCTFail("An installed streaming executable must be refused")
+            } catch { XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal) }
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
-    func testBufferedAndStreamingProvidersRefuseBeforeCommandResolution() async throws {
-        let runner = CLIProcessRunner(config: .init(command: "missing-provider-for-refusal-test"))
-        do {
-            _ = try await runner.run(args: [], stdin: nil, outputMode: .none, timeout: 1)
-            XCTFail("A provider must not run without explicit XCTest opt-in")
-        } catch {
-            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
-        }
-        do {
-            _ = try await runner.runStreaming(args: [], stdin: nil, outputMode: .none, timeout: 1)
-            XCTFail("A streaming provider must not run without explicit XCTest opt-in")
-        } catch {
-            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
-        }
-    }
-
-    func testFixtureProcessOptInDoesNotEscapeItsTaskScope() async throws {
-        let runner = CLIProcessRunner(config: .init(command: "/bin/sh", shellLookupMode: .disabled))
-        let result = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
-            try await runner.run(args: ["-c", "printf fixture-ok"], stdin: nil, outputMode: .none, timeout: 2)
-        }
+    func testTemporaryFixtureRunsWithoutOptIn() async throws {
+        let executable = try makeExecutableFixture()
+        let runner = CLIProcessRunner(config: .init(command: executable.path, shellLookupMode: .disabled))
+        let result = try await runner.run(args: [], stdin: nil, outputMode: .none, timeout: 2)
         XCTAssertEqual(result.status, 0)
         XCTAssertEqual(String(data: result.stdout, encoding: .utf8), "fixture-ok")
-        XCTAssertThrowsError(try ProviderProcessLaunchPolicy.check()) { error in
-            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal)
+        var output = Data()
+        var status: Int32?
+        let stream = try await runner.runStreaming(args: [], stdin: nil, outputMode: .none, timeout: 2)
+        for try await event in stream {
+            switch event {
+            case let .stdout(data): output.append(data)
+            case let .terminated(exitStatus, timedOut):
+                status = exitStatus
+                XCTAssertFalse(timedOut)
+            case .stderr: break
+            }
         }
+        XCTAssertEqual(status, 0)
+        XCTAssertEqual(String(data: output, encoding: .utf8), "fixture-ok")
+    }
+
+    func testFixtureContainmentUsesCanonicalTrustedRoots() throws {
+        let executable = try makeExecutableFixture()
+        let link = executable.deletingLastPathComponent().appendingPathComponent("fixture-link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: executable)
+        XCTAssertEqual(try ProviderProcessLaunchPolicy.checkedExecutablePath(link.path), executable.resolvingSymlinksInPath().path)
+        try FileManager.default.removeItem(at: link)
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "/bin/sh")
+        for path in [link.path, "/bin/../bin/sh", executable.deletingLastPathComponent().path, "claude"] {
+            XCTAssertThrowsError(try ProviderProcessLaunchPolicy.checkedExecutablePath(path)) { error in
+                XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal)
+            }
+        }
+        let bundleExecutable = try XCTUnwrap(Bundle(for: Self.self).executableURL)
+        XCTAssertEqual(try ProviderProcessLaunchPolicy.checkedExecutablePath(bundleExecutable.path), bundleExecutable.resolvingSymlinksInPath().path)
+    }
+
+    private func makeExecutableFixture() throws -> URL {
+        let executable = try makeTestDirectory().appendingPathComponent("codex")
+        try "#!/bin/sh\nprintf fixture-ok\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        return executable
     }
 }

@@ -1,23 +1,49 @@
+import Darwin
 import Foundation
 
-/// Provider launches fail closed in an in-process XCTest host, including nested test runners.
-/// Separate non-XCTest child processes are not guarded; user arguments and inherited test
-/// environment variables never establish test-host identity.
-/// Fixture-process tests opt in for one configured instance or task scope; no process-global
-/// environment toggle can authorize an unrelated test or a controller that lost its fake.
+/// In-process XCTest hosts may launch test-owned fixtures, never installed providers.
+/// Separate non-XCTest children are not guarded. Arguments and environment do not identify a test host.
 package enum ProviderProcessLaunchPolicy {
+    /// Legacy task/instance permits are retained for source compatibility and have no effect.
     @TaskLocal package static var allowsLaunchForTesting = false
 
     package struct Refusal: LocalizedError {
         package var errorDescription: String? {
-            "Provider process launch refused under XCTest. Inject a fake or explicitly opt in with ProviderProcessLaunchPolicy.$allowsLaunchForTesting."
+            "Provider process launch refused under XCTest: use an executable in a test temporary directory, bundle or fixture."
         }
     }
 
-    package static func check(allowsLaunchInTests: Bool = false) throws {
-        // Check at the launch boundary: XCTest can load after an earlier non-test lookup.
-        if NSClassFromString("XCTestCase") != nil, !allowsLaunchInTests, !allowsLaunchForTesting {
-            throw Refusal()
+    package static func checkedExecutablePath(_ path: String) throws -> String {
+        // XCTest may load after an earlier non-test lookup; never cache host identity.
+        guard NSClassFromString("XCTestCase") != nil else { return path }
+        let files = FileManager.default
+        guard path.hasPrefix("/"), let executable = canonicalPath(path),
+              let attributes = try? files.attributesOfItem(atPath: executable),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              files.isExecutableFile(atPath: executable)
+        else { throw Refusal() }
+
+        var roots = [files.temporaryDirectory.path]
+        roots += Bundle.allBundles.filter { $0.bundleURL.pathExtension == "xctest" }.map(\.bundleURL.path)
+        let checkout = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let tests = checkout.appendingPathComponent("Tests").path
+        if let checkoutPath = canonicalPath(checkout.path), let testsPath = canonicalPath(tests),
+           testsPath == checkoutPath + "/Tests"
+        {
+            roots.append(testsPath)
         }
+        guard roots.contains(where: { root in
+            guard let root = canonicalPath(root) else { return false }
+            return executable.hasPrefix(root + "/")
+        }) else { throw Refusal() }
+        // Launch this target, not the original symlink, so classification and execution agree.
+        return executable
+    }
+
+    private static func canonicalPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 }
