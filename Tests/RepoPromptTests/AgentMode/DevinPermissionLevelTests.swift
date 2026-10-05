@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -9,6 +10,11 @@ import XCTest
 /// identity, the persisted store binding, the launch argument the provider emits, and the
 /// controller reuse key that forces a fresh process when the launch flag changes.
 final class DevinPermissionLevelTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     private typealias Level = DevinAgentToolPreferences.PermissionLevel
 
     func testDefaultDiscoveryRefusesBeforeInstalledProviderSupportProbe() async {
@@ -796,7 +802,9 @@ final class DevinPermissionLevelTests: XCTestCase {
             config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false)
         )
         let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(
+            provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true
+        )
         do {
             _ = try await controller.bootstrap()
             try await controller.prompt(AgentMessage(userMessage: "Read roots"), request: request)
@@ -859,7 +867,8 @@ final class DevinPermissionLevelTests: XCTestCase {
                     commandName: executable.path,
                     includeRepoPromptMCPServer: false
                 )),
-                runRequest: request
+                runRequest: request,
+                allowsProviderProcessLaunchForTesting: true
             )
             do {
                 _ = try await controller.bootstrap()
@@ -951,6 +960,11 @@ private actor DevinProbeEnvironmentGate {
 }
 
 final class DevinIntegrationConfigurationTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testOverlayPreservesXDGEntriesAndDevinWritesThroughCleanup() throws {
         let sourceRoot = try makeTestDirectory(name: "DevinIntegrationSource")
         let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
