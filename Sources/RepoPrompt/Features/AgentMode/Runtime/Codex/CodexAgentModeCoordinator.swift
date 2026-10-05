@@ -6790,11 +6790,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             return
         }
-        // Native compact resumes an exact idle thread only to issue a control-plane request. It
-        // cannot satisfy the managed bootstrap's active-turn readiness predicate until after resume.
-        // The next ordinary model turn still establishes its own routed tool policy.
+        // Cold native compact needs the same PID-owned policy before required MCP discovery.
+        // Its control-plane resume may become ready while idle; compaction claims an active
+        // attempt only after routing and the final compaction admission check succeed.
         let shouldInstallPolicy = shouldManageCodexTooling
-            && !forIdleNativeCompact
             && shouldBootstrapSessionInitialization
             && (!policyAlreadyInstalled || !deferPublicationUntilRouting)
             && requiresTransportStart
@@ -6837,7 +6836,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let pendingStart = pendingCodexStartsByTabID[session.tabID]
             let routingReadinessStartupDisposition = pendingStart?.result.disposition
                 ?? (routingReadinessAttemptedResume ? .resumed : .fresh)
-            let providerReady = effectiveRunState.isActive
+            let providerReady = (effectiveRunState.isActive || forIdleNativeCompact)
                 && pendingStart?.sessionID == ObjectIdentifier(session)
                 && pendingStart?.runID == runID
                 && pendingStart?.runAttemptID == runAttemptIDAtEntry
