@@ -24,13 +24,15 @@ extension AgentSessionRow {
     /// mark click and hover affordance — build once per activation. The retained NSMenu then
     /// owns it for the presentation's lifetime, so sidebar invalidations cannot repopulate
     /// the open menu the way a re-rendered SwiftUI `Menu`'s content can (and did: cross-window
-    /// projection publishes collapsed the menu mid-browse). Mirrors
-    /// `sidebarOversightMenuContent` item-for-item; keep the two in sync.
+    /// projection publishes collapsed the menu mid-browse). Both available-session pickers share
+    /// the same pure project grouping policy.
     static func sidebarOversightMenuItems(
         _ menu: AgentSidebarOversightMenuProps,
         busyKeys: Set<AgentSidebarOversightActionKey>,
         actions: AgentSidebarOversightMenuActions
     ) -> [StableMenuItem] {
+        let availableTargets = menu.availableTargets
+        let availableObservers = menu.availableObservers
         let hasLinkedSections = !menu.linkedTargets.isEmpty || !menu.linkedObservers.isEmpty
         let hasTopSections = hasLinkedSections || menu.showsCreatedBySection
 
@@ -41,6 +43,18 @@ extension AgentSessionRow {
                 accessibilityHint: AgentOversightUICopy.openHint(option.menuLabel)
             ) {
                 actions.openLinkedSession(option.peerEndpoint)
+            }
+        }
+
+        func availableItems(
+            _ options: [AgentSidebarOversightMenuProps.PeerOption],
+            item: (AgentSidebarOversightMenuProps.PeerOption) -> StableMenuItem
+        ) -> [StableMenuItem] {
+            guard let projects = AgentSidebarOversightPickerPresentation.projects(for: options) else {
+                return options.map(item)
+            }
+            return projects.map { project in
+                .submenu(project.title, items: project.options.map(item))
             }
         }
 
@@ -81,10 +95,10 @@ extension AgentSessionRow {
         if let reason = menu.observerIneligibleReason {
             overseeNewItems.append(.message(reason))
         }
-        if menu.availableTargets.isEmpty, menu.observerIneligibleReason == nil {
+        if availableTargets.isEmpty, menu.observerIneligibleReason == nil {
             overseeNewItems.append(.message(AgentOversightUICopy.noSessionsToOversee))
         } else {
-            overseeNewItems += menu.availableTargets.map { option in
+            overseeNewItems += availableItems(availableTargets) { option in
                 let busy = busyKeys.contains(.add(
                     observerEndpoint: menu.targetEndpoint,
                     targetEndpoint: option.peerEndpoint
@@ -113,7 +127,7 @@ extension AgentSessionRow {
             accessibilityLabel: AgentOversightUICopy.overseeNewTitle,
             accessibilityValue: AgentOversightUICopy.overseeMenuAccessibilityValue(
                 overseeingCount: menu.linkedTargets.count,
-                availableCount: menu.availableTargets.count
+                availableCount: availableTargets.count
             ),
             items: overseeNewItems
         ))
@@ -122,10 +136,10 @@ extension AgentSessionRow {
         if let reason = menu.targetIneligibleReason {
             overseeByItems.append(.message(reason))
         }
-        if menu.availableObservers.isEmpty, menu.targetIneligibleReason == nil {
+        if availableObservers.isEmpty, menu.targetIneligibleReason == nil {
             overseeByItems.append(.message(AgentOversightUICopy.noEligibleOverseers))
         } else {
-            overseeByItems += menu.availableObservers.map { option in
+            overseeByItems += availableItems(availableObservers) { option in
                 let busy = busyKeys.contains(.add(
                     observerEndpoint: option.peerEndpoint,
                     targetEndpoint: menu.targetEndpoint
@@ -154,7 +168,7 @@ extension AgentSessionRow {
             accessibilityLabel: AgentOversightUICopy.overseeByTitle,
             accessibilityValue: AgentOversightUICopy.overseeByMenuAccessibilityValue(
                 overseenByCount: menu.linkedObservers.count,
-                availableCount: menu.availableObservers.count
+                availableCount: availableObservers.count
             ),
             items: overseeByItems
         ))

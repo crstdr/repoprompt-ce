@@ -299,6 +299,7 @@ extension AgentModeViewModel {
                     agentRaw: entry.agentKindRaw, modelRaw: entry.agentModelRaw
                 ).agent.displayName,
                 locationLabel: includeLocation ? workspaceManager?.activeWorkspace?.name : nil,
+                workspaceName: includeLocation ? workspaceManager?.workspace(withID: identity.workspaceID)?.name : nil,
                 isDeletionInProgress: AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
             )
             candidate.hasValidatedManagementMetadata = ownerValidatedSessionIndex[sessionID] != nil
@@ -349,6 +350,7 @@ extension AgentModeViewModel {
                 worktreeLabel: primaryExecutionWorktreeIndicator(forTabID: identity.tabID)?.label,
                 workspaceName: workspaceManager?.workspace(withID: identity.workspaceID)?.name
             ) : nil,
+            workspaceName: includeLocation ? workspaceManager?.workspace(withID: identity.workspaceID)?.name : nil,
             // Qualified here, in the endpoint's own window, against the binding state read in this
             // same MainActor pass. A proof left over from a superseded binding degrades to pending
             // rather than travelling on the candidate as authoritative.

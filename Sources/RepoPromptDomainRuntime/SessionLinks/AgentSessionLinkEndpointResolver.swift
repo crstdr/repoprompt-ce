@@ -232,6 +232,8 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
     /// Workspace/worktree label for **UI only**. It is never placed in an agent-facing snapshot,
     /// inventory, or prompt.
     package let locationLabel: String?
+    /// Semantic project name for UI sorting/grouping, independent of the worktree label.
+    package let workspaceName: String?
 
     /// Binding-qualified hydration proof, already resolved against this candidate's *current*
     /// binding state by its owning window.
@@ -266,6 +268,7 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
         displayName: String?,
         providerDisplayName: String?,
         locationLabel: String?,
+        workspaceName: String? = nil,
         restorationReadiness: AgentSessionRestorationReadiness = .unbound,
         isDeletionInProgress: Bool = false
     ) {
@@ -285,6 +288,7 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
         self.displayName = displayName
         self.providerDisplayName = providerDisplayName
         self.locationLabel = locationLabel
+        self.workspaceName = workspaceName
         self.restorationReadiness = restorationReadiness
         self.isDeletionInProgress = isDeletionInProgress
     }

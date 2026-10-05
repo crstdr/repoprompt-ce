@@ -37,6 +37,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         displayName: String? = "Agent",
         providerDisplayName: String? = "Codex CLI",
         locationLabel: String? = nil,
+        workspaceName: String? = nil,
         isDeletionInProgress: Bool = false
     ) -> AgentSessionLinkEndpointCandidate {
         AgentSessionLinkEndpointCandidate(
@@ -56,6 +57,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             displayName: displayName,
             providerDisplayName: providerDisplayName,
             locationLabel: locationLabel,
+            workspaceName: workspaceName,
             isDeletionInProgress: isDeletionInProgress
         )
     }
@@ -210,8 +212,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertEqual(menu.availableObservers.map(\.peerEndpoint), [eligibleOverseer.domainEndpoint])
     }
 
-    /// Ordering contract: the row's own workspace cohort first, then folded name — flat across
-    /// linked and available observers in the inbound list.
+    /// Available project/session order is independent of the retained linked-option order.
     func testInboundListOrdersOwnWorkspaceFirstThenName() {
         let ownWorkspace = id("10000000-0000-0000-0000-000000000001")
         let otherWorkspace = id("20000000-0000-0000-0000-000000000002")
@@ -229,6 +230,21 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             workspaceID: otherWorkspace,
             displayName: "BBB remote"
         )
+        let alphaProject = candidate(
+            windowID: 5, workspaceID: UUID(), displayName: "Zeta", locationLabel: "worktree: Zeta",
+            workspaceName: "alpha"
+        )
+        let betaWorkspace = UUID()
+        let betaFirst = candidate(
+            windowID: 6, workspaceID: betaWorkspace,
+            sessionID: id("30000000-0000-0000-0000-000000000001"), displayName: "alpha", workspaceName: "Beta"
+        )
+        let betaTie = candidate(
+            windowID: 7, workspaceID: betaWorkspace,
+            sessionID: id("30000000-0000-0000-0000-000000000002"), displayName: "ALPHA", workspaceName: "Beta"
+        )
+        let betaLast = candidate(windowID: 8, workspaceID: betaWorkspace, displayName: "Zeta", workspaceName: "Beta")
+        let peers = [availableRemote, betaLast, betaTie, alphaProject, availableLocal, betaFirst]
         let relationship = Linked(endpoint: linkedRemote.domainEndpoint, linkID: UUID(), generation: 3)
 
         let menu = AgentSidebarOversightMenuProjection.make(
@@ -236,26 +252,21 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             inputs: inputs(
                 target: target,
                 linked: [relationship],
-                activeOutboundObserverEndpoints: [
-                    linkedRemote.domainEndpoint,
-                    availableLocal.domainEndpoint,
-                    availableRemote.domainEndpoint
-                ]
+                activeOutboundObserverEndpoints: Set(peers.map(\.domainEndpoint))
             ),
-            candidates: [target, linkedRemote, availableLocal, availableRemote]
+            candidates: [target, linkedRemote] + peers
         )
 
         XCTAssertEqual(
-            menu.observerOptions.map(\.displayName),
-            ["Zeta local", "AAA linked remote", "BBB remote"]
+            menu.availableObservers.map(\.peerEndpoint),
+            [availableLocal, alphaProject, betaFirst, betaTie, betaLast, availableRemote].map(\.domainEndpoint)
         )
-        guard case .linked = menu.observerOptions[1].relationship else {
-            return XCTFail("expected the remote option to stay linked after sorting")
-        }
+        XCTAssertEqual(menu.linkedObservers.map(\.peerEndpoint), [linkedRemote.domainEndpoint])
+        XCTAssertEqual(menu.availableObservers[1].menuLabel, "worktree: Zeta: Zeta")
+        XCTAssertEqual(menu.availableObservers[1].workspaceName, "alpha")
     }
 
-    /// The inverse list keeps ticked (linked) targets first, then applies the same
-    /// own-workspace/name ordering inside each group.
+    /// Linked targets stay first; available targets share the project/session picker policy.
     func testOutboundListKeepsLinkedFirstThenWorkspaceThenName() {
         let ownWorkspace = id("10000000-0000-0000-0000-000000000001")
         let otherWorkspace = id("20000000-0000-0000-0000-000000000002")
@@ -265,7 +276,9 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             workspaceID: otherWorkspace,
             displayName: "Linked target"
         )
-        let availableLocal = candidate(windowID: 3, workspaceID: ownWorkspace, displayName: "Alpha local")
+        let availableLocal = candidate(windowID: 3, workspaceID: ownWorkspace, displayName: "Zeta local")
+        let alphaProject = candidate(windowID: 7, workspaceID: UUID(), displayName: "Zeta", workspaceName: "alpha")
+        let betaProject = candidate(windowID: 8, workspaceID: UUID(), displayName: "Alpha", workspaceName: "Beta")
         let selfSession = candidate(windowID: 5, sessionID: observer.sessionID, displayName: "Self")
         let ineligibleTarget = candidate(
             windowID: 6,
@@ -277,13 +290,14 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         let menu = AgentSidebarOversightMenuProjection.make(
             target: observer,
             inputs: inputs(target: observer, linkedTargets: [relationship]),
-            candidates: [observer, linkedRemote, availableLocal, selfSession, ineligibleTarget]
+            candidates: [observer, betaProject, linkedRemote, availableLocal, selfSession, alphaProject, ineligibleTarget]
         )
 
         XCTAssertEqual(
             menu.targetOptions.map(\.peerEndpoint),
-            [linkedRemote.domainEndpoint, availableLocal.domainEndpoint]
+            [linkedRemote.domainEndpoint, availableLocal.domainEndpoint, betaProject.domainEndpoint, alphaProject.domainEndpoint]
         )
+        XCTAssertEqual(menu.availableTargets.map(\.peerEndpoint), [availableLocal, alphaProject, betaProject].map(\.domainEndpoint))
         XCTAssertTrue(menu.isOverseer)
         XCTAssertEqual(menu.outboundTargetNames, ["Linked target"])
         XCTAssertNil(menu.observerIneligibleReason)
@@ -1294,10 +1308,13 @@ final class AgentOversightMarkRenderTests: XCTestCase {
 
 @MainActor
 final class AgentSidebarOversightStableMenuTests: XCTestCase {
-    private func endpoint(_ seed: Int) -> DomainAgentSessionLinkEndpointIdentity {
+    private func endpoint(
+        _ seed: Int,
+        workspaceID: UUID = UUID(uuidString: "10000000-0000-0000-0000-00000000000A")!
+    ) -> DomainAgentSessionLinkEndpointIdentity {
         DomainAgentSessionLinkEndpointIdentity(
             windowID: seed,
-            workspaceID: UUID(uuidString: "10000000-0000-0000-0000-00000000000A")!,
+            workspaceID: workspaceID,
             tabID: UUID(),
             sessionID: UUID(),
             persistentBindingGeneration: UUID(),
@@ -1308,13 +1325,16 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
     private func peer(
         _ label: String,
         seed: Int,
+        workspaceID: UUID = UUID(uuidString: "10000000-0000-0000-0000-00000000000A")!,
+        workspaceName: String? = nil,
         relationship: AgentSidebarOversightMenuProps.Relationship = .available
     ) -> AgentSidebarOversightMenuProps.PeerOption {
         AgentSidebarOversightMenuProps.PeerOption(
-            peerEndpoint: endpoint(seed),
+            peerEndpoint: endpoint(seed, workspaceID: workspaceID),
             peerSessionID: UUID(),
             displayName: label,
             providerDisplayName: nil,
+            workspaceName: workspaceName,
             menuLabel: label,
             fullIdentityDescription: "identity \(label)",
             relationship: relationship
@@ -1456,6 +1476,79 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         // reason row and the Session-ID item are disabled by an inbound eligibility reason.
         XCTAssertTrue(blockedBy.items[1].isEnabled)
         XCTAssertFalse(blockedBy.items[3].isEnabled)
+    }
+
+    func testAvailablePickerGroupsOnlyAboveTenAcrossProjectsIncludingDisabledEntries() throws {
+        let ownID = try XCTUnwrap(UUID(uuidString: "10000000-0000-0000-0000-00000000000A"))
+        let otherID = try XCTUnwrap(UUID(uuidString: "20000000-0000-0000-0000-00000000000B"))
+        let own = (1 ... 9).map { peer("worktree: Session \($0)", seed: $0, workspaceName: "Project") }
+        let other = peer("branch: Other", seed: 10, workspaceID: otherID, workspaceName: "PROJECT")
+        let unnamed = peer("main: Unnamed", seed: 11, workspaceID: UUID(), workspaceName: " \n ")
+        var inbound: [DomainAgentSessionLinkEndpointIdentity] = []
+        var outbound: [DomainAgentSessionLinkEndpointIdentity] = []
+        let actions = AgentSessionRow.AgentSidebarOversightMenuActions(
+            addInbound: { inbound.append($0.peerEndpoint) },
+            addOutbound: { outbound.append($0.peerEndpoint) }
+        )
+        func rendered(_ choices: [AgentSidebarOversightMenuProps.PeerOption]) -> NSMenu {
+            let menuProps = props(observerOptions: choices, targetOptions: choices)
+            return NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+                menuProps,
+                busyKeys: [
+                    .add(observerEndpoint: menuProps.targetEndpoint, targetEndpoint: own[0].peerEndpoint),
+                    .add(observerEndpoint: own[0].peerEndpoint, targetEndpoint: menuProps.targetEndpoint)
+                ],
+                actions: actions
+            ))
+        }
+
+        let ten = rendered([other] + own.reversed())
+        XCTAssertEqual(try submenu("Oversee new", in: ten).items.map(\.title), own.map(\.menuLabel) + [other.menuLabel, "", "Session ID…"])
+        XCTAssertEqual(try submenu("Oversee by", in: ten).items.count, 12)
+        XCTAssertTrue(try submenu("Oversee by", in: ten).items.allSatisfy { $0.submenu == nil })
+
+        let eleven = rendered([unnamed, other] + own.reversed())
+        let newPicker = try submenu("Oversee new", in: eleven)
+        let byPicker = try submenu("Oversee by", in: eleven)
+        let expectedProjects = ["Project (10000000)", "PROJECT (20000000)", "Untitled project", "", "Session ID…"]
+        XCTAssertEqual(newPicker.items.map(\.title), expectedProjects)
+        XCTAssertEqual(byPicker.items.map(\.title), expectedProjects)
+        let ownProject = try submenu(expectedProjects[0], in: newPicker)
+        XCTAssertEqual(ownProject.items.map(\.title), own.map(\.menuLabel))
+        XCTAssertFalse(ownProject.items[0].isEnabled)
+        XCTAssertFalse(try submenu(expectedProjects[0], in: byPicker).items[0].isEnabled)
+        XCTAssertEqual(ownProject.items[0].accessibilityHelp(), "identity \(own[0].menuLabel)")
+        let newOther = try submenu(expectedProjects[1], in: newPicker)
+        let byOther = try submenu(expectedProjects[1], in: byPicker)
+        XCTAssertEqual(newOther.items.map(\.title), [other.menuLabel])
+        XCTAssertEqual(try submenu("Untitled project", in: byPicker).items.map(\.title), [unnamed.menuLabel])
+        fire(newOther.items[0])
+        fire(byOther.items[0])
+        XCTAssertEqual(outbound, [other.peerEndpoint])
+        XCTAssertEqual(inbound, [other.peerEndpoint])
+
+        let captionLookalike = try peer(
+            "Lookalike", seed: 14,
+            workspaceID: XCTUnwrap(UUID(uuidString: "40000000-0000-0000-0000-00000000000D")),
+            workspaceName: "Project (10000000)"
+        )
+        let withLookalike = rendered(own + [other, unnamed, captionLookalike])
+        XCTAssertEqual(try submenu("Oversee new", in: withLookalike).items.map(\.title), [
+            "Project (10000000)", "PROJECT (20000000)", "Project (10000000) (40000000)",
+            "Untitled project", "", "Session ID…"
+        ])
+        XCTAssertEqual(try submenu("Oversee by", in: withLookalike).items.map(\.title), [
+            "Project (10000000)", "PROJECT (20000000)", "Project (10000000) (40000000)",
+            "Untitled project", "", "Session ID…"
+        ])
+
+        let singleProject = rendered(own + [
+            peer("Session 10", seed: 12, workspaceID: ownID, workspaceName: "Project"),
+            peer("Session 11", seed: 13, workspaceID: ownID, workspaceName: "Project")
+        ])
+        XCTAssertEqual(try submenu("Oversee new", in: singleProject).items.count, 13)
+        XCTAssertTrue(try submenu("Oversee new", in: singleProject).items.allSatisfy { $0.submenu == nil })
+        XCTAssertTrue(try submenu("Oversee by", in: singleProject).items.allSatisfy { $0.submenu == nil })
     }
 
     func testEmptyDirectionFallsBackToMessageItem() throws {

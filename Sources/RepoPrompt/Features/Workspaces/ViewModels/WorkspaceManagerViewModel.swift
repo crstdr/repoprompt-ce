@@ -1028,6 +1028,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
             refreshSelectionMirrorContextRevision()
             refreshAgentCreatorNameSource()
+            // Includes externally projected renames, even with unchanged worktree labels/tab names.
+            if let activeWorkspaceID,
+               let previous = oldValue.first(where: { $0.id == activeWorkspaceID }),
+               let current = workspace(withID: activeWorkspaceID), previous.name != current.name
+            {
+                AgentSessionLinkLocationInvalidationSink.locationLabelsChanged(inWorkspace: activeWorkspaceID)
+            }
         }
     }
 

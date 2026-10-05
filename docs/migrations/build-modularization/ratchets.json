@@ -1,5 +1,5 @@
 {
-  "description": "Fork upstream sync 2026-10-05: exact measured merged tree of fork main 61bb8275 and complete upstream main a53e0b1f, including reviewed conflict resolutions and upstream platform extraction. Zero numeric headroom. All metrics equal the measured merged tree; no feature allowance or hidden drift. Upstream #1185 is byte-identical to retained fork #44 production and tests; its inclusion changes no measured value. Cold-row oversight management and its reviewed policy-custody fix add exactly 168 app-target lines (132 + 36) to fork main caf5f877 (604745 to 604913); zero headroom and all other main metrics preserved. Required RepoPrompt MCP discovery adds exactly 5 app-source lines (604913 to 604918); all other metrics and advisory/headroom policy are unchanged.",
+  "description": "Fork upstream sync 2026-10-05: exact measured merged tree of fork main 61bb8275 and complete upstream main a53e0b1f, including reviewed conflict resolutions and upstream platform extraction. Zero numeric headroom. All metrics equal the measured merged tree; no feature allowance or hidden drift. Upstream #1185 is byte-identical to retained fork #44 production and tests; its inclusion changes no measured value. Cold-row oversight management and its reviewed policy-custody fix add exactly 168 app-target lines (132 + 36) to fork main caf5f877 (604745 to 604913); zero headroom and all other main metrics preserved. Required RepoPrompt MCP discovery adds exactly 5 app-source lines (604913 to 604918); all other metrics and advisory/headroom policy are unchanged. Oversight picker ordering starts from exact measured fork main 44e5c7f4: app-source lines 604918, first-party Swift lines 763980, shared-accessor uses 1216, sleep calls 69. This PR adds exactly 29 app-source lines (604918 to 604947) and 121 first-party Swift lines (763980 to 764101); all other measured main metrics are unchanged. Inherited main-only tracked deltas versus the prior recorded baseline are explicit: shared-accessor uses +3, sleep calls +1, first-party Swift lines +179; they are not this PR's delta. Zero numeric headroom; metrics equal measured main plus this PR's exact delta.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -21,14 +21,14 @@
     "app_files_over_5000_lines": 16,
     "app_largest_cycle_components": 64,
     "app_share_permille": 791,
-    "app_shared_accessor_uses": 1213,
+    "app_shared_accessor_uses": 1216,
     "app_static_shared_declarations": 89,
     "app_target_swift_files": 1060,
-    "app_target_swift_lines": 604918,
+    "app_target_swift_lines": 604947,
     "app_userdefaults_standard_uses": 229,
     "app_wrong_way_file_edges": 956,
-    "first_party_swift_lines": 763801,
-    "tests_sleep_calls": 68,
+    "first_party_swift_lines": 764101,
+    "tests_sleep_calls": 69,
     "tests_testable_import_app_files": 332
   }
 }

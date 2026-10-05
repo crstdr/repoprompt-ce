@@ -4491,9 +4491,15 @@ final class AgentSessionLinkRuntimeBridge {
     /// Conservative scan for the label inputs that carry no tab identity.
     ///
     /// A workspace rename or a global worktree label can change many endpoints' labels at once and
-    /// names none of them. Scanning the observed targets — optionally narrowed to one workspace — is
-    /// bounded by the number of live grants, and equal props deduplicate at the publication boundary.
+    /// names none of them. Workspace renames also reuse the all-candidate presentation refresh,
+    /// since unlinked rows render project names. Global execution-label edits remain grant-bounded;
+    /// equal props deduplicate at the publication boundary.
     func requestMonitorLocationRefreshForObservedTargets(inWorkspace workspaceID: UUID? = nil) {
+        guard !isFrozenForTermination else { return }
+        // Workspace names also order unlinked candidate menus, not just linked target labels.
+        if workspaceID != nil {
+            requestCandidatePresentationRefresh()
+        }
         let targets = workspaceID.map { id in
             knownTargetEndpoints.filter { $0.workspaceID == id }
         } ?? knownTargetEndpoints

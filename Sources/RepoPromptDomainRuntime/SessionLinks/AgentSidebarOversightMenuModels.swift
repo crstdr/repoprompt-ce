@@ -26,6 +26,7 @@ package struct AgentSidebarOversightMenuProps: Equatable {
         package let peerSessionID: UUID
         package let displayName: String
         package let providerDisplayName: String?
+        package let workspaceName: String?
         package let menuLabel: String
         package let fullIdentityDescription: String
         package let relationship: Relationship
@@ -35,6 +36,7 @@ package struct AgentSidebarOversightMenuProps: Equatable {
             peerSessionID: UUID,
             displayName: String,
             providerDisplayName: String?,
+            workspaceName: String? = nil,
             menuLabel: String,
             fullIdentityDescription: String,
             relationship: Relationship
@@ -43,6 +45,7 @@ package struct AgentSidebarOversightMenuProps: Equatable {
             self.peerSessionID = peerSessionID
             self.displayName = displayName
             self.providerDisplayName = providerDisplayName
+            self.workspaceName = workspaceName
             self.menuLabel = menuLabel
             self.fullIdentityDescription = fullIdentityDescription
             self.relationship = relationship
@@ -132,7 +135,10 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     }
 
     package var availableObservers: [ObserverOption] {
-        observerOptions.filter { $0.relationship == .available }
+        AgentSidebarOversightPickerPresentation.sorted(
+            observerOptions.filter { $0.relationship == .available },
+            currentWorkspaceID: targetEndpoint.workspaceID
+        )
     }
 
     package var linkedTargets: [TargetOption] {
@@ -143,7 +149,10 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     }
 
     package var availableTargets: [TargetOption] {
-        targetOptions.filter { $0.relationship == .available }
+        AgentSidebarOversightPickerPresentation.sorted(
+            targetOptions.filter { $0.relationship == .available },
+            currentWorkspaceID: targetEndpoint.workspaceID
+        )
     }
 
     /// True when the row's creator still holds an inbound link — the Overseen-by section
@@ -183,6 +192,72 @@ package struct AgentSidebarOversightMenuProps: Equatable {
         var copy = self
         copy.observerIneligibleReason = reason
         return copy
+    }
+}
+
+/// Shared, UI-only policy for both available-session pickers. Linked sections never use it.
+package enum AgentSidebarOversightPickerPresentation {
+    package static let projectSubmenuThreshold = 10
+
+    package struct Project {
+        package let title: String
+        package let options: [AgentSidebarOversightMenuProps.PeerOption]
+    }
+
+    private static func name(_ option: AgentSidebarOversightMenuProps.PeerOption) -> String {
+        option.workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    package static func sorted(
+        _ options: [AgentSidebarOversightMenuProps.PeerOption],
+        currentWorkspaceID: UUID
+    ) -> [AgentSidebarOversightMenuProps.PeerOption] {
+        options.sorted { lhs, rhs in
+            let lhsIsOwn = lhs.peerEndpoint.workspaceID == currentWorkspaceID
+            let rhsIsOwn = rhs.peerEndpoint.workspaceID == currentWorkspaceID
+            if lhsIsOwn != rhsIsOwn { return lhsIsOwn }
+            let lhsProject = name(lhs), rhsProject = name(rhs)
+            if lhsProject.isEmpty != rhsProject.isEmpty { return !lhsProject.isEmpty }
+            let projectOrder = lhsProject.localizedCaseInsensitiveCompare(rhsProject)
+            if projectOrder != .orderedSame { return projectOrder == .orderedAscending }
+            let sessionOrder = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
+            if sessionOrder != .orderedSame { return sessionOrder == .orderedAscending }
+            return AgentSidebarOversightMenuProjection.identityOrderedBefore(lhs.peerEndpoint, rhs.peerEndpoint)
+        }
+    }
+
+    /// Nil means a flat list. Count offered endpoints, including temporarily disabled choices.
+    /// Identity, not caption, owns each group; only colliding captions acquire a UUID suffix.
+    package static func projects(
+        for options: [AgentSidebarOversightMenuProps.PeerOption]
+    ) -> [Project]? {
+        let groups = Dictionary(grouping: options, by: { $0.peerEndpoint.workspaceID })
+        guard options.count > projectSubmenuThreshold, groups.count >= 2 else { return nil }
+        var seen: Set<UUID> = []
+        let workspaceIDs = options.map(\.peerEndpoint.workspaceID).filter { seen.insert($0).inserted }
+        let titles = workspaceIDs.map { id in
+            let projectName = name(groups[id]![0])
+            return projectName.isEmpty ? "Untitled project" : projectName
+        }
+        var captions = titles
+        while true {
+            let collisions = captions.indices.filter { index in
+                captions.count(where: { $0.localizedCaseInsensitiveCompare(captions[index]) == .orderedSame }) > 1
+            }
+            guard !collisions.isEmpty else { break }
+            for index in collisions {
+                let id = workspaceIDs[index]
+                var length = 8
+                while workspaceIDs.count(where: { $0.uuidString.prefix(length) == id.uuidString.prefix(length) }) > 1 {
+                    length += 1
+                }
+                // Recheck generated captions too: a real name can resemble a disambiguated title.
+                captions[index] = "\(titles[index]) (\(id.uuidString.prefix(length)))"
+            }
+        }
+        return zip(workspaceIDs, captions).map { id, caption in
+            Project(title: caption, options: groups[id]!)
+        }
     }
 }
 
@@ -236,10 +311,9 @@ package enum AgentSidebarOversightActionKey: Hashable {
 /// live-candidate presentation snapshot; the exact Add operation revalidates them before
 /// mutating.
 ///
-/// Ordering contract (approved 2026-09-30): in both directions the row's own workspace cohort
-/// sorts first, then the rest by folded display name; the outbound list additionally keeps its
-/// linked (ticked) entries first. Ineligible directions produce a greyed reason instead of a
-/// hidden menu.
+/// Linked options retain the own-workspace/folded-session-name contract; outbound linked
+/// entries stay first. Available pickers separately sort by project/session and optionally group
+/// by workspace identity. Ineligible directions produce a greyed reason instead of a hidden menu.
 package enum AgentSidebarOversightMenuProjection {
     private struct Seed {
         let peerEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -247,6 +321,7 @@ package enum AgentSidebarOversightMenuProjection {
         let displayName: String
         let providerDisplayName: String?
         let locationLabel: String?
+        let workspaceName: String?
         let relationship: AgentSidebarOversightMenuProps.Relationship
 
         var baseMenuLabel: String {
@@ -336,6 +411,7 @@ package enum AgentSidebarOversightMenuProjection {
                     observer?.providerDisplayName ?? observerBySession?.providerDisplayName
                 ),
                 locationLabel: observer?.locationLabel ?? observerBySession?.locationLabel,
+                workspaceName: observer?.workspaceName ?? observerBySession?.workspaceName,
                 relationship: .linked(
                     reference: DomainAgentSessionLinkReference(
                         linkID: item.linkID,
@@ -369,6 +445,7 @@ package enum AgentSidebarOversightMenuProjection {
                     displayName: observer.resolvedDisplayName,
                     providerDisplayName: normalizedProvider(observer.providerDisplayName),
                     locationLabel: observer.locationLabel,
+                    workspaceName: observer.workspaceName,
                     relationship: .available
                 ))
             }
@@ -408,6 +485,7 @@ package enum AgentSidebarOversightMenuProjection {
                     targetPeer?.providerDisplayName ?? targetPeerBySession?.providerDisplayName
                 ),
                 locationLabel: targetPeer?.locationLabel ?? targetPeerBySession?.locationLabel,
+                workspaceName: targetPeer?.workspaceName ?? targetPeerBySession?.workspaceName,
                 relationship: .linked(
                     reference: DomainAgentSessionLinkReference(
                         linkID: item.linkID,
@@ -437,6 +515,7 @@ package enum AgentSidebarOversightMenuProjection {
                     displayName: peer.resolvedDisplayName,
                     providerDisplayName: normalizedProvider(peer.providerDisplayName),
                     locationLabel: peer.locationLabel,
+                    workspaceName: peer.workspaceName,
                     relationship: .available
                 ))
             }
@@ -463,6 +542,7 @@ package enum AgentSidebarOversightMenuProjection {
                 peerSessionID: seed.peerSessionID,
                 displayName: seed.displayName,
                 providerDisplayName: seed.providerDisplayName,
+                workspaceName: seed.workspaceName,
                 menuLabel: observerLabels[seed.peerEndpoint] ?? seed.baseMenuLabel,
                 fullIdentityDescription: seed.fullIdentityDescription,
                 relationship: seed.relationship
@@ -474,6 +554,7 @@ package enum AgentSidebarOversightMenuProjection {
                 peerSessionID: seed.peerSessionID,
                 displayName: seed.displayName,
                 providerDisplayName: seed.providerDisplayName,
+                workspaceName: seed.workspaceName,
                 menuLabel: targetLabels[seed.peerEndpoint] ?? seed.baseMenuLabel,
                 fullIdentityDescription: seed.fullIdentityDescription,
                 relationship: seed.relationship
@@ -537,26 +618,33 @@ package enum AgentSidebarOversightMenuProjection {
         let rhsName = folded(rhs.displayName)
         if lhsName != rhsName { return lhsName < rhsName }
 
-        let lhsSession = lhs.peerSessionID.uuidString
-        let rhsSession = rhs.peerSessionID.uuidString
+        return identityOrderedBefore(lhs.peerEndpoint, rhs.peerEndpoint)
+    }
+
+    fileprivate static func identityOrderedBefore(
+        _ lhs: DomainAgentSessionLinkEndpointIdentity,
+        _ rhs: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        let lhsSession = lhs.sessionID.uuidString
+        let rhsSession = rhs.sessionID.uuidString
         if lhsSession != rhsSession { return lhsSession < rhsSession }
-        if lhs.peerEndpoint.windowID != rhs.peerEndpoint.windowID {
-            return lhs.peerEndpoint.windowID < rhs.peerEndpoint.windowID
+        if lhs.windowID != rhs.windowID {
+            return lhs.windowID < rhs.windowID
         }
 
-        let lhsWorkspace = lhs.peerEndpoint.workspaceID.uuidString
-        let rhsWorkspace = rhs.peerEndpoint.workspaceID.uuidString
+        let lhsWorkspace = lhs.workspaceID.uuidString
+        let rhsWorkspace = rhs.workspaceID.uuidString
         if lhsWorkspace != rhsWorkspace { return lhsWorkspace < rhsWorkspace }
 
-        let lhsTab = lhs.peerEndpoint.tabID.uuidString
-        let rhsTab = rhs.peerEndpoint.tabID.uuidString
+        let lhsTab = lhs.tabID.uuidString
+        let rhsTab = rhs.tabID.uuidString
         if lhsTab != rhsTab { return lhsTab < rhsTab }
 
-        let lhsBinding = lhs.peerEndpoint.persistentBindingGeneration?.uuidString ?? ""
-        let rhsBinding = rhs.peerEndpoint.persistentBindingGeneration?.uuidString ?? ""
+        let lhsBinding = lhs.persistentBindingGeneration?.uuidString ?? ""
+        let rhsBinding = rhs.persistentBindingGeneration?.uuidString ?? ""
         if lhsBinding != rhsBinding { return lhsBinding < rhsBinding }
-        return lhs.peerEndpoint.bindingTransitionGeneration
-            < rhs.peerEndpoint.bindingTransitionGeneration
+        return lhs.bindingTransitionGeneration
+            < rhs.bindingTransitionGeneration
     }
 
     private static func folded(_ value: String) -> String {
