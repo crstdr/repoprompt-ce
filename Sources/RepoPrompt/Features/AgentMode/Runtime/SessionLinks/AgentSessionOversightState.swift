@@ -22,6 +22,10 @@ import RepoPromptDomainRuntime
 /// slot (see `pendingAutoWakeOwnsTransportBoundary`), so nothing may clear it except a path that can
 /// prove no transport call happened.
 struct AgentSessionOversightState {
+    /// Admission policy moves with the exact management identity during passive runtime eviction.
+    /// Scheduling tasks and transport ownership never leave the runtime session.
+    var autoWakePolicy = AgentSessionLinkAutoWakePolicy()
+
     // MARK: Durable Auto-wake selection
 
     /// Master Auto-wake preference, persisted with the session. New sessions default on and remain
@@ -109,7 +113,10 @@ struct AgentSessionOversightState {
     /// Content changes feed the owning session's observation signal, because the monitor renders
     /// the active subrow from it. Task/token changes deliberately do not: they publish no
     /// user-visible state.
-    var autoWakeSnoozes: [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord] = [:]
+    var autoWakeSnoozes: [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord] {
+        get { autoWakePolicy.snoozes }
+        set { autoWakePolicy.snoozes = newValue }
+    }
 
     /// The single nearest-deadline task for this session, plus the never-reused token that fences it.
     ///
@@ -122,14 +129,20 @@ struct AgentSessionOversightState {
     var snoozeDeadlineTask: Task<Void, Never>?
     var snoozeTaskToken: UUID?
     /// Injected monotonic seam. Production is `ContinuousClock`; tests advance it explicitly.
-    var snoozeClock: AgentSessionLinkAutoWakeSnoozeClock = .continuous
+    var snoozeClock: AgentSessionLinkAutoWakeSnoozeClock {
+        get { autoWakePolicy.clock }
+        set { autoWakePolicy.clock = newValue }
+    }
 
     // MARK: Ephemeral wake timing
 
     /// The last physical oversight dispatch this incarnation acquired — routine, attention, or
     /// manual alike, and recorded even while limiting is off so enabling it measures from the wake
     /// that actually happened. Monotonic, so a clock change moves the display and never admission.
-    var lastOversightWakeDispatch: AgentSessionLinkOversightWakeDispatch?
+    var lastOversightWakeDispatch: AgentSessionLinkOversightWakeDispatch? {
+        get { autoWakePolicy.lastDispatch }
+        set { autoWakePolicy.lastDispatch = newValue }
+    }
 
     // MARK: Target-declared context
 
@@ -252,6 +265,15 @@ struct AgentSessionOversightState {
 
     // MARK: Mutation
 
+    /// Transfers policy custody, leaving no runtime copy or deadline callback behind.
+    mutating func takeAutoWakePolicy() -> AgentSessionLinkAutoWakePolicy {
+        snoozeDeadlineTask?.cancel()
+        snoozeDeadlineTask = nil
+        snoozeTaskToken = nil
+        defer { autoWakePolicy = AgentSessionLinkAutoWakePolicy() }
+        return autoWakePolicy
+    }
+
     /// Cancels the shared deadline task and drops every observer-local policy record, including the
     /// wake stamp.
     ///
@@ -264,6 +286,14 @@ struct AgentSessionOversightState {
         autoWakeSnoozes.removeAll()
         lastOversightWakeDispatch = nil
     }
+}
+
+/// Process-local admission policy for one exact observer incarnation, loaded or unloaded.
+/// The management record holds it only while no runtime session owns that incarnation.
+struct AgentSessionLinkAutoWakePolicy {
+    var snoozes: [AgentSessionLinkAutoWakeSnoozeKey: AgentSessionLinkAutoWakeSnoozeRecord] = [:]
+    var clock: AgentSessionLinkAutoWakeSnoozeClock = .continuous
+    var lastDispatch: AgentSessionLinkOversightWakeDispatch?
 }
 
 /// One physical oversight dispatch, qualified by the exact incarnation that acquired it, so a rebind

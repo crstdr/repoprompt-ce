@@ -1473,16 +1473,30 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     }
 
     func testEndpointDriftAfterFinalAwaitRefusesBeforeSeeding() async {
-        let fixture = makeFixture()
-        fixture.bridge.test_beforeSynchronousSeed = {
-            fixture.host.candidates = [fixture.observer]
+        for loss in ["endpoint", "observer-metadata", "target-metadata"] {
+            let fixture = makeFixture()
+            let original = loss == "observer-metadata" ? fixture.observer : fixture.target
+            let unavailable = makeCandidate(
+                windowID: original.windowID, sessionID: original.sessionID, workspaceID: original.workspaceID,
+                tabID: original.tabID, persistentBindingGeneration: original.persistentBindingGeneration,
+                bindingTransitionGeneration: original.bindingTransitionGeneration, hasLoadedPersistedState: false
+            )
+            fixture.bridge.test_beforeSynchronousSeed = {
+                if loss == "endpoint" {
+                    fixture.host.candidates = [fixture.observer]
+                } else {
+                    fixture.host.candidates = fixture.host.candidates.map {
+                        $0.sessionID == original.sessionID ? unavailable : $0
+                    }
+                }
+            }
+            let outcome = await addLink(fixture)
+            XCTAssertEqual(outcome, .failed(.rebinding), loss)
+            XCTAssertEqual(fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0], 0)
+            let snapshot = await fixture.authority.snapshot()
+            XCTAssertEqual(snapshot.activeLinkCount, 0)
+            XCTAssertEqual(snapshot.pendingReservationCount, 0)
         }
-        let outcome = await addLink(fixture)
-        XCTAssertEqual(outcome, .failed(.rebinding))
-        XCTAssertEqual(fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0], 0)
-        let snapshot = await fixture.authority.snapshot()
-        XCTAssertEqual(snapshot.activeLinkCount, 0)
-        XCTAssertEqual(snapshot.pendingReservationCount, 0)
     }
 
     func testSeedFailureRollsBackTheReservationAndLeavesNoActiveLink() async {

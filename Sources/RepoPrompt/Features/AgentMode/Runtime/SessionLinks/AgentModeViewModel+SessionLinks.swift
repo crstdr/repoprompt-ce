@@ -59,13 +59,22 @@ extension AgentModeViewModel {
     ///   never offered as endpoints.
     func agentSessionLinkCandidates(isWindowClosing: Bool) -> [AgentSessionLinkEndpointCandidate] {
         guard let workspaceManager else { return [] }
+        let workspace = workspaceManager.activeWorkspace
+        let bindings = Dictionary(grouping: workspace?.composeTabs ?? [], by: \.id)
+            .compactMapValues { $0.count == 1 ? $0[0].activeAgentSessionID : nil }
+        for (tabID, record) in agentSessionLinkManagementRecords
+            where record.identity.workspaceID != workspace?.id || bindings[tabID] != record.identity.sessionID
+        {
+            agentSessionLinkManagementRecords.removeValue(forKey: tabID)
+            AgentSessionLinkInvalidationSink.bindingEnded(windowID: windowID, tabID: tabID, reason: .tabClosed)
+        }
         var candidates: [AgentSessionLinkEndpointCandidate] = []
         for workspace in workspaceManager.workspaces {
             // Only the active workspace of this window has live tab bindings; a background
             // workspace's tabs are persisted projections, not live endpoints.
             guard workspace.id == workspaceManager.activeWorkspaceID else { continue }
             for tab in workspace.composeTabs {
-                guard let sessionID = tab.activeAgentSessionID,
+                guard let sessionID = tab.activeAgentSessionID, bindings[tab.id] == sessionID,
                       let candidate = agentSessionLinkCandidate(
                           tabID: tab.id,
                           sessionID: sessionID,
@@ -79,6 +88,48 @@ extension AgentModeViewModel {
         return candidates
     }
 
+    /// Metadata admits link management only; provider and run routing still require a TabSession.
+    func agentSessionLinkManagementIdentity(tabID: UUID, sessionID: UUID) -> AgentSessionLifecycleAuthority.Identity? {
+        guard let workspace = workspaceManager?.activeWorkspace,
+              workspace.composeTabs.count(where: { $0.id == tabID }) == 1,
+              workspace.composeTabs.first(where: { $0.id == tabID })?.activeAgentSessionID == sessionID
+        else { return nil }
+        if let record = agentSessionLinkManagementRecords[tabID],
+           record.identity.workspaceID != workspace.id || record.identity.sessionID != sessionID
+        {
+            agentSessionLinkManagementRecords.removeValue(forKey: tabID)
+        }
+        let metadata = ownerValidatedSessionIndex[sessionID]
+        if sessions[tabID] != nil {
+            guard let identity = agentSessionLifecycleIdentity(tabID: tabID, expectedSessionID: sessionID) else { return nil }
+            if let metadata {
+                agentSessionLinkManagementRecords[tabID] = (identity, metadata, nil)
+            }
+            return identity
+        }
+        if let metadata {
+            let identity = agentSessionLinkManagementRecords[tabID]?.identity ?? AgentSessionLifecycleAuthority.Identity(
+                workspaceID: workspace.id, tabID: tabID, sessionID: sessionID,
+                persistentBindingGeneration: UUID(), bindingTransitionGeneration: 0
+            )
+            agentSessionLinkManagementRecords[tabID] = (identity, metadata, agentSessionLinkManagementRecords[tabID]?.autoWakePolicy)
+        }
+        return agentSessionLinkManagementRecords[tabID]?.identity
+    }
+
+    func agentSessionLinkManagementEndpoint(tabID: UUID, sessionID: UUID) -> DomainAgentSessionLinkEndpointIdentity? {
+        agentSessionLinkManagementIdentity(tabID: tabID, sessionID: sessionID)?.monitorEndpoint(windowID: windowID)
+    }
+
+    /// Ordinary hydration hands management custody to runtime before any new turn prepares input.
+    func agentSessionLinkRefreshRuntimePublications(for session: TabSession) async {
+        guard sessions[session.tabID] === session,
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              agentSessionLinkManagementRecords[session.tabID]?.identity.monitorEndpoint(windowID: windowID) == endpoint
+        else { return }
+        await AgentSessionLinkRuntimeBridge.shared.refreshRuntimePublications(for: endpoint)
+    }
+
     // MARK: - Discovery epochs and lazy binding descriptors
 
     /// Starts a new discovery level for one workspace activation.
@@ -88,6 +139,7 @@ extension AgentModeViewModel {
     /// newer one, and only the newest level is ever read.
     @discardableResult
     func beginAgentSessionLinkDiscoveryEpoch(workspaceID: UUID?) -> AgentSessionLinkDiscoveryEpoch {
+        agentSessionLinkManagementRecords.removeAll()
         agentSessionLinkDiscoveryGeneration &+= 1
         agentSessionLinkDiscoveryWorkspaceID = workspaceID
         return AgentSessionLinkDiscoveryEpoch(
@@ -230,11 +282,27 @@ extension AgentModeViewModel {
         isWindowClosing: Bool,
         includeLocation: Bool = true
     ) -> AgentSessionLinkEndpointCandidate? {
-        guard let session = sessions[tabID],
-              let identity = agentSessionLifecycleIdentity(tabID: tabID, expectedSessionID: sessionID),
-              identity.sessionID == sessionID
-        else {
-            return nil
+        guard let identity = agentSessionLinkManagementIdentity(tabID: tabID, sessionID: sessionID) else { return nil }
+        guard let session = sessions[tabID] else {
+            guard let record = agentSessionLinkManagementRecords[tabID] else { return nil }
+            let entry = record.metadata
+            var candidate = AgentSessionLinkEndpointCandidate(
+                windowID: windowID, workspaceID: identity.workspaceID, tabID: tabID, sessionID: sessionID,
+                persistentBindingGeneration: identity.persistentBindingGeneration,
+                bindingTransitionGeneration: identity.bindingTransitionGeneration,
+                isTopLevel: entry.parentSessionID == nil, hasLoadedPersistedState: false,
+                bindingTransitionInProgress: false,
+                isClosing: isWindowClosing || AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+                isMCPControlled: mcpControlledTabIDs.contains(tabID), isMCPOriginated: entry.isMCPOriginated,
+                roleAllowsOutboundMonitoring: AgentSessionLinkToolPolicy.allowsOutboundMonitoring(taskLabelKind: nil),
+                displayName: tabName, providerDisplayName: AgentModelCatalog.normalizePersistedSelection(
+                    agentRaw: entry.agentKindRaw, modelRaw: entry.agentModelRaw
+                ).agent.displayName,
+                locationLabel: includeLocation ? workspaceManager?.activeWorkspace?.name : nil,
+                isDeletionInProgress: AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+            )
+            candidate.hasValidatedManagementMetadata = ownerValidatedSessionIndex[sessionID] != nil
+            return candidate
         }
         return agentSessionLinkCandidate(
             session: session, identity: identity, tabName: tabName,
@@ -353,7 +421,7 @@ extension AgentModeViewModel {
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,
                 visibleRowCount: 0,
-                lastActivityAt: Date()
+                lastActivityAt: agentSessionLinkManagementRecords[candidate.tabID]?.metadata.savedAt ?? .distantPast
             )
         }
         let counts = agentSessionLinkCensusWorkspaceID == candidate.workspaceID
@@ -779,31 +847,29 @@ extension AgentModeViewModel {
         for candidate: AgentSessionLinkEndpointCandidate,
         onChange: @escaping @MainActor () -> Void
     ) -> AgentSessionLinkObservationToken? {
-        guard let session = sessions[candidate.tabID],
-              session.activeAgentSessionID == candidate.sessionID
-        else {
-            return nil
-        }
+        guard agentSessionLinkManagementEndpoint(tabID: candidate.tabID, sessionID: candidate.sessionID) == candidate.domainEndpoint else { return nil }
+        let cancellable = $sessions.map { [weak self] current -> AnyPublisher<Void, Never> in
+            guard let self, let session = current[candidate.tabID] else { return Just(()).eraseToAnyPublisher() }
+            let publishers: [AnyPublisher<Void, Never>] = [
+                session.$runState.map { _ in () }.eraseToAnyPublisher(),
+                session.$items.map { _ in () }.eraseToAnyPublisher(),
+                session.$waitingPrompt.map { _ in () }.eraseToAnyPublisher(),
+                session.$pendingAskUser.map { _ in () }.eraseToAnyPublisher(),
+                session.$pendingUserInputRequest.map { _ in () }.eraseToAnyPublisher(),
+                session.$pendingApproval.map { _ in () }.eraseToAnyPublisher(),
+                session.$pendingPermissionsRequest.map { _ in () }.eraseToAnyPublisher(),
+                session.$pendingMCPElicitationRequest.map { _ in () }.eraseToAnyPublisher(),
+                session.$pendingApplyEditsReview.map { _ in () }.eraseToAnyPublisher(),
+                session.$pendingWorktreeMergeReview.map { _ in () }.eraseToAnyPublisher(),
+                session.monitorObservationSignal.eraseToAnyPublisher(),
+                agentSessionLinkSubagentCensusChanged
+                    .filter { $0.contains(candidate.sessionID) }
+                    .map { _ in () }
+                    .eraseToAnyPublisher()
+            ]
 
-        let publishers: [AnyPublisher<Void, Never>] = [
-            session.$runState.map { _ in () }.eraseToAnyPublisher(),
-            session.$items.map { _ in () }.eraseToAnyPublisher(),
-            session.$waitingPrompt.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingAskUser.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingUserInputRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApproval.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingPermissionsRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingMCPElicitationRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApplyEditsReview.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingWorktreeMergeReview.map { _ in () }.eraseToAnyPublisher(),
-            session.monitorObservationSignal.eraseToAnyPublisher(),
-            agentSessionLinkSubagentCensusChanged
-                .filter { $0.contains(candidate.sessionID) }
-                .map { _ in () }
-                .eraseToAnyPublisher()
-        ]
-
-        let cancellable = Publishers.MergeMany(publishers)
+            return Publishers.MergeMany(publishers).eraseToAnyPublisher()
+        }.switchToLatest()
             // `@Published` fires in `willSet`, so the snapshot must be built on a later turn to read
             // settled state. `DispatchQueue.main` rather than `RunLoop.main`: a run-loop scheduler
             // only runs in `.default` mode, so target publications would stall for the whole duration
@@ -1015,7 +1081,7 @@ extension AgentModeViewModel {
             }
             return nil
         }
-        guard let expectedID = expectedSessionID, currentSessionID != nil else { return unavailable(.sessionUUIDMissing) }
+        guard let expectedID = expectedSessionID else { return unavailable(.sessionUUIDMissing) }
         guard let endpoint = agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: expectedID)
         else { return unavailable(.endpointMissing) }
         guard let props = monitorPillPropsByEndpoint[endpoint] else { return unavailable(.projectionMissing) }
@@ -1037,8 +1103,7 @@ extension AgentModeViewModel {
         tabID: UUID,
         expectedSessionID: UUID
     ) -> DomainAgentSessionLinkEndpointIdentity? {
-        guard sessions[tabID]?.activeAgentSessionID == expectedSessionID else { return nil }
-        return agentSessionLinkObserverEndpoint(tabID: tabID)
+        agentSessionLinkManagementEndpoint(tabID: tabID, sessionID: expectedSessionID)
     }
 
     /// Adds one exact current overseer to one exact target through the shared establishment core.
@@ -1244,8 +1309,30 @@ extension AgentModeViewModel {
     /// grants for that UUID. The bridge intersects this hint with the live candidate set, so a tab
     /// whose binding merely moved is a no-op.
     func notifyAgentSessionLinkBindingsChanged(previous: [UUID: TabSession]) {
+        for (tabID, session) in previous where sessions[tabID] == nil {
+            guard !session.runState.isActive, session.mcpControlContext == nil,
+                  let sessionID = session.activeAgentSessionID,
+                  let workspace = workspaceManager?.activeWorkspace,
+                  workspace.composeTabs.contains(where: { $0.id == tabID && $0.activeAgentSessionID == sessionID }),
+                  let binding = session.persistentSessionBindingIdentity,
+                  let metadata = ownerValidatedSessionIndex[sessionID]
+            else { agentSessionLinkManagementRecords.removeValue(forKey: tabID)
+                continue
+            }
+            agentSessionLinkManagementRecords[tabID] = (
+                .init(
+                    workspaceID: workspace.id,
+                    tabID: tabID,
+                    sessionID: sessionID,
+                    persistentBindingGeneration: binding.generation,
+                    bindingTransitionGeneration: session.bindingTransitionGeneration
+                ), metadata, session.oversight.takeAutoWakePolicy()
+            )
+        }
         let closedTabIDs = previous
-            .filter { tabID, session in sessions[tabID] == nil && session.activeAgentSessionID != nil }
+            .filter { tabID, session in sessions[tabID] == nil && session.activeAgentSessionID != nil
+                && agentSessionLinkManagementRecords[tabID] == nil
+            }
             .map(\.key)
         guard !closedTabIDs.isEmpty else { return }
         agentSessionLinkPruneProjections()
@@ -1263,7 +1350,7 @@ extension AgentModeViewModel {
     /// Resolved through the lifecycle identity rather than assembled from `sessions` alone, so it is
     /// the same value space the bridge publishes against.
     func agentSessionLinkLiveEndpoints() -> Set<DomainAgentSessionLinkEndpointIdentity> {
-        Set(sessions.keys.compactMap { agentSessionLinkObserverEndpoint(tabID: $0) })
+        Set(agentSessionLinkCandidates(isWindowClosing: false).map(\.domainEndpoint))
     }
 
     /// Drops projections whose exact incarnation is no longer live in this window.
