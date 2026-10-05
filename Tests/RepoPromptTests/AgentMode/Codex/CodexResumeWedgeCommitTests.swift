@@ -102,6 +102,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     func testColdCompactionAfterRouteRevocationInstallsPolicyBeforeDiscovery() async throws {
         let fixture = makeFixture([
             [.success(Self.oldThreadID)],
+            [.policyRequiredResume],
             [.policyRequiredResume]
         ])
         addTeardownBlock { @MainActor in
@@ -160,6 +161,103 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         assertOldTuple(fixture.session)
         XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
         XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
+
+        if let ownership = fixture.session.activeRunOwnership {
+            _ = fixture.session.endRunAttempt(ifCurrent: ownership, source: "fake-compact-completed")
+        }
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "send-after-cold-compact")
+        let send = Task {
+            await fixture.coordinator.sendCodexNativeMessage(
+                session: fixture.session, text: "continue", attachments: []
+            )
+        }
+        addTeardownBlock {
+            send.cancel()
+            _ = await send.value
+        }
+        // Synthetic routing left no live app connection, so the ordinary send must rebind.
+        try await waitForPendingStart(fixture)
+        XCTAssertEqual(fixture.factory.controllers.count, 3)
+        let sendController = try XCTUnwrap(fixture.factory.controllers.last)
+        XCTAssertEqual(sendController.receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(sendController.startedTurnCount, 0)
+        try await MCPRoutingWaiter.shared.notifyRouted(runID: XCTUnwrap(fixture.session.runID))
+        let sendOutcome = await send.value
+        XCTAssertTrue(sendOutcome.didSend)
+        XCTAssertEqual(sendController.startedTurnCount, 1)
+        XCTAssertEqual(sendController.compactCount, 0)
+        assertOldTuple(fixture.session)
+    }
+
+    /// Routing is synthetic; assert pending-policy cleanup rather than live socket admission.
+    func testColdResumeFailureAfterRoutedCleansOnlyItsOwnedStartup() async throws {
+        for superseded in [false, true] {
+            let gate = TestReleaseFence(name: "routed compact resume failure")
+            let fixture = makeFixture([[.routedThenResumeFailure(gate)]])
+            fixture.session.runState = .idle
+            addTeardownBlock { @MainActor in
+                let runID = fixture.session.runID
+                await fixture.coordinator.shutdownCodexSession(fixture.session)
+                if let runID, let clientName = AgentProviderKind.codexExec.mcpClientNameHint {
+                    await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                        for: clientName, windowID: 1, runID: runID
+                    )
+                    await MCPRoutingWaiter.shared.cleanup(runID: runID)
+                }
+            }
+            let compact = Task {
+                await fixture.coordinator.startOversightCompaction(
+                    session: fixture.session,
+                    expectedThreadID: Self.oldThreadID,
+                    isStillAdmissible: { true }
+                )
+            }
+            addTeardownBlock {
+                compact.cancel()
+                gate.release()
+                _ = await compact.value
+            }
+            let entered = await gate.waitUntilEntered(timeout: 4)
+            XCTAssertTrue(entered)
+            let controller = try XCTUnwrap(fixture.factory.controllers.first)
+            let runID = try XCTUnwrap(fixture.session.runID)
+            let successor = WedgeFakeCodexController(runID: runID, responses: [])
+            if superseded {
+                fixture.session.beginRunAttempt(source: "compact-successor")
+                fixture.session.codexController = successor
+                try await ServerNetworkManager.shared.installClientConnectionPolicy(
+                    for: XCTUnwrap(AgentProviderKind.codexExec.mcpClientNameHint),
+                    windowID: 1, restrictedTools: [], tabID: fixture.session.tabID,
+                    runID: runID, purpose: .agentModeRun, requiresExpectedAgentPID: true
+                )
+            }
+            let attemptBeforeFailure = fixture.session.activeRunAttemptID
+            let itemsBeforeFailure = fixture.session.items.count
+            gate.release()
+            let outcome = await compact.value
+            try await AsyncTestWait.waitUntil("failed compact controller retired", timeout: 4) {
+                controller.shutdownCount == 1
+            }
+            let pendingPolicyRemains = await hasPendingPolicy(for: runID)
+            XCTAssertEqual(pendingPolicyRemains, superseded)
+            if superseded {
+                XCTAssertEqual(fixture.session.codexController.map(ObjectIdentifier.init), ObjectIdentifier(successor))
+                XCTAssertEqual(successor.shutdownCount, 0)
+                XCTAssertEqual(fixture.session.items.count, itemsBeforeFailure)
+            } else {
+                XCTAssertNil(fixture.session.codexController)
+            }
+            XCTAssertEqual(fixture.factory.controllers.count, 1)
+            XCTAssertEqual(controller.receivedExistingIDs, [Self.oldThreadID])
+            XCTAssertEqual(outcome, .notStarted)
+            XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
+            XCTAssertEqual(controller.startedTurnCount, 0)
+            XCTAssertEqual(controller.compactCount, 0)
+            XCTAssertEqual(fixture.session.runState, .idle)
+            XCTAssertEqual(fixture.session.activeRunAttemptID, attemptBeforeFailure)
+            assertOldTuple(fixture.session)
+        }
     }
 
     private func waitForPendingStart(_ fixture: Fixture) async throws {
@@ -724,6 +822,7 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
         case timeout
         case discoveryFailure
         case policyRequiredResume
+        case routedThenResumeFailure(TestReleaseFence)
         case missingRollout
         case suspendedSuccess(String, TestReleaseFence)
         case success(String)
@@ -792,6 +891,15 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
                 method: existing == nil ? "thread/start" : "thread/resume",
                 code: -32603,
                 message: "Failed to initialize session: required MCP servers failed to initialize: RepoPromptCE: Tool catalog not ready. Please retry.",
+                data: nil
+            ))
+        case let .routedThenResumeFailure(gate):
+            await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+            await gate.enterAndWait()
+            throw CodexAppServerClient.ClientError.requestFailed(.init(
+                method: "thread/resume",
+                code: -32603,
+                message: "Non-timeout resume failure after routing",
                 data: nil
             ))
         case .policyRequiredResume:
