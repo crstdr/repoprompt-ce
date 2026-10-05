@@ -239,10 +239,7 @@ package final class CLIProcessRunner {
         additionalRemovedKeys: Set<String> = [],
         cancelChildOnTaskCancellation: Bool = false
     ) async throws -> Result {
-        if config.processPurpose == .provider {
-            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: config.allowsProviderProcessLaunchForTesting)
-        }
-        return try await gate.withPermit { [self] in
+        try await gate.withPermit { [self] in
             let environment = await resolvedEnvironment(
                 additionalEnvironment: additionalEnvironment,
                 additionalRemovedKeys: additionalRemovedKeys
@@ -468,9 +465,6 @@ package final class CLIProcessRunner {
         onProcessStarted: (@Sendable (pid_t) async -> Void)? = nil,
         onProcessTerminated: (@Sendable (pid_t) async -> Void)? = nil
     ) async throws -> AsyncThrowingStream<StreamEvent, Error> {
-        if config.processPurpose == .provider {
-            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: config.allowsProviderProcessLaunchForTesting)
-        }
         // Hold the permit for the entire lifetime of the child process
         ProcessDiagnostics.log("🔵 [GATE] Acquiring gate...")
         guard await gate.acquire() else { throw CancellationError() }

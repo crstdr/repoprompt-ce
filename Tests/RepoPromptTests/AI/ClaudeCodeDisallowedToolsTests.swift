@@ -147,12 +147,14 @@ private final class OracleCancellationFixture {
         done
         exit 66
         """#
+        let executable = directory.appendingPathComponent("oracle-fixture")
+        try ("#!/bin/sh\n" + script).write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let runner = CLIProcessRunner(config: CLIProcessConfiguration(
-            command: "/usr/bin/env",
-            allowsProviderProcessLaunchForTesting: true,
+            command: executable.path,
             workingDirectory: directory.path,
             additionalPaths: [],
-            commandSuffix: ["-i", "/bin/sh", "-c", script, "oracle-fixture", gate.path, readiness.path, acknowledgement.path],
+            commandSuffix: [gate.path, readiness.path, acknowledgement.path],
             shellLookupMode: .disabled
         ))
         // Only the runner configuration is substituted. Production provider timeout,

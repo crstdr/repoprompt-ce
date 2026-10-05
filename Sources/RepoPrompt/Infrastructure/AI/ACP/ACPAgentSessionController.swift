@@ -541,7 +541,6 @@ actor ACPAgentSessionController {
         guard state == .idle else {
             throw ControllerError.invalidState(expected: "idle", actual: state)
         }
-        try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
         promptImagesSupported = false
         state = .launching
         log("Launching ACP transport")
@@ -596,6 +595,7 @@ actor ACPAgentSessionController {
                 pid: nil,
                 error: error
             )
+            if error is ProviderProcessLaunchPolicy.Refusal { state = .idle }
             throw error
         }
         process = spawned

@@ -1609,7 +1609,6 @@ actor CodexAppServerClient {
     }
 
     private func startProcess(startupAuthority: UInt64) async throws {
-        try ProviderProcessLaunchPolicy.check()
         let runtime = try await prepareRuntimeForLaunch()
         guard let launchContext = preparedRuntimeLaunchContext else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")

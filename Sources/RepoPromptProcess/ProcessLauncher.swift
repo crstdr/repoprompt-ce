@@ -113,9 +113,7 @@ package enum ProcessLauncher {
         purpose: Purpose,
         allowsProviderProcessLaunchForTesting: Bool
     ) throws -> SpawnedProcess {
-        if purpose == .provider {
-            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
-        }
+        let command = try purpose == .provider ? ProviderProcessLaunchPolicy.checkedExecutablePath(command) : command
 
         var stdinPipe: [Int32] = [-1, -1]
         var stdoutPipe: [Int32] = [-1, -1]
