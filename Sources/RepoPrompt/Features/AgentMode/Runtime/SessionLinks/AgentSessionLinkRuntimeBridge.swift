@@ -7097,7 +7097,7 @@ final class AgentSessionLinkRuntimeBridge {
     func createLane(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         request: AgentSessionLaneCreateRequest,
-        resolveDestination: @escaping @MainActor () -> (windowID: Int, workspaceID: UUID)?
+        resolveDestination: @escaping @MainActor () -> (windowID: Int, workspaceID: UUID, workspaceName: String)?
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination else { return .refused(.shuttingDown) }
         let key = LaneCreationKey(endpoint: observerEndpoint, idempotencyKey: request.idempotencyKey)
@@ -7162,7 +7162,7 @@ final class AgentSessionLinkRuntimeBridge {
     private func performClaimedLaneCreation(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         request: AgentSessionLaneCreateRequest,
-        resolveDestination: @escaping @MainActor () -> (windowID: Int, workspaceID: UUID)?
+        resolveDestination: @escaping @MainActor () -> (windowID: Int, workspaceID: UUID, workspaceName: String)?
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
         guard let host,
@@ -7239,7 +7239,7 @@ final class AgentSessionLinkRuntimeBridge {
         return await performLaneCreation(
             observerEndpoint: observerEndpoint, request: request, selection: selection,
             destinationWindowID: destination.windowID, workspaceID: destination.workspaceID,
-            reservationTicket: ticket
+            workspaceName: destination.workspaceName, reservationTicket: ticket
         )
     }
 
@@ -7249,6 +7249,7 @@ final class AgentSessionLinkRuntimeBridge {
         selection: AgentSessionLanePolicy.RoleSelection,
         destinationWindowID: Int,
         workspaceID: UUID,
+        workspaceName: String,
         reservationTicket: UUID
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination, !Task.isCancelled, let host else {
@@ -7313,6 +7314,7 @@ final class AgentSessionLinkRuntimeBridge {
                 reason: reason, firstTask: firstTask, laneCount: count
             )
             value.firstTaskReason = firstTaskReason
+            value.workspaceName = workspaceName
             return value
         }
         guard saved else { return await receipt(false, .saveFailed) }

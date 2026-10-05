@@ -1,5 +1,5 @@
 {
-  "description": "Build-modularization ratchet baselines. Ratcheted metrics may only decrease; regenerate with `python3 Scripts/modularization_metrics.py update` after an improving slice. App Swift lines above baseline plus the unchanged 2000-line headroom are advisory, not a failing gate; the recorded baseline remains 650047 (advisory reference 652047; upstream baseline 649794 plus this PR's exact net +253 app lines). Missing or invalid baseline configuration and all other ratchets remain mandatory.",
+  "description": "Per-conversation Claude effort upstream port: upstream/main recorded app baseline 650075 plus exact own delta 95 = 650170; existing 2000-line advisory headroom is unchanged. Other ratchets, including test imports and wrong-way edges, are unchanged. The recorded upstream app-line drift is not absorbed into this fix. The untracked-stat cache adds its exact 98 app-source lines, raising 650170 to 650268 with no additional headroom. Missing or invalid baseline configuration and all other ratchets remain mandatory. Window-reopen oversight restoration adds its exact net 253 app-source lines: 650268 + 253 = 650521; existing headroom and all other numeric baselines are unchanged.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -24,7 +24,7 @@
     "app_shared_accessor_uses": 1218,
     "app_static_shared_declarations": 94,
     "app_target_swift_files": 1126,
-    "app_target_swift_lines": 650047,
+    "app_target_swift_lines": 650521,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1079,
     "first_party_swift_lines": 747202,
