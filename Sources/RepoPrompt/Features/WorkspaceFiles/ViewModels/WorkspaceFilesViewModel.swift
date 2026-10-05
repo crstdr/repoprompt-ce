@@ -1,8 +1,10 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 import SwiftUI
 #if DEBUG || EDIT_FLOW_PERF
@@ -832,6 +834,8 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var partitionStoreSaveCancellable: AnyCancellable?
     private var fileSystemSettingsCancellable: AnyCancellable?
     private var nonGitCodeMapsSettingCancellable: AnyCancellable?
+    private var globalCodeMapsSettingCancellable: AnyCancellable?
+    private var globalCodeMapsSettingRevision: UInt64 = 0
     private var forceReloadOnNextFileSystemSettingsRefresh = false
 
     private let selectionSliceCoordinator = SelectionSliceCoordinator()
@@ -12371,30 +12375,6 @@ extension WorkspaceFilesViewModel {
     }
 }
 
-enum FileManagerError: Error, LocalizedError {
-    case failedToLoadFolder(Error)
-    case failedToLoadFile(Error)
-    case fileSystemServiceNotFound
-    case failedToLoadContent
-    // New: richer, contextual variant used by MCP tools and FS ops
-    case fileSystemServiceNotFoundWithContext(String)
-
-    var errorDescription: String? {
-        switch self {
-        case let .failedToLoadFolder(err):
-            "Failed to load folder: \(err.localizedDescription)"
-        case let .failedToLoadFile(err):
-            "Failed to load file: \(err.localizedDescription)"
-        case .fileSystemServiceNotFound:
-            "No matching workspace folder for the requested path."
-        case .failedToLoadContent:
-            "Failed to load content."
-        case let .fileSystemServiceNotFoundWithContext(context):
-            context
-        }
-    }
-}
-
 struct PathLocation {
     let rootPath: String
     let correctedPath: String
@@ -13223,6 +13203,18 @@ extension WorkspaceFilesViewModel {
             )
         }
         return nil
+    }
+
+    func bindGlobalCodeMapsSetting(_ settings: GlobalSettingsStore) {
+        globalCodeMapsSettingCancellable = settings.$codeMapsGloballyDisabled
+            .removeDuplicates()
+            .sink { [weak self] disabled in
+                guard let self else { return }
+                globalCodeMapsSettingRevision += 1
+                let revision = globalCodeMapsSettingRevision
+                let store = workspaceFileContextStore
+                Task { await store.setCodeMapsGloballyDisabled(disabled, settingsRevision: revision) }
+            }
     }
 
     func bindNonGitCodeMapsSetting(_ settings: GlobalSettingsStore) {

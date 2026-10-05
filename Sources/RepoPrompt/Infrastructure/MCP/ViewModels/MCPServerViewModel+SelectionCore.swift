@@ -1,6 +1,8 @@
 import Foundation
 import MCP
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 
 extension MCPServerViewModel {
@@ -58,7 +60,7 @@ extension MCPServerViewModel {
     /// Returns selection-aware workspace records for the resolved tab context snapshot.
     @MainActor
     func selectedRecordsForCurrentTabContext(
-        metadataOverride: RequestMetadata? = nil,
+        metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> [WorkspaceFileRecord] {
         do {
@@ -85,7 +87,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func selectionCollections(
-        for context: TabContextSnapshot,
+        for context: MCPTabContextSnapshot,
         codeMapUsageOverride: CodeMapUsage? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async -> SelectionReplyAssembler.SelectionCollections {
@@ -108,7 +110,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func lookupContext(for context: TabContextSnapshot) async -> WorkspaceLookupContext {
+    func lookupContext(for context: MCPTabContextSnapshot) async -> WorkspaceLookupContext {
         if let authority = context.frozenFileToolAuthority,
            let workspaceManager
         {
@@ -133,10 +135,10 @@ extension MCPServerViewModel {
 
     @MainActor
     func selectionCollectionsForCurrentTabContext(
-        metadataOverride: RequestMetadata? = nil,
+        metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> SelectionReplyAssembler.SelectionCollections {
-        let metadata: RequestMetadata = if let metadataOverride {
+        let metadata: MCPRequestMetadata = if let metadataOverride {
             metadataOverride
         } else {
             await captureRequestMetadata()
@@ -155,11 +157,11 @@ extension MCPServerViewModel {
 
     @MainActor
     func physicalSelectionForCurrentTabContext(
-        metadataOverride: RequestMetadata? = nil,
+        metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> StoredSelection {
         do {
-            let metadata: RequestMetadata = if let metadataOverride {
+            let metadata: MCPRequestMetadata = if let metadataOverride {
                 metadataOverride
             } else {
                 await captureRequestMetadata()

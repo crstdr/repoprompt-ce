@@ -2,7 +2,9 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptShared
+import RepoPromptVCS
 
 struct OracleExportFile: Equatable {
     let path: String
@@ -254,7 +256,7 @@ private let agentRunExpiredHandleRecoveryNote = [
 
 @MainActor
 struct AgentRunMCPToolService {
-    typealias RequestMetadata = MCPServerViewModel.RequestMetadata
+    typealias RequestMetadata = MCPRequestMetadata
     typealias HeartbeatOperation = @Sendable () async throws -> Value
 
     static func requireWritableWorkspaceAuthority(_ issue: DomainWorkspaceAuthorityIssue?) throws {

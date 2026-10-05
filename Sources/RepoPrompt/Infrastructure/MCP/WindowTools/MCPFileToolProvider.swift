@@ -3,6 +3,7 @@ import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptRegexCore
 import RepoPromptShared
@@ -22,8 +23,8 @@ final class MCPFileToolProvider: MCPAppToolProviding {
     private let dependencies: Dependencies
 
     private struct ReadAuthority {
-        let metadata: MCPServerViewModel.RequestMetadata
-        let frozen: MCPServerViewModel.FrozenFileToolAuthority
+        let metadata: MCPRequestMetadata
+        let frozen: MCPFrozenFileToolAuthority
         let dependencies: Dependencies
         let isRunlessOneShotHint: Bool
 
@@ -64,7 +65,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             }
         } catch is CancellationError {
             throw CancellationError()
-        } catch let failure as MCPServerViewModel.FileToolAuthorityFailure {
+        } catch let failure as MCPFileToolAuthorityFailure {
             return try Self.authorityFailureValue(toolName: toolName, args: args, failure: failure)
         }
     }
@@ -74,7 +75,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
     ) async throws -> ReadAuthority {
         if let appContext {
             guard let frozen = appContext.frozenFileToolAuthority else {
-                throw MCPServerViewModel.FileToolAuthorityFailure.unavailable
+                throw MCPFileToolAuthorityFailure.unavailable
             }
             let authority = ReadAuthority(
                 metadata: appContext.metadata,
@@ -101,7 +102,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
 
     private func validate(_ authority: ReadAuthority) async throws {
         guard let workspaceManager = authority.dependencies.context.workspaceManager else {
-            throw MCPServerViewModel.FileToolAuthorityFailure.unavailable
+            throw MCPFileToolAuthorityFailure.unavailable
         }
         try await authority.frozen.validate(
             workspaceManager: workspaceManager,
@@ -112,10 +113,10 @@ final class MCPFileToolProvider: MCPAppToolProviding {
     nonisolated static func authorityFailureValue(
         toolName: String,
         args: [String: Value],
-        failure: MCPServerViewModel.FileToolAuthorityFailure
+        failure: MCPFileToolAuthorityFailure
     ) throws -> Value {
         let message = failure.localizedDescription
-        let retryAfter = MCPServerViewModel.FileToolAuthorityFailure.retryAfterMilliseconds
+        let retryAfter = MCPFileToolAuthorityFailure.retryAfterMilliseconds
         switch toolName {
         case MCPWindowToolName.search:
             return try Value(ToolResultDTOs.SearchResultDTO(
@@ -453,7 +454,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 try await validate(authority)
                 if snapshot.roots.isEmpty {
                     guard authority.frozen.rootCatalogSnapshot.isGenuinelyRootless else {
-                        throw MCPServerViewModel.FileToolAuthorityFailure.mismatchedProjection
+                        throw MCPFileToolAuthorityFailure.mismatchedProjection
                     }
                     await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction, transition: .completed)
                     return try Value(ToolResultDTOs.FileTreeDTO(
@@ -502,7 +503,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 if resultAndRootCount.emptyReason == .rootProjectionEmpty,
                    !authority.frozen.rootCatalogSnapshot.isGenuinelyRootless
                 {
-                    throw MCPServerViewModel.FileToolAuthorityFailure.mismatchedProjection
+                    throw MCPFileToolAuthorityFailure.mismatchedProjection
                 }
                 return try Value(ToolResultDTOs.FileTreeDTO(
                     rootsCount: resultAndRootCount.rootCount,
@@ -1076,8 +1077,8 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         reply: ToolResultDTOs.ReadFileReply,
         requestedPath: String,
         absolutePhysicalPath: String,
-        metadata: MCPServerViewModel.RequestMetadata,
-        authority: MCPServerViewModel.FrozenFileToolAuthority,
+        metadata: MCPRequestMetadata,
+        authority: MCPFrozenFileToolAuthority,
         files: MCPAppPhysicalCapabilityAdapters.Files
     ) async throws -> Bool {
         try await files.enqueueReadFileAutoSelection(
@@ -1094,8 +1095,8 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         contextLines: Int,
         reply: ToolResultDTOs.SearchResultDTO,
         resolvedPhysicalPaths: [String],
-        metadata: MCPServerViewModel.RequestMetadata,
-        authority: MCPServerViewModel.FrozenFileToolAuthority,
+        metadata: MCPRequestMetadata,
+        authority: MCPFrozenFileToolAuthority,
         files: MCPAppPhysicalCapabilityAdapters.Files
     ) async throws -> Bool {
         try await files.enqueueFileSearchAutoSelection(

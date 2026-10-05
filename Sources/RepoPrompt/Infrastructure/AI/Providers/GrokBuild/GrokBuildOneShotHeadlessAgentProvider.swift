@@ -1,9 +1,9 @@
 import Foundation
 import RepoPromptProcess
 
-/// Prompt-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
+/// Text-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
 /// Agent Mode continues to use `grok agent stdio`; this adapter uses the documented
-/// one-shot JSON CLI and preserves the existing trusted Grok executable preflight.
+/// one-shot prompt-file CLI and rejects images before launch.
 final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     typealias APIKeyProvider = @Sendable () async throws -> String?
 
@@ -34,6 +34,11 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         guard message.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
             throw AIProviderError.invalidConfiguration(
                 detail: "Grok Build one-shot requests cannot resume a previous session."
+            )
+        }
+        guard message.transientImages.isEmpty else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Grok Build one-shot requests do not accept image attachments. Choose an image-capable Oracle model or remove the images and retry."
             )
         }
 
@@ -123,14 +128,11 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         )
         let runner = CLIProcessRunner(config: processConfig)
 
-        var additionalEnvironment: [String: String] = [:]
         var apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
         if apiKey?.isEmpty != false {
             apiKey = try await apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        if let apiKey, !apiKey.isEmpty {
-            additionalEnvironment["XAI_API_KEY"] = apiKey
-        }
+        let additionalEnvironment = Self.launchEnvironment(apiKey: apiKey)
         try Task.checkCancellation()
 
         let arguments = GrokBuildOneShotCLIOptions(
@@ -187,6 +189,15 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 detail: "Failed to decode Grok Build CLI JSON: \(error.localizedDescription)"
             )
         }
+    }
+
+    /// Process-local overrides, kept separate from Grok's inherited credential/config environment.
+    static func launchEnvironment(apiKey: String?) -> [String: String] {
+        var environment = GrokBuildAgentConfig.importIsolationEnvironment
+        if let apiKey, !apiKey.isEmpty {
+            environment["XAI_API_KEY"] = apiKey
+        }
+        return environment
     }
 
     private func mapProcessError(_ error: Error) -> Error {

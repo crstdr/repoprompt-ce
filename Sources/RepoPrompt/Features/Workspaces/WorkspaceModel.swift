@@ -1,6 +1,7 @@
 import Foundation
 import OSLog
 import RepoPromptFoundation
+import RepoPromptSettingsCore
 
 struct WorkspaceDuplicateGroupSummary: Identifiable, Equatable {
     struct DuplicateWorkspaceRow: Identifiable, Equatable {
@@ -123,56 +124,6 @@ struct WorkspacePreset: Codable, Identifiable, Equatable {
     }
 }
 
-struct StoredSelection: Codable, Equatable, Hashable {
-    let selectedPaths: [String]
-    let manualCodemapPaths: [String]
-    let slices: [String: [LineRange]]
-    let codemapAutoEnabled: Bool
-
-    init(
-        selectedPaths: [String] = [],
-        manualCodemapPaths: [String] = [],
-        slices: [String: [LineRange]] = [:],
-        codemapAutoEnabled: Bool = true
-    ) {
-        self.selectedPaths = selectedPaths
-        self.manualCodemapPaths = manualCodemapPaths
-        self.slices = slices
-        self.codemapAutoEnabled = codemapAutoEnabled
-    }
-
-    var isEmptyForSelectedFileTree: Bool {
-        selectedPaths.isEmpty && manualCodemapPaths.isEmpty && slices.isEmpty
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(
-            selectedPaths: container.decodeIfPresent([String].self, forKey: .selectedPaths) ?? [],
-            manualCodemapPaths: container.decodeIfPresent([String].self, forKey: .manualCodemapPaths) ?? [],
-            slices: container.decodeIfPresent([String: [LineRange]].self, forKey: .slices) ?? [:],
-            codemapAutoEnabled: container.decodeIfPresent(Bool.self, forKey: .codemapAutoEnabled) ?? true
-        )
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(selectedPaths, forKey: .selectedPaths)
-        try container.encode(manualCodemapPaths, forKey: .manualCodemapPaths)
-        try container.encode([String](), forKey: .autoCodemapPaths)
-        try container.encode(slices, forKey: .slices)
-        try container.encode(codemapAutoEnabled, forKey: .codemapAutoEnabled)
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case selectedPaths
-        case manualCodemapPaths
-        case autoCodemapPaths
-        case slices
-        case codemapAutoEnabled
-    }
-}
-
 /// Records when workspace decoding synthesized values that are not a pure
 /// function of the input bytes — `UUID()`/`Date()` fallbacks in the custom
 /// decoders, and `normalizeComposeTabInvariants` creating a tab. Results that
@@ -269,6 +220,16 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
     var contextOverrides: ContextBuilderOverrides
     /// Active Context Builder tab config. Encodes/decodes under the legacy JSON key `discover`.
     var contextBuilder: ContextBuilderTabConfig
+
+    /// Matches empty, chat-placeholder and T-number titles eligible for automatic naming.
+    var hasDefaultName: Bool {
+        if ChatSession.isPlaceholderName(name) { return true }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return false }
+        let prefix = trimmed.prefix(1)
+        guard prefix == "T" || prefix == "t" else { return false }
+        return Int(trimmed.dropFirst()) != nil
+    }
 
     init(
         id: UUID = UUID(),

@@ -1,13 +1,6 @@
 import Foundation
 import RepoPromptProcess
-
-enum ACPProviderID: String, Codable, Hashable {
-    case openCode
-    case cursor
-    case grokBuild
-    case antigravity
-    case devin
-}
+import RepoPromptSettingsCore
 
 enum ACPSupportResult: Equatable {
     case supported
@@ -30,17 +23,21 @@ struct ACPDiscoveredSessionModels: Equatable {
     /// provider advertises one. Lets the controller skip redundant effort mutations.
     var currentEffortRaw: String?
     var modelParameterSets: [ACPModelParameterSet]
+    /// False only for persisted model-only records written before parameter discovery.
+    var hasModelParameterMetadata: Bool
 
     init(
         options: [AgentModelOption],
         currentModelRaw: String?,
         currentEffortRaw: String? = nil,
-        modelParameterSets: [ACPModelParameterSet] = []
+        modelParameterSets: [ACPModelParameterSet] = [],
+        hasModelParameterMetadata: Bool = true
     ) {
         self.options = options
         self.currentModelRaw = currentModelRaw
         self.currentEffortRaw = currentEffortRaw
         self.modelParameterSets = modelParameterSets
+        self.hasModelParameterMetadata = hasModelParameterMetadata
     }
 
     var preferredModelRaw: String? {

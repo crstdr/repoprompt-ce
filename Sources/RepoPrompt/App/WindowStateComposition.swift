@@ -1,5 +1,46 @@
+import Combine
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
+
+extension CodeMapArtifactRuntime {
+    static let processWideProvider: CodeMapArtifactRuntimeProvider = {
+        let identity = WorkspaceContextFilesystemIdentity.identity
+        return makeProcessWideProvider(
+            identity: identity,
+            applicationSupportRootURL: identity.applicationSupportRootURL(),
+            postSuccessfulInitialization: {
+                #if !DEBUG
+                    CodeMapV6CacheDeletionScheduler.schedule()
+                #endif
+            },
+            globalCodeMapsDisabled: {
+                await MainActor.run { GlobalSettingsStore.shared.globalCodeMapsDisabled() }
+            },
+            bindingEngineDidInitialize: { engine in
+                Task { @MainActor in
+                    CodeMapGlobalDisableObservation.processWide = CodeMapGlobalDisableObservation(engine: engine)
+                    await engine.refreshGlobalCodeMapsDisabled()
+                }
+            }
+        )
+    }()
+}
+
+/// Production composition retains settings observation; isolated runtimes have no user-settings dependency.
+@MainActor
+final class CodeMapGlobalDisableObservation {
+    static var processWide: CodeMapGlobalDisableObservation?
+    private var subscription: AnyCancellable?
+
+    init(engine: WorkspaceCodemapBindingEngine) {
+        subscription = GlobalSettingsStore.shared.$codeMapsGloballyDisabled
+            .removeDuplicates()
+            .sink { [weak engine] _ in
+                Task { await engine?.refreshGlobalCodeMapsDisabled() }
+            }
+    }
+}
 
 @MainActor
 struct WindowStateComposition {
@@ -44,18 +85,29 @@ enum WindowStateCompositionFactory {
         codexModelPollingService: CodexModelPollingService = .shared,
         modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil
     ) -> WindowStateComposition {
+        WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
+        WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())
+        #if DEBUG
+            WorkspacePreparationInstrumentation.install(AppWorkspacePreparationRecorderProvider())
+            WorkspaceRootLoadFieldHooks.install(AppWorkspaceRootLoadFieldProvider())
+            WorkspaceApplyEditsRebaseProbeHooks.install(AppWorkspaceApplyEditsRebaseProbeRecorder())
+        #endif
         let modelRouterRuntime = injectedModelRouterRuntime ?? WindowStatesManager.shared.modelRouterRuntime
         // 1) Workspace file context store + visible file-tree UI adapter
         #if DEBUG
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
+                startupFeatureFlags: .current(),
                 enableCatalogShardShadowValidation: false,
                 nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
+                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
                 restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
                 perfRecorder: AppAgentModePerfRecorder()
             )
         #else
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
+                startupFeatureFlags: .current(),
                 nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
+                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
                 restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
                 perfRecorder: AppAgentModePerfRecorder()
             )
@@ -68,6 +120,7 @@ enum WindowStateCompositionFactory {
         )
         if injectedWorkspaceFileContextStore == nil {
             workspaceFilesViewModel.bindNonGitCodeMapsSetting(settingsStore)
+            workspaceFilesViewModel.bindGlobalCodeMapsSetting(settingsStore)
         }
 
         // 2) AI queries

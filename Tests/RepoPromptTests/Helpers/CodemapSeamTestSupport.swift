@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptPersistence
 
 final class CodemapRuntimeTracker: @unchecked Sendable {
     private let lock = NSLock()
@@ -26,6 +27,10 @@ final class CodemapLockedValues<Value: Sendable>: @unchecked Sendable {
 
     func append(_ value: Value) {
         lock.withLock { storage.append(value) }
+    }
+
+    func takeFirst() -> Value? {
+        lock.withLock { storage.isEmpty ? nil : storage.removeFirst() }
     }
 }
 
@@ -59,7 +64,11 @@ final class CodemapStoreFixture: @unchecked Sendable {
         name: String,
         capabilityHooks: WorkspaceCodemapRootCapabilityServiceHooks = .none,
         enginePolicy: WorkspaceCodemapBindingEnginePolicy = .default,
+        engineHooks: WorkspaceCodemapBindingEngineHooks = .none,
+        manifestStoreHooks: CodeMapRootManifestStoreHooks = .none,
+        globalCodeMapsDisabled: @escaping @Sendable () async -> Bool = { false },
         graphPullPause: WorkspaceCodemapGraphPullPause = .production,
+        overlay: WorkspaceCodemapLiveOverlay = WorkspaceCodemapLiveOverlay(),
         forbidCodeMapGitProcesses: Bool = false,
         beforeArtifactBuild: @escaping @Sendable (String) async -> Void = { _ in }
     ) throws {
@@ -106,6 +115,8 @@ final class CodemapStoreFixture: @unchecked Sendable {
         let runtimeProvider = CodeMapArtifactRuntimeProvider {
             try runtimeTracker.record(CodeMapArtifactRuntime(
                 rootURL: resolvedArtifactRoot,
+                manifestStoreHooks: manifestStoreHooks,
+                globalCodeMapsDisabled: globalCodeMapsDisabled,
                 builder: CodeMapArtifactBuilderClient(execute: { input, ownerID, priority in
                     var decodedText: String?
                     if case let .decoded(source) = input.source.decodeResult {
@@ -137,8 +148,11 @@ final class CodemapStoreFixture: @unchecked Sendable {
                         ),
                         sourceReader: registry.makeValidatedSourceReaderClient(),
                         catalogClient: registry.makeBindingCatalogClient(),
+                        overlay: overlay,
                         policy: enginePolicy,
-                        graphPullPause: graphPullPause
+                        hooks: engineHooks,
+                        graphPullPause: graphPullPause,
+                        globalCodeMapsDisabled: globalCodeMapsDisabled
                     )
                 }
             ))
@@ -159,12 +173,13 @@ final class CodemapStoreFixture: @unchecked Sendable {
 
     /// Store that forces Code Map eligibility. Retained for the existing Git scenarios, whose
     /// contracts are about serving and not about admission.
-    func makeStore() -> WorkspaceFileContextStore {
+    func makeStore(codeMapsGloballyDisabled: Bool = false) -> WorkspaceFileContextStore {
         let runtimeProvider = runtimeProvider
         return WorkspaceFileContextStore(
             codemapRuntimeProvider: { try runtimeProvider.runtime() },
             codemapLocalGitClassificationProbe: .init { _ in .requiresGitPreflight },
-            codemapGitEligibilityProbe: .init { _ in .eligible }
+            codemapGitEligibilityProbe: .init { _ in .eligible },
+            codeMapsGloballyDisabled: codeMapsGloballyDisabled
         )
     }
 

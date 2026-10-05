@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import XCTest
 
 /// Cross-window lifecycle bridge: synchronous first-link seeding, activation-time observation
@@ -11,10 +12,47 @@ import XCTest
 /// two-window add/revoke/status flows are deterministic without constructing windows.
 @MainActor
 final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
+    func testBindingInvalidationRetiresInputStateEvenWithoutOversightLinks() async {
+        let fixture = makeFixture()
+        let endpoint = fixture.observer.domainEndpoint
+        let release = fixture.bridge.acceptLocalInput(for: endpoint)
+        fixture.host.candidates.removeAll { $0.domainEndpoint == endpoint }
+        await fixture.bridge.invalidateBinding(windowID: endpoint.windowID, tabID: endpoint.tabID)
+        await release.value // A pending forward must not recreate state after retirement.
+        XCTAssertEqual(fixture.bridge.captureWaitInput(for: endpoint).generation, 0)
+    }
+
     // MARK: - Fake host
 
     private final class FakeEndpointHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
+        var beforeModelFence: (() async -> Void)?
+        var afterModelFence: (() async -> Void)?
+        var modelMutationCount = 0
+
+        func agentSessionLinkModelCandidate(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionLinkEndpointCandidate? {
+            candidates.first { $0.domainEndpoint == endpoint }
+        }
+
+        func agentSessionLinkPerformSetModel(
+            to _: AgentSessionLinkEndpointCandidate, modelID: String,
+            liveness: @escaping AgentSessionLinkSendLivenessProbe,
+            reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkModelOutcome {
+            await beforeModelFence?()
+            let commit = await reauthorize()
+            guard commit == .committed else { return .blocked(commit.refusal) }
+            await afterModelFence?()
+            guard liveness().permitsDelivery else { return .blocked(.endpointInvalidated) }
+            modelMutationCount += 1
+            return .accepted(.init(modelID: modelID, modelRaw: "test", reasoningEffortRaw: nil, changed: true))
+        }
+
         var laneCandidate: AgentSessionLinkEndpointCandidate?
         var laneCreationOutcome: AgentSessionLaneHostCreationOutcome?
         var laneCreationCount = 0
@@ -59,7 +97,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             isStillRetirable: @escaping @MainActor () -> Bool
         ) async -> Bool {
             guard isStillRetirable() else { return false }
-            if !commit { return retirePreflightAllowed }
+            if !commit {
+                return retirePreflightAllowed
+            }
             await beforeRetireCommit?()
             guard retireCommitAllowed, isStillRetirable() else { return false }
             candidates.removeAll { $0.domainEndpoint == endpoint }
@@ -287,7 +327,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         ) {
             guard let token else { return }
             let ownsFence = promptInventoryHoldsByEndpoint[endpoint] == token
-            if ownsFence { promptInventoryHoldsByEndpoint.removeValue(forKey: endpoint) }
+            if ownsFence {
+                promptInventoryHoldsByEndpoint.removeValue(forKey: endpoint)
+            }
             guard let value = inventory
                 ?? (ownsFence ? retractedInventoriesByEndpoint[endpoint] : nil)
             else {
@@ -405,7 +447,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             stopLivenessReadings.append(postCommitLiveness)
             guard postCommitLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
             guard !queueHasCommittedDrain(), withdrawInbound() else { return .blocked(.targetBusy) }
-            if let currentStopRunID { stoppedRunIDs.append(currentStopRunID) }
+            if let currentStopRunID {
+                stoppedRunIDs.append(currentStopRunID)
+            }
             return .settled(DomainAgentSessionLinkStopReceipt(
                 requestID: request.requestID,
                 targetSessionID: candidate.sessionID,
@@ -1048,7 +1092,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 threadID: "acp-session",
                 turnID: "acp-session",
                 itemID: "tool-\(id)",
-                overseerOneTimeAllowAvailable: oneTimeAllowAvailable
+                overseerOneTimeAllowAvailable: oneTimeAllowAvailable,
+                plainApproveAvailable: oneTimeAllowAvailable
             )
         }
 
@@ -1068,7 +1113,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             target: sendTarget,
             request: interactionRequest(restricted.id, ["response": .string("accept")])
         )
-        XCTAssertEqual(accept, .responded(.manualOnly(.noOneTimeAllowOption)))
+        guard case .responded(.invalid) = accept else { return XCTFail("Expected invalid, got \(accept)") }
         XCTAssertEqual(session.pendingApproval, restricted, "a refused accept applies nothing")
         // Decline and cancel pass the observer policy and reach the ACP controller hop. This fixture
         // has no live ACP process, so that hop reports `unavailable` rather than a manual-only refusal.
@@ -3971,6 +4016,52 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
     }
 
+    func testSetModelValidatesOriginalLeaseInsideHostHopWithoutCandidateSweep() async throws {
+        for revokeBeforeFence in [true, false] {
+            let fixture = makeFixture()
+            _ = await addLink(fixture)
+            let resolved = await fixture.bridge.authorizeTarget(
+                operation: .monitorSetModel, observerEndpoint: fixture.observer.domainEndpoint,
+                targetSessionID: fixture.target.sessionID
+            )
+            let target = try XCTUnwrap(resolved.success)
+            let referenceValue = await linkReference(fixture)
+            let reference = try XCTUnwrap(referenceValue)
+            let revoke: () async -> Void = {
+                _ = await fixture.authority.revoke(linkID: reference.linkID, generation: reference.generation, reason: .userRequested)
+            }
+            if revokeBeforeFence {
+                fixture.host.beforeModelFence = revoke
+            } else {
+                fixture.host.afterModelFence = revoke
+            }
+            let reads = fixture.host.candidateReadCount
+            let result = await fixture.bridge.setModel(target: target, modelID: "claudeCode:test")
+            if revokeBeforeFence {
+                guard case .blocked(.linkRevoked) = result else { return XCTFail("Original lease must fail at final host hop") }
+            } else {
+                guard case .accepted = result else { return XCTFail("Already-authorized synchronous commit must settle") }
+            }
+            XCTAssertEqual(fixture.host.modelMutationCount, revokeBeforeFence ? 0 : 1)
+            XCTAssertEqual(fixture.host.candidateReadCount, reads, "set_model must use exact memory lookups, not sweep endpoints")
+        }
+    }
+
+    func testSetModelPostFenceEndpointReplacementCannotMutate() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let resolved = await fixture.bridge.authorizeTarget(
+            operation: .monitorSetModel, observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(resolved.success)
+        fixture.host.afterModelFence = { fixture.host.candidates.removeAll { $0.sessionID == fixture.target.sessionID } }
+        guard case .blocked(.endpointInvalidated) = await fixture.bridge.setModel(target: target, modelID: "claudeCode:test") else {
+            return XCTFail("Endpoint lost during the final hop must fail closed")
+        }
+        XCTAssertEqual(fixture.host.modelMutationCount, 0)
+    }
+
     // MARK: - Compaction
 
     private func authorizedCompactTarget(
@@ -4567,7 +4658,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     /// the state settles and cannot pass by waiting long enough.
     private func settleDrains(until condition: @MainActor () async -> Bool) async {
         for _ in 0 ..< 500 {
-            if await condition() { return }
+            if await condition() {
+                return
+            }
             await Task.yield()
         }
     }
@@ -5901,10 +5994,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     private func createLane(
         _ fixture: Fixture,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        request: AgentSessionLaneCreateRequest
+        request: AgentSessionLaneCreateRequest,
+        workspaceName: String = "Original destination"
     ) async -> AgentSessionLaneCreateReceipt {
         await fixture.bridge.createLane(observerEndpoint: observerEndpoint, request: request) {
-            (windowID: fixture.observer.windowID, workspaceID: fixture.observer.workspaceID)
+            (windowID: fixture.observer.windowID, workspaceID: fixture.observer.workspaceID, workspaceName: workspaceName)
         }
     }
 
@@ -5982,7 +6076,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             second = await createLane(
                 fixture,
                 observerEndpoint: fixture.observer.domainEndpoint,
-                request: request
+                request: request,
+                workspaceName: "Changed while creating"
             )
             completed.fulfill()
         }
@@ -5991,14 +6086,18 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(first?.result, .created)
         XCTAssertEqual(first?.sessionID, lane.sessionID)
         XCTAssertEqual(second?.sessionID, lane.sessionID)
+        XCTAssertEqual(first?.workspaceName, "Original destination")
+        XCTAssertEqual(second?.workspaceName, first?.workspaceName)
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
         let replay = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: request
+            request: request,
+            workspaceName: "Changed before replay"
         )
         XCTAssertTrue(replay.duplicate)
         XCTAssertEqual(replay.sessionID, lane.sessionID)
+        XCTAssertEqual(replay.workspaceName, first?.workspaceName)
         let conflict = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
@@ -6137,16 +6236,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(receipt.result, .creationIncomplete)
         XCTAssertEqual(receipt.reason, .saveFailed)
         XCTAssertEqual(receipt.sessionID, lane.sessionID)
+        XCTAssertEqual(receipt.workspaceName, "Original destination")
         let inbound = await fixture.authority.links(forTarget: lane.sessionID)
         XCTAssertEqual(inbound.items.count, 0)
         let replay = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture)
+            request: laneRequest(fixture),
+            workspaceName: "Changed before tombstone replay"
         )
         XCTAssertEqual(replay.result, .creationIncomplete)
         XCTAssertTrue(replay.duplicate)
         XCTAssertEqual(replay.sessionID, lane.sessionID)
+        XCTAssertEqual(replay.workspaceName, receipt.workspaceName)
         XCTAssertEqual(fixture.host.laneCreationCount, 1, "an incomplete key cannot allocate again")
     }
 
@@ -6323,7 +6425,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let request = laneRequest(fixture, key: "published-hydration-failure")
         let first = await fixture.bridge.createLane(
             observerEndpoint: fixture.observer.domainEndpoint, request: request,
-            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id) }
+            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id, workspaceName: destination.name) }
         )
         XCTAssertEqual(first.result, .creationIncomplete)
         XCTAssertNotNil(first.sessionID)
@@ -6344,7 +6446,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         window.agentModeViewModel.test_setAfterDurableChildTabCreation(nil)
         let replay = await fixture.bridge.createLane(
             observerEndpoint: fixture.observer.domainEndpoint, request: request,
-            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id) }
+            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id, workspaceName: destination.name) }
         )
         XCTAssertEqual(replay.result, .creationIncomplete)
         XCTAssertEqual(replay.sessionID, first.sessionID)
@@ -6459,7 +6561,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture, key: "create-and-attend", message: "Do the first task")
         ) {
-            (windowID: lane.windowID, workspaceID: lane.workspaceID)
+            (windowID: lane.windowID, workspaceID: lane.workspaceID, workspaceName: "Original destination")
         }
         XCTAssertEqual(created.result, .created)
         XCTAssertEqual(created.firstTask, .delivered)
@@ -6580,7 +6682,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             completed.fulfill()
         }
         await fulfillment(of: [completed], timeout: 3)
-        if let deletion { AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletion) }
+        if let deletion {
+            AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletion)
+        }
         AgentSessionDeletionRegistry.shared.test_reset()
         XCTAssertEqual(receipt?.result, .creationIncomplete)
         XCTAssertEqual(receipt?.sessionID, lane.sessionID)
@@ -6685,7 +6789,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var firstLane: AgentSessionLinkEndpointCandidate?
         for index in 0 ..< 8 {
             let lane = makeCandidate(windowID: 70 + index)
-            if firstLane == nil { firstLane = lane }
+            if firstLane == nil {
+                firstLane = lane
+            }
             fixture.host.candidates.append(lane)
             fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
             guard case .added = await fixture.bridge.addMonitorLink(
@@ -6808,7 +6914,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             ) else { XCTFail("authority churn Add failed")
                 return
             }
-            if churnCount == 3 { fixture.bridge.freezeForTermination() }
+            if churnCount == 3 {
+                fixture.bridge.freezeForTermination()
+            }
         }
         let done = expectation(description: "cancelled cap inventory settled")
         var outcome: AgentSessionLaneCreateReceipt?
@@ -7059,7 +7167,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             completed.fulfill()
         }
         await fulfillment(of: [completed], timeout: 3)
-        if case .failed(.closing) = racedAdd {} else { XCTFail("retiring observer Add was not fenced") }
+        if case .failed(.closing) = racedAdd {} else {
+            XCTFail("retiring observer Add was not fenced")
+        }
         XCTAssertEqual(outcome, .retired(sessionID: fixture.target.sessionID))
         let outbound = await fixture.authority.links(forObserver: fixture.target.sessionID)
         XCTAssertTrue(outbound.items.isEmpty)

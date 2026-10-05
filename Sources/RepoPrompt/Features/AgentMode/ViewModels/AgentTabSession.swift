@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 // MARK: - Agent Tab Session
 
@@ -731,6 +732,25 @@ final class AgentTabSession: ObservableObject {
         activeRunOwnership?.attemptID
     }
 
+    /// Acceptance installs this before provider branching. It only forwards an observational wake.
+    var observerWaitRelease: (runID: UUID?, attemptID: UUID?, task: Task<Void, Never>)?
+
+    func awaitObserverWaitRelease(runID: UUID, runAttemptID: UUID?) async throws {
+        try Task.checkCancellation()
+        guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
+        while let release = observerWaitRelease,
+              release.runID == runID, release.attemptID == runAttemptID
+        {
+            await release.task.value
+            try Task.checkCancellation()
+            guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
+            // Input accepted during this suspension installs a newer forwarding barrier.
+            if observerWaitRelease?.task == release.task { break }
+        }
+        try Task.checkCancellation()
+        guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
+    }
+
     var activeRunLiveness: AgentRunLivenessSnapshot? {
         runLifecycle.liveness
     }
@@ -758,6 +778,7 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
+                selectedClaudeEffortRaw = nil
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
@@ -770,6 +791,11 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // A different model can have a different window; wait for its own report.
             if selectedModelRaw != oldValue {
+                if selectedAgent.usesClaudeTooling,
+                   let effort = ClaudeModelSpecifier(raw: selectedModelRaw).explicitEffortLevel
+                {
+                    selectedClaudeEffortRaw = effort.rawValue
+                }
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
@@ -779,6 +805,12 @@ final class AgentTabSession: ObservableObject {
     }
 
     var selectedReasoningEffortRaw: String?
+    /// Session-owned Claude effort; shared preferences only seed a missing selection.
+    var selectedClaudeEffortRaw: String?
+    var persistedReasoningEffortRaw: String? {
+        selectedAgent.usesClaudeTooling ? selectedClaudeEffortRaw : selectedReasoningEffortRaw
+    }
+
     private var acpModelParameterSelectionRevisionByIdentity: [ACPModelParameterIdentity: UInt64] = [:]
     private var nextACPModelParameterSelectionRevision: UInt64 = 0
     var acpModelParameterSelections: [ACPModelParameterSelection] = [] {
