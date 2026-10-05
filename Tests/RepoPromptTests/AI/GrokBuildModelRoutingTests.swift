@@ -83,6 +83,41 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
     }
 
+    func testOneShotLaunchIsolatesImportedMCPServersAndPreservesAPIKey() {
+        for apiKey in [nil, "xai-test-key-123"] as [String?] {
+            let environment = GrokBuildOneShotHeadlessAgentProvider.launchEnvironment(apiKey: apiKey)
+            XCTAssertEqual(environment["GROK_CLAUDE_MCPS_ENABLED"], "0")
+            XCTAssertEqual(environment["GROK_CURSOR_MCPS_ENABLED"], "0")
+            XCTAssertEqual(environment["XAI_API_KEY"], apiKey)
+            XCTAssertNil(environment["HOME"])
+            XCTAssertNil(environment["GROK_HOME"])
+        }
+    }
+
+    func testOneShotRejectsImagesBeforeLaunchWithoutLeakingPayload() async {
+        let provider = GrokBuildOneShotHeadlessAgentProvider(
+            config: GrokBuildCLIProvider.test_makeHeadlessConfig(modelName: nil)
+        )
+        let message = AgentMessage(
+            systemPrompt: "system",
+            userMessage: "inspect",
+            transientImages: [
+                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "Secret Diagram")
+            ]
+        )
+
+        do {
+            _ = try await provider.streamAgentMessage(message)
+            XCTFail("Expected Grok Build image rejection")
+        } catch let AIProviderError.invalidConfiguration(detail) {
+            XCTAssertTrue(detail.contains("image attachments"))
+            XCTAssertFalse(detail.contains("AQID"))
+            XCTAssertFalse(detail.contains("Secret Diagram"))
+        } catch {
+            XCTFail("Expected actionable provider configuration error, got \(error)")
+        }
+    }
+
     func testNonAgentAdapterMapsNonSuccessfulStopsToIncomplete() {
         let incompleteStopReasons = [
             "max_tokens",

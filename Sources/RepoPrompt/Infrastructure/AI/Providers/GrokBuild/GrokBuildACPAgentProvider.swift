@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct GrokBuildACPAgentProvider: ACPAgentProvider {
     private let config: GrokBuildAgentConfig
@@ -19,7 +20,12 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         launchResolver: GrokBuildACPLaunchResolver = GrokBuildACPLaunchResolver()
     ) {
         self.config = config
-        self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
+        self.repoPromptMCPConfiguration = RepoPromptMCPServerConfiguration(
+            name: RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName,
+            command: repoPromptMCPConfiguration.command,
+            args: repoPromptMCPConfiguration.args,
+            env: repoPromptMCPConfiguration.env
+        )
         self.launchResolver = launchResolver
     }
 
@@ -47,7 +53,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
             }
         }
 
-        var environment: [String: String] = [:]
+        var environment = GrokBuildAgentConfig.importIsolationEnvironment
         if let apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !apiKey.isEmpty {
             // Never log this value; it exists only as a child-process launch override.
             environment["XAI_API_KEY"] = apiKey
@@ -91,7 +97,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
     ) throws -> [[String: Any]] {
         // Grok Build 1.0.3 advertises promptCapabilities.image = false over ACP, so v1 is
         // text-only: reject attachments explicitly instead of silently dropping them.
-        guard request.attachments.isEmpty else {
+        guard request.attachments.isEmpty, message.transientImages.isEmpty else {
             throw AIProviderError.invalidConfiguration(
                 detail: "Grok Build does not advertise image support over ACP; remove attachments and retry."
             )
