@@ -3143,7 +3143,7 @@ final class AgentSessionLinkRuntimeBridge {
         let liveCandidates = host.agentSessionLinkCandidates()
         guard !isFrozenForTermination, let liveTarget = liveCandidates.first(where: { $0.domainEndpoint == targetEndpoint }),
               liveCandidates.contains(where: { $0.domainEndpoint == observerEndpoint }),
-              expectedEndpoints.isEmpty || liveCandidatesMatch(
+              liveCandidatesMatch(
                   expectedEndpoints,
                   pair: pair,
                   candidates: liveCandidates
@@ -4019,6 +4019,14 @@ final class AgentSessionLinkRuntimeBridge {
     ///
     /// Scopes merge rather than overwrite: a status-only refresh queued behind a membership change
     /// must not narrow that pending full rebuild.
+    /// Runtime custody enables previously unavailable prompt/status publication, not a new grant.
+    func refreshRuntimePublications(for endpoint: DomainAgentSessionLinkEndpointIdentity) async {
+        guard host?.agentSessionLinkCandidates().contains(where: {
+            $0.domainEndpoint == endpoint && $0.hasLoadedPersistedState
+        }) == true else { return }
+        await requestProjectionRefresh(.sessions([endpoint.sessionID]))
+    }
+
     private func requestProjectionRefresh(_ scope: ProjectionRefreshScope = .full) async {
         pendingRefreshScope = pendingRefreshScope?.merged(with: scope) ?? scope
         if let refreshTask {

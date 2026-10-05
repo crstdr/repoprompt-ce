@@ -1890,27 +1890,183 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
     }
 
     func testMenuOpeningLeavesColdPersistedRowUnloaded() async throws {
-        let fixture = try await makeFixture(peerCount: 1)
+        let fixture = try await makeFixture(peerCount: 2)
+        try await add(from: 1, to: 2, in: fixture)
         let tabID = fixture.tabs[0].id
         let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
         let workspaceID = try XCTUnwrap(fixture.state.workspaceManager.activeWorkspaceID)
-        let provider = try mountedRegion(in: fixture).itemsProvider
         let persisted = fixture.vm.session(for: tabID)
         persisted.selectedAgent = .devin
         persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
         persisted.providerSessionID = "hosted-existing-acp-session"
         await fixture.vm.flushSave(for: tabID)
-        // Keep ordinary active-chat ownership away from this cold menu target.
         fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
         fixture.vm.test_removeSession(tabID: tabID)
         let hydrationBefore = fixture.hydrationAttempts.events
         fixture.vm.prepareSidebarOversightSession(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID)
-        _ = provider()
-        await settleHostedPublication(in: fixture)
-        XCTAssertNil(fixture.vm.sessions[tabID], "Opening a menu must not mount or hydrate a persisted row")
-        XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
-        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore, "No-launch boundary: menu repair must not enter hydration")
-        XCTAssertTrue(fixture.providerAttempts.events.isEmpty, "Cold persisted rows must not request a provider")
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        let menu = try menuProps(in: fixture)
+        let observer = try XCTUnwrap(menu.availableObservers.first)
+        let target = try XCTUnwrap(menu.availableTargets.first)
+        let inbound = await fixture.vm.addAgentSidebarOversight(
+            observerEndpoint: observer.peerEndpoint, targetEndpoint: menu.targetEndpoint
+        )
+        let outbound = await fixture.vm.addAgentOversightLink(
+            observerEndpoint: menu.targetEndpoint, targetEndpoint: target.peerEndpoint
+        )
+        XCTAssertEqual(inbound, .changed)
+        XCTAssertEqual(outbound, .changed)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        let linked = try menuProps(in: fixture)
+        XCTAssertEqual(linked.linkedObservers.count, 1)
+        XCTAssertEqual(linked.linkedTargets.count, 1)
+        XCTAssertNil(fixture.vm.sessions[tabID], "Menu and Add must not mount a persisted row")
+        XCTAssertEqual(fixture.hydrationAttempts.events, hydrationBefore)
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty)
+    }
+
+    func testColdSidebarRejectsStaleIdentityAndRestrictedObservers() async throws {
+        for restriction in ["child", "mcp-origin", "mcp-control"] {
+            let fixture = try await makeFixture(peerCount: 1)
+            let tabID = fixture.tabs[0].id
+            let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+            let persisted = fixture.vm.session(for: tabID)
+            persisted.parentSessionID = restriction == "child" ? UUID() : nil
+            persisted.isMCPOriginated = restriction == "mcp-origin"
+            if restriction == "mcp-control" {
+                fixture.vm.test_setMCPControlledTabIDs([tabID])
+            }
+            await fixture.vm.flushSave(for: tabID)
+            fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
+            fixture.vm.test_removeSession(tabID: tabID)
+            await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+            XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: UUID()))
+            let menu = try menuProps(in: fixture)
+            XCTAssertNotNil(menu.observerIneligibleReason)
+            XCTAssertTrue(menu.availableTargets.isEmpty)
+            XCTAssertTrue(menu.availableObservers.isEmpty)
+            XCTAssertEqual(menu.targetSessionID, sessionID)
+            XCTAssertNil(fixture.vm.sessions[tabID])
+            XCTAssertTrue(fixture.providerAttempts.events.isEmpty)
+        }
+        let fixture = try await makeFixture(peerCount: 0)
+        let tabID = fixture.tabs[0].id
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        await fixture.vm.flushSave(for: tabID)
+        fixture.vm.test_setCurrentTabIDOverride(UUID())
+        fixture.vm.test_removeSession(tabID: tabID)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        let original = fixture.state.workspaceManager.workspaces
+        var ambiguous = original[0]
+        ambiguous.composeTabs.append(fixture.tabs[0])
+        fixture.state.workspaceManager.workspaces = [ambiguous]
+        XCTAssertNil(
+            fixture.vm.agentSessionLinkManagementEndpoint(tabID: tabID, sessionID: sessionID),
+            "Duplicate persisted tab claims must not pick an arbitrary incarnation"
+        )
+        fixture.state.workspaceManager.workspaces = original
+        XCTAssertNil(fixture.vm.sessions[tabID])
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty)
+    }
+
+    func testColdSidebarLinkSurvivesMountAndEvictionButNotRebinding() async throws {
+        let fixture = try await makeFixture(peerCount: 0)
+        let peerWindow = try await makeFixture(peerCount: 0)
+        _ = peerWindow
+        let tabID = fixture.tabs[0].id
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        await fixture.vm.flushSave(for: tabID)
+        fixture.vm.test_setCurrentTabIDOverride(UUID())
+        fixture.vm.test_removeSession(tabID: tabID)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        let cold = try menuProps(in: fixture)
+        let target = try XCTUnwrap(cold.availableTargets.first)
+        let outcome = await fixture.vm.addAgentOversightLink(
+            observerEndpoint: cold.targetEndpoint, targetEndpoint: target.peerEndpoint
+        )
+        XCTAssertEqual(outcome, .changed)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        let before = try XCTUnwrap(try menuProps(in: fixture).linkedTargets.first)
+        XCTAssertTrue(fixture.vm.agentSessionLinkPromptInventoryBySessionID[sessionID]?.inventory.isEmpty != false)
+        let ready = await fixture.vm.ensureSessionReady(tabID: tabID)
+        XCTAssertFalse(
+            try XCTUnwrap(fixture.vm.agentSessionLinkPromptContext(for: ready)).inventory.isEmpty,
+            "Ordinary mount must publish outbound inventory without a target change or a forced refresh"
+        )
+        // Hydration's loaded latch may flip before its publication task finishes.
+        let held = expectation(description: "Runtime publication is held after hydration")
+        var release: CheckedContinuation<Void, Never>?
+        ready.persistedLoadTask = Task { @MainActor in
+            await withCheckedContinuation { release = $0
+                held.fulfill()
+            }
+        }
+        await fulfillment(of: [held], timeout: 2)
+        let entered = expectation(description: "Second readiness caller enters the pending handoff")
+        var returned = false
+        let second = Task { @MainActor in
+            entered.fulfill()
+            _ = await fixture.vm.ensureSessionReady(tabID: tabID)
+            returned = true
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertFalse(returned, "The loaded latch must not bypass the outstanding publication task")
+        release?.resume()
+        await second.value
+        ready.persistedLoadTask = nil
+        let reciprocal = await fixture.vm.addAgentOversightLink(
+            observerEndpoint: target.peerEndpoint, targetEndpoint: cold.targetEndpoint
+        )
+        XCTAssertEqual(reciprocal, .changed)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        let inbound = try XCTUnwrap(try menuProps(in: fixture).linkedObservers.first)
+        XCTAssertEqual(try menuProps(in: fixture).targetEndpoint, cold.targetEndpoint)
+        XCTAssertEqual(try menuProps(in: fixture).linkedTargets.first?.relationship, before.relationship)
+        XCTAssertEqual(try menuProps(in: fixture).linkedObservers.first?.relationship, inbound.relationship)
+        fixture.vm.test_removeSession(tabID: tabID)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        XCTAssertEqual(try menuProps(in: fixture).targetEndpoint, cold.targetEndpoint)
+        XCTAssertEqual(try menuProps(in: fixture).linkedTargets.first?.relationship, before.relationship)
+        XCTAssertEqual(try menuProps(in: fixture).linkedObservers.first?.relationship, inbound.relationship)
+        _ = await fixture.vm.ensureSessionReady(tabID: tabID)
+        let mounted = fixture.vm.session(for: tabID)
+        _ = fixture.vm.test_installPersistentSessionBinding(sessionID: nil, on: mounted)
+        _ = fixture.vm.test_installPersistentSessionBinding(sessionID: sessionID, on: mounted)
+        mounted.hasLoadedPersistedState = true
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        XCTAssertNotEqual(try menuProps(in: fixture).targetEndpoint, cold.targetEndpoint)
+        XCTAssertTrue(try menuProps(in: fixture).linkedTargets.isEmpty)
+        await fixture.vm.flushSave(for: tabID)
+        fixture.vm.test_removeSession(tabID: tabID)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        let retired = try menuProps(in: fixture).targetEndpoint
+        let restoredLink = await fixture.vm.addAgentOversightLink(
+            observerEndpoint: retired, targetEndpoint: target.peerEndpoint
+        )
+        XCTAssertEqual(restoredLink, .changed)
+        let manager = fixture.state.workspaceManager
+        var workspace = try XCTUnwrap(manager.activeWorkspace)
+        let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspace.id })
+        workspace.composeTabs.removeAll { $0.id == tabID }
+        manager.workspaces[workspaceIndex] = workspace
+        let issues = await fixture.vm.handleComposeTabsDidRemove([tabID], reason: .stash, workspaceID: workspace.id)
+        XCTAssertTrue(issues.isEmpty)
+        workspace.composeTabs.append(fixture.tabs[0])
+        manager.workspaces[workspaceIndex] = workspace
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        let restored = try menuProps(in: fixture)
+        XCTAssertNotEqual(restored.targetEndpoint, retired)
+        XCTAssertTrue(restored.linkedTargets.isEmpty)
+        let staleAdd = await fixture.vm.addAgentOversightLink(
+            observerEndpoint: retired, targetEndpoint: target.peerEndpoint
+        )
+        XCTAssertNotNil(staleAdd.failureMessage)
+        let freshAdd = await fixture.vm.addAgentOversightLink(
+            observerEndpoint: restored.targetEndpoint, targetEndpoint: target.peerEndpoint
+        )
+        XCTAssertEqual(freshAdd, .changed)
+        XCTAssertNil(fixture.vm.sessions[tabID])
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty)
     }
 
     func testMenuOpeningRepairsLoadedNilBindingWithoutHydration() async throws {
@@ -2188,8 +2344,11 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         addTeardownBlock {
             await MainActor.run {
                 GlobalSettingsStore.shared.setMCPAutoStart(oldAutoStart, commit: false)
-                if let oldShowEmpty { UserDefaults.standard.set(oldShowEmpty, forKey: key) }
-                else { UserDefaults.standard.removeObject(forKey: key) }
+                if let oldShowEmpty {
+                    UserDefaults.standard.set(oldShowEmpty, forKey: key)
+                } else {
+                    UserDefaults.standard.removeObject(forKey: key)
+                }
             }
         }
         let providerAttempts = LifecycleRecorder()
