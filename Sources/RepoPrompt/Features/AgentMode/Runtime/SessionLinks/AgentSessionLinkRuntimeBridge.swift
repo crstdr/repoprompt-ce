@@ -1913,7 +1913,6 @@ final class AgentSessionLinkRuntimeBridge {
 
     func noteOversightWindowClosing(windowID: Int) {
         guard !isFrozenForTermination else { return }
-        launchCoordinator?.noteWindowClosing(windowID: windowID)
         for (reference, bookkeeping) in bookkeepingByReference {
             let closing = [bookkeeping.observerEndpoint, bookkeeping.targetEndpoint]
                 .filter { $0.windowID == windowID }
@@ -1922,7 +1921,7 @@ final class AgentSessionLinkRuntimeBridge {
             else { continue }
             launchCoordinatorIfNeeded().noteWindowClose(
                 pair: bookkeeping.pair, token: token, assertedAt: generation,
-                reference: reference, closedSessionIDs: Set(closing.map(\.sessionID))
+                reference: reference
             )
         }
     }

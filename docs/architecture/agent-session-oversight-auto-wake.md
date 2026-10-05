@@ -34,6 +34,9 @@ Parking survives transient hydration and sequential closes until a valid restora
 the ordinary establishment path. Unlink and committed deletion forget intent; failed removal uses
 the existing cleanup warning/retry. Parking is process-local, preserves no capabilities, and adds no
 UI or MCP state; cold launch keeps its existing restoration policy.
+Hydration need is derived from current readiness on existing reconciliation events; the loader owns
+loaded/in-flight deduplication. Queued passive work must still match its complete discovery owner and
+persisted descriptor before admission, so an abandoned request cannot suppress successor recovery.
 
 ## Configuration-only model selection
 
