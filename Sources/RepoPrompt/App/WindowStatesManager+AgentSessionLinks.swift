@@ -236,7 +236,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         _ props: AgentMonitorPillProps,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint, allowManagement: true) else { return }
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
         viewModel.agentSessionLinkPublishProjection(props, to: endpoint)
     }
 
@@ -291,8 +291,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
 
     /// The view model that currently owns this exact endpoint incarnation, or `nil`.
     private func agentSessionLinkOwningViewModel(
-        for endpoint: DomainAgentSessionLinkEndpointIdentity,
-        allowManagement: Bool = false
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentModeViewModel? {
         guard !isTerminating,
               let window = window(withID: endpoint.windowID),
@@ -303,10 +302,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         let viewModel = window.agentModeViewModel
         // Full incarnation match, not `(tabID, sessionID)`: an in-place rebind keeps both while
         // advancing the binding generations.
-        let current = allowManagement
-            ? viewModel.agentSessionLinkManagementEndpoint(tabID: endpoint.tabID, sessionID: endpoint.sessionID)
-            : viewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID)
-        guard current == endpoint else {
+        guard viewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint else {
             return nil
         }
         return viewModel

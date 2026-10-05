@@ -246,8 +246,6 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
     /// while a deletion attempt can fail and restore the session unchanged. Everything that revokes
     /// or retires must key off the committed tombstone instead.
     package var isDeletionInProgress: Bool = false
-    /// Permission to manage links from owner-validated metadata, never execution readiness.
-    package var hasValidatedManagementMetadata: Bool = false
 
     package init(
         windowID: Int,
@@ -298,8 +296,7 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
             isMCPOriginated: isMCPOriginated,
             bindingTransitionInProgress: bindingTransitionInProgress,
             isClosing: isClosing,
-            isDeletionInProgress: isDeletionInProgress,
-            hasValidatedManagementMetadata: hasValidatedManagementMetadata
+            isDeletionInProgress: isDeletionInProgress
         )
     }
 
@@ -404,7 +401,6 @@ package enum AgentSessionLinkEndpointEligibility {
     package struct Input: Equatable {
         package var hasDurableBinding: Bool
         package var hasLoadedPersistedState: Bool
-        package var hasValidatedManagementMetadata: Bool
         package var isChildSession: Bool
         package var isMCPControlled: Bool
         package var isMCPOriginated: Bool
@@ -426,12 +422,10 @@ package enum AgentSessionLinkEndpointEligibility {
             isMCPOriginated: Bool,
             bindingTransitionInProgress: Bool,
             isClosing: Bool,
-            isDeletionInProgress: Bool = false,
-            hasValidatedManagementMetadata: Bool = false
+            isDeletionInProgress: Bool = false
         ) {
             self.hasDurableBinding = hasDurableBinding
             self.hasLoadedPersistedState = hasLoadedPersistedState
-            self.hasValidatedManagementMetadata = hasValidatedManagementMetadata
             self.isChildSession = isChildSession
             self.isMCPControlled = isMCPControlled
             self.isMCPOriginated = isMCPOriginated
@@ -473,7 +467,7 @@ package enum AgentSessionLinkEndpointEligibility {
         // Transient: a running deletion refuses a new link without implying permanent endpoint loss.
         if input.isDeletionInProgress { return .closing }
         if input.bindingTransitionInProgress { return .rebinding }
-        if !input.hasLoadedPersistedState, !input.hasValidatedManagementMetadata { return .loading }
+        if !input.hasLoadedPersistedState { return .loading }
         if !input.hasDurableBinding { return .bindingUnresolved }
         return nil
     }
@@ -554,7 +548,7 @@ package enum AgentSessionLinkEndpointEligibility {
         if !input.hasDurableBinding {
             return noDurableBindingReason
         }
-        if !input.hasLoadedPersistedState, !input.hasValidatedManagementMetadata {
+        if !input.hasLoadedPersistedState {
             return "Load this thread before adding sessions to oversee."
         }
         return nil
