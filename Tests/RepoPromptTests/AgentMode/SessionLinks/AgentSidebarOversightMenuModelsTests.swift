@@ -1969,6 +1969,54 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertTrue(fixture.providerAttempts.events.isEmpty)
     }
 
+    func testAutoWakeSnoozeAndSpacingSurviveRuntimeUnloadAndLoad() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        try await add(from: 0, to: 1, in: fixture)
+        let props = try menuProps(in: fixture)
+        let lane = try XCTUnwrap(props.linkedTargets.first)
+        guard case let .linked(reference, _) = lane.relationship else { return XCTFail("Expected exact link") }
+        let endpoint = props.targetEndpoint
+        let tabID = fixture.tabs[0].id
+        let original = fixture.vm.session(for: tabID)
+        let now = ContinuousClock.now
+        original.oversight.snoozeClock = AgentSessionLinkAutoWakeSnoozeClock(
+            now: { now }, wallNow: { Date(timeIntervalSince1970: 0) },
+            sleepUntil: { _ in try await Task.sleep(for: .seconds(3600)) }
+        )
+        original.oversight.routineWakeIntervalEnabled = true
+        original.oversight.routineWakeIntervalSeconds = 300
+        original.oversight.lastOversightWakeDispatch = .init(observerEndpoint: endpoint, instant: now)
+        _ = try fixture.vm.agentSessionLinkMutateAutoWakeSnooze(
+            endpoint: endpoint, targetSessionID: lane.peerEndpoint.sessionID,
+            expectedReference: reference, command: .set(durationSeconds: 600), origin: .user
+        ).get()
+        let snooze = try XCTUnwrap(try fixture.vm.agentSessionLinkAutoWakeSnoozeProjection(
+            endpoint: endpoint, targetSessionID: lane.peerEndpoint.sessionID,
+            expectedReference: reference
+        ).get())
+        await fixture.vm.flushSave(for: tabID)
+        fixture.vm.test_setCurrentTabIDOverride(UUID())
+        fixture.vm.test_removeSession(tabID: tabID)
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        XCTAssertNil(fixture.vm.sessions[tabID])
+        XCTAssertTrue(original.oversight.autoWakeSnoozes.isEmpty, "Eviction transfers policy rather than copying it")
+        XCTAssertNil(original.oversight.lastOversightWakeDispatch)
+        XCTAssertEqual(try menuProps(in: fixture).targetEndpoint, endpoint)
+        XCTAssertEqual(try menuProps(in: fixture).linkedTargets.first?.relationship, lane.relationship)
+
+        let mounted = await fixture.vm.ensureSessionReady(tabID: tabID)
+        XCTAssertFalse(mounted === original)
+        XCTAssertEqual(try fixture.vm.agentSessionLinkAutoWakeSnoozeProjection(
+            endpoint: endpoint, targetSessionID: lane.peerEndpoint.sessionID,
+            expectedReference: reference
+        ).get(), snooze, "The exact link must retain its active snooze across remount")
+        XCTAssertEqual(
+            mounted.oversight.routineWakeIntervalDeferral(observerEndpoint: endpoint, now: now),
+            now.advanced(by: .seconds(300)), "Remount must not reset routine wake spacing"
+        )
+        XCTAssertTrue(fixture.providerAttempts.events.isEmpty)
+    }
+
     func testColdSidebarLinkSurvivesMountAndEvictionButNotRebinding() async throws {
         let fixture = try await makeFixture(peerCount: 0)
         let peerWindow = try await makeFixture(peerCount: 0)

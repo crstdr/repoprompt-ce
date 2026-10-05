@@ -103,7 +103,7 @@ extension AgentModeViewModel {
         if sessions[tabID] != nil {
             guard let identity = agentSessionLifecycleIdentity(tabID: tabID, expectedSessionID: sessionID) else { return nil }
             if let metadata {
-                agentSessionLinkManagementRecords[tabID] = (identity, metadata)
+                agentSessionLinkManagementRecords[tabID] = (identity, metadata, nil)
             }
             return identity
         }
@@ -112,7 +112,7 @@ extension AgentModeViewModel {
                 workspaceID: workspace.id, tabID: tabID, sessionID: sessionID,
                 persistentBindingGeneration: UUID(), bindingTransitionGeneration: 0
             )
-            agentSessionLinkManagementRecords[tabID] = (identity, metadata)
+            agentSessionLinkManagementRecords[tabID] = (identity, metadata, agentSessionLinkManagementRecords[tabID]?.autoWakePolicy)
         }
         return agentSessionLinkManagementRecords[tabID]?.identity
     }
@@ -1321,7 +1321,7 @@ extension AgentModeViewModel {
                     sessionID: sessionID,
                     persistentBindingGeneration: binding.generation,
                     bindingTransitionGeneration: session.bindingTransitionGeneration
-                ), metadata
+                ), metadata, session.oversight.takeAutoWakePolicy()
             )
         }
         let closedTabIDs = previous

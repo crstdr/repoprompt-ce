@@ -477,7 +477,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
     /// Management identity survives passive runtime eviction, not a workspace/binding retirement.
-    var agentSessionLinkManagementRecords: [UUID: (identity: AgentSessionLifecycleAuthority.Identity, metadata: AgentSessionIndexEntry)] = [:]
+    var agentSessionLinkManagementRecords: [UUID: (
+        identity: AgentSessionLifecycleAuthority.Identity,
+        metadata: AgentSessionIndexEntry,
+        autoWakePolicy: AgentSessionLinkAutoWakePolicy?
+    )] = [:]
 
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
@@ -5272,16 +5276,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removePendingUIRefresh(for: session.tabID)
         }
         let adoption = sessions[session.tabID] == nil && previousSessionID == nil
-            ? agentSessionLinkManagementRecords[session.tabID]?.identity : nil
+            ? agentSessionLinkManagementRecords[session.tabID] : nil
         let binding: AgentPersistentSessionBindingIdentity?
-        if let adoption, adoption.sessionID == sessionID,
-           adoption.workspaceID == workspaceManager?.activeWorkspaceID,
+        if let adoption, adoption.identity.sessionID == sessionID,
+           adoption.identity.workspaceID == workspaceManager?.activeWorkspaceID,
            explicitActiveSessionID(for: session.tabID) == sessionID,
-           let generation = adoption.persistentBindingGeneration, let sessionID
+           let generation = adoption.identity.persistentBindingGeneration, let sessionID
         {
             let adopted = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: sessionID, generation: generation)
             binding = adopted
-            session.adoptManagementBinding(adopted, transitionGeneration: adoption.bindingTransitionGeneration)
+            session.adoptManagementBinding(adopted, transitionGeneration: adoption.identity.bindingTransitionGeneration)
+            session.oversight.autoWakePolicy = adoption.autoWakePolicy ?? AgentSessionLinkAutoWakePolicy()
+            agentSessionLinkManagementRecords[session.tabID]?.autoWakePolicy = nil
         } else {
             agentSessionLinkManagementRecords.removeValue(forKey: session.tabID)
             _ = session.beginPersistentBindingTransition()
