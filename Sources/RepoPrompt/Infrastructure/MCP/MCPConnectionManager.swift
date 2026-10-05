@@ -12504,10 +12504,12 @@ actor ServerNetworkManager {
                 )
             }
             #if DEBUG
-                let transportTimelineIdentity = MCPRequestTimelineRegistry.shared.claimToolRequest(
-                    connectionID: connectionID.uuidString,
-                    originalToolName: originalName
-                )
+                let transportTimelineIdentity = MCPAgentRunStartExecutionScope.current != nil
+                    ? MCPRequestTimelineContext.current
+                    : MCPRequestTimelineRegistry.shared.claimToolRequest(
+                        connectionID: connectionID.uuidString,
+                        originalToolName: originalName
+                    )
                 let inheritedRequestIdentity = transportTimelineIdentity?.fillingMissingFields(
                     from: MCPRequestTimelineContext.current
                 ) ?? MCPRequestTimelineContext.current
@@ -15158,25 +15160,45 @@ actor ServerNetworkManager {
                 return await MCPAgentRunStartExecutionScope.$current.withValue(nil) { await requestBody(params) }
             }
             let environment = await toolExecutionWatchdogEnvironment
-            let scope = MCPAgentRunStartExecutionScope(connectionID: connectionID, environment: environment)
-            return await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
-                do {
-                    let result = try await MCPToolExecutionWatchdog.execute(
-                        deadline: MCPTimeoutPolicy.agentRunStartSetupDeadline,
-                        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
-                        cleanupDisposition: .detachAndSettle,
-                        startScope: scope, environment: environment,
-                        operation: { await requestBody(params) }
-                    )
-                    return Self.startFailureWithRecovery(result, scope: scope)
-                } catch {
-                    // Deadline-to-return is memory-only: no routing, snapshots, or host cleanup.
-                    let code = MCPToolExecutionCancelledError.matches(error)
-                        ? "tool_execution_cancelled" : "tool_execution_deadline_exceeded"
-                    let value = scope.timeoutValue(code: code, message: "Start request did not settle within its setup/return envelope; inspect its existing identity before recovery.")
-                    return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
+            #if DEBUG
+                // Claim once before scope creation; the handler reuses this packet, never a sibling claim.
+                let transportIdentity = MCPRequestTimelineRegistry.shared.claimToolRequest(
+                    connectionID: connectionID.uuidString, originalToolName: params.name
+                )
+                let startIdentity = transportIdentity?.fillingMissingFields(from: MCPRequestTimelineContext.current)
+                    ?? MCPRequestTimelineContext.current
+                let invocationID = startIdentity?.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
+            #else
+                let invocationID = UUID()
+            #endif
+            let scope = MCPAgentRunStartExecutionScope(
+                invocationID: invocationID, connectionID: connectionID, environment: environment
+            )
+            let operation: @Sendable () async -> CallTool.Result = {
+                await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                    do {
+                        let result = try await MCPToolExecutionWatchdog.execute(
+                            deadline: MCPTimeoutPolicy.agentRunStartSetupDeadline,
+                            cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                            cleanupDisposition: .detachAndSettle,
+                            startScope: scope, environment: environment,
+                            operation: { await requestBody(params) }
+                        )
+                        return Self.startFailureWithRecovery(result, scope: scope)
+                    } catch {
+                        // Deadline-to-return is memory-only: no routing, snapshots, or host cleanup.
+                        let code = MCPToolExecutionCancelledError.matches(error)
+                            ? "tool_execution_cancelled" : "tool_execution_deadline_exceeded"
+                        let value = scope.timeoutValue(code: code, message: "Start request did not settle within its setup/return envelope; inspect its existing identity before recovery.")
+                        return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
+                    }
                 }
             }
+            #if DEBUG
+                return await MCPRequestTimelineContext.$current.withValue(startIdentity, operation: operation)
+            #else
+                return await operation()
+            #endif
         }
     }
 

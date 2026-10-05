@@ -12,6 +12,49 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPExportWatchdogIntegrationTests: XCTestCase {
+        func testIndependentQAStartPreservesAcceptedTransportInvocationIdentity() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let endpoint = try fixture.endpointA(), manager = fixture.networkManager
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    let request = Data("{\"jsonrpc\":\"2.0\",\"id\":891,\"method\":\"tools/call\",\"params\":{\"name\":\"agent_run\",\"arguments\":{\"op\":\"start\"}}}\n".utf8)
+                    let recorded = MCPRequestTimelineRegistry.shared.recordAcceptedFrame(
+                        request, connectionID: endpoint.connectionID.uuidString,
+                        correlationConnectionID: endpoint.connectionID.uuidString, connectionGeneration: 1
+                    )
+                    let expected = try XCTUnwrap(recorded.first?.identity.appInvocationID.flatMap(UUID.init(uuidString:)))
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun) {
+                        let context = try XCTUnwrap(MCPInvocationContextBridge.current)
+                        let scope = try XCTUnwrap(MCPAgentRunStartExecutionScope.current)
+                        XCTAssertEqual(scope.invocationID, context.invocationID)
+                        return .object(["invocation_id": .string(context.invocationID.uuidString)])
+                    }
+                    let response = try await endpoint.callTool(name: MCPWindowToolName.agentRun, arguments: [
+                        "op": "start", "message": "Fake instruction", "detach": true, "_rawJSON": true
+                    ])
+                    let payload = try Self.toolResultObject(response)
+                    XCTAssertEqual(
+                        (payload["invocation_id"] as? String).flatMap(UUID.init(uuidString:)),
+                        expected,
+                        "A start must preserve the transport's known invocation identity"
+                    )
+                    let wire = Data("{\"jsonrpc\":\"2.0\",\"id\":891,\"result\":{}}".utf8)
+                    let delivery = MCPRequestTimelineRegistry.shared.recordedResponses(
+                        in: wire, connectionID: endpoint.connectionID.uuidString, connectionGeneration: 1
+                    )
+                    XCTAssertEqual(delivery.first?.identity.appInvocationID.flatMap(UUID.init(uuidString:)), expected)
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testExpiredStartCannotOverwriteSuccessorWindowMappingAtActorCommit() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
