@@ -62,6 +62,43 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         )
     }
 
+    func testRequiredRepoPromptDiscoveryFailureIsVisibleAndTerminatesBeforeDispatch() async throws {
+        for resuming in [false, true] {
+            let fixture = makeFixture([[.discoveryFailure]])
+            if !resuming {
+                fixture.session.codexConversationID = nil
+                fixture.session.codexRolloutPath = nil
+                fixture.session.providerCleanupHandle = nil
+            }
+            var sendFinished = false
+            let send = Task {
+                let result = await fixture.coordinator.sendCodexNativeMessage(
+                    session: fixture.session,
+                    text: "continue",
+                    attachments: []
+                )
+                sendFinished = true
+                return result
+            }
+            defer { send.cancel() }
+            try await AsyncTestWait.waitUntil("discovery failure terminates", timeout: 4) {
+                sendFinished
+            }
+            guard case .failed = await send.value else {
+                return XCTFail("Discovery failure must reject the send")
+            }
+            let errors = fixture.session.items.filter { $0.kind == .error }
+            XCTAssertEqual(errors.count, 1)
+            let message = try XCTUnwrap(errors.first).text
+            XCTAssertTrue(message.contains("RepoPromptCE"))
+            XCTAssertTrue(message.contains("required MCP servers failed to initialize"))
+            XCTAssertTrue(message.contains("Tool catalog not ready. Please retry."))
+            XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
+            XCTAssertEqual(fixture.factory.controllers.count, 1)
+            XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+        }
+    }
+
     private func waitForPendingStart(_ fixture: Fixture) async throws {
         try await AsyncTestWait.waitUntil("Codex start staged", timeout: 4) {
             fixture.coordinator.test_hasPendingCodexStart(for: fixture.session)
@@ -455,6 +492,7 @@ private final class WedgeControllerFactory {
 private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
     enum Response {
         case timeout
+        case discoveryFailure
         case missingRollout
         case suspendedSuccess(String, TestReleaseFence)
         case success(String)
@@ -511,6 +549,13 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
                 method: "thread/resume",
                 code: nil,
                 message: "Request timed out after 120.0s",
+                data: nil
+            ))
+        case .discoveryFailure:
+            throw CodexAppServerClient.ClientError.requestFailed(.init(
+                method: existing == nil ? "thread/start" : "thread/resume",
+                code: -32603,
+                message: "Failed to initialize session: required MCP servers failed to initialize: RepoPromptCE: Tool catalog not ready. Please retry.",
                 data: nil
             ))
         case .missingRollout:
