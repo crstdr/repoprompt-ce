@@ -3,7 +3,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import XCTest
 
-/// Reference-backed close preservation, durable deletion, and bounded termination freeze.
+/// Quit-only lifetime, the durable deletion fence, and the bounded termination freeze.
 ///
 /// These are the paths where a mistake is invisible until the next launch: a saved relationship
 /// silently deleted by the window-close cascade that quitting produces, or a deleted transcript
@@ -238,40 +238,7 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
         await fixture.bridge.invalidateWindow(1, reason: .windowClosed)
 
         let afterClose = await fixture.store.token(for: fixture.pair)
-        XCTAssertNil(afterClose, "Revocation without exact close-begin capture still forgets the saved pair.")
-    }
-
-    func testDisappearanceSweepBeforeAsyncCloseKeepsCapturedInteractiveIntent() async throws {
-        let fixture = makeFixture()
-        guard case .added = await add(fixture) else { return XCTFail("Expected the link to be added") }
-        let inventory = await fixture.authority.links(forObserver: fixture.observer.sessionID)
-        let oldItem = try XCTUnwrap(inventory.items.first)
-        let oldReference = DomainAgentSessionLinkReference(linkID: oldItem.linkID, generation: oldItem.generation)
-        let originalToken = await fixture.store.token(for: fixture.pair)
-        let siblingTarget = makeCandidate(windowID: 3, displayName: "Another target")
-        fixture.host.candidates = [fixture.observer, siblingTarget]
-        let fence = TestReleaseFence(name: "sweep settlement before async close")
-        fixture.bridge.test_beforeDurableIntentSettlement = { pair in
-            if pair == fixture.pair { await fence.enterAndWait() }
-        }
-        // Adding a sibling requests a full projection refresh, which sweeps the vanished target.
-        let siblingAdd = Task { @MainActor in
-            await fixture.bridge.addMonitorLink(
-                observerSessionID: fixture.observer.sessionID,
-                rawTargetSessionID: siblingTarget.sessionID.uuidString
-            )
-        }
-        await fence.waitUntilEntered()
-        fixture.bridge.noteOversightWindowClosing(windowID: 2)
-        fixture.bridge.test_beforeDurableIntentSettlement = nil
-        fence.release()
-        let siblingOutcome = await siblingAdd.value
-        guard case .added = siblingOutcome else { return XCTFail("Expected sibling Add to settle") }
-        await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
-        let token = await fixture.store.token(for: fixture.pair)
-        let retired = await fixture.authority.activeGrant(for: oldReference)
-        XCTAssertEqual(token, originalToken)
-        XCTAssertNil(retired, "Preserving intent must never preserve the vanished incarnation's authority.")
+        XCTAssertNil(afterClose, "v1 creates no invisible dormant subscriptions across window closes.")
     }
 
     func testShutdownRevocationPreservesTheSavedRelationship() async {
