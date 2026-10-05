@@ -4393,6 +4393,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// discarded `statusSamples`, reconcile passive work, advance target activity, or trigger Auto-wake.
     private func requestCandidatePresentationRefresh() {
         guard let host else { return }
+        NotificationCenter.default.post(name: .agentSessionLinkCandidatesDidChange, object: nil)
         requestMonitorProjectionRefresh(
             forExactObserverEndpoints: Set(host.agentSessionLinkCandidates().map(\.domainEndpoint))
         )

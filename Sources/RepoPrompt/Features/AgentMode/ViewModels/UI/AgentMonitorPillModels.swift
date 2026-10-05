@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import RepoPromptDomainRuntime
 
@@ -1585,6 +1586,50 @@ enum AgentMonitorNoticeFormatter {
 }
 
 // MARK: - Resolved preview
+
+/// Presentation only: readiness and explicit retry re-resolve unchanged input; Add still authorizes.
+@MainActor
+final class AgentMonitorSessionIDEditor: ObservableObject {
+    @Published var identifierText = ""
+    @Published var preview: AgentMonitorResolvedPreview?
+    @Published var validationMessage: String?
+    private var resolve: ((String) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure>)?
+    private var readinessSubscription: AnyCancellable?
+
+    init(readinessChanges: AnyPublisher<Void, Never>) {
+        readinessSubscription = readinessChanges.receive(on: DispatchQueue.main).sink { [weak self] in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+    }
+
+    func updateIdentifier(_ text: String) {
+        identifierText = text
+        refresh()
+    }
+
+    func refresh(using resolve: @escaping (String) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure>) {
+        self.resolve = resolve
+        refresh()
+    }
+
+    func refresh() {
+        let trimmed = identifierText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            preview = nil
+            validationMessage = nil
+            return
+        }
+        guard let resolve else { return }
+        switch resolve(trimmed) {
+        case let .success(resolved):
+            preview = resolved
+            validationMessage = nil
+        case let .failure(failure):
+            preview = nil
+            validationMessage = failure.uiMessage
+        }
+    }
+}
 
 /// Preview shown after a UUID resolves but before the user authorizes the link.
 ///

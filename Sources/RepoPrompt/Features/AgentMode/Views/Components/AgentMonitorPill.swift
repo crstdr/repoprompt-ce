@@ -97,10 +97,10 @@ struct AgentMonitorPopoverView: View {
         fontScale.preset
     }
 
-    @State private var identifierText = ""
-    @State private var preview: AgentMonitorResolvedPreview?
-    /// Persistent validation text. Errors are never conveyed by transient colour alone.
-    @State private var validationMessage: String?
+    @StateObject private var sessionIDEditor = AgentMonitorSessionIDEditor(
+        readinessChanges: NotificationCenter.default.publisher(for: .agentSessionLinkCandidatesDidChange)
+            .map { _ in () }.eraseToAnyPublisher()
+    )
     @State private var isWorking = false
     /// One busy gate per generation-qualified row. Navigation, acknowledgement, durable Unlink, and
     /// Auto-wake changes must not race from the same stale projection.
@@ -222,6 +222,9 @@ struct AgentMonitorPopoverView: View {
         .onChange(of: visibleRowKeys) { _, _ in
             pruneRetiredRowState()
         }
+        .onAppear { refreshPreview() }
+        .onChange(of: props.sessionID) { _, _ in refreshPreview() }
+        .onChange(of: existingOutboundTargetIDs) { _, _ in refreshPreview() }
         .onDisappear {
             // Presentation only. The revocation itself already committed and stays committed.
             undoExpiryTask?.cancel()
@@ -235,23 +238,28 @@ struct AgentMonitorPopoverView: View {
         VStack(alignment: .leading, spacing: 6) {
             sectionHeader("Oversee a session")
 
-            TextField("Session ID", text: $identifierText)
-                .textFieldStyle(.roundedBorder)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                .accessibilityLabel("Session ID to oversee")
-                .onChange(of: identifierText) { _, _ in refreshPreview() }
-                .onSubmit { submit() }
+            TextField("Session ID", text: Binding(
+                get: { sessionIDEditor.identifierText },
+                set: { sessionIDEditor.updateIdentifier($0) }
+            ))
+            .textFieldStyle(.roundedBorder)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            .accessibilityLabel("Session ID to oversee")
+            .onSubmit { submit() }
 
             HStack(spacing: 6) {
                 Button("Paste from Clipboard") { pasteFromClipboard() }
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .accessibilityHint("Pastes a copied session ID")
 
+                Button("Retry") { sessionIDEditor.refresh() }
+                    .disabled(sessionIDEditor.identifierText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking)
+
                 Spacer(minLength: 0)
 
                 Button("Oversee session") { submit() }
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                    .disabled(!props.canAdd || preview == nil || isWorking)
+                    .disabled(!props.canAdd || sessionIDEditor.preview == nil || isWorking)
                     .hoverTooltip(AgentMonitorOversightDisclosure.boundary, .top)
             }
 
@@ -259,11 +267,11 @@ struct AgentMonitorPopoverView: View {
                 if reason != AgentSessionLinkEndpointEligibility.roleDeniedReason {
                     messageText(reason)
                 }
-            } else if let validationMessage {
+            } else if let validationMessage = sessionIDEditor.validationMessage {
                 messageText(validationMessage)
             }
 
-            if let preview {
+            if let preview = sessionIDEditor.preview {
                 previewRow(preview)
             }
         }
@@ -1064,29 +1072,18 @@ struct AgentMonitorPopoverView: View {
 
     private func pasteFromClipboard() {
         let pasted = NSPasteboard.general.string(forType: .string) ?? ""
-        identifierText = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+        sessionIDEditor.updateIdentifier(pasted.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Resolution is pure and read-only: it scans live windows without focusing, activating, or
-    /// switching the target. Knowing or pasting a UUID still grants nothing.
     private func refreshPreview() {
-        let trimmed = identifierText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            preview = nil
-            validationMessage = nil
-            return
-        }
-        switch AgentSessionLinkRuntimeBridge.shared.resolvePreview(
-            observerSessionID: props.sessionID,
-            rawTargetSessionID: trimmed,
-            existingOutboundTargetIDs: existingOutboundTargetIDs
-        ) {
-        case let .success(resolved):
-            preview = resolved
-            validationMessage = nil
-        case let .failure(failure):
-            preview = nil
-            validationMessage = failure.uiMessage
+        let observerID = props.sessionID
+        let outboundIDs = existingOutboundTargetIDs
+        sessionIDEditor.refresh { raw in
+            AgentSessionLinkRuntimeBridge.shared.resolvePreview(
+                observerSessionID: observerID,
+                rawTargetSessionID: raw,
+                existingOutboundTargetIDs: outboundIDs
+            )
         }
     }
 
@@ -1425,8 +1422,8 @@ struct AgentMonitorPopoverView: View {
     }
 
     private func submit() {
-        guard props.canAdd, preview != nil, !isWorking, let observerSessionID = props.sessionID else { return }
-        let raw = identifierText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard props.canAdd, sessionIDEditor.preview != nil, !isWorking, let observerSessionID = props.sessionID else { return }
+        let raw = sessionIDEditor.identifierText.trimmingCharacters(in: .whitespacesAndNewlines)
         isWorking = true
         Task {
             // Re-resolve at submit so the confirmation dialog and the Add both name the same
@@ -1440,22 +1437,22 @@ struct AgentMonitorPopoverView: View {
             guard case let .success(candidate) = resolved else {
                 isWorking = false
                 if case let .failure(failure) = resolved {
-                    preview = nil
+                    sessionIDEditor.preview = nil
                     // Already linked in this direction is done — clear the field with no
                     // error and no dialog, matching the sidebar Session-ID sheets.
                     if failure == .alreadyMonitoring {
-                        identifierText = ""
-                        validationMessage = nil
+                        sessionIDEditor.identifierText = ""
+                        sessionIDEditor.validationMessage = nil
                     } else {
-                        validationMessage = failure.uiMessage
+                        sessionIDEditor.validationMessage = failure.uiMessage
                     }
                 }
                 return
             }
             guard let observerEndpoint = props.endpoint else {
                 isWorking = false
-                preview = nil
-                validationMessage = AgentMonitorAutoWakeCopy.unavailableMessage
+                sessionIDEditor.preview = nil
+                sessionIDEditor.validationMessage = AgentMonitorAutoWakeCopy.unavailableMessage
                 return
             }
             // Shared UI confirmation gate — the same dialog the sidebar Session-ID and menu
@@ -1478,12 +1475,12 @@ struct AgentMonitorPopoverView: View {
             )
             isWorking = false
             if let message = outcome.failureMessage {
-                validationMessage = message
-                preview = nil
+                sessionIDEditor.validationMessage = message
+                sessionIDEditor.preview = nil
             } else {
-                identifierText = ""
-                preview = nil
-                validationMessage = nil
+                sessionIDEditor.identifierText = ""
+                sessionIDEditor.preview = nil
+                sessionIDEditor.validationMessage = nil
             }
         }
     }

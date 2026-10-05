@@ -101,6 +101,8 @@ package enum AgentOversightUICopy {
     /// Disabled reason shown in the Oversee-by / Oversee-new context submenus on a row whose chat
     /// has no session ID yet (fresh chat before the first send). Approved by Cristian 2026-10-01.
     package static let oversightAvailableAfterFirstMessage = "Available after the first message"
+    /// A frozen submenu cannot promise that waiting will make its choices appear.
+    package static let oversightMenuUnavailableMessage = "Not available yet — reopen this menu"
 
     /// VoiceOver hint on a linked/creator jump item: selecting it opens that session.
     package static func openHint(_ displayName: String) -> String {

@@ -1390,12 +1390,10 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             "Overseen by", "Observer",
             "Created by", "Creator",
             "",
-            "Oversee new", "Oversee by",
-            "",
-            "Unlink"
+            "Oversee new", "Oversee by", "Unlink"
         ])
         XCTAssertTrue(menu.items[6].isSeparatorItem)
-        XCTAssertTrue(menu.items[9].isSeparatorItem)
+        XCTAssertFalse(menu.items[9].isSeparatorItem)
         XCTAssertFalse(menu.items[0].isEnabled)
         XCTAssertEqual(menu.items[0].accessibilityHelp(), nil)
     }
