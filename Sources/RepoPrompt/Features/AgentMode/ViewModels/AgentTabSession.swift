@@ -776,6 +776,7 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
+                selectedClaudeEffortRaw = nil
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
@@ -788,6 +789,11 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // A different model can have a different window; wait for its own report.
             if selectedModelRaw != oldValue {
+                if selectedAgent.usesClaudeTooling,
+                   let effort = ClaudeModelSpecifier(raw: selectedModelRaw).explicitEffortLevel
+                {
+                    selectedClaudeEffortRaw = effort.rawValue
+                }
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
@@ -797,6 +803,12 @@ final class AgentTabSession: ObservableObject {
     }
 
     var selectedReasoningEffortRaw: String?
+    /// Session-owned Claude effort; shared preferences only seed a missing selection.
+    var selectedClaudeEffortRaw: String?
+    var persistedReasoningEffortRaw: String? {
+        selectedAgent.usesClaudeTooling ? selectedClaudeEffortRaw : selectedReasoningEffortRaw
+    }
+
     private var acpModelParameterSelectionRevisionByIdentity: [ACPModelParameterIdentity: UInt64] = [:]
     private var nextACPModelParameterSelectionRevision: UInt64 = 0
     var acpModelParameterSelections: [ACPModelParameterSelection] = [] {
