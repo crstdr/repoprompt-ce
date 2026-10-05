@@ -1,5 +1,6 @@
 @testable import RepoPromptApp
 import RepoPromptProcess
+import RepoPromptSettingsCore
 import XCTest
 
 /// Exercises the real headless stream path against a scripted Devin CLI, so the session-mode

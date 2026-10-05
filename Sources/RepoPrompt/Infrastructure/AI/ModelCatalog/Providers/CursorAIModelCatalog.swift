@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 // SEARCH-HELPER: Cursor model catalogue projection, dynamic membership, canonical identity, legacy aliases
 /// Projection of Cursor's discovered model catalogue for Agent Mode UI and MCP surfaces.

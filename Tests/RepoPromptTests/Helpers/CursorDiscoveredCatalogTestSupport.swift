@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -80,6 +81,7 @@ enum CursorDiscoveredCatalogTestSupport {
     }
 
     static func reset() {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
     }
 }
