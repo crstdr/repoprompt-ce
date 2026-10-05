@@ -3,6 +3,8 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptProcess
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 @MainActor

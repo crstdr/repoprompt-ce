@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptFileSystem
 
 enum StableUserInteractionIdentity {
     static func uuid(from seed: String) -> UUID {
@@ -957,6 +958,8 @@ struct AgentApprovalRequest: Identifiable, Hashable {
     let proposedExecpolicyAmendmentJSON: String?
     /// ACP-only snapshot of genuine one-time allow availability; submission rechecks the live request.
     let overseerOneTimeAllowAvailable: Bool?
+    /// ACP-only availability of the ordinary one-time decision, derived from live provider options.
+    let plainApproveAvailable: Bool?
     let details: [AgentApprovalDetail]
 
     init(
@@ -973,6 +976,7 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         grantRoot: String? = nil,
         proposedExecpolicyAmendmentJSON: String? = nil,
         overseerOneTimeAllowAvailable: Bool? = nil,
+        plainApproveAvailable: Bool? = nil,
         details: [AgentApprovalDetail] = []
     ) {
         self.id = id ?? Self.stableID(
@@ -995,6 +999,7 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         self.grantRoot = grantRoot
         self.proposedExecpolicyAmendmentJSON = proposedExecpolicyAmendmentJSON
         self.overseerOneTimeAllowAvailable = overseerOneTimeAllowAvailable
+        self.plainApproveAvailable = plainApproveAvailable
         self.details = details
     }
 
@@ -1018,6 +1023,11 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         case .fileChange:
             "File Change Approval"
         }
+    }
+
+    var supportsPlainApprove: Bool {
+        guard case .acp = requestID else { return true }
+        return plainApproveAvailable == true
     }
 
     var supportsAlwaysAllow: Bool {

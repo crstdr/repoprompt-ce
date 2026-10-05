@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 

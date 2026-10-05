@@ -1,4 +1,5 @@
 import MCP
+import RepoPromptSettingsCore
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 

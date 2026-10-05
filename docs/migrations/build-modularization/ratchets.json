@@ -1,5 +1,5 @@
 {
-  "description": "Fork upstream sync 2026-10-04: exact measured merged tree of fork ea25ab9b and upstream adb3fe4f, including reviewed integration fixes; zero numeric headroom. Wrong-way edges and test imports are disclosed in the PR. Upstream App-line advisory behavior remains; this file grants no App-line headroom. Fork twin of upstream #1179 adds exactly 5 app-target lines (655628 to 655633), zero headroom; no other ratchet is raised. Fork #71 self_compact rename merge-forward adds exactly +22 App lines to this main baseline, with unchanged zero headroom and every other metric baseline/enforcement unchanged. Sidebar menu ownership/removal diagnostic after #71: measured fork-main baseline 655655 plus exactly this diagnostic's own 26 app-target lines = 655681; zero headroom and no other numeric ratchet raised. Fork menu row-ownership fix: baseline 655681 plus exactly one own-bounds guard line = 655682; zero headroom and no other ratchet raised. Approved self_compact plain-rename follow-up removes the hidden compatibility layer and adjusts the app-line baseline by exactly -11; all other metrics and zero-headroom enforcement are unchanged. Identical FSEvents replay #44 on fork main 96868598: measured main baseline 655671 plus this feature's exact 10 app-target lines = 655681; zero headroom and no other numeric baseline raised. Oversight hydration ownership fix on fork main 2d559299: exact app-target delta -22 (655681 to 655659); one new focused host-integration test file adds exactly one testable App import (339 to 340). Zero headroom; all other ratchets unchanged. Required RepoPrompt MCP discovery adds exactly 5 app-source lines (655659 to 655664); all other metrics and advisory/headroom policy are unchanged.",
+  "description": "Fork upstream sync 2026-10-05: exact measured merged tree of fork main 61bb8275 and complete upstream main a53e0b1f, including reviewed conflict resolutions and upstream platform extraction. Zero numeric headroom. All metrics equal the measured merged tree; no feature allowance or hidden drift. Upstream #1185 is byte-identical to retained fork #44 production and tests; its inclusion changes no measured value. Required RepoPrompt MCP discovery adds exactly 5 app-source lines (604745 to 604750); all other metrics and advisory/headroom policy are unchanged.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -17,18 +17,18 @@
   ],
   "metrics": {
     "app_components": 69,
-    "app_files_over_2000_lines": 53,
+    "app_files_over_2000_lines": 47,
     "app_files_over_5000_lines": 16,
     "app_largest_cycle_components": 64,
-    "app_share_permille": 862,
-    "app_shared_accessor_uses": 1260,
-    "app_static_shared_declarations": 94,
-    "app_target_swift_files": 1142,
-    "app_target_swift_lines": 655664,
-    "app_userdefaults_standard_uses": 234,
-    "app_wrong_way_file_edges": 1067,
-    "first_party_swift_lines": 759872,
+    "app_share_permille": 791,
+    "app_shared_accessor_uses": 1213,
+    "app_static_shared_declarations": 89,
+    "app_target_swift_files": 1060,
+    "app_target_swift_lines": 604750,
+    "app_userdefaults_standard_uses": 229,
+    "app_wrong_way_file_edges": 956,
+    "first_party_swift_lines": 763801,
     "tests_sleep_calls": 68,
-    "tests_testable_import_app_files": 340
+    "tests_testable_import_app_files": 332
   }
 }
