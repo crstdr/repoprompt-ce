@@ -3685,6 +3685,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(targetProps.hasInbound)
     }
 
+    func testFullProjectionRefreshReadsCandidatesIndependentlyOfOpenChatCount() async throws {
+        let fixture = makeFixture()
+        fixture.host.candidates += (0 ..< 200).map { makeCandidate(windowID: 3 + $0 % 3, displayName: "Chat \($0)") }
+        let readsBefore = fixture.host.candidateReadCount
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        await fixture.bridge.test_settleProjections()
+        XCTAssertLessThan(
+            fixture.host.candidateReadCount - readsBefore,
+            50,
+            "A full refresh must not re-read every candidate once per candidate"
+        )
+    }
+
     func testRevokeClearsBothProjectionsAndLeavesEndpointRelativeNotices() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("add failed") }

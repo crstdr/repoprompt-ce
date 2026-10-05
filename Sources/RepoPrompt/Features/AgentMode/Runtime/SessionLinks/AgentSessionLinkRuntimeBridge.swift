@@ -4134,16 +4134,19 @@ final class AgentSessionLinkRuntimeBridge {
             // Built from the authority inventory, not from the UI rows: those substitute a live
             // candidate's name and status when the grant carries none, and neither substitution may
             // leak into agent-facing prompt text.
-            promptInventory: laneAnnotatedPromptInventory(inputs.outbound),
+            promptInventory: laneAnnotatedPromptInventory(inputs.outbound, candidates: candidates),
             passiveNotices: passiveNotices
         )
     }
 
     /// Annotate only uniquely resolved live targets; an ambiguous session UUID grants no provenance.
+    /// Pass `candidates` from a refresh pass that already read them; re-reading per endpoint makes
+    /// a full refresh quadratic in open chats.
     func laneAnnotatedPromptInventory(
-        _ inventory: DomainAgentSessionLinkInventory
+        _ inventory: DomainAgentSessionLinkInventory,
+        candidates: [AgentSessionLinkEndpointCandidate]? = nil
     ) -> AgentSessionLinkPromptInventory {
-        let candidates = host?.agentSessionLinkCandidates() ?? []
+        let candidates = candidates ?? host?.agentSessionLinkCandidates() ?? []
         let bySessionID = Dictionary(grouping: candidates, by: \.sessionID)
         return AgentSessionLinkPromptInventory(inventory) { targetID in
             guard let matches = bySessionID[targetID], matches.count == 1 else { return false }
