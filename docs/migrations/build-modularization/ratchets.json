@@ -1,5 +1,5 @@
 {
-  "description": "Fork upstream sync 2026-10-05: exact measured merged tree of fork main 61bb8275 and complete upstream main bc66560d, including reviewed conflict resolutions and upstream platform extraction. Zero numeric headroom. All metrics equal the measured merged tree; no feature allowance or hidden drift.",
+  "description": "Fork upstream sync 2026-10-05: exact measured merged tree of fork main 61bb8275 and complete upstream main a53e0b1f, including reviewed conflict resolutions and upstream platform extraction. Zero numeric headroom. All metrics equal the measured merged tree; no feature allowance or hidden drift. Upstream #1185 is byte-identical to retained fork #44 production and tests; its inclusion changes no measured value.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
