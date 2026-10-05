@@ -99,6 +99,167 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
     }
 
+    func testColdCompactionAfterRouteRevocationInstallsPolicyBeforeDiscovery() async throws {
+        let fixture = makeFixture([
+            [.success(Self.oldThreadID)],
+            [.policyRequiredResume],
+            [.policyRequiredResume]
+        ])
+        addTeardownBlock { @MainActor in
+            let runID = fixture.session.runID
+            await fixture.coordinator.shutdownCodexSession(fixture.session)
+            if let runID,
+               let clientName = AgentProviderKind.codexExec.mcpClientNameHint
+            {
+                await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                    for: clientName,
+                    windowID: 1,
+                    runID: runID
+                )
+            }
+        }
+        let failedStart = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
+        addTeardownBlock {
+            failedStart.cancel()
+            await failedStart.value
+        }
+        try await waitForPendingStart(fixture)
+        let revokedRunID = try XCTUnwrap(fixture.session.runID)
+        await MCPRoutingWaiter.shared.notifyFailed(runID: revokedRunID)
+        await failedStart.value
+        let oldPolicyRemains = await hasPendingPolicy(for: revokedRunID)
+        XCTAssertFalse(oldPolicyRemains)
+        XCTAssertNil(fixture.session.codexController)
+        assertOldTuple(fixture.session)
+
+        fixture.session.runState = .idle
+        let compact = Task {
+            await fixture.coordinator.startOversightCompaction(
+                session: fixture.session,
+                expectedThreadID: Self.oldThreadID,
+                isStillAdmissible: { true }
+            )
+        }
+        addTeardownBlock {
+            compact.cancel()
+            _ = await compact.value
+        }
+        try await waitForPendingStart(fixture)
+        let controller = try XCTUnwrap(fixture.factory.controllers.last)
+        XCTAssertEqual(fixture.factory.controllers.count, 2)
+        XCTAssertEqual(controller.receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(controller.startedTurnCount, 0)
+        XCTAssertEqual(controller.compactCount, 0, "Compaction must wait for owned routing")
+        XCTAssertEqual(fixture.session.runState, .idle, "Resume must not manufacture an active model turn")
+        let compactRunID = try XCTUnwrap(fixture.session.runID)
+        XCTAssertNotEqual(compactRunID, revokedRunID)
+        await MCPRoutingWaiter.shared.notifyRouted(runID: compactRunID)
+        let outcome = await compact.value
+        XCTAssertEqual(outcome, .started)
+        XCTAssertEqual(controller.compactCount, 1)
+        XCTAssertEqual(controller.startedTurnCount, 0)
+        assertOldTuple(fixture.session)
+        XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
+        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
+
+        if let ownership = fixture.session.activeRunOwnership {
+            _ = fixture.session.endRunAttempt(ifCurrent: ownership, source: "fake-compact-completed")
+        }
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "send-after-cold-compact")
+        let send = Task {
+            await fixture.coordinator.sendCodexNativeMessage(
+                session: fixture.session, text: "continue", attachments: []
+            )
+        }
+        addTeardownBlock {
+            send.cancel()
+            _ = await send.value
+        }
+        // Synthetic routing left no live app connection, so the ordinary send must rebind.
+        try await waitForPendingStart(fixture)
+        XCTAssertEqual(fixture.factory.controllers.count, 3)
+        let sendController = try XCTUnwrap(fixture.factory.controllers.last)
+        XCTAssertEqual(sendController.receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(sendController.startedTurnCount, 0)
+        try await MCPRoutingWaiter.shared.notifyRouted(runID: XCTUnwrap(fixture.session.runID))
+        let sendOutcome = await send.value
+        XCTAssertTrue(sendOutcome.didSend)
+        XCTAssertEqual(sendController.startedTurnCount, 1)
+        XCTAssertEqual(sendController.compactCount, 0)
+        assertOldTuple(fixture.session)
+    }
+
+    /// Routing is synthetic; assert pending-policy cleanup rather than live socket admission.
+    func testColdResumeFailureAfterRoutedCleansOnlyItsOwnedStartup() async throws {
+        for superseded in [false, true] {
+            let gate = TestReleaseFence(name: "routed compact resume failure")
+            let fixture = makeFixture([[.routedThenResumeFailure(gate)]])
+            fixture.session.runState = .idle
+            addTeardownBlock { @MainActor in
+                let runID = fixture.session.runID
+                await fixture.coordinator.shutdownCodexSession(fixture.session)
+                if let runID, let clientName = AgentProviderKind.codexExec.mcpClientNameHint {
+                    await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                        for: clientName, windowID: 1, runID: runID
+                    )
+                    await MCPRoutingWaiter.shared.cleanup(runID: runID)
+                }
+            }
+            let compact = Task {
+                await fixture.coordinator.startOversightCompaction(
+                    session: fixture.session,
+                    expectedThreadID: Self.oldThreadID,
+                    isStillAdmissible: { true }
+                )
+            }
+            addTeardownBlock {
+                compact.cancel()
+                gate.release()
+                _ = await compact.value
+            }
+            let entered = await gate.waitUntilEntered(timeout: 4)
+            XCTAssertTrue(entered)
+            let controller = try XCTUnwrap(fixture.factory.controllers.first)
+            let runID = try XCTUnwrap(fixture.session.runID)
+            let successor = WedgeFakeCodexController(runID: runID, responses: [])
+            if superseded {
+                fixture.session.beginRunAttempt(source: "compact-successor")
+                fixture.session.codexController = successor
+                try await ServerNetworkManager.shared.installClientConnectionPolicy(
+                    for: XCTUnwrap(AgentProviderKind.codexExec.mcpClientNameHint),
+                    windowID: 1, restrictedTools: [], tabID: fixture.session.tabID,
+                    runID: runID, purpose: .agentModeRun, requiresExpectedAgentPID: true
+                )
+            }
+            let attemptBeforeFailure = fixture.session.activeRunAttemptID
+            let itemsBeforeFailure = fixture.session.items.count
+            gate.release()
+            let outcome = await compact.value
+            try await AsyncTestWait.waitUntil("failed compact controller retired", timeout: 4) {
+                controller.shutdownCount == 1
+            }
+            let pendingPolicyRemains = await hasPendingPolicy(for: runID)
+            XCTAssertEqual(pendingPolicyRemains, superseded)
+            if superseded {
+                XCTAssertEqual(fixture.session.codexController.map(ObjectIdentifier.init), ObjectIdentifier(successor))
+                XCTAssertEqual(successor.shutdownCount, 0)
+                XCTAssertEqual(fixture.session.items.count, itemsBeforeFailure)
+            } else {
+                XCTAssertNil(fixture.session.codexController)
+            }
+            XCTAssertEqual(fixture.factory.controllers.count, 1)
+            XCTAssertEqual(controller.receivedExistingIDs, [Self.oldThreadID])
+            XCTAssertEqual(outcome, .notStarted)
+            XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
+            XCTAssertEqual(controller.startedTurnCount, 0)
+            XCTAssertEqual(controller.compactCount, 0)
+            XCTAssertEqual(fixture.session.runState, .idle)
+            XCTAssertEqual(fixture.session.activeRunAttemptID, attemptBeforeFailure)
+            assertOldTuple(fixture.session)
+        }
+    }
+
     private func waitForPendingStart(_ fixture: Fixture) async throws {
         try await AsyncTestWait.waitUntil("Codex start staged", timeout: 4) {
             fixture.coordinator.test_hasPendingCodexStart(for: fixture.session)
@@ -660,6 +821,8 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
     enum Response {
         case timeout
         case discoveryFailure
+        case policyRequiredResume
+        case routedThenResumeFailure(TestReleaseFence)
         case missingRollout
         case suspendedSuccess(String, TestReleaseFence)
         case success(String)
@@ -671,6 +834,7 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
     private var existingIDs: [String?] = []
     private var active = false
     private var turnCount = 0
+    private var compactions = 0
     private var shutdowns = 0
     private let continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
     let events: AsyncStream<CodexNativeSessionController.Event>
@@ -693,6 +857,10 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
 
     var startedTurnCount: Int {
         lock.withLock { turnCount }
+    }
+
+    var compactCount: Int {
+        lock.withLock { compactions }
     }
 
     var shutdownCount: Int {
@@ -725,6 +893,25 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
                 message: "Failed to initialize session: required MCP servers failed to initialize: RepoPromptCE: Tool catalog not ready. Please retry.",
                 data: nil
             ))
+        case let .routedThenResumeFailure(gate):
+            await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+            await gate.enterAndWait()
+            throw CodexAppServerClient.ClientError.requestFailed(.init(
+                method: "thread/resume",
+                code: -32603,
+                message: "Non-timeout resume failure after routing",
+                data: nil
+            ))
+        case .policyRequiredResume:
+            guard let clientName = AgentProviderKind.codexExec.mcpClientNameHint else {
+                throw CodexAppServerClient.ClientError.invalidResponse
+            }
+            let policies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: clientName)
+            guard policies.contains(where: { $0.runID == runID && $0.purpose == .agentModeRun }),
+                  let existing
+            else { throw CodexAppServerClient.ClientError.invalidResponse }
+            lock.withLock { active = true }
+            return existing
         case .missingRollout:
             throw CodexAppServerClient.ClientError.requestFailed(.init(
                 method: "thread/resume",
@@ -766,6 +953,10 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
             return turnCount
         }
         return CodexTurnStartReceipt(provisionalSubmissionID: "fake-turn-\(count)")
+    }
+
+    func compactThread() async throws {
+        lock.withLock { compactions += 1 }
     }
 
     func shutdown() async {
