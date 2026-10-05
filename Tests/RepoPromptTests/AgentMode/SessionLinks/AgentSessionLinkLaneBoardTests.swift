@@ -419,11 +419,13 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         defer { withExtendedLifetime(workspaceManager) {} }
         let parent = viewModel.session(for: tabID)
         let parentID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(parent))
-        let target = try candidate(
-            tabID: tabID,
-            sessionID: parentID,
-            workspaceID: XCTUnwrap(workspaceManager.activeWorkspace?.id)
-        )
+        let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
+            tabID: tabID, sessionID: parentID, tabName: "Parent", isWindowClosing: false
+        ))
+        let staleTarget = candidate(tabID: tabID, sessionID: parentID, workspaceID: target.workspaceID)
+        XCTAssertNil(viewModel.agentSessionLinkInstallObservation(for: staleTarget) {
+            XCTFail("A stale incarnation must not observe this parent's board")
+        })
         let child = AgentModeViewModel.TabSession(tabID: UUID())
         child.parentSessionID = parentID
         child.runState = .running

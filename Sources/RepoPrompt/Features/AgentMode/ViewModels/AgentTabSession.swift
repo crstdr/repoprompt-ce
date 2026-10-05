@@ -1511,6 +1511,13 @@ final class AgentTabSession: ObservableObject {
         return bindingTransitionGeneration
     }
 
+    /// Ordinary mount takes custody of the management incarnation, without claiming hydration.
+    func adoptManagementBinding(_ binding: AgentPersistentSessionBindingIdentity, transitionGeneration: UInt64) {
+        precondition(persistentSessionBindingIdentity == nil)
+        bindingTransitionGeneration = transitionGeneration
+        installPersistentSessionBinding(binding)
+    }
+
     func installPersistentSessionBinding(_ binding: AgentPersistentSessionBindingIdentity?) {
         precondition(binding == nil || binding?.tabID == tabID)
         persistentSessionBindingIdentity = binding
