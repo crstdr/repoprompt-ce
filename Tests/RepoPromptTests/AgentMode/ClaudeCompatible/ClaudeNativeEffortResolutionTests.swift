@@ -300,6 +300,72 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
     }
 
     @MainActor
+    func testColdClaudeControlsDoNotSaveBeforeHydrationAndAdoptionPreservesContent() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rpce-claude-cold-effort-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        defer {
+            WindowStatesManager.shared.unregisterWindowState(window)
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        }
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Cold Claude effort", repoPaths: [root.path], ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "coldClaudeEffortTests")
+        let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+        let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+        let viewModel = window.agentModeViewModel
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = "claude-opus-5-5"
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer {
+            viewModel.test_setCurrentTabIDOverride(nil)
+            session.saveDebounceTask?.cancel()
+        }
+        session.saveDebounceTask?.cancel()
+        session.hasLoadedPersistedState = false
+        session.selectedClaudeEffortRaw = nil
+        session.isDirty = false
+        var saves: [AgentSession] = []
+        viewModel.test_setAgentSessionSaver { saved, _, _ in
+            saves.append(saved)
+            return root.appendingPathComponent("session.json")
+        }
+        let settings = AgentProviderPermissionsSettingsViewModel(
+            bindingService: viewModel.providerBindingService,
+            claudeEffortLevelProvider: { viewModel.claudeCoordinator.currentClaudeEffortLevel(for: session) }
+        )
+        let expected = viewModel.providerBindingService.claudeEffortLevel(
+            forModelRaw: session.selectedModelRaw, agentKind: session.selectedAgent
+        )
+        XCTAssertEqual(settings.controlsBinding(for: .claude)?.claudeTools?.effortLevel, expected)
+        await viewModel.flushSave(for: tabID)
+        XCTAssertTrue(saves.isEmpty, "Projecting cold controls must not persist an incomplete existing conversation")
+        XCTAssertNil(session.selectedClaudeEffortRaw, "Default adoption waits for authoritative hydration")
+
+        // Commit the authoritative payload before restoring the legacy effort, as hydration does.
+        session.setItemsSilently([.user("Existing conversation")], reason: .persistedSessionHydration)
+        session.providerSessionID = "existing-provider-session"
+        session.hasLoadedPersistedState = true
+        viewModel.restoreClaudeEffort(from: AgentSession(id: sessionID, name: "Legacy conversation"), to: session)
+        await viewModel.flushSave(for: tabID)
+        XCTAssertEqual(saves.count, 1)
+        let saved = try XCTUnwrap(saves.last)
+        XCTAssertEqual(saved.id, sessionID)
+        XCTAssertEqual(saved.agentReasoningEffort, expected.rawValue)
+        XCTAssertEqual(saved.providerSessionID, "existing-provider-session")
+        XCTAssertEqual(saved.toLiveItems().map(\.text), ["Existing conversation"])
+    }
+
+    @MainActor
     func testMCPConfigurationPreservesClaudePinAndClearsItForUnpinnedModel() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rpce-claude-effort-\(UUID().uuidString)", isDirectory: true)

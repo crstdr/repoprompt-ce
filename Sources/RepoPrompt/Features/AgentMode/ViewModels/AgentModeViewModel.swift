@@ -5955,7 +5955,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         session.runState = payload.normalizedRunState
-        restoreClaudeEffort(from: agentSession, to: session)
         session.providerSessionID = agentSession.providerSessionID
         session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
@@ -5999,6 +5998,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // earned.
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.hasLoadedPersistedState = true
+        restoreClaudeEffort(from: agentSession, to: session)
 
         let autoEditEnabled = agentSession.autoEditEnabled
         let tabID = session.tabID
