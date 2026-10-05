@@ -479,13 +479,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         Int
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
-    /// Management identity survives passive runtime eviction, not a workspace/binding retirement.
-    var agentSessionLinkManagementRecords: [UUID: (
-        identity: AgentSessionLifecycleAuthority.Identity,
-        metadata: AgentSessionIndexEntry,
-        autoWakePolicy: AgentSessionLinkAutoWakePolicy?
-    )] = [:]
-
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
             for tabID in oldValue.keys where sessions[tabID] == nil {
@@ -4956,7 +4949,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
 
-        if session.persistedLoadTask != nil || !session.hasLoadedPersistedState {
+        if !session.hasLoadedPersistedState {
             await loadSessionFromDisk(for: session)
         }
     }
@@ -5280,25 +5273,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             cancelPersistedLoad(for: session)
             removePendingUIRefresh(for: session.tabID)
         }
-        let adoption = sessions[session.tabID] == nil && previousSessionID == nil
-            ? agentSessionLinkManagementRecords[session.tabID] : nil
-        let binding: AgentPersistentSessionBindingIdentity?
-        if let adoption, adoption.identity.sessionID == sessionID,
-           adoption.identity.workspaceID == workspaceManager?.activeWorkspaceID,
-           explicitActiveSessionID(for: session.tabID) == sessionID,
-           let generation = adoption.identity.persistentBindingGeneration, let sessionID
-        {
-            let adopted = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: sessionID, generation: generation)
-            binding = adopted
-            session.adoptManagementBinding(adopted, transitionGeneration: adoption.identity.bindingTransitionGeneration)
-            session.oversight.autoWakePolicy = adoption.autoWakePolicy ?? AgentSessionLinkAutoWakePolicy()
-            agentSessionLinkManagementRecords[session.tabID]?.autoWakePolicy = nil
-        } else {
-            agentSessionLinkManagementRecords.removeValue(forKey: session.tabID)
-            _ = session.beginPersistentBindingTransition()
-            binding = sessionID.map { AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: $0) }
-            session.installPersistentSessionBinding(binding)
+        _ = session.beginPersistentBindingTransition()
+        let binding = sessionID.map {
+            AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: $0)
         }
+        session.installPersistentSessionBinding(binding)
         handleSidebarRefreshBindingMutation(
             tabID: session.tabID,
             sessionID: sessionID
@@ -5368,9 +5347,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         previousSessionID: UUID?,
         sessionID: UUID?
     ) {
-        if previousSessionID != nil {
-            agentSessionLinkManagementRecords.removeValue(forKey: tabID)
-        }
         NotificationCenter.default.post(
             name: .agentSessionBindingDidChange,
             object: self,
@@ -5701,17 +5677,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             }
         #endif
+        if session.hasLoadedPersistedState {
+            #if DEBUG
+                logLoadTask(outcome: "alreadyLoaded")
+            #endif
+            return
+        }
         if let persistedLoadTask = session.persistedLoadTask {
             Self.logCodexDebug("[AgentModeVM][PersistedLoad] join inflight tab=\(session.tabID)")
             await persistedLoadTask.value
             #if DEBUG
                 logLoadTask(outcome: "joinedExistingTask")
-            #endif
-            return
-        }
-        if session.hasLoadedPersistedState {
-            #if DEBUG
-                logLoadTask(outcome: "alreadyLoaded")
             #endif
             return
         }
@@ -5731,7 +5707,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 hydrationToken: hydrationToken,
                 startRevision: startRevision
             )
-            await agentSessionLinkRefreshRuntimePublications(for: session)
         }
         session.persistedLoadTask = persistedLoadTask
         defer {
@@ -6198,7 +6173,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let session = session(for: tabID)
 
         // Load persisted session if we haven't already.
-        if session.persistedLoadTask != nil || !session.hasLoadedPersistedState {
+        if !session.hasLoadedPersistedState {
             await loadSessionFromDisk(for: session)
         }
 
@@ -15337,12 +15312,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return issues
         }
         let orderedRuntimeCleanupTabIDs = orderedTabIDs.filter(runtimeCleanupTabIDs.contains)
-        for tabID in orderedRuntimeCleanupTabIDs
-            where agentSessionLinkManagementRecords[tabID]?.identity.workspaceID == workspaceID
-        {
-            agentSessionLinkManagementRecords.removeValue(forKey: tabID)
-            AgentSessionLinkInvalidationSink.bindingEnded(windowID: windowID, tabID: tabID, reason: .tabClosed)
-        }
         let capturedSessionsByTabID = Dictionary(
             uniqueKeysWithValues: orderedRuntimeCleanupTabIDs.map { ($0, sessions[$0]) }
         )
@@ -22595,7 +22564,6 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
     ) {
         switch reason {
         case .sessionIndex:
-            AgentSessionLinkCandidateReadinessSignal.didChange()
             rebuildAgentSessionLinkSubagentCensus()
             syncSidebarUIState(refresh: true, reason: .sessionIndex)
         case .sortDates:
