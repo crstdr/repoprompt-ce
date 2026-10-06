@@ -507,6 +507,21 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testActivationFenceRejectsLossOfInitiallyRegisteredWindow() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        let vm = window.agentModeViewModel
+        let admitted = try await vm.mcpPreflightResidentActivation(sessionID: sessionID)
+        let target = try XCTUnwrap(admitted)
+        XCTAssertNoThrow(try vm.mcpRequireResidentActivationFence(target))
+        WindowStatesManager.shared.unregisterWindowState(window)
+        XCTAssertThrowsError(try vm.mcpRequireResidentActivationFence(target))
+        XCTAssertFalse(vm.mcpResidentTargetIsCurrent(target))
+        XCTAssertNil(session.mcpControlContext)
+    }
+
     private func legacyExpiredValue(sessionID: UUID) -> Value {
         .object([
             "session_id": .string(sessionID.uuidString), "status": .string("expired"),

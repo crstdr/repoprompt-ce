@@ -7,6 +7,8 @@ import RepoPromptSettingsCore
 struct MCPResidentTarget {
     let session: AgentTabSession
     let endpoint: DomainAgentSessionLinkEndpointIdentity
+    /// Strong, action-scoped incarnation anchor. Absence at admission is not window loss.
+    let window: WindowState?
 }
 
 extension AgentModeViewModel {
@@ -32,15 +34,31 @@ extension AgentModeViewModel {
               !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID),
               workspaceManager?.activeWorkspaceID == endpoint.workspaceID
         else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
-        return MCPResidentTarget(session: session, endpoint: endpoint)
+        return MCPResidentTarget(
+            session: session,
+            endpoint: endpoint,
+            window: WindowStatesManager.shared.window(withID: endpoint.windowID)
+        )
     }
 
     func mcpResidentTargetIsCurrent(_ target: MCPResidentTarget) -> Bool {
-        guard let current = try? authoritativeLiveSession(for: target.endpoint.sessionID),
-              let window = WindowStatesManager.shared.window(withID: target.endpoint.windowID),
-              !window.isClosing, !WindowStatesManager.shared.isTerminating,
-              window.agentModeViewModel === self
+        // External resident access always requires an actual registered app window.
+        target.window != nil && mcpActivationTargetIsCurrent(target)
+    }
+
+    private func mcpActivationTargetIsCurrent(_ target: MCPResidentTarget) -> Bool {
+        guard !WindowStatesManager.shared.isTerminating,
+              target.endpoint.windowID == windowID,
+              let current = try? authoritativeLiveSession(for: target.endpoint.sessionID)
         else { return false }
+        let registered = WindowStatesManager.shared.window(withID: target.endpoint.windowID)
+        if let admittedWindow = target.window {
+            guard registered === admittedWindow, !admittedWindow.isClosing,
+                  admittedWindow.agentModeViewModel === self else { return false }
+        } else if registered != nil {
+            // Internal admission may start before UI registration, never against its successor.
+            return false
+        }
         return current === target.session && Self.isMCPResidentAppOwned(current)
             && !current.bindingTransitionInProgress
             && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target.endpoint.sessionID)
@@ -51,9 +69,16 @@ extension AgentModeViewModel {
 
     /// Mutation preflight only. A negative result is carried with the exact incarnation, never cached.
     func mcpPreflightResidentActivation(sessionID: UUID) async throws -> MCPResidentTarget? {
+        try await mcpPreflightResidentActivation(
+            sessionID: sessionID, admittedWindow: WindowStatesManager.shared.window(withID: windowID)
+        )
+    }
+
+    func mcpPreflightResidentActivation(sessionID: UUID, admittedWindow: WindowState?) async throws -> MCPResidentTarget? {
         // An unloaded runtime has not established persisted origin yet. Explicit adoption may
         // hydrate it; the shared preparation/activation fences requalify before any control action.
-        guard let target = try mcpResidentTarget(sessionID: sessionID), target.session.hasLoadedPersistedState else { return nil }
+        guard let resolved = try mcpResidentTarget(sessionID: sessionID), resolved.session.hasLoadedPersistedState else { return nil }
+        let target = MCPResidentTarget(session: resolved.session, endpoint: resolved.endpoint, window: admittedWindow)
         let hasLinks = await agentSessionLinkHasActiveOutboundLink(target.endpoint)
         try mcpRequireResidentActivationFence(target, authoritativeHasLinks: hasLinks)
         return target
@@ -64,7 +89,7 @@ extension AgentModeViewModel {
     func mcpRequireResidentActivationFence(
         _ target: MCPResidentTarget, authoritativeHasLinks: Bool = false
     ) throws {
-        guard mcpResidentTargetIsCurrent(target),
+        guard mcpActivationTargetIsCurrent(target),
               agentSessionLinkPromptInventoryHoldsByEndpoint[target.endpoint] == nil
         else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
         let published = agentSessionLinkPromptInventoryBySessionID[target.endpoint.sessionID]
