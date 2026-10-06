@@ -58,25 +58,60 @@ extension AgentModeViewModel {
     /// - Parameter isWindowClosing: the owning window's `isClosing` flag. A closing window's tabs are
     ///   never offered as endpoints.
     func agentSessionLinkCandidates(isWindowClosing: Bool) -> [AgentSessionLinkEndpointCandidate] {
-        guard let workspaceManager else { return [] }
-        var candidates: [AgentSessionLinkEndpointCandidate] = []
-        for workspace in workspaceManager.workspaces {
-            // Only the active workspace of this window has live tab bindings; a background
-            // workspace's tabs are persisted projections, not live endpoints.
-            guard workspace.id == workspaceManager.activeWorkspaceID else { continue }
-            for tab in workspace.composeTabs {
-                guard let sessionID = tab.activeAgentSessionID,
-                      let candidate = agentSessionLinkCandidate(
-                          tabID: tab.id,
-                          sessionID: sessionID,
-                          tabName: tab.name,
-                          isWindowClosing: isWindowClosing
-                      )
-                else { continue }
-                candidates.append(candidate)
-            }
+        guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else { return [] }
+        return workspace.composeTabs.compactMap { tab in
+            guard let sessionID = tab.activeAgentSessionID else { return nil }
+            return agentSessionLinkCandidate(
+                workspaceID: workspace.id, tabID: tab.id, sessionID: sessionID,
+                isWindowClosing: isWindowClosing, includeLocation: true
+            )
         }
-        return candidates
+    }
+
+    /// Fresh exact addressing shares the indexed model route, but keeps real presentation fields.
+    func agentSessionLinkCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        guard endpoint.windowID == windowID,
+              let candidate = agentSessionLinkCandidate(
+                  workspaceID: endpoint.workspaceID, tabID: endpoint.tabID,
+                  sessionID: endpoint.sessionID, isWindowClosing: false,
+                  includeLocation: includeLocation
+              ), candidate.domainEndpoint == endpoint else { return nil }
+        return candidate
+    }
+
+    func agentSessionLinkCandidates(
+        forSessionIDs sessionIDs: Set<UUID>, includeLocation: Bool
+    ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+        var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
+        guard let workspaceManager, let workspaceID = workspaceManager.activeWorkspaceID else { return result }
+        for sessionID in sessionIDs {
+            result[sessionID] = workspaceManager.oversightTabs(workspaceID: workspaceID, sessionID: sessionID)
+                .compactMap { tab in
+                    agentSessionLinkCandidate(
+                        workspaceID: workspaceID, tabID: tab.id, sessionID: sessionID,
+                        isWindowClosing: false, includeLocation: includeLocation
+                    )
+                }
+        }
+        return result
+    }
+
+    private func agentSessionLinkCandidate(
+        workspaceID: UUID, tabID: UUID, sessionID: UUID,
+        isWindowClosing: Bool, includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        guard let identity = agentSessionLinkModelIdentity(
+            workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
+        ), let session = sessions[tabID],
+        let tab = workspaceManager?.modelRoutingTab(workspaceID: workspaceID, tabID: tabID) else { return nil }
+        return agentSessionLinkCandidate(
+            session: session, identity: identity, tabName: tab.name,
+            providerDisplayName: session.selectedAgent.displayName,
+            isWindowClosing: isWindowClosing, includeLocation: includeLocation
+        )
     }
 
     // MARK: - Discovery epochs and lazy binding descriptors

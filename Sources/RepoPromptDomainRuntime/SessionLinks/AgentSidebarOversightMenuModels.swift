@@ -104,12 +104,12 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     /// that already hold an outbound link (the existing-overseer rule, enforced again at Add).
     package let observerOptions: [PeerOption]
     /// Oversee list: linked targets retained for unlinking, plus eligible target candidates.
-    /// Empty when the row cannot currently observe (see `observerIneligibleReason`).
+    /// Available choices are hidden when the row cannot currently observe.
     package let targetOptions: [PeerOption]
 
     /// Why the row cannot currently accept a new inbound link, or `nil` when it can.
     /// Rendered greyed-out in the Oversee-by menu instead of hiding the menu.
-    package let targetIneligibleReason: String?
+    package var targetIneligibleReason: String?
     /// Why the row cannot currently observe other sessions, or `nil` when it can. Includes
     /// the persistence blocker (it wins over lifecycle eligibility, matching `canAddReason`).
     package var observerIneligibleReason: String?
@@ -132,7 +132,8 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     }
 
     package var availableObservers: [ObserverOption] {
-        observerOptions.filter { $0.relationship == .available }
+        guard targetIneligibleReason == nil else { return [] }
+        return observerOptions.filter { $0.relationship == .available }
     }
 
     package var linkedTargets: [TargetOption] {
@@ -143,7 +144,8 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     }
 
     package var availableTargets: [TargetOption] {
-        targetOptions.filter { $0.relationship == .available }
+        guard observerIneligibleReason == nil else { return [] }
+        return targetOptions.filter { $0.relationship == .available }
     }
 
     /// True when the row's creator still holds an inbound link — the Overseen-by section
@@ -173,6 +175,18 @@ package struct AgentSidebarOversightMenuProps: Equatable {
 
     package var isEmpty: Bool {
         observerOptions.isEmpty && targetOptions.isEmpty
+    }
+
+    /// Refreshes only the subject's pure eligibility, retaining all peer choices for recovery.
+    /// No peer walk: linked actions, ordering and accessibility labels stay unchanged.
+    package func withSubjectEligibility(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSidebarOversightMenuProps {
+        var copy = self
+        copy.targetIneligibleReason = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)?.uiMessage
+        copy.observerIneligibleReason = AgentSessionLinkEndpointEligibility.addDisabledReason(
+            candidate.eligibilityInput,
+            roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+        )
+        return copy
     }
 
     /// Returns a copy whose observer-eligibility reason has been overlaid, used by

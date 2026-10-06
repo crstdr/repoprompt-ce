@@ -1026,6 +1026,14 @@ class WorkspaceManagerViewModel: ObservableObject {
                 },
                 uniquingKeysWith: { _, _ in [:] }
             )
+            oversightSessionTabIDs = Dictionary(
+                workspaces.map { workspace in
+                    (workspace.id, Dictionary(grouping: workspace.composeTabs.compactMap { tab in
+                        tab.activeAgentSessionID.map { ($0, tab.id) }
+                    }, by: { $0.0 }).mapValues { $0.map(\.1) })
+                },
+                uniquingKeysWith: { _, _ in [:] }
+            )
             refreshSelectionMirrorContextRevision()
             refreshAgentCreatorNameSource()
         }
@@ -1049,6 +1057,17 @@ class WorkspaceManagerViewModel: ObservableObject {
         bridge.noteCreatorNameSourceChanged(windowID: promptViewModel.windowID, sources: sources)
         if oldIdentities != newIdentities {
             bridge.noteTopologyMayHaveChanged()
+        }
+    }
+
+    /// Metadata addresses only: runtime eligibility and binding generations are never cached.
+    private var oversightSessionTabIDs: [UUID: [UUID: [UUID]]] = [:]
+
+    func oversightTabs(workspaceID: UUID, sessionID: UUID) -> [ComposeTabState] {
+        (oversightSessionTabIDs[workspaceID]?[sessionID] ?? []).compactMap { tabID in
+            guard let tab = modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
+                  tab.activeAgentSessionID == sessionID else { return nil }
+            return tab
         }
     }
 
