@@ -10,7 +10,7 @@ struct MCPResidentTarget {
 }
 
 extension AgentModeViewModel {
-    static let mcpResidentWaitError = "App-owned sessions do not support MCP waits. Use agent_run.steer with wait=false, agent_run.poll for status, and agent_manage.get_log for replies."
+    static let mcpResidentWaitError = "App-owned sessions do not support message-and-wait. Use agent_run.steer with wait=false, agent_run.poll for status, and agent_manage.get_log for replies."
     static let mcpResidentTargetError = "The session target changed or is not ready. Resolve it again before retrying."
     static let mcpResidentBusyError = "Client task input was not submitted because the session is busy or changing. Use agent_run.poll before retrying."
     static let mcpResidentProtectedError = "Client task input was not submitted. Resolve the protected prompt in the app, then retry agent_run.steer."
@@ -20,8 +20,10 @@ extension AgentModeViewModel {
         session.parentSessionID == nil && !session.isMCPOriginated && session.mcpControlContext == nil
     }
 
-    func mcpResidentTarget(sessionID: UUID) throws -> MCPResidentTarget? {
-        guard let session = try authoritativeLiveSession(for: sessionID), Self.isMCPResidentAppOwned(session) else {
+    func mcpResidentTarget(sessionID: UUID, requiringLoadedState: Bool = false) throws -> MCPResidentTarget? {
+        guard let session = try authoritativeLiveSession(for: sessionID), Self.isMCPResidentAppOwned(session),
+              !requiringLoadedState || session.hasLoadedPersistedState
+        else {
             return nil
         }
         guard let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),

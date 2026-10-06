@@ -1045,8 +1045,7 @@ struct AgentRunMCPToolService {
             agentModeVM: agentModeVM,
             metadata: metadata
         )
-        if let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID) {
-            guard forcePoll else { throw MCPError.invalidParams(AgentModeViewModel.mcpResidentWaitError) }
+        if forcePoll, let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID, requiringLoadedState: true) {
             let (snapshot, overseer) = try await residentPoll(
                 resident, targetWindow: targetWindow, agentModeVM: agentModeVM, metadata: metadata
             )
@@ -1091,10 +1090,6 @@ struct AgentRunMCPToolService {
             agentModeVM: agentModeVM,
             metadata: metadata
         )
-
-        for sessionID in sessionIDs where try agentModeVM.mcpResidentTarget(sessionID: sessionID) != nil {
-            throw MCPError.invalidParams(AgentModeViewModel.mcpResidentWaitError)
-        }
 
         // Single-element waits should preserve the existing single-session response shape.
         if sessionIDs.count == 1 {
@@ -1223,7 +1218,7 @@ struct AgentRunMCPToolService {
         var snapshots: [AgentRunMCPSnapshot] = []
         var overseers: [UUID: Value] = [:]
         for sessionID in sessionIDs {
-            if let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID) {
+            if let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID, requiringLoadedState: true) {
                 let (snapshot, overseer) = try await residentPoll(
                     resident, targetWindow: targetWindow, agentModeVM: agentModeVM, metadata: metadata
                 )

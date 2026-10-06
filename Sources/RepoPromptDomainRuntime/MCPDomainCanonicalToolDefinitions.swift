@@ -1252,7 +1252,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             if !description.contains(routerDescription) {
                 description += "\n\n\(routerDescription)"
             }
-            let residentDescription = " For resident app-owned top-level sessions, use steer, poll, and agent_manage.get_log without capture; MCP waits are unsupported."
+            let residentDescription = " For resident app-owned top-level sessions, use steer with wait=false, poll, and agent_manage.get_log without capture."
             if !description.contains(residentDescription) {
                 description += residentDescription
             }

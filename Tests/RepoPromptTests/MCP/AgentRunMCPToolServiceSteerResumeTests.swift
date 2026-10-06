@@ -46,7 +46,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let message = "</client_task> & \"not approval\""
         let value = try await service.execute(args: [
             "op": .string("steer"), "session_id": .string(sessionID.uuidString),
-            "message": .string(message), "wait": .bool(false)
+            "message": .string(message), "wait": .bool(false), "timeout_seconds": .int(0)
         ])
         let response = try await resumed.value
         let frame = AgentModeViewModel.mcpResidentTaskFrame(message)
@@ -72,7 +72,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertFalse(registered)
     }
 
-    func testResidentWaitRefusalsHappenBeforeSubmission() async throws {
+    func testResidentMessageAndWaitRefusesBeforeSubmission() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let sessionID = UUID()
@@ -80,14 +80,13 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let service = makeService(window: window)
         let count = session.items.count
         let cases: [[String: Value]] = [
-            ["op": .string("wait"), "session_id": .string(sessionID.uuidString), "timeout": .int(0)],
             ["op": .string("steer"), "session_id": .string(sessionID.uuidString), "message": .string("task"), "wait": .bool(true)],
             ["op": .string("steer"), "session_id": .string(sessionID.uuidString), "message": .string("task"), "timeout_seconds": .int(0)]
         ]
         for args in cases {
             do {
                 _ = try await service.execute(args: args)
-                XCTFail("resident waits must refuse")
+                XCTFail("resident message-and-wait must refuse")
             } catch {
                 XCTAssertTrue(String(describing: error).contains(AgentModeViewModel.mcpResidentWaitError))
             }
@@ -98,6 +97,71 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertEqual(zero.objectValue?["overseer"]?.objectValue?["lane_count"], .int(0))
         let many = try await service.execute(args: ["op": .string("poll"), "session_ids": .array([.string(sessionID.uuidString)])])
         XCTAssertEqual(many.objectValue?["snapshots"]?.arrayValue?.first?.objectValue?["overseer"]?.objectValue?["lane_count"], .int(0))
+    }
+
+    /// Pre-PR base 6d23fbcd: no control registration means the legacy terminal expired
+    /// snapshot, returned successfully before any timeout wait is enrolled.
+    func testResidentStandaloneWaitPreservesLegacyResult() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        let service = makeService(window: window)
+        let expected = legacyExpiredValue(sessionID: sessionID)
+        let itemCount = session.items.count
+        for timeout: Value? in [nil, .int(0), .int(30)] {
+            for target in [
+                "session_id": Value.string(sessionID.uuidString),
+                "session_ids": .array([.string(sessionID.uuidString)])
+            ] {
+                var args: [String: Value] = ["op": .string("wait"), target.key: target.value]
+                args["timeout"] = timeout
+                let result = try await service.execute(args: args)
+                XCTAssertEqual(withoutSnapshotTimestamps(result), expected)
+            }
+        }
+        let createdTab = await window.promptManager.createBackgroundComposeTab(strategy: .blank)
+        let laneTab = try XCTUnwrap(createdTab)
+        let secondID = UUID()
+        _ = try await makeWorkspaceOwnedSession(in: window, sessionID: secondID, tabID: laneTab.id)
+        let many = try await service.execute(args: [
+            "op": .string("wait"), "session_ids": .array([.string(sessionID.uuidString), .string(secondID.uuidString)]),
+            "timeout": .int(0)
+        ])
+        var expectedMany = try XCTUnwrap(expected.objectValue)
+        expectedMany["_meta"] = .object(["wait_result": .string("expired")])
+        expectedMany["wait"] = .object([
+            "mode": .string("any"), "result": .string("expired"), "winner_session_id": .null,
+            "session_ids": .array([.string(sessionID.uuidString), .string(secondID.uuidString)]),
+            "waited_count": .int(2), "pending_session_ids": .array([]), "instruction": .null
+        ])
+        XCTAssertEqual(withoutSnapshotTimestamps(many), .object(expectedMany))
+        XCTAssertEqual(session.items.count, itemCount)
+        XCTAssertNil(session.mcpControlContext)
+        XCTAssertFalse(session.isMCPOriginated)
+    }
+
+    func testColdResidentPollPreservesLegacySuccessShape() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.hasLoadedPersistedState = false
+        let service = makeService(window: window)
+        let expected = legacyExpiredValue(sessionID: sessionID)
+        let single = try await service.execute(args: ["op": .string("poll"), "session_id": .string(sessionID.uuidString)])
+        XCTAssertEqual(withoutSnapshotTimestamps(single), expected)
+        let many = try await service.execute(args: ["op": .string("poll"), "session_ids": .array([.string(sessionID.uuidString)])])
+        XCTAssertEqual(withoutSnapshotTimestamps(many), .object([
+            "poll": .object([
+                "mode": .string("many"), "session_ids": .array([.string(sessionID.uuidString)]),
+                "polled_count": .int(1), "interesting_session_ids": .array([.string(sessionID.uuidString)]),
+                "running_session_ids": .array([]), "terminal_session_ids": .array([.string(sessionID.uuidString)])
+            ]), "snapshots": .array([expected])
+        ]))
+        XCTAssertFalse(session.hasLoadedPersistedState)
+        XCTAssertNil(session.mcpControlContext)
+        XCTAssertFalse(session.isMCPOriginated)
     }
 
     func testReconstructedSteerAcceptsBeforeLaterBookkeepingFailure() async throws {
@@ -441,6 +505,26 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         _ = try await viewModel.mcpActivateControlContext(forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil)
         XCTAssertNotNil(session.mcpControlContext)
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
+    private func legacyExpiredValue(sessionID: UUID) -> Value {
+        .object([
+            "session_id": .string(sessionID.uuidString), "status": .string("expired"),
+            "transcript_item_count": .int(0),
+            "session": .object(["id": .string(sessionID.uuidString), "name": .null]),
+            "status_text": .string("This run/control/wait handle has expired. If the session still exists in the active workspace, you can usually continue it with `agent_run` using `op: \"steer\"`, the same `session_id`, and a new `message`. Use `op: \"start\"` only when you want a new session.")
+        ])
+    }
+
+    private func withoutSnapshotTimestamps(_ value: Value) -> Value {
+        guard var object = value.objectValue else { return value }
+        if object["session_id"] != nil {
+            XCTAssertNotNil(object.removeValue(forKey: "updated_at")?.stringValue)
+        }
+        if let snapshots = object["snapshots"]?.arrayValue {
+            object["snapshots"] = .array(snapshots.map(withoutSnapshotTimestamps))
+        }
+        return .object(object)
     }
 
     private func makeManageService(window: WindowState) -> AgentManageMCPToolService {
