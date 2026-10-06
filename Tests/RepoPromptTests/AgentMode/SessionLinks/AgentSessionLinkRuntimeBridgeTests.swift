@@ -7293,11 +7293,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await fulfillment(of: [completed], timeout: 4)
     }
 
-    func testSevenLinkedLanesAdmitOnlyOneOfTwoOverlappingCreators() async throws {
+    func testOneRemainingLaneSlotAdmitsOnlyOneOfTwoOverlappingCreators() async throws {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        for index in 0 ..< 7 {
+        for index in 0 ..< (AgentSessionLanePolicy.agentSessionLaneMaximumCount - 1) {
             let existing = makeCandidate(windowID: 20 + index)
             fixture.host.candidates.append(existing)
             fixture.host.laneProvenance[existing.domainEndpoint] = fixture.observer.sessionID
@@ -7319,7 +7319,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             first = await createLane(
                 fixture,
                 observerEndpoint: fixture.observer.domainEndpoint,
-                request: laneRequest(fixture, key: "seven-first")
+                request: laneRequest(fixture, key: "one-slot-first")
             )
             completed.fulfill()
         }
@@ -7327,7 +7327,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let second = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "seven-second")
+            request: laneRequest(fixture, key: "one-slot-second")
         )
         XCTAssertEqual(second.reason, .laneLimitReached)
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
@@ -7341,7 +7341,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         var firstLane: AgentSessionLinkEndpointCandidate?
-        for index in 0 ..< 8 {
+        for index in 0 ..< AgentSessionLanePolicy.agentSessionLaneMaximumCount {
             let lane = makeCandidate(windowID: 70 + index)
             if firstLane == nil {
                 firstLane = lane
@@ -7395,7 +7395,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let sibling = makeCandidate(windowID: 91, sessionID: fixture.observer.sessionID)
         fixture.host.candidates.append(sibling)
-        for index in 0 ..< 8 {
+        for index in 0 ..< AgentSessionLanePolicy.agentSessionLaneMaximumCount {
             let lane = makeCandidate(windowID: 100 + index)
             fixture.host.candidates.append(lane)
             fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
@@ -7419,7 +7419,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        for index in 0 ..< 7 {
+        for index in 0 ..< (AgentSessionLanePolicy.agentSessionLaneMaximumCount - 1) {
             let lane = makeCandidate(windowID: 120 + index)
             fixture.host.candidates.append(lane)
             fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
@@ -7491,7 +7491,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        for index in 0 ..< 6 {
+        for index in 0 ..< (AgentSessionLanePolicy.agentSessionLaneMaximumCount - 2) {
             let lane = makeCandidate(windowID: 140 + index)
             fixture.host.candidates.append(lane)
             fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
@@ -7524,7 +7524,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let second = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "eighth")
+            request: laneRequest(fixture, key: "last-slot")
         )
         XCTAssertEqual(second.result, .created)
         XCTAssertEqual(fixture.host.laneCreationCount, 2)
