@@ -1,5 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import XCTest
 
 /// Pins how often the jj backend snapshots the working copy.

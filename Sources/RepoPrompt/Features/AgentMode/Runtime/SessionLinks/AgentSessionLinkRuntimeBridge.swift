@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 // The process-wide runtime bridge between the MCP tool surface, the domain link authority, and
 // every window's live sessions.
@@ -3990,10 +3991,7 @@ final class AgentSessionLinkRuntimeBridge {
         // Keyed by exact incarnation. A `[sessionID: candidate]` map with first-wins uniquing picks
         // an arbitrary incarnation when one session UUID is live in two windows, which would source
         // outbound status/provider/location and inbound names from the wrong one.
-        let byEndpoint = Dictionary(
-            candidates.map { ($0.domainEndpoint, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
+        let candidateIndex = AgentSidebarOversightMenuProjection.CandidateIndex(candidates)
         let rebuilt: [AgentSessionLinkEndpointCandidate] = switch scope {
         case .full:
             candidates
@@ -4003,8 +4001,7 @@ final class AgentSessionLinkRuntimeBridge {
         for candidate in rebuilt {
             let projection = await makeProjection(
                 for: candidate,
-                candidates: candidates,
-                candidatesByEndpoint: byEndpoint
+                candidateIndex: candidateIndex
             )
             host.agentSessionLinkPublishProjection(projection.props, to: candidate.domainEndpoint)
             // Both projections are built from one authority read, but only the pill is published
@@ -4047,8 +4044,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func makeProjection(
         for candidate: AgentSessionLinkEndpointCandidate,
-        candidates: [AgentSessionLinkEndpointCandidate],
-        candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate]
+        candidateIndex: AgentSidebarOversightMenuProjection.CandidateIndex
     ) async -> EndpointProjection {
         // Endpoint-scoped on every axis, read in one authority turn: a second live incarnation of
         // this session UUID owns neither these outbound grants nor these inbound observers nor these
@@ -4057,23 +4053,28 @@ final class AgentSessionLinkRuntimeBridge {
         let monitor = await makeMonitorProjection(
             for: candidate,
             inputs: inputs,
-            candidates: candidates,
-            candidatesByEndpoint: candidatesByEndpoint,
+            candidateIndex: candidateIndex,
             collectsStatusSamples: true
         )
         // Reconciled here rather than inside the row builder, because this is the only pass that is
         // authoritative about membership *and* status at once.
+        // One post-await snapshot serves both eligibility and app-wide UUID uniqueness. Empty,
+        // unrelated chats need neither. Do not share this freshness-sensitive snapshot across hops.
+        let needsFreshCandidates = passiveNoticesByObserver[candidate.domainEndpoint] != nil
+            || !monitor.statusSamples.isEmpty || !inputs.outbound.items.isEmpty
+        let freshCandidates = needsFreshCandidates ? host?.agentSessionLinkCandidates() ?? [] : []
         let passiveNotices = reconcilePassiveNotices(
             for: candidate,
             samples: monitor.statusSamples,
-            linkSetRevision: inputs.outbound.linkSetRevision
+            linkSetRevision: inputs.outbound.linkSetRevision,
+            currentCandidate: freshCandidates.first { $0.domainEndpoint == candidate.domainEndpoint }
         )
         return EndpointProjection(
             props: monitor.props,
             // Built from the authority inventory, not from the UI rows: those substitute a live
             // candidate's name and status when the grant carries none, and neither substitution may
             // leak into agent-facing prompt text.
-            promptInventory: laneAnnotatedPromptInventory(inputs.outbound),
+            promptInventory: laneAnnotatedPromptInventory(inputs.outbound, freshCandidates: freshCandidates),
             passiveNotices: passiveNotices
         )
     }
@@ -4082,8 +4083,17 @@ final class AgentSessionLinkRuntimeBridge {
     func laneAnnotatedPromptInventory(
         _ inventory: DomainAgentSessionLinkInventory
     ) -> AgentSessionLinkPromptInventory {
-        let candidates = host?.agentSessionLinkCandidates() ?? []
-        let bySessionID = Dictionary(grouping: candidates, by: \.sessionID)
+        guard !inventory.items.isEmpty else { return AgentSessionLinkPromptInventory(inventory) }
+        return laneAnnotatedPromptInventory(inventory, freshCandidates: host?.agentSessionLinkCandidates() ?? [])
+    }
+
+    /// Called synchronously with a snapshot read after this endpoint's final authority hop.
+    private func laneAnnotatedPromptInventory(
+        _ inventory: DomainAgentSessionLinkInventory,
+        freshCandidates: [AgentSessionLinkEndpointCandidate]
+    ) -> AgentSessionLinkPromptInventory {
+        guard !inventory.items.isEmpty else { return AgentSessionLinkPromptInventory(inventory) }
+        let bySessionID = Dictionary(grouping: freshCandidates, by: \.sessionID)
         return AgentSessionLinkPromptInventory(inventory) { targetID in
             guard let matches = bySessionID[targetID], matches.count == 1 else { return false }
             return host?.agentSessionLinkLaneProvenance(for: matches[0].domainEndpoint)
@@ -4108,12 +4118,12 @@ final class AgentSessionLinkRuntimeBridge {
     private func makeMonitorProjection(
         for candidate: AgentSessionLinkEndpointCandidate,
         inputs: DomainAgentSessionLinkEndpointProjectionInputs,
-        candidates: [AgentSessionLinkEndpointCandidate],
-        candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate],
+        candidateIndex: AgentSidebarOversightMenuProjection.CandidateIndex,
         collectsStatusSamples: Bool = false
     ) async -> MonitorProjection {
         let sessionID = candidate.sessionID
         let endpoint = candidate.domainEndpoint
+        let candidatesByEndpoint = candidateIndex.byEndpoint
 
         var outbound: [AgentMonitorPillProps.Outbound] = []
         var statusSamples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
@@ -4210,7 +4220,7 @@ final class AgentSessionLinkRuntimeBridge {
             sidebarOversightMenu: AgentSidebarOversightMenuProjection.make(
                 target: candidate,
                 inputs: inputs,
-                candidates: candidates,
+                candidateIndex: candidateIndex,
                 createdByLabel: host?.agentSessionLinkLaneCreatorLabel(for: endpoint)
             ),
             outbound: outbound,
@@ -4504,7 +4514,7 @@ final class AgentSessionLinkRuntimeBridge {
         forExactObserverEndpoints endpoints: Set<DomainAgentSessionLinkEndpointIdentity>
     ) async {
         for observer in endpoints {
-            guard !isFrozenForTermination, monitorProjectionEndpointIsLive(observer) else { continue }
+            guard !isFrozenForTermination else { continue }
             let inputs = await authority.projectionInputs(forEndpoint: observer)
             guard !isFrozenForTermination, let host else { return }
             // One candidate read after the hop backs both the observer's own revalidation and the
@@ -4513,18 +4523,14 @@ final class AgentSessionLinkRuntimeBridge {
             guard let candidate = candidates.first(where: { $0.domainEndpoint == observer }) else {
                 continue
             }
-            let byEndpoint = Dictionary(
-                candidates.map { ($0.domainEndpoint, $0) },
-                uniquingKeysWith: { first, _ in first }
-            )
+            let candidateIndex = AgentSidebarOversightMenuProjection.CandidateIndex(candidates)
             // Rows only: `statusSamples` are deliberately dropped here. Location, Seen, settings,
             // sidebar-menu, and observer-role repaints are not authoritative status observations;
             // presentation work cannot queue a notice or trigger Auto-wake.
             let monitor = await makeMonitorProjection(
                 for: candidate,
                 inputs: inputs,
-                candidates: candidates,
-                candidatesByEndpoint: byEndpoint
+                candidateIndex: candidateIndex
             )
             host.agentSessionLinkPublishProjection(monitor.props, to: observer)
         }
@@ -5182,7 +5188,8 @@ final class AgentSessionLinkRuntimeBridge {
     private func reconcilePassiveNotices(
         for candidate: AgentSessionLinkEndpointCandidate,
         samples: [AgentSessionLinkPassiveStatusNotices.Sample],
-        linkSetRevision: UInt64
+        linkSetRevision: UInt64,
+        currentCandidate current: AgentSessionLinkEndpointCandidate?
     ) -> AgentSessionLinkPassiveStatusNotices.Snapshot? {
         let endpoint = candidate.domainEndpoint
         let existing = passiveNoticesByObserver[endpoint]
@@ -5192,8 +5199,8 @@ final class AgentSessionLinkRuntimeBridge {
         // a suppression that landed during the hop has nothing else to catch it — and an observer that
         // cannot be told anything must stop accumulating rather than keep a backlog. Fails closed: an
         // endpoint that vanished during the hop is not deliverable.
-        let current = host?.agentSessionLinkCandidates()
-            .first { $0.domainEndpoint == endpoint }
+        // The caller supplies the fresh post-hop exact candidate; nil is an authoritative absence,
+        // never a request to reconstruct candidates or reuse the pre-hop presentation snapshot.
         let deliverable = current.map(Self.passiveDeliveryIsPermitted) ?? false
         var notices = existing
             ?? AgentSessionLinkPassiveStatusNotices(observerEndpoint: endpoint)
@@ -7188,10 +7195,12 @@ final class AgentSessionLinkRuntimeBridge {
                     modelID, availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID)
                 )
             } else {
-                // Preserve the existing role/default behavior. Explicit selections never warm.
+                // Role/default selections retain persisted-catalog warming. Explicit selections never warm.
                 await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
                 selection = try AgentSessionLanePolicy.resolveRole(
-                    request.role, availability: .current, workspaceID: destination.workspaceID
+                    request.role,
+                    availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID),
+                    workspaceID: destination.workspaceID
                 )
             }
         } catch { return .refused(request.modelID == nil ? .roleUnavailable : .modelUnavailable) }
