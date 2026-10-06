@@ -9979,6 +9979,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
         }
+        let releaseComputerUseAdmission = session.holdCodexComputerUseAdmission()
+        defer { releaseComputerUseAdmission() }
         if requireInactiveRunState, session.runState.isActive {
             throw MCPError.invalidParams(
                 "The requested agent session is already running and cannot be reactivated for inactive MCP control."
@@ -10014,6 +10016,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 cleanupSessionStore: true
             )
         }
+        try mcpRequireActivationOwnerFence(residentActivationTarget, session: session)
+        try MCPAgentRunStartExecutionScope.current?.checkAdmission()
+        await codexCoordinator.revokeCodexComputerUse(session: session, reason: "mcp-control")
         try mcpRequireActivationOwnerFence(residentActivationTarget, session: session)
         try MCPAgentRunStartExecutionScope.current?.checkAdmission()
         session.mcpControlCleanupTask?.cancel()
@@ -17616,6 +17621,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard stopFence?.permitsStart(of: session) ?? true else {
             return .blocked(message: "This scheduled run was cancelled by Stop.")
         }
+        if nativePreparedTurn?.shouldEnableCodexComputerUse == true || session.pendingCodexComputerUseActivation != nil || session.codexControllerFeatureState?.computerUseEnabled == true {
+            guard isLocalComposerInput, managedTurn == nil, codexAttemptID == nil else {
+                return .blocked(message: "Computer Use accepts only local-user input for the existing operation.")
+            }
+        }
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
         // Composer claims preserve the exact raw snapshot separately from provider-normalized text.
         // A managed cross-session steer has no composer draft and must never restore one: an empty
@@ -17842,7 +17852,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 optimisticUserItemID: userItem.id,
                 origin: codexAttemptID.map(TabSession.CodexFallbackOrigin.mcp) ?? .manual,
                 dispatchTicket: dispatchTicket,
-                stopFence: producerStopFence
+                stopFence: producerStopFence,
+                isLocalUserInput: isLocalComposerInput && managedTurn == nil && codexAttemptID == nil
             )
             // The exact run a managed steer was classified to steer. If it settles before dispatch,
             // the steer is withdrawn rather than becoming a new turn outside the durable idle path.
@@ -19535,7 +19546,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 optimisticUserItemID: context.optimisticUserItemID,
                 origin: context.origin,
                 dispatchTicket: context.dispatchTicket,
-                stopFence: context.stopFence ?? stopFence
+                stopFence: context.stopFence ?? stopFence,
+                isLocalUserInput: context.isLocalUserInput
             )
         }
 

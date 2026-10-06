@@ -3,6 +3,7 @@ import RepoPromptSettingsCore
 
 extension Notification.Name {
     static let codexGoalSupportDidChange = Notification.Name("RepoPrompt.codexGoalSupportDidChange")
+    static let codexComputerUseDidChange = Notification.Name("RepoPrompt.codexComputerUseDidChange")
 }
 
 private enum CodexNativeFeatureGate: Hashable {
@@ -130,10 +131,33 @@ enum CodexGoalSupport {
 
 enum CodexComputerUseWorkflow {
     static let commandName = "computer-use"
-    static let disabledMessage = "Codex computer-use is currently disabled in RepoPrompt because it requires additional computer permissions/accessibility setup."
+    static let disabledMessage = "Computer Use is turned off. Enable Computer Use in Codex Direct Agent permissions, then submit /computer-use. macOS permissions must be granted manually."
+    static let unavailableMessage = "Computer Use requires the installed SkyComputerUseClient companion from Codex or ChatGPT. No companion is available; this turn cannot use computer-use tools."
+    static let collisionMessage = "Computer Use cannot start because the RepoPrompt-owned Codex runtime already contains a reserved 'computer-use' MCP entry. Review and manually remove or rename that entry in the owned runtime configuration, then retry. RepoPrompt will not rewrite it or import personal Codex configuration."
+    static let ineligibleMessage = "Computer Use is only available in user-created, top-level native Codex sessions without MCP control or active session links."
 
+    @MainActor
     static var isEnabled: Bool {
-        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: false)
+        GlobalSettingsStore.shared.codexComputerUseEnabled()
+    }
+
+    static func isEnabled(defaults: UserDefaults) -> Bool {
+        CodexNativeFeatureGate.computerUse.isEnabled(defaults: defaults)
+    }
+
+    static func isEnabled(persistedValue: Bool?) -> Bool {
+        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: persistedValue)
+    }
+
+    static func setEnabled(_ value: Bool, defaults: UserDefaults = .standard) {
+        let oldValue = isEnabled(defaults: defaults)
+        CodexNativeFeatureGate.computerUse.setEnabled(value, defaults: defaults)
+        postDidChangeIfNeeded(previousValue: oldValue, currentValue: isEnabled(defaults: defaults))
+    }
+
+    static func postDidChangeIfNeeded(previousValue: Bool, currentValue: Bool) {
+        guard currentValue != previousValue else { return }
+        NotificationCenter.default.post(name: .codexComputerUseDidChange, object: nil)
     }
 
     #if DEBUG
@@ -164,7 +188,7 @@ enum CodexComputerUseWorkflow {
         <computer_use_workflow>
         The user explicitly requested a Codex computer-use workflow in RepoPrompt Agent Mode.
 
-        Use Codex's computer-use, tool-search, plugin, and MCP tools only when they are available in this session. If exact computer-use tool names are not already visible, use tool search first; useful searches include "computer use", "browser", "screen", "click", "type", or app/site-specific terms from the user's request. If no computer-use tools are available, say so plainly and ask the user to enable or install the required Codex computer-use capability instead of hallucinating tool calls.
+        Use the installed computer-use companion's MCP tools only when they are available in this session. Do not install or enable plugins, browser integrations, or app connectors for this workflow. If exact computer-use tool names are not already visible, use tool search first; useful searches include "computer use", "browser", "screen", "click", "type", or app/site-specific terms from the user's request. If no computer-use tools are available, say so plainly and ask the user to enable or install the required Codex computer-use capability instead of hallucinating tool calls.
 
         Safety requirements:
         - Clarify missing target app/site/account, destination, credentials, or intended action before operating.
