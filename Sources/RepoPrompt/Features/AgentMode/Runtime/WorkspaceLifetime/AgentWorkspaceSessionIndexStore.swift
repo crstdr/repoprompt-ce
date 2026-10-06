@@ -1,6 +1,178 @@
 import Foundation
 import RepoPromptInstrumentation
 
+enum AgentSidebarDateSectionBucket: CaseIterable, Hashable, Identifiable {
+    case today
+    case yesterday
+    case previous
+
+    var id: Self {
+        self
+    }
+
+    var title: String {
+        switch self {
+        case .today:
+            "Today"
+        case .yesterday:
+            "Yesterday"
+        case .previous:
+            "Previous"
+        }
+    }
+
+    static func bucket(
+        for date: Date,
+        relativeTo now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> AgentSidebarDateSectionBucket {
+        let clampedDate = min(date, now)
+        let todayStart = calendar.startOfDay(for: now)
+        let dateStart = calendar.startOfDay(for: clampedDate)
+        if dateStart == todayStart {
+            return .today
+        }
+        if let yesterdayStart = calendar.date(byAdding: .day, value: -1, to: todayStart),
+           calendar.isDate(dateStart, inSameDayAs: yesterdayStart)
+        {
+            return .yesterday
+        }
+        return .previous
+    }
+}
+
+/// Settlement of the selected tab's restoration, derived from the same presentation records and loader
+/// exits as the pane (§5.5 selected side). Read-only; shared with the sidebar baseline join.
+enum AgentSelectedRestorationSettlement: Equatable {
+    enum Reason: Equatable {
+        case payloadApplied
+        case fresh
+        case unbound
+        case missing
+        case loadFailed
+        case persistenceSuppressed
+        case interrupted
+        case localStateReclassified
+        case noSelection
+        case workspaceUnavailable
+    }
+
+    case pending
+    case settled(Reason)
+}
+
+/// Store-owned sidebar restoration baseline (§5.2): captured once per index owner from persisted
+/// metadata only, then extended by admission. While it exists it alone decides row placement and date
+/// headings; it is never persisted and holds no session or live/index dates.
+struct AgentSidebarRestoreBaseline: Equatable {
+    struct Entry: Equatable {
+        let ordinal: Int
+        let persistedLastModified: Date
+        let bucket: AgentSidebarDateSectionBucket
+    }
+
+    let owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner
+    let capturedAt: Date
+    let calendar: Calendar
+    private(set) var entries: [UUID: Entry] = [:]
+    /// Monotonic in-memory revision; consumers fingerprint it instead of the entries.
+    var revision: UInt64
+
+    init(
+        owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner,
+        capturedAt: Date,
+        calendar: Calendar,
+        orderedTabs: [ComposeTabState],
+        revision: UInt64 = 0
+    ) {
+        self.owner = owner
+        self.capturedAt = capturedAt
+        self.calendar = calendar
+        self.revision = revision
+        _ = admit(orderedTabs)
+    }
+
+    /// Bucket of `date` against the captured clock/calendar, so headings cannot relabel mid-restore.
+    func bucket(for date: Date) -> AgentSidebarDateSectionBucket {
+        .bucket(for: date, relativeTo: capturedAt, calendar: calendar)
+    }
+
+    /// Appends uncovered tabs in their given order without renumbering; returns whether coverage grew.
+    /// Removed rows keep their reservation, so a reappearing row returns to its original ordinal.
+    mutating func admit(_ tabs: [ComposeTabState]) -> Bool {
+        var admitted = false
+        for tab in tabs where entries[tab.id] == nil {
+            entries[tab.id] = Entry(
+                ordinal: entries.count,
+                persistedLastModified: tab.lastModified,
+                bucket: bucket(for: tab.lastModified)
+            )
+            admitted = true
+        }
+        return admitted
+    }
+}
+
+/// Two-sided restore join (§5.2/§5.5): the baseline is released only once the owner's index
+/// transaction and the initially selected restoration are both terminal.
+struct AgentSidebarRestoreJoin: Equatable {
+    enum IndexOutcome: Equatable {
+        case success
+        case skipped
+        case failed
+        case cancelled
+    }
+
+    enum DeferralReason: Equatable {
+        case agentModeInactive
+        case initialSystemDeferral
+    }
+
+    enum IndexSide: Equatable {
+        /// Awaiting the owner's refresh; `generation` is the existing refresh token once one started.
+        case pending(generation: UInt64?)
+        case deferred(DeferralReason)
+        /// Staged final metadata; the latest local overlay is applied at release.
+        case terminal(
+            generation: UInt64?,
+            outcome: IndexOutcome,
+            entries: [UUID: AgentSessionIndexEntry],
+            ready: Bool
+        )
+
+        var isTerminal: Bool {
+            if case .terminal = self { true } else { false }
+        }
+    }
+
+    enum SelectedReason: Equatable {
+        case restoration(AgentSelectedRestorationSettlement.Reason)
+        case selectionChanged
+        case bindingChanged
+        case notPresented
+    }
+
+    enum SelectedSide: Equatable {
+        case discovering
+        case waiting
+        case settled(SelectedReason)
+
+        var isSettled: Bool {
+            if case .settled = self { true } else { false }
+        }
+    }
+
+    /// The initially selected restoration target the selected side follows (never a later selection).
+    let initialTabID: UUID?
+    let initialBindingID: UUID?
+    var index: IndexSide
+    var selected: SelectedSide
+
+    var isReleasable: Bool {
+        index.isTerminal && selected.isSettled
+    }
+}
+
 /// Reasons the session-index state changed, used by the store to notify the
 /// delegate (the view model) so it can trigger sidebar UI sync.
 enum SessionIndexStateChangeReason {

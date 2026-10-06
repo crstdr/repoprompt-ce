@@ -1161,46 +1161,6 @@ private struct AgentSidebarDateSectionHeader: View {
     }
 }
 
-enum AgentSidebarDateSectionBucket: CaseIterable, Hashable, Identifiable {
-    case today
-    case yesterday
-    case previous
-
-    var id: Self {
-        self
-    }
-
-    var title: String {
-        switch self {
-        case .today:
-            "Today"
-        case .yesterday:
-            "Yesterday"
-        case .previous:
-            "Previous"
-        }
-    }
-
-    static func bucket(
-        for date: Date,
-        relativeTo now: Date = Date(),
-        calendar: Calendar = .current
-    ) -> AgentSidebarDateSectionBucket {
-        let clampedDate = min(date, now)
-        let todayStart = calendar.startOfDay(for: now)
-        let dateStart = calendar.startOfDay(for: clampedDate)
-        if dateStart == todayStart {
-            return .today
-        }
-        if let yesterdayStart = calendar.date(byAdding: .day, value: -1, to: todayStart),
-           calendar.isDate(dateStart, inSameDayAs: yesterdayStart)
-        {
-            return .yesterday
-        }
-        return .previous
-    }
-}
-
 struct AgentSidebarActiveDateGroup: Identifiable {
     let id: UUID
     let bucket: AgentSidebarDateSectionBucket
