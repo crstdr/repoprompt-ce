@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSettingsCore
 import XCTest
 
@@ -79,6 +79,75 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         window.beginClose()
         await window.tearDown()
         WindowStatesManager.shared.unregisterWindowState(window)
+    }
+
+    func testPersistedDevinExploreRoleDurablySavesFirstPayload() async throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let registry = AgentACPModelRegistry.shared
+        registry.test_reset(providerID: .devin)
+        defer { registry.test_reset(providerID: .devin) }
+        XCTAssertTrue(registry.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [AgentModelOption(
+                    rawValue: "swe-2-high", displayName: "SWE-2", description: nil, isDefault: true
+                )],
+                currentModelRaw: "swe-2-high",
+                modelParameterSets: [ACPModelParameterSet(
+                    baseModelRaw: "swe-2-high",
+                    parameters: [ACPModelParameterDefinition(
+                        kind: .thinking, configID: "thought_level", displayName: "Thinking",
+                        choices: ["medium", "high", "max"].map {
+                            ACPModelParameterChoice(rawValue: $0, displayName: $0)
+                        },
+                        currentValueRaw: "high"
+                    )]
+                )]
+            ), for: .devin
+        ))
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false, devinAvailable: true
+        )
+        try await withFixture(ephemeral: false) { fixture in
+            let suiteName = "lane-devin-role-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            let fileStore = GlobalSettingsFileStore(fileURL: fixture.root.appendingPathComponent("roles.json"))
+            let pins = ["explore": "devin:swe-2-medium"]
+            try fileStore.save(GlobalSettingsDocument(globalDefaults: GlobalDefaults(
+                discoverAgentRaw: nil, discoverModelsByAgent: nil, mcpAgentRoleOverrides: pins
+            )))
+            let settings = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+            XCTAssertEqual(settings.globalMCPAgentRoleOverrides(), pins)
+            let selection = try AgentSessionLanePolicy.resolveRole(
+                "explore", availability: availability, workspaceID: fixture.workspaceID, settingsStore: settings
+            )
+            XCTAssertEqual(selection.agentRaw, "devin")
+            XCTAssertEqual(selection.modelRaw, "swe-2-medium")
+            XCTAssertNil(selection.reasoningEffortRaw)
+            let creatorID = UUID()
+            let outcome = try await WindowStatesManager.shared.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID,
+                workspaceID: fixture.workspaceID,
+                creatorSessionID: creatorID,
+                sessionName: "Devin explore lane",
+                selection: selection
+            )
+            guard case let .created(sessionID, tabID, bindingToken) = outcome else {
+                return XCTFail("persisted Devin explore role must establish a durable first save")
+            }
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let loaded = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+            let saved = try XCTUnwrap(loaded)
+            XCTAssertEqual(saved.id, sessionID)
+            XCTAssertEqual(saved.createdByOverseerSessionID, creatorID)
+            XCTAssertEqual(saved.agentKind, "devin")
+            XCTAssertEqual(saved.agentModel, "swe-2-medium")
+            XCTAssertNil(saved.parentSessionID)
+            let lane = try XCTUnwrap(fixture.window.agentModeViewModel.sessions[tabID])
+            XCTAssertEqual(lane.restorationReadiness, .authoritative(bindingToken, .freshBindingDurablyCreated))
+            XCTAssertFalse(lane.runState.isActive)
+            XCTAssertFalse(lane.isMCPOriginated)
+        }
     }
 
     func testDrivenFirstSaveWaitsForPreviouslyEnteredSaveAndPersistsProvenance() async throws {
