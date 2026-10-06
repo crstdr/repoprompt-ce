@@ -274,6 +274,31 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         CodexNativeSessionController(client: CodexAppServerClient(), runID: UUID(), tabID: UUID(), windowID: 1, workspacePaths: .uniform(nil), options: options, requestExecutor: requestExecutor)
     }
 
+    func testQA90UnarmedRuntimeRetainsOwnedReservedCompanionDisable() async throws {
+        let entry = MCPIntegrationHelper.CodexServerEntry(rawName: "computer-use", normalizedName: "computer-use", cliPathComponent: "computer-use")
+        var proposed = CodexNativeSessionController.appServerMCPServerOverrides(serverEntries: [entry], enabledMCPServerNames: [], suppressThirdPartyMCPServers: false, computerUseEnabled: false, computerUseClientPath: nil)
+        XCTAssertEqual(proposed["mcp_servers.computer-use.enabled"] as? Bool, false)
+        // The ordinary config builder combines this unchanged MCP map with the disabled feature.
+        proposed["features.computer_use"] = false
+        let baseMap = CodexOverrides.appServerMCPServerMap(entries: [entry], policy: .enableSelected(enabledNormalizedNames: [], repoPromptNormalizedName: MCPIntegrationHelper.repoPromptMCPServerName, exceptBroken: []))
+        XCTAssertEqual(baseMap["mcp_servers.computer-use.enabled"] as? Bool, false)
+        var options = CodexNativeSessionController.Options.agentModeDefault(computerUseEnabledProvider: { false }, computerUseClientPathProvider: { nil }, mcpServerEntriesProvider: { [entry] })
+        let supplied = proposed
+        options.configOverridesProvider = { supplied }
+        let requests = OffStartupRequestRecorder()
+        let controller = makeController(options: options, requestExecutor: { method, _, _ in
+            requests.record(method)
+            throw CodexAppServerClient.ClientError.invalidResponse
+        })
+        let runtime = try await controller.test_computerUseStartupConfig()
+        XCTAssertEqual(runtime["mcp_servers.computer-use.enabled"] as? Bool, false, "The final ordinary thread overlay must retain the known owned-entry disabling flag")
+        XCTAssertEqual(runtime["features.computer_use"] as? Bool, false)
+        XCTAssertNil(runtime["mcp_servers.computer-use"])
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: runtime, options: [.sortedKeys]), try JSONSerialization.data(withJSONObject: supplied, options: [.sortedKeys]), "Unarmed runtime must preserve the supplied static overlay exactly")
+        XCTAssertEqual(requests.methods, [], "Static overlay preservation must not require a configuration RPC")
+        await controller.shutdown()
+    }
+
     func testOrdinaryStartupDoesNotRequestComputerUseConfiguration() async throws {
         for optedIn in [false, true] {
             CodexComputerUseWorkflow.setEnabledForTesting(optedIn)

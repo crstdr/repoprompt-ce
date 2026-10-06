@@ -9204,14 +9204,16 @@ final class CodexNativeSessionController {
         }
     }
 
-    /// The actual thread boundary is authoritative, even when an injected/default override
-    /// provider evaluated readiness differently. Never synthesize a disabled transport.
+    /// Preserve the ordinary static overlay without discovering or rewriting companion entries.
+    /// For armed scopes, the actual thread boundary remains authoritative even when an
+    /// injected/default override provider evaluated readiness differently.
     static func computerUseRuntimeConfigOverrides(
         _ proposed: [String: Any],
         computerUseEnabled: Bool,
         acceptedClientPath: String?,
         effectiveServerNames: [String]
     ) throws -> [String: Any] {
+        guard computerUseEnabled else { return proposed }
         let prefixes = ["mcp_servers.computer-use", "mcp_servers.\"computer-use\""]
         var overrides = proposed.filter { key, _ in
             let lower = key.lowercased()
