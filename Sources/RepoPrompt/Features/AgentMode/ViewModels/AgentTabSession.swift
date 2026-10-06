@@ -402,8 +402,32 @@ final class AgentTabSession: ObservableObject {
     struct ACPSteeringManagedContext {
         let sink: AgentSessionLinkManagedSteerSink
         let attributedItemID: UUID
-        let candidate: AgentSessionLinkEndpointCandidate
-        let attribution: AgentCrossSessionAttribution
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let attribution: AgentCrossSessionAttribution?
+
+        init(
+            sink: AgentSessionLinkManagedSteerSink,
+            attributedItemID: UUID,
+            endpoint: DomainAgentSessionLinkEndpointIdentity,
+            attribution: AgentCrossSessionAttribution?
+        ) {
+            self.sink = sink
+            self.attributedItemID = attributedItemID
+            self.endpoint = endpoint
+            self.attribution = attribution
+        }
+
+        init(
+            sink: AgentSessionLinkManagedSteerSink,
+            attributedItemID: UUID,
+            candidate: AgentSessionLinkEndpointCandidate,
+            attribution: AgentCrossSessionAttribution
+        ) {
+            self.init(
+                sink: sink, attributedItemID: attributedItemID,
+                endpoint: candidate.domainEndpoint, attribution: attribution
+            )
+        }
     }
 
     struct ACPSteeringInstruction: Identifiable {
@@ -433,7 +457,7 @@ final class AgentTabSession: ObservableObject {
     func settlePendingManagedACPSteeringAsNotAccepted() {
         for instruction in pendingACPSteeringInstructions {
             guard let managed = instruction.managed else { continue }
-            let candidate = managed.candidate
+            let candidate = managed.endpoint
             if tabID == candidate.tabID,
                activeAgentSessionID == candidate.sessionID,
                persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration,

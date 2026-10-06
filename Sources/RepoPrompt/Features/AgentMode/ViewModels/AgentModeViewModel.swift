@@ -16909,7 +16909,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
         stagedCodexComputerUseActivationID: UUID?,
-        managedTurn: AgentSessionLinkManagedTurn? = nil,
+        managedTurn: AgentNoncomposerTurn? = nil,
         message: String
     ) {
         guard sessions[tabID] === session else {
@@ -16957,7 +16957,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
         stagedCodexComputerUseActivationID: UUID?,
-        managedTurn: AgentSessionLinkManagedTurn? = nil
+        managedTurn: AgentNoncomposerTurn? = nil
     ) {
         let expectedWaitID = session.instructionWaitID
         let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
@@ -17170,7 +17170,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// an expected path. It never starts a run, never queues a follow-up, and never restores a
     /// composer draft: it removes the attributed row it just appended and reports `notAccepted`.
     private func withdrawAgentSessionLinkManagedTurn(
-        _ managedTurn: AgentSessionLinkManagedTurn,
+        _ managedTurn: AgentNoncomposerTurn,
         userItemID: UUID,
         session: TabSession,
         tabID: UUID,
@@ -17200,6 +17200,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession,
         displayText: String,
         turn: AgentSessionLinkManagedTurn,
+        route: AgentSessionLinkManagedSteerRoute
+    ) -> Bool {
+        submitNoncomposerSteer(
+            tabID: tabID, session: session, displayText: displayText,
+            turn: AgentNoncomposerTurn(managed: turn), route: route
+        )
+    }
+
+    /// Shares prepared submission and provider settlement without borrowing link authority.
+    @discardableResult
+    func submitNoncomposerSteer(
+        tabID: UUID,
+        session: TabSession,
+        displayText: String,
+        turn: AgentNoncomposerTurn,
         route: AgentSessionLinkManagedSteerRoute
     ) -> Bool {
         // Codex reports its terminal state through the acknowledgement tracker `agent_run` uses. The
@@ -17278,7 +17293,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
-        managedTurn: AgentSessionLinkManagedTurn? = nil,
+        managedTurn: AgentNoncomposerTurn? = nil,
         stopFence: AgentRunStartStopFence? = nil,
         isLocalComposerInput: Bool = true
     ) -> UserTurnSubmissionResult {
@@ -17551,7 +17566,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let dispatchIsCurrent = self.sessions[tabID] === session
                     && producerStopFence.permitsStart(of: session)
                     && managedTurn.map { turn in
-                        self.agentSessionLinkLiveSession(matching: turn.candidate) === session
+                        self.agentSessionLifecycleIdentity(
+                            tabID: tabID, expectedSessionID: turn.endpoint.sessionID
+                        )?.monitorEndpoint(windowID: self.windowID) == turn.endpoint
                             && session.runState.isActive
                             && session.runID == managedSteerRunID
                             && session.activeRunAttemptID == managedSteerAttemptID
@@ -17889,7 +17906,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         trimmedText: String,
         userItem: AgentChatItem,
         userInputTokenEstimate: Int,
-        managedTurn: AgentSessionLinkManagedTurn? = nil
+        managedTurn: AgentNoncomposerTurn? = nil
     ) {
         // Steering recovery restores a queued instruction's draft into the composer. A managed
         // steer carries none, so a withdrawn one can never reappear as the target user's draft.
@@ -17916,7 +17933,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     TabSession.ACPSteeringManagedContext(
                         sink: $0.sink,
                         attributedItemID: userItem.id,
-                        candidate: $0.candidate,
+                        endpoint: $0.endpoint,
                         attribution: $0.attribution
                     )
                 }

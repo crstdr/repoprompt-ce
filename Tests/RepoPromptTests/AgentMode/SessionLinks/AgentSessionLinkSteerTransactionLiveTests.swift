@@ -264,6 +264,47 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         assertComposerUntouched(fixture, workflow: workflow)
     }
 
+    func testNoncomposerContinuationUsesExplicitTextWithoutLinkOrComposerAttribution() async throws {
+        let fixture = try makeFixture()
+        let workflow = stageComposerState(fixture)
+        let session = fixture.session
+        session.runState = .waitingForUser
+        session.installRunID(UUID())
+        session.instructionWaitID = UUID()
+        let resumed = Task { @MainActor in
+            try await withCheckedThrowingContinuation { continuation in
+                session.instructionContinuation = continuation
+            }
+        }
+        try await AsyncTestWait.waitUntil("the noncomposer instruction continuation") {
+            await MainActor.run { session.instructionContinuation != nil }
+        }
+        let sink = AgentSessionLinkManagedSteerSink()
+        let providerText = "<task>explicit programmatic input</task>"
+        let turn = AgentNoncomposerTurn(
+            endpoint: fixture.candidate.domainEndpoint,
+            providerText: providerText,
+            sink: sink
+        )
+
+        XCTAssertTrue(fixture.viewModel.submitNoncomposerSteer(
+            tabID: fixture.tabID, session: session, displayText: providerText,
+            turn: turn, route: .waitingInstruction
+        ))
+        let outcome = await sink.awaitOutcome(timeoutSeconds: 1)
+        let response = try await resumed.value
+
+        XCTAssertEqual(outcome, .delivered(.deliveredToWaitingInstruction))
+        XCTAssertEqual(response.text, providerText)
+        let row = try XCTUnwrap(session.items.first { $0.id == sink.appendedItemID })
+        XCTAssertEqual(row.text, providerText)
+        XCTAssertEqual(row.dispatchedProviderText, providerText)
+        XCTAssertNil(row.crossSessionAttribution, "shared mechanics must not fabricate a link grant")
+        XCTAssertNil(row.workflow, "the composer workflow remains the local user's")
+        XCTAssertNil(session.mcpControlContext)
+        assertComposerUntouched(fixture, workflow: workflow)
+    }
+
     // MARK: - Refusals leave the target untouched
 
     func testPendingPromptBlocksTheSteerBeforeTheFence() async throws {
