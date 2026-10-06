@@ -4529,7 +4529,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         tabID: UUID,
         runID: UUID,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
-        allowsAgentExternalControlTools: Bool = false
+        allowsAgentExternalControlTools: Bool = false,
+        routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
         viewModel?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
@@ -4548,7 +4549,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             mcpServerEnabler: { [weak viewModel] in
                 await viewModel?.ensureMCPServerEnabledForThreadStart() ?? false
             },
-            policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller)
+            policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
+            routingStateOwner: routingStateOwner
         )
     }
 
@@ -6804,15 +6806,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                       session.activeRunAttemptID == runAttemptIDAtEntry
                 else { return }
             }
+            let startupController = session.codexController
+            let startupControllerID = startupController.map(ObjectIdentifier.init)
+            let startupControllerGeneration = session.codexControllerGeneration
+            let routingStateOwner: (@MainActor @Sendable () -> Bool)? = if forIdleNativeCompact {
+                { [weak session] in
+                    guard let session, session.runID == runID, session.codexController != nil else { return true }
+                    return session.codexControllerGeneration == startupControllerGeneration
+                        && session.codexController.map(ObjectIdentifier.init) == startupControllerID
+                }
+            } else {
+                nil
+            }
             let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
             guard let lease = makeCodexRunLease(
                 tabID: session.tabID,
                 runID: runID,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
-                allowsAgentExternalControlTools: allowsAgentExternalControlTools
+                allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+                routingStateOwner: routingStateOwner
             ) else { return }
-            let startupController = session.codexController
-            let startupControllerGeneration = session.codexControllerGeneration
             func cleanupIdleCompactStartup() async {
                 let originalControllerInstalled = session.codexControllerGeneration == startupControllerGeneration
                     && session.codexController.map(ObjectIdentifier.init) == startupController.map(ObjectIdentifier.init)
@@ -6838,7 +6851,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
             }
             let acquired = await lease.acquire()
-            guard acquired else { return }
+            guard acquired else {
+                if forIdleNativeCompact { await cleanupIdleCompactStartup() }
+                return
+            }
 
             await lease.providerInitializationStarted(provider: AgentProviderKind.codexExec.rawValue)
             let routingReadinessResumeCandidate = Self.codexResumeCandidate(
@@ -6894,7 +6910,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   session.activeRunAttemptID == runAttemptIDAtEntry,
                   session.codexControllerGeneration == pendingStart.controllerGeneration
             else {
-                if forIdleNativeCompact, pendingStart == nil {
+                if forIdleNativeCompact {
+                    discardPendingCodexStart(for: session, controllerID: startupControllerID)
                     await cleanupIdleCompactStartup()
                     return
                 }
@@ -6969,9 +6986,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             controller: expectedController,
                             source: "uncommitted-routing-or-attempt"
                         )
+                        if forIdleNativeCompact { await cleanupIdleCompactStartup() }
                         return
                     }
                     await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
+                    return
                 } catch is CancellationError {
                     // Cancellation cannot publish a staged reference even if the provider
                     // already reported an active thread.
@@ -6986,7 +7005,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 } catch {
                     // Fail closed: RepoPrompt MCP routing was never confirmed for this run, so the
                     // child cannot be trusted to hold RepoPrompt tools and must not reach its first
-                    // turn. requireRouting has already released the gate, one-shot policy, and routing
+                    // turn. requireRouting has released the gate and any still-owned policy and routing
                     // waiter; tear down the started thread and publish the readiness failure as the
                     // run's terminal outcome so the parent sees a failed start instead of a tool-less
                     // child.
@@ -7017,6 +7036,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
                 await lease.releaseWithoutRoutingWait()
             }
+            if forIdleNativeCompact { await cleanupIdleCompactStartup() }
             return
         }
         guard requiresTransportStart else {
