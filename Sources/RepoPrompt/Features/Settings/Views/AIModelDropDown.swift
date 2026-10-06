@@ -344,7 +344,7 @@ struct AIModelDropdown: View {
 
     private func aiModelMenuItem(_ model: AIModel) -> StableMenuItem {
         StableMenuItem.action(
-            truncateHeadIfNeeded(model.displayName),
+            truncateHeadIfNeeded(AgentModelMenuTitle.displayName(for: model)),
             isSelected: model.rawValue == destination.currentRawValue
         ) {
             destination.apply(model.rawValue)

@@ -347,7 +347,14 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     func additionalOracleModelDestination(at index: Int) -> ModelDestination {
         let expectedScope = editingScope
-        let expectedRaw = additionalOracleModelRaws.indices.contains(index) ? additionalOracleModelRaws[index] : nil
+        // Capture the lane's displayed value alongside its index. This applier is handed to a
+        // model picker that can stay open across a refresh, and an index alone is not an
+        // identity: if the roster is reordered or shortened meanwhile, the index still validates
+        // but now names a different lane. The staleness guard in `updateSelectedProfile` cannot
+        // catch that on its own — by the time the menu item fires, cache and store agree again.
+        let expectedRaw = additionalOracleModelRaws.indices.contains(index)
+            ? additionalOracleModelRaws[index]
+            : nil
         return ModelDestination(
             id: "agentModels.oracle.additional.\(index)",
             getter: { [weak self] in
@@ -357,10 +364,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             applier: { [weak self] rawValue in
                 guard let self else { return }
                 reloadScopedState()
-                if rawValue.hasPrefix("cursor_custom_") {
-                    guard editingScope == expectedScope, additionalOracleModelRaws.indices.contains(index), additionalOracleModelRaws[index] == expectedRaw else { return }
-                }
-                setAdditionalOracleModel(raw: rawValue, at: index)
+                guard !rawValue.hasPrefix("cursor_custom_") || editingScope == expectedScope else { return }
+                setAdditionalOracleModel(raw: rawValue, at: index, expecting: expectedRaw)
             }
         )
     }
@@ -412,8 +417,13 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         }
     }
 
-    func setAdditionalOracleModel(raw: String, at index: Int) {
+    /// - Parameter expectedRaw: the value this lane displayed when the action was constructed.
+    ///   Supplied by deferred callers so a retained picker cannot retarget a reordered roster.
+    func setAdditionalOracleModel(raw: String, at index: Int, expecting expectedRaw: String? = nil) {
         guard additionalOracleModelRaws.indices.contains(index) else { return }
+        if let expectedRaw, additionalOracleModelRaws[index] != expectedRaw {
+            return
+        }
         updateSelectedProfile(reason: "agent_models.oracle_model") { profile in
             profile.additionalOracleModelRaws[index] = raw
         }

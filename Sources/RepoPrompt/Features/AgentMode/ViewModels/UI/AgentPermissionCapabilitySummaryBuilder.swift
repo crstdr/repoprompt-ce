@@ -209,7 +209,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .devin:
             let level = devinPermissionLevel(profile: profile)
             let warnings = level.isWarning
-                ? ["Devin launches with `--permission-mode dangerous` — its tools run without approval prompts."]
+                ? ["Devin runs in its Bypass mode — its tools run without approval prompts."]
                 : []
             return AgentPermissionCapabilitySummary(
                 providerID: providerID,

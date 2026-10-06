@@ -257,9 +257,11 @@ enum MCPAgentRoleDefaultsService {
               let agent = AgentProviderKind(rawValue: parsed.agentRaw)
         else { return nil }
 
-        // Codex may have dynamic model IDs, so defer its model-level validation. Other
-        // providers must still expose the stored model or the stale pin is non-executable.
+        // Codex and Cursor have discovery-backed model IDs; defer their model-level
+        // validation to admission so a cold catalogue cannot silently replace a stored pin.
+        // Other providers must still expose the stored model or the pin is non-executable.
         let modelIsExecutable = agent == .codexExec
+            || agent == .cursor
             || AgentModelCatalog.isValid(rawModel: parsed.modelRaw, for: agent, availability: availability)
         guard AgentModelCatalog.isAgentAvailable(agent, availability: availability), modelIsExecutable else { return nil }
 

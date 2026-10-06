@@ -83,6 +83,7 @@ var repoPromptSettingsCoreSwiftSettings: [SwiftSetting] = [
 ]
 
 var repoPromptTestDependencies: [Target.Dependency] = [
+    "RepoPromptTestSandboxPreflight",
     "RepoPromptApp",
     "RepoPromptFoundation",
     "RepoPromptProcess",
@@ -310,6 +311,7 @@ let package = Package(
         .testTarget(
             name: "RepoPromptMCPCoreTests",
             dependencies: [
+                "RepoPromptTestSandboxPreflight",
                 "RepoPromptMCPCore",
                 "RepoPromptDomainRuntime",
                 "RepoPromptShared",
@@ -375,6 +377,15 @@ let package = Package(
                 .copy("Goldens")
             ],
             swiftSettings: swift6LanguageMode + repoPromptCodeMapTestSwiftSettings
+        ),
+        // Test-only guard: refuses to load RepoPromptTests and RepoPromptMCPCoreTests outside the isolated sandbox created by
+        // Scripts/ci_app_test_runner.py, so tests can never resolve the user's real app storage.
+        // Not part of any product.
+        .target(
+            name: "RepoPromptTestSandboxPreflight",
+            path: "Tests/RepoPromptTestSandboxPreflight",
+            publicHeadersPath: "include",
+            linkerSettings: [.linkedFramework("CoreFoundation")]
         ),
         .testTarget(
             name: "RepoPromptTests",

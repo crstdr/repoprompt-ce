@@ -241,6 +241,9 @@ class WindowState: ObservableObject {
     /// decorative animation in hidden windows. `true` until an attached window is sampled.
     @Published private(set) var isPresentationVisible: Bool = true
 
+    /// Test seam for the on-screen sample; production reads the attached `NSWindow`.
+    var presentationVisibilitySampler: @MainActor (NSWindow) -> Bool = WindowPresentationVisibility.sample
+
     private var presentationVisibilityCancellables = Set<AnyCancellable>()
     private weak var presentationVisibilityObservedWindow: NSWindow?
 
@@ -488,10 +491,13 @@ class WindowState: ObservableObject {
 
     func beginClose() {
         guard !isClosing else { return }
+        let manager = windowStatesManager ?? WindowStatesManager.shared
+        if !manager.isTerminating {
+            AgentSessionLinkRuntimeBridge.shared.noteOversightWindowClosing(windowID: windowID)
+        }
         isClosing = true
         failUnstartedCommandsForWindowClose()
 
-        let manager = windowStatesManager ?? WindowStatesManager.shared
         if !manager.isTerminating {
             manager.markWindowAsExplicitlyClosing(windowID: windowID)
         }
@@ -544,6 +550,19 @@ class WindowState: ObservableObject {
     }
 
     #if DEBUG
+        convenience init(
+            agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory,
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory
+        ) {
+            self.init(
+                contextBuilderProviderFactory: contextBuilderProviderFactory,
+                loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: nil,
+                agentModeViewModelFactory: agentModeViewModelFactory
+            )
+        }
+
         convenience init(
             contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
             domainRuntime: MCPDomainRuntime,
@@ -617,7 +636,8 @@ class WindowState: ObservableObject {
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         domainRuntimeOverride: MCPDomainRuntime?,
-        keyManager injectedKeyManager: KeyManager? = nil
+        keyManager injectedKeyManager: KeyManager? = nil,
+        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -641,7 +661,8 @@ class WindowState: ObservableObject {
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            agentModeViewModelFactory: agentModeViewModelFactory
         )
 
         workspaceFileContextStore = composition.workspaceFileContextStore
@@ -804,7 +825,9 @@ class WindowState: ObservableObject {
             schedulePresentationVisibilityUpdate(from: nil)
             return
         }
-        guard let window else { return }
+        // A deferred WindowAccessor callback can deliver the first attach after `beginClose()`;
+        // reinstalling observers then would leak them, since `beginClose` is idempotent.
+        guard let window, !isClosing else { return }
 
         if nsWindow === window {
             configureWindowChrome(for: window)
@@ -942,6 +965,12 @@ class WindowState: ObservableObject {
         presentationVisibilityObservedWindow = nil
     }
 
+    #if DEBUG
+        var debugPresentationVisibilityObserverCount: Int {
+            presentationVisibilityCancellables.count
+        }
+    #endif
+
     /// Samples after a yield so a notification delivered mid-update never publishes in place, and
     /// only for the window still attached; `nil` (detached) restores the unknown-is-visible default.
     private func schedulePresentationVisibilityUpdate(from window: NSWindow?) {
@@ -954,7 +983,7 @@ class WindowState: ObservableObject {
             let visible: Bool
             if let window {
                 guard nsWindow === window else { return }
-                visible = WindowPresentationVisibility.sample(window)
+                visible = presentationVisibilitySampler(window)
             } else {
                 guard nsWindow == nil else { return }
                 visible = true

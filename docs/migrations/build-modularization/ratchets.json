@@ -1,5 +1,5 @@
 {
-  "description": "Oversight projection refresh port: measured upstream/main 9d7a625438409b76f50ecae8ec4f0ebf28f8a064 app baseline 602839 plus exact port delta 63 = 602902, with zero app-line headroom. Other metrics and upstream advisory enforcement remain unchanged.",
+  "description": "Fork upstream sync 2026-10-06: exact measured merged tree of fork main f3f035a2 and approved upstream 87239876, including conflict resolutions retaining fork oversight/menu ownership and Cursor pin behavior. Zero numeric headroom; all metrics equal the measured merged tree.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -20,15 +20,15 @@
     "app_files_over_2000_lines": 47,
     "app_files_over_5000_lines": 16,
     "app_largest_cycle_components": 64,
-    "app_share_permille": 868,
-    "app_shared_accessor_uses": 1218,
+    "app_share_permille": 791,
+    "app_shared_accessor_uses": 1214,
     "app_static_shared_declarations": 89,
-    "app_target_swift_files": 1126,
-    "app_target_swift_lines": 602902,
-    "app_userdefaults_standard_uses": 234,
-    "app_wrong_way_file_edges": 1079,
-    "first_party_swift_lines": 747202,
-    "tests_sleep_calls": 59,
-    "tests_testable_import_app_files": 326
+    "app_target_swift_files": 1060,
+    "app_target_swift_lines": 605133,
+    "app_userdefaults_standard_uses": 229,
+    "app_wrong_way_file_edges": 956,
+    "first_party_swift_lines": 764260,
+    "tests_sleep_calls": 67,
+    "tests_testable_import_app_files": 329
   }
 }

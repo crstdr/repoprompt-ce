@@ -40,9 +40,9 @@ make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTes
 make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTests/testBehavior
 ```
 
-Root `dev-test` jobs build tests in the normal developer environment, then run `swift test --skip-build` in a disposable home and temporary directory using the CI runner's sandbox contract. `FILTER` and `TEST_PRODUCT` are forwarded to that execution; provider-package jobs are unchanged. The sandbox is shared for the local invocation and removed afterward (hosted CI still isolates each suite). Plain `swift test` does not supply this isolation and cannot run the root-authority fixtures safely.
+Root `dev-test` jobs build tests in the normal developer environment, then run the selected bundles in a disposable home and temporary directory using the CI runner's sandbox contract. The optional `./conductor test --module RepoPromptMCPCoreTests` path builds only that test target in `.build/swiftbuild` and also sandboxes helper discovery and execution. `FILTER` and `TEST_PRODUCT` are forwarded to that execution; provider-package jobs are unchanged. The sandbox is shared for the local invocation and removed afterward (hosted CI still isolates each suite). Plain `swift test` does not supply this isolation: both `RepoPromptTests` and `RepoPromptMCPCoreTests` link a bundle-load preflight (`Tests/RepoPromptTestSandboxPreflight`) that exits with status 78 unless `REPOPROMPT_TEST_SANDBOX_ROOT`, the runner marker, `HOME` and `CFFIXED_USER_HOME` (from which Foundation resolves Application Support) place the process inside a sandbox, so a bare run can never resolve the real `~/Library/Application Support/RepoPrompt CE` storage. Use `./conductor test`, `make dev-test`, or the uncoordinated `make test` / `python3 Scripts/ci_app_test_runner.py --local [--filter <name>]`. Preferences are not redirected by the sandbox (they stay in the real `~/Library/Preferences` domain of the test host), so the preflight also clears an inherited `GlobalCustomStorageURL` unless it resolves, outside the real home, into an existing marked runner sandbox (normally a concurrently running test).
 
-`FILTER` matches suite and method names, never file names. A test file commonly holds several suites named after the contracts they pin, none of them named after the file, so filtering by a filename selects nothing — and a zero-test run exits `0`, reporting `Executed 0 tests, with 0 failures`, which reads as a pass. Check the printed executed count before treating a focused run as evidence; if it is zero, take a real suite name from the file (or `swift test list`) and filter on that.
+`FILTER` matches suite and method names, never file names. A test file commonly holds several suites named after the contracts they pin, none of them named after the file, so filtering by a filename selects nothing — and a zero-test run exits `0`, reporting `Executed 0 tests, with 0 failures`, which reads as a pass. Check the printed executed count before treating a focused run as evidence; if it is zero, take a real suite name from the file (or list suites the way CI does, from a throwaway sandbox: `python3 -c 'import sys; sys.path.insert(0, "Scripts"); import ci_app_test_runner as r; print(*r.list_suite_methods("swift", None), sep="\n")'`) and filter on that; bare `swift test list` loads the bundle and is refused outside the sandbox.
 
 Use the narrowest relevant filter while iterating. Broaden to the affected target or full suite when the change crosses shared infrastructure, package boundaries, generated surfaces, test harness behavior, or many unrelated suites:
 
@@ -972,6 +972,17 @@ python3 Scripts/worktree_startup_live_benchmark.py codemap-gate --help
 python3 Scripts/worktree_startup_live_benchmark.py aggregate --help
 python3 Scripts/worktree_startup_live_benchmark.py cleanup --help
 ```
+
+## Devin ACP feature map
+
+Use `./conductor build` to package the debug app, then `./conductor smoke --launch` for the app and MCP health check. The bundled `DebugApps/RepoPrompt.app/Contents/MacOS/repoprompt-mcp` CLI targets this CE app. Bind it to the intended workspace before running `agent_manage` or `agent_run`. Use Cua Driver snapshots and background actions to check the visible controls; an ad-hoc signed debug app forgets secure permission settings after relaunch.
+
+| Feature | User path | Agent drive and observable result |
+| --- | --- | --- |
+| Devin permissions | Agent Models → Devin permission level, then a Devin Agent Mode run | Select Normal/Smart/Full Approval and inspect the ACP trace for the advertised mode before `session/prompt`; Provider Default restores the mode advertised when that ACP session opened. A permission card's Allow/Allow for session must select `allow_once`/`allow_session` respectively. Account policy can reject Smart or Bypass. |
+| Agent reasoning | Agent Mode → Devin model and thinking picker | `agent_manage list_agents` advertises per-model `thought_level`; `agent_run` with `model_parameters` applies the selected value before `session/prompt`. The model menu shows the advertised default effort without changing the model ID. |
+| Context Builder | Models → All Agent Models → Context Builder Agent | Select Devin and a thinking pin with Cua Driver, then run `context_builder`; its ACP trace must apply model and effort before prompting. Headless Devin uses top-level `--permission-mode auto` and does not inherit Agent Mode's Full Approval setting. |
+| Oracle picker | Models → All Agent Models → Oracle Models | Open the Devin submenu with Cua Driver; model rows show their advertised default effort and retain their raw model identity on selection. |
 
 ## Handoff checklist
 

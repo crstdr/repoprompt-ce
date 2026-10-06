@@ -62,7 +62,7 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
             makeController: controllerFactory,
             beforePrompt: { controller, _ in
                 if let model = Self.selectedModelToApply(config: config) {
-                    try await controller.applyCursorModelSelection(model, overrides: config.modelOverrides)
+                    try await controller.applyCursorModelSelection(model, selections: config.modelParameterSelections)
                 }
                 if let sessionMode = Self.sessionModeToApply(config: config) {
                     try await controller.setSessionMode(sessionMode)

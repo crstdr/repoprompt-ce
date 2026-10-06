@@ -127,14 +127,55 @@ extension AgentModeViewModel {
         _ gesture: AgentSidebarSelectionGesture,
         identity: AgentSidebarSelectionIdentity,
         renderedOrder: [AgentSidebarSelectionIdentity],
-        workspaceID: UUID?
-    ) -> AgentSidebarSelectionGestureDisposition {
-        guard let workspaceID, workspaceManager?.activeWorkspaceID == workspaceID else { return .ignored }
-        return ui.sessionSidebar.handleSelectionGesture(
+        workspaceID: UUID?,
+        rowID: UUID
+    ) -> AgentSidebarSelectionGestureResult {
+        // Mirrors guards in `AgentSidebarSelectionState.handle` for diagnostics; keep in sync.
+        let selectionCount = ui.sessionSidebar.selectionState.selectedIdentities.count
+        let match = AgentSidebarTapWorkspaceGate.evaluate(
+            sidebarWorkspaceID: workspaceID,
+            activeWorkspaceID: workspaceManager?.activeWorkspaceID
+        )
+        guard match == .matched, let workspaceID else {
+            return AgentSidebarSelectionGestureResult(
+                disposition: .ignored,
+                reason: match.ignoredReason,
+                selectionCount: selectionCount,
+                workspaceMatched: false,
+                rowID: rowID
+            )
+        }
+        let state = ui.sessionSidebar.selectionState
+        if state.inFlightAction != nil {
+            return AgentSidebarSelectionGestureResult(
+                disposition: .ignored,
+                reason: "mutation-in-flight",
+                selectionCount: selectionCount,
+                workspaceMatched: true,
+                rowID: rowID
+            )
+        }
+        guard renderedOrder.contains(identity) else {
+            return AgentSidebarSelectionGestureResult(
+                disposition: .ignored,
+                reason: "identity-not-rendered",
+                selectionCount: selectionCount,
+                workspaceMatched: true,
+                rowID: rowID
+            )
+        }
+        let disposition = ui.sessionSidebar.handleSelectionGesture(
             gesture,
             identity: identity,
             renderedOrder: renderedOrder,
             workspaceID: workspaceID
+        )
+        return AgentSidebarSelectionGestureResult(
+            disposition: disposition,
+            reason: nil,
+            selectionCount: ui.sessionSidebar.selectionState.selectedIdentities.count,
+            workspaceMatched: true,
+            rowID: rowID
         )
     }
 

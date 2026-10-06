@@ -173,6 +173,19 @@ extension GlobalSettingsStore {
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
     }
 
+    /// App-global UI preference for the oversight-link confirmation. Nil reads as false; the flag
+    /// only skips the dialog and never relaxes runtime authorization or approval restrictions.
+    func suppressOversightLinkConfirmation() -> Bool {
+        scalarPreferences.agentMode?.suppressOversightLinkConfirmation == true
+    }
+
+    func setSuppressOversightLinkConfirmation(_ suppressed: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            // Clearing returns to the baseline scalar shape for older CE builds.
+            settings.suppressOversightLinkConfirmation = suppressed ? true : nil
+        }
+    }
+
     func codexMemoriesEnabled() -> Bool {
         CodexMemories.isEnabled(persistedValue: scalarPreferences.agentMode?.codexMemoriesEnabled)
     }
@@ -571,16 +584,7 @@ extension GlobalSettingsStore {
 
     /// Invoke before constructing any settings store or decoding Agent Models profiles.
     nonisolated static func installApplicationModelIdentityPolicy() {
-        SettingsModelIdentityPolicy.installCursorCanonicalizer { raw in
-            // Exact advertised identities win over historical rename aliases.
-            if AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options.contains(where: { $0.rawValue == raw }) == true {
-                return raw
-            }
-            if let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: raw), !specifier.overrides.isEmpty {
-                return ACPModelParameterIdentity.canonicalBaseModelRaw(specifier.baseModelRaw, providerID: .cursor)
-            }
-            return CursorAIModelCatalog.canonicalAlias(raw)
-        }
+        SettingsModelIdentityPolicy.installCursorCanonicalizer(CursorAIModelCatalog.canonicalIdentity)
     }
 
     static func installProcessApplicationEventBridge(notificationCenter: NotificationCenter = .default) {

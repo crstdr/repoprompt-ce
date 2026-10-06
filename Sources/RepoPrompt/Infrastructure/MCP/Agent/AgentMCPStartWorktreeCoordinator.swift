@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptProcess
 import RepoPromptSettingsCore
@@ -271,6 +272,7 @@ struct AgentMCPStartWorktreeCoordinator {
                     repository: context.repo,
                     agentModeVM: agentModeVM
                 )
+                try MCPAgentRunStartExecutionScope.current?.checkAdmission()
                 let identity = try persistVisualIdentity(for: worktree, request: request)
                 let rootPrefix = try repositoryRelativeRootPrefix(
                     logicalRoot: context.logicalRoot,
@@ -430,6 +432,7 @@ struct AgentMCPStartWorktreeCoordinator {
                 expectedWorkspaceID: expectedWorkspaceID
             )
         } catch {
+            try? MCPAgentRunStartExecutionScope.current?.enterReturn()
             if let createdWorktree {
                 try await removeUncommittedWorktree(createdWorktree, repository: repository)
             }
@@ -699,6 +702,9 @@ struct AgentMCPStartWorktreeCoordinator {
         } else {
             nil
         }
+        try MCPAgentRunStartExecutionScope.current?.recordWorktreeIntent(
+            "Inspect manage_worktree list for the planned worktree at \(plan.path.path); do not repeat creation."
+        )
         let result: GitWorktreeCreateResult
         #if DEBUG
             result = try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(benchmarkMetricTag) {

@@ -1027,6 +1027,28 @@ class WorkspaceManagerViewModel: ObservableObject {
                 uniquingKeysWith: { _, _ in [:] }
             )
             refreshSelectionMirrorContextRevision()
+            refreshAgentCreatorNameSource()
+        }
+    }
+
+    private var agentCreatorNameSource: [UUID: AgentSessionCreatorNames.Source] = [:]
+
+    private func refreshAgentCreatorNameSource() {
+        let sources = Dictionary(
+            (activeWorkspace?.composeTabs ?? []).compactMap { tab -> (UUID, AgentSessionCreatorNames.Source)? in
+                guard let workspaceID = activeWorkspaceID, let sessionID = tab.activeAgentSessionID else { return nil }
+                return (tab.id, .init(workspaceID: workspaceID, sessionID: sessionID, name: tab.name))
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        guard sources != agentCreatorNameSource else { return }
+        let oldIdentities = agentCreatorNameSource.mapValues { [$0.workspaceID, $0.sessionID] }
+        let newIdentities = sources.mapValues { [$0.workspaceID, $0.sessionID] }
+        agentCreatorNameSource = sources
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.noteCreatorNameSourceChanged(windowID: promptViewModel.windowID, sources: sources)
+        if oldIdentities != newIdentities {
+            bridge.noteTopologyMayHaveChanged()
         }
     }
 
@@ -1062,6 +1084,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceSearchReadinessFence.publish(nil)
             refreshSelectionMirrorContextRevision()
             synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "workspace_selection")
+            refreshAgentCreatorNameSource()
         }
     }
 

@@ -18,10 +18,11 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     /// topology reason. The focused bridge tests elsewhere rely on the protocol defaults instead.
     private final class FakeHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
-        /// Answers by call index so a test can make an endpoint drift at one exact point between the
-        /// coordinator's classification and the shared establishment path's own resolution.
-        var candidatesByCall: ((Int) -> [AgentSessionLinkEndpointCandidate])?
-        private(set) var candidateCallCount = 0
+        /// Drift only after the coordinator's descriptor-backed classification snapshot. Bootstrap
+        /// presentation reads candidates too, so a raw call index is not an establishment boundary.
+        var candidatesAfterClassification: [AgentSessionLinkEndpointCandidate]?
+        private var classificationSnapshotPending = false
+        private(set) var classificationHandoffCount = 0
         var descriptors: [AgentSessionLinkComposeTabDescriptor] = []
         var discovery: [AgentSessionLinkDiscoveryState] = []
         var topology: AgentSessionOversightRestoreTopologyState = .completeAllEntriesConsumed
@@ -34,18 +35,27 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         }
 
         private(set) var hydrationRequests: [Set<UUID>] = []
+        var hydrationHandler: ((Set<UUID>) -> Void)?
 
         func agentSessionLinkRequestRestorationHydration(sessionIDs: Set<UUID>) {
             hydrationRequests.append(sessionIDs)
+            hydrationHandler?(sessionIDs)
         }
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
-            candidateCallCount += 1
-            return candidatesByCall?(candidateCallCount) ?? candidates
+            let snapshot = candidates
+            if classificationSnapshotPending, let successor = candidatesAfterClassification {
+                classificationSnapshotPending = false
+                candidatesAfterClassification = nil
+                classificationHandoffCount += 1
+                candidates = successor
+            }
+            return snapshot
         }
 
         func agentSessionLinkComposeTabDescriptors() -> [AgentSessionLinkComposeTabDescriptor] {
-            descriptors
+            classificationSnapshotPending = candidatesAfterClassification != nil
+            return descriptors
         }
 
         func agentSessionLinkDiscoveryStates() -> [AgentSessionLinkDiscoveryState] {
@@ -203,8 +213,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     }
 
     /// Seeds the durable manifest so the launch load produces exactly this one saved pair.
-    private func seedSavedPair() throws {
-        let document = AgentSessionOversightIntentDocument(links: [pair])
+    private func seedSavedPair(_ additionalPairs: [AgentSessionOversightIntent] = []) throws {
+        let document = AgentSessionOversightIntentDocument(links: [pair] + additionalPairs)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         try encoder.encode(document).write(
@@ -215,11 +225,13 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
     /// A live, eligible candidate whose hydration proof matches its own current binding, which is
     /// the only shape automatic restoration accepts.
-    private func makeReadyCandidate(windowID: Int, sessionID: UUID) -> AgentSessionLinkEndpointCandidate {
+    private func makeReadyCandidate(
+        windowID: Int, sessionID: UUID, workspaceID: UUID = UUID()
+    ) -> AgentSessionLinkEndpointCandidate {
         let tabID = UUID()
         return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
-            workspaceID: UUID(),
+            workspaceID: workspaceID,
             tabID: tabID,
             sessionID: sessionID,
             persistentBindingGeneration: UUID(),
@@ -313,6 +325,847 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     private func isRestored(_ fixture: Fixture) async -> Bool {
         let inventory = await fixture.authority.links(forObserver: observerSessionID)
         return inventory.items.contains { $0.targetSessionID == targetSessionID }
+    }
+
+    private func makeRestoredFixture() async throws -> (
+        Fixture, AgentSessionLinkEndpointCandidate, AgentSessionLinkEndpointCandidate
+    ) {
+        try seedSavedPair()
+        let fixture = makeFixture()
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        fixture.host.candidates = [observer, target]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        return (fixture, observer, target)
+    }
+
+    private func liveReference(_ fixture: Fixture) async -> DomainAgentSessionLinkReference? {
+        let inventory = await fixture.authority.links(forObserver: observerSessionID)
+        guard let item = inventory.items.first(where: { $0.targetSessionID == targetSessionID }) else { return nil }
+        return DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
+    }
+
+    private func replaceTopology(_ fixture: Fixture, with candidates: [AgentSessionLinkEndpointCandidate]) {
+        fixture.host.candidates = candidates
+        fixture.host.descriptors = candidates.map { descriptor(for: $0) }
+    }
+
+    // MARK: - Same-process window reopen
+
+    func testCapturedObserverTargetAndBothWindowClosesRestoreOneFreshManagedGrant() async throws {
+        let closingWindows: [Set<Int>] = [[1], [2], [1, 2]]
+        for windows in closingWindows {
+            let (fixture, observer, target) = try await makeRestoredFixture()
+            let originalReference = await liveReference(fixture)
+            let oldReference = try XCTUnwrap(originalReference)
+            let originalToken = await fixture.store.token(for: pair)
+            for windowID in windows {
+                fixture.bridge.noteOversightWindowClosing(windowID: windowID)
+            }
+            replaceTopology(fixture, with: [observer, target].filter { !windows.contains($0.windowID) })
+            for windowID in windows {
+                await fixture.bridge.invalidateWindow(windowID, reason: .windowClosed)
+            }
+            await fixture.bridge.test_settleLaunchReconciliation()
+
+            let parkedToken = await fixture.store.token(for: pair)
+            let retiredGrant = await fixture.authority.activeGrant(for: oldReference)
+            XCTAssertEqual(parkedToken, originalToken)
+            XCTAssertNil(retiredGrant)
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.lifecycleRevoked))
+
+            let reopenedObserver = windows.contains(1)
+                ? makeReadyCandidate(windowID: 3, sessionID: observerSessionID) : observer
+            let reopenedTarget = windows.contains(2)
+                ? makeReadyCandidate(windowID: 4, sessionID: targetSessionID) : target
+            replaceTopology(fixture, with: [reopenedObserver, reopenedTarget])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let replacement = await liveReference(fixture)
+            XCTAssertNotNil(replacement)
+            XCTAssertNotEqual(replacement, oldReference)
+            let inventory = await fixture.authority.links(forObserverEndpoint: reopenedObserver.domainEndpoint)
+            XCTAssertEqual(inventory.items.map(\.targetSessionID), [targetSessionID])
+            XCTAssertEqual(inventory.items.first?.capabilities, DomainAgentSessionLinkCapability.managed)
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let repeated = await liveReference(fixture)
+            XCTAssertEqual(repeated, replacement, "An ordinary event must not reserve again.")
+            XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+        }
+    }
+
+    func testSameWindowReopenRestoresAfterPassiveHydrationIsInterruptedByDiscoveryChange() async throws {
+        for interrupted in [false, true] {
+            try seedSavedPair()
+            let fixture = makeFixture()
+            let workspaceID = UUID()
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID, workspaceID: workspaceID)
+            let target = makeReadyCandidate(windowID: 1, sessionID: targetSessionID, workspaceID: workspaceID)
+            replaceTopology(fixture, with: [observer, target])
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let original = await liveReference(fixture)
+            XCTAssertNotNil(original)
+            let token = await fixture.store.token(for: pair)
+
+            fixture.bridge.noteOversightWindowClosing(windowID: 1)
+            replaceTopology(fixture, with: [])
+            await fixture.bridge.invalidateWindow(1, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+
+            let reopenedObserver = makeReadyCandidate(windowID: 2, sessionID: observerSessionID, workspaceID: workspaceID)
+            let reopenedTarget = makeReadyCandidate(windowID: 2, sessionID: targetSessionID, workspaceID: workspaceID)
+            fixture.host.candidates = [reopenedObserver]
+            fixture.host.descriptors = [descriptor(for: reopenedObserver), descriptor(for: reopenedTarget)]
+            let epoch = AgentSessionLinkDiscoveryEpoch(windowID: 2, workspaceID: workspaceID, generation: 1)
+            fixture.host.discovery = [.init(epoch: epoch, isComplete: true)]
+
+            // Gate the host's passive load, not a provider: delivery can be abandoned by its owner.
+            let completeHydration = {
+                fixture.host.candidates = [reopenedObserver, reopenedTarget]
+                fixture.bridge.noteCandidateReadinessChanged()
+            }
+            var pendingHydration: (() -> Void)?
+            fixture.host.hydrationHandler = { _ in pendingHydration = completeHydration }
+            defer { fixture.host.hydrationHandler = nil }
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID]])
+            XCTAssertNotNil(pendingHydration)
+            let beforeHydration = await fixture.authority.links(forObserver: observerSessionID)
+            XCTAssertTrue(beforeHydration.items.isEmpty)
+
+            if interrupted {
+                // Model a workspace activation discarding that request. The saved bindings survive.
+                let successor = AgentSessionLinkDiscoveryEpoch(windowID: 2, workspaceID: workspaceID, generation: 2)
+                fixture.host.discovery = [.init(epoch: successor, isComplete: false)]
+                pendingHydration = nil
+                fixture.bridge.noteTopologyMayHaveChanged()
+                await fixture.bridge.test_settleLaunchReconciliation()
+                fixture.host.hydrationHandler = { _ in completeHydration() }
+                fixture.host.discovery = [.init(epoch: successor, isComplete: true)]
+                fixture.bridge.noteCandidateReadinessChanged()
+            } else {
+                pendingHydration?()
+                pendingHydration = nil
+            }
+            await fixture.bridge.test_settleLaunchReconciliation()
+
+            let restored = await fixture.authority.links(forObserverEndpoint: reopenedObserver.domainEndpoint)
+            XCTAssertEqual(
+                restored.items.map(\.targetSessionID), [targetSessionID],
+                "Same-window reopen must restore without a user turn; interrupted=\(interrupted)."
+            )
+            if let link = restored.items.first {
+                XCTAssertNotEqual(DomainAgentSessionLinkReference(linkID: link.linkID, generation: link.generation), original)
+                XCTAssertEqual(link.capabilities, DomainAgentSessionLinkCapability.managed)
+            }
+            let retainedToken = await fixture.store.token(for: pair)
+            XCTAssertEqual(retainedToken, token)
+            XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+        }
+    }
+
+    func testReferenceBackedInteractivePairEnrollsWithItsActualAssertionOnClose() async {
+        let fixture = makeFixture()
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        replaceTopology(fixture, with: [observer, target])
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let added = await fixture.bridge.addMonitorLink(
+            observerSessionID: observerSessionID, rawTargetSessionID: targetSessionID.uuidString
+        )
+        guard case .added = added else { return XCTFail("Expected interactive Add") }
+        XCTAssertNil(fixture.bridge.test_launchEntryState(for: pair))
+        let assertion = await fixture.store.assertionGeneration(for: pair)
+        XCTAssertGreaterThan(assertion, 0)
+        let original = await liveReference(fixture)
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
+        replaceTopology(fixture, with: [observer])
+        await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let replacement = await liveReference(fixture)
+        XCTAssertNotNil(replacement)
+        XCTAssertNotEqual(replacement, original)
+        let token = await fixture.store.token(for: pair)
+        XCTAssertNotNil(token)
+    }
+
+    func testSuccessfulUnlinkBeforeCloseCannotRestoreOnReopen() async throws {
+        let (fixture, observer, target) = try await makeRestoredFixture()
+        let originalReference = await liveReference(fixture)
+        let reference = try XCTUnwrap(originalReference)
+        let stopped = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: observer.domainEndpoint, targetEndpoint: target.domainEndpoint,
+            expectedReference: reference
+        )
+        XCTAssertEqual(stopped, .stopped)
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
+        replaceTopology(fixture, with: [observer])
+        await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let restored = await isRestored(fixture)
+        let token = await fixture.store.token(for: pair)
+        XCTAssertFalse(restored)
+        XCTAssertNil(token)
+    }
+
+    private enum UnlinkSurface: CaseIterable {
+        case exact, legacy, reference
+    }
+
+    private func unlink(
+        _ fixture: Fixture,
+        observer: AgentSessionLinkEndpointCandidate,
+        target: AgentSessionLinkEndpointCandidate,
+        reference: DomainAgentSessionLinkReference,
+        surface: UnlinkSurface
+    ) async -> AgentMonitorStopOutcome? {
+        switch surface {
+        case .exact:
+            return await fixture.bridge.stopMonitorLink(
+                observerEndpoint: observer.domainEndpoint, targetEndpoint: target.domainEndpoint,
+                expectedReference: reference
+            )
+        case .legacy:
+            return await fixture.bridge.stopMonitorLink(
+                observerSessionID: observer.sessionID, targetSessionID: target.sessionID,
+                linkID: reference.linkID, generation: reference.generation
+            )
+        case .reference:
+            await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+            return nil
+        }
+    }
+
+    func testUnlinkAdmittedBeforeCloseRetiresItsParkedIntentAfterGrantRemoval() async throws {
+        for surface in UnlinkSurface.allCases {
+            let (fixture, observer, target) = try await makeRestoredFixture()
+            let original = await liveReference(fixture)
+            let reference = try XCTUnwrap(original)
+            let fence = TestReleaseFence(name: "Unlink admitted before close")
+            fixture.bridge.test_afterStopAdmission = { await fence.enterAndWait() }
+            let stop = Task { @MainActor in
+                await unlink(fixture, observer: observer, target: target, reference: reference, surface: surface)
+            }
+            await fence.waitUntilEntered()
+            fixture.bridge.noteOversightWindowClosing(windowID: 2)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let retired = await fixture.authority.activeGrant(for: reference)
+            let parkedToken = await fixture.store.token(for: pair)
+            XCTAssertNil(retired)
+            XCTAssertNotNil(parkedToken)
+            fixture.bridge.test_afterStopAdmission = nil
+            fence.release()
+            let outcome = await stop.value
+            XCTAssertNil(outcome?.failureMessage)
+            let token = await fixture.store.token(for: pair)
+            XCTAssertNil(token, "An admitted Unlink must forget its exact parked ownership: \(surface)")
+            replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let restored = await isRestored(fixture)
+            XCTAssertFalse(restored)
+        }
+    }
+
+    func testUnlinkFirstInvokedAfterCloseDoesNotCreateSavedOnlyRetirement() async throws {
+        for surface in UnlinkSurface.allCases {
+            let (fixture, observer, target) = try await makeRestoredFixture()
+            let original = await liveReference(fixture)
+            let reference = try XCTUnwrap(original)
+            let savedToken = await fixture.store.token(for: pair)
+            fixture.bridge.noteOversightWindowClosing(windowID: 2)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            _ = await unlink(fixture, observer: observer, target: target, reference: reference, surface: surface)
+            let token = await fixture.store.token(for: pair)
+            XCTAssertEqual(token, savedToken, "No live/admitted relationship exists to unlink: \(surface)")
+            replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let restored = await isRestored(fixture)
+            XCTAssertTrue(restored)
+        }
+    }
+
+    func testSuspendedPreCloseUnlinkCannotRetireReopenedSuccessor() async throws {
+        for surface in UnlinkSurface.allCases {
+            let (fixture, observer, target) = try await makeRestoredFixture()
+            let original = await liveReference(fixture)
+            let reference = try XCTUnwrap(original)
+            let originalToken = await fixture.store.token(for: pair)
+            let fence = TestReleaseFence(name: "old Unlink before successor")
+            fixture.bridge.test_afterStopAdmission = { await fence.enterAndWait() }
+            let stop = Task { @MainActor in
+                await unlink(fixture, observer: observer, target: target, reference: reference, surface: surface)
+            }
+            await fence.waitUntilEntered()
+            fixture.bridge.noteOversightWindowClosing(windowID: 2)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let replacement = await liveReference(fixture)
+            XCTAssertNotNil(replacement)
+            XCTAssertNotEqual(replacement, reference)
+            fixture.bridge.test_afterStopAdmission = nil
+            fence.release()
+            _ = await stop.value
+            let current = await liveReference(fixture)
+            let token = await fixture.store.token(for: pair)
+            XCTAssertEqual(current, replacement)
+            XCTAssertEqual(token, originalToken, "A stale Unlink cannot retire a same-token successor: \(surface)")
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        }
+    }
+
+    func testOldAdmittedUnlinkCannotRetireSuccessorThatHasAlsoClosed() async throws {
+        for surface in UnlinkSurface.allCases {
+            let (fixture, observer, target) = try await makeRestoredFixture()
+            let original = await liveReference(fixture)
+            let reference = try XCTUnwrap(original)
+            let originalToken = await fixture.store.token(for: pair)
+            let originalAssertion = await fixture.store.assertionGeneration(for: pair)
+            let fence = TestReleaseFence(name: "predecessor Unlink through successor close")
+            fixture.bridge.test_afterStopAdmission = { await fence.enterAndWait() }
+            let stop = Task { @MainActor in
+                await unlink(fixture, observer: observer, target: target, reference: reference, surface: surface)
+            }
+            await fence.waitUntilEntered()
+            fixture.bridge.noteOversightWindowClosing(windowID: 2)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let reopened = makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+            replaceTopology(fixture, with: [observer, reopened])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let replacement = await liveReference(fixture)
+            XCTAssertNotNil(replacement)
+            XCTAssertNotEqual(replacement, reference)
+            let reopenedAssertion = await fixture.store.assertionGeneration(for: pair)
+            XCTAssertEqual(reopenedAssertion, originalAssertion, "Automatic relink uses the same assertion.")
+
+            // Park the successor before releasing the original Unlink. Historical membership of
+            // the old reference remains, but only the successor's current capture may retire it.
+            fixture.bridge.noteOversightWindowClosing(windowID: 3)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(3, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            fixture.bridge.test_afterStopAdmission = nil
+            fence.release()
+            _ = await stop.value
+            let token = await fixture.store.token(for: pair)
+            XCTAssertEqual(token, originalToken, "A predecessor Unlink cannot consume the successor's park: \(surface)")
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.lifecycleRevoked))
+            replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 4, sessionID: targetSessionID)])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let next = await liveReference(fixture)
+            XCTAssertNotNil(next)
+            XCTAssertNotEqual(next, replacement)
+        }
+    }
+
+    func testAdmittedCloseUnlinkCannotCompensateAwayNewerSameTokenAssertion() async throws {
+        for surface in UnlinkSurface.allCases {
+            let (fixture, observer, target) = try await makeRestoredFixture()
+            let original = await liveReference(fixture)
+            let reference = try XCTUnwrap(original)
+            let originalToken = await fixture.store.token(for: pair)
+            let originalAssertion = await fixture.store.assertionGeneration(for: pair)
+            let fence = TestReleaseFence(name: "old Unlink before same-token assertion")
+            fixture.bridge.test_afterStopAdmission = { await fence.enterAndWait() }
+            let stop = Task { @MainActor in
+                await unlink(fixture, observer: observer, target: target, reference: reference, surface: surface)
+            }
+            await fence.waitUntilEntered()
+            fixture.bridge.noteOversightWindowClosing(windowID: 2)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            // Model the assertion committing before its interactive notification arrives. The store
+            // assertion fence itself must deny this stale retirement, without a compensation retry.
+            let reassertion = await fixture.store.insert(pair)
+            XCTAssertEqual(reassertion.outcome, .unchanged)
+            let assertion = await fixture.store.assertionGeneration(for: pair)
+            XCTAssertGreaterThan(assertion, originalAssertion)
+            fixture.bridge.test_afterStopAdmission = nil
+            fence.release()
+            _ = await stop.value
+            let token = await fixture.store.token(for: pair)
+            XCTAssertEqual(token, originalToken)
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.lifecycleRevoked))
+            XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        }
+    }
+
+    func testAdmittedUnlinkCannotRetireSameReferenceReassertedBeforeClose() async throws {
+        for surface in UnlinkSurface.allCases {
+            let (fixture, observer, target) = try await makeRestoredFixture()
+            let original = await liveReference(fixture)
+            let reference = try XCTUnwrap(original)
+            let originalToken = await fixture.store.token(for: pair)
+            let originalAssertion = await fixture.store.assertionGeneration(for: pair)
+            let fence = TestReleaseFence(name: "admitted Unlink before successful reassertion")
+            fixture.bridge.test_afterStopAdmission = { await fence.enterAndWait() }
+            let stop = Task { @MainActor in
+                await unlink(fixture, observer: observer, target: target, reference: reference, surface: surface)
+            }
+            await fence.waitUntilEntered()
+            let readded = await fixture.bridge.addMonitorLink(
+                observerSessionID: observerSessionID, rawTargetSessionID: targetSessionID.uuidString
+            )
+            guard case .alreadyLinked = readded else {
+                fixture.bridge.test_afterStopAdmission = nil
+                fence.release()
+                _ = await stop.value
+                return XCTFail("Expected same-reference explicit reassertion")
+            }
+            let assertion = await fixture.store.assertionGeneration(for: pair)
+            let reassertedReference = await liveReference(fixture)
+            XCTAssertGreaterThan(assertion, originalAssertion)
+            XCTAssertEqual(reassertedReference, reference)
+            fixture.bridge.noteOversightWindowClosing(windowID: 2)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            fixture.bridge.test_afterStopAdmission = nil
+            fence.release()
+            _ = await stop.value
+            let token = await fixture.store.token(for: pair)
+            XCTAssertEqual(token, originalToken)
+            replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let restored = await isRestored(fixture)
+            XCTAssertTrue(restored, "Only the newer assertion owns this close capture: \(surface)")
+        }
+    }
+
+    func testRawUnlinkAdmittedBeforeCloseReportsFailedRemovalAndRetriesExactIntent() async throws {
+        let (fixture, observer, _) = try await makeRestoredFixture()
+        let original = await liveReference(fixture)
+        let reference = try XCTUnwrap(original)
+        let savedToken = await fixture.store.token(for: pair)
+        let fence = TestReleaseFence(name: "raw Unlink before close and failed write")
+        fixture.bridge.test_afterStopAdmission = { await fence.enterAndWait() }
+        let stop = Task { @MainActor in
+            await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        }
+        await fence.waitUntilEntered()
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
+        replaceTopology(fixture, with: [observer])
+        await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        fixture.gate.failsNextWrites = true
+        fixture.bridge.test_afterStopAdmission = nil
+        fence.release()
+        await stop.value
+        let afterFailure = await fixture.store.token(for: pair)
+        XCTAssertEqual(afterFailure, savedToken)
+        XCTAssertTrue(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        XCTAssertEqual(
+            fixture.bridge.currentPersistencePresentation.warnings.map(\.id),
+            [AgentSessionOversightWarningID.cleanupFailed]
+        )
+        let reopened = makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+        replaceTopology(fixture, with: [observer, reopened])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let beforeRetry = await isRestored(fixture)
+        XCTAssertFalse(beforeRetry, "Explicit Unlink cleanup must not reauthorize on reopen")
+        fixture.gate.failsNextWrites = false
+        await fixture.bridge.retryPendingIntentCleanup()
+        let afterRetry = await fixture.store.token(for: pair)
+        XCTAssertNil(afterRetry)
+        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let restored = await isRestored(fixture)
+        XCTAssertFalse(restored)
+        XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+    }
+
+    func testReopenedPendingCandidateRetainsParkingAcrossAnotherClose() async throws {
+        for unbound in [false, true] {
+            let (fixture, observer, _) = try await makeRestoredFixture()
+            let original = await liveReference(fixture)
+            let savedToken = await fixture.store.token(for: pair)
+            fixture.bridge.noteOversightWindowClosing(windowID: 2)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let reopened = makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+            guard case let .authoritative(bindingToken, _) = reopened.restorationReadiness else {
+                return XCTFail("Expected an authoritative fixture")
+            }
+            let pending = withReadiness(reopened, unbound ? .unbound : .pending(bindingToken))
+            replaceTopology(fixture, with: [observer, pending])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID]])
+            let beforeClose = await isRestored(fixture)
+            XCTAssertFalse(beforeClose)
+            fixture.bridge.noteOversightWindowClosing(windowID: 3)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(3, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let afterClose = await fixture.store.token(for: pair)
+            XCTAssertEqual(afterClose, savedToken)
+            let final = makeReadyCandidate(windowID: 4, sessionID: targetSessionID)
+            fixture.host.descriptors = [descriptor(for: observer), descriptor(for: final)]
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID], [targetSessionID]])
+            replaceTopology(fixture, with: [observer, final])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let replacement = await liveReference(fixture)
+            XCTAssertNotNil(replacement)
+            XCTAssertNotEqual(replacement, original)
+            let inventory = await fixture.authority.links(forObserver: observerSessionID)
+            XCTAssertEqual(inventory.items.map(\.targetSessionID), [targetSessionID])
+            XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+        }
+    }
+
+    func testSequentialClosesRearmBothPreviouslyHydratedAndReopenedBackgroundTabs() async throws {
+        for order in [[1, 2], [2, 1]] {
+            try seedSavedPair()
+            let fixture = makeFixture()
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+            let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+            fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let bothSessions: Set<UUID> = [observerSessionID, targetSessionID]
+            XCTAssertEqual(fixture.host.hydrationRequests, [bothSessions])
+            replaceTopology(fixture, with: [observer, target])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let original = await liveReference(fixture)
+            XCTAssertNotNil(original)
+            for windowID in order {
+                fixture.bridge.noteOversightWindowClosing(windowID: windowID)
+                let surviving = fixture.host.candidates.filter { $0.windowID != windowID }
+                replaceTopology(fixture, with: surviving)
+                await fixture.bridge.invalidateWindow(windowID, reason: .windowClosed)
+                await fixture.bridge.test_settleLaunchReconciliation()
+            }
+            let reopenedObserver = makeReadyCandidate(windowID: 3, sessionID: observerSessionID)
+            let reopenedTarget = makeReadyCandidate(windowID: 4, sessionID: targetSessionID)
+            fixture.host.descriptors = [descriptor(for: reopenedObserver), descriptor(for: reopenedTarget)]
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.host.hydrationRequests, [bothSessions, bothSessions])
+
+            // A background tab can close again while parked; both still-cold endpoints stay eligible.
+            fixture.bridge.noteOversightWindowClosing(windowID: 3)
+            fixture.host.descriptors = [descriptor(for: reopenedTarget)]
+            await fixture.bridge.invalidateWindow(3, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let finalObserver = makeReadyCandidate(windowID: 5, sessionID: observerSessionID)
+            fixture.host.descriptors = [descriptor(for: finalObserver), descriptor(for: reopenedTarget)]
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.host.hydrationRequests, [bothSessions, bothSessions, bothSessions])
+            replaceTopology(fixture, with: [finalObserver, reopenedTarget])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let replacement = await liveReference(fixture)
+            XCTAssertNotNil(replacement)
+            XCTAssertNotEqual(replacement, original)
+            let inventory = await fixture.authority.links(forObserver: observerSessionID)
+            XCTAssertEqual(inventory.items.map(\.targetSessionID), [targetSessionID])
+            XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+        }
+    }
+
+    func testParkedDeletionCannotRestoreAndFailedCleanupRemainsRetryable() async throws {
+        for failsWrite in [false, true] {
+            AgentSessionDeletionRegistry.shared.test_reset()
+            let (fixture, observer, _) = try await makeRestoredFixture()
+            fixture.bridge.attach(host: fixture.host)
+            fixture.bridge.noteOversightWindowClosing(windowID: 2)
+            replaceTopology(fixture, with: [observer])
+            await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            fixture.gate.failsNextWrites = failsWrite
+            let deletion = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: targetSessionID)
+            await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(deletion)
+            replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let restored = await isRestored(fixture)
+            XCTAssertFalse(restored)
+            XCTAssertEqual(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry, failsWrite)
+            fixture.gate.failsNextWrites = false
+            await fixture.bridge.retryPendingIntentCleanup()
+            let token = await fixture.store.token(for: pair)
+            XCTAssertNil(token)
+            XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        }
+    }
+
+    func testReopenedDescriptorOnlyTabRearmsHydrationAndDuplicatesStayParked() async throws {
+        try seedSavedPair()
+        let fixture = makeFixture()
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        fixture.host.candidates = [observer]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID]])
+        replaceTopology(fixture, with: [observer, target])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
+        replaceTopology(fixture, with: [observer])
+        await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+        await fixture.bridge.test_settleLaunchReconciliation()
+
+        let reopened = makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: reopened)]
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID], [targetSessionID]])
+        let duplicate = makeReadyCandidate(windowID: 4, sessionID: targetSessionID)
+        replaceTopology(fixture, with: [observer, reopened, duplicate])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let whileDuplicated = await isRestored(fixture)
+        let saved = await fixture.store.token(for: pair)
+        XCTAssertFalse(whileDuplicated)
+        XCTAssertNotNil(saved)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.lifecycleRevoked))
+        replaceTopology(fixture, with: [observer, reopened])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let restored = await isRestored(fixture)
+        XCTAssertTrue(restored)
+        XCTAssertEqual(fixture.host.hydrationRequests.count, 2)
+    }
+
+    func testLatePreCloseInvalidationCannotRemoveSameTokenReopenedGrant() async throws {
+        let (fixture, observer, target) = try await makeRestoredFixture()
+        let originalToken = await fixture.store.token(for: pair)
+        let fence = TestReleaseFence(name: "old lifecycle settlement")
+        fixture.bridge.test_beforeDurableIntentSettlement = { _ in await fence.enterAndWait() }
+        let invalidation = Task { @MainActor in
+            await fixture.bridge.invalidate(endpoint: target.domainEndpoint, reason: .targetEndpointInvalidated)
+        }
+        await fence.waitUntilEntered()
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
+        replaceTopology(fixture, with: [observer])
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let reopened = makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+        replaceTopology(fixture, with: [observer, reopened])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let replacement = await liveReference(fixture)
+        XCTAssertNotNil(replacement)
+        fixture.bridge.test_beforeDurableIntentSettlement = nil
+        fence.release()
+        await invalidation.value
+        let token = await fixture.store.token(for: pair)
+        let current = await liveReference(fixture)
+        XCTAssertEqual(token, originalToken)
+        XCTAssertEqual(current, replacement)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+    }
+
+    func testAlreadySubmittedRemovalCannotBeAdoptedByLateWindowClose() async throws {
+        let (fixture, observer, target) = try await makeRestoredFixture()
+        let fence = TestReleaseFence(name: "committed removal before receipt callback")
+        fixture.bridge.test_afterDurableIntentRemoval = { await fence.enterAndWait() }
+        let invalidation = Task { @MainActor in
+            await fixture.bridge.invalidate(endpoint: target.domainEndpoint, reason: .targetEndpointInvalidated)
+        }
+        await fence.waitUntilEntered()
+        let removedToken = await fixture.store.token(for: pair)
+        XCTAssertNil(removedToken, "This removal was already submitted before close and cannot be retracted.")
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
+        replaceTopology(fixture, with: [observer])
+        fixture.bridge.test_afterDurableIntentRemoval = nil
+        fence.release()
+        await invalidation.value
+        await fixture.bridge.test_settleLaunchReconciliation()
+        replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let restored = await isRestored(fixture)
+        XCTAssertFalse(restored)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.lifecycleRevoked))
+        XCTAssertTrue(fixture.bridge.currentPersistencePresentation.warnings.isEmpty)
+    }
+
+    func testSuspendedActiveAuditCannotRetireCloseParkedOwnership() async throws {
+        let (fixture, observer, _) = try await makeRestoredFixture()
+        let originalToken = await fixture.store.token(for: pair)
+        let fence = TestReleaseFence(name: "audit before exact runtime revocation")
+        fixture.bridge.test_beforeLaunchAuditRevocation = { await fence.enterAndWait() }
+        replaceTopology(fixture, with: [observer])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fence.waitUntilEntered()
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
+        fixture.bridge.test_beforeLaunchAuditRevocation = nil
+        fence.release()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let parkedToken = await fixture.store.token(for: pair)
+        XCTAssertEqual(parkedToken, originalToken)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.lifecycleRevoked))
+        XCTAssertTrue(fixture.bridge.currentPersistencePresentation.warnings.isEmpty)
+        replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let restored = await isRestored(fixture)
+        XCTAssertTrue(restored)
+    }
+
+    func testCloseDuringReservationOrActivationCannotLetProofRollbackForgetIntent() async throws {
+        for afterActivation in [false, true] {
+            try seedSavedPair()
+            let fixture = makeFixture()
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+            let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+            replaceTopology(fixture, with: [observer, target])
+            let fence = TestReleaseFence(name: "establishment before close")
+            if afterActivation {
+                fixture.bridge.test_afterActivationBeforeDeletionFence = { _ in await fence.enterAndWait() }
+            } else {
+                fixture.bridge.test_afterReservationBeforeActivation = { _ in await fence.enterAndWait() }
+            }
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fence.waitUntilEntered()
+            fixture.bridge.noteOversightWindowClosing(windowID: 2)
+            replaceTopology(fixture, with: [observer])
+            fixture.bridge.test_afterReservationBeforeActivation = nil
+            fixture.bridge.test_afterActivationBeforeDeletionFence = nil
+            fence.release()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let parked = await fixture.store.token(for: pair)
+            XCTAssertNotNil(parked)
+            let whileClosed = await isRestored(fixture)
+            XCTAssertFalse(whileClosed, "Captured ownership preserves intent, never reservation/grant authority.")
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.lifecycleRevoked))
+            replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let restored = await isRestored(fixture)
+            XCTAssertTrue(restored)
+        }
+    }
+
+    func testCloseDuringEarlierPairsSuspendedPassRestartsBeforeRearmingLaterPair() async throws {
+        observerSessionID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+        targetSessionID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000003"))
+        let earlierTargetID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+        let earlierPair = AgentSessionOversightIntent(
+            observerSessionID: observerSessionID, targetSessionID: earlierTargetID
+        )
+        try seedSavedPair([earlierPair])
+        let fixture = makeFixture()
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        let earlierTarget = makeReadyCandidate(windowID: 3, sessionID: earlierTargetID)
+        fixture.host.candidates = [observer, target]
+        fixture.host.descriptors = [observer, target, earlierTarget].map { descriptor(for: $0) }
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: earlierPair), .waiting)
+
+        let fence = TestReleaseFence(name: "earlier pair establishing")
+        fixture.bridge.test_afterReservationBeforeActivation = { reservedPair in
+            if reservedPair == earlierPair { await fence.enterAndWait() }
+        }
+        replaceTopology(fixture, with: [observer, target, earlierTarget])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fence.waitUntilEntered()
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
+        replaceTopology(fixture, with: [observer, earlierTarget])
+        fixture.bridge.test_afterReservationBeforeActivation = nil
+        fence.release()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let parkedToken = await fixture.store.token(for: pair)
+        XCTAssertNotNil(parkedToken, "The pre-close pass snapshot must not spend the reopen allowance.")
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.lifecycleRevoked))
+        replaceTopology(fixture, with: [
+            observer, earlierTarget, makeReadyCandidate(windowID: 4, sessionID: targetSessionID)
+        ])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let restored = await isRestored(fixture)
+        XCTAssertTrue(restored)
+    }
+
+    func testFailedReopenEstablishmentDoesNotRetryOnOrdinaryEvents() async throws {
+        let (fixture, observer, _) = try await makeRestoredFixture()
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
+        replaceTopology(fixture, with: [observer])
+        await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let reopened = makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+        replaceTopology(fixture, with: [observer, reopened])
+        fixture.bridge.test_beforeSynchronousSeed = { fixture.host.candidates = [observer] }
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.activationFailed))
+        fixture.bridge.test_beforeSynchronousSeed = nil
+        replaceTopology(fixture, with: [observer, reopened])
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let restored = await isRestored(fixture)
+        let token = await fixture.store.token(for: pair)
+        XCTAssertFalse(restored)
+        XCTAssertNil(token)
+    }
+
+    func testCleanupAndSameTokenReassertionDisplaceCloseOwnership() async throws {
+        try seedSavedPair()
+        let fixture = makeFixture()
+        let loadResult = await fixture.store.loadForLaunch()
+        guard case let .ready(load) = loadResult else { return XCTFail("Expected a ready manifest") }
+        let token = try XCTUnwrap(load.tokenByPair[pair])
+        let reference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
+        let coordinator = AgentSessionOversightLaunchCoordinator()
+        coordinator.loadLaunchEntries(load, automaticRestoreEnabled: true)
+        coordinator.noteWindowClose(
+            pair: pair, token: token, assertedAt: 0, reference: reference
+        )
+        XCTAssertFalse(coordinator.permitsRemoval(pair: pair, token: token))
+        coordinator.noteCleanupPending(pair: pair, token: token, assertedAt: 0)
+        XCTAssertTrue(coordinator.permitsRemoval(pair: pair, token: token), "Committed deletion must remain retryable.")
+        XCTAssertFalse(coordinator.preservesClosedReference(reference, pair: pair, token: token, assertedAt: 0))
+        coordinator.noteWindowClose(
+            pair: pair, token: token, assertedAt: 0, reference: reference
+        )
+        XCTAssertEqual(coordinator.state(for: pair), .cleanupPending(token), "Close cannot adopt an unrelated cleanup.")
+        coordinator.noteInteractiveTokenChange(pair: pair, token: token, assertedAt: 1)
+        coordinator.noteCleanupPending(pair: pair, token: token, assertedAt: 0)
+        coordinator.noteRevocation(pair: pair, assertedAt: 0, preservesIntent: false)
+        XCTAssertEqual(coordinator.state(for: pair), .active, "Old callbacks cannot replace a same-token successor.")
+        XCTAssertFalse(coordinator.preservesClosedReference(reference, pair: pair, token: token, assertedAt: 1))
+        await coordinator.settle()
     }
 
     // MARK: - Barriers
@@ -412,10 +1265,10 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             "Only the unhydrated endpoint of the saved pair is asked to load."
         )
 
-        // Further events before the load lands must not re-request it.
+        // Dispatch history cannot prove loading: external events re-read current readiness.
         fixture.bridge.noteCandidateReadinessChanged()
         await fixture.bridge.test_settleLaunchReconciliation()
-        XCTAssertEqual(fixture.host.hydrationRequests.count, 1)
+        XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID], [targetSessionID]])
 
         // The requested load lands: the tab becomes a live authoritative candidate.
         let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
@@ -634,6 +1487,9 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         token = await fixture.store.token(for: pair)
         XCTAssertNotNil(token, "A failed load may be transient and must not discard the intent.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID]], "Terminal loads must not be retried")
 
         fixture.host.candidates = [observer, target]
         fixture.bridge.noteCandidateReadinessChanged()
@@ -716,16 +1572,16 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             "The identity must be unchanged, or the resolver would have caught this on its own."
         )
         fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
-        // Call 1 is the coordinator's classification; every later call is the shared path resolving.
-        fixture.host.candidatesByCall = { call in
-            call == 1 ? [observer, target] : [observer, rehydrating]
-        }
+        fixture.host.candidates = [observer, target]
+        fixture.host.candidatesAfterClassification = [observer, rehydrating]
 
         await fixture.bridge.bootstrapIntentStore(fixture.store)
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let restored = await isRestored(fixture)
         XCTAssertFalse(restored, "An unproven incarnation must never be reauthorized.")
+        XCTAssertEqual(fixture.host.classificationHandoffCount, 1)
+        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
         XCTAssertEqual(
             fixture.bridge.test_launchEntryState(for: pair),
             .terminal(.activationFailed)
@@ -750,9 +1606,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
                 ? withReadiness(observer, .terminal(observerToken, .loadFailed)) : observer
             fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
             // Classification sees completed payloads; the shared path sees their supersession.
-            fixture.host.candidatesByCall = { call in
-                call == 1 ? [observer, target] : [currentObserver, superseded]
-            }
+            fixture.host.candidates = [observer, target]
+            fixture.host.candidatesAfterClassification = [currentObserver, superseded]
 
             await fixture.bridge.bootstrapIntentStore(fixture.store)
             await fixture.bridge.test_settleLaunchReconciliation()
@@ -760,6 +1615,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             let restored = await isRestored(fixture)
             let token = await fixture.store.token(for: pair)
             XCTAssertFalse(restored)
+            XCTAssertEqual(fixture.host.classificationHandoffCount, 1)
             XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
             XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
             XCTAssertNotNil(token)
@@ -859,6 +1715,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let whileWaiting = await fixture.store.token(for: pair)
         XCTAssertNotNil(whileWaiting)
 
+        fixture.bridge.noteOversightWindowClosing(windowID: 2)
         fixture.host.descriptors = [descriptor(for: observer)]
         await fixture.bridge.invalidateBinding(windowID: 2, tabID: lazyTabID, reason: .tabClosed)
         await fixture.bridge.test_settleLaunchReconciliation()

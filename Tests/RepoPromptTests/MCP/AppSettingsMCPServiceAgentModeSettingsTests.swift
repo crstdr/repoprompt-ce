@@ -703,11 +703,11 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
                 ),
                 for: .cursor
             )
-            // A discovered catalog need not contain "auto"; don't append historical models.
+            // Fork policy retains its parameter-free Auto identity alongside discovered models.
             try await assertContextBuilderModelOptions(
                 service: service,
                 agent: .cursor,
-                expectedModels: Set(discoveredModels)
+                expectedModels: Set(["auto"] + discoveredModels)
             )
         }
     }
