@@ -2477,12 +2477,20 @@ struct AgentModeChatDetailView: View {
         } else if let approval = runInteractionSnapshot.pendingApproval {
             AgentApprovalCard(
                 request: approval,
+                allowsRememberedDecision: agentModeVM.codexRememberedApprovalAllowed(for: currentTabID),
                 onDecision: { decision in
                     guard let tabID = currentTabID else { return }
                     agentModeVM.submitApprovalDecision(tabID: tabID, requestID: approval.id, decision: decision)
                 }
             )
             .id("pendingApproval")
+            .transition(.opacity)
+        } else if let request = runInteractionSnapshot.pendingPermissionsRequest {
+            AgentPermissionsApprovalCard(request: request, onDecision: { decision in
+                guard let tabID = currentTabID else { return }
+                agentModeVM.submitPermissionsDecision(tabID: tabID, requestID: request.id, decision: decision)
+            })
+            .id("pendingPermissions")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingMCPElicitationRequest {
             AgentMCPElicitationCard(
