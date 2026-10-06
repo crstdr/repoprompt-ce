@@ -1,5 +1,5 @@
 {
-  "description": "Oversight projection refresh port: measured upstream/main e5eca35bf8321effbec68961d81fb20e8bbdb567 app baseline 602511 plus exact port delta 63 = 602574, with zero app-line headroom. Other metrics and upstream advisory enforcement remain unchanged.",
+  "description": "Oversight projection refresh port: measured upstream/main 9d7a625438409b76f50ecae8ec4f0ebf28f8a064 app baseline 602839 plus exact port delta 63 = 602902, with zero app-line headroom. Other metrics and upstream advisory enforcement remain unchanged.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -24,7 +24,7 @@
     "app_shared_accessor_uses": 1218,
     "app_static_shared_declarations": 89,
     "app_target_swift_files": 1126,
-    "app_target_swift_lines": 602574,
+    "app_target_swift_lines": 602902,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1079,
     "first_party_swift_lines": 747202,
