@@ -184,8 +184,9 @@ struct AgentSessionRow: View {
     /// generation-bearing target immediately before writing and returns `false` when it went stale,
     /// so a stale row performs zero clipboard writes and shows no false success.
     var onCopySessionID: (() -> Bool)?
-    /// Re-resolves the exact current target projection whenever SwiftUI materializes either menu.
-    /// A frozen props value would make an available observer actionable after it closed or rebound.
+    /// Bounded current row facts for rendering, never the full available choices.
+    var resolveSidebarOversightSummary: (@MainActor () -> AgentSidebarOversightSummary?)?
+    /// Fresh full choices at activation; action handlers revalidate captured exact identities.
     var resolveSidebarOversightMenu: (@MainActor () -> AgentSidebarOversightMenuProps?)?
     var diagnoseSidebarOversightMenuUnavailable: (@MainActor () -> Void)?
     var prepareSidebarOversightMenu: (@MainActor () -> Void)?
@@ -309,7 +310,7 @@ struct AgentSessionRow: View {
     var showsDisabledOversightContextSubmenus: Bool {
         allowsDirectMutations
             && sidebarOversightUnavailableReason != nil
-            && presentableSidebarOversightMenu == nil
+            && resolveSidebarOversightSummary?() == nil
     }
 
     private func currentContextMenuSnapshot() -> ContextMenuSnapshot {
@@ -1004,11 +1005,11 @@ struct AgentSessionRow: View {
     /// so it can never offer a mutation the row forbids.
     @ViewBuilder
     private func oversightMark(
-        menu: AgentSidebarOversightMenuProps?,
+        summary: AgentSidebarOversightSummary?,
         tooltip: String,
         interactive: Bool
     ) -> some View {
-        if interactive, let menu {
+        if interactive, let summary {
             // A menu label image template-renders, which would flatten the palette
             // colours (and the two-tone/count colours) to the control tint — and to white on
             // selected rows. The coloured glyph therefore stays ordinary content underneath a
@@ -1028,7 +1029,7 @@ struct AgentSessionRow: View {
                         Color.clear.contentShape(Rectangle())
                     }
                     .accessibilityLabel(tooltip)
-                    .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+                    .accessibilityValue(summary.accessibilityValue)
                 }
                 .fixedSize()
         } else {
@@ -1090,7 +1091,7 @@ struct AgentSessionRow: View {
     }
 
     var body: some View {
-        let sidebarOversightMenu = resolveSidebarOversightMenu?()
+        let sidebarOversightSummary = resolveSidebarOversightSummary?()
         let sidebarOversightTargetEndpoint = resolveSidebarOversightTargetEndpoint?()
         HStack(spacing: rowSpacing) {
             if showsSelectionPresentation {
@@ -1135,7 +1136,7 @@ struct AgentSessionRow: View {
                     // plate keeps carrying the dot/chevron run state ahead of it.
                     if oversightRole.hasMark {
                         oversightMark(
-                            menu: sidebarOversightMenu,
+                            summary: sidebarOversightSummary,
                             tooltip: oversightMarkTooltip(),
                             interactive: allowsDirectMutations
                                 && onAddSidebarOversight != nil

@@ -8,13 +8,13 @@ import RepoPromptDomainRuntime
 /// or activates a window: resolution, snapshotting, and observation are strictly read-only with
 /// respect to window state.
 extension WindowStatesManager: AgentSessionLinkEndpointHost {
-    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+    func agentSessionLinkCandidates(includeLocation: Bool) -> [AgentSessionLinkEndpointCandidate] {
         guard !isTerminating else { return [] }
         var candidates: [AgentSessionLinkEndpointCandidate] = []
         for window in allWindows where !window.isClosing {
             guard modelRoutingWindow(withID: window.windowID) === window else { continue }
             candidates.append(
-                contentsOf: window.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false)
+                contentsOf: window.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false, includeLocation: includeLocation)
             )
         }
         return candidates
@@ -28,13 +28,6 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
 
     func agentSessionLinkSheetWindow(windowID: Int) -> NSWindow? {
         allWindows.first(where: { $0.windowID == windowID })?.nsWindow
-    }
-
-    func agentSessionLinkPublishedSidebarMenu(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSidebarOversightMenuProps? {
-        guard let window = modelRoutingWindow(withID: endpoint.windowID),
-              let candidate = window.agentModeViewModel.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { return nil }
-        return window.agentModeViewModel.monitorPillPropsByEndpoint[endpoint]?.sidebarOversightMenu?
-            .withSubjectEligibility(for: candidate)
     }
 
     func agentSessionLinkCandidate(

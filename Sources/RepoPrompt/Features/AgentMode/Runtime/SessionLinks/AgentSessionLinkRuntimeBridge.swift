@@ -31,10 +31,6 @@ enum AgentSessionLinkModelOutcome {
 }
 
 extension AgentSessionLinkEndpointHost {
-    func agentSessionLinkPublishedSidebarMenu(for _: DomainAgentSessionLinkEndpointIdentity) -> AgentSidebarOversightMenuProps? {
-        nil
-    }
-
     func agentSessionLinkModelAvailability(windowID _: Int) -> AgentModelCatalog.AvailabilityContext {
         .none
     }
@@ -127,15 +123,12 @@ struct AgentSessionLinkForkInheritanceSummary: Equatable {
 @MainActor
 protocol AgentSessionLinkEndpointHost: AnyObject {
     /// All live compose-tab/session bindings across every non-closing window.
-    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate]
+    func agentSessionLinkCandidates(includeLocation: Bool) -> [AgentSessionLinkEndpointCandidate]
 
     /// The `NSWindow` hosting a logical window ID, for alerts that should present as a sheet.
     /// Lets Feature-layer UI reach a concrete window without touching App-layer types directly.
     /// Default `nil` — hosts that do not own real windows present app-modally instead.
     func agentSessionLinkSheetWindow(windowID: Int) -> NSWindow?
-
-    /// Status passes reuse the existing published complete menu; topology/presentation owns choices.
-    func agentSessionLinkPublishedSidebarMenu(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSidebarOversightMenuProps?
 
     /// Fresh MainActor reads, without hydration, focus changes, or full candidate discovery.
     func agentSessionLinkCandidate(
@@ -529,6 +522,11 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    /// Full choice discovery remains rich by default; cheap topology discovery is explicit.
+    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+        agentSessionLinkCandidates(includeLocation: true)
+    }
+
     func agentSessionLinkClaimLaneRetirement(endpoint _: DomainAgentSessionLinkEndpointIdentity) -> UUID? {
         nil
     }
@@ -1089,7 +1087,8 @@ final class AgentSessionLinkRuntimeBridge {
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
         // Every live target menu can include this name among linked/available peers. Repaint from
         // cached membership in the existing coalesced UI-only lane, never the authoritative lane.
-        requestMonitorProjectionRefresh(forExactObserverEndpoints: creatorNames.liveEndpoints)
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: creatorNames.liveEndpoints.intersection(menuCatalog?.endpoints ?? []))
+        notifyCandidateAvailabilityChanged()
     }
 
     private func settleCreatorNames(_ candidates: [AgentSessionLinkEndpointCandidate]) {
@@ -1206,6 +1205,10 @@ final class AgentSessionLinkRuntimeBridge {
     private var changeFeedTask: Task<Void, Never>?
     private var inboundAdvertisementCountByTargetSession: [UUID: Int] = [:]
     private var refreshTask: Task<Void, Never>?
+    // Derived UI inputs only. The coalesced authoritative refresh lane is the sole installer.
+    private var menuCatalog: DomainAgentSessionLinkPresentationSnapshot?
+    private var projectedEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
+    private var candidateAvailabilityNotificationPending = false
     private var pendingRefreshScope: ProjectionRefreshScope?
     /// Exact target incarnations whose effective location label changed and whose observers still
     /// have to be repainted. Coalesced: a burst of worktree/branch/workspace edits costs one pass.
@@ -1217,6 +1220,22 @@ final class AgentSessionLinkRuntimeBridge {
     private var bindingChangeCancellable: AnyCancellable?
 
     #if DEBUG
+        var test_afterPresentationSnapshot: (@MainActor () async -> Void)?
+        /// Fault injection for native tracking tests: hide coherent UI inputs without installing
+        /// another catalog or blocking AppKit's nested run loop on an async authority turn.
+        var test_menuCatalogUnavailable = false
+
+        func test_settleCandidateAvailabilityNotifications() async {
+            while candidateAvailabilityNotificationPending {
+                await Task.yield()
+            }
+        }
+
+        func test_enqueueProjectionRefresh(sessionIDs: Set<UUID>) {
+            let scope = ProjectionRefreshScope.sessions(sessionIDs)
+            pendingRefreshScope = pendingRefreshScope?.merged(with: scope) ?? scope
+        }
+
         /// Runs after the terminal survivor authority hop, before release to the observer.
         var test_afterTerminalWaitSurvivorAuthorityValidation: (@MainActor () -> Void)?
         /// Parks managed prompt projection after authority validation and before release.
@@ -1275,6 +1294,7 @@ final class AgentSessionLinkRuntimeBridge {
     // MARK: - Attachment
 
     func attach(host: AgentSessionLinkEndpointHost) {
+        if self.host !== host { invalidateMenuCatalog() }
         self.host = host
         AgentSessionLinkInvalidationSink.invalidateBinding = { [weak self] windowID, tabID, reason in
             guard let self else { return }
@@ -1309,6 +1329,9 @@ final class AgentSessionLinkRuntimeBridge {
         // late window from losing all three; attach itself still restores nothing.
         host.agentSessionLinkPublishPersistencePresentation(persistencePresentation)
         noteTopologyMayHaveChanged()
+        Task { @MainActor [weak self] in
+            await self?.requestProjectionRefresh()
+        }
     }
 
     /// Qualifies passive row preparation without inventing an endpoint or accepting duplicate claims.
@@ -1373,10 +1396,9 @@ final class AgentSessionLinkRuntimeBridge {
             let observers = await authority.links(forTarget: targetSessionID).items.map(\.observerSessionID)
             return .sessions(Set(observers))
         case .activated, .revoked:
-            // Every target menu intersects live candidates with the authority-wide set of exact
-            // endpoints holding outbound grants. A membership change can cross an observer's 0↔1
-            // boundary and therefore change availability in otherwise unrelated target rows.
-            return .full
+            // Unlinked rows derive choices at opening. Only this pair needs authoritative writes;
+            // catalog-key removals (including unrelated notice eviction) are reconciled by the pass.
+            return .sessions(Set([event.observerSessionID, event.targetSessionID].compactMap(\.self)))
         case .draining, .shutdown:
             return .full
         }
@@ -1607,9 +1629,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// exists to keep.
     private func auditObserverEligibility() async {
         guard !isFrozenForTermination, let host else { return }
-        let live = host.agentSessionLinkCandidates()
         for endpoint in knownObserverEndpoints {
-            guard let candidate = live.first(where: { $0.domainEndpoint == endpoint }) else { continue }
+            guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { continue }
             guard AgentSessionLinkEndpointEligibility.observerOperationEligibility(
                 candidate.eligibilityInput,
                 roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
@@ -1726,6 +1747,8 @@ final class AgentSessionLinkRuntimeBridge {
         pendingMonitorTargetEndpoints.removeAll()
         pendingMonitorObserverEndpoints.removeAll()
         monitorSeenByReference.removeAll()
+        menuCatalog = nil
+        projectedEndpoints.removeAll()
         // Queued sends die with the process by design. They are pre-authorization for a delivery the
         // user is not present for, and quitting ends the turn that authorized them; nothing about a
         // queued message is expected back next launch.
@@ -3109,7 +3132,8 @@ final class AgentSessionLinkRuntimeBridge {
                 observerEndpoint: observerEndpoint,
                 targetEndpoint: targetEndpoint
             )
-            await requestProjectionRefresh()
+            await sweepKnownEndpointsForMembershipRefresh()
+            await requestProjectionRefresh(.sessions([observerEndpoint.sessionID, targetEndpoint.sessionID]))
             guard await tokenIsCurrent(token) else {
                 await revoke(reference: reference, settlesDurableIntent: false)
                 return EstablishmentResult(outcome: .rejected(message: Self.retiredMessage))
@@ -3344,7 +3368,8 @@ final class AgentSessionLinkRuntimeBridge {
         // Otherwise this activation joined a record whose live chain already owns the dedupe state;
         // overwriting it would discard that chain's next publication.
 
-        await requestProjectionRefresh()
+        await sweepKnownEndpointsForMembershipRefresh()
+        await requestProjectionRefresh(.sessions([observerEndpoint.sessionID, targetEndpoint.sessionID]))
         if activation.installsTargetObservation {
             let targetHoldsOutboundLink = await authority.hasActiveOutboundLink(
                 observerEndpoint: targetEndpoint
@@ -3836,6 +3861,15 @@ final class AgentSessionLinkRuntimeBridge {
         await requestProjectionRefresh()
     }
 
+    /// Membership used to refresh full topology, which also settled disappeared grants/input
+    /// owners. Retain that lifecycle fence without discovering or projecting unrelated chats.
+    private func sweepKnownEndpointsForMembershipRefresh() async {
+        guard let host else { return }
+        let endpoints = knownObserverEndpoints.union(knownTargetEndpoints).union(localInputGenerations.keys)
+        let live = endpoints.compactMap { host.agentSessionLinkCandidate(for: $0, includeLocation: false) }
+        await sweepStaleEndpoints(liveCandidates: live)
+    }
+
     /// Revokes every known endpoint incarnation that is no longer live.
     ///
     /// Runs inline inside a refresh pass and therefore must never call `requestProjectionRefresh`:
@@ -3906,7 +3940,8 @@ final class AgentSessionLinkRuntimeBridge {
         await reconcile(afterTargetSessions: Set(notices.map(\.targetSessionID)))
         await pruneKnownEndpoints(sessionIDs: touched)
         if refreshingProjections {
-            await requestProjectionRefresh()
+            await sweepKnownEndpointsForMembershipRefresh()
+            await requestProjectionRefresh(.sessions(touched))
         }
         // Every revocation path — manual Stop, lifecycle invalidation, stale-endpoint sweep — funnels
         // through here, so this is the one place that covers losing a link the way the add path covers
@@ -4092,53 +4127,188 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     private func performProjectionRefresh(_ scope: ProjectionRefreshScope) async {
-        guard let host else { return }
-        let candidates: [AgentSessionLinkEndpointCandidate]
-        let candidateIndex: AgentSidebarOversightMenuProjection.CandidateIndex?
-        switch scope {
-        case .full:
-            await sweepStaleEndpoints(liveCandidates: host.agentSessionLinkCandidates())
-            candidates = host.agentSessionLinkCandidates()
-            // Keep #1238's one shared preparation on topology/membership passes.
-            candidateIndex = AgentSidebarOversightMenuProjection.CandidateIndex(candidates)
-        case let .sessions(sessionIDs):
-            candidates = host.agentSessionLinkCandidates(
-                forSessionIDs: sessionIDs, includeLocation: true
-            ).values.flatMap(\.self)
-            candidateIndex = nil
+        guard !isFrozenForTermination, let host else { return }
+        var fullCandidates: [AgentSessionLinkEndpointCandidate] = []
+        if scope.isFull {
+            await sweepStaleEndpoints(liveCandidates: host.agentSessionLinkCandidates(includeLocation: false))
+            guard !isFrozenForTermination else { return }
+            fullCandidates = host.agentSessionLinkCandidates(includeLocation: false)
         }
-        let rebuilt = candidates
-        for candidate in rebuilt {
-            let projection = await makeProjection(
-                for: candidate,
-                candidateIndex: candidateIndex
-            )
-            host.agentSessionLinkPublishProjection(projection.props, to: candidate.domainEndpoint)
-            // Both projections are built from one authority read, but only the pill is published
-            // unconditionally. The prompt inventory here was read before this line — possibly several
-            // hops ago, since each candidate costs its own `projectionInputs` — and a membership
-            // write may have fenced this endpoint in between. The host refuses the write in that
-            // case; the write's own release publishes the post-mutation inventory instead, and the
-            // refresh this method is called from again afterwards reconciles the pill.
-            host.agentSessionLinkPublishPromptInventory(
-                projection.promptInventory,
-                to: candidate.domainEndpoint
-            )
-            // Published after the inventory it will later be joined to, and only for an observer
-            // holding a queue. A fenced endpoint refuses the inventory above while accepting this,
-            // which is exactly the state the revision match is for: the snapshot simply stays
-            // undeliverable until the pass after the membership write republishes both.
-            if let passiveNotices = projection.passiveNotices {
-                host.agentSessionLinkPublishPassiveStatusNotices(
-                    passiveNotices,
-                    to: candidate.domainEndpoint
-                )
+        let previousCatalog = menuCatalog
+        let previousKeys = previousCatalog?.endpoints ?? []
+        let retained = previousKeys.union(projectedEndpoints).union(passiveNoticesByObserver.keys)
+        let snapshot = await authority.presentationSnapshot(additionalEndpoints: retained)
+        #if DEBUG
+            await test_afterPresentationSnapshot?()
+        #endif
+        guard !isFrozenForTermination, self.host === host,
+              snapshot.authorityRevision >= (menuCatalog?.authorityRevision ?? 0)
+        else { return }
+        // Equal revisions are intentionally installable: dismissal changes notices, not revision.
+        // No other lane installs, so equal-revision snapshots follow transaction order.
+        let availabilityChanged = menuCatalog == nil
+            || menuCatalog?.activeOutboundObserverEndpoints != snapshot.activeOutboundObserverEndpoints
+        // Notice eviction/dismissal can change an owner that still has links and is outside scope.
+        // Compare actual old/new inputs, not only key removal or authority revisions.
+        let changedNoticeOwners = previousKeys.union(snapshot.endpoints).filter {
+            (previousCatalog?.inputs[$0]?.notices ?? []) != (snapshot.inputs[$0]?.notices ?? [])
+        }
+        menuCatalog = snapshot
+        let removed = previousKeys.subtracting(snapshot.endpoints)
+        var endpoints: Set<DomainAgentSessionLinkEndpointIdentity> = switch scope {
+        case .full:
+            snapshot.endpoints.union(retained)
+        case let .sessions(sessionIDs):
+            snapshot.endpoints.union(retained).filter { sessionIDs.contains($0.sessionID) }
+        }
+        endpoints.formUnion(removed)
+        endpoints.formUnion(changedNoticeOwners)
+        endpoints.formUnion(Set(passiveNoticesByObserver.keys).subtracting(snapshot.endpoints))
+        var fullMap: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate] = [:]
+        if scope.isFull {
+            // Discovery proves topology without resolving N execution locations. Only exact peers
+            // recorded by this authority snapshot contribute display fields to linked/notice rows.
+            var peers: Set<DomainAgentSessionLinkEndpointIdentity> = []
+            for inputs in snapshot.inputs.values {
+                peers.formUnion(inputs.outboundTargetEndpoints.values)
+                peers.formUnion(inputs.inboundObserverEndpoints.values)
+                for notice in inputs.notices {
+                    if let observer = notice.observerEndpoint { peers.insert(observer) }
+                    if let target = notice.targetEndpoint { peers.insert(target) }
+                }
+            }
+            for peer in peers {
+                if let current = host.agentSessionLinkCandidate(for: peer, includeLocation: true) {
+                    fullMap[peer] = current
+                }
             }
         }
+        for endpoint in endpoints {
+            guard !isFrozenForTermination else { return }
+            // Re-read exact ownership after the authority hop; a displaced endpoint cannot clear
+            // or label its successor. UI empty defaults never enter this publication path.
+            guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: true),
+                  let inputs = snapshot.inputs[endpoint]
+            else {
+                projectedEndpoints.remove(endpoint)
+                continue
+            }
+            let projection = await makeProjection(
+                for: candidate,
+                inputs: inputs,
+                candidatesByEndpoint: scope.isFull ? fullMap : presentationCandidates(for: endpoint, inputs: inputs)
+            )
+            guard !isFrozenForTermination, self.host === host,
+                  host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil
+            else { continue }
+            host.agentSessionLinkPublishProjection(projection.props, to: endpoint)
+            // Membership holds and inventory revisions remain the publication fence.
+            host.agentSessionLinkPublishPromptInventory(projection.promptInventory, to: endpoint)
+            if let passiveNotices = projection.passiveNotices {
+                host.agentSessionLinkPublishPassiveStatusNotices(passiveNotices, to: endpoint)
+            }
+            if snapshot.endpoints.contains(endpoint) {
+                projectedEndpoints.insert(endpoint)
+            } else {
+                projectedEndpoints.remove(endpoint)
+            }
+        }
+        if availabilityChanged { notifyCandidateAvailabilityChanged() }
         if scope.isFull {
-            prunePassiveNotices(liveEndpoints: Set(candidates.map(\.domainEndpoint)))
+            let live = Set(fullCandidates.map(\.domainEndpoint))
+            projectedEndpoints.formIntersection(live)
+            prunePassiveNotices(liveEndpoints: live)
             await reconcilePendingSends()
         }
+    }
+
+    private func invalidateMenuCatalog() {
+        guard menuCatalog != nil else { return }
+        menuCatalog = nil
+        notifyCandidateAvailabilityChanged()
+    }
+
+    /// Payload-free shared availability invalidation, always after catalog storage. It is not a
+    /// status event and never runs for ordinary target snapshots.
+    private func notifyCandidateAvailabilityChanged() {
+        guard !candidateAvailabilityNotificationPending, !isFrozenForTermination else { return }
+        candidateAvailabilityNotificationPending = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            candidateAvailabilityNotificationPending = false
+            guard !isFrozenForTermination else { return }
+            NotificationCenter.default.post(name: .agentSessionLinkCandidatesDidChange, object: nil)
+        }
+    }
+
+    /// UI-only empty inputs require a coherent catalog and fresh exact ownership. They are never
+    /// published as agent inventories or consumed by authorization.
+    private func menuInputs(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> DomainAgentSessionLinkEndpointProjectionInputs? {
+        #if DEBUG
+            guard !test_menuCatalogUnavailable else { return nil }
+        #endif
+        guard !isFrozenForTermination, let catalog = menuCatalog,
+              host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil
+        else { return nil }
+        if catalog.endpoints.contains(endpoint) { return catalog.inputs[endpoint] }
+        return DomainAgentSessionLinkEndpointProjectionInputs(
+            outbound: DomainAgentSessionLinkInventory(sessionID: endpoint.sessionID, linkSetRevision: 0, authorityRevision: catalog.authorityRevision, items: []),
+            inbound: DomainAgentSessionLinkInventory(sessionID: endpoint.sessionID, linkSetRevision: 0, authorityRevision: catalog.authorityRevision, items: []),
+            outboundTargetEndpoints: [:], inboundObserverEndpoints: [:],
+            activeOutboundObserverEndpoints: catalog.activeOutboundObserverEndpoints, notices: []
+        )
+    }
+
+    /// Fresh single-row choice construction at a menu tracking boundary, never during row rendering.
+    func sidebarOversightMenu(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSidebarOversightMenuProps? {
+        guard let host, let inputs = menuInputs(for: endpoint),
+              let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: true)
+        else { return nil }
+        let candidates = host.agentSessionLinkCandidates()
+        let creatorID = host.agentSessionLinkLaneProvenance(for: endpoint)
+        let creatorFallback = creatorID.flatMap { id -> String? in
+            // The unchanged builder resolves live names itself. Fallback only for a known,
+            // non-live creator, exactly as the former eager projection did.
+            if candidates.contains(where: { $0.sessionID == id }) { return nil }
+            return creatorNames.snapshot[id] ?? host.agentSessionLinkLaneCreatorLabel(for: endpoint)
+        }
+        return AgentSidebarOversightMenuProjection.make(
+            target: candidate, inputs: inputs, candidates: candidates,
+            createdByLabel: creatorFallback, creatorSessionID: creatorID
+        )
+    }
+
+    /// Closed-row summary: bounded exact peers only, no candidate index, labels or option arrays.
+    func sidebarOversightSummary(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSidebarOversightSummary? {
+        guard let host, let inputs = menuInputs(for: endpoint),
+              let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false)
+        else { return nil }
+        let linked = Set(inputs.inboundObserverEndpoints.values)
+        let targetReason = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)?.uiMessage
+        let available = inputs.activeOutboundObserverEndpoints.reduce(into: 0) { count, peer in
+            guard targetReason == nil, peer.sessionID != endpoint.sessionID, !linked.contains(peer),
+                  let current = host.agentSessionLinkCandidate(for: peer, includeLocation: false),
+                  AgentSessionLinkEndpointEligibility.addDisabledReason(current.eligibilityInput, roleAllowsOutboundMonitoring: current.roleAllowsOutboundMonitoring) == nil
+            else { return }
+            count += 1
+        }
+        let creatorID = host.agentSessionLinkLaneProvenance(for: endpoint)
+        let peerIDs = Set(inputs.inbound.items.map(\.observerSessionID)).union(inputs.outbound.items.map(\.targetSessionID)).union(creatorID.map { [$0] } ?? [])
+        let peers = host.agentSessionLinkCandidates(forSessionIDs: peerIDs, includeLocation: false).compactMapValues { $0.first }
+        func name(_ exact: DomainAgentSessionLinkEndpointIdentity?, id: UUID, fallback: String?) -> String {
+            exact.flatMap { host.agentSessionLinkCandidate(for: $0, includeLocation: false)?.resolvedDisplayName }
+                ?? peers[id]?.resolvedDisplayName ?? fallback ?? AgentMonitorSessionIDFormatter.short(id)
+        }
+        return AgentSidebarOversightSummary(
+            linkedObserverCount: linked.count, availableObserverCount: available,
+            inboundObserverNames: inputs.inbound.items.map { name(inputs.inboundObserverEndpoints[$0.linkID], id: $0.observerSessionID, fallback: $0.displayName) },
+            inboundObserverSessionIDs: inputs.inbound.items.map(\.observerSessionID),
+            outboundTargetNames: inputs.outbound.items.map { name(inputs.outboundTargetEndpoints[$0.linkID], id: $0.targetSessionID, fallback: $0.displayName) },
+            createdByLabel: creatorID.flatMap { peers[$0]?.resolvedDisplayName ?? creatorNames.snapshot[$0] ?? host.agentSessionLinkLaneCreatorLabel(for: endpoint) },
+            creatorSessionID: creatorID,
+            targetIneligibleReason: targetReason,
+            observerIneligibleReason: AgentSessionLinkEndpointEligibility.addDisabledReason(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring)
+        )
     }
 
     /// One endpoint's refreshed projections: the Oversee rows the user sees and the inventory the
@@ -4154,23 +4324,12 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func makeProjection(
         for candidate: AgentSessionLinkEndpointCandidate,
-        candidateIndex: AgentSidebarOversightMenuProjection.CandidateIndex?
+        inputs: DomainAgentSessionLinkEndpointProjectionInputs,
+        candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate]
     ) async -> EndpointProjection {
-        // Endpoint-scoped on every axis, read in one authority turn: a second live incarnation of
-        // this session UUID owns neither these outbound grants nor these inbound observers nor these
-        // notices, and must not render or be told about them.
-        let inputs = await authority.projectionInputs(forEndpoint: candidate.domainEndpoint)
-        // A scoped status pass resolves only linked/notice peers and active observers. Fork menus
-        // retain their complete published choices; full lazy choices remain Step 2.
-        let presentationIndex = candidateIndex ?? AgentSidebarOversightMenuProjection.CandidateIndex(
-            projectionCandidates(for: candidate.domainEndpoint, inputs: inputs)
-        )
         let monitor = await makeMonitorProjection(
-            for: candidate,
-            inputs: inputs,
-            candidateIndex: presentationIndex,
-            collectsStatusSamples: true,
-            refreshesSidebarMenu: candidateIndex != nil
+            for: candidate, inputs: inputs, candidatesByEndpoint: candidatesByEndpoint,
+            collectsStatusSamples: true
         )
         // Reconciled here rather than inside the row builder, because this is the only pass that is
         // authoritative about membership *and* status at once.
@@ -4200,12 +4359,11 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Only authority-recorded exact peers can contribute to these linked rows/inbound choices.
-    private func projectionCandidates(
+    private func presentationCandidates(
         for endpoint: DomainAgentSessionLinkEndpointIdentity,
         inputs: DomainAgentSessionLinkEndpointProjectionInputs
-    ) -> [AgentSessionLinkEndpointCandidate] {
-        var endpoints = inputs.activeOutboundObserverEndpoints
-        endpoints.insert(endpoint)
+    ) -> [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate] {
+        var endpoints: Set<DomainAgentSessionLinkEndpointIdentity> = [endpoint]
         endpoints.formUnion(inputs.outboundTargetEndpoints.values)
         endpoints.formUnion(inputs.inboundObserverEndpoints.values)
         for notice in inputs.notices {
@@ -4220,7 +4378,8 @@ final class AgentSessionLinkRuntimeBridge {
         // This bounded census does not build the complete outbound menu choices.
         var sessionIDs = Set(endpoints.map(\.sessionID))
         if let creator = host?.agentSessionLinkLaneProvenance(for: endpoint) { sessionIDs.insert(creator) }
-        return host?.agentSessionLinkCandidates(forSessionIDs: sessionIDs, includeLocation: true).values.flatMap(\.self) ?? []
+        let candidates = host?.agentSessionLinkCandidates(forSessionIDs: sessionIDs, includeLocation: true).values.flatMap(\.self) ?? []
+        return Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
     /// Annotate only uniquely resolved live targets; an ambiguous session UUID grants no provenance.
@@ -4264,17 +4423,16 @@ final class AgentSessionLinkRuntimeBridge {
     private func makeMonitorProjection(
         for candidate: AgentSessionLinkEndpointCandidate,
         inputs: DomainAgentSessionLinkEndpointProjectionInputs,
-        candidateIndex: AgentSidebarOversightMenuProjection.CandidateIndex,
-        collectsStatusSamples: Bool = false,
-        refreshesSidebarMenu: Bool = true
+        candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate],
+        collectsStatusSamples: Bool = false
     ) async -> MonitorProjection {
         let sessionID = candidate.sessionID
         let endpoint = candidate.domainEndpoint
         // Display names resolve app-wide by session ID: a linked peer whose exact endpoint
         // incarnation moved (rebind or another window) still names itself, and the compact ID
         // only shows for a truly unknown session.
-        let candidatesBySessionID = candidateIndex.firstBySessionID
-        let candidatesByEndpoint = candidateIndex.byEndpoint
+        let peerIDs = Set(inputs.outbound.items.map(\.targetSessionID)).union(inputs.inbound.items.map(\.observerSessionID))
+        let candidatesBySessionID = host?.agentSessionLinkCandidates(forSessionIDs: peerIDs, includeLocation: true).compactMapValues { $0.first } ?? [:]
 
         var outbound: [AgentMonitorPillProps.Outbound] = []
         var statusSamples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
@@ -4369,25 +4527,9 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
 
-        let creatorID = host?.agentSessionLinkLaneProvenance(for: endpoint)
-        // Live names already supplied to the menu builder win. The host fallback must be local,
-        // non-enumerating, and is needed only for an unknown/non-live creator.
-        let creatorFallback = creatorID.flatMap { id -> String? in
-            if candidatesBySessionID[id] != nil {
-                return nil
-            }
-            return creatorNames.snapshot[id] ?? host?.agentSessionLinkLaneCreatorLabel(for: endpoint)
-        }
         let props = AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: refreshesSidebarMenu ? AgentSidebarOversightMenuProjection.make(
-                target: candidate,
-                inputs: inputs,
-                candidateIndex: candidateIndex,
-                createdByLabel: creatorFallback,
-                creatorSessionID: creatorID
-            ) : host?.agentSessionLinkPublishedSidebarMenu(for: endpoint),
             outbound: outbound,
             inbound: inbound,
             recentNotices: inputs.notices.map { notice in
@@ -4648,13 +4790,11 @@ final class AgentSessionLinkRuntimeBridge {
     /// uses the presentation-only lane so the repaint cannot publish prompt inventory, consume its
     /// discarded `statusSamples`, reconcile passive work, advance target activity, or trigger Auto-wake.
     private func requestCandidatePresentationRefresh() {
-        guard let host else { return }
-        let candidates = host.agentSessionLinkCandidates()
-        settleCreatorNames(candidates)
-        NotificationCenter.default.post(name: .agentSessionLinkCandidatesDidChange, object: nil)
-        requestMonitorProjectionRefresh(
-            forExactObserverEndpoints: Set(candidates.map(\.domainEndpoint))
-        )
+        guard !isFrozenForTermination, let host else { return }
+        // Keep creator-name publication with its existing owner; it is not menu materialization.
+        settleCreatorNames(host.agentSessionLinkCandidates())
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: menuCatalog?.endpoints ?? [])
+        notifyCandidateAvailabilityChanged()
     }
 
     private func scheduleMonitorProjectionRefresh() {
@@ -4683,22 +4823,19 @@ final class AgentSessionLinkRuntimeBridge {
     ) async {
         for observer in endpoints {
             guard !isFrozenForTermination else { continue }
-            let inputs = await authority.projectionInputs(forEndpoint: observer)
-            guard !isFrozenForTermination, let host else { return }
-            // One candidate read after the hop backs both the observer's own revalidation and the
-            // peer lookup, so the rows cannot mix two window snapshots.
-            let candidates = host.agentSessionLinkCandidates()
-            guard let candidate = candidates.first(where: { $0.domainEndpoint == observer }) else {
-                continue
-            }
-            let candidateIndex = AgentSidebarOversightMenuProjection.CandidateIndex(candidates)
+            guard let inputs = menuCatalog?.inputs[observer],
+                  menuCatalog?.endpoints.contains(observer) == true,
+                  let host,
+                  let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: true)
+            else { continue }
+            let candidates = presentationCandidates(for: observer, inputs: inputs)
             // Rows only: `statusSamples` are deliberately dropped here. Location, Seen, settings,
             // sidebar-menu, and observer-role repaints are not authoritative status observations;
             // presentation work cannot queue a notice or trigger Auto-wake.
             let monitor = await makeMonitorProjection(
                 for: candidate,
                 inputs: inputs,
-                candidateIndex: candidateIndex
+                candidatesByEndpoint: candidates
             )
             host.agentSessionLinkPublishProjection(monitor.props, to: observer)
         }
@@ -4707,7 +4844,7 @@ final class AgentSessionLinkRuntimeBridge {
     private func monitorProjectionEndpointIsLive(
         _ endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        host?.agentSessionLinkCandidates().contains { $0.domainEndpoint == endpoint } ?? false
+        host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil
     }
 
     #if DEBUG
@@ -4722,7 +4859,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     func dismissNotices(forEndpoint endpoint: DomainAgentSessionLinkEndpointIdentity) async {
         await authority.clearRecentRevocationNotices(forEndpoint: endpoint)
-        await requestProjectionRefresh()
+        await requestProjectionRefresh(.sessions([endpoint.sessionID]))
     }
 
     // MARK: - Unread acknowledgement

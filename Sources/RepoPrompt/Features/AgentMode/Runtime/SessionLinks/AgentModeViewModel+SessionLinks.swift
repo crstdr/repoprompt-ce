@@ -58,13 +58,13 @@ extension AgentModeViewModel {
     ///
     /// - Parameter isWindowClosing: the owning window's `isClosing` flag. A closing window's tabs are
     ///   never offered as endpoints.
-    func agentSessionLinkCandidates(isWindowClosing: Bool) -> [AgentSessionLinkEndpointCandidate] {
+    func agentSessionLinkCandidates(isWindowClosing: Bool, includeLocation: Bool = true) -> [AgentSessionLinkEndpointCandidate] {
         guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else { return [] }
         return workspace.composeTabs.compactMap { tab in
             guard let sessionID = tab.activeAgentSessionID else { return nil }
             return agentSessionLinkCandidate(
                 workspaceID: workspace.id, tabID: tab.id, sessionID: sessionID,
-                isWindowClosing: isWindowClosing, includeLocation: true
+                tabName: tab.name, isWindowClosing: isWindowClosing, includeLocation: includeLocation
             )
         }
     }
@@ -93,23 +93,26 @@ extension AgentModeViewModel {
                 .compactMap { tab in
                     agentSessionLinkCandidate(
                         workspaceID: workspaceID, tabID: tab.id, sessionID: sessionID,
-                        isWindowClosing: false, includeLocation: includeLocation
+                        tabName: tab.name, isWindowClosing: false, includeLocation: includeLocation
                     )
                 }
         }
         return result
     }
 
+    /// Batch callers already read the name from the current model in this synchronous MainActor
+    /// pass. Reuse that value while retaining the existing indexed identity/incarnation validation.
     private func agentSessionLinkCandidate(
         workspaceID: UUID, tabID: UUID, sessionID: UUID,
+        tabName: String? = nil,
         isWindowClosing: Bool, includeLocation: Bool
     ) -> AgentSessionLinkEndpointCandidate? {
         guard let identity = agentSessionLinkModelIdentity(
             workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
         ), let session = sessions[tabID],
-        let tab = workspaceManager?.modelRoutingTab(workspaceID: workspaceID, tabID: tabID) else { return nil }
+        let name = tabName ?? workspaceManager?.modelRoutingTab(workspaceID: workspaceID, tabID: tabID)?.name else { return nil }
         return agentSessionLinkCandidate(
-            session: session, identity: identity, tabName: tab.name,
+            session: session, identity: identity, tabName: name,
             providerDisplayName: session.selectedAgent.displayName,
             isWindowClosing: isWindowClosing, includeLocation: includeLocation
         )
@@ -867,16 +870,6 @@ extension AgentModeViewModel {
         // view performs from ever addressing a different incarnation than the rows it is showing.
         var props = agentSessionLinkOverlayingAutoWakePolicy(props, endpoint: endpoint)
         props.endpoint = endpoint
-        // A suspended bridge pass may carry an older creator name. Settle against the latest
-        // synchronous UI source at publication, without touching the agent-facing projections.
-        if props.sidebarOversightMenu != nil {
-            let creatorID = agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
-                ? agentSessionLinkLaneCreatorSessionID(tabID: endpoint.tabID, expectedSessionID: endpoint.sessionID) : nil
-            props.sidebarOversightMenu?.creatorSessionID = creatorID
-            props.sidebarOversightMenu?.createdByLabel = creatorID.map {
-                sidebarCreatorDisplayNames[$0] ?? agentSessionLinkLocalCreatorLabel(creatorID: $0)
-            }
-        }
         // One tab of one window holds at most one live incarnation
         // (`agentSessionLinkObserverEndpoint(tabID:)` resolves exactly one), so any *other* entry
         // filed under this tab is a superseded incarnation that nothing can read again. Collecting it
@@ -897,13 +890,7 @@ extension AgentModeViewModel {
     /// Names also invalidate archived/unlinked consumers whose exact projection props are equal.
     func agentSessionLinkPublishCreatorNames(_ names: [UUID: String]) {
         guard names != sidebarCreatorDisplayNames else { return }
-        agentSessionLinkMutateProjectionStorage(creatorNames: names) { stored in
-            for endpoint in stored.keys {
-                guard let creatorID = stored[endpoint]?.sidebarOversightMenu?.creatorSessionID else { continue }
-                stored[endpoint]?.sidebarOversightMenu?.createdByLabel = names[creatorID]
-                    ?? agentSessionLinkLocalCreatorLabel(creatorID: creatorID)
-            }
-        }
+        agentSessionLinkMutateProjectionStorage(creatorNames: names) { _ in }
     }
 
     /// Applies one logical exact-projection storage transaction and publishes one presentation
@@ -1054,16 +1041,26 @@ extension AgentModeViewModel {
         guard let expectedID = expectedSessionID, currentSessionID != nil else { return unavailable(.sessionUUIDMissing) }
         guard let endpoint = agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: expectedID)
         else { return unavailable(.endpointMissing) }
-        guard let props = monitorPillPropsByEndpoint[endpoint] else { return unavailable(.projectionMissing) }
-        guard props.endpoint == endpoint else { return unavailable(.enclosingEndpointMismatch) }
-        guard let menu = props.sidebarOversightMenu else { return unavailable(.innerMenuNil) }
+        guard var menu = AgentSessionLinkRuntimeBridge.shared.sidebarOversightMenu(for: endpoint) else { return unavailable(.projectionMissing) }
         guard menu.targetEndpoint == endpoint, menu.targetSessionID == expectedID else { return unavailable(.targetMismatch) }
+        let creatorID = agentSessionLinkLaneCreatorSessionID(tabID: endpoint.tabID, expectedSessionID: endpoint.sessionID)
+        menu.creatorSessionID = creatorID
+        menu.createdByLabel = creatorID.map { sidebarCreatorDisplayNames[$0] ?? agentSessionLinkLocalCreatorLabel(creatorID: $0) }
         // The stored projection carries lifecycle-only eligibility; overlay the shared
         // persistence blocker so the inverse menu's greyed reason matches the pill's Add reason.
         return menu.withObserverIneligibleReason(
             agentSessionLinkPersistencePresentation.addBlockerMessage
                 ?? menu.observerIneligibleReason
         )
+    }
+
+    func agentSidebarOversightSummary(tabID: UUID, expectedSessionID: UUID?) -> AgentSidebarOversightSummary? {
+        guard let expectedSessionID,
+              let endpoint = agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: expectedSessionID),
+              var summary = AgentSessionLinkRuntimeBridge.shared.sidebarOversightSummary(for: endpoint)
+        else { return nil }
+        summary.observerIneligibleReason = agentSessionLinkPersistencePresentation.addBlockerMessage ?? summary.observerIneligibleReason
+        return summary
     }
 
     /// Exact current endpoint behind one active sidebar row, independent of whether its target menu
@@ -1251,7 +1248,6 @@ extension AgentModeViewModel {
         return AgentMonitorPillProps(
             sessionID: overlaid.sessionID,
             endpoint: overlaid.endpoint,
-            sidebarOversightMenu: overlaid.sidebarOversightMenu,
             outbound: outbound,
             inbound: overlaid.inbound,
             recentNotices: overlaid.recentNotices,
@@ -1434,7 +1430,6 @@ extension AgentModeViewModel {
         guard let published else {
             return AgentMonitorPillProps(
                 sessionID: sessionID,
-                sidebarOversightMenu: nil,
                 outbound: [],
                 inbound: [],
                 recentNotices: [],

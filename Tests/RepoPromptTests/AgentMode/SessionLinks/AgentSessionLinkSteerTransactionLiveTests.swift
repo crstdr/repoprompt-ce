@@ -322,7 +322,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
             )
         }
         fixture.viewModel.agentSessionLinkPublishProjection(AgentMonitorPillProps(
-            sessionID: endpoint.sessionID, endpoint: endpoint, sidebarOversightMenu: nil,
+            sessionID: endpoint.sessionID, endpoint: endpoint,
             outbound: rows, inbound: [], recentNotices: [], canAddReason: nil
         ), to: endpoint)
         fixture.viewModel.agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID] = .init(

@@ -568,6 +568,10 @@ struct AgentModeSessionsListView: View {
                                 expectedSessionID: sessionID
                             )
                         } ?? .none
+                        let sidebarOversightSummaryResolver: (@MainActor () -> AgentSidebarOversightSummary?)? =
+                            session.sessionID.map { expectedSessionID in
+                                { @MainActor in agentModeVM.agentSidebarOversightSummary(tabID: session.tabID, expectedSessionID: expectedSessionID) }
+                            }
                         let sidebarOversightMenuResolver: (@MainActor () -> AgentSidebarOversightMenuProps?)? =
                             session.sessionID.map { expectedSessionID in
                                 { @MainActor in
@@ -708,6 +712,7 @@ struct AgentModeSessionsListView: View {
                             },
                             onDismissAttention: dismissAttentionAction,
                             onCopySessionID: copySessionIDAction,
+                            resolveSidebarOversightSummary: sidebarOversightSummaryResolver,
                             resolveSidebarOversightMenu: sidebarOversightMenuResolver,
                             diagnoseSidebarOversightMenuUnavailable: {
                                 _ = agentModeVM.agentSidebarOversightMenuProps(
@@ -917,6 +922,9 @@ struct AgentModeSessionsListView: View {
             )
             .receive(on: DispatchQueue.main)
         ) { _ in
+            sessionLinkProjectionRevision &+= 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .agentSessionLinkCandidatesDidChange).receive(on: DispatchQueue.main)) { _ in
             sessionLinkProjectionRevision &+= 1
         }
         .task(id: activeWorkspaceID) {
