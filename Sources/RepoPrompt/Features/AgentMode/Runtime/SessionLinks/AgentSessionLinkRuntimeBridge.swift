@@ -1163,6 +1163,11 @@ final class AgentSessionLinkRuntimeBridge {
     /// of resuming a backlog its previous incarnation collected under authority it no longer holds.
     private var passiveNoticesByObserver:
         [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkPassiveStatusNotices] = [:]
+    /// Read-only exact-incarnation count. No reducer, publication or receipt is created by a read.
+    func pendingAttentionOccurrenceCount(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> Int {
+        passiveNoticesByObserver[endpoint]?.pendingAttentionOccurrenceCount ?? 0
+    }
+
     private var chains: [UUID: TargetPublicationChain] = [:]
     /// Never reset per target record. A re-installed chain therefore continues above any high-water
     /// mark a previous incarnation left behind, so its first publication is never rejected as stale.

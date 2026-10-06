@@ -1252,6 +1252,10 @@ package enum MCPDomainCanonicalToolDefinitions {
             if !description.contains(routerDescription) {
                 description += "\n\n\(routerDescription)"
             }
+            let residentDescription = " For resident app-owned top-level sessions, use steer with wait=false, poll, and agent_manage.get_log without capture."
+            if !description.contains(residentDescription) {
+                description += residentDescription
+            }
             description = description.replacingOccurrences(
                 of: "Waits up to `timeout` seconds (default 120).",
                 with: "Waits up to `timeout` seconds when present. Omitted `timeout` uses the \(phrase)."

@@ -118,7 +118,7 @@ extension AgentModeViewModel {
         return .ready(token)
     }
 
-    private func agentSessionLinkHasActiveOutboundLink(
+    func agentSessionLinkHasActiveOutboundLink(
         _ endpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> Bool {
         #if DEBUG

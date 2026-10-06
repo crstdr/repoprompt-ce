@@ -955,6 +955,7 @@ struct AgentManageMCPToolService {
             agentModeVM: agentModeVM,
             workspace: workspace
         )
+        _ = try await agentModeVM.mcpPreflightResidentActivation(sessionID: sessionID)
         // See create_session: warm the persisted ACP catalog before model validation.
         await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         let selection = try await AgentMCPSelectionResolver.resolve(
