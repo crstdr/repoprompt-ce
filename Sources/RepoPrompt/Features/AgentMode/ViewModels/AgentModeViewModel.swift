@@ -17215,7 +17215,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession,
         displayText: String,
         turn: AgentNoncomposerTurn,
-        route: AgentSessionLinkManagedSteerRoute
+        route: AgentSessionLinkManagedSteerRoute,
+        workflow: AgentWorkflowDefinition? = nil
     ) -> Bool {
         // Codex reports its terminal state through the acknowledgement tracker `agent_run` uses. The
         // `.mcp` fallback origin that an attempt ID selects is the programmatic-dispatch origin,
@@ -17228,7 +17229,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             trimmedText: displayText,
             attachmentsToSend: [],
             taggedFilesToSend: [],
-            activeWorkflow: nil,
+            activeWorkflow: workflow,
             codexAttemptID: codexAttemptID,
             managedTurn: turn
         )
@@ -17399,7 +17400,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sequenceIndex: session.nextSequenceIndex,
             workflow: activeWorkflow,
             crossSessionAttribution: managedTurn?.attribution,
-            dispatchedProviderText: managedTurn?.providerText
+            dispatchedProviderText: managedTurn.map { _ in wrappedText }
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)

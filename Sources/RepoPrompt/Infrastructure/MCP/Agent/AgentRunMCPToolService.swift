@@ -1029,6 +1029,15 @@ struct AgentRunMCPToolService {
             agentModeVM: agentModeVM,
             metadata: metadata
         )
+        if let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID) {
+            guard forcePoll else { throw MCPError.invalidParams(AgentModeViewModel.mcpResidentWaitError) }
+            let (snapshot, overseer) = try await residentPoll(
+                resident, targetWindow: targetWindow, agentModeVM: agentModeVM, metadata: metadata
+            )
+            var object = snapshot.asObject()
+            object["overseer"] = overseer
+            return .object(object)
+        }
         let capturedDefaultWaitSeconds = Self.capturedDefaultWaitTimeoutSeconds()
         let timeoutSeconds = try forcePoll
             ? 0
@@ -1066,6 +1075,10 @@ struct AgentRunMCPToolService {
             agentModeVM: agentModeVM,
             metadata: metadata
         )
+
+        for sessionID in sessionIDs where try agentModeVM.mcpResidentTarget(sessionID: sessionID) != nil {
+            throw MCPError.invalidParams(AgentModeViewModel.mcpResidentWaitError)
+        }
 
         // Single-element waits should preserve the existing single-session response shape.
         if sessionIDs.count == 1 {
@@ -1157,10 +1170,29 @@ struct AgentRunMCPToolService {
         return targetWindow.agentModeViewModel
     }
 
+    private func residentPoll(
+        _ target: MCPResidentTarget, targetWindow: WindowState,
+        agentModeVM: AgentModeViewModel, metadata: RequestMetadata
+    ) async throws -> (AgentRunMCPSnapshot, Value) {
+        let hasLinks = await agentModeVM.agentSessionLinkHasActiveOutboundLink(target.endpoint)
+        try await authorizeControlTargets(
+            operation: .runPoll, sessionIDs: [target.endpoint.sessionID], reference: nil,
+            targetWindow: targetWindow, agentModeVM: agentModeVM, metadata: metadata
+        )
+        guard !targetWindow.isClosing, !WindowStatesManager.shared.isTerminating,
+              targetWindow.windowID == target.endpoint.windowID,
+              agentModeVM.mcpResidentTargetIsCurrent(target)
+        else { throw MCPError.invalidParams(AgentModeViewModel.mcpResidentTargetError) }
+        return try (
+            agentModeVM.mcpResidentSnapshot(target),
+            agentModeVM.mcpResidentOverseerValue(target, hasOutboundLinks: hasLinks)
+        )
+    }
+
     private func executePollMany(args: [String: Value]) async throws -> Value {
         let references = try parseSessionIDArray(args)
         let targetWindow = try requireTargetWindow()
-        let agentModeVM = targetWindow.agentModeViewModel
+        let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let metadata = await captureRequestMetadata()
         // All-or-nothing: authorize every requested target before returning any snapshot.
@@ -1172,8 +1204,20 @@ struct AgentRunMCPToolService {
             agentModeVM: agentModeVM,
             metadata: metadata
         )
-        let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
-        return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots)
+        var snapshots: [AgentRunMCPSnapshot] = []
+        var overseers: [UUID: Value] = [:]
+        for sessionID in sessionIDs {
+            if let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID) {
+                let (snapshot, overseer) = try await residentPoll(
+                    resident, targetWindow: targetWindow, agentModeVM: agentModeVM, metadata: metadata
+                )
+                snapshots.append(snapshot)
+                overseers[sessionID] = overseer
+            } else {
+                await snapshots.append(currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM))
+            }
+        }
+        return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots, overseers: overseers)
     }
 
     private func executeCancel(args: [String: Value]) async throws -> Value {
@@ -1234,6 +1278,26 @@ struct AgentRunMCPToolService {
         )
         let text = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
+        if let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID) {
+            let shouldWait = parseBool(args["wait"]) ?? (args["timeout_seconds"] != nil)
+            guard !shouldWait else { throw MCPError.invalidParams(AgentModeViewModel.mcpResidentWaitError) }
+            let delivery = try await agentModeVM.mcpSubmitResidentTask(
+                resident, text: text, workflow: workflow,
+                windowIsAvailable: {
+                    targetWindow.windowID == resident.endpoint.windowID
+                        && !targetWindow.isClosing && !WindowStatesManager.shared.isTerminating
+                }
+            )
+            guard agentModeVM.mcpResidentTargetIsCurrent(resident) else {
+                throw MCPError.invalidParams(AgentModeViewModel.mcpResidentUnconfirmedError)
+            }
+            let snapshot = try agentModeVM.mcpResidentSnapshot(resident)
+            return decoratedRunValue(
+                snapshot: snapshot, workflow: workflow, delivery: delivery,
+                warning: args["timeout_seconds"] != nil
+                    ? "Ignoring timeout_seconds because wait=false; the steering instruction was accepted without waiting." : nil
+            )
+        }
         let resolution = try await ensureSteerControlContext(
             sessionID: sessionID,
             targetWindow: targetWindow,
@@ -2480,7 +2544,8 @@ struct AgentRunMCPToolService {
 
     private nonisolated func decoratedMultiPollValue(
         sessionIDs: [UUID],
-        snapshots: [AgentRunMCPSnapshot]
+        snapshots: [AgentRunMCPSnapshot],
+        overseers: [UUID: Value] = [:]
     ) -> Value {
         let interestingIDs = snapshots.filter { isInterestingSnapshot($0) }.map(\.sessionID)
         let runningIDs = snapshots.filter { $0.status == .running }.map(\.sessionID)
@@ -2494,7 +2559,11 @@ struct AgentRunMCPToolService {
                 "running_session_ids": .array(runningIDs.map { .string($0.uuidString) }),
                 "terminal_session_ids": .array(terminalIDs.map { .string($0.uuidString) })
             ]),
-            "snapshots": .array(snapshots.map { .object($0.asObject()) })
+            "snapshots": .array(snapshots.map {
+                var object = $0.asObject()
+                if let overseer = overseers[$0.sessionID] { object["overseer"] = overseer }
+                return .object(object)
+            })
         ])
     }
 
