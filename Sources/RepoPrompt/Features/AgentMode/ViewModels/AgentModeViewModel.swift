@@ -9011,7 +9011,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             expectedWorkspaceID: expectedWorkspaceID,
             requiresHydratedRuntime: false
         )
-        let residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID)
+        let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
+        let residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
         let hydrated = await ensureSessionReady(tabID: tabID)
         #if DEBUG
             await test_afterExplicitTabSessionReady?()
@@ -9033,7 +9034,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let hydratedActivationTarget: MCPResidentTarget? = if let residentActivationTarget {
             residentActivationTarget
         } else {
-            try await mcpPreflightResidentActivation(sessionID: sessionID)
+            try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
         }
         try mcpRequireActivationOwnerFence(hydratedActivationTarget, session: hydrated)
         let resolvedSessionID = sessionID
@@ -9736,7 +9737,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         markSessionAsMCPOriginated: Bool = true,
         requireInactiveRunState: Bool = false
     ) async throws -> AgentMCPControlContext {
-        var residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID)
+        let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
+        var residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
         let session = await ensureSessionReady(tabID: tabID)
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
@@ -9753,7 +9755,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             try mcpRequireResidentActivationFence(residentActivationTarget)
         }
         if residentActivationTarget == nil, Self.isMCPResidentAppOwned(session) {
-            residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID)
+            residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
             guard residentActivationTarget?.session === session else {
                 throw MCPError.invalidParams(Self.mcpResidentTargetError)
             }
