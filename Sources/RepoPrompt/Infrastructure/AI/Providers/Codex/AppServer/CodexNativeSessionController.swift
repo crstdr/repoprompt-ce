@@ -1971,9 +1971,11 @@ final class CodexNativeSessionController {
                 #endif
                 throw error
             }
-            // Inspect effective layers for EVERY controller, before thread creation initializes MCP.
-            // Process overlays only change enabled flags, so they cannot conceal a reserved name.
-            try await inspectComputerUseEffectiveConfiguration()
+            // Armed scopes must reject effective collisions before thread creation initializes MCP.
+            // Ordinary starts retain their existing configuration path without an extra RPC.
+            if computerUseRequiresUserReview {
+                try await inspectComputerUseEffectiveConfiguration()
+            }
             await ensureInboundStreamsStarted()
 
             let skillExtraRoots = options.skillExtraRootsProvider().map(\.standardizedFileURL.path)
@@ -2864,6 +2866,7 @@ final class CodexNativeSessionController {
     }
 
     private func inspectComputerUseEffectiveConfiguration() async throws {
+        guard computerUseRequiresUserReview else { return }
         var params: [String: Any] = ["includeLayers": false]
         if let executionDirectory = workspacePaths.executionDirectory { params["cwd"] = executionDirectory }
         let config = try await performRequest(method: "config/read", params: params, timeout: options.requestTimeout)

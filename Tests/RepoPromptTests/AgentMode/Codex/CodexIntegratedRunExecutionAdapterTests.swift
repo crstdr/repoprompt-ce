@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptProcess
 import RepoPromptSettingsCore
 import XCTest
 
@@ -273,30 +274,81 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         CodexNativeSessionController(client: CodexAppServerClient(), runID: UUID(), tabID: UUID(), windowID: 1, workspacePaths: .uniform(nil), options: options, requestExecutor: requestExecutor)
     }
 
-    func testEffectiveLayerSuppressionAndCollisionAtControllerBoundary() async throws {
-        for enabled in [false, true] {
-            let controller = makeController(options: .agentModeDefault(computerUseEnabledProvider: { enabled }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" }, mcpServerEntriesProvider: { [] }), requestExecutor: { method, params, _ in
-                XCTAssertEqual(method, "config/read")
-                XCTAssertEqual(params?["includeLayers"] as? Bool, false)
-                // No owned-file entry: this represents trusted project/managed configuration.
-                return ["config": ["mcp_servers": ["computer-use": ["command": "/configured/client", "enabled": true]]]]
+    func testOrdinaryStartupDoesNotRequestComputerUseConfiguration() async throws {
+        for optedIn in [false, true] {
+            CodexComputerUseWorkflow.setEnabledForTesting(optedIn)
+            let requests = OffStartupRequestRecorder()
+            let controller = makeController(options: .agentModeDefault(computerUseEnabledProvider: { false }, mcpServerEntriesProvider: { [] }), requestExecutor: { method, _, _ in
+                requests.record(method)
+                throw CodexAppServerClient.ClientError.invalidResponse
             })
             do {
                 let config = try await controller.test_computerUseStartupConfig()
-                XCTAssertFalse(enabled, "Active scope must reject effective collisions")
-                XCTAssertEqual(config["mcp_servers.computer-use.enabled"] as? Bool, false)
-                XCTAssertNil(config["mcp_servers.computer-use"])
+                XCTAssertFalse(config.keys.contains { $0.contains("computer-use") })
                 XCTAssertEqual(config["features.computer_use"] as? Bool, false)
             } catch {
-                XCTAssertTrue(enabled, "Ordinary scope disables existing transport, not fails")
-                XCTAssertTrue(error.localizedDescription.contains("computer-use"))
+                XCTFail("An ordinary unarmed startup must not depend on config/read: \(error)")
             }
+            XCTAssertEqual(requests.methods, [], "OFF and opted-in-but-unarmed starts must not add a configuration RPC")
             await controller.shutdown()
         }
-        let absent = makeController(options: .agentModeDefault(mcpServerEntriesProvider: { [] }), requestExecutor: { _, _, _ in ["config": [:]] })
-        let config = try await absent.test_computerUseStartupConfig()
-        XCTAssertFalse(config.keys.contains { $0.contains("computer-use") })
-        await absent.shutdown()
+    }
+
+    func testOrdinaryProcessLaunchDoesNotRereadOwnedComputerUseConfiguration() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("off-start-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("mock-codex")
+        let marker = root.appendingPathComponent("spawned")
+        let script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex 0.156.0'; exit 0; fi\nprintf spawned > '\(marker.path)'\nexit 42\n"
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let configURL = CodexRuntimeAuthority.statePaths().codexHome.appendingPathComponent("config.toml")
+        let original = try? Data(contentsOf: configURL)
+        defer {
+            if let original { try? original.write(to: configURL) }
+            else { try? FileManager.default.removeItem(at: configURL) }
+        }
+        let environment = ["HOME": root.path, "PATH": "/usr/bin:/bin"]
+        let client = CodexAppServerClient(
+            processSpawnPreparation: { try Data([0xFF]).write(to: configURL) },
+            processEnvironmentBuilder: { _ in
+                ProcessEnvironmentResult(environment: environment, launchContext: .detect(from: environment), shellEnvironmentSource: .capturedLoginShell)
+            },
+            runtimeStatePreparer: { runtime in
+                XCTAssertEqual(runtime.statePaths.codexHome, configURL.deletingLastPathComponent())
+                try FileManager.default.createDirectory(at: runtime.statePaths.codexHome, withIntermediateDirectories: true)
+            },
+            launchSnapshot: .init(selection: .external(path: executable.path)),
+            provisionsRepoPromptMCPOnStart: false
+        )
+        await client.updateProcessLaunchPolicy(featurePolicy: .defaultDisabled, modelReasoningSummary: nil)
+        do {
+            try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await client.startIfNeeded() }
+            XCTFail("The inert test executable exits instead of initializing a provider")
+        } catch {
+            // Reaching this inert executable, despite deliberately invalid post-preparation bytes,
+            // distinguishes a launch with no added owned-config read from the current regression.
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "Ordinary launch must reach spawn without the new UTF-8 config read")
+            XCTAssertEqual(try Data(contentsOf: configURL), Data([0xFF]))
+        }
+        await client.stop()
+    }
+
+    func testArmedEffectiveLayerCollisionAtControllerBoundary() async throws {
+        let controller = makeController(options: .agentModeDefault(computerUseEnabledProvider: { true }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" }, mcpServerEntriesProvider: { [] }), requestExecutor: { method, params, _ in
+            XCTAssertEqual(method, "config/read")
+            XCTAssertEqual(params?["includeLayers"] as? Bool, false)
+            // No owned-file entry: this represents trusted project/managed configuration.
+            return ["config": ["mcp_servers": ["computer-use": ["command": "/configured/client", "enabled": true]]]]
+        })
+        do {
+            _ = try await controller.test_computerUseStartupConfig()
+            XCTFail("Armed scope must reject effective collisions")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("computer-use"))
+        }
+        await controller.shutdown()
     }
 
     func testReadinessCannotEnableCompanionAfterPermissivePolicyDecision() async throws {
@@ -341,19 +393,6 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         XCTAssertEqual(session.items.last?.kind, .error)
     }
 
-    func testFinishClearsActivationAndRetiresCompanionController() {
-        let session = AgentTabSession(tabID: UUID())
-        session.selectedAgent = .codexExec
-        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-        session.codexController = makeController(options: .agentModeDefault())
-        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
-        makeCoordinator().test_clearComputerUseAfterTurn(session: session)
-        XCTAssertNil(session.pendingCodexComputerUseActivation)
-        XCTAssertNil(session.codexController)
-        XCTAssertNil(session.codexControllerFeatureState)
-        XCTAssertTrue(session.codexNeedsReconnect)
-    }
-
     func testMissingNativeEndpointFailsClosedWithoutTestInjection() async {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         let session = AgentTabSession(tabID: UUID())
@@ -366,5 +405,17 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
 
     private func makeCoordinator(ready: Bool = true, collision: Bool = false, linked: ((AgentTabSession) async -> Bool)? = { _ in false }) -> CodexAgentModeCoordinator {
         CodexAgentModeCoordinator(windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) }, codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Admission tests must not launch a controller") }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, shouldManageCodexTooling: false, computerUseCompanionReady: { ready }, computerUseReservedEntryExists: { collision }, computerUseHasActiveLink: linked, codexHookApprovalSettings: GlobalSettingsStore.shared)
+    }
+}
+
+private final class OffStartupRequestRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+    func record(_ method: String) {
+        lock.withLock { recorded.append(method) }
+    }
+
+    var methods: [String] {
+        lock.withLock { recorded }
     }
 }

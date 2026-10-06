@@ -139,7 +139,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
     }
 
-    func testComputerUseLocalFollowUpSteersButNonLocalInputCannotReachController() async throws {
+    func testQA90ProviderCompletionDisarmsBeforeOneOrdinarySend() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
         let fixture = makeFixture([])
@@ -152,6 +152,40 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             return controller
         }
         let session = fixture.session
+        var publications = 0
+        let barrier = AgentRunTerminalCommitBarrier()
+        coordinator.installTerminalCommitBarrier(barrier, terminalSessionBinder: { owned in
+            AgentRunTerminalSessionBinding(
+                tabID: owned.tabID, lifecycle: owned.runLifecycle,
+                hooks: .init(
+                    flushPendingAssistantDelta: {},
+                    finalizeStreamingItems: {},
+                    finalizePendingToolCalls: { _ in },
+                    finalizeNonCodexTurnUsage: {},
+                    cancelPendingInteractions: { _ in },
+                    finalizeAttachments: { _, _ in },
+                    setAgentRunInactive: {},
+                    prepareTerminalPublication: {},
+                    makeTerminalPublicationEnvelope: { _, _, _, _ in nil },
+                    updateBindings: {},
+                    notifyAgentTurnComplete: {},
+                    scheduleSave: {},
+                    publishTerminalCommit: { _, _ in publications += 1
+                        return .accepted(successorEpoch: nil)
+                    },
+                    startFollowUpRun: { _ in }
+                ),
+                validatesOwnership: { owned.isCurrentRunAttemptForCurrentBinding($0, expectedRunID: $1) },
+                providerDrainGeneration: { owned.providerTerminalDrainGeneration },
+                terminalTurnID: { nil }, queuedFollowUp: { nil }, setFollowUpPending: { _ in },
+                removeFirstQueuedFollowUp: { nil }, appendError: { _ in },
+                finishActiveState: { ownership, state, source in
+                    owned.runState = state
+                    _ = owned.endRunAttempt(ifCurrent: ownership, source: source)
+                }, retainProcessRunIdentity: { _, _ in }, sourceItemsRevision: { owned.items.count },
+                assistantDeltaFlushGeneration: { 0 }, latestFailureText: { nil }
+            )
+        })
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
         await coordinator.ensureCodexNativeSession(session: session)
         let controller = try XCTUnwrap(controllers.first)
@@ -162,6 +196,22 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let first = await coordinator.sendCodexNativeMessage(session: session, text: "perform the operation", attachments: [], fallbackContext: context(true))
         XCTAssertTrue(first.didSend)
         await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "computer-use-turn"), session: session, sourceController: controller)
+        let permission = AgentApprovalRequest(
+            requestID: .codex(.int(90)),
+            method: "item/commandExecution/requestApproval",
+            kind: .commandExecution,
+            threadID: "computer-use-thread",
+            turnID: "computer-use-turn",
+            itemID: "qa-permission"
+        )
+        await coordinator.test_handleCodexNativeEvent(.approvalRequest(permission), session: session, sourceController: controller)
+        XCTAssertEqual(session.pendingApproval?.id, permission.id)
+        XCTAssertEqual(controller.qaResponseCount, 0)
+        coordinator.submitApprovalDecision(session: session, decision: .acceptForSession)
+        XCTAssertEqual(session.pendingApproval?.id, permission.id, "Remembered permission must remain rejected")
+        coordinator.submitApprovalDecision(session: session, decision: .accept)
+        try await AsyncTestWait.waitUntil("one explicit permission response", timeout: 4) { controller.qaResponseCount == 1 }
+        XCTAssertNil(session.pendingApproval)
         let followUp = await coordinator.sendCodexNativeMessage(session: session, text: "continue locally", attachments: [], fallbackContext: context(true))
         XCTAssertTrue(followUp.didSend, "Plain local input must steer an active Computer Use operation")
         XCTAssertEqual(controller.startedTurnCount, 1)
@@ -174,8 +224,15 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(controller.startedTurnCount, 1)
         XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
 
-        coordinator.test_clearComputerUseAfterTurn(session: session)
-        session.runState = .idle
+        await coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "computer-use-turn", status: .completed), session: session, sourceController: controller)
+        XCTAssertEqual(publications, 1)
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertNil(session.codexController)
+        XCTAssertNil(session.codexControllerFeatureState)
+        XCTAssertTrue(session.codexNeedsReconnect)
+        try await AsyncTestWait.waitUntil("armed controller retired", timeout: 4) { controller.shutdownCount == 1 }
+        session.beginRunAttempt(source: "qa90.next-ordinary-local-send")
         let ordinary = await coordinator.sendCodexNativeMessage(session: session, text: "ordinary next turn", attachments: [], fallbackContext: context(true))
         XCTAssertTrue(ordinary.didSend)
         XCTAssertEqual(flags, [true, false], "Settlement must not let an ordinary next turn inherit the companion")
@@ -1250,6 +1307,15 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
     private var interrupts: [String] = []
     private var compactions = 0
     private var shutdowns = 0
+    private var qaResponses = 0
+    var qaResponseCount: Int {
+        lock.withLock { qaResponses }
+    }
+
+    func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {
+        lock.withLock { qaResponses += 1 }
+    }
+
     var shutdownGate: TestReleaseFence?
     private let continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
     let events: AsyncStream<CodexNativeSessionController.Event>
