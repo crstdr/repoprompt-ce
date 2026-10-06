@@ -124,6 +124,12 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     package var createdByLabel: String?
     package var creatorSessionID: UUID?
 
+    // Cached status refreshes may retain peer choices while the live subject becomes ineligible.
+    // Keep that fact separate from displayed reasons: a persistence overlay disables offered rows
+    // in the renderer, but must not remove those rows or change their accessibility counts.
+    private var subjectTargetIsEligible = true
+    private var subjectObserverIsEligible = true
+
     package var linkedObservers: [ObserverOption] {
         observerOptions.filter {
             if case .linked = $0.relationship { return true }
@@ -132,7 +138,7 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     }
 
     package var availableObservers: [ObserverOption] {
-        guard targetIneligibleReason == nil else { return [] }
+        guard subjectTargetIsEligible else { return [] }
         return observerOptions.filter { $0.relationship == .available }
     }
 
@@ -144,7 +150,7 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     }
 
     package var availableTargets: [TargetOption] {
-        guard observerIneligibleReason == nil else { return [] }
+        guard subjectObserverIsEligible else { return [] }
         return targetOptions.filter { $0.relationship == .available }
     }
 
@@ -186,6 +192,8 @@ package struct AgentSidebarOversightMenuProps: Equatable {
             candidate.eligibilityInput,
             roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
         )
+        copy.subjectTargetIsEligible = copy.targetIneligibleReason == nil
+        copy.subjectObserverIsEligible = copy.observerIneligibleReason == nil
         return copy
     }
 
