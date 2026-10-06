@@ -78,7 +78,10 @@ enum AgentSessionLanePolicy {
         else {
             throw RoleResolutionError.roleUnavailable
         }
-        let effort = AgentExternalMCPRunStarter.extractReasoningEffort(from: effective.modelRaw)
+        // Devin encodes thinking in its model ID, not in the native reasoning-effort field.
+        let effort = effective.agent == .devin
+            ? (model: effective.modelRaw, effort: nil)
+            : AgentExternalMCPRunStarter.extractReasoningEffort(from: effective.modelRaw)
         return RoleSelection(
             role: role,
             agentRaw: effective.agent.rawValue,
