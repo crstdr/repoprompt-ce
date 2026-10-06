@@ -7128,7 +7128,7 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let endpointReceiptCount = laneCreationReceipts.keys.count(where: { $0.endpoint == observerEndpoint })
             + laneCreationTombstones.keys.count(where: { $0.endpoint == observerEndpoint })
-        // Global in-flight pressure and per-creator lane capacity happen to share the value eight.
+        // Global in-flight creation pressure remains capped at eight, independently of per-creator lane capacity.
         guard endpointReceiptCount + laneCreationTasks.keys.count(where: { $0.endpoint == observerEndpoint }) < 256,
               laneCreationTasks.count < 8
         else {
