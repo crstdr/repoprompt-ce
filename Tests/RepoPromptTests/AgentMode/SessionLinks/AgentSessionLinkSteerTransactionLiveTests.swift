@@ -305,6 +305,52 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         assertComposerUntouched(fixture, workflow: workflow)
     }
 
+    func testResidentCountsUseExactExistingBoardAndRefuseUnsettledMembership() throws {
+        let fixture = try makeFixture()
+        let endpoint = fixture.candidate.domainEndpoint
+        let statuses: [AgentMonitorLinkStatus] = [.idle, .running, .awaitingUser, .unavailable]
+        let rows = statuses.map { status in
+            let targetID = UUID()
+            let targetEndpoint = DomainAgentSessionLinkEndpointIdentity(
+                windowID: 2, workspaceID: endpoint.workspaceID, tabID: UUID(), sessionID: targetID,
+                persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+            )
+            return AgentMonitorPillProps.Outbound(
+                linkID: UUID(), generation: 1, targetSessionID: targetID,
+                targetEndpoint: targetEndpoint, displayName: "Lane", providerDisplayName: nil,
+                locationLabel: nil, status: status
+            )
+        }
+        fixture.viewModel.agentSessionLinkPublishProjection(AgentMonitorPillProps(
+            sessionID: endpoint.sessionID, endpoint: endpoint, sidebarOversightMenu: nil,
+            outbound: rows, inbound: [], recentNotices: [], canAddReason: nil
+        ), to: endpoint)
+        fixture.viewModel.agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID] = .init(
+            endpoint: endpoint,
+            inventory: .init(observerSessionID: endpoint.sessionID, linkSetRevision: 1, items: rows.map {
+                .init(
+                    targetSessionID: $0.targetSessionID,
+                    displayName: $0.displayName,
+                    capabilityNames: [],
+                    reference: .init(linkID: $0.linkID, generation: $0.generation)
+                )
+            })
+        )
+        let counts = try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: true)
+        XCTAssertEqual(counts.idle, 1)
+        XCTAssertEqual(counts.running, 1)
+        XCTAssertEqual(counts.awaitingUser, 1)
+        XCTAssertEqual(counts.unavailable, 1)
+        XCTAssertThrowsError(try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: false))
+        let hold = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        XCTAssertThrowsError(try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: true))
+        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil)
+        fixture.viewModel.agentSessionLinkPromptInventoryBySessionID.removeValue(forKey: endpoint.sessionID)
+        XCTAssertThrowsError(try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: true))
+        let zero = try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: false)
+        XCTAssertEqual(zero.idle + zero.running + zero.awaitingUser + zero.unavailable, 0)
+    }
+
     // MARK: - Refusals leave the target untouched
 
     func testPendingPromptBlocksTheSteerBeforeTheFence() async throws {
