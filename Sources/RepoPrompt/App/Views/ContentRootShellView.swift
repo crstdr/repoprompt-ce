@@ -73,8 +73,10 @@ struct ContentRootShellView: View {
             if let request = presentedWorkspaceApprovalRequest {
                 WorkspaceApprovalOverlayView(
                     approvalManager: workspaceApprovalManager,
-                    request: request
+                    request: request,
+                    respondingWindowID: viewModel.state.windowID
                 )
+                .id(request.id)
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 .zIndex(1001)
             }
