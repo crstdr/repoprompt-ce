@@ -9011,6 +9011,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             expectedWorkspaceID: expectedWorkspaceID,
             requiresHydratedRuntime: false
         )
+        let residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID)
         let hydrated = await ensureSessionReady(tabID: tabID)
         #if DEBUG
             await test_afterExplicitTabSessionReady?()
@@ -9029,6 +9030,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 "The requested Agent session runtime changed while its target was prepared."
             )
         }
+        let hydratedActivationTarget: MCPResidentTarget? = if let residentActivationTarget {
+            residentActivationTarget
+        } else {
+            try await mcpPreflightResidentActivation(sessionID: sessionID)
+        }
+        try mcpRequireActivationOwnerFence(hydratedActivationTarget, session: hydrated)
         let resolvedSessionID = sessionID
         let indexedParentSessionID = ownerValidatedSessionIndex[resolvedSessionID]?.parentSessionID
         let target = MCPSessionTarget(
@@ -9729,6 +9736,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         markSessionAsMCPOriginated: Bool = true,
         requireInactiveRunState: Bool = false
     ) async throws -> AgentMCPControlContext {
+        var residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID)
         let session = await ensureSessionReady(tabID: tabID)
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
@@ -9740,6 +9748,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams(
                 "The requested agent session is already running and cannot be reactivated for inactive MCP control."
             )
+        }
+        if let residentActivationTarget {
+            try mcpRequireResidentActivationFence(residentActivationTarget)
+        }
+        if residentActivationTarget == nil, Self.isMCPResidentAppOwned(session) {
+            residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID)
+            guard residentActivationTarget?.session === session else {
+                throw MCPError.invalidParams(Self.mcpResidentTargetError)
+            }
         }
         // A new control activation owns a new launch lifecycle. Never retain review state from a
         // prior activation, including direct/source-equals-target starts that do not stage anew.
@@ -9760,6 +9777,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 cleanupSessionStore: true
             )
         }
+        try mcpRequireActivationOwnerFence(residentActivationTarget, session: session)
         session.mcpControlCleanupTask?.cancel()
         session.mcpControlActivationGeneration &+= 1
         let activationGeneration = session.mcpControlActivationGeneration
@@ -9768,6 +9786,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         case let .accepted(claimed):
             registration = claimed
         case .unavailable, .alreadyActive:
+            try mcpRequireActivationOwnerFence(residentActivationTarget, session: session)
             registration = await AgentRunSessionStore.register(sessionID: sessionID)
         case .shuttingDown:
             throw MCPError.internalError(
@@ -9777,6 +9796,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #if DEBUG
             await test_afterMCPControlRegistration?(activationID)
         #endif
+        do {
+            try mcpRequireActivationOwnerFence(residentActivationTarget, session: session)
+        } catch {
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw error
+        }
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
               !session.bindingTransitionInProgress,

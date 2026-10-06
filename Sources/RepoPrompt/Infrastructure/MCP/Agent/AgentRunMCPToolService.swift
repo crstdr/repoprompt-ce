@@ -498,6 +498,14 @@ struct AgentRunMCPToolService {
             await resolveSpawnParentSessionID(metadata, targetWindow)
         }
         let resolvedTabID = try resolveRequestedTabID(args)
+        let residentActivationTarget: MCPResidentTarget? = if let resolvedTabID,
+                                                              let existingID = agentModeVM.session(for: resolvedTabID, createIfNeeded: false)?.activeAgentSessionID
+        {
+            // Spawn routing and workspace authority were validated above; retain that policy.
+            try await agentModeVM.mcpPreflightResidentActivation(sessionID: existingID)
+        } else {
+            nil
+        }
         #if DEBUG
             perfRecorder.event("mcp.routing.agentRunStartParentResolved", tabID: parentSourceTabID, fields: [
                 "connectionID": metadata.connectionID?.uuidString ?? "nil",
@@ -613,6 +621,9 @@ struct AgentRunMCPToolService {
         let effectiveParentWorktreeInheritance = worktreeStartRequest.inheritParentWorktreeBindings
             && !worktreeStartRequest.hasExplicitWorktreeArgs
         let usesRoutedParentSource = parentSourceTabID != nil
+        if let residentActivationTarget {
+            try agentModeVM.mcpRequireResidentActivationFence(residentActivationTarget)
+        }
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: resolvedTabID,
             sessionID: nil,
@@ -890,6 +901,11 @@ struct AgentRunMCPToolService {
                 }
             #endif
             WorktreeStartupInstrumentation.record(.providerStart, context: worktreeStartupContext)
+            if let residentActivationTarget,
+               spawnParentSessionID == nil || spawnParentSessionID == residentActivationTarget.endpoint.sessionID
+            {
+                try agentModeVM.mcpRequireResidentActivationFence(residentActivationTarget)
+            }
             providerDispatchAttempted = true
             modelParameterStagingRollback = try agentModeVM.mcpStageModelParameterSelections(
                 tabID: target.tabID,
@@ -1499,6 +1515,9 @@ struct AgentRunMCPToolService {
             throw MCPError.invalidParams("Session '\(sessionID.uuidString)' was not found in the active workspace.")
         }
 
+        if try agentModeVM.mcpResidentTarget(sessionID: sessionID) != nil {
+            throw MCPError.invalidParams(AgentModeViewModel.mcpResidentTargetError)
+        }
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: sessionID,

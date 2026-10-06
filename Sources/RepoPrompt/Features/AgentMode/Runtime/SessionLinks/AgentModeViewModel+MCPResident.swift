@@ -34,13 +34,54 @@ extension AgentModeViewModel {
     }
 
     func mcpResidentTargetIsCurrent(_ target: MCPResidentTarget) -> Bool {
-        guard let current = try? authoritativeLiveSession(for: target.endpoint.sessionID) else { return false }
+        guard let current = try? authoritativeLiveSession(for: target.endpoint.sessionID),
+              let window = WindowStatesManager.shared.window(withID: target.endpoint.windowID),
+              !window.isClosing, !WindowStatesManager.shared.isTerminating,
+              window.agentModeViewModel === self
+        else { return false }
         return current === target.session && Self.isMCPResidentAppOwned(current)
             && !current.bindingTransitionInProgress
             && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target.endpoint.sessionID)
             && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target.endpoint.sessionID)
             && agentSessionLinkObserverEndpoint(tabID: current.tabID) == target.endpoint
             && workspaceManager?.activeWorkspaceID == target.endpoint.workspaceID
+    }
+
+    /// Mutation preflight only. A negative result is carried with the exact incarnation, never cached.
+    func mcpPreflightResidentActivation(sessionID: UUID) async throws -> MCPResidentTarget? {
+        // An unloaded runtime has not established persisted origin yet. Explicit adoption may
+        // hydrate it; the shared preparation/activation fences requalify before any control action.
+        guard let target = try mcpResidentTarget(sessionID: sessionID), target.session.hasLoadedPersistedState else { return nil }
+        let hasLinks = await agentSessionLinkHasActiveOutboundLink(target.endpoint)
+        try mcpRequireResidentActivationFence(target, authoritativeHasLinks: hasLinks)
+        return target
+    }
+
+    /// Membership writers withhold inventory before their authority hop. Re-reading that existing
+    /// fence immediately before acting prevents a previously negative query admitting a new grant.
+    func mcpRequireResidentActivationFence(
+        _ target: MCPResidentTarget, authoritativeHasLinks: Bool = false
+    ) throws {
+        guard mcpResidentTargetIsCurrent(target),
+              agentSessionLinkPromptInventoryHoldsByEndpoint[target.endpoint] == nil
+        else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
+        let published = agentSessionLinkPromptInventoryBySessionID[target.endpoint.sessionID]
+        let publishedLinks = published?.endpoint == target.endpoint && published?.inventory.isEmpty == false
+        if authoritativeHasLinks || publishedLinks {
+            throw MCPError.invalidParams(
+                "Session \(target.endpoint.sessionID.uuidString) is app-owned and oversees other sessions. MCP activation would revoke its oversight links. Use agent_run.steer with wait=false, agent_run.poll, and agent_manage.get_log."
+            )
+        }
+    }
+
+    func mcpRequireActivationOwnerFence(_ target: MCPResidentTarget?, session: TabSession) throws {
+        if let target {
+            guard target.session === session else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
+            try mcpRequireResidentActivationFence(target)
+        } else if Self.isMCPResidentAppOwned(session) {
+            // A previously non-app-owned admission cannot silently capture its new owner.
+            throw MCPError.invalidParams(Self.mcpResidentTargetError)
+        }
     }
 
     /// Pure in-memory projection. Never acquires control, hydrates, clears masks or scans transcripts.
@@ -120,11 +161,15 @@ extension AgentModeViewModel {
         let protectedPrompt = session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil
             || mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         guard !protectedPrompt else { throw MCPError.invalidParams(Self.mcpResidentProtectedError) }
-        let liveness = AgentSessionLinkSendLiveness(
-            observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false
+        let admission = AgentSessionLinkSteerAdmission.evaluate(
+            readiness: Self.agentSessionLinkDeliveryReadinessSnapshot(
+                session: session, endpointMatchesGrant: true, isClosing: false
+            ),
+            runStateIsActive: session.runState.isActive, pendingPromptExists: protectedPrompt,
+            route: agentSessionLinkManagedSteerRoute(for: session)
         )
         let frame = Self.mcpResidentTaskFrame(text)
-        switch agentSessionLinkSteerAdmission(for: session, liveness: liveness) {
+        switch admission {
         case .blocked:
             throw MCPError.invalidParams(Self.mcpResidentBusyError)
         case let .steer(route):
