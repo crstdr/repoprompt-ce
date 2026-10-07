@@ -105,6 +105,21 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 )]
             ), for: .devin
         ))
+        // Install the fake CLI before window construction also on hosts that cache availability.
+        let transportRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lane-devin-transport-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: transportRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: transportRoot) }
+        let script = try AgentSessionLinkACPServerScript.write(to: transportRoot)
+        let command = transportRoot.appendingPathComponent("devin")
+        try FileManager.default.copyItem(at: script, to: command)
+        let previousPath = ProcessInfo.processInfo.environment["PATH"]
+        setenv("PATH", transportRoot.path + ":" + (previousPath ?? ""), 1)
+        _ = DevinRuntimeLocator.isInstalledSync(now: Date(timeIntervalSinceNow: 4))
+        defer {
+            if let previousPath { setenv("PATH", previousPath, 1) } else { unsetenv("PATH") }
+            _ = DevinRuntimeLocator.isInstalledSync(now: Date(timeIntervalSinceNow: 8))
+        }
         try await withFixture(ephemeral: false) { fixture in
             let suiteName = "lane-devin-role-\(UUID().uuidString)"
             let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -124,17 +139,6 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             profile.mcpAgentRoleModelParameters = [:]
             store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
 
-            let script = try AgentSessionLinkACPServerScript.write(to: fixture.root)
-            // Make availability portable without depending on an installed or authenticated Devin CLI.
-            let command = fixture.root.appendingPathComponent("devin")
-            try FileManager.default.copyItem(at: script, to: command)
-            let previousPath = ProcessInfo.processInfo.environment["PATH"]
-            setenv("PATH", fixture.root.path + ":" + (previousPath ?? ""), 1)
-            _ = DevinRuntimeLocator.isInstalledSync(now: Date(timeIntervalSinceNow: 4))
-            defer {
-                if let previousPath { setenv("PATH", previousPath, 1) } else { unsetenv("PATH") }
-                _ = DevinRuntimeLocator.isInstalledSync(now: Date(timeIntervalSinceNow: 8))
-            }
             fixture.window.agentModeViewModel.setAgentModeActive(true)
             try await AsyncTestWait.waitUntil("destination workspace activation") {
                 !fixture.window.agentModeViewModel.workspaceSwitchInFlight
