@@ -3044,6 +3044,18 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         /// projection: the suspension point a user's Stop can land in.
         var duringTranscriptPage: (() async -> Void)?
 
+        func agentSessionLinkCandidate(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation _: Bool
+        ) -> AgentSessionLinkEndpointCandidate? {
+            candidates.first { $0.domainEndpoint == endpoint }
+        }
+
+        func agentSessionLinkCandidates(
+            forSessionIDs sessionIDs: Set<UUID>, includeLocation _: Bool
+        ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+            Dictionary(uniqueKeysWithValues: sessionIDs.map { id in (id, candidates.filter { $0.sessionID == id }) })
+        }
+
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
             candidates
         }

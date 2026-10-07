@@ -1429,6 +1429,33 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         XCTAssertEqual(chooseTargetCount, 1)
     }
 
+    func testPersistenceOverlayRetainsDisabledOutboundChoicesAndAccessibilityCount() throws {
+        let offered = [peer("Session B", seed: 1), peer("Session C", seed: 2)]
+        let presentation = AgentSessionOversightPersistencePresentation(availability: .blocked("Persistence blocked"))
+        let blocker = try XCTUnwrap(presentation.addBlockerMessage)
+        let published = AgentMonitorPillProps(
+            sessionID: nil, sidebarOversightMenu: props(targetOptions: offered),
+            outbound: [], inbound: [], recentNotices: [], canAddReason: nil
+        )
+        // Exercise the shared VM/pill persistence overlay with a competing lifecycle reason.
+        let overlaid = try XCTUnwrap(published.withPersistence(
+            presentation, eligibilityReason: "Lifecycle reason"
+        ).sidebarOversightMenu)
+        XCTAssertEqual(overlaid.observerIneligibleReason, blocker)
+        XCTAssertEqual(overlaid.availableTargets, offered, "Offered choices are not actionable eligibility")
+
+        let root = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            overlaid, busyKeys: [], actions: .init()
+        ))
+        let choices = try submenu("Oversee new", in: root)
+        XCTAssertEqual(choices.items.map(\.title), [blocker, "Session B", "Session C", "", "Session ID…"])
+        XCTAssertTrue(choices.items.allSatisfy { !$0.isEnabled })
+        XCTAssertEqual(
+            root.items.first { $0.title == "Oversee new" }?.accessibilityValue() as? String,
+            AgentOversightUICopy.overseeMenuAccessibilityValue(overseeingCount: 0, availableCount: 2)
+        )
+    }
+
     func testOverseeByInboundActionAndIneligibleReason() throws {
         let candidateItem = peer("Overseer", seed: 1)
         let menuProps = props(observerOptions: [candidateItem])
