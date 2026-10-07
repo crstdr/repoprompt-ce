@@ -48,6 +48,7 @@ struct WindowContentView: View {
             )
             // Once the view appears, register it with WindowStatesManager
             .onAppear {
+                StartupPhaseLog.mark(.windowAppeared, window: windowState.windowID)
                 windowStatesManager.registerWindowState(windowState)
                 MCPExternalEventsMonitor.shared.scheduleCleanupOnce()
 
