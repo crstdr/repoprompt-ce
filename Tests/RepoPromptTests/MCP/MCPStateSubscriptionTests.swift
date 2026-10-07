@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
+import RepoPromptShared
 import XCTest
 
 /// Regression coverage for per-subscriber MCP state streams.
@@ -184,6 +185,46 @@ final class MCPStateSubscriptionTests: XCTestCase {
             ensureGitDataRootLoaded: { _, _ in
                 throw MCPError.internalError("git-data loading is not used by these tests")
             }
+        )
+    }
+
+    /// Composition must leave old events untouched: pruning belongs to window
+    /// appearance, not to any of the per-window view-model constructors.
+    @MainActor
+    func testTwentySixViewModelsDoNotPruneEventDirectoryDuringComposition() throws {
+        let directory = MCPExternalClientEvent.eventsDirectoryURL
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let prefix = "startup-scale-" + UUID().uuidString
+        let files = (0 ..< 3000).map { directory.appendingPathComponent("\(prefix)-\($0).json") }
+        defer {
+            for file in files {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
+        for file in files {
+            try Data("{}".utf8).write(to: file)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date().addingTimeInterval(-8 * 24 * 3600)],
+                ofItemAtPath: file.path
+            )
+        }
+
+        let service = makeService()
+        var servers: [MCPServerViewModel] = []
+        let started = ProcessInfo.processInfo.systemUptime
+        for _ in 0 ..< 26 {
+            servers.append(makeServerViewModel(service: service))
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        defer { for server in servers {
+            server.stopServiceObservation()
+        } }
+
+        print("STARTUP_SCALE windows=26 events=3000 composition_seconds=\(elapsed)")
+        XCTAssertLessThan(elapsed, 5, "Window composition must not wait on repeated event housekeeping")
+        XCTAssertTrue(
+            files.allSatisfy { FileManager.default.fileExists(atPath: $0.path) },
+            "View-model composition must not prune old events"
         )
     }
 

@@ -49,6 +49,7 @@ struct WindowContentView: View {
             // Once the view appears, register it with WindowStatesManager
             .onAppear {
                 windowStatesManager.registerWindowState(windowState)
+                MCPExternalEventsMonitor.shared.scheduleCleanupOnce()
 
                 // Install the openWindow action into AppWindowOpener for programmatic window creation
                 AppWindowOpener.shared.install {
