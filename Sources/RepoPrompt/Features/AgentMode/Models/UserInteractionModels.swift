@@ -602,6 +602,15 @@ enum AgentJSONValue: Hashable {
 struct AgentRequestUserInputOption: Hashable {
     let label: String
     let description: String
+
+    /// Legacy MCP approval answers have only display labels, not typed permission scopes.
+    /// CU therefore accepts known one-shot/refusal labels only; unknown scopes fail closed.
+    var isComputerUseOneShotApprovalOption: Bool {
+        switch label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "allow", "allow once", "deny", "decline", "reject", "cancel": true
+        default: false
+        }
+    }
 }
 
 struct AgentRequestUserInputQuestion: Hashable {
@@ -616,6 +625,10 @@ struct AgentRequestUserInputQuestion: Hashable {
 
     var isOtherOptionEnabled: Bool {
         isOther && !options.isEmpty
+    }
+
+    var isLegacyMCPToolApproval: Bool {
+        id.hasPrefix("mcp_tool_call_approval")
     }
 }
 
@@ -681,6 +694,36 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
         StableUserInteractionIdentity.uuid(
             from: "request-user-input|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
         )
+    }
+
+    /// Preserve request identity while removing persistent/unknown answers from CU consent UI
+    /// and from other pending-interaction projections. Ordinary requests are never transformed.
+    var computerUseReviewRequest: AgentRequestUserInputRequest {
+        guard questions.contains(where: \.isLegacyMCPToolApproval) else { return self }
+        return .init(
+            id: id, requestID: requestID, method: method, threadID: threadID,
+            turnID: turnID, itemID: itemID, askedAt: askedAt,
+            questions: questions.map { question in
+                guard question.isLegacyMCPToolApproval else { return question }
+                return .init(
+                    id: question.id, header: question.header, question: question.question,
+                    isOther: false, isSecret: question.isSecret,
+                    options: question.options.filter(\.isComputerUseOneShotApprovalOption)
+                )
+            }
+        )
+    }
+
+    func allowsComputerUseResponse(_ response: AgentRequestUserInputResponse) -> Bool {
+        let approvals = questions.filter(\.isLegacyMCPToolApproval)
+        guard !approvals.isEmpty else { return true }
+        guard Set(response.answersByQuestionID.keys).isSubset(of: Set(questions.map(\.id))) else { return false }
+        return approvals.allSatisfy { question in
+            guard let answers = response.answersByQuestionID[question.id], answers.count == 1 else { return false }
+            return question.options.contains { option in
+                option.isComputerUseOneShotApprovalOption && option.label == answers[0]
+            }
+        }
     }
 
     func buildResponse(from drafts: [String: AgentRequestUserInputQuestionDraft]) -> AgentRequestUserInputResponse {
