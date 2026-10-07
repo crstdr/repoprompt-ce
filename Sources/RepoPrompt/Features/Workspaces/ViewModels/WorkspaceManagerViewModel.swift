@@ -3924,6 +3924,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         #if DEBUG
             let indexLoadStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
+        let corpusLoadSpan = StartupPhaseLog.begin(
+            .workspaceCorpusLoad,
+            window: domainWorkspaceAuthorityClient?.windowID
+        )
         let indexEntries = loadWorkspaceIndex()
         #if DEBUG
             let indexLoadDurationMS = indexLoadStartMS.map { restorePerfRecorder.elapsedMS(since: $0) }
@@ -3993,6 +3997,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         #endif
         workspaces = loaded
+        corpusLoadSpan.end(extraFields: ["entries": indexEntries.count, "loaded": loaded.count])
         recordRepoPathBaselines(for: loaded)
 
         startPollTimer()
@@ -15522,6 +15527,11 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func findOrCreatePublishedDefaultWorkspace() async -> WorkspaceModel? {
         guard let fallback = findOrCreateDefaultWorkspace() else { return nil }
         guard let domainWorkspaceAuthorityClient else { return fallback }
+        let authorityWaitSpan = StartupPhaseLog.begin(
+            .authorityBootstrapWait,
+            window: domainWorkspaceAuthorityClient.windowID
+        )
+        defer { authorityWaitSpan.end() }
 
         if let creationTask = pendingSystemWorkspaceCreationTasks[fallback.id] {
             await creationTask.value
