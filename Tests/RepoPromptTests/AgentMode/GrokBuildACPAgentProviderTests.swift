@@ -19,7 +19,8 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
             modelString: config.modelString,
             includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
             alwaysApproveTools: config.alwaysApproveTools,
-            apiKey: config.apiKey
+            apiKey: config.apiKey,
+            backgroundFeatureEnvironment: config.backgroundFeatureEnvironment
         )
         let provider = GrokBuildACPAgentProvider(
             config: resolvedConfig,
@@ -50,6 +51,9 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
         XCTAssertEqual(launch.arguments, ["agent", "--no-leader", "stdio"])
         XCTAssertNil(launch.cleanupArtifact)
+        for key in ["GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_AUTO_WAKE"] {
+            XCTAssertNil(launch.environment[key], "Default config must preserve native behavior for \(key)")
+        }
     }
 
     func testManagedModeDoesNotAppendAlwaysApprove() throws {
@@ -92,6 +96,24 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         }
     }
 
+    func testBackgroundFeatureEnvironmentPreservesImportIsolationAndStoredKey() throws {
+        let config = GrokBuildAgentConfig(
+            apiKey: "xai-test-key-123",
+            backgroundFeatureEnvironment: [
+                "GROK_MEMORY": "1",
+                "GROK_CLAUDE_MCPS_ENABLED": "1",
+                "GROK_CURSOR_MCPS_ENABLED": "1",
+                "XAI_API_KEY": "background-test-key"
+            ]
+        )
+        let (provider, directory) = try makeProvider(config: config)
+        let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
+        XCTAssertEqual(launch.environment["GROK_MEMORY"], "1")
+        XCTAssertEqual(launch.environment["GROK_CLAUDE_MCPS_ENABLED"], "0")
+        XCTAssertEqual(launch.environment["GROK_CURSOR_MCPS_ENABLED"], "0")
+        XCTAssertEqual(launch.environment["XAI_API_KEY"], "xai-test-key-123")
+    }
+
     func testStoredGrokAPIKeyIsInjectedAsXAIAPIKey() throws {
         let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig(apiKey: "xai-test-key-123"))
         let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
@@ -128,6 +150,37 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
             XCTAssertEqual(server.command, RepoPromptMCPServerConfiguration.repoPrompt.command)
             XCTAssertEqual(server.args, RepoPromptMCPServerConfiguration.repoPrompt.args)
             XCTAssertEqual(server.env, RepoPromptMCPServerConfiguration.repoPrompt.env)
+        }
+    }
+
+    func testSessionPermissionOverridesFollowEffectiveFullAccess() throws {
+        for configFullAccess in [false, true] {
+            let (provider, directory) = try makeProvider(
+                config: GrokBuildAgentConfig(alwaysApproveTools: configFullAccess)
+            )
+            for requestFullAccess in [false, true] {
+                for resumeSessionID in [nil, "sess-123"] as [String?] {
+                    let context = "configFullAccess=\(configFullAccess), requestFullAccess=\(requestFullAccess), resume=\(resumeSessionID ?? "new")"
+                    let session = try provider.makeSessionConfiguration(
+                        for: makeRequest(
+                            workspacePath: directory.path,
+                            resumeSessionID: resumeSessionID,
+                            autoApprove: requestFullAccess
+                        ),
+                        mcpServer: .repoPrompt
+                    )
+                    let fullAccess = configFullAccess || requestFullAccess
+                    let expectedMetadata: [String: AgentJSONValue] = fullAccess ? [:] : [
+                        "yoloMode": .bool(false),
+                        "autoMode": .bool(false)
+                    ]
+                    let expectedNotification: ACPSessionConfiguration.PostOpenNotification? = fullAccess ? nil : .init(
+                        method: "_x.ai/yolo_mode_changed", params: ["auto_mode": .bool(false)]
+                    )
+                    XCTAssertEqual(session.metadata, expectedMetadata, context)
+                    XCTAssertEqual(session.postOpenNotification, expectedNotification, context)
+                }
+            }
         }
     }
 
@@ -319,6 +372,21 @@ extension GrokBuildACPAgentProviderTests {
         )
         let grokProvider = try XCTUnwrap(provider as? GrokBuildACPAgentProvider)
         XCTAssertFalse(grokProvider.test_config.alwaysApproveTools)
+    }
+
+    func testInteractiveFactoryDisablesUnmanagedBackgroundFeatures() async throws {
+        let factoryProvider = try await ACPAgentProviderFactory.makeProvider(
+            for: .grokBuild,
+            modelString: nil,
+            grokAPIKeyProvider: { nil }
+        )
+        let grokProvider = try XCTUnwrap(factoryProvider as? GrokBuildACPAgentProvider)
+        let (provider, directory) = try makeProvider(config: grokProvider.test_config)
+        let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
+
+        for key in ["GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_AUTO_WAKE"] {
+            XCTAssertEqual(launch.environment[key], "0", "Agent Mode must disable unmanaged background feature \(key)")
+        }
     }
 }
 

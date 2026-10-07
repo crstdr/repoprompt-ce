@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 import MCP
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
@@ -85,9 +85,14 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     private final class FakeEndpointHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
+        var modelAvailabilityByWindow: [Int: AgentModelCatalog.AvailabilityContext] = [:]
         var beforeModelFence: (() async -> Void)?
         var afterModelFence: (() async -> Void)?
         var modelMutationCount = 0
+
+        func agentSessionLinkModelAvailability(windowID: Int) -> AgentModelCatalog.AvailabilityContext {
+            modelAvailabilityByWindow[windowID] ?? .current
+        }
 
         func agentSessionLinkModelCandidate(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionLinkEndpointCandidate? {
             candidates.first { $0.domainEndpoint == endpoint }
@@ -110,6 +115,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var laneCandidate: AgentSessionLinkEndpointCandidate?
         var laneCreationOutcome: AgentSessionLaneHostCreationOutcome?
         var laneCreationCount = 0
+        var lastLaneSelection: AgentSessionLanePolicy.RoleSelection?
         var beforeLaneCreationReturn: (() async -> Void)?
         var laneCreationHandler: (
             (Int, UUID, UUID, String?, AgentSessionLanePolicy.RoleSelection)
@@ -131,6 +137,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             selection: AgentSessionLanePolicy.RoleSelection
         ) async throws -> AgentSessionLaneHostCreationOutcome {
             laneCreationCount += 1
+            lastLaneSelection = selection
             await beforeLaneCreationReturn?()
             if let laneCreationHandler {
                 return try await laneCreationHandler(
@@ -3306,6 +3313,35 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(targetProps.hasInbound)
     }
 
+    func testFullProjectionRefreshReadsCandidatesIndependentlyOfOpenChatCount() async {
+        let fixture = makeFixture()
+        fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        fixture.host.candidates += (0 ..< 200).map { makeCandidate(windowID: 3 + $0 % 3, displayName: "Chat \($0)") }
+        let readsBefore = fixture.host.candidateReadCount
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        await fixture.bridge.test_settleProjections()
+        XCTAssertLessThan(
+            fixture.host.candidateReadCount - readsBefore,
+            50,
+            "A full refresh must not re-read every candidate once per candidate"
+        )
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint[fixture.observer.domainEndpoint]?.items.first?.createdByYou, true)
+
+        let duplicate = makeCandidate(windowID: 6, sessionID: fixture.target.sessionID, displayName: "Duplicate target")
+        let nextPassRead = fixture.host.candidateReadCount
+        fixture.host.onCandidatesRead = { read in
+            // Two pass snapshots precede the authority hops; the observer's fresh read sees drift.
+            if read == nextPassRead + 3 { fixture.host.candidates.append(duplicate) }
+        }
+        await fixture.bridge.test_settleProjections()
+        fixture.host.onCandidatesRead = nil
+        XCTAssertEqual(
+            fixture.host.publishedInventoriesByEndpoint[fixture.observer.domainEndpoint]?.items.first?.createdByYou,
+            false,
+            "Pass-local presentation indexes must not supply pre-hop UUID uniqueness to prompt provenance"
+        )
+    }
+
     func testRevokeClearsBothProjectionsAndLeavesEndpointRelativeNotices() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
@@ -6017,6 +6053,68 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     // MARK: - Overseer-created lanes
 
+    func testRoleLaneCreationUsesDestinationAvailabilityWithoutSubstitution() async throws {
+        let registry = AgentACPModelRegistry.shared
+        registry.test_reset(providerID: .cursor)
+        defer { registry.test_reset(providerID: .cursor) }
+        let cursorModel = AgentModelOption(
+            rawValue: AgentModel.cursorAuto.rawValue, displayName: "Auto", description: nil, isDefault: true
+        )
+        XCTAssertTrue(registry.updateDiscoveredModels(
+            .init(options: [cursorModel], currentModelRaw: cursorModel.rawValue), for: .cursor
+        ))
+
+        let store = GlobalSettingsStore.shared
+        let originalProfile = store.globalAgentModelsProfile()
+        defer { store.setGlobalAgentModelsProfile(originalProfile, contextBuilderWriteIntent: .preserveExistingOwnership) }
+        let scenarios: [(name: String, agent: AgentProviderKind, model: String, connected: Bool)] = [
+            ("connected Grok", .grokBuild, AgentModel.defaultModel.rawValue, true),
+            ("connected Cursor", .cursor, cursorModel.rawValue, true),
+            ("disconnected Grok", .grokBuild, AgentModel.defaultModel.rawValue, false),
+            ("disconnected Codex", .codexExec, AgentModel.gpt61SolHigh.rawValue, false)
+        ]
+        for scenario in scenarios {
+            let fixture = makeFixture()
+            try installLaneIntentStore(fixture)
+            guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+            let lane = prepareCreatedLane(fixture)
+            let available = AgentModelCatalog.AvailabilityContext(
+                claudeCodeAvailable: false,
+                codexAvailable: scenario.agent == .codexExec,
+                openCodeAvailable: false,
+                cursorAvailable: scenario.agent == .cursor,
+                grokBuildAvailable: scenario.agent == .grokBuild
+            )
+            // Opposite states distinguish the destination window from the observer window.
+            fixture.host.modelAvailabilityByWindow[fixture.observer.windowID] = scenario.connected ? .none : available
+            fixture.host.modelAvailabilityByWindow[fixture.target.windowID] = scenario.connected ? available : .none
+            var profile = originalProfile
+            profile.mcpAgentRoleOverrides = ["pair": AgentModelSelectionID(
+                agentRaw: scenario.agent.rawValue, modelRaw: scenario.model
+            ).rawValue]
+            store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
+
+            let receipt = await fixture.bridge.createLane(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                request: laneRequest(fixture, key: scenario.name)
+            ) {
+                (windowID: fixture.target.windowID, workspaceID: fixture.target.workspaceID, workspaceName: "Destination")
+            }
+            if scenario.connected {
+                XCTAssertEqual(receipt.result, .created, "\(scenario.name): a valid destination pin must create the lane")
+                XCTAssertEqual(receipt.sessionID, lane.sessionID, scenario.name)
+                XCTAssertEqual(fixture.host.laneCreationCount, 1, scenario.name)
+                XCTAssertEqual(fixture.host.lastLaneSelection?.agentRaw, scenario.agent.rawValue, "\(scenario.name): no provider substitution")
+                XCTAssertEqual(fixture.host.lastLaneSelection?.modelRaw, scenario.model, "\(scenario.name): no model substitution")
+            } else {
+                XCTAssertEqual(receipt.reason, .roleUnavailable, "\(scenario.name): unavailable destination pins must fail closed")
+                XCTAssertNil(receipt.sessionID, scenario.name)
+                XCTAssertEqual(fixture.host.laneCreationCount, 0, "\(scenario.name): refuse before allocation")
+                XCTAssertNil(fixture.host.lastLaneSelection, scenario.name)
+            }
+        }
+    }
+
     @discardableResult
     private func installLaneIntentStore(
         _ fixture: Fixture,
@@ -6793,11 +6891,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await fulfillment(of: [completed], timeout: 4)
     }
 
-    func testSevenLinkedLanesAdmitOnlyOneOfTwoOverlappingCreators() async throws {
+    func testOneRemainingLaneSlotAdmitsOnlyOneOfTwoOverlappingCreators() async throws {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        for index in 0 ..< 7 {
+        for index in 0 ..< (AgentSessionLanePolicy.agentSessionLaneMaximumCount - 1) {
             let existing = makeCandidate(windowID: 20 + index)
             fixture.host.candidates.append(existing)
             fixture.host.laneProvenance[existing.domainEndpoint] = fixture.observer.sessionID
@@ -6819,7 +6917,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             first = await createLane(
                 fixture,
                 observerEndpoint: fixture.observer.domainEndpoint,
-                request: laneRequest(fixture, key: "seven-first")
+                request: laneRequest(fixture, key: "one-slot-first")
             )
             completed.fulfill()
         }
@@ -6827,7 +6925,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let second = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "seven-second")
+            request: laneRequest(fixture, key: "one-slot-second")
         )
         XCTAssertEqual(second.reason, .laneLimitReached)
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
@@ -6841,7 +6939,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         var firstLane: AgentSessionLinkEndpointCandidate?
-        for index in 0 ..< 8 {
+        for index in 0 ..< AgentSessionLanePolicy.agentSessionLaneMaximumCount {
             let lane = makeCandidate(windowID: 70 + index)
             if firstLane == nil {
                 firstLane = lane
@@ -6895,7 +6993,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let sibling = makeCandidate(windowID: 91, sessionID: fixture.observer.sessionID)
         fixture.host.candidates.append(sibling)
-        for index in 0 ..< 8 {
+        for index in 0 ..< AgentSessionLanePolicy.agentSessionLaneMaximumCount {
             let lane = makeCandidate(windowID: 100 + index)
             fixture.host.candidates.append(lane)
             fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
@@ -6919,7 +7017,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        for index in 0 ..< 7 {
+        for index in 0 ..< (AgentSessionLanePolicy.agentSessionLaneMaximumCount - 1) {
             let lane = makeCandidate(windowID: 120 + index)
             fixture.host.candidates.append(lane)
             fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
@@ -6991,7 +7089,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        for index in 0 ..< 6 {
+        for index in 0 ..< (AgentSessionLanePolicy.agentSessionLaneMaximumCount - 2) {
             let lane = makeCandidate(windowID: 140 + index)
             fixture.host.candidates.append(lane)
             fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
@@ -7024,7 +7122,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let second = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "eighth")
+            request: laneRequest(fixture, key: "last-slot")
         )
         XCTAssertEqual(second.result, .created)
         XCTAssertEqual(fixture.host.laneCreationCount, 2)

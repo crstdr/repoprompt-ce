@@ -1,12 +1,12 @@
 {
-  "description": "Sidebar oversight PR: upstream/main recorded app baseline 650279 plus exact full PR app-source delta 1028 = 651307; existing advisory headroom unchanged, no additional allowance. All other numeric ratchets including test imports and wrong-way edges unchanged.",
+  "description": "Sidebar oversight refresh: upstream/main recorded app baseline 603133 plus exact net PR app-source delta 966 = 604099, with zero additional app-line headroom. All other upstream numeric metrics and enforcement remain unchanged.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
     "tests_testable_import_app_files",
     "app_static_shared_declarations"
   ],
-  "app_target_swift_lines_headroom": 2000,
+  "app_target_swift_lines_headroom": 0,
   "tracked": [
     "app_target_swift_lines",
     "app_shared_accessor_uses",
@@ -24,7 +24,7 @@
     "app_shared_accessor_uses": 1218,
     "app_static_shared_declarations": 89,
     "app_target_swift_files": 1126,
-    "app_target_swift_lines": 651307,
+    "app_target_swift_lines": 604099,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1079,
     "first_party_swift_lines": 747202,

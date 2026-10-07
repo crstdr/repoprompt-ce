@@ -241,7 +241,7 @@ package enum AgentSidebarOversightActionKey: Hashable {
 /// linked (ticked) entries first. Ineligible directions produce a greyed reason instead of a
 /// hidden menu.
 package enum AgentSidebarOversightMenuProjection {
-    private struct Seed {
+    fileprivate struct Seed {
         let peerEndpoint: DomainAgentSessionLinkEndpointIdentity
         let peerSessionID: UUID
         let displayName: String
@@ -269,10 +269,61 @@ package enum AgentSidebarOversightMenuProjection {
 
     private static let foldingLocale = Locale(identifier: "en_US_POSIX")
 
+    /// Immutable preparation shared by every endpoint in one refresh pass.
+    package struct CandidateIndex {
+        package let byEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate]
+        package let bySessionID: [UUID: AgentSessionLinkEndpointCandidate]
+        fileprivate let orderedPeers: [Seed]
+        fileprivate let observerEligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+        fileprivate let targetEligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+        fileprivate let labelsAreUnique: Bool
+
+        package init(_ candidates: [AgentSessionLinkEndpointCandidate]) {
+            // Preserve live first-match representatives, including moved-peer display fallback.
+            byEndpoint = Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
+            bySessionID = Dictionary(candidates.map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
+            orderedPeers = byEndpoint.values.map { candidate in
+                Seed(
+                    peerEndpoint: candidate.domainEndpoint,
+                    peerSessionID: candidate.sessionID,
+                    displayName: candidate.resolvedDisplayName,
+                    providerDisplayName: normalizedProvider(candidate.providerDisplayName),
+                    locationLabel: candidate.locationLabel,
+                    relationship: .available
+                )
+            }.sorted { orderedBefore($0, $1, currentWorkspaceID: nil) }
+            labelsAreUnique = Set(orderedPeers.map(\.baseMenuLabel)).count == orderedPeers.count
+            observerEligibleEndpoints = Set(byEndpoint.values.filter {
+                AgentSessionLinkEndpointEligibility.addDisabledReason(
+                    $0.eligibilityInput, roleAllowsOutboundMonitoring: $0.roleAllowsOutboundMonitoring
+                ) == nil
+            }.map(\.domainEndpoint))
+            targetEligibleEndpoints = Set(byEndpoint.values.filter {
+                AgentSessionLinkEndpointEligibility.targetResolveFailure(for: $0) == nil
+            }.map(\.domainEndpoint))
+        }
+    }
+
     package static func make(
         target: AgentSessionLinkEndpointCandidate,
         inputs: DomainAgentSessionLinkEndpointProjectionInputs,
         candidates: [AgentSessionLinkEndpointCandidate],
+        createdByLabel: String? = nil,
+        creatorSessionID: UUID? = nil
+    ) -> AgentSidebarOversightMenuProps {
+        make(
+            target: target,
+            inputs: inputs,
+            candidateIndex: CandidateIndex(candidates),
+            createdByLabel: createdByLabel,
+            creatorSessionID: creatorSessionID
+        )
+    }
+
+    package static func make(
+        target: AgentSessionLinkEndpointCandidate,
+        inputs: DomainAgentSessionLinkEndpointProjectionInputs,
+        candidateIndex: CandidateIndex,
         createdByLabel: String? = nil,
         creatorSessionID: UUID? = nil
     ) -> AgentSidebarOversightMenuProps {
@@ -287,17 +338,8 @@ package enum AgentSidebarOversightMenuProjection {
             roleAllowsOutboundMonitoring: target.roleAllowsOutboundMonitoring
         )
 
-        let candidatesByEndpoint = Dictionary(
-            candidates.map { ($0.domainEndpoint, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        // Display names resolve app-wide by session ID, like the candidate lists: a linked
-        // peer whose live incarnation moved (rebind, generation rollover, another window)
-        // still names itself, and the compact ID only shows for a truly unknown session.
-        let candidatesBySessionID = Dictionary(
-            candidates.map { ($0.sessionID, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
+        let candidatesByEndpoint = candidateIndex.byEndpoint
+        let candidatesBySessionID = candidateIndex.bySessionID
 
         // MARK: Inbound (who oversees this row)
 
@@ -346,33 +388,12 @@ package enum AgentSidebarOversightMenuProjection {
             ))
         }
 
-        var availableObservers: [Seed] = []
-        var availableObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
-        // New inbound links require an eligible target; a greyed reason replaces the list otherwise.
-        if targetFailure == nil {
-            for observer in candidates {
-                let observerEndpoint = observer.domainEndpoint
-                guard observer.sessionID != target.sessionID,
-                      !linkedObserverEndpoints.contains(observerEndpoint),
-                      availableObserverEndpoints.insert(observerEndpoint).inserted,
-                      inputs.activeOutboundObserverEndpoints.contains(observerEndpoint),
-                      AgentSessionLinkEndpointEligibility.addDisabledReason(
-                          observer.eligibilityInput,
-                          roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-                      ) == nil
-                else {
-                    continue
-                }
-                availableObservers.append(Seed(
-                    peerEndpoint: observerEndpoint,
-                    peerSessionID: observer.sessionID,
-                    displayName: observer.resolvedDisplayName,
-                    providerDisplayName: normalizedProvider(observer.providerDisplayName),
-                    locationLabel: observer.locationLabel,
-                    relationship: .available
-                ))
-            }
-        }
+        let availableObservers: [Seed] = targetFailure == nil ? candidateIndex.orderedPeers.filter {
+            $0.peerSessionID != target.sessionID
+                && !linkedObserverEndpoints.contains($0.peerEndpoint)
+                && inputs.activeOutboundObserverEndpoints.contains($0.peerEndpoint)
+                && candidateIndex.observerEligibleEndpoints.contains($0.peerEndpoint)
+        } : []
 
         // MARK: Outbound (who this row oversees)
 
@@ -418,29 +439,11 @@ package enum AgentSidebarOversightMenuProjection {
             ))
         }
 
-        var availableTargets: [Seed] = []
-        var availableTargetEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
-        // New outbound links require an eligible observer; a greyed reason replaces the list.
-        if observerReason == nil {
-            for peer in candidates {
-                let peerEndpoint = peer.domainEndpoint
-                guard peer.sessionID != target.sessionID,
-                      !linkedTargetEndpoints.contains(peerEndpoint),
-                      availableTargetEndpoints.insert(peerEndpoint).inserted,
-                      AgentSessionLinkEndpointEligibility.targetResolveFailure(for: peer) == nil
-                else {
-                    continue
-                }
-                availableTargets.append(Seed(
-                    peerEndpoint: peerEndpoint,
-                    peerSessionID: peer.sessionID,
-                    displayName: peer.resolvedDisplayName,
-                    providerDisplayName: normalizedProvider(peer.providerDisplayName),
-                    locationLabel: peer.locationLabel,
-                    relationship: .available
-                ))
-            }
-        }
+        let availableTargets: [Seed] = observerReason == nil ? candidateIndex.orderedPeers.filter {
+            $0.peerSessionID != target.sessionID
+                && !linkedTargetEndpoints.contains($0.peerEndpoint)
+                && candidateIndex.targetEligibleEndpoints.contains($0.peerEndpoint)
+        } : []
 
         // MARK: Ordering and labels
 
@@ -450,12 +453,11 @@ package enum AgentSidebarOversightMenuProjection {
         // Outbound: ticked first, then own-workspace-first and folded name within each group.
         let targetSeeds = linkedTargets.sorted {
             orderedBefore($0, $1, currentWorkspaceID: rowWorkspaceID)
-        } + availableTargets.sorted {
-            orderedBefore($0, $1, currentWorkspaceID: rowWorkspaceID)
-        }
+        } + availableTargets.filter { $0.peerEndpoint.workspaceID == rowWorkspaceID }
+            + availableTargets.filter { $0.peerEndpoint.workspaceID != rowWorkspaceID }
 
-        let observerLabels = collisionSafeLabels(for: observerSeeds)
-        let targetLabels = collisionSafeLabels(for: targetSeeds)
+        let observerLabels = collisionSafeLabels(for: observerSeeds, linked: linkedObservers, candidateIndex: candidateIndex)
+        let targetLabels = collisionSafeLabels(for: targetSeeds, linked: linkedTargets, candidateIndex: candidateIndex)
 
         let observerOptions = observerSeeds.map { seed in
             AgentSidebarOversightMenuProps.PeerOption(
@@ -527,7 +529,7 @@ package enum AgentSidebarOversightMenuProjection {
     private static func orderedBefore(
         _ lhs: Seed,
         _ rhs: Seed,
-        currentWorkspaceID: UUID
+        currentWorkspaceID: UUID?
     ) -> Bool {
         let lhsInWorkspace = lhs.peerEndpoint.workspaceID == currentWorkspaceID
         let rhsInWorkspace = rhs.peerEndpoint.workspaceID == currentWorkspaceID
@@ -568,8 +570,18 @@ package enum AgentSidebarOversightMenuProjection {
 
     /// Widen only colliding labels, one exact component at a time, while keeping unique names clean.
     private static func collisionSafeLabels(
-        for seeds: [Seed]
+        for seeds: [Seed],
+        linked: [Seed],
+        candidateIndex: CandidateIndex
     ) -> [DomainAgentSessionLinkEndpointIdentity: String] {
+        // A subset of unique snapshot labels needs no widening. A moved/missing peer must
+        // first prove the same label; otherwise use ordinary row-specific collision handling.
+        if candidateIndex.labelsAreUnique, linked.allSatisfy({ seed in
+            guard let candidate = candidateIndex.byEndpoint[seed.peerEndpoint] else { return false }
+            return seed.displayName == candidate.resolvedDisplayName && seed.locationLabel == candidate.locationLabel
+        }) {
+            return [:]
+        }
         var labels = Dictionary(
             uniqueKeysWithValues: seeds.map { ($0.peerEndpoint, $0.baseMenuLabel) }
         )

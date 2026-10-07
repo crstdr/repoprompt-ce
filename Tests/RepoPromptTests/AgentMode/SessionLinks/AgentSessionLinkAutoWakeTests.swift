@@ -58,6 +58,39 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         super.tearDown()
     }
 
+    func testScheduledWakeDuringWorktreeCommitAdmissionCannotDispatchOrChangeBinding() async throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.runState = .idle
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let original = AgentSessionWorktreeBinding(
+            id: "primary", repositoryID: "repo", repoKey: "repo", logicalRootPath: "/tmp/wake-logical",
+            logicalRootName: "Project", worktreeID: "wt", worktreeRootPath: "/tmp/wake-physical", source: "test"
+        )
+        fixture.session.worktreeBindings = [original]
+        var wake: AgentSessionLinkAutoWakeAttempt?
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [], forSessionID: fixture.sessionID, intent: .externalManagement,
+                beforeCommit: {
+                    XCTAssertTrue(fixture.session.isChangingExecutionLocation)
+                    try self.publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+                    wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+                    XCTAssertEqual(wake?.phase, .scheduled)
+                    XCTAssertEqual(wake?.physicalOutcome, .notAttempted)
+                    wake?.task?.cancel()
+                }
+            )
+            XCTFail("A competing wake reservation must fail closed, not migrate its provider turn")
+        } catch {
+            XCTAssertNotNil(wake, "The test must reach the deterministic reservation boundary")
+            XCTAssertTrue(error.localizedDescription.contains("queued work"))
+            XCTAssertEqual(fixture.session.worktreeBindings, [original])
+            XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+            XCTAssertEqual(wake?.physicalOutcome, .notAttempted)
+        }
+    }
+
     func testRepeatedCancellationKeepsRawProviderDispatchFenced() async throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
@@ -1431,28 +1464,23 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertNil(fixture.session.oversight.suppressedWakeFingerprint)
     }
 
-    func testReadyCatalogTransitionRedrivesOneOwedWakeWithoutAnotherNotice() async throws {
+    func testUnreadyCatalogDoesNotDelayOrDuplicateOwedWake() async throws {
         let fixture = try makeFixture(catalogReady: false)
         try publishInventory(fixture, revision: 1)
         fixture.session.oversight.autoWakeOnUpdates = true
         fixture.session.runState = .running
 
         try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
-        XCTAssertNil(
-            fixture.session.oversight.pendingAutoWake,
-            "the passive publication remains owed while its current run catalog is unready"
-        )
-
-        let projection = try publishCatalogProjection(fixture, revision: 1, hasAgentSessionLink: true)
-        try await AsyncTestWait.waitUntil("the ready transition to re-drive the owed wake") {
+        try await AsyncTestWait.waitUntil("the owed wake without a tool-list refresh") {
             await MainActor.run {
                 fixture.session.oversight.pendingAutoWake?.phase == .awaitingSettlement
             }
         }
         let reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
 
-        // Replaying the same ready projection is not a second transition and must not reserve another
-        // wake. No passive status publication occurs after the one above.
+        let projection = try publishCatalogProjection(fixture, revision: 1, hasAgentSessionLink: true)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, reserved.wakeID)
+        // Discovery catching up must not reserve a second wake for the same pending batch.
         fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
             projection,
             to: reserved.observerEndpoint
