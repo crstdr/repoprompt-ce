@@ -6660,7 +6660,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         preserveExistingRunID: Bool = false,
         skipResumeWhenNoPriorCodexHistory: Bool = false,
         semanticRunState: AgentSessionRunState? = nil,
-        startupClaimToken: UUID? = nil
+        startupClaimToken: UUID? = nil,
+        renewBootstrapForReplacement: (@MainActor () async -> Bool)? = nil
     ) async {
         let managedSessionFence = CodexManagedSessionFence.shared
         let sessionInstallationToken = managedSessionFence.capturePublicationToken()
@@ -6718,7 +6719,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     forIdleNativeCompact: forIdleNativeCompact,
                     skipResumeWhenNoPriorCodexHistory: false,
                     semanticRunState: semanticRunState,
-                    startupClaimToken: claimToken
+                    startupClaimToken: claimToken,
+                    renewBootstrapForReplacement: renewBootstrapForReplacement
                 )
                 return
             }
@@ -7057,7 +7059,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
-                startupClaimToken: claimToken
+                startupClaimToken: claimToken,
+                renewBootstrapForReplacement: renewBootstrapForReplacement
             )
             return
         }
@@ -7088,13 +7091,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 nil
             }
             let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
-            guard let lease = makeCodexRunLease(
+            guard let initialLease = makeCodexRunLease(
                 tabID: session.tabID,
                 runID: runID,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
                 routingStateOwner: routingStateOwner
             ) else { return }
+            var lease = initialLease
             func cleanupIdleCompactStartup() async {
                 let originalControllerInstalled = session.codexControllerGeneration == startupControllerGeneration
                     && session.codexController.map(ObjectIdentifier.init) == startupController.map(ObjectIdentifier.init)
@@ -7160,7 +7164,42 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
-                startupClaimToken: claimToken
+                startupClaimToken: claimToken,
+                renewBootstrapForReplacement: {
+                    guard let replacementController = session.codexController else { return false }
+                    let replacementID = ObjectIdentifier(replacementController)
+                    let replacementGeneration = session.codexControllerGeneration
+                    @MainActor func stillOwnsReplacement() -> Bool {
+                        !Task.isCancelled
+                            && session.selectedAgent == .codexExec
+                            && session.runID == runID
+                            && session.activeRunAttemptID == runAttemptIDAtEntry
+                            && session.codexController.map(ObjectIdentifier.init) == replacementID
+                            && session.codexControllerGeneration == replacementGeneration
+                            && self.codexStartupClaimsByTabID[session.tabID]?.token == claimToken
+                            && managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                    }
+                    guard stillOwnsReplacement() else { return false }
+                    // Retirement has joined before this handoff. Fully settle the old permit
+                    // and run-keyed waiter before admitting another process on the same run.
+                    await lease.cancelAndCleanup()
+                    guard stillOwnsReplacement(),
+                          let successor = self.makeCodexRunLease(
+                              tabID: session.tabID,
+                              runID: runID,
+                              taskLabelKind: session.mcpControlContext?.taskLabelKind,
+                              allowsAgentExternalControlTools: session.mcpControlContext != nil && session.parentSessionID == nil
+                          )
+                    else { return false }
+                    lease = successor
+                    guard await successor.acquire() else { return false }
+                    await successor.providerInitializationStarted(provider: AgentProviderKind.codexExec.rawValue)
+                    guard stillOwnsReplacement() else {
+                        await successor.cancelAndCleanup()
+                        return false
+                    }
+                    return true
+                }
             )
 
             let pendingStart = pendingCodexStartsByTabID[session.tabID]
@@ -7544,6 +7583,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     preserveRunID: true
                 )
                 guard let freshController = await prepareCodexController() else { return }
+                let freshControllerGeneration = session.codexControllerGeneration
+                if shouldManageCodexTooling, !forIdleNativeCompact {
+                    guard let renewBootstrapForReplacement,
+                          await renewBootstrapForReplacement() else { return }
+                }
+                guard !Task.isCancelled,
+                      session.runID == runID,
+                      session.activeRunAttemptID == runAttemptIDAtEntry,
+                      session.codexControllerGeneration == freshControllerGeneration,
+                      session.codexController.map({ Self.sameCodexControllerInstance($0, freshController) }) == true,
+                      managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                else { return }
                 do {
                     var retryResult = try await startCodexNativeSession(
                         controller: freshController,
