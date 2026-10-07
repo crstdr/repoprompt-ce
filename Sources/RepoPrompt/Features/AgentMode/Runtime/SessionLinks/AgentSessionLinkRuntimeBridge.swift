@@ -7905,7 +7905,7 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Resolves a pasted Session ID for the *inbound* direction: the pasted session is the
-    /// prospective overseer of the row's target, and "Oversee by" only offers sessions that
+    /// prospective overseer of the row's target, and "Link overseer" only offers sessions that
     /// already hold an outbound link. Returns user-facing message text on failure.
     ///
     /// Observer eligibility reuses `addDisabledReason` (child/MCP-controlled/MCP-originated and

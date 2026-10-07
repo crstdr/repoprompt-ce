@@ -1398,16 +1398,72 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
 
         let titles = menu.items.map(\.title)
         XCTAssertEqual(titles, [
-            "Overseeing", "Target",
             "Overseen by", "Observer",
+            "Overseeing", "Target",
             "Created by", "Creator",
             "",
-            "Oversee new", "Oversee by", "Unlink"
+            "Link overseer", "Oversee", "Unlink"
         ])
         XCTAssertTrue(menu.items[6].isSeparatorItem)
         XCTAssertFalse(menu.items[9].isSeparatorItem)
         XCTAssertFalse(menu.items[0].isEnabled)
         XCTAssertEqual(menu.items[0].accessibilityHelp(), nil)
+    }
+
+    /// Order contract: "Overseen by" — including its "Created and overseen by" collapse —
+    /// leads "Overseeing" wherever both sections render: the menu's top sections, the Unlink
+    /// submenu, and the monitor pill popover. The hierarchy reads top-down.
+    func testOverseenBySectionLeadsOverseeingWhereBothSectionsExist() throws {
+        let target = peer("Target", seed: 1, relationship: .linked(reference: link(11), peerCurrentlyEligible: true))
+        let observer = peer("Observer", seed: 2, relationship: .linked(reference: link(12), peerCurrentlyEligible: true))
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            props(observerOptions: [observer], targetOptions: [target]),
+            busyKeys: [],
+            actions: .init()
+        ))
+
+        XCTAssertEqual(
+            menu.items.map(\.title),
+            ["Overseen by", "Observer", "Overseeing", "Target", "", "Link overseer", "Oversee", "Unlink"]
+        )
+        XCTAssertEqual(
+            try submenu("Unlink", in: menu).items.map(\.title),
+            ["Overseen by", "Observer", "Overseeing", "Target"]
+        )
+        XCTAssertEqual(
+            AgentMonitorPopoverLinkedSection.displayOrder(hasInbound: true, hasOutbound: true),
+            [.inbound, .outbound]
+        )
+
+        // The sole-overseer collapse keeps the same lead position.
+        let creatorSessionID = UUID()
+        let creator = AgentSidebarOversightMenuProps.PeerOption(
+            peerEndpoint: endpoint(3),
+            peerSessionID: creatorSessionID,
+            displayName: "Creator",
+            providerDisplayName: nil,
+            menuLabel: "Creator",
+            fullIdentityDescription: "identity Creator",
+            relationship: .linked(reference: link(13), peerCurrentlyEligible: true)
+        )
+        let collapsed = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            props(
+                observerOptions: [creator],
+                targetOptions: [target],
+                createdByLabel: "Creator",
+                creatorSessionID: creatorSessionID
+            ),
+            busyKeys: [],
+            actions: .init()
+        ))
+        XCTAssertEqual(
+            collapsed.items.map(\.title),
+            [
+                "Created and overseen by", "Creator",
+                "Overseeing", "Target",
+                "", "Link overseer", "Oversee", "Unlink"
+            ]
+        )
     }
 
     func testOverseeNewItemsAndDisabledReason() throws {
@@ -1424,7 +1480,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             )
         ))
 
-        let overseeNew = try submenu("Oversee new", in: menu)
+        let overseeNew = try submenu("Oversee", in: menu)
         XCTAssertEqual(overseeNew.items.map(\.title), ["Session B", "", "Session ID…"])
         XCTAssertTrue(overseeNew.items[0].isEnabled)
         XCTAssertTrue(overseeNew.items[1].isSeparatorItem)
@@ -1454,11 +1510,11 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         let root = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
             overlaid, busyKeys: [], actions: .init()
         ))
-        let choices = try submenu("Oversee new", in: root)
+        let choices = try submenu("Oversee", in: root)
         XCTAssertEqual(choices.items.map(\.title), [blocker, "Session B", "Session C", "", "Session ID…"])
         XCTAssertTrue(choices.items.allSatisfy { !$0.isEnabled })
         XCTAssertEqual(
-            root.items.first { $0.title == "Oversee new" }?.accessibilityValue() as? String,
+            root.items.first { $0.title == "Oversee" }?.accessibilityValue() as? String,
             AgentOversightUICopy.overseeMenuAccessibilityValue(overseeingCount: 0, availableCount: 2)
         )
     }
@@ -1473,7 +1529,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             actions: .init(addInbound: { added.append($0) })
         ))
 
-        let overseeBy = try submenu("Oversee by", in: menu)
+        let overseeBy = try submenu("Link overseer", in: menu)
         XCTAssertEqual(overseeBy.items.map(\.title), ["Overseer", "", "Session ID…"])
         fire(overseeBy.items[0])
         XCTAssertEqual(added.map(\.peerEndpoint), [candidateItem.peerEndpoint])
@@ -1483,7 +1539,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             busyKeys: [],
             actions: .init()
         ))
-        let blockedBy = try submenu("Oversee by", in: blocked)
+        let blockedBy = try submenu("Link overseer", in: blocked)
         XCTAssertEqual(blockedBy.items.map(\.title), ["Not eligible", "Overseer", "", "Session ID…"])
         XCTAssertFalse(blockedBy.items[0].isEnabled)
         // Parity with the SwiftUI builder: the candidate itself stays enabled; only the
@@ -1499,13 +1555,13 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             actions: .init()
         ))
         let titles = menu.items.map(\.title)
-        XCTAssertEqual(titles, ["Manage session oversight", "Oversee new", "Oversee by"])
+        XCTAssertEqual(titles, ["Manage session oversight", "Link overseer", "Oversee"])
 
-        let overseeNew = try submenu("Oversee new", in: menu)
+        let overseeNew = try submenu("Oversee", in: menu)
         XCTAssertEqual(overseeNew.items.map(\.title), ["No sessions to oversee", "", "Session ID…"])
         XCTAssertFalse(overseeNew.items[0].isEnabled)
 
-        let overseeBy = try submenu("Oversee by", in: menu)
+        let overseeBy = try submenu("Link overseer", in: menu)
         XCTAssertEqual(overseeBy.items.map(\.title), ["No eligible overseers", "", "Session ID…"])
     }
 
@@ -1609,7 +1665,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             actions: .init()
         ))
 
-        let overseeNew = try submenu("Oversee new", in: menu)
+        let overseeNew = try submenu("Oversee", in: menu)
         let item = overseeNew.items[0]
         XCTAssertFalse(item.isEnabled)
         XCTAssertNotNil(item.image)
@@ -1645,9 +1701,9 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             actions: .init()
         ))
 
-        let overseeNewItem = try XCTUnwrap(menu.items.first { $0.title == "Oversee new" })
+        let overseeNewItem = try XCTUnwrap(menu.items.first { $0.title == "Oversee" })
         XCTAssertEqual(overseeNewItem.accessibilityValue() as? String, "Overseeing 1; 0 available")
-        let overseeByItem = try XCTUnwrap(menu.items.first { $0.title == "Oversee by" })
+        let overseeByItem = try XCTUnwrap(menu.items.first { $0.title == "Link overseer" })
         XCTAssertEqual(overseeByItem.accessibilityValue() as? String, "Overseen by 1; 1 available")
         let unlinkItem = try XCTUnwrap(menu.items.first { $0.title == "Unlink" })
         XCTAssertEqual(unlinkItem.accessibilityValue() as? String, "2 linked")
@@ -1751,7 +1807,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             XCTAssertTrue(titles.contains { $0.contains("Hosted peer \(index)") }, "Missing peer \(index)")
         }
         let unlinkIndex = try XCTUnwrap(titles.firstIndex(of: AgentOversightUICopy.unlinkTitle))
-        XCTAssertEqual(titles[unlinkIndex - 1], AgentOversightUICopy.overseeByTitle)
+        XCTAssertEqual(titles[unlinkIndex - 1], AgentOversightUICopy.overseeNewTitle)
         XCTAssertTrue(menu.items[unlinkIndex + 1].isSeparatorItem)
         XCTAssertEqual(titles[unlinkIndex + 2], "Select chat")
         XCTAssertTrue(titles.contains("Stash chat for later"), "Opening must also capture current standard callbacks")
@@ -2185,7 +2241,16 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             }
             timeout = watchdog
             RunLoop.main.add(watchdog, forMode: .common)
-            postKey(125, character: "\u{F701}")
+            // Down-arrow once per root position before the submenu's own, then Right to open:
+            // the first Down highlights item 0, so the count follows the item's index, not a
+            // fixed press count.
+            guard let submenuIndex = root.items.firstIndex(where: { $0.submenu === submenu }) else {
+                XCTFail("candidate submenu is not a root item")
+                return root.cancelTracking()
+            }
+            for _ in 0 ... submenuIndex {
+                postKey(125, character: "\u{F701}")
+            }
             postKey(124, character: "\u{F703}")
         })
         withExtendedLifetime(observer) {}

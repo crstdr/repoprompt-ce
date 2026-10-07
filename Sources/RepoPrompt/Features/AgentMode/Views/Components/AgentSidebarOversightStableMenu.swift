@@ -50,10 +50,8 @@ extension AgentSessionRow {
             items.append(.header(AgentOversightUICopy.oversightMenuHeader))
         }
 
-        if !menu.linkedTargets.isEmpty {
-            items.append(.header(AgentOversightUICopy.overseeingSectionLabel))
-            items += menu.linkedTargets.map(jumpItem)
-        }
+        // "Overseen by" leads "Overseeing": the hierarchy reads top-down — this session's own
+        // overseers first, then the sessions it oversees.
         if !menu.linkedObservers.isEmpty {
             items.append(.header(
                 menu.creatorIsSoleOverseer
@@ -61,6 +59,10 @@ extension AgentSessionRow {
                     : AgentOversightUICopy.overseenBySectionLabel
             ))
             items += menu.linkedObservers.map(jumpItem)
+        }
+        if !menu.linkedTargets.isEmpty {
+            items.append(.header(AgentOversightUICopy.overseeingSectionLabel))
+            items += menu.linkedTargets.map(jumpItem)
         }
         if menu.showsCreatedBySection, let creatorLabel = menu.createdByLabel {
             items.append(.header(AgentOversightUICopy.createdBySectionLabel))
@@ -76,6 +78,48 @@ extension AgentSessionRow {
         if hasTopSections {
             items.append(.separator)
         }
+
+        // "Link overseer" leads "Oversee" — the same top-down hierarchy as the linked sections.
+        var overseeByItems: [StableMenuItem] = []
+        if let reason = menu.targetIneligibleReason {
+            overseeByItems.append(.message(reason))
+        }
+        if menu.availableObservers.isEmpty, menu.targetIneligibleReason == nil {
+            overseeByItems.append(.message(AgentOversightUICopy.noEligibleOverseers))
+        } else {
+            overseeByItems += menu.availableObservers.map { option in
+                let busy = busyKeys.contains(.add(
+                    observerEndpoint: option.peerEndpoint,
+                    targetEndpoint: menu.targetEndpoint
+                ))
+                return .action(
+                    option.menuLabel,
+                    isEnabled: !busy,
+                    imageSystemName: busy ? "hourglass" : nil,
+                    accessibilityLabel: option.menuLabel,
+                    accessibilityValue: busy ? "In progress" : nil,
+                    accessibilityHint: option.fullIdentityDescription
+                ) {
+                    actions.addInbound(option)
+                }
+            }
+        }
+        overseeByItems.append(.separator)
+        overseeByItems.append(.action(
+            AgentOversightUICopy.sessionIDMenuItem,
+            isEnabled: menu.targetIneligibleReason == nil
+        ) {
+            actions.presentChooseOverseerSheet()
+        })
+        items.append(.submenu(
+            AgentOversightUICopy.overseeByTitle,
+            accessibilityLabel: AgentOversightUICopy.overseeByTitle,
+            accessibilityValue: AgentOversightUICopy.overseeByMenuAccessibilityValue(
+                overseenByCount: menu.linkedObservers.count,
+                availableCount: menu.availableObservers.count
+            ),
+            items: overseeByItems
+        ))
 
         var overseeNewItems: [StableMenuItem] = []
         if let reason = menu.observerIneligibleReason {
@@ -118,70 +162,8 @@ extension AgentSessionRow {
             items: overseeNewItems
         ))
 
-        var overseeByItems: [StableMenuItem] = []
-        if let reason = menu.targetIneligibleReason {
-            overseeByItems.append(.message(reason))
-        }
-        if menu.availableObservers.isEmpty, menu.targetIneligibleReason == nil {
-            overseeByItems.append(.message(AgentOversightUICopy.noEligibleOverseers))
-        } else {
-            overseeByItems += menu.availableObservers.map { option in
-                let busy = busyKeys.contains(.add(
-                    observerEndpoint: option.peerEndpoint,
-                    targetEndpoint: menu.targetEndpoint
-                ))
-                return .action(
-                    option.menuLabel,
-                    isEnabled: !busy,
-                    imageSystemName: busy ? "hourglass" : nil,
-                    accessibilityLabel: option.menuLabel,
-                    accessibilityValue: busy ? "In progress" : nil,
-                    accessibilityHint: option.fullIdentityDescription
-                ) {
-                    actions.addInbound(option)
-                }
-            }
-        }
-        overseeByItems.append(.separator)
-        overseeByItems.append(.action(
-            AgentOversightUICopy.sessionIDMenuItem,
-            isEnabled: menu.targetIneligibleReason == nil
-        ) {
-            actions.presentChooseOverseerSheet()
-        })
-        items.append(.submenu(
-            AgentOversightUICopy.overseeByTitle,
-            accessibilityLabel: AgentOversightUICopy.overseeByTitle,
-            accessibilityValue: AgentOversightUICopy.overseeByMenuAccessibilityValue(
-                overseenByCount: menu.linkedObservers.count,
-                availableCount: menu.availableObservers.count
-            ),
-            items: overseeByItems
-        ))
-
         if hasLinkedSections {
             var unlinkItems: [StableMenuItem] = []
-            if !menu.linkedTargets.isEmpty {
-                unlinkItems.append(.header(AgentOversightUICopy.overseeingSectionLabel))
-                unlinkItems += menu.linkedTargets.compactMap { option in
-                    guard case let .linked(reference, _) = option.relationship else { return nil }
-                    let busy = busyKeys.contains(.unlink(
-                        observerEndpoint: menu.targetEndpoint,
-                        targetEndpoint: option.peerEndpoint,
-                        reference: reference
-                    ))
-                    return .action(
-                        option.menuLabel,
-                        isEnabled: !busy,
-                        imageSystemName: busy ? "hourglass" : nil,
-                        accessibilityLabel: AgentOversightUICopy.unlinkAccessibilityLabel(option.menuLabel),
-                        accessibilityValue: busy ? "In progress" : nil,
-                        accessibilityHint: option.fullIdentityDescription
-                    ) {
-                        actions.unlink(menu.targetEndpoint, option.peerEndpoint, reference)
-                    }
-                }
-            }
             if !menu.linkedObservers.isEmpty {
                 unlinkItems.append(.header(AgentOversightUICopy.overseenBySectionLabel))
                 unlinkItems += menu.linkedObservers.compactMap { option in
@@ -200,6 +182,27 @@ extension AgentSessionRow {
                         accessibilityHint: option.fullIdentityDescription
                     ) {
                         actions.unlink(option.peerEndpoint, menu.targetEndpoint, reference)
+                    }
+                }
+            }
+            if !menu.linkedTargets.isEmpty {
+                unlinkItems.append(.header(AgentOversightUICopy.overseeingSectionLabel))
+                unlinkItems += menu.linkedTargets.compactMap { option in
+                    guard case let .linked(reference, _) = option.relationship else { return nil }
+                    let busy = busyKeys.contains(.unlink(
+                        observerEndpoint: menu.targetEndpoint,
+                        targetEndpoint: option.peerEndpoint,
+                        reference: reference
+                    ))
+                    return .action(
+                        option.menuLabel,
+                        isEnabled: !busy,
+                        imageSystemName: busy ? "hourglass" : nil,
+                        accessibilityLabel: AgentOversightUICopy.unlinkAccessibilityLabel(option.menuLabel),
+                        accessibilityValue: busy ? "In progress" : nil,
+                        accessibilityHint: option.fullIdentityDescription
+                    ) {
+                        actions.unlink(menu.targetEndpoint, option.peerEndpoint, reference)
                     }
                 }
             }

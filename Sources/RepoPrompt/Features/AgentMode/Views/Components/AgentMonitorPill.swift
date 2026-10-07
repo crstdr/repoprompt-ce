@@ -175,8 +175,19 @@ struct AgentMonitorPopoverView: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
-                    if !props.outbound.isEmpty {
-                        outboundSection
+                    ForEach(
+                        AgentMonitorPopoverLinkedSection.displayOrder(
+                            hasInbound: !props.inbound.isEmpty,
+                            hasOutbound: !props.outbound.isEmpty
+                        ),
+                        id: \.self
+                    ) { section in
+                        switch section {
+                        case .inbound:
+                            inboundSection
+                        case .outbound:
+                            outboundSection
+                        }
                         Divider()
                     }
                     addSection
@@ -194,10 +205,6 @@ struct AgentMonitorPopoverView: View {
                     if hasPersistenceContent {
                         Divider()
                         persistenceSection
-                    }
-                    if !props.inbound.isEmpty {
-                        Divider()
-                        inboundSection
                     }
                     if !props.recentNotices.isEmpty {
                         Divider()
@@ -1498,6 +1505,25 @@ struct AgentMonitorPopoverView: View {
 enum AgentMonitorLaneGrouping {
     static func drawsSeparator(afterLaneAt index: Int, of count: Int) -> Bool {
         index >= 0 && index < count - 1
+    }
+}
+
+// MARK: - Linked-section order
+
+/// The linked-direction sections the popover can show, in display order.
+///
+/// "Overseen by" leads "Overseeing" whenever both render — the hierarchy reads top-down: the
+/// session's own overseers first, then the sessions it oversees. Same order the sidebar
+/// oversight menu and its Unlink submenu draw.
+enum AgentMonitorPopoverLinkedSection: Hashable {
+    case inbound
+    case outbound
+
+    static func displayOrder(hasInbound: Bool, hasOutbound: Bool) -> [AgentMonitorPopoverLinkedSection] {
+        var sections: [AgentMonitorPopoverLinkedSection] = []
+        if hasInbound { sections.append(.inbound) }
+        if hasOutbound { sections.append(.outbound) }
+        return sections
     }
 }
 

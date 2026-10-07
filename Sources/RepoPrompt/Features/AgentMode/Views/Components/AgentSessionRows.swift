@@ -559,20 +559,20 @@ struct AgentSessionRow: View {
 
     /// The two Oversee submenus for an unavailable or ID-less row: the labels stay
     /// enabled so the reason is discoverable, while the only item inside each is the
-    /// disabled explanation.
+    /// disabled explanation. Same order as the live menu: "Link overseer" leads.
     private func sidebarOversightUnavailableMenuItems(reason: String) -> [StableMenuItem] {
         [
-            .submenu(
-                AgentOversightUICopy.overseeNewTitle,
-                imageSystemName: AgentOversightUICopy.manageOversightIcon,
-                accessibilityLabel: AgentOversightUICopy.overseeNewTitle,
-                accessibilityValue: reason,
-                items: [.message(reason)]
-            ),
             .submenu(
                 AgentOversightUICopy.overseeByTitle,
                 imageSystemName: AgentOversightUICopy.manageOversightIcon,
                 accessibilityLabel: AgentOversightUICopy.overseeByTitle,
+                accessibilityValue: reason,
+                items: [.message(reason)]
+            ),
+            .submenu(
+                AgentOversightUICopy.overseeNewTitle,
+                imageSystemName: AgentOversightUICopy.manageOversightIcon,
+                accessibilityLabel: AgentOversightUICopy.overseeNewTitle,
                 accessibilityValue: reason,
                 items: [.message(reason)]
             )
