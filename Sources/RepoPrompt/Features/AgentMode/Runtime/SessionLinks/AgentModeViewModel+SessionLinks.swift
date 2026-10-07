@@ -848,6 +848,18 @@ extension AgentModeViewModel {
         }
     }
 
+    func agentSessionLinkHoldComputerUseAdmission(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> (@MainActor () -> Void)? {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = sessions[endpoint.tabID] else { return nil }
+        return session.holdCodexComputerUseAdmission()
+    }
+
+    func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = sessions[endpoint.tabID] else { return }
+        await codexCoordinator.revokeCodexComputerUse(session: session, reason: "session-link")
+    }
+
     /// Applies one logical exact-projection storage transaction and publishes one presentation
     /// invalidation only after every write and removal is visible.
     ///

@@ -1649,20 +1649,22 @@ actor CodexAppServerClient {
         try await processSpawnPreparation()
         try Task.checkCancellation()
         try ensureStartupAuthority(startupAuthority)
-        // No suspension between presence-dependent overrides and spawn. This does not
-        // claim atomicity against independent writers of the owned configuration.
-        // Read the actual launch runtime, not a personal/default home. A reserved saved
-        // definition cannot be safely cleared through Codex's recursively merged overrides.
-        let runtimeConfigURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
-        let runtimeConfig = if FileManager.default.fileExists(atPath: runtimeConfigURL.path) {
-            try String(contentsOf: runtimeConfigURL, encoding: .utf8)
-        } else {
-            ""
+        if config.processFeaturePolicy.computerUseEnabled {
+            // No suspension between presence-dependent overrides and spawn. This does not
+            // claim atomicity against independent writers of the owned configuration.
+            // Read the actual armed launch runtime, not a personal/default home. A reserved
+            // saved definition cannot be safely cleared through recursively merged overrides.
+            let runtimeConfigURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
+            let runtimeConfig = if FileManager.default.fileExists(atPath: runtimeConfigURL.path) {
+                try String(contentsOf: runtimeConfigURL, encoding: .utf8)
+            } else {
+                ""
+            }
+            processOverrides += try Self.computerUseProcessConfigArgs(
+                computerUseEnabled: true,
+                serverEntries: CodexIntegrationConfiguration.mcpServerEntries(from: runtimeConfig)
+            )
         }
-        processOverrides += try Self.computerUseProcessConfigArgs(
-            computerUseEnabled: config.processFeaturePolicy.computerUseEnabled,
-            serverEntries: CodexIntegrationConfiguration.mcpServerEntries(from: runtimeConfig)
-        )
         let args = processOverrides + ["app-server"]
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
             config.processLaunchDirectory
