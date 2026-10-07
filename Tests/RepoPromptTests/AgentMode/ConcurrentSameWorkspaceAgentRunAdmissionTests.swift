@@ -168,6 +168,16 @@ import XCTest
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Worktree abort"
             )
             let sessionID = try XCTUnwrap(target.sessionID)
+            // Removing a binding exercises preparation; an unchanged empty binding is now a no-op.
+            let session = vm.session(for: target.tabID)
+            session.worktreeBindings = [.init(
+                id: "abort-fixture", repositoryID: "fixture-repo", repoKey: "fixture-repo",
+                logicalRootPath: fixture.authorityRoot.path, logicalRootName: "Fixture",
+                worktreeID: "fixture-worktree",
+                worktreeRootPath: fixture.authorityRoot.appendingPathComponent("worktree").path,
+                source: "test"
+            )]
+            let previousBindings = session.worktreeBindings
             let clock = MCPExportWatchdogManualClock()
             let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
             let gate = AdmissionHandoffGate()
@@ -194,7 +204,7 @@ import XCTest
             } catch AdmissionTestError.expected {}
             vm.test_afterWorktreeBindingPreparation = nil
             vm.test_beforeWorktreeBindingAbort = nil
-            XCTAssertTrue(vm.session(for: target.tabID).worktreeBindings.isEmpty)
+            XCTAssertEqual(session.worktreeBindings, previousBindings)
         }
 
         func testDirectOwnedAdmissionDiscardEntersReturnBeforeRecovery() async throws {

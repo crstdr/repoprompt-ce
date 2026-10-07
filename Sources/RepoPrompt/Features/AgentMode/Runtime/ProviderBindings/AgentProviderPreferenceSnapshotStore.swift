@@ -199,6 +199,8 @@ final class AgentProviderPreferenceSnapshotStore {
             CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
         case let .goalSupport(enabled):
             CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
+        case let .computerUse(enabled):
+            CodexAgentModeBooleanPreference.computerUse.setEnabled(enabled, defaults: defaults)
         case let .reasoningSummaries(enabled):
             CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
         case let .memories(enabled):
@@ -233,6 +235,10 @@ final class AgentProviderPreferenceSnapshotStore {
 
     func setCodexGoalSupportEnabled(_ enabled: Bool) {
         applyCodexToolSettingMutation(.goalSupport(enabled: enabled))
+    }
+
+    func setCodexComputerUseEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.computerUse(enabled: enabled))
     }
 
     func setCodexReasoningSummariesEnabled(_ enabled: Bool) {
@@ -496,6 +502,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 bashToolEnabled: CodexAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions),
                 searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
                 goalSupportEnabled: codexGoalSupportEnabled(),
+                computerUseEnabled: codexComputerUseEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
                 appsEnabled: codexAppsEnabled(),
@@ -516,6 +523,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 bashToolEnabled: true,
                 searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
                 goalSupportEnabled: codexGoalSupportEnabled(),
+                computerUseEnabled: codexComputerUseEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
                 appsEnabled: codexAppsEnabled(),
@@ -565,6 +573,10 @@ final class AgentProviderPreferenceSnapshotStore {
 
     private func codexGoalSupportEnabled() -> Bool {
         CodexAgentModeBooleanPreference.goalSupport.isEnabled(defaults: defaults)
+    }
+
+    private func codexComputerUseEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.computerUse.isEnabled(defaults: defaults)
     }
 
     private func codexReasoningSummariesEnabled() -> Bool {

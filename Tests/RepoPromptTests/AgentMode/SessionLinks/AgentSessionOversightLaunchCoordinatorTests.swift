@@ -365,6 +365,116 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         fixture.host.descriptors = candidates.map { descriptor(for: $0) }
     }
 
+    func testThreeHundredChatsRestoreTenLinksAcrossReopenAndRestartWithinBudget() async throws {
+        var ids = (0 ..< 300).map { _ in UUID() }
+        ids[0] = observerSessionID
+        ids[1] = targetSessionID
+        let workspaceIDs = (0 ..< 3).map { _ in UUID() }
+        let pairs = (0 ..< 10).map { index in
+            AgentSessionOversightIntent(
+                observerSessionID: ids[(index % 3) * 100],
+                targetSessionID: ids[1 + index * 29]
+            )
+        }
+        try seedSavedPair(Array(pairs.dropFirst()))
+        let linkedIDs = Set(pairs.flatMap { [$0.observerSessionID, $0.targetSessionID] })
+        let clock = ContinuousClock()
+        let budget: Duration = .seconds(5)
+
+        func candidates(firstWindowID: Int) -> [AgentSessionLinkEndpointCandidate] {
+            ids.enumerated().map { index, id in
+                makeReadyCandidate(
+                    windowID: firstWindowID + index / 100,
+                    sessionID: id, workspaceID: workspaceIDs[index / 100]
+                )
+            }
+        }
+
+        func installColdTopology(_ fixture: Fixture, _ ready: [AgentSessionLinkEndpointCandidate]) {
+            fixture.host.candidates = []
+            fixture.host.descriptors = ready.map { descriptor(for: $0) }
+            fixture.host.discovery = (0 ..< 3).map { index in
+                .init(epoch: .init(
+                    windowID: ready[index * 100].windowID,
+                    workspaceID: workspaceIDs[index],
+                    generation: 1
+                ), isComplete: true)
+            }
+            fixture.host.hydrationHandler = { requested in
+                fixture.host.candidates += ready.filter { candidate in
+                    requested.contains(candidate.sessionID)
+                        && !fixture.host.candidates.contains(where: { $0.sessionID == candidate.sessionID })
+                }
+                fixture.bridge.noteCandidateReadinessChanged()
+            }
+        }
+
+        func assertLinks(_ fixture: Fixture) async -> [AgentSessionOversightIntent: DomainAgentSessionLinkReference] {
+            var references: [AgentSessionOversightIntent: DomainAgentSessionLinkReference] = [:]
+            for observerID in Set(pairs.map(\.observerSessionID)) {
+                let inventory = await fixture.authority.links(forObserver: observerID)
+                let expected = pairs.filter { $0.observerSessionID == observerID }
+                XCTAssertEqual(Set(inventory.items.map(\.targetSessionID)), Set(expected.map(\.targetSessionID)))
+                for item in inventory.items {
+                    XCTAssertEqual(item.capabilities, DomainAgentSessionLinkCapability.managed)
+                    references[.init(observerSessionID: observerID, targetSessionID: item.targetSessionID)] =
+                        .init(linkID: item.linkID, generation: item.generation)
+                }
+            }
+            XCTAssertEqual(references.count, 10)
+            XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+            return references
+        }
+
+        let fixture = makeFixture()
+        installColdTopology(fixture, candidates(firstWindowID: 1))
+        let launchStart = clock.now
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let launchTime = launchStart.duration(to: clock.now)
+        let original = await assertLinks(fixture)
+        XCTAssertEqual(Set(fixture.host.hydrationRequests.flatMap(\.self)), linkedIDs)
+        XCTAssertLessThan(launchTime, budget)
+
+        let reopenStart = clock.now
+        for windowID in 1 ... 3 {
+            fixture.bridge.noteOversightWindowClosing(windowID: windowID)
+            fixture.host.candidates.removeAll { $0.windowID == windowID }
+            fixture.host.descriptors.removeAll { $0.windowID == windowID }
+            fixture.host.discovery.removeAll { $0.epoch.windowID == windowID }
+            await fixture.bridge.invalidateWindow(windowID, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+        }
+        installColdTopology(fixture, candidates(firstWindowID: 4))
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let reopenTime = reopenStart.duration(to: clock.now)
+        let reopened = await assertLinks(fixture)
+        for pair in pairs {
+            XCTAssertNotEqual(reopened[pair], original[pair])
+            let token = await fixture.store.token(for: pair)
+            XCTAssertNotNil(token)
+        }
+        XCTAssertLessThan(reopenTime, budget)
+        fixture.host.hydrationHandler = nil
+
+        // Fresh authority, bridge and disk-backed store model process restart, not a reused cache.
+        let restarted = makeFixture()
+        installColdTopology(restarted, candidates(firstWindowID: 7))
+        let restartStart = clock.now
+        await restarted.bridge.bootstrapIntentStore(restarted.store)
+        await restarted.bridge.test_settleLaunchReconciliation()
+        let restartTime = restartStart.duration(to: clock.now)
+        let restored = await assertLinks(restarted)
+        for pair in pairs {
+            XCTAssertNotEqual(restored[pair], reopened[pair])
+        }
+        XCTAssertEqual(Set(restarted.host.hydrationRequests.flatMap(\.self)), linkedIDs)
+        XCTAssertLessThan(restartTime, budget)
+        restarted.host.hydrationHandler = nil
+        print("RESTORE_SCALE chats=300 windows=3 overseers=3 links=10 launch=\(launchTime) reopen=\(reopenTime) restart=\(restartTime) budget=5s/phase")
+    }
+
     // MARK: - Same-process window reopen
 
     func testCapturedObserverTargetAndBothWindowClosesRestoreOneFreshManagedGrant() async throws {
@@ -406,78 +516,6 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             await fixture.bridge.test_settleLaunchReconciliation()
             let repeated = await liveReference(fixture)
             XCTAssertEqual(repeated, replacement, "An ordinary event must not reserve again.")
-            XCTAssertEqual(fixture.host.providerTaskRequests, 0)
-        }
-    }
-
-    func testSameWindowReopenRestoresAfterPassiveHydrationIsInterruptedByDiscoveryChange() async throws {
-        for interrupted in [false, true] {
-            try seedSavedPair()
-            let fixture = makeFixture()
-            let workspaceID = UUID()
-            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID, workspaceID: workspaceID)
-            let target = makeReadyCandidate(windowID: 1, sessionID: targetSessionID, workspaceID: workspaceID)
-            replaceTopology(fixture, with: [observer, target])
-            await fixture.bridge.bootstrapIntentStore(fixture.store)
-            await fixture.bridge.test_settleLaunchReconciliation()
-            let original = await liveReference(fixture)
-            XCTAssertNotNil(original)
-            let token = await fixture.store.token(for: pair)
-
-            fixture.bridge.noteOversightWindowClosing(windowID: 1)
-            replaceTopology(fixture, with: [])
-            await fixture.bridge.invalidateWindow(1, reason: .windowClosed)
-            await fixture.bridge.test_settleLaunchReconciliation()
-
-            let reopenedObserver = makeReadyCandidate(windowID: 2, sessionID: observerSessionID, workspaceID: workspaceID)
-            let reopenedTarget = makeReadyCandidate(windowID: 2, sessionID: targetSessionID, workspaceID: workspaceID)
-            fixture.host.candidates = [reopenedObserver]
-            fixture.host.descriptors = [descriptor(for: reopenedObserver), descriptor(for: reopenedTarget)]
-            let epoch = AgentSessionLinkDiscoveryEpoch(windowID: 2, workspaceID: workspaceID, generation: 1)
-            fixture.host.discovery = [.init(epoch: epoch, isComplete: true)]
-
-            // Gate the host's passive load, not a provider: delivery can be abandoned by its owner.
-            let completeHydration = {
-                fixture.host.candidates = [reopenedObserver, reopenedTarget]
-                fixture.bridge.noteCandidateReadinessChanged()
-            }
-            var pendingHydration: (() -> Void)?
-            fixture.host.hydrationHandler = { _ in pendingHydration = completeHydration }
-            defer { fixture.host.hydrationHandler = nil }
-            fixture.bridge.noteTopologyMayHaveChanged()
-            await fixture.bridge.test_settleLaunchReconciliation()
-            XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID]])
-            XCTAssertNotNil(pendingHydration)
-            let beforeHydration = await fixture.authority.links(forObserver: observerSessionID)
-            XCTAssertTrue(beforeHydration.items.isEmpty)
-
-            if interrupted {
-                // Model a workspace activation discarding that request. The saved bindings survive.
-                let successor = AgentSessionLinkDiscoveryEpoch(windowID: 2, workspaceID: workspaceID, generation: 2)
-                fixture.host.discovery = [.init(epoch: successor, isComplete: false)]
-                pendingHydration = nil
-                fixture.bridge.noteTopologyMayHaveChanged()
-                await fixture.bridge.test_settleLaunchReconciliation()
-                fixture.host.hydrationHandler = { _ in completeHydration() }
-                fixture.host.discovery = [.init(epoch: successor, isComplete: true)]
-                fixture.bridge.noteCandidateReadinessChanged()
-            } else {
-                pendingHydration?()
-                pendingHydration = nil
-            }
-            await fixture.bridge.test_settleLaunchReconciliation()
-
-            let restored = await fixture.authority.links(forObserverEndpoint: reopenedObserver.domainEndpoint)
-            XCTAssertEqual(
-                restored.items.map(\.targetSessionID), [targetSessionID],
-                "Same-window reopen must restore without a user turn; interrupted=\(interrupted)."
-            )
-            if let link = restored.items.first {
-                XCTAssertNotEqual(DomainAgentSessionLinkReference(linkID: link.linkID, generation: link.generation), original)
-                XCTAssertEqual(link.capabilities, DomainAgentSessionLinkCapability.managed)
-            }
-            let retainedToken = await fixture.store.token(for: pair)
-            XCTAssertEqual(retainedToken, token)
             XCTAssertEqual(fixture.host.providerTaskRequests, 0)
         }
     }
@@ -1242,11 +1280,83 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertFalse(restored)
     }
 
+    func testSameWindowReopenRestoresAfterPassiveHydrationIsInterruptedByDiscoveryChange() async throws {
+        for interrupted in [false, true] {
+            try seedSavedPair()
+            let fixture = makeFixture()
+            let workspaceID = UUID()
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID, workspaceID: workspaceID)
+            let target = makeReadyCandidate(windowID: 1, sessionID: targetSessionID, workspaceID: workspaceID)
+            replaceTopology(fixture, with: [observer, target])
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let original = await liveReference(fixture)
+            XCTAssertNotNil(original)
+            let token = await fixture.store.token(for: pair)
+
+            fixture.bridge.noteOversightWindowClosing(windowID: 1)
+            replaceTopology(fixture, with: [])
+            await fixture.bridge.invalidateWindow(1, reason: .windowClosed)
+            await fixture.bridge.test_settleLaunchReconciliation()
+
+            let reopenedObserver = makeReadyCandidate(windowID: 2, sessionID: observerSessionID, workspaceID: workspaceID)
+            let reopenedTarget = makeReadyCandidate(windowID: 2, sessionID: targetSessionID, workspaceID: workspaceID)
+            fixture.host.candidates = [reopenedObserver]
+            fixture.host.descriptors = [descriptor(for: reopenedObserver), descriptor(for: reopenedTarget)]
+            let epoch = AgentSessionLinkDiscoveryEpoch(windowID: 2, workspaceID: workspaceID, generation: 1)
+            fixture.host.discovery = [.init(epoch: epoch, isComplete: true)]
+
+            // Gate the host's passive load, not a provider: delivery can be abandoned by its owner.
+            let completeHydration = {
+                fixture.host.candidates = [reopenedObserver, reopenedTarget]
+                fixture.bridge.noteCandidateReadinessChanged()
+            }
+            var pendingHydration: (() -> Void)?
+            fixture.host.hydrationHandler = { _ in pendingHydration = completeHydration }
+            defer { fixture.host.hydrationHandler = nil }
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID]])
+            XCTAssertNotNil(pendingHydration)
+            let beforeHydration = await fixture.authority.links(forObserver: observerSessionID)
+            XCTAssertTrue(beforeHydration.items.isEmpty)
+
+            if interrupted {
+                // Model a workspace activation discarding that request. The saved bindings survive.
+                let successor = AgentSessionLinkDiscoveryEpoch(windowID: 2, workspaceID: workspaceID, generation: 2)
+                fixture.host.discovery = [.init(epoch: successor, isComplete: false)]
+                pendingHydration = nil
+                fixture.bridge.noteTopologyMayHaveChanged()
+                await fixture.bridge.test_settleLaunchReconciliation()
+                fixture.host.hydrationHandler = { _ in completeHydration() }
+                fixture.host.discovery = [.init(epoch: successor, isComplete: true)]
+                fixture.bridge.noteCandidateReadinessChanged()
+            } else {
+                pendingHydration?()
+                pendingHydration = nil
+            }
+            await fixture.bridge.test_settleLaunchReconciliation()
+
+            let restored = await fixture.authority.links(forObserverEndpoint: reopenedObserver.domainEndpoint)
+            XCTAssertEqual(
+                restored.items.map(\.targetSessionID), [targetSessionID],
+                "Same-window reopen must restore without a user turn; interrupted=\(interrupted)."
+            )
+            if let link = restored.items.first {
+                XCTAssertNotEqual(DomainAgentSessionLinkReference(linkID: link.linkID, generation: link.generation), original)
+                XCTAssertEqual(link.capabilities, DomainAgentSessionLinkCapability.managed)
+            }
+            let retainedToken = await fixture.store.token(for: pair)
+            XCTAssertEqual(retainedToken, token)
+            XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+        }
+    }
+
     // MARK: - Lazy background tabs
 
     /// A saved session that is *present* but unhydrated is waited for — never declared missing — and
-    /// its tab is asked to load exactly once, so the pair comes back at launch without the user having
-    /// to open every endpoint's tab. The already-hydrated observer is never asked to reload.
+    /// passive loading is owned by the host, so the pair comes back without the user opening every
+    /// endpoint's tab. The already-hydrated observer is never asked to reload.
     func testALazyBackgroundTabWaitsAndThenActivatesExactlyOnceWhenItHydrates() async throws {
         try seedSavedPair()
         let fixture = makeFixture()
@@ -1277,7 +1387,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             "Only the unhydrated endpoint of the saved pair is asked to load."
         )
 
-        // Dispatch history cannot prove loading: external events re-read current readiness.
+        // A still-cold endpoint is requested again; the host loader owns in-flight deduplication.
         fixture.bridge.noteCandidateReadinessChanged()
         await fixture.bridge.test_settleLaunchReconciliation()
         XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID], [targetSessionID]])
@@ -1499,9 +1609,10 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         token = await fixture.store.token(for: pair)
         XCTAssertNotNil(token, "A failed load may be transient and must not discard the intent.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+        let requestCount = fixture.host.hydrationRequests.count
         fixture.bridge.noteCandidateReadinessChanged()
         await fixture.bridge.test_settleLaunchReconciliation()
-        XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID]], "Terminal loads must not be retried")
+        XCTAssertEqual(fixture.host.hydrationRequests.count, requestCount)
 
         fixture.host.candidates = [observer, target]
         fixture.bridge.noteCandidateReadinessChanged()
