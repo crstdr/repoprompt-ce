@@ -1386,8 +1386,8 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
 
         let titles = menu.items.map(\.title)
         XCTAssertEqual(titles, [
-            "Overseeing", "Target",
             "Overseen by", "Observer",
+            "Overseeing", "Target",
             "Created by", "Creator",
             "",
             "Oversee new", "Oversee by", "Unlink"
@@ -1396,6 +1396,62 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         XCTAssertFalse(menu.items[9].isSeparatorItem)
         XCTAssertFalse(menu.items[0].isEnabled)
         XCTAssertEqual(menu.items[0].accessibilityHelp(), nil)
+    }
+
+    /// Order contract: "Overseen by" — including its "Created and overseen by" collapse —
+    /// leads "Overseeing" wherever both sections render: the menu's top sections, the Unlink
+    /// submenu, and the monitor pill popover. The hierarchy reads top-down.
+    func testOverseenBySectionLeadsOverseeingWhereBothSectionsExist() throws {
+        let target = peer("Target", seed: 1, relationship: .linked(reference: link(11), peerCurrentlyEligible: true))
+        let observer = peer("Observer", seed: 2, relationship: .linked(reference: link(12), peerCurrentlyEligible: true))
+        let menu = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            props(observerOptions: [observer], targetOptions: [target]),
+            busyKeys: [],
+            actions: .init()
+        ))
+
+        XCTAssertEqual(
+            menu.items.map(\.title),
+            ["Overseen by", "Observer", "Overseeing", "Target", "", "Oversee new", "Oversee by", "Unlink"]
+        )
+        XCTAssertEqual(
+            try submenu("Unlink", in: menu).items.map(\.title),
+            ["Overseen by", "Observer", "Overseeing", "Target"]
+        )
+        XCTAssertEqual(
+            AgentMonitorPopoverLinkedSection.displayOrder(hasInbound: true, hasOutbound: true),
+            [.inbound, .outbound]
+        )
+
+        // The sole-overseer collapse keeps the same lead position.
+        let creatorSessionID = UUID()
+        let creator = AgentSidebarOversightMenuProps.PeerOption(
+            peerEndpoint: endpoint(3),
+            peerSessionID: creatorSessionID,
+            displayName: "Creator",
+            providerDisplayName: nil,
+            menuLabel: "Creator",
+            fullIdentityDescription: "identity Creator",
+            relationship: .linked(reference: link(13), peerCurrentlyEligible: true)
+        )
+        let collapsed = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(
+            props(
+                observerOptions: [creator],
+                targetOptions: [target],
+                createdByLabel: "Creator",
+                creatorSessionID: creatorSessionID
+            ),
+            busyKeys: [],
+            actions: .init()
+        ))
+        XCTAssertEqual(
+            collapsed.items.map(\.title),
+            [
+                "Created and overseen by", "Creator",
+                "Overseeing", "Target",
+                "", "Oversee new", "Oversee by", "Unlink"
+            ]
+        )
     }
 
     func testOverseeNewItemsAndDisabledReason() throws {
