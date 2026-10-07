@@ -4148,10 +4148,15 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         if availabilityChanged { notifyCandidateAvailabilityChanged() }
+        // A missing observer cannot reconcile its last-link projection. Retire that exact queue
+        // even during sparse refreshes, looking up only existing reducer owners through the host index.
+        let livePassiveOwners = Set(passiveNoticesByObserver.keys.filter {
+            host.agentSessionLinkCandidate(for: $0, includeLocation: false) != nil
+        })
+        prunePassiveNotices(liveEndpoints: livePassiveOwners)
         if scope.isFull {
             let live = Set(fullCandidates.map(\.domainEndpoint))
             projectedEndpoints.formIntersection(live)
-            prunePassiveNotices(liveEndpoints: live)
             await reconcilePendingSends()
         }
     }
