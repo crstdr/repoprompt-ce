@@ -196,10 +196,13 @@ protocol CodexSessionControlling: AnyObject {
     func cancelCurrentTurn() async
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
+    func revokeComputerUseAutoApproval()
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
 }
 
 extension CodexSessionControlling {
+    func revokeComputerUseAutoApproval() {}
+
     var currentSessionReference: CodexNativeSessionController.SessionRef? {
         nil
     }
@@ -296,6 +299,7 @@ final class CodexNativeSessionController {
     private static let computerUseMCPServerName = "computer-use"
     // Controller-scoped: never follows a live settings toggle while requests are outstanding.
     private var computerUseRequiresUserReview = false
+    private var computerUseAutoApprovalRevoked = false
     private var computerUseScopePrepared = false
     private var computerUseAcceptedClientPath: String?
     private var effectiveComputerUseServerNames: [String] = []
@@ -2628,7 +2632,12 @@ final class CodexNativeSessionController {
         return nil
     }
 
+    func revokeComputerUseAutoApproval() {
+        withEventsStateLock { computerUseAutoApprovalRevoked = true }
+    }
+
     func shutdown() async {
+        revokeComputerUseAutoApproval()
         withEventsStateLock {
             if lifecycleState != .terminated {
                 lifecycleState = .shuttingDown
@@ -4807,8 +4816,8 @@ final class CodexNativeSessionController {
         case .authTokensRefresh:
             await handleChatgptAuthTokensRefreshServerRequest(request.id, method: method, params: params)
         case .mcpElicitation:
-            let scopedComputerUse = computerUseScopePrepared ? computerUseRequiresUserReview : await MainActor.run { options.computerUseEnabledProvider() }
-            if !scopedComputerUse, Self.isRepoPromptMCPElicitationRequest(params: params) {
+            let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
+            if Self.isRepoPromptMCPElicitationRequest(params: params) || autoApproveCompanion {
                 await respondToServerRequest(
                     id: request.id,
                     result: [
@@ -4837,6 +4846,20 @@ final class CodexNativeSessionController {
             }
             await emit(.mcpElicitationRequest(elicitationRequest))
         case .permissions:
+            if shouldAutoApproveComputerUseCompanion(params: params),
+               let permission = Self.parsePermissionsRequest(
+                   requestID: request.id,
+                   method: method,
+                   params: params,
+                   activeThreadID: threadID,
+                   currentTurnID: routingCurrentTurnID
+               )
+            {
+                await respondToServerRequest(id: request.id, result: [
+                    "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
+                ])
+                return
+            }
             let scopedComputerUse = computerUseScopePrepared ? computerUseRequiresUserReview : await MainActor.run { options.computerUseEnabledProvider() }
             if !scopedComputerUse, let approvalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params) {
                 await respondToServerRequest(id: request.id, result: approvalResult)
@@ -4956,6 +4979,15 @@ final class CodexNativeSessionController {
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
         }
+    }
+
+    private func shouldAutoApproveComputerUseCompanion(params: [String: Any]) -> Bool {
+        !withEventsStateLock { computerUseAutoApprovalRevoked }
+            && computerUseScopePrepared && computerUseAcceptedClientPath != nil
+            && CodexComputerUseWorkflow.automaticallyApprovesCompanion(
+                armed: computerUseRequiresUserReview,
+                approvalPolicy: options.approvalPolicyProvider(), sandboxMode: options.sandboxModeProvider()
+            ) && MCPIntegrationHelper.isComputerUseCompanionPermissionRequest(params)
     }
 
     static func isRepoPromptMCPElicitationRequest(params: [String: Any]) -> Bool {
@@ -5228,7 +5260,9 @@ final class CodexNativeSessionController {
             threadID: threadID,
             turnID: turnID,
             itemID: itemID,
-            questions: parsedQuestions
+            questions: parsedQuestions,
+            repoPromptAutoApprovalVerified: MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: nil, requestPayload: params) != nil,
+            computerUseCompanionVerified: MCPIntegrationHelper.isComputerUseCompanionPermissionRequest(params)
         )
     }
 
