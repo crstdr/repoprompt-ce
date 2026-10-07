@@ -425,7 +425,10 @@ enum ACPAIModelCatalog {
             .replacingOccurrences(of: " ", with: "-")
     }
 
-    /// All Cursor surfaces use the same discovered membership, with Auto before discovery.
+    /// Cursor's discovery snapshot (live, else the persisted last-known one) is the picker's
+    /// membership authority through `CursorAIModelCatalog`. Auto stays pinned first so the
+    /// non-Agent picker remains usable before any ACP session exists. Applying a selected model
+    /// and its parameters remains live-session authoritative.
     private static func cursorModelOptionsForPicker() -> [AgentModelOption] {
         CursorAIModelCatalog.options
     }

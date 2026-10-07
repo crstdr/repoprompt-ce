@@ -1896,6 +1896,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 await configurationGate.open()
                 await removalGate.open()
                 await manager.debugRemoveConnection(connectionID)
+                server.stopServiceObservation()
             }
             let confirmed = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
             fixture.session.appendItem(confirmed)
@@ -1932,7 +1933,9 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                         $0.kind == .error && $0.text.contains("[route:configuration-fence]")
                     }
                 }
-                if refused { return true }
+                if refused {
+                    return true
+                }
                 return await controller.sentCount > 1
             }
             let sent = await controller.sentMessages
@@ -2751,12 +2754,16 @@ private actor MonitorRemovalConnection: MCPServerConnection {
     }
 
     func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
-        if !pauseTermination { _ = await gate.requirement() }
+        if !pauseTermination {
+            _ = await gate.requirement()
+        }
         return nil
     }
 
     func terminate(reason _: TerminationReason, message _: String?) async {
-        if pauseTermination { _ = await gate.requirement() }
+        if pauseTermination {
+            _ = await gate.requirement()
+        }
     }
 
     func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
@@ -2820,7 +2827,9 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     ) async throws -> NativeAgentRuntimeSessionRef {
         configuration.replaceProcess()
         startOrResumeExistingSessionIDs.append(existingSessionID)
-        if rejectResume, existingSessionID != nil { throw NativeAgentRuntimeControllerError.processNotRunning }
+        if rejectResume, existingSessionID != nil {
+            throw NativeAgentRuntimeControllerError.processNotRunning
+        }
         return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
     }
 
@@ -2848,13 +2857,17 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
         try configuration.validate(proof)
         sentMessages.append(text)
-        if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
+        if failSendAfterRecord {
+            throw NativeAgentRuntimeControllerError.processNotRunning
+        }
         return UUID()
     }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
-        if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
+        if failSendAfterRecord {
+            throw NativeAgentRuntimeControllerError.processNotRunning
+        }
         return UUID()
     }
 

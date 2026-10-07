@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 
@@ -307,6 +308,17 @@ final class AgentTabSession: ObservableObject {
     var mcpStateObservationCancellable: AnyCancellable?
     var mcpControlCleanupTask: Task<Void, Never>?
     var mcpControlActivationGeneration: UInt64 = 0
+    private(set) var codexComputerUseOwnershipTransitionHolds: Set<UUID> = []
+    var codexComputerUseRevocationDepth = 0
+
+    /// A scoped eligibility fence, not link authority. Independent ownership transitions cannot
+    /// release each other's hold, and a rebound endpoint still releases its captured session.
+    func holdCodexComputerUseAdmission() -> @MainActor () -> Void {
+        let token = UUID()
+        codexComputerUseOwnershipTransitionHolds.insert(token)
+        return { [weak self] in self?.codexComputerUseOwnershipTransitionHolds.remove(token) }
+    }
+
     var mcpFollowUpRunPendingUpdatedAt: Date?
     var mcpFollowUpRunPending: Bool = false {
         didSet {
@@ -319,7 +331,12 @@ final class AgentTabSession: ObservableObject {
 
     var isMCPInstructionDispatchInProgress: Bool = false
     /// Whether this session was originally created by an MCP client.
-    var isMCPOriginated: Bool = false
+    var isMCPOriginated: Bool = false {
+        didSet {
+            if oldValue != isMCPOriginated { AgentSessionLinkCandidateReadinessSignal.didChange() }
+        }
+    }
+
     /// Lifetime classification for sessions created, controlled, parented, or pending activation through MCP.
     /// A nonzero activation generation remains authoritative after live control is released.
     var isMCPRelated: Bool {
@@ -403,8 +420,32 @@ final class AgentTabSession: ObservableObject {
     struct ACPSteeringManagedContext {
         let sink: AgentSessionLinkManagedSteerSink
         let attributedItemID: UUID
-        let candidate: AgentSessionLinkEndpointCandidate
-        let attribution: AgentCrossSessionAttribution
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let attribution: AgentCrossSessionAttribution?
+
+        init(
+            sink: AgentSessionLinkManagedSteerSink,
+            attributedItemID: UUID,
+            endpoint: DomainAgentSessionLinkEndpointIdentity,
+            attribution: AgentCrossSessionAttribution?
+        ) {
+            self.sink = sink
+            self.attributedItemID = attributedItemID
+            self.endpoint = endpoint
+            self.attribution = attribution
+        }
+
+        init(
+            sink: AgentSessionLinkManagedSteerSink,
+            attributedItemID: UUID,
+            candidate: AgentSessionLinkEndpointCandidate,
+            attribution: AgentCrossSessionAttribution
+        ) {
+            self.init(
+                sink: sink, attributedItemID: attributedItemID,
+                endpoint: candidate.domainEndpoint, attribution: attribution
+            )
+        }
     }
 
     struct ACPSteeringInstruction: Identifiable {
@@ -434,7 +475,7 @@ final class AgentTabSession: ObservableObject {
     func settlePendingManagedACPSteeringAsNotAccepted() {
         for instruction in pendingACPSteeringInstructions {
             guard let managed = instruction.managed else { continue }
-            let candidate = managed.candidate
+            let candidate = managed.endpoint
             if tabID == candidate.tabID,
                activeAgentSessionID == candidate.sessionID,
                persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration,
@@ -616,6 +657,8 @@ final class AgentTabSession: ObservableObject {
         let origin: CodexFallbackOrigin
         let dispatchTicket: UInt64?
         var stopFence: AgentRunStartStopFence?
+        /// Explicit composer provenance; absent/internal contexts never inherit companion access.
+        var isLocalUserInput: Bool = false
     }
 
     struct CodexFallbackBlockingTurn: Equatable {
@@ -1309,7 +1352,12 @@ final class AgentTabSession: ObservableObject {
 
     private(set) var persistenceMutationGeneration: UInt64 = 0
     var saveRequestGeneration: UInt64 = 0
-    var parentSessionID: UUID?
+    var parentSessionID: UUID? {
+        didSet {
+            if (oldValue == nil) != (parentSessionID == nil) { AgentSessionLinkCandidateReadinessSignal.didChange() }
+        }
+    }
+
     var createdByOverseerSessionID: UUID?
     var hasLoadedPersistedState: Bool = false {
         didSet {

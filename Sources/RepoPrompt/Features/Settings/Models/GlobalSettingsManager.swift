@@ -161,6 +161,18 @@ extension GlobalSettingsStore {
         CodexGoalSupport.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexGoalSupportEnabled())
     }
 
+    func codexComputerUseEnabled() -> Bool {
+        CodexComputerUseWorkflow.isEnabled(persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled)
+    }
+
+    func setCodexComputerUseEnabled(_ enabled: Bool, commit: Bool = true) {
+        let oldValue = codexComputerUseEnabled()
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexComputerUseEnabled = enabled
+        }
+        CodexComputerUseWorkflow.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexComputerUseEnabled())
+    }
+
     func codexReasoningSummariesEnabled() -> Bool {
         CodexReasoningSummaries.isEnabled(persistedValue: scalarPreferences.agentMode?.codexReasoningSummariesEnabled)
     }
@@ -171,6 +183,19 @@ extension GlobalSettingsStore {
             settings.codexReasoningSummariesEnabled = enabled
         }
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
+    }
+
+    /// App-global UI preference for the oversight-link confirmation. Nil reads as false; the flag
+    /// only skips the dialog and never relaxes runtime authorization or approval restrictions.
+    func suppressOversightLinkConfirmation() -> Bool {
+        scalarPreferences.agentMode?.suppressOversightLinkConfirmation == true
+    }
+
+    func setSuppressOversightLinkConfirmation(_ suppressed: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            // Clearing returns to the baseline scalar shape for older CE builds.
+            settings.suppressOversightLinkConfirmation = suppressed ? true : nil
+        }
     }
 
     func codexMemoriesEnabled() -> Bool {
@@ -571,16 +596,7 @@ extension GlobalSettingsStore {
 
     /// Invoke before constructing any settings store or decoding Agent Models profiles.
     nonisolated static func installApplicationModelIdentityPolicy() {
-        SettingsModelIdentityPolicy.installCursorCanonicalizer { raw in
-            // Exact advertised identities win over historical rename aliases.
-            if AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options.contains(where: { $0.rawValue == raw }) == true {
-                return raw
-            }
-            if let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: raw), !specifier.overrides.isEmpty {
-                return ACPModelParameterIdentity.canonicalBaseModelRaw(specifier.baseModelRaw, providerID: .cursor)
-            }
-            return CursorAIModelCatalog.canonicalAlias(raw)
-        }
+        SettingsModelIdentityPolicy.installCursorCanonicalizer(CursorAIModelCatalog.canonicalIdentity)
     }
 
     static func installProcessApplicationEventBridge(notificationCenter: NotificationCenter = .default) {

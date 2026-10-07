@@ -42,7 +42,7 @@ enum ACPModelParameterResolver {
             let savedChoice = saved.flatMap { selection in
                 definition.choice(matching: selection.valueRaw)
                     ?? (
-                        providerID == .openCode || providerID == .cursor
+                        providerID == .openCode || providerID == .devin || providerID == .cursor
                             ? ACPModelParameterChoice(rawValue: selection.valueRaw, displayName: selection.valueRaw)
                             : nil
                     )
@@ -65,29 +65,26 @@ enum ACPModelParameterResolver {
     ) -> ACPModelParameterSet? {
         switch providerID {
         case .cursor:
-            if let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
-               snapshot.hasModelParameterMetadata
-            {
-                if let exact = snapshot.modelParameterSets.first(where: { $0.baseModelRaw == selectedModelRaw }) {
-                    return exact
-                }
-                let identity = ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: .cursor)
-                return snapshot.modelParameterSets.first {
-                    ACPModelParameterIdentity.canonicalBaseModelRaw($0.baseModelRaw, providerID: .cursor) == identity
-                }
-            }
-            // Legacy absence remains distinct from complete-empty metadata, but neither
-            // can supply effort choices without an advertised runtime parameter set.
-            return CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+            CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
         case .openCode:
-            return openCodeParameterSet(
+            openCodeParameterSet(
                 selectedModelRaw: selectedModelRaw,
                 workspacePath: workspacePath,
                 observation: openCodeParameters
             )
+        case .devin:
+            devinParameterSet(selectedModelRaw: selectedModelRaw)
         default:
-            return nil
+            nil
         }
+    }
+
+    private static func devinParameterSet(selectedModelRaw: String) -> ACPModelParameterSet? {
+        let identity = ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: .devin)
+        let matches = AgentACPModelRegistry.shared.resolvedSnapshot(for: .devin)?.modelParameterSets.filter {
+            ACPModelParameterIdentity.canonicalBaseModelRaw($0.baseModelRaw, providerID: .devin) == identity
+        } ?? []
+        return matches.count == 1 ? matches[0] : nil
     }
 
     /// Accept OpenCode metadata only when the observation is `.available`, its key matches the

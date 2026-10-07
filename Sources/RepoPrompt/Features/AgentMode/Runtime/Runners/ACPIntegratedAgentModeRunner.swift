@@ -670,7 +670,9 @@ final class ACPIntegratedAgentModeRunner {
         if let dispatchID = carry.dispatchID,
            !session.selfCompactNoteDispatchIsCurrent(dispatchID)
         {
-            if carry.exactNote { return false }
+            if carry.exactNote {
+                return false
+            }
             carry = .init(text: messageForRun, dispatchID: nil)
         }
         let agentMessage = carry.exactNote
@@ -1113,7 +1115,9 @@ final class ACPIntegratedAgentModeRunner {
         if let dispatchID = carry.dispatchID,
            !session.selfCompactNoteDispatchIsCurrent(dispatchID)
         {
-            if dedicatedNoteID != nil { return .cancelled }
+            if dedicatedNoteID != nil {
+                return .cancelled
+            }
             carry = .init(text: initialMessageForRun, dispatchID: nil)
         }
         // This run was created only to send the captured note. If an ordinary local turn
@@ -1503,6 +1507,7 @@ final class ACPIntegratedAgentModeRunner {
                 { [self] in
                     try await applyRequestedSessionModeIfNeeded(
                         runRequest.sessionModeID,
+                        agentKind: runRequest.agentKind,
                         controller: controller
                     )
                 }
@@ -1526,10 +1531,13 @@ final class ACPIntegratedAgentModeRunner {
 
     private func applyRequestedSessionModeIfNeeded(
         _ requestedMode: String?,
+        agentKind: AgentProviderKind,
         controller: ACPAgentSessionController
     ) async throws {
         if let requestedMode = requestedMode?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedMode.isEmpty {
             try await controller.setSessionMode(requestedMode)
+        } else if agentKind == .devin {
+            try await controller.restoreOpenedSessionMode()
         }
     }
 
@@ -1538,6 +1546,11 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
+        // The membership fence below is synchronous and reads the shared ACP registry, whose
+        // persisted snapshot warms asynchronously. Warm it first so a cold launch cannot reject a
+        // cached, still-advertised selection. Already-warm calls return immediately; this performs
+        // no discovery and no provider request.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         guard let model = try Self.explicitSelectedModel(
             agentKind: runRequest.agentKind,
             modelString: runRequest.modelString
@@ -1566,6 +1579,17 @@ final class ACPIntegratedAgentModeRunner {
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
         else {
             return nil
+        }
+        if agentKind == .cursor,
+           model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
+           !CursorAIModelCatalog.contains(modelRaw: model)
+        {
+            // Cursor membership is time-varying discovery data, not a release gate: a model the
+            // account no longer advertises fails with actionable recovery instead of silently
+            // running Cursor's default.
+            throw AIProviderError.invalidConfiguration(
+                detail: "Cursor model `\(model)` is not in Cursor's last known model catalog. Refresh Cursor models with Test Connection, or choose Cursor Auto."
+            )
         }
         if agentKind == .grokBuild || agentKind == .antigravity,
            let providerID = agentKind.acpProviderID,

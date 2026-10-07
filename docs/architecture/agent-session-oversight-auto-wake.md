@@ -56,6 +56,20 @@ fences remain in place without importing a native pre-discovery requirement into
 Catalog observations and `tools/list_changed` remain discovery/usability signals. This changes no
 MCP tool name, schema, operation, caller identity or per-call authorization contract.
 
+## Same-process window reopen
+
+Window close still revokes live authority, leases, queues, and wakes. Before teardown, the runtime
+bridge captures only reference-backed saved pairs in the existing launch coordinator. Its current
+parked reference owns restoration or an already-admitted Unlink; historical closed references only
+fence late cleanup. Exact endpoints, durable token, and assertion generation fence both paths.
+Parking survives transient hydration and sequential closes until a valid restoration proof enters
+the ordinary establishment path. Unlink and committed deletion forget intent; failed removal uses
+the existing cleanup warning/retry. Parking is process-local, preserves no capabilities, and adds no
+UI or MCP state; cold launch keeps its existing restoration policy.
+Hydration need is derived from current readiness on existing reconciliation events; the loader owns
+loaded/in-flight deduplication. Queued passive work must still match its complete discovery owner and
+persisted descriptor before admission, so an abandoned request cannot suppress successor recovery.
+
 ## Configuration-only model selection
 
 `set_model(session_id, model_id)` requires the exact original **Manage** lease and a fully idle,
@@ -210,6 +224,31 @@ selection state and the exact lane's snooze without mutating any of them. Select
 may retract a routine pre-dispatch attempt, but not an exact live attention-backed attempt. Unlink,
 revocation, and every other hard gate still retract either kind. No control claims to cancel a
 physical provider call already in flight.
+
+## Sidebar creator names are UI-only settled presentation
+
+Active and archived creator rows use settled UI names plus known-tab/session provenance reads and
+the owner-valid index, without walking the target menu's lifecycle identity. A hydrated live nil
+creator suppresses stale indexed provenance, while a fresh unhydrated creator remains readable before
+index publication. Neither row discovers candidates or searches unrelated live sessions.
+
+The bridge derives live display names on binding/readiness/topology changes. The workspace array's
+mutation owner compares the active cohort's tab/session/name tuples, including reload/sync replacements;
+name-only changes update that UI snapshot synchronously without reconstructing provider/location
+candidates. Effective name changes also schedule a coalesced presentation-only repaint for live menus,
+whose linked/available peers and inbound labels use those names. Publication uses the existing
+exact-projection storage transaction, including a changed name signal for archived/unlinked consumers
+when exact props are equal. Late monitor publication
+re-resolves creator provenance and names against the current settled source. This changes no grants,
+prompt inventory, passive delivery, or Auto-wake policy.
+
+Live first-match `resolvedDisplayName` wins for duplicate session UUIDs; descriptive UUID lookup never
+selects an action endpoint. Up to 4,096 last-known display names are retained in launch-local memory,
+including a rename immediately followed by source removal/close. A later settled non-live source
+rename/reload updates only already-known retained names, never overriding a live first match or
+creating membership. Committed deletion prunes them.
+There is no new persisted state: after restart (or retention eviction), a non-live creator falls back
+to the requesting workspace's valid indexed name, then its compact UUID.
 
 ## Exact projection is presentation truth
 
@@ -925,3 +964,19 @@ This channel observes existing authority; it does not add a refresh receipt, ret
 state machine, or provider policy. Its purpose is to distinguish future failures where RepoPrompt never
 publishes the tool from failures where the server projection is ready but the provider/model catalog
 does not converge.
+
+### Bounded start requests and child lifetime
+
+`agent_run start` supervises setup for 150 seconds, including detached and zero-timeout
+starts. An attached start begins its caller-selected wait only after wait registration;
+return processing has 25 seconds, never beyond that wait's fixed deadline plus 25 seconds.
+The existing watchdog allows at most five further seconds for request settlement, then
+detaches noncooperative work. It does not stop a submitted child.
+
+Cancellation closes the invocation's in-memory mutation admission before cancelling its
+operation task. Owners record reserved session/worktree identity and submitted dispatch
+before suspended acknowledgement. Timeout recovery in `_meta.start` reports known identity,
+phase, dispatch certainty and settlement without awaiting another snapshot or host cleanup.
+Inspect that existing identity; never blindly repeat `start` after a timeout. Accepted or
+uncertain submission is not discarded/deactivated by start failure. Standalone wait/poll,
+steer, filesystem leases and transport cancellation retain their existing contracts.

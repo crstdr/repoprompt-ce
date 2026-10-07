@@ -965,6 +965,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var maxBackgroundAgentComposeTabs: Int?
         package var showBuiltInWorkflowCleanupGuidance: Bool?
         package var codexGoalSupportEnabled: Bool?
+        package var codexComputerUseEnabled: Bool?
         package var codexReasoningSummariesEnabled: Bool?
         package var autoEffortEnabled: Bool?
         package var codexMemoriesEnabled: Bool?
@@ -978,6 +979,8 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         package var agentSessionHandoffInstructions: String?
         package var subagentDefaultWaitSeconds: Int?
+        /// App-global UI preference; skipping confirmation grants no runtime authority.
+        package var suppressOversightLinkConfirmation: Bool?
 
         package init(
             proEditAgentMode: Bool? = nil,
@@ -988,6 +991,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             maxBackgroundAgentComposeTabs: Int? = nil,
             showBuiltInWorkflowCleanupGuidance: Bool? = nil,
             codexGoalSupportEnabled: Bool? = nil,
+            codexComputerUseEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
             autoEffortEnabled: Bool? = nil,
             codexMemoriesEnabled: Bool? = nil,
@@ -1000,7 +1004,8 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil,
-            subagentDefaultWaitSeconds: Int? = nil
+            subagentDefaultWaitSeconds: Int? = nil,
+            suppressOversightLinkConfirmation: Bool? = nil
         ) {
             self.proEditAgentMode = proEditAgentMode
             self.proEditAgentKind = proEditAgentKind
@@ -1010,6 +1015,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.maxBackgroundAgentComposeTabs = maxBackgroundAgentComposeTabs
             self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
+            self.codexComputerUseEnabled = codexComputerUseEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
             self.autoEffortEnabled = autoEffortEnabled
             self.codexMemoriesEnabled = codexMemoriesEnabled
@@ -1023,6 +1029,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions
             self.subagentDefaultWaitSeconds = subagentDefaultWaitSeconds
+            self.suppressOversightLinkConfirmation = suppressOversightLinkConfirmation
         }
     }
 }

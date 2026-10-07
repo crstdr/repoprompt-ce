@@ -2377,6 +2377,58 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertTrue(result["detail"]?.stringValue?.contains("Refresh `list`") == true)
     }
 
+    func testPartialWaitRefencesEarlierSurvivorsAfterLaterSiblingRevocation() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second")
+        let third = makeCandidate(windowID: 4, displayName: "Third")
+        fixture.host.candidates.append(contentsOf: [second, third])
+        for target in [second, third] {
+            guard case .added = await fixture.bridge.addMonitorLink(
+                observerSessionID: fixture.observer.sessionID,
+                rawTargetSessionID: target.sessionID.uuidString
+            ) else { return XCTFail("expected sibling link") }
+        }
+        let inventory = await fixture.authority.links(forObserver: fixture.observer.sessionID)
+        let first = try XCTUnwrap(inventory.items.first { $0.targetSessionID == fixture.target.sessionID })
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+
+        var fenceCount = 0
+        var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
+        var revokedEarlierSurvivor = false
+        fixture.bridge.test_afterManagedObservationAuthorityValidation = {
+            fenceCount += 1
+            if fenceCount == 1 {
+                // Force the original whole-batch fence into its per-target fallback.
+                deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: third.sessionID)
+            } else if fenceCount == 3 {
+                // The first survivor has already yielded its prompt; a later sibling's authority
+                // hop must not let that earlier inspection escape after its grant is revoked.
+                await fixture.bridge.revokeLink(linkID: first.linkID, generation: first.generation)
+                revokedEarlierSurvivor = true
+            }
+        }
+        defer {
+            fixture.bridge.test_afterManagedObservationAuthorityValidation = nil
+            if let deletionAttempt {
+                AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletionAttempt)
+            }
+        }
+
+        do {
+            _ = try await Self.executeObject(fixture.service, args: [
+                "op": .string("wait"),
+                "session_ids": .array([fixture.target, second, third].map { .string($0.sessionID.uuidString) }),
+                "timeout_seconds": .int(0)
+            ])
+            XCTFail("a changed survivor batch must deny rather than release an earlier prompt or cursor")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("No active session link"))
+        }
+        XCTAssertNotNil(deletionAttempt)
+        XCTAssertTrue(revokedEarlierSurvivor, "the later sibling must revoke the previously inspected survivor")
+    }
+
     func testSingleTargetWaitStillDeniesWhenItsObservationFenceFails() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
@@ -2992,7 +3044,19 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         /// projection: the suspension point a user's Stop can land in.
         var duringTranscriptPage: (() async -> Void)?
 
-        func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+        func agentSessionLinkCandidate(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation _: Bool
+        ) -> AgentSessionLinkEndpointCandidate? {
+            candidates.first { $0.domainEndpoint == endpoint }
+        }
+
+        func agentSessionLinkCandidates(
+            forSessionIDs sessionIDs: Set<UUID>, includeLocation _: Bool
+        ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+            Dictionary(uniqueKeysWithValues: sessionIDs.map { id in (id, candidates.filter { $0.sessionID == id }) })
+        }
+
+        func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
             candidates
         }
 

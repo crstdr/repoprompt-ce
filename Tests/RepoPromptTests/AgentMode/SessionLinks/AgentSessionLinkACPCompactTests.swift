@@ -245,9 +245,9 @@ final class ACPAdvertisedCommandControllerTests: XCTestCase {
         XCTAssertFalse(fixture.controller.advertisesCommand("compact", inProviderSession: ACPCompactFixtures.sessionID))
     }
 
-    /// The current request must match the resumed Devin process's launch-time permission mode.
-    /// A command never relaunches to apply a changed mode, or normalizes an unrecognized mode into
-    /// authority. The final actor-owned dispatch seam must refuse it without writing a prompt.
+    /// A resumed Devin session refuses any prompt whose request cannot apply its permission level.
+    /// The command is checked against the run's current request, like an ordinary prompt,
+    /// not the one the session was opened with.
     func testAResumedDevinCommandIsCheckedAgainstTheCurrentRequest() async throws {
         let directory = try ACPCompactFixtures.makeTemporaryDirectory(tracking: &temporaryURLs)
         let scriptURL = try AgentSessionLinkACPServerScript.write(to: directory)
@@ -261,7 +261,7 @@ final class ACPAdvertisedCommandControllerTests: XCTestCase {
                 "ACP_PROMPT_LOG": promptLog.path
             ]
         )
-        func request(launchPermissionMode: String?) -> ACPRunRequest {
+        func request(sessionModeID: String?) -> ACPRunRequest {
             ACPRunRequest(
                 agentKind: .devin,
                 modelString: nil,
@@ -269,37 +269,35 @@ final class ACPAdvertisedCommandControllerTests: XCTestCase {
                 resumeSessionID: "resumed-devin",
                 attachments: [],
                 taskLabelKind: nil,
-                launchPermissionMode: launchPermissionMode
+                sessionModeID: sessionModeID
             )
         }
         // Opened while an applicable permission level was selected.
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request(launchPermissionMode: "auto"), allowsProviderProcessLaunchForTesting: true)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request(sessionModeID: "ask"), allowsProviderProcessLaunchForTesting: true)
         controllers.append(controller)
         _ = try await controller.bootstrap()
         try await AsyncTestWait.waitUntil("the load advertisement to be captured") {
             controller.advertisesCommand("compact", inProviderSession: "resumed-devin")
         }
 
-        for mode in ["dangerous", "unknown-mode"] {
-            do {
-                try await controller.promptAdvertisedCommand(
-                    "compact",
-                    expectedSessionID: "resumed-devin",
-                    request: request(launchPermissionMode: mode)
-                )
-                XCTFail("A changed or unrecognized launch mode must be refused before the write")
-            } catch let refusal as ACPAgentSessionController.ProviderCommandRefusal {
-                XCTAssertTrue(refusal.sessionIsUsable)
-            }
-            let reusable = await controller.hasReusableSession
-            XCTAssertTrue(reusable, "Refusal retains the live controller; it must not relaunch")
+        do {
+            try await controller.promptAdvertisedCommand(
+                "compact",
+                expectedSessionID: "resumed-devin",
+                request: request(sessionModeID: nil)
+            )
+            XCTFail("The current selection cannot be applied to the resumed session, so the command must be refused")
+        } catch let refusal as ACPAgentSessionController.ProviderCommandRefusal {
+            XCTAssertTrue(refusal.sessionIsUsable)
         }
+        let reusable = await controller.hasReusableSession
+        XCTAssertTrue(reusable, "Refusal retains the live controller; it must not relaunch")
         XCTAssertEqual(try ACPCompactFixtures.loggedPrompts(at: promptLog), [], "Nothing was written")
 
         try await controller.promptAdvertisedCommand(
             "compact",
             expectedSessionID: "resumed-devin",
-            request: request(launchPermissionMode: "auto")
+            request: request(sessionModeID: "ask")
         )
         XCTAssertEqual(try ACPCompactFixtures.loggedPrompts(at: promptLog), [ACPCompactFixtures.bareCompactPrompt])
     }
@@ -741,7 +739,9 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
             acpProviderFactory: { _, _ in provider },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
-                if let runID { await MCPRoutingWaiter.notifyRouted(runID: runID) }
+                if let runID {
+                    await MCPRoutingWaiter.notifyRouted(runID: runID)
+                }
             },
             mcpServerEnabler: { true }
         )
@@ -1144,7 +1144,9 @@ final class AgentSessionLinkACPBackgroundCompactionSettleTests: XCTestCase {
         let subscription = session.monitorReadinessChangePublisher.sink { [weak session] in
             guard let session else { return }
             transitions.append(session.isSettlingACPBackgroundCompaction)
-            if session.acpBackgroundCompactionSettlesAt == nil { lifted.fulfill() }
+            if session.acpBackgroundCompactionSettlesAt == nil {
+                lifted.fulfill()
+            }
         }
         defer { subscription.cancel() }
 

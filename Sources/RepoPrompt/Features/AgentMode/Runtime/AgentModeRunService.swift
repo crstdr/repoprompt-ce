@@ -406,7 +406,6 @@ final class AgentModeRunService {
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             sessionModeID: runtimePermission.acpSessionModeID,
             autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
-            launchPermissionMode: runtimePermission.acpLaunchPermissionMode,
             // Resolve pins for whichever ACP provider is selected, not Cursor alone: OpenCode
             // effort pins ride this same path, and narrowing it to `.cursor` silently drops them.
             modelParameterSelections: selectedAgent.acpProviderID.map { providerID in
@@ -781,7 +780,7 @@ final class AgentModeRunService {
         _ managed: AgentTabSession.ACPSteeringManagedContext,
         session: AgentTabSession
     ) -> Bool {
-        let candidate = managed.candidate
+        let candidate = managed.endpoint
         return session.tabID == candidate.tabID
             && session.activeAgentSessionID == candidate.sessionID
             && session.persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration
