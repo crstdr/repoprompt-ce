@@ -4111,6 +4111,34 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertNil(replacementHost.publishedInventoriesByEndpoint[third.domainEndpoint])
     }
 
+    func testRefreshAbandonsPublicationsWhenFrozenAfterStatusCollection() async {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        await fixture.bridge.test_settleProjections()
+        await fixture.bridge.test_settleCandidateAvailabilityNotifications()
+        let gate = TestReleaseFence(name: "status collection completed")
+        defer { gate.release() }
+        fixture.bridge.test_afterMonitorProjection = { await gate.enterAndWait() }
+        let refresh = Task { @MainActor in
+            await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID])
+        }
+        guard await gate.waitUntilEntered() else { return }
+        fixture.bridge.freezeForTermination()
+        let exactReads = fixture.host.exactCandidateReadCount
+        let uuidReads = fixture.host.uuidCandidateReadCount
+        let props = fixture.host.publishedPropsByEndpoint
+        let inventories = fixture.host.publishedInventoriesByEndpoint
+        let passive = fixture.host.publishedPassiveNoticesByEndpoint
+        gate.release()
+        await refresh.value
+        XCTAssertEqual(fixture.host.exactCandidateReadCount, exactReads, "Frozen projection must abandon fresh reads before passive reconciliation")
+        XCTAssertEqual(fixture.host.uuidCandidateReadCount, uuidReads)
+        XCTAssertEqual(fixture.host.publishedPropsByEndpoint, props)
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint, inventories)
+        XCTAssertEqual(fixture.host.publishedPassiveNoticesByEndpoint, passive)
+        XCTAssertNil(fixture.bridge.sidebarOversightSummary(for: fixture.observer.domainEndpoint))
+    }
+
     func testSparseCatalogClearsEvictedNoticesAndSerializedEqualRevisionDismissal() async throws {
         let fixture = makeFixture()
         let observers = (0 ..< 34).map { makeCandidate(windowID: 1, displayName: "Observer \($0)") }

@@ -1234,6 +1234,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     #if DEBUG
         var test_afterPresentationSnapshot: (@MainActor () async -> Void)?
+        var test_afterMonitorProjection: (@MainActor () async -> Void)?
         /// Fault injection for native tracking tests: hide coherent UI inputs without installing
         /// another catalog or blocking AppKit's nested run loop on an async authority turn.
         var test_menuCatalogUnavailable = false
@@ -4155,7 +4156,7 @@ final class AgentSessionLinkRuntimeBridge {
         var fullCandidates: [AgentSessionLinkEndpointCandidate] = []
         if scope.isFull {
             await sweepStaleEndpoints(liveCandidates: host.agentSessionLinkCandidates(includeLocation: false))
-            guard !isFrozenForTermination else { return }
+            guard !isFrozenForTermination, self.host === host else { return }
             fullCandidates = host.agentSessionLinkCandidates(includeLocation: false)
         }
         let previousCatalog = menuCatalog
@@ -4208,7 +4209,7 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         for endpoint in endpoints {
-            guard !isFrozenForTermination else { return }
+            guard !isFrozenForTermination, self.host === host else { return }
             // Re-read exact ownership after the authority hop; a displaced endpoint cannot clear
             // or label its successor. UI empty defaults never enter this publication path.
             guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: true),
@@ -4217,14 +4218,13 @@ final class AgentSessionLinkRuntimeBridge {
                 projectedEndpoints.remove(endpoint)
                 continue
             }
-            let projection = await makeProjection(
+            guard let projection = await makeProjection(
                 for: candidate,
                 inputs: inputs,
                 candidatesByEndpoint: scope.isFull ? fullMap : presentationCandidates(for: endpoint, inputs: inputs)
-            )
-            guard !isFrozenForTermination, self.host === host,
-                  host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil
-            else { continue }
+            ) else { return }
+            guard !isFrozenForTermination, self.host === host else { return }
+            guard host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil else { continue }
             host.agentSessionLinkPublishProjection(projection.props, to: endpoint)
             // Membership holds and inventory revisions remain the publication fence.
             host.agentSessionLinkPublishPromptInventory(projection.promptInventory, to: endpoint)
@@ -4350,22 +4350,27 @@ final class AgentSessionLinkRuntimeBridge {
         for candidate: AgentSessionLinkEndpointCandidate,
         inputs: DomainAgentSessionLinkEndpointProjectionInputs,
         candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate]
-    ) async -> EndpointProjection {
+    ) async -> EndpointProjection? {
+        guard !isFrozenForTermination, let host else { return nil }
         let monitor = await makeMonitorProjection(
             for: candidate, inputs: inputs, candidatesByEndpoint: candidatesByEndpoint,
             collectsStatusSamples: true
         )
+        #if DEBUG
+            await test_afterMonitorProjection?()
+        #endif
+        guard !isFrozenForTermination, self.host === host else { return nil }
         // Reconciled here rather than inside the row builder, because this is the only pass that is
         // authoritative about membership *and* status at once.
         // One post-await snapshot serves both eligibility and app-wide UUID uniqueness. Empty,
         // unrelated chats need neither. Do not share this freshness-sensitive snapshot across hops.
         let needsFreshCandidates = passiveNoticesByObserver[candidate.domainEndpoint] != nil
             || !monitor.statusSamples.isEmpty || !inputs.outbound.items.isEmpty
-        let freshCandidates = needsFreshCandidates ? host?.agentSessionLinkCandidates(
+        let freshCandidates = needsFreshCandidates ? host.agentSessionLinkCandidates(
             forSessionIDs: Set(inputs.outbound.items.map(\.targetSessionID)), includeLocation: false
-        ).values.flatMap(\.self) ?? [] : []
+        ).values.flatMap(\.self) : []
         let currentCandidate = needsFreshCandidates
-            ? host?.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: false) : nil
+            ? host.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: false) : nil
         let passiveNotices = reconcilePassiveNotices(
             for: candidate,
             samples: monitor.statusSamples,
