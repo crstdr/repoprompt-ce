@@ -79,47 +79,7 @@ extension AgentSessionRow {
             items.append(.separator)
         }
 
-        var overseeNewItems: [StableMenuItem] = []
-        if let reason = menu.observerIneligibleReason {
-            overseeNewItems.append(.message(reason))
-        }
-        if menu.availableTargets.isEmpty, menu.observerIneligibleReason == nil {
-            overseeNewItems.append(.message(AgentOversightUICopy.noSessionsToOversee))
-        } else {
-            overseeNewItems += menu.availableTargets.map { option in
-                let busy = busyKeys.contains(.add(
-                    observerEndpoint: menu.targetEndpoint,
-                    targetEndpoint: option.peerEndpoint
-                ))
-                return .action(
-                    option.menuLabel,
-                    isEnabled: !busy && menu.observerIneligibleReason == nil,
-                    imageSystemName: busy ? "hourglass" : nil,
-                    accessibilityLabel: option.menuLabel,
-                    accessibilityValue: busy ? "In progress" : nil,
-                    accessibilityHint: option.fullIdentityDescription
-                ) {
-                    actions.addOutbound(option)
-                }
-            }
-        }
-        overseeNewItems.append(.separator)
-        overseeNewItems.append(.action(
-            AgentOversightUICopy.sessionIDMenuItem,
-            isEnabled: menu.observerIneligibleReason == nil
-        ) {
-            actions.presentChooseTargetSheet()
-        })
-        items.append(.submenu(
-            AgentOversightUICopy.overseeNewTitle,
-            accessibilityLabel: AgentOversightUICopy.overseeNewTitle,
-            accessibilityValue: AgentOversightUICopy.overseeMenuAccessibilityValue(
-                overseeingCount: menu.linkedTargets.count,
-                availableCount: menu.availableTargets.count
-            ),
-            items: overseeNewItems
-        ))
-
+        // "Link overseer" leads "Oversee" — the same top-down hierarchy as the linked sections.
         var overseeByItems: [StableMenuItem] = []
         if let reason = menu.targetIneligibleReason {
             overseeByItems.append(.message(reason))
@@ -159,6 +119,47 @@ extension AgentSessionRow {
                 availableCount: menu.availableObservers.count
             ),
             items: overseeByItems
+        ))
+
+        var overseeNewItems: [StableMenuItem] = []
+        if let reason = menu.observerIneligibleReason {
+            overseeNewItems.append(.message(reason))
+        }
+        if menu.availableTargets.isEmpty, menu.observerIneligibleReason == nil {
+            overseeNewItems.append(.message(AgentOversightUICopy.noSessionsToOversee))
+        } else {
+            overseeNewItems += menu.availableTargets.map { option in
+                let busy = busyKeys.contains(.add(
+                    observerEndpoint: menu.targetEndpoint,
+                    targetEndpoint: option.peerEndpoint
+                ))
+                return .action(
+                    option.menuLabel,
+                    isEnabled: !busy && menu.observerIneligibleReason == nil,
+                    imageSystemName: busy ? "hourglass" : nil,
+                    accessibilityLabel: option.menuLabel,
+                    accessibilityValue: busy ? "In progress" : nil,
+                    accessibilityHint: option.fullIdentityDescription
+                ) {
+                    actions.addOutbound(option)
+                }
+            }
+        }
+        overseeNewItems.append(.separator)
+        overseeNewItems.append(.action(
+            AgentOversightUICopy.sessionIDMenuItem,
+            isEnabled: menu.observerIneligibleReason == nil
+        ) {
+            actions.presentChooseTargetSheet()
+        })
+        items.append(.submenu(
+            AgentOversightUICopy.overseeNewTitle,
+            accessibilityLabel: AgentOversightUICopy.overseeNewTitle,
+            accessibilityValue: AgentOversightUICopy.overseeMenuAccessibilityValue(
+                overseeingCount: menu.linkedTargets.count,
+                availableCount: menu.availableTargets.count
+            ),
+            items: overseeNewItems
         ))
 
         if hasLinkedSections {
