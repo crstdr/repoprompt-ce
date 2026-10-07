@@ -986,6 +986,12 @@ struct AgentPermissionsRequest: Identifiable, Hashable {
     }
 }
 
+/// Provider-projected scope of the session decision; nil preserves legacy presentation.
+enum AgentApprovalSessionScope: Hashable {
+    case oneTime
+    case editsSession
+}
+
 struct AgentApprovalRequest: Identifiable, Hashable {
     let id: UUID
     let requestID: AgentApprovalRequestID
@@ -1003,6 +1009,8 @@ struct AgentApprovalRequest: Identifiable, Hashable {
     let overseerOneTimeAllowAvailable: Bool?
     /// ACP-only availability of the ordinary one-time decision, derived from live provider options.
     let plainApproveAvailable: Bool?
+    /// Live request scope only; this does not store or grant consent.
+    let sessionApprovalScope: AgentApprovalSessionScope?
     let details: [AgentApprovalDetail]
 
     init(
@@ -1020,6 +1028,7 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         proposedExecpolicyAmendmentJSON: String? = nil,
         overseerOneTimeAllowAvailable: Bool? = nil,
         plainApproveAvailable: Bool? = nil,
+        sessionApprovalScope: AgentApprovalSessionScope? = nil,
         details: [AgentApprovalDetail] = []
     ) {
         self.id = id ?? Self.stableID(
@@ -1043,6 +1052,7 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         self.proposedExecpolicyAmendmentJSON = proposedExecpolicyAmendmentJSON
         self.overseerOneTimeAllowAvailable = overseerOneTimeAllowAvailable
         self.plainApproveAvailable = plainApproveAvailable
+        self.sessionApprovalScope = sessionApprovalScope
         self.details = details
     }
 
@@ -1074,6 +1084,10 @@ struct AgentApprovalRequest: Identifiable, Hashable {
     }
 
     var supportsAlwaysAllow: Bool {
-        true
+        sessionApprovalScope != .oneTime
+    }
+
+    var sessionApprovalLabel: String {
+        sessionApprovalScope == .editsSession ? "Allow edits this session" : "Always Allow"
     }
 }

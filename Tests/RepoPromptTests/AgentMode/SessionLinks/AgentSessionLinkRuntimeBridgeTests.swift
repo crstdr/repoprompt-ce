@@ -3856,6 +3856,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             })
             let reads = fixture.host.candidateReadCount
             let visits = fixture.host.boundedCandidateVisits
+            let clock = ContinuousClock()
+            let refreshStart = clock.now
             for target in candidates[10 ..< 50] {
                 fixture.host.snapshotOverrides[target.sessionID] = DomainAgentSessionObservationSnapshot(
                     sessionID: target.sessionID, displayName: target.displayName, providerDisplayName: "Codex CLI",
@@ -3870,6 +3872,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             await fixture.bridge.test_settleTargetPublications()
             XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: candidates[10].sessionID), sequence, "Equal snapshots must not allocate sequences")
             await fixture.bridge.test_refreshStatus(sessionIDs: Set(candidates.prefix(10).map(\.sessionID)))
+            let refreshTime = refreshStart.duration(to: clock.now)
+            XCTAssertLessThan(refreshTime, .seconds(5))
+            print("STATUS_SCALE chats=1500 windows=\(windowCount) overseers=10 links=40 refresh=\(refreshTime) fullDiscoveryReads=\(fixture.host.candidateReadCount - reads) candidateVisits=\(fixture.host.boundedCandidateVisits - visits) budget=5s")
             XCTAssertEqual(fixture.host.candidateReadCount, reads, "No discovery at \(windowCount) windows / 40 links")
             XCTAssertLessThanOrEqual(fixture.host.boundedCandidateVisits - visits, 300, "Count underlying candidates, not just query calls")
             for observer in candidates.prefix(10) {
