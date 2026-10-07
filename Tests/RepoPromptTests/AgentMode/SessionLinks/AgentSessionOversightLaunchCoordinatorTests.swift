@@ -366,14 +366,23 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     }
 
     func testThreeHundredChatsRestoreTenLinksAcrossReopenAndRestartWithinBudget() async throws {
-        var ids = (0 ..< 300).map { _ in UUID() }
+        try await assertRestoreScale(chatCount: 300)
+    }
+
+    func testFifteenHundredChatsRestoreTenLinksAcrossReopenAndRestartWithinBudget() async throws {
+        try await assertRestoreScale(chatCount: 1500)
+    }
+
+    private func assertRestoreScale(chatCount: Int) async throws {
+        let chatsPerWindow = chatCount / 3
+        var ids = (0 ..< chatCount).map { _ in UUID() }
         ids[0] = observerSessionID
         ids[1] = targetSessionID
         let workspaceIDs = (0 ..< 3).map { _ in UUID() }
         let pairs = (0 ..< 10).map { index in
             AgentSessionOversightIntent(
-                observerSessionID: ids[(index % 3) * 100],
-                targetSessionID: ids[1 + index * 29]
+                observerSessionID: ids[(index % 3) * chatsPerWindow],
+                targetSessionID: ids[1 + index * ((chatCount - 10) / 10)]
             )
         }
         try seedSavedPair(Array(pairs.dropFirst()))
@@ -384,8 +393,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         func candidates(firstWindowID: Int) -> [AgentSessionLinkEndpointCandidate] {
             ids.enumerated().map { index, id in
                 makeReadyCandidate(
-                    windowID: firstWindowID + index / 100,
-                    sessionID: id, workspaceID: workspaceIDs[index / 100]
+                    windowID: firstWindowID + index / chatsPerWindow,
+                    sessionID: id, workspaceID: workspaceIDs[index / chatsPerWindow]
                 )
             }
         }
@@ -395,7 +404,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             fixture.host.descriptors = ready.map { descriptor(for: $0) }
             fixture.host.discovery = (0 ..< 3).map { index in
                 .init(epoch: .init(
-                    windowID: ready[index * 100].windowID,
+                    windowID: ready[index * chatsPerWindow].windowID,
                     workspaceID: workspaceIDs[index],
                     generation: 1
                 ), isComplete: true)
@@ -472,7 +481,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertEqual(Set(restarted.host.hydrationRequests.flatMap(\.self)), linkedIDs)
         XCTAssertLessThan(restartTime, budget)
         restarted.host.hydrationHandler = nil
-        print("RESTORE_SCALE chats=300 windows=3 overseers=3 links=10 launch=\(launchTime) reopen=\(reopenTime) restart=\(restartTime) budget=5s/phase")
+        print("RESTORE_SCALE chats=\(chatCount) windows=3 overseers=3 links=10 launch=\(launchTime) reopen=\(reopenTime) restart=\(restartTime) budget=5s/phase")
     }
 
     // MARK: - Same-process window reopen
