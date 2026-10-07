@@ -721,7 +721,7 @@ struct AgentComposerView: View, Equatable {
                     Button {
                         Task { await actions.toggleComputerUse(target.tabID, target.expectedSourceTabSessionIdentity) }
                     } label: {
-                        Image(systemName: "display")
+                        Image(systemName: "cursorarrow")
                             .font(.system(size: 15))
                             .foregroundStyle(props.computerUse.isOn ? Color.white : Color.secondary)
                             .frame(width: 28, height: 28)

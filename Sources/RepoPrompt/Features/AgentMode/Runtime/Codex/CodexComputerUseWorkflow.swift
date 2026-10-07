@@ -182,7 +182,7 @@ enum CodexComputerUseWorkflow {
         AgentWorkflowDefinition(
             customID: UUID(),
             displayName: "/\(commandName)",
-            iconName: "display",
+            iconName: "cursorarrow",
             accentColorHex: "#0EA5E9",
             tooltipText: "Guide Codex through a computer-use workflow",
             descriptionText: "Arms Computer Use for this chat until /computer-use off or the session ends.",
