@@ -21374,7 +21374,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             return
         }
-        codexCoordinator.submitUserInputResponse(session: session, requestID: requestID, response: response)
+        guard codexCoordinator.submitUserInputResponse(session: session, requestID: requestID, response: response) else { return }
         session.pendingUserInputRequest = nil
         if !session.queuedUserInputRequests.isEmpty {
             session.pendingUserInputRequest = session.queuedUserInputRequests.removeFirst()

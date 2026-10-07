@@ -64,6 +64,66 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         )
     }
 
+    func testComputerUseLegacyApprovalSurfacesAndRejectsRememberedAnswers() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(false)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture([])
+        let session = fixture.session
+        let controller = WedgeFakeCodexController(runID: UUID(), responses: [])
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        let request = makeLegacyApprovalRequest()
+        let questionID = try XCTUnwrap(request.questions.first?.id)
+        await fixture.coordinator.test_handleCodexNativeEvent(.requestUserInput(request), session: session, sourceController: controller)
+        XCTAssertEqual(session.pendingUserInputRequest?.id, request.id, "Frozen armed scope must surface approval even with the global setting OFF")
+        XCTAssertEqual(session.pendingUserInputRequest?.questions.first?.options.map(\.label), ["Allow", "Deny"], "Remembered and unknown approval options must not be offered")
+        // Continue probing submission even on the known-bad autoanswer path.
+        if session.pendingUserInputRequest == nil { session.pendingUserInputRequest = request }
+        for remembered in ["Allow for this session", "AlwaysAllow", "Allow forever", "user_note: Allow for this session"] {
+            fixture.viewModel.submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: .init(answersByQuestionID: [questionID: [remembered]]))
+            XCTAssertEqual(session.pendingUserInputRequest?.id, request.id, "Rejected answers must preserve the pending review: \(remembered)")
+            if session.pendingUserInputRequest == nil { session.pendingUserInputRequest = request }
+        }
+        fixture.viewModel.submitUserInputResponse(tabID: session.tabID, requestID: .int(999), response: .init(answersByQuestionID: [questionID: ["Allow"]]))
+        XCTAssertEqual(session.pendingUserInputRequest?.id, request.id, "A stale request ID must not consume the prompt")
+        fixture.viewModel.submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: .init(answersByQuestionID: [questionID: ["Allow"]]))
+        try await AsyncTestWait.waitUntil("explicit one-shot legacy answer", timeout: 4) { controller.qaUserInputAnswers[questionID] == ["Allow"] }
+        XCTAssertEqual(controller.qaResponseCount, 1, "Only the explicit one-shot response may reach the controller")
+        XCTAssertNil(session.pendingUserInputRequest)
+        await fixture.coordinator.shutdownCodexSession(session)
+    }
+
+    func testOrdinaryLegacyApprovalRetainsAutomaticSessionAnswer() async throws {
+        for optedIn in [false, true] {
+            CodexComputerUseWorkflow.setEnabledForTesting(optedIn)
+            let fixture = makeFixture([])
+            let session = fixture.session
+            let controller = WedgeFakeCodexController(runID: UUID(), responses: [])
+            session.codexController = controller
+            session.codexControllerFeatureState = .init(computerUseEnabled: false, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+            let request = makeLegacyApprovalRequest()
+            let questionID = try XCTUnwrap(request.questions.first?.id)
+            await fixture.coordinator.test_handleCodexNativeEvent(.requestUserInput(request), session: session, sourceController: controller)
+            try await AsyncTestWait.waitUntil("ordinary automatic legacy answer", timeout: 4) { controller.qaResponseCount == 1 }
+            XCTAssertNil(session.pendingUserInputRequest)
+            XCTAssertEqual(controller.qaUserInputAnswers[questionID], ["Allow for this session"])
+            await fixture.coordinator.shutdownCodexSession(session)
+        }
+        CodexComputerUseWorkflow.setEnabledForTesting(nil)
+    }
+
+    private func makeLegacyApprovalRequest() -> AgentRequestUserInputRequest {
+        .init(requestID: .int(91), method: "item/tool/requestUserInput", threadID: Self.oldThreadID, turnID: "legacy-turn", itemID: "legacy-approval", questions: [
+            .init(id: "mcp_tool_call_approval_read_file", header: "MCP approval", question: "Allow this tool?", isOther: true, isSecret: false, options: [
+                .init(label: "Allow", description: "One call"),
+                .init(label: "Allow for this session", description: "Remember"),
+                .init(label: "AlwaysAllow", description: "Remember"),
+                .init(label: "Allow forever", description: "Unknown persistent choice"),
+                .init(label: "Deny", description: "Refuse")
+            ])
+        ])
+    }
+
     func testQA90ComputerUseSetupOwnershipDriftFailsClosed() async throws {
         try await assertComputerUseSetupOwnershipDrift(manageTooling: false)
     }
@@ -1312,8 +1372,18 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
         lock.withLock { qaResponses }
     }
 
-    func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {
-        lock.withLock { qaResponses += 1 }
+    private var qaAnswers: [String: [String]] = [:]
+    var qaUserInputAnswers: [String: [String]] {
+        lock.withLock { qaAnswers }
+    }
+
+    func respondToServerRequest(id _: CodexAppServerRequestID, result: [String: Any]) async {
+        lock.withLock {
+            qaResponses += 1
+            if let answers = result["answers"] as? [String: [String: Any]] {
+                qaAnswers = answers.compactMapValues { $0["answers"] as? [String] }
+            }
+        }
     }
 
     var shutdownGate: TestReleaseFence?

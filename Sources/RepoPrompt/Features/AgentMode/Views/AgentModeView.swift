@@ -2506,6 +2506,7 @@ struct AgentModeChatDetailView: View {
             let cancelTarget = runInteractionSnapshot.pendingUserInputCancelTarget
             AgentRequestUserInputCard(
                 request: request,
+                allowsRememberedDecision: agentModeVM.codexRememberedApprovalAllowed(for: currentTabID),
                 onSubmit: { response in
                     guard let tabID = currentTabID else { return }
                     agentModeVM.submitUserInputResponse(tabID: tabID, requestID: request.requestID, response: response)
