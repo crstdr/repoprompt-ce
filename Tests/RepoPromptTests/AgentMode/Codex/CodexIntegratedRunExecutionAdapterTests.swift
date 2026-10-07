@@ -216,23 +216,23 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
             var params: [String: CodexJSONValue] = ["toolName": .string(tool), "threadId": .string("thread"), "turnId": .string("turn"), "message": .string("Approve app tool call?"), "requestedSchema": .object(["type": .string("object"), "properties": .object([:])])]
             if let server { params["serverName"] = .string(server) }
             await controller.test_handleServerRequest(method: "mcpServer/elicitation/request", params: params)
-            if server != "RepoPromptCE" {
-                var permissionParams = params
-                permissionParams["itemId"] = .string("permission")
-                permissionParams["cwd"] = .string(root.path)
-                permissionParams["permissions"] = .object(["network": .object(["enabled": .bool(true)])])
-                await controller.test_handleServerRequest(method: "item/permissions/requestApproval", params: permissionParams)
-                XCTAssertEqual(recorder.permissionScopes, autoApproved ? ["turn"] : [], "Typed companion grants must follow the same policy without remembered consent")
-            }
+            var permissionParams = params
+            permissionParams["itemId"] = .string("permission")
+            permissionParams["cwd"] = .string(root.path)
+            permissionParams["permissions"] = .object(["network": .object(["enabled": .bool(true)])])
+            await controller.test_handleServerRequest(method: "item/permissions/requestApproval", params: permissionParams)
+            let hostTypedAutoApproved = server == "RepoPromptCE" && autoApproved
+            XCTAssertEqual(recorder.permissionScopes, autoApproved && !hostTypedAutoApproved ? ["turn"] : [], "Typed companion grants must follow the same policy without remembered consent")
             await controller.shutdown()
             if autoApproved {
-                XCTAssertEqual(recorder.actions, ["accept"], "Only provenance-verified RepoPrompt requests retain normal auto-approval while armed")
+                XCTAssertEqual(recorder.actions, hostTypedAutoApproved ? ["accept", "accept"] : ["accept"], "Genuine host typed permissions must match the unarmed base response while armed")
             } else {
                 XCTAssertTrue(recorder.actions.isEmpty)
                 var events = controller.events.makeAsyncIterator()
                 guard case let .mcpElicitationRequest(request) = await events.next() else { return XCTFail("Unverified or companion request must be surfaced") }
                 XCTAssertEqual(request.serverName, server)
                 XCTAssertEqual(request.toolName, tool)
+                guard case .permissionsRequest = await events.next() else { return XCTFail("Strict companion and unverified typed requests must surface") }
             }
         }
     }

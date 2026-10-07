@@ -4860,8 +4860,7 @@ final class CodexNativeSessionController {
                 ])
                 return
             }
-            let scopedComputerUse = computerUseScopePrepared ? computerUseRequiresUserReview : await MainActor.run { options.computerUseEnabledProvider() }
-            if !scopedComputerUse, let approvalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params) {
+            if let approvalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params) {
                 await respondToServerRequest(id: request.id, result: approvalResult)
                 return
             }
