@@ -3,7 +3,7 @@ import RepoPromptSettingsCore
 
 /// Pre-allocation policy for ordinary, top-level sessions created by an overseer.
 enum AgentSessionLanePolicy {
-    static let agentSessionLaneMaximumCount = 8
+    static let agentSessionLaneMaximumCount = 12
 
     enum RoleResolutionError: Error, Equatable {
         case roleUnavailable
