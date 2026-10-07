@@ -334,6 +334,7 @@ struct AgentRequestUserInputCard: View {
     private static let otherOptionDescription = "Optionally, add details below."
 
     let request: AgentRequestUserInputRequest
+    let allowsRememberedDecision: Bool
     let onSubmit: (AgentRequestUserInputResponse) -> Void
     let onStop: () -> Void
 
@@ -341,10 +342,12 @@ struct AgentRequestUserInputCard: View {
 
     init(
         request: AgentRequestUserInputRequest,
+        allowsRememberedDecision: Bool = true,
         onSubmit: @escaping (AgentRequestUserInputResponse) -> Void,
         onStop: @escaping () -> Void
     ) {
         self.request = request
+        self.allowsRememberedDecision = allowsRememberedDecision
         self.onSubmit = onSubmit
         self.onStop = onStop
         _draftsByQuestionID = State(initialValue: Self.makeDrafts(for: request))
@@ -424,13 +427,16 @@ struct AgentRequestUserInputCard: View {
                 }
             }
 
-            if question.isSecret {
-                SecureField(notePlaceholder(for: question), text: noteBinding(for: question))
-                    .textFieldStyle(.roundedBorder)
-            } else {
-                TextField(notePlaceholder(for: question), text: noteBinding(for: question), axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(2 ... 6)
+            // CU legacy approval answers are literal one-shot choices, never arbitrary scope text.
+            if allowsRememberedDecision || !question.isLegacyMCPToolApproval {
+                if question.isSecret {
+                    SecureField(notePlaceholder(for: question), text: noteBinding(for: question))
+                        .textFieldStyle(.roundedBorder)
+                } else {
+                    TextField(notePlaceholder(for: question), text: noteBinding(for: question), axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .lineLimit(2 ... 6)
+                }
             }
         }
         .padding(12)

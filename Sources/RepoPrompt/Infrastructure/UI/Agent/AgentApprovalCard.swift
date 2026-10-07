@@ -110,7 +110,7 @@ struct AgentApprovalCard: View {
         if request.proposedExecpolicyAmendmentJSON != nil {
             return "Approve & Remember"
         }
-        return "Always Allow"
+        return request.sessionApprovalLabel
     }
 
     private func alwaysAllowDecision() {

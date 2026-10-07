@@ -6143,6 +6143,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.pendingPermissionsRequest = nil
             session.pendingMCPElicitationRequest = nil
             session.queuedMCPElicitationRequests.removeAll()
+            session.pendingUserInputRequest = nil
+            session.queuedUserInputRequests.removeAll()
         }
         session.codexController = nil
         session.codexControllerPermissionProfile = nil
@@ -9642,11 +9644,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             sealAssistantBoundary(session)
             // Auto-approve RepoPrompt MCP tool approval requests instead of forwarding to the parent agent.
             // Codex expects the literal option label (e.g. "Allow"), not a generic "accept" decision.
-            if Self.shouldAutoApproveCodexMCPToolRequest(request) {
+            let computerUseArmed = session.codexControllerFeatureState?.computerUseEnabled == true
+            if !computerUseArmed, Self.shouldAutoApproveCodexMCPToolRequest(request) {
                 let response = Self.buildAutoApprovalResponse(for: request)
                 submitUserInputResponse(session: session, requestID: request.requestID, response: response)
                 return
             }
+            let request = computerUseArmed ? request.computerUseReviewRequest : request
             let alreadyPending = session.pendingUserInputRequest?.requestID == request.requestID
             let alreadyQueued = session.queuedUserInputRequests.contains { $0.requestID == request.requestID }
             guard !alreadyPending, !alreadyQueued else {
@@ -11932,17 +11936,23 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
+    @discardableResult
     func submitUserInputResponse(
         session: AgentTabSession,
         requestID: CodexAppServerRequestID,
         response: AgentRequestUserInputResponse
-    ) {
-        guard let controller = session.codexController else {
-            return
+    ) -> Bool {
+        if session.codexControllerFeatureState?.computerUseEnabled == true {
+            guard let request = session.pendingUserInputRequest,
+                  request.requestID == requestID,
+                  request.allowsComputerUseResponse(response) else { return false }
         }
+        // Preserve ordinary callers' existing pending-state settlement even without a controller.
+        guard let controller = session.codexController else { return true }
         Task { [controller] in
             await controller.respondToServerRequest(id: requestID, result: response.jsonObject)
         }
+        return true
     }
 
     // MARK: - MCP Tool Auto-Approval

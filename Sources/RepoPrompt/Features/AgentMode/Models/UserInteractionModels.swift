@@ -602,6 +602,15 @@ enum AgentJSONValue: Hashable {
 struct AgentRequestUserInputOption: Hashable {
     let label: String
     let description: String
+
+    /// Legacy MCP approval answers have only display labels, not typed permission scopes.
+    /// CU therefore accepts known one-shot/refusal labels only; unknown scopes fail closed.
+    var isComputerUseOneShotApprovalOption: Bool {
+        switch label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "allow", "allow once", "deny", "decline", "reject", "cancel": true
+        default: false
+        }
+    }
 }
 
 struct AgentRequestUserInputQuestion: Hashable {
@@ -616,6 +625,10 @@ struct AgentRequestUserInputQuestion: Hashable {
 
     var isOtherOptionEnabled: Bool {
         isOther && !options.isEmpty
+    }
+
+    var isLegacyMCPToolApproval: Bool {
+        id.hasPrefix("mcp_tool_call_approval")
     }
 }
 
@@ -681,6 +694,36 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
         StableUserInteractionIdentity.uuid(
             from: "request-user-input|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
         )
+    }
+
+    /// Preserve request identity while removing persistent/unknown answers from CU consent UI
+    /// and from other pending-interaction projections. Ordinary requests are never transformed.
+    var computerUseReviewRequest: AgentRequestUserInputRequest {
+        guard questions.contains(where: \.isLegacyMCPToolApproval) else { return self }
+        return .init(
+            id: id, requestID: requestID, method: method, threadID: threadID,
+            turnID: turnID, itemID: itemID, askedAt: askedAt,
+            questions: questions.map { question in
+                guard question.isLegacyMCPToolApproval else { return question }
+                return .init(
+                    id: question.id, header: question.header, question: question.question,
+                    isOther: false, isSecret: question.isSecret,
+                    options: question.options.filter(\.isComputerUseOneShotApprovalOption)
+                )
+            }
+        )
+    }
+
+    func allowsComputerUseResponse(_ response: AgentRequestUserInputResponse) -> Bool {
+        let approvals = questions.filter(\.isLegacyMCPToolApproval)
+        guard !approvals.isEmpty else { return true }
+        guard Set(response.answersByQuestionID.keys).isSubset(of: Set(questions.map(\.id))) else { return false }
+        return approvals.allSatisfy { question in
+            guard let answers = response.answersByQuestionID[question.id], answers.count == 1 else { return false }
+            return question.options.contains { option in
+                option.isComputerUseOneShotApprovalOption && option.label == answers[0]
+            }
+        }
     }
 
     func buildResponse(from drafts: [String: AgentRequestUserInputQuestionDraft]) -> AgentRequestUserInputResponse {
@@ -943,6 +986,12 @@ struct AgentPermissionsRequest: Identifiable, Hashable {
     }
 }
 
+/// Provider-projected scope of the session decision; nil preserves legacy presentation.
+enum AgentApprovalSessionScope: Hashable {
+    case oneTime
+    case editsSession
+}
+
 struct AgentApprovalRequest: Identifiable, Hashable {
     let id: UUID
     let requestID: AgentApprovalRequestID
@@ -960,6 +1009,8 @@ struct AgentApprovalRequest: Identifiable, Hashable {
     let overseerOneTimeAllowAvailable: Bool?
     /// ACP-only availability of the ordinary one-time decision, derived from live provider options.
     let plainApproveAvailable: Bool?
+    /// Live request scope only; this does not store or grant consent.
+    let sessionApprovalScope: AgentApprovalSessionScope?
     let details: [AgentApprovalDetail]
 
     init(
@@ -977,6 +1028,7 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         proposedExecpolicyAmendmentJSON: String? = nil,
         overseerOneTimeAllowAvailable: Bool? = nil,
         plainApproveAvailable: Bool? = nil,
+        sessionApprovalScope: AgentApprovalSessionScope? = nil,
         details: [AgentApprovalDetail] = []
     ) {
         self.id = id ?? Self.stableID(
@@ -1000,6 +1052,7 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         self.proposedExecpolicyAmendmentJSON = proposedExecpolicyAmendmentJSON
         self.overseerOneTimeAllowAvailable = overseerOneTimeAllowAvailable
         self.plainApproveAvailable = plainApproveAvailable
+        self.sessionApprovalScope = sessionApprovalScope
         self.details = details
     }
 
@@ -1031,6 +1084,10 @@ struct AgentApprovalRequest: Identifiable, Hashable {
     }
 
     var supportsAlwaysAllow: Bool {
-        true
+        sessionApprovalScope != .oneTime
+    }
+
+    var sessionApprovalLabel: String {
+        sessionApprovalScope == .editsSession ? "Allow edits this session" : "Always Allow"
     }
 }
