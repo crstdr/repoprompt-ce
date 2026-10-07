@@ -651,6 +651,7 @@ class WindowState: ObservableObject {
         // ️⃣ Connect to the global WindowStatesManager singleton
         windowStatesManager = manager
 
+        let compositionSpan = StartupPhaseLog.begin(.windowComposition, window: windowID)
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
@@ -664,6 +665,7 @@ class WindowState: ObservableObject {
             codexModelPollingService: codexModelPollingService,
             agentModeViewModelFactory: agentModeViewModelFactory
         )
+        compositionSpan.end()
 
         workspaceFileContextStore = composition.workspaceFileContextStore
         workspaceSearchService = composition.workspaceSearchService
@@ -859,6 +861,7 @@ class WindowState: ObservableObject {
         requestWindowTitleUpdate(reason: .windowAttached)
         // Install Agent mode titlebar accessory if requested before window was attached
         applyAgentTitlebarAccessoryIfPossible()
+        StartupPhaseLog.mark(.windowAttached, window: windowID)
     }
 
     private func configureWindowChrome(for window: NSWindow) {
@@ -1592,6 +1595,7 @@ class WindowState: ObservableObject {
         pendingRestoreCompletion?()
         pendingRestoreEntry = entry
         pendingRestoreCompletion = completion
+        StartupPhaseLog.mark(.restoreEntryAssigned, window: windowID)
         applyPendingRestoreEntryIfPossible()
     }
 
@@ -1609,6 +1613,9 @@ class WindowState: ObservableObject {
     }
 
     private func restoreWorkspace(from entry: WindowSessionEntry) async {
+        let restoreSpan = StartupPhaseLog.begin(.restoreWorkspace, window: windowID)
+        var resolvedTarget = 0
+        defer { restoreSpan.end(extraFields: ["resolved": resolvedTarget]) }
         #if DEBUG
             let restoreStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
@@ -1617,6 +1624,7 @@ class WindowState: ObservableObject {
         // refused switch persist the Default fallback over the snapshot.
         unresolvedRestoreEntry = entry
         if let target = resolveWorkspace(for: entry) {
+            resolvedTarget = 1
             #if DEBUG
                 WorkspaceRestorePerfLog.log(
                     "restore.window workspaceResolved windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(target.id)) workspaceName=\(target.name) entryWorkspaceID=\(WorkspaceRestorePerfLog.shortID(entry.workspaceID))"
