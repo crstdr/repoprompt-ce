@@ -2,7 +2,7 @@ import Foundation
 
 /// Single owner of user-visible copy for the unified sidebar oversight UI.
 ///
-/// Scope: the row relationship marks, the shared lane menu ("Oversee by"), the inverse
+/// Scope: the row relationship marks, the shared lane menu ("Link overseer"), the inverse
 /// "Oversee" menu, the Session-ID sheets, and the link confirmation
 /// dialog. Existing dashboard/pill copy (`AgentMonitorPillModels`, resolver `uiMessage`
 /// strings, persistence copy) stays in its current owners and is only referenced from here.
@@ -73,10 +73,13 @@ package enum AgentOversightUICopy {
 
     // MARK: - Menus
 
-    package static let overseeByTitle = "Oversee by"
-    /// Candidate submenu for starting outbound links — always "Oversee new ▸" (Cristian,
-    /// 2026-10-01).
-    package static let overseeNewTitle = "Oversee new"
+    /// Candidate submenu for linking an overseer to this row — "Link overseer ▸" (renamed
+    /// from "Oversee by", Cristian 2026-10-07). It leads the two add submenus: the hierarchy
+    /// reads top-down.
+    package static let overseeByTitle = "Link overseer"
+    /// Candidate submenu for starting outbound links — "Oversee ▸" (renamed from
+    /// "Oversee new", Cristian 2026-10-07).
+    package static let overseeNewTitle = "Oversee"
     /// The link-unlink submenu. Approved by Cristian 2026-10-01.
     package static let unlinkTitle = "Unlink"
     package static let sessionIDMenuItem = "Session ID…"
@@ -98,7 +101,7 @@ package enum AgentOversightUICopy {
     /// Disabled header line atop the oversight menu when the row has no link sections to
     /// explain — one plain line about what the popup does. Approved by Cristian 2026-10-01.
     package static let oversightMenuHeader = "Manage session oversight"
-    /// Disabled reason shown in the Oversee-by / Oversee-new context submenus on a row whose chat
+    /// Disabled reason shown in the Link-overseer / Oversee context submenus on a row whose chat
     /// has no session ID yet (fresh chat before the first send). Approved by Cristian 2026-10-01.
     package static let oversightAvailableAfterFirstMessage = "Available after the first message"
     /// A frozen submenu cannot promise that waiting will make its choices appear.

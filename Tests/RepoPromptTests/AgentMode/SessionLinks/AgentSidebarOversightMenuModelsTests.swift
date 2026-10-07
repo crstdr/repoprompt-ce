@@ -1390,7 +1390,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             "Overseeing", "Target",
             "Created by", "Creator",
             "",
-            "Oversee new", "Oversee by", "Unlink"
+            "Link overseer", "Oversee", "Unlink"
         ])
         XCTAssertTrue(menu.items[6].isSeparatorItem)
         XCTAssertFalse(menu.items[9].isSeparatorItem)
@@ -1412,7 +1412,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
 
         XCTAssertEqual(
             menu.items.map(\.title),
-            ["Overseen by", "Observer", "Overseeing", "Target", "", "Oversee new", "Oversee by", "Unlink"]
+            ["Overseen by", "Observer", "Overseeing", "Target", "", "Link overseer", "Oversee", "Unlink"]
         )
         XCTAssertEqual(
             try submenu("Unlink", in: menu).items.map(\.title),
@@ -1449,7 +1449,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             [
                 "Created and overseen by", "Creator",
                 "Overseeing", "Target",
-                "", "Oversee new", "Oversee by", "Unlink"
+                "", "Link overseer", "Oversee", "Unlink"
             ]
         )
     }
@@ -1468,7 +1468,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             )
         ))
 
-        let overseeNew = try submenu("Oversee new", in: menu)
+        let overseeNew = try submenu("Oversee", in: menu)
         XCTAssertEqual(overseeNew.items.map(\.title), ["Session B", "", "Session ID…"])
         XCTAssertTrue(overseeNew.items[0].isEnabled)
         XCTAssertTrue(overseeNew.items[1].isSeparatorItem)
@@ -1492,7 +1492,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             actions: .init(addInbound: { added.append($0) })
         ))
 
-        let overseeBy = try submenu("Oversee by", in: menu)
+        let overseeBy = try submenu("Link overseer", in: menu)
         XCTAssertEqual(overseeBy.items.map(\.title), ["Overseer", "", "Session ID…"])
         fire(overseeBy.items[0])
         XCTAssertEqual(added.map(\.peerEndpoint), [candidateItem.peerEndpoint])
@@ -1502,7 +1502,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             busyKeys: [],
             actions: .init()
         ))
-        let blockedBy = try submenu("Oversee by", in: blocked)
+        let blockedBy = try submenu("Link overseer", in: blocked)
         XCTAssertEqual(blockedBy.items.map(\.title), ["Not eligible", "Overseer", "", "Session ID…"])
         XCTAssertFalse(blockedBy.items[0].isEnabled)
         // Parity with the SwiftUI builder: the candidate itself stays enabled; only the
@@ -1518,13 +1518,13 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             actions: .init()
         ))
         let titles = menu.items.map(\.title)
-        XCTAssertEqual(titles, ["Manage session oversight", "Oversee new", "Oversee by"])
+        XCTAssertEqual(titles, ["Manage session oversight", "Link overseer", "Oversee"])
 
-        let overseeNew = try submenu("Oversee new", in: menu)
+        let overseeNew = try submenu("Oversee", in: menu)
         XCTAssertEqual(overseeNew.items.map(\.title), ["No sessions to oversee", "", "Session ID…"])
         XCTAssertFalse(overseeNew.items[0].isEnabled)
 
-        let overseeBy = try submenu("Oversee by", in: menu)
+        let overseeBy = try submenu("Link overseer", in: menu)
         XCTAssertEqual(overseeBy.items.map(\.title), ["No eligible overseers", "", "Session ID…"])
     }
 
@@ -1628,7 +1628,7 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             actions: .init()
         ))
 
-        let overseeNew = try submenu("Oversee new", in: menu)
+        let overseeNew = try submenu("Oversee", in: menu)
         let item = overseeNew.items[0]
         XCTAssertFalse(item.isEnabled)
         XCTAssertNotNil(item.image)
@@ -1664,9 +1664,9 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
             actions: .init()
         ))
 
-        let overseeNewItem = try XCTUnwrap(menu.items.first { $0.title == "Oversee new" })
+        let overseeNewItem = try XCTUnwrap(menu.items.first { $0.title == "Oversee" })
         XCTAssertEqual(overseeNewItem.accessibilityValue() as? String, "Overseeing 1; 0 available")
-        let overseeByItem = try XCTUnwrap(menu.items.first { $0.title == "Oversee by" })
+        let overseeByItem = try XCTUnwrap(menu.items.first { $0.title == "Link overseer" })
         XCTAssertEqual(overseeByItem.accessibilityValue() as? String, "Overseen by 1; 1 available")
         let unlinkItem = try XCTUnwrap(menu.items.first { $0.title == "Unlink" })
         XCTAssertEqual(unlinkItem.accessibilityValue() as? String, "2 linked")
