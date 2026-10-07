@@ -3732,14 +3732,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> AgentSessionLifecycleAuthority.Identity? {
         guard let session = sessions[tabID],
               session.activeAgentSessionID == expectedSessionID,
-              let workspace = workspaceManager?.workspaces.first(where: { workspace in
-                  workspace.composeTabs.contains(where: {
-                      $0.id == tabID && $0.activeAgentSessionID == expectedSessionID
-                  })
-              })
+              let workspaceID = workspaceManager?.agentSessionLifecycleWorkspaceID(
+                  tabID: tabID, sessionID: expectedSessionID
+              )
         else { return nil }
         return AgentSessionLifecycleAuthority.Identity(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             tabID: tabID,
             sessionID: expectedSessionID,
             persistentBindingGeneration: session.persistentSessionBindingIdentity?.generation,
@@ -7094,7 +7092,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             case "accept":
                 "Allow this action"
             case "accept_for_session":
-                "Allow this action for the rest of the session"
+                approval.sessionApprovalScope == .editsSession
+                    ? "Allow edits for the rest of this session" : "Allow this action for the rest of the session"
             case "accept_with_amendment":
                 "Allow with exec policy amendment (provide amendment field)"
             case "decline":
@@ -7109,8 +7108,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, includeAliases: Bool = true) -> [String] {
-        var labels = approval.supportsPlainApprove ? ["accept", "accept_for_session"] : ["accept_for_session"]
-        if approval.kind == .commandExecution {
+        var labels = approval.supportsPlainApprove ? ["accept"] : []
+        if approval.supportsAlwaysAllow {
+            labels.append("accept_for_session")
+        }
+        if approval.kind == .commandExecution, approval.sessionApprovalScope == nil {
             labels.append("accept_with_amendment")
         }
         labels.append("decline")
@@ -11595,10 +11597,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 decision = .accept
             case "accept_for_session", "always_allow", "approve_for_session":
+                guard approval.supportsAlwaysAllow else {
+                    throw MCPError.invalidParams(
+                        "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", ")). No response was applied."
+                    )
+                }
                 decision = .acceptForSession
             case "accept_with_amendment", "amend":
-                guard approval.kind == .commandExecution else {
-                    throw MCPError.invalidParams("accept_with_amendment is only supported for command approvals.")
+                guard approval.kind == .commandExecution, approval.sessionApprovalScope == nil else {
+                    throw MCPError.invalidParams(
+                        "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", ")). No response was applied."
+                    )
                 }
                 let amendment = payload.amendment?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 guard !amendment.isEmpty else {
@@ -13315,17 +13324,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     retainedPayloadByItemID: session.ephemeralToolResultPayloadByItemID
                 )
             if canApplyWorkingItems, trimmedWorkingItems != session.items {
-                let retainedPayloadByItemID = session.ephemeralToolResultPayloadByItemID
-                let retainedPayloadRevisionByItemID = session.ephemeralToolResultPayloadRevisionByItemID
-                let retainedTrimmedItemIDs = Set(trimmedWorkingItems.map(\.id))
-                session.setItemsSilently(trimmedWorkingItems, reason: .retentionCompaction)
-                session.replaceEphemeralToolResultPayloadMap(
-                    retainedPayloadByItemID.filter { retainedTrimmedItemIDs.contains($0.key) },
-                    liveItemIDs: retainedTrimmedItemIDs
-                )
-                session.ephemeralToolResultPayloadRevisionByItemID = retainedPayloadRevisionByItemID.filter {
-                    retainedTrimmedItemIDs.contains($0.key) && session.ephemeralToolResultPayloadByItemID[$0.key] != nil
-                }
+                session.setItemsSilentlyForRetentionCompaction(trimmedWorkingItems)
                 markDerivedTranscriptSynchronized(
                     for: session,
                     projectionProtection: builtPresentation.projectionProtection
