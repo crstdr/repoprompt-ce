@@ -39,7 +39,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
             Dictionary(uniqueKeysWithValues: sessionIDs.map { id in (id, candidates.filter { $0.sessionID == id }) })
         }
 
-        func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+        func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
             candidates
         }
 

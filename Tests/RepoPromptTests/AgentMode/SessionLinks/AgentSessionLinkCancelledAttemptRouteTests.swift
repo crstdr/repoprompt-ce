@@ -505,6 +505,11 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
 
             func assertQueries(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
                 let full = manager.agentSessionLinkCandidates()
+                let cheap = manager.agentSessionLinkCandidates(includeLocation: false)
+                let expectedCheap = try full.map { candidate in
+                    try XCTUnwrap(manager.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: false))
+                }
+                XCTAssertEqual(cheap, expectedCheap, "Cheap discovery keeps every non-location field: \(label)", file: file, line: line)
                 let census = manager.agentSessionLinkCandidates(forSessionIDs: [sessionID, absentID], includeLocation: true)
                 XCTAssertEqual(census[sessionID], full, label, file: file, line: line)
                 XCTAssertEqual(census[absentID], [], "Known absence stays explicit: \(label)", file: file, line: line)

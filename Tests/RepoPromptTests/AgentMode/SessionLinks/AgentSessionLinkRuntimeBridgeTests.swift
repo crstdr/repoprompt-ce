@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import MCP
@@ -408,11 +409,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var uuidCandidateReadCount = 0
         var onUUIDCandidatesRead: ((Set<UUID>) -> Void)?
 
-        func agentSessionLinkPublishedSidebarMenu(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSidebarOversightMenuProps? {
-            guard let candidate = candidatesByEndpoint[endpoint] else { return nil }
-            return publishedPropsByEndpoint[endpoint]?.sidebarOversightMenu?.withSubjectEligibility(for: candidate)
-        }
-
         func agentSessionLinkCandidate(
             for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation _: Bool
         ) -> AgentSessionLinkEndpointCandidate? {
@@ -434,7 +430,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             })
         }
 
-        func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+        func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
             candidateReadCount += 1
             onCandidatesRead?(candidateReadCount)
             return candidates
@@ -909,6 +905,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let advertisement: ToolAdvertisementRecorder
     }
 
+    /// LOCAL DIAGNOSTIC ONLY: warm Step2 bridge-with-indexed-fake-host refreshes.
     private func makeFixture() -> Fixture {
         let authority = makeAuthority()
         let host = FakeEndpointHost()
@@ -2075,16 +2072,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             [fixture.target.sessionID],
             "The granted incarnation still renders its own outbound row"
         )
-        XCTAssertEqual(
-            fixture.host.publishedPropsByEndpoint[duplicate.domainEndpoint]?.outbound.count,
-            0,
-            "A duplicate incarnation must never render another incarnation's outbound rows"
+        // The sparse pass does not publish authoritative empty inventories to untouched rows.
+        // Exercise the real UI default, rather than treating a missing publication as an empty one.
+        let displayed = AgentModeViewModel.monitorPillProps(
+            sessionID: duplicate.sessionID,
+            published: fixture.host.publishedPropsByEndpoint[duplicate.domainEndpoint],
+            eligibility: duplicate.eligibilityInput,
+            roleAllowsOutboundMonitoring: duplicate.roleAllowsOutboundMonitoring
         )
-        XCTAssertEqual(
-            fixture.host.publishedInventoriesByEndpoint[duplicate.domainEndpoint]?.items.count,
-            0,
-            "...and must never be told, in its own prompt, that it is overseeing anything"
-        )
+        XCTAssertEqual(displayed.outbound.count, 0, "A duplicate must render no inherited outbound rows")
+        XCTAssertEqual(displayed.inbound.count, 0, "The UI default must not invent another incarnation's inbound rows")
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: duplicate.domainEndpoint)?.linkedObserverCount, 0)
+        XCTAssertNil(fixture.host.publishedPropsByEndpoint[duplicate.domainEndpoint], "Reading UI defaults must not authoritatively project an unlinked row")
+        XCTAssertNil(fixture.host.publishedInventoriesByEndpoint[duplicate.domainEndpoint], "UI defaults must never publish an agent inventory")
     }
 
     func testObservationIsTornDownOnlyAfterTheLastInboundLink() async {
@@ -2323,7 +2323,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let targetProps = try XCTUnwrap(
             fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]
         )
-        let menu = try XCTUnwrap(targetProps.sidebarOversightMenu)
+        let menu = try XCTUnwrap(fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint))
         XCTAssertEqual(menu.targetEndpoint, fixture.target.domainEndpoint)
         XCTAssertEqual(
             Set(menu.linkedObservers.map(\.observerEndpoint)),
@@ -2391,6 +2391,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     func testCreatorNameSourceRenameCloseAndReappearanceArePresentationOnly() async {
         let fixture = makeFixture()
         fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        await fixture.bridge.test_settleProjections() // Install the initial coherent catalog, as attach does.
         fixture.bridge.noteCandidateReadinessChanged()
         await fixture.bridge.test_settleMonitorProjectionRefresh()
         let reads = fixture.host.candidateReadCount
@@ -2409,8 +2410,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await fixture.bridge.test_settleMonitorProjectionRefresh()
         XCTAssertEqual(fixture.host.creatorNameSnapshot[fixture.observer.sessionID], "Renamed creator")
         XCTAssertEqual(
-            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?
-                .sidebarOversightMenu?.createdByLabel,
+            fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint)?.createdByLabel,
             "Renamed creator"
         )
         XCTAssertTrue(fixture.host.publishedPromptInventories.isEmpty)
@@ -2432,9 +2432,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await fixture.bridge.test_settleMonitorProjectionRefresh()
         guard case .added = await addLink(fixture) else { return XCTFail("setup link failed") }
         await fixture.bridge.test_settleProjections()
-        let before = try XCTUnwrap(fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint])
-        XCTAssertTrue(try XCTUnwrap(before.sidebarOversightMenu).creatorIsOverseer)
-        XCTAssertEqual(before.sidebarOversightMenu?.linkedObservers.map(\.displayName), ["Planning"])
+        let before = try XCTUnwrap(fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint))
+        XCTAssertTrue(before.creatorIsOverseer)
+        XCTAssertEqual(before.linkedObservers.map(\.displayName), ["Planning"])
         let authorityBefore = await fixture.authority.snapshot()
         let inventoriesBefore = fixture.host.publishedInventoriesByEndpoint
         let passiveBefore = fixture.host.passiveNoticePublicationCount
@@ -2455,7 +2455,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.host.candidateReadCount, readsBefore, "The source delta must not discover candidates inline")
         await fixture.bridge.test_settleMonitorProjectionRefresh()
         let after = try XCTUnwrap(fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint])
-        let menu = try XCTUnwrap(after.sidebarOversightMenu)
+        let menu = try XCTUnwrap(fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint))
         XCTAssertTrue(menu.creatorIsOverseer)
         XCTAssertEqual(menu.linkedObservers.map(\.displayName), ["Renamed sole overseer"])
         XCTAssertEqual(menu.inboundObserverNames, ["Renamed sole overseer"])
@@ -2570,7 +2570,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     func testCreatorWorkspaceReplacementSignalsArchiveAndFencesLatePublication() async throws {
         let viewModel = AgentModeViewModel(
-            testWindowID: 92, testWorkspacePath: FileManager.default.currentDirectoryPath,
+            testWindowID: -1, testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, mcpServerEnabler: { true }
         )
@@ -2582,10 +2582,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         session.createdByOverseerSessionID = sessionID
         let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
         let creator = makeCandidate(
-            windowID: manager.promptViewModel.windowID,
+            windowID: endpoint.windowID,
             sessionID: sessionID,
             workspaceID: endpoint.workspaceID,
             tabID: tabID,
+            persistentBindingGeneration: endpoint.persistentBindingGeneration,
+            bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
             displayName: "Original"
         )
         let host = FakeEndpointHost()
@@ -2595,6 +2597,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         bridge.attach(host: host)
         defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
         bridge.noteCandidateReadinessChanged()
+        await bridge.test_settleProjections()
         await bridge.test_settleMonitorProjectionRefresh()
         var notifications = 0
         let token = NotificationCenter.default.addObserver(
@@ -2618,29 +2621,21 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             names: viewModel.sidebarCreatorDisplayNames,
             archived: true
         )?.label, "Reloaded creator")
-        let menu = AgentSidebarOversightMenuProps(
-            targetEndpoint: endpoint,
-            targetSessionID: sessionID,
-            targetDisplayName: "Lane",
-            observerOptions: [],
-            createdByLabel: "Stale async name",
-            creatorSessionID: sessionID
-        )
         let stale = AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: menu,
             outbound: [],
             inbound: [],
             recentNotices: [],
             canAddReason: nil
         )
+        XCTAssertNotNil(host.agentSessionLinkCandidate(for: endpoint, includeLocation: false), "The name fixture must prove the actual VM endpoint")
         viewModel.agentSessionLinkPublishProjection(stale, to: endpoint)
-        XCTAssertEqual(viewModel.monitorPillPropsByEndpoint[endpoint]?.sidebarOversightMenu?.createdByLabel, "Reloaded creator")
+        XCTAssertEqual(viewModel.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID)?.createdByLabel, "Reloaded creator")
         session.hasLoadedPersistedState = true
         session.createdByOverseerSessionID = nil
         viewModel.agentSessionLinkPublishProjection(stale, to: endpoint)
-        XCTAssertNil(viewModel.monitorPillPropsByEndpoint[endpoint]?.sidebarOversightMenu?.creatorSessionID)
+        XCTAssertNil(viewModel.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID)?.creatorSessionID)
         // Same UUID, new incarnation cannot inherit the old exact menu.
         _ = viewModel.test_installPersistentSessionBinding(sessionID: nil, on: session, updateWorkspaceMetadata: false)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: false)
@@ -2650,10 +2645,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     func testCreatorProjectionUsesSuppliedLiveNamesWithoutFallbackDiscovery() async throws {
         let fixture = makeFixture()
         fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        await fixture.bridge.test_settleProjections() // Install the initial coherent catalog, as attach does.
         fixture.bridge.noteCandidateReadinessChanged()
         await fixture.bridge.test_settleMonitorProjectionRefresh()
         let menu = try XCTUnwrap(
-            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
+            fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint)
         )
         XCTAssertEqual(menu.createdByLabel, "Planning")
         XCTAssertEqual(
@@ -2686,9 +2682,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(
             fixture.host.publishedPropsByEndpoint[existingOverseer.domainEndpoint]
         ).isOverseer)
-        XCTAssertFalse(try XCTUnwrap(
-            fixture.host.publishedPropsByEndpoint[ordinaryLane.domainEndpoint]
-        ).isOverseer)
+        XCTAssertNil(fixture.host.publishedPropsByEndpoint[ordinaryLane.domainEndpoint], "Unlinked UI defaults are not authoritative projections")
 
         // Keep the authority relationship but remove its live candidate. This is the unlink path that
         // must survive an observer closing or otherwise becoming unavailable.
@@ -2697,7 +2691,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await fixture.bridge.test_settleMonitorProjectionRefresh()
 
         let menu = try XCTUnwrap(
-            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
+            fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint)
         )
         XCTAssertEqual(menu.linkedObservers.map(\.observerEndpoint), [fixture.observer.domainEndpoint])
         guard case .linked(_, peerCurrentlyEligible: false) = menu.linkedObservers.first?.relationship else {
@@ -2722,7 +2716,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
         await fixture.bridge.test_settleProjections()
         let presentedMenu = try XCTUnwrap(
-            fixture.host.publishedPropsByEndpoint[newTarget.domainEndpoint]?.sidebarOversightMenu
+            fixture.bridge.sidebarOversightMenu(for: newTarget.domainEndpoint)
         )
         XCTAssertEqual(
             presentedMenu.availableObservers.map(\.observerEndpoint),
@@ -2911,7 +2905,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
         await fixture.bridge.test_settleProjections()
         let before = try XCTUnwrap(
-            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
+            fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint)
         )
         XCTAssertEqual(before.availableObservers.map(\.observerEndpoint), [fixture.observer.domainEndpoint])
         let inventoryBefore = fixture.host.publishedInventoriesByEndpoint
@@ -2933,7 +2927,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await fixture.bridge.test_settleMonitorProjectionRefresh()
 
         let repainted = try XCTUnwrap(
-            fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
+            fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint)
         )
         XCTAssertTrue(repainted.availableObservers.isEmpty)
         XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint, inventoryBefore)
@@ -3853,8 +3847,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             }
             fixture.host.candidates = candidates
             await fixture.bridge.test_settleProjections()
+            XCTAssertEqual(fixture.host.publishedPropsByEndpoint.count, 50)
+            let fullReads = fixture.host.candidateReadCount
+            await fixture.bridge.test_settleProjections()
+            XCTAssertEqual(fixture.host.candidateReadCount - fullReads, 2)
             let menus = Dictionary(uniqueKeysWithValues: candidates.prefix(10).map { candidate in
-                (candidate.domainEndpoint, fixture.host.publishedPropsByEndpoint[candidate.domainEndpoint]?.sidebarOversightMenu)
+                (candidate.domainEndpoint, fixture.bridge.sidebarOversightSummary(for: candidate.domainEndpoint))
             })
             let reads = fixture.host.candidateReadCount
             let visits = fixture.host.boundedCandidateVisits
@@ -3876,8 +3874,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             XCTAssertLessThanOrEqual(fixture.host.boundedCandidateVisits - visits, 300, "Count underlying candidates, not just query calls")
             for observer in candidates.prefix(10) {
                 let props = fixture.host.publishedPropsByEndpoint[observer.domainEndpoint]
-                XCTAssertEqual(props?.sidebarOversightMenu, menus[observer.domainEndpoint] ?? nil)
-                XCTAssertEqual(props?.sidebarOversightMenu?.targetOptions.count, 1499, "All eligible outbound choices, not a bounded peer subset")
+                XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: observer.domainEndpoint), menus[observer.domainEndpoint] ?? nil)
                 let inventory = fixture.host.publishedInventoriesByEndpoint[observer.domainEndpoint]
                 XCTAssertEqual(inventory?.items.map(\.createdByYou), Array(repeating: true, count: 4))
                 XCTAssertEqual(Set(inventory?.items.map(\.displayName) ?? []), Set(props?.outbound.map(\.displayName) ?? []))
@@ -3888,7 +3885,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             // subject was captured. Fresh subject eligibility must hide Add choices in BOTH
             // directions without losing unlink actions or rebuilding the complete peer lists.
             let subject = candidates[0]
-            XCTAssertFalse((menus[subject.domainEndpoint] ?? nil)?.availableObservers.isEmpty ?? true)
+            XCTAssertGreaterThan((menus[subject.domainEndpoint] ?? nil)?.availableObserverCount ?? 0, 0)
             let deleting = makeCandidate(
                 windowID: subject.windowID, sessionID: subject.sessionID,
                 workspaceID: subject.workspaceID, tabID: subject.tabID,
@@ -3900,17 +3897,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 if ids.contains(candidates[10].sessionID) { fixture.host.candidates[0] = deleting }
             }
             await fixture.bridge.test_refreshStatus(sessionIDs: [subject.sessionID])
-            let menu = fixture.host.publishedPropsByEndpoint[subject.domainEndpoint]?.sidebarOversightMenu
+            let statusReads = fixture.host.candidateReadCount
+            let menu = fixture.bridge.sidebarOversightMenu(for: subject.domainEndpoint)
+            XCTAssertEqual(fixture.host.candidateReadCount, statusReads + 1, "Only explicit opening enumerates choices")
             XCTAssertEqual(menu?.targetIneligibleReason, AgentSessionLinkEndpointEligibility.targetResolveFailure(for: deleting)?.uiMessage)
             XCTAssertEqual(menu?.observerIneligibleReason, AgentSessionLinkEndpointEligibility.addDisabledReason(deleting.eligibilityInput, roleAllowsOutboundMonitoring: deleting.roleAllowsOutboundMonitoring))
             XCTAssertEqual(menu?.availableObservers, [])
             XCTAssertEqual(menu?.availableTargets, [])
-            XCTAssertEqual(menu?.linkedTargets, (menus[subject.domainEndpoint] ?? nil)?.linkedTargets)
+            XCTAssertEqual(menu?.linkedTargets.count, 4)
             fixture.host.onUUIDCandidatesRead = nil
             fixture.host.candidates[0] = subject
             await fixture.bridge.test_refreshStatus(sessionIDs: [subject.sessionID])
-            XCTAssertEqual(fixture.host.publishedPropsByEndpoint[subject.domainEndpoint]?.sidebarOversightMenu, menus[subject.domainEndpoint] ?? nil)
-            XCTAssertEqual(fixture.host.candidateReadCount, reads, "Eligibility and recovery must not enumerate peers")
+            XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: subject.domainEndpoint), menus[subject.domainEndpoint] ?? nil)
+            XCTAssertEqual(fixture.host.candidateReadCount, reads + 1, "Only the explicit menu opening enumerated peers")
             // Ambiguity introduced after authority awaits must remove the provenance claim.
             fixture.host.onUUIDCandidatesRead = { ids in
                 if ids.contains(candidates[10].sessionID) {
@@ -3919,7 +3918,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             }
             await fixture.bridge.test_refreshStatus(sessionIDs: [candidates[0].sessionID])
             fixture.host.onUUIDCandidatesRead = nil
-            XCTAssertEqual(fixture.host.candidateReadCount, reads)
+            XCTAssertEqual(fixture.host.candidateReadCount, reads + 1)
             XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint[candidates[0].domainEndpoint]?.items.first?.createdByYou, false)
         }
     }
@@ -3988,6 +3987,171 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await fixture.bridge.test_settleProjections()
         let count = await fixture.authority.snapshot().activeLinkCount
         XCTAssertEqual(count, 0, "Actual current-chain absence still revokes the drifted grant")
+    }
+
+    func testLazyMenusMatchPureChoicesAndClosedRowsObserveAvailabilityWithoutProjection() async throws {
+        let fixture = makeFixture()
+        let third = makeCandidate(windowID: 3, displayName: "Planning")
+        fixture.host.candidates.append(third)
+        XCTAssertNil(fixture.bridge.sidebarOversightSummary(for: third.domainEndpoint), "No default before the first coherent catalog")
+        await fixture.bridge.test_settleProjections()
+        var observedCounts: [Int] = []
+        let cancellable = NotificationCenter.default.publisher(for: .agentSessionLinkCandidatesDidChange)
+            .sink { _ in
+                observedCounts.append(fixture.bridge.sidebarOversightSummary(for: third.domainEndpoint)?.availableObserverCount ?? -1)
+            }
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        await fixture.bridge.test_settleCandidateAvailabilityNotifications()
+        XCTAssertEqual(observedCounts.last, 1)
+        XCTAssertNil(fixture.host.publishedPropsByEndpoint[third.domainEndpoint])
+        XCTAssertNil(fixture.host.publishedInventoriesByEndpoint[third.domainEndpoint])
+        let reads = fixture.host.candidateReadCount
+        var menuResolutions = 0
+        let row = AgentSessionRow(
+            title: "Third", isActive: false, isPinned: false, isMCPControlled: false, runState: .idle,
+            threadDepth: 0, onSelectionGesture: { _ in .ignored }, onSelect: {}, onTogglePin: {},
+            onDelete: {}, onRename: { _ in },
+            resolveSidebarOversightSummary: { fixture.bridge.sidebarOversightSummary(for: third.domainEndpoint) },
+            resolveSidebarOversightMenu: { menuResolutions += 1
+                return fixture.bridge.sidebarOversightMenu(for: third.domainEndpoint)
+            },
+            sessionIDCopyAction: .init(sessionID: third.sessionID, clipboardWriter: { _ in })
+        )
+        _ = row.body
+        XCTAssertEqual(menuResolutions, 0, "Rendering may not materialize choices")
+        XCTAssertEqual(fixture.host.candidateReadCount, reads, "Summary must not discover all chats")
+        for candidate in fixture.host.candidates {
+            let inputs = await fixture.authority.projectionInputs(forEndpoint: candidate.domainEndpoint)
+            let expected = AgentSidebarOversightMenuProjection.make(target: candidate, inputs: inputs, candidates: fixture.host.candidates)
+            let opened = fixture.bridge.sidebarOversightMenu(for: candidate.domainEndpoint)
+            XCTAssertEqual(opened, expected)
+            XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: candidate.domainEndpoint)?.availableObserverCount, opened?.availableObservers.count)
+            let actualNative = try NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(XCTUnwrap(opened), busyKeys: [], actions: .init()))
+            let expectedNative = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(expected, busyKeys: [], actions: .init()))
+            func nativeSignature(_ menu: NSMenu) -> [String] {
+                menu.items.flatMap { item in
+                    ["\(item.title)|\(item.isEnabled)|\(item.state.rawValue)|\(item.accessibilityLabel() ?? "")|\(item.accessibilityValue() ?? "")|\(item.accessibilityHelp() ?? "")"]
+                        + (item.submenu.map(nativeSignature) ?? [])
+                }
+            }
+            XCTAssertEqual(nativeSignature(actualNative), nativeSignature(expectedNative), "Mark/hover/context use this same native builder")
+        }
+        // The VM overlays the pill's persistence-first reason after fresh menu materialization.
+        let openedObserver = try XCTUnwrap(fixture.bridge.sidebarOversightMenu(for: fixture.observer.domainEndpoint))
+        let blocked = AgentSessionOversightPersistencePresentation(availability: .blocked("Persistence blocked"))
+        let displayed = AgentModeViewModel.monitorPillProps(
+            sessionID: fixture.observer.sessionID, published: nil,
+            eligibility: fixture.observer.eligibilityInput,
+            roleAllowsOutboundMonitoring: fixture.observer.roleAllowsOutboundMonitoring, persistence: blocked
+        )
+        let overlaid = openedObserver.withObserverIneligibleReason(displayed.canAddReason)
+        XCTAssertEqual(overlaid.availableTargets, openedObserver.availableTargets)
+        let blockedNative = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(overlaid, busyKeys: [], actions: .init()))
+        let blockedChoices = try XCTUnwrap(blockedNative.items.first { $0.title == AgentOversightUICopy.overseeNewTitle })
+        let submenu = try XCTUnwrap(blockedChoices.submenu)
+        XCTAssertEqual(submenu.items.map(\.title), try [XCTUnwrap(blocked.addBlockerMessage)] + overlaid.availableTargets.map(\.menuLabel) + ["", "Session ID…"])
+        XCTAssertTrue(submenu.items.allSatisfy { !$0.isEnabled })
+        XCTAssertEqual(blockedChoices.accessibilityValue() as? String, AgentOversightUICopy.overseeMenuAccessibilityValue(overseeingCount: overlaid.linkedTargets.count, availableCount: overlaid.availableTargets.count))
+        let tracked = try XCTUnwrap(fixture.bridge.sidebarOversightMenu(for: third.domainEndpoint))
+        let trackedNative = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(tracked, busyKeys: [], actions: .init()))
+        let trackedTitles = trackedNative.items.map(\.title)
+        let renamed = makeCandidate(
+            windowID: fixture.observer.windowID, sessionID: fixture.observer.sessionID,
+            workspaceID: fixture.observer.workspaceID, tabID: fixture.observer.tabID,
+            persistentBindingGeneration: fixture.observer.persistentBindingGeneration,
+            bindingTransitionGeneration: fixture.observer.bindingTransitionGeneration,
+            displayName: "Renamed", locationLabel: "another/worktree"
+        )
+        fixture.host.candidates = [renamed, fixture.target, third]
+        let fresh = try XCTUnwrap(fixture.bridge.sidebarOversightMenu(for: third.domainEndpoint))
+        XCTAssertEqual(fresh.availableObservers.first?.displayName, "Renamed")
+        XCTAssertNotEqual(fresh, tracked, "The next opening is fresh, while a tracked root stays immutable")
+        XCTAssertEqual(trackedNative.items.map(\.title), trackedTitles)
+        let loading = makeCandidate(
+            windowID: renamed.windowID, sessionID: renamed.sessionID,
+            workspaceID: renamed.workspaceID, tabID: renamed.tabID,
+            persistentBindingGeneration: renamed.persistentBindingGeneration,
+            bindingTransitionGeneration: renamed.bindingTransitionGeneration,
+            hasLoadedPersistedState: false, displayName: renamed.resolvedDisplayName,
+            locationLabel: renamed.locationLabel
+        )
+        fixture.host.candidates = [loading, fixture.target, third]
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        await fixture.bridge.test_settleCandidateAvailabilityNotifications()
+        XCTAssertEqual(observedCounts.last, 0, "An active but ineligible observer invalidates closed rows")
+        fixture.host.candidates = [renamed, fixture.target, third]
+        let currentReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(currentReference)
+        await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        await fixture.bridge.test_settleCandidateAvailabilityNotifications()
+        XCTAssertEqual(observedCounts.last, 0, "Final outbound removal invalidates closed rows")
+        XCTAssertNil(fixture.host.publishedPropsByEndpoint[third.domainEndpoint])
+        withExtendedLifetime(cancellable) {}
+        // A catalog belongs to its attached host, including across an in-flight authority hop.
+        let replacementHost = FakeEndpointHost()
+        replacementHost.candidates = [renamed, fixture.target, third]
+        fixture.bridge.test_afterPresentationSnapshot = {
+            fixture.bridge.test_afterPresentationSnapshot = nil
+            fixture.bridge.attach(host: replacementHost)
+            XCTAssertNil(fixture.bridge.sidebarOversightMenu(for: third.domainEndpoint))
+            XCTAssertNil(fixture.bridge.sidebarOversightSummary(for: third.domainEndpoint))
+        }
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        await fixture.bridge.test_settleProjections() // The old-host transaction is rejected.
+        await fixture.bridge.test_settleProjections() // Join the replacement host's serialized pass.
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        XCTAssertNotNil(fixture.bridge.sidebarOversightMenu(for: third.domainEndpoint))
+        XCTAssertNil(replacementHost.publishedInventoriesByEndpoint[third.domainEndpoint])
+    }
+
+    func testSparseCatalogClearsEvictedNoticesAndSerializedEqualRevisionDismissal() async throws {
+        let fixture = makeFixture()
+        let observers = (0 ..< 34).map { makeCandidate(windowID: 1, displayName: "Observer \($0)") }
+        let targets = (0 ..< 34).map { makeCandidate(windowID: 2, displayName: "Target \($0)") }
+        let survivingTarget = makeCandidate(windowID: 3, displayName: "Surviving target")
+        let survivingObserver = makeCandidate(windowID: 4, displayName: "Surviving observer")
+        fixture.host.candidates = observers + targets + [survivingTarget, survivingObserver]
+        guard case .added = await fixture.bridge.addMonitorLink(observerEndpoint: observers[0].domainEndpoint, targetEndpoint: survivingTarget.domainEndpoint),
+              case .added = await fixture.bridge.addMonitorLink(observerEndpoint: survivingObserver.domainEndpoint, targetEndpoint: targets[0].domainEndpoint)
+        else { return XCTFail("surviving links setup failed") }
+        for index in observers.indices {
+            guard case let .added(linkID, _) = await fixture.bridge.addMonitorLink(observerEndpoint: observers[index].domainEndpoint, targetEndpoint: targets[index].domainEndpoint) else { return XCTFail("setup add failed") }
+            let inventory = await fixture.authority.links(forObserverEndpoint: observers[index].domainEndpoint)
+            let item = try XCTUnwrap(inventory.items.first { $0.linkID == linkID })
+            await fixture.bridge.revokeLink(linkID: linkID, generation: item.generation)
+        }
+        let outboundOwner = observers[0].domainEndpoint
+        let inboundOwner = targets[0].domainEndpoint
+        let outboundInputs = await fixture.authority.projectionInputs(forEndpoint: outboundOwner)
+        let inboundInputs = await fixture.authority.projectionInputs(forEndpoint: inboundOwner)
+        XCTAssertEqual(outboundInputs.notices, [])
+        XCTAssertEqual(inboundInputs.notices, [])
+        let outboundProps = try XCTUnwrap(fixture.host.publishedPropsByEndpoint[outboundOwner])
+        let inboundProps = try XCTUnwrap(fixture.host.publishedPropsByEndpoint[inboundOwner])
+        XCTAssertEqual(outboundProps.recentNotices, [], "Eviction clears notices even while outbound membership retains the owner")
+        XCTAssertEqual(inboundProps.recentNotices, [], "Inbound-only retained owners need the same clear")
+        XCTAssertEqual(outboundProps.outbound.map(\.targetEndpoint), [survivingTarget.domainEndpoint])
+        XCTAssertEqual(outboundProps.inbound, [])
+        XCTAssertEqual(inboundProps.outbound, [])
+        XCTAssertEqual(inboundProps.inbound.map(\.observerEndpoint), [survivingObserver.domainEndpoint])
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint[outboundOwner], AgentSessionLinkPromptInventory(outboundInputs.outbound), "Surviving authoritative inventory and revision remain intact")
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint[inboundOwner], AgentSessionLinkPromptInventory(inboundInputs.outbound))
+        XCTAssertEqual(fixture.host.publishedPropsByEndpoint[observers[1].domainEndpoint]?.recentNotices, [], "An unlinked evicted bucket still receives its final empty props")
+        let endpoint = try XCTUnwrap(targets.last?.domainEndpoint)
+        let revision = await fixture.authority.snapshot().authorityRevision
+        fixture.bridge.test_afterPresentationSnapshot = {
+            fixture.bridge.test_afterPresentationSnapshot = nil
+            await fixture.authority.clearRecentRevocationNotices(forEndpoint: endpoint)
+            fixture.bridge.test_enqueueProjectionRefresh(sessionIDs: [endpoint.sessionID])
+        }
+        await fixture.bridge.test_refreshStatus(sessionIDs: [endpoint.sessionID])
+        let finalRevision = await fixture.authority.snapshot().authorityRevision
+        XCTAssertEqual(finalRevision, revision, "Dismissal has no authority revision bump")
+        XCTAssertEqual(fixture.host.publishedPropsByEndpoint[endpoint]?.recentNotices, [])
+        let input = await fixture.authority.projectionInputs(forEndpoint: endpoint)
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint[endpoint]?.linkSetRevision, input.outbound.linkSetRevision, "Final clear uses authority inventories, never UI defaults")
     }
 
     func testFullProjectionRefreshReadsCandidatesIndependentlyOfOpenChatCount() async {

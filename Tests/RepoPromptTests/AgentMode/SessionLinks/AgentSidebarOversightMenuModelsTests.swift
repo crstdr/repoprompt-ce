@@ -1087,6 +1087,15 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         if interactive {
             let props = props()
             row.resolveSidebarOversightMenu = { props }
+            row.resolveSidebarOversightSummary = {
+                AgentSidebarOversightSummary(
+                    linkedObserverCount: props.linkedObservers.count, availableObserverCount: props.availableObservers.count,
+                    inboundObserverNames: props.linkedObservers.map(\.displayName),
+                    inboundObserverSessionIDs: props.linkedObservers.map(\.peerSessionID),
+                    outboundTargetNames: [], createdByLabel: nil, creatorSessionID: nil,
+                    targetIneligibleReason: nil, observerIneligibleReason: nil
+                )
+            }
             row.onAddSidebarOversight = { _, _ in .changed }
             row.onStopSidebarOversight = { _, _, _ in .changed }
         }
@@ -1434,13 +1443,11 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         let presentation = AgentSessionOversightPersistencePresentation(availability: .blocked("Persistence blocked"))
         let blocker = try XCTUnwrap(presentation.addBlockerMessage)
         let published = AgentMonitorPillProps(
-            sessionID: nil, sidebarOversightMenu: props(targetOptions: offered),
-            outbound: [], inbound: [], recentNotices: [], canAddReason: nil
+            sessionID: nil, outbound: [], inbound: [], recentNotices: [], canAddReason: nil
         )
-        // Exercise the shared VM/pill persistence overlay with a competing lifecycle reason.
-        let overlaid = try XCTUnwrap(published.withPersistence(
-            presentation, eligibilityReason: "Lifecycle reason"
-        ).sidebarOversightMenu)
+        // Menus are lazy now: apply the same persistence-first reason supplied by the shared pill.
+        let reason = published.withPersistence(presentation, eligibilityReason: "Lifecycle reason").canAddReason
+        let overlaid = props(targetOptions: offered).withObserverIneligibleReason(reason)
         XCTAssertEqual(overlaid.observerIneligibleReason, blocker)
         XCTAssertEqual(overlaid.availableTargets, offered, "Offered choices are not actionable eligibility")
 
@@ -1754,7 +1761,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
     func testColdRightClickShowsUnavailableSubmenusBeforeProjectionReady() async throws {
         let fixture = try await makeFixture(peerCount: 2)
         let endpoint = try menuProps(in: fixture).targetEndpoint
-        fixture.vm.agentSessionLinkPublishProjection(.empty, to: endpoint)
+        AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
+        defer { AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false }
         XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(
             tabID: fixture.tabs[0].id, expectedSessionID: endpoint.sessionID
         ))
@@ -2057,20 +2065,22 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let otherWindow = try await makeFixture(peerCount: 1)
         try await add(from: 0, to: 1, in: otherWindow)
         AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
-        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
         let props = try menuProps(in: fixture)
         let observerEndpoint = try menuProps(in: otherWindow).targetEndpoint
         let observer = try XCTUnwrap(props.availableObservers.first { $0.peerEndpoint == observerEndpoint })
         let region = try mountedRegion(in: fixture)
         let originalProvider = region.itemsProvider
 
-        fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+        AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
+        defer { AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false }
         let cold = NSMenu.stableMenu(from: originalProvider())
         let coldSubmenu = try XCTUnwrap(cold.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
         XCTAssertEqual(coldSubmenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
 
+        AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false
         AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
-        await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
         XCTAssertEqual(try menuProps(in: fixture).targetEndpoint, props.targetEndpoint)
         let reopened = NSMenu.stableMenu(from: originalProvider())
         let reopenedSubmenu = try XCTUnwrap(reopened.items.first { $0.title == AgentOversightUICopy.overseeByTitle }?.submenu)
@@ -2089,8 +2099,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let peerEndpoint = try menuProps(in: otherWindow).targetEndpoint
         let observer = try XCTUnwrap(props.availableObservers.first { $0.peerEndpoint == peerEndpoint })
         let target = try XCTUnwrap(props.availableTargets.first { $0.peerEndpoint == peerEndpoint })
-        let readyProjection = try XCTUnwrap(fixture.vm.monitorPillPropsByEndpoint[props.targetEndpoint])
-        fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+        AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
+        defer { AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false }
 
         var observed = false
         _ = try await open(in: fixture, whileTracking: { root in
@@ -2099,7 +2109,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 (AgentOversightUICopy.overseeNewTitle, target.menuLabel),
                 (AgentOversightUICopy.overseeByTitle, observer.menuLabel)
             ]
-            fixture.vm.agentSessionLinkPublishProjection(readyProjection, to: props.targetEndpoint)
+            AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false
             for (title, peerLabel) in directions {
                 guard let submenu = root.items.first(where: { $0.title == title })?.submenu else {
                     XCTFail("Missing \(title) submenu")
@@ -2115,12 +2125,12 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 let parent = root.items.first { $0.submenu === submenu }
                 XCTAssertNotEqual(parent?.accessibilityValue() as? String, AgentOversightUICopy.oversightMenuUnavailableMessage)
 
-                fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+                AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
                 updater?.menuNeedsUpdate?(submenu)
                 XCTAssertEqual(submenu.items.map(\.title), [AgentOversightUICopy.oversightMenuUnavailableMessage])
                 XCTAssertFalse(submenu.items[0].isEnabled)
                 XCTAssertEqual(parent?.accessibilityValue() as? String, AgentOversightUICopy.oversightMenuUnavailableMessage)
-                fixture.vm.agentSessionLinkPublishProjection(readyProjection, to: props.targetEndpoint)
+                AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false
                 updater?.menuNeedsUpdate?(submenu)
                 XCTAssertEqual(submenu.items.count { $0.title == peerLabel && $0.isEnabled }, 1)
             }
@@ -2137,8 +2147,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let fixture = try await makeFixture(peerCount: 1)
         let props = try menuProps(in: fixture)
         let target = try XCTUnwrap(props.availableTargets.first)
-        let readyProjection = try XCTUnwrap(fixture.vm.monitorPillPropsByEndpoint[props.targetEndpoint])
-        fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+        AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
+        defer { AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false }
         var observer: SubmenuOpeningObserver?
         var timeout: Timer?
         var openings = 0
@@ -2159,7 +2169,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 return root.cancelTracking()
             }
             let rootItems = root.items
-            fixture.vm.agentSessionLinkPublishProjection(readyProjection, to: props.targetEndpoint)
+            AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false
             let forwarding = SubmenuOpeningObserver(delegate: submenu.delegate)
             observer = forwarding
             submenu.delegate = forwarding
@@ -2191,7 +2201,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             let originalTitles = menu.items.map(\.title)
             // Exercise the real presentation publication boundary synchronously inside tracking.
             // No fake row/builder input: the initial menu came from the real bridge grant above.
-            fixture.vm.agentSessionLinkPublishProjection(.empty, to: props.targetEndpoint)
+            AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
+            defer { AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false }
             fixture.host.rootView = self.sidebar(for: fixture.state, tabID: fixture.tabs[0].id)
             fixture.host.layoutSubtreeIfNeeded()
             XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(

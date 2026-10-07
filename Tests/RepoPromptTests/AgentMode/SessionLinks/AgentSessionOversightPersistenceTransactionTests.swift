@@ -36,7 +36,7 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
             Dictionary(uniqueKeysWithValues: sessionIDs.map { id in (id, candidates.filter { $0.sessionID == id }) })
         }
 
-        func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+        func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
             candidateCallCount += 1
             return candidatesByCall?(candidateCallCount) ?? candidates
         }

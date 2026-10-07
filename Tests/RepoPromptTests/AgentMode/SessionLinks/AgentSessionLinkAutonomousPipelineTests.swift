@@ -556,7 +556,7 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         return result
     }
 
-    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+    func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
         viewModelsByWindowID.keys.sorted().flatMap { windowID in
             viewModelsByWindowID[windowID]?.agentSessionLinkCandidates(isWindowClosing: false) ?? []
         }
