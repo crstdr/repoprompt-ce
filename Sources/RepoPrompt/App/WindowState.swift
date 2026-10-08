@@ -694,7 +694,9 @@ class WindowState: ObservableObject {
         // Process any queued commands once the workspace is initialized
         workspaceManager.onceInitialized { [weak self] in
             guard let self else { return }
+            StartupPhaseLog.mark(.initCallbackEnqueue, window: windowID)
             Task {
+                StartupPhaseLog.mark(.initCallbackStart, window: self.windowID)
                 self.applyPendingRestoreEntryIfPossible()
                 await self.processCommands()
             }
@@ -1580,6 +1582,7 @@ class WindowState: ObservableObject {
         let completion = pendingRestoreCompletion
         pendingRestoreCompletion = nil
 
+        StartupPhaseLog.mark(.restoreDispatchEnqueue, window: windowID)
         Task {
             await restoreWorkspace(from: entry)
             completion?()
@@ -1589,7 +1592,14 @@ class WindowState: ObservableObject {
     private func restoreWorkspace(from entry: WindowSessionEntry) async {
         let restoreSpan = StartupPhaseLog.begin(.restoreWorkspace, window: windowID)
         var resolvedTarget = 0
-        defer { restoreSpan.end(extraFields: ["resolved": resolvedTarget]) }
+        var switchOutcome: StartupPhaseLog.SwitchOutcome?
+        defer {
+            var fields = ["resolved": resolvedTarget]
+            if let switchOutcome {
+                fields["switch_result"] = switchOutcome.rawValue
+            }
+            restoreSpan.end(extraFields: fields)
+        }
         #if DEBUG
             let restoreStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
@@ -1611,7 +1621,9 @@ class WindowState: ObservableObject {
                 // the observer below only fires for non-system workspaces.
                 unresolvedRestoreEntry = nil
             }
-            _ = await workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
+            switchOutcome = await StartupPhaseLog.SwitchOutcome(
+                workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
+            )
             #if DEBUG
                 if let restoreStartMS {
                     WorkspaceRestorePerfLog.log(

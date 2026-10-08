@@ -3189,6 +3189,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Execute callbacks if any
         let callbacks = initializationCallbacks
         initializationCallbacks.removeAll()
+        StartupPhaseLog.mark(.managerInitialized, window: promptViewModel.windowID, fields: ["callbacks": callbacks.count])
         for callback in callbacks {
             callback()
         }
@@ -4080,9 +4081,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             completeInitialization()
         } else if activeWorkspace == nil {
             Task {
+                let initialSwitchSpan = StartupPhaseLog.begin(.initialDefaultSwitch, window: self.promptViewModel.windowID)
                 if let defaultWS = await findOrCreatePublishedDefaultWorkspace() {
                     await switchWorkspace(to: defaultWS, saveState: false)
                 }
+                initialSwitchSpan.end()
                 self.completeInitialization()
             }
         } else {
@@ -6050,8 +6053,10 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // The switch operation already owns lifecycle admission. Retire and join the
         // old root flight before any hydration, root teardown, or active-ID change.
+        let reconciliationJoinSpan = StartupPhaseLog.begin(.rootReconciliationJoin, window: promptViewModel.windowID)
         cancelRootReconciliationForLifecycleTransition()
         await awaitRootReconciliationShutdown()
+        reconciliationJoinSpan.end()
         if let cancellation = cancellationResult(operationID: operationID, targetWorkspace: newWorkspace, boundary: "joining root reconciliation") {
             return cancellation
         }
@@ -6151,7 +6156,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 await workspaceSwitchReadinessDidInvalidateHandlerForTesting()
             }
         #endif
+        let schedulerStopSpan = StartupPhaseLog.begin(.tokenSchedulerStop, window: promptViewModel.windowID)
         await promptViewModel.stopTokenCountUpdateTimer()
+        schedulerStopSpan.end()
         await workspaceSearchService.reset()
         if let cancellation = cancellationResult(
             operationID: operationID,
@@ -6421,10 +6428,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         // If roots were already unloaded during save/unload, this restore-time refresh is
         // a harmless no-op. Otherwise, defer it until after target root hydration so we
         // do not walk outgoing roots that `loadWorkspaceFolders` will immediately unload.
+        let restoreStateSpan = StartupPhaseLog.begin(.switchRestoreState, window: promptViewModel.windowID)
         await restoreWorkspaceState(
             activeWS,
             refreshExistingRootFolderState: rootsUnloadedBeforeFolderLoad
         )
+        restoreStateSpan.end()
         let restoreDuration = Date().timeIntervalSince(restoreStart)
         logWorkspaceSwitch("restore state END workspace=\"\(activeWS.name)\" duration=\(String(format: "%.3f", restoreDuration))s")
         #if DEBUG
@@ -6463,6 +6472,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // watchers, slices and codemap scans are post-catalog work.
         overlayVisibilityGate.markRestoreStateReady()
         advanceWorkspaceSwitchOperation(operationID, to: .hydratingRoots)
+        let hydrationJoinSpan = StartupPhaseLog.begin(.switchHydrationJoin, window: promptViewModel.windowID)
         if let folderLoadTask {
             await folderLoadTask.value
             folderLoadCompleted = true
@@ -6471,6 +6481,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             logWorkspaceSwitch("catalog hydration BEGIN workspace=\"\(activeWS.name)\" roots=\(activeWS.repoPaths.count)")
             await loadTargetWorkspaceFolders()
         }
+        hydrationJoinSpan.end()
         let folderLoadDuration = folderLoadStart.map { Date().timeIntervalSince($0) } ?? 0
         logWorkspaceSwitch("catalog hydration END workspace=\"\(activeWS.name)\" duration=\(String(format: "%.3f", folderLoadDuration))s")
         #if DEBUG
@@ -6490,7 +6501,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was superseded during root hydration.")
         }
 
+        let selectionReplaySpan = StartupPhaseLog.begin(.switchSelectionReplay, window: promptViewModel.windowID)
         await replayActiveComposeTabHeavyFileStateAfterHydration(restoredHeavyFileState, workspaceID: activeWS.id)
+        selectionReplaySpan.end()
         if let cancellation = cancellationResult(
             operationID: operationID,
             targetWorkspace: newWorkspace,
@@ -6534,12 +6547,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Cancellation observed after this point cannot turn a committed activation into
         // a cancelled result.
         markWorkspaceSwitchCommitted(operationID)
+        let listenerNotifySpan = StartupPhaseLog.begin(.switchListenerNotify, window: promptViewModel.windowID)
 
         // Notify listeners that workspace switched.
         #if DEBUG
             let listenerStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         notifyWorkspaceDidSwitch(activeWorkspace)
+        listenerNotifySpan.end()
         #if DEBUG
             if let listenerStartMS {
                 restorePerfRecorder.event(
@@ -8074,7 +8089,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         await applyComposeTabHeavyFileState(refreshedTab)
         guard !Task.isCancelled else { return }
         if performFinalRecount {
-            await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+            await promptViewModel.tokenCountingViewModel.forceImmediateRecount(windowOrdinal: promptViewModel.windowID)
         }
         guard markWorkspaceDirtyAfterApply else { return }
         if markWorkspaceDirtyIfTabStillActive(tabID: tabID) {
@@ -11357,7 +11372,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 restorePerfRecorder.event("workspaceSwitch.restoreState.tokenRecount.watchdog", fields: fields)
             }
         #endif
-        await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+        let forcedRecountSpan = StartupPhaseLog.begin(.forcedTokenRecount, window: promptViewModel.windowID)
+        await promptViewModel.tokenCountingViewModel.forceImmediateRecount(windowOrdinal: promptViewModel.windowID)
+        forcedRecountSpan.end()
         #if DEBUG
             restoreTokenRecountWatchdogIDs.remove(tokenRecountWatchdogID)
             var tokenRecountEndFields = tokenRecountSelectionFields
