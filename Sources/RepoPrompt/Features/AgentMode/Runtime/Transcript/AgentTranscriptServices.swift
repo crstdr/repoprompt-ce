@@ -6797,7 +6797,7 @@ enum AgentTranscriptProjectionBuilder {
         stableExecutionID: String?,
         emittedToolExecutionKeys: inout Set<String>
     ) -> Bool {
-        let executionKey = stableExecutionID ?? "activity:\(firstActivity.id.uuidString)"
+        let executionKey = stableExecutionID ?? "\u{0}activity:\(firstActivity.id.uuidString)"
         let isFirstExecutionLeaf = emittedToolExecutionKeys.insert(executionKey).inserted
         return isFirstExecutionLeaf
             && MCPIntegrationHelper.isComputerUseCompanionToolName(firstActivity.toolExecution?.toolName)
