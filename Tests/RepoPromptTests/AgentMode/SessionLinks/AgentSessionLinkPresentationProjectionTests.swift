@@ -122,9 +122,10 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             XCTAssertEqual(candidates.count, count)
             XCTAssertEqual(
                 manager.test_lifecycleBindingTabValidationCount,
-                0,
-                "Batch candidates reuse the workspace-qualified model index"
+                count,
+                "One lifecycle validation per candidate, independent of its array position"
             )
+            manager.test_lifecycleBindingTabValidationCount = 0
             for candidate in candidates {
                 XCTAssertEqual(fixture.viewModel.agentSidebarOversightTargetEndpoint(
                     tabID: candidate.tabID, expectedSessionID: candidate.sessionID

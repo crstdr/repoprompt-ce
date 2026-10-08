@@ -640,13 +640,17 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             workspace.activeWorkspace = active
             try assertQueries("Reactivation")
             workspace.workspaces[0].composeTabs.append(workspace.workspaces[0].composeTabs[0])
-            try assertQueries("Duplicate tab address fails closed")
-            XCTAssertEqual(manager.agentSessionLinkCandidates(), [secondCandidate])
+            let duplicateTabs = manager.agentSessionLinkCandidates()
+            XCTAssertEqual(duplicateTabs.count, 3)
+            XCTAssertEqual(manager.agentSessionLinkCandidates(forSessionIDs: [sessionID], includeLocation: true)[sessionID], duplicateTabs)
+            XCTAssertNil(manager.agentSessionLinkCandidate(for: firstCandidate.domainEndpoint, includeLocation: true), "Exact model routing remains strict while census preserves ambiguity")
             workspace.workspaces[0].composeTabs.removeLast()
             try assertQueries("Repair tab ambiguity")
             workspace.workspaces.append(workspace.workspaces[0])
-            try assertQueries("Duplicate workspace address fails closed")
-            XCTAssertEqual(manager.agentSessionLinkCandidates(), [secondCandidate])
+            let duplicateWorkspaces = manager.agentSessionLinkCandidates()
+            XCTAssertEqual(duplicateWorkspaces.count, 3)
+            XCTAssertEqual(manager.agentSessionLinkCandidates(forSessionIDs: [sessionID], includeLocation: true)[sessionID], duplicateWorkspaces, "A discarded corrupt occurrence must never turn the other window into unique provenance")
+            XCTAssertNil(manager.agentSessionLinkCandidate(for: firstCandidate.domainEndpoint, includeLocation: true))
         }
 
         func testModelCallerUsesInstalledRouteAndNeverRepairsColdOrStaleContext() async throws {
