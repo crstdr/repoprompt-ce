@@ -205,6 +205,7 @@ struct RepoPromptSwiftUIApp: App {
 @MainActor
 public enum RepoPromptApplication {
     public static func main() {
+        if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
         let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
