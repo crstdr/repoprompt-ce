@@ -552,7 +552,8 @@ package actor DomainAgentSessionLinkAuthority {
                 observerSessionID: record.grant.observer.sessionID,
                 targetSessionID: targetSessionID,
                 displayName: targets[targetSessionID]?.snapshot.displayName,
-                capabilities: record.grant.capabilities
+                capabilities: record.grant.capabilities,
+                createdAt: record.grant.createdAt
             ))
         }
         items.sort(by: Self.orderedByTarget)
@@ -593,7 +594,8 @@ package actor DomainAgentSessionLinkAuthority {
                 observerSessionID: record.grant.observer.sessionID,
                 targetSessionID: record.grant.target.sessionID,
                 displayName: nil,
-                capabilities: record.grant.capabilities
+                capabilities: record.grant.capabilities,
+                createdAt: record.grant.createdAt
             ))
         }
         items.sort(by: Self.orderedByObserver)

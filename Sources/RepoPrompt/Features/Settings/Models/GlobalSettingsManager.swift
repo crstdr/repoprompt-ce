@@ -173,6 +173,19 @@ extension GlobalSettingsStore {
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
     }
 
+    /// App-global UI preference for the oversight-link confirmation. Nil reads as false; the flag
+    /// only skips the dialog and never relaxes runtime authorization or approval restrictions.
+    func suppressOversightLinkConfirmation() -> Bool {
+        scalarPreferences.agentMode?.suppressOversightLinkConfirmation == true
+    }
+
+    func setSuppressOversightLinkConfirmation(_ suppressed: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            // Clearing returns to the baseline scalar shape for older CE builds.
+            settings.suppressOversightLinkConfirmation = suppressed ? true : nil
+        }
+    }
+
     func codexMemoriesEnabled() -> Bool {
         CodexMemories.isEnabled(persistedValue: scalarPreferences.agentMode?.codexMemoriesEnabled)
     }

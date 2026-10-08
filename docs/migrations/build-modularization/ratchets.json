@@ -1,5 +1,5 @@
 {
-  "description": "Oversight window-reopen integration: measured upstream/main 872398766e4e8a3df4b8bbdba22c735ad2c88823 app baseline 602902 plus exact net source delta 231 = 603133, with zero app-line headroom. All other upstream metrics and advisory enforcement remain unchanged.",
+  "description": "Sidebar oversight refresh: measured upstream/main 2181ec27017858bfa76d0f1e97bd80c8e4745494 app baseline 604071 plus exact net PR app-source delta 995 = 605066, with zero app-line headroom. All other upstream numeric metrics and enforcement remain unchanged.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -24,7 +24,7 @@
     "app_shared_accessor_uses": 1218,
     "app_static_shared_declarations": 89,
     "app_target_swift_files": 1126,
-    "app_target_swift_lines": 603133,
+    "app_target_swift_lines": 605066,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1079,
     "first_party_swift_lines": 747202,
