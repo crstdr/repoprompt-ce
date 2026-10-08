@@ -28,6 +28,78 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
 
     // MARK: - Connection-manager level
 
+    func testRetiredPolicyCompletionCannotSignalRenewedSameRunBootstrap() async throws {
+        let observer = try await makeRoutedObserver()
+        let manager = observer.manager
+        let oldLease = makeAttemptLease(observer)
+        let acquired = await oldLease.acquire()
+        XCTAssertTrue(acquired)
+        let oldConnectionID = UUID()
+        let successorConnectionID = UUID()
+        await manager.debugInstallDirectAdmissionConnectionForTesting(
+            connectionID: oldConnectionID,
+            connection: CancelledAttemptRouteTestConnection(),
+            pendingClientID: clientName
+        )
+        let capturedGeneration = await MCPRoutingWaiter.generation(runID: observer.runID)
+        let oldGeneration = try XCTUnwrap(capturedGeneration)
+        await manager.debugSuspendNextRunCatalogPublicationBeforeMainActor()
+        let oldApplication = Task {
+            await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: oldConnectionID,
+                clientPid: Int(getpid()),
+                requireRunRouting: true
+            )
+        }
+        do {
+            try await AsyncTestWait.waitUntil("consumed policy at catalog handover") {
+                await manager.debugIsRunCatalogPublicationBeforeMainActorSuspended()
+            }
+        } catch {
+            await manager.debugResumeRunCatalogPublicationBeforeMainActor()
+            _ = await oldApplication.value
+            throw error
+        }
+        let consumed = await manager.debugPendingPolicySnapshot(for: clientName)
+        XCTAssertFalse(consumed.contains { $0.runID == observer.runID })
+        await oldLease.cancelAndCleanup()
+        let successor = makeAttemptLease(observer)
+        let successorAcquired = await successor.acquire()
+        XCTAssertTrue(successorAcquired)
+        let successorGeneration = await MCPRoutingWaiter.generation(runID: observer.runID)
+        XCTAssertNotEqual(try XCTUnwrap(successorGeneration), oldGeneration)
+        await manager.debugResumeRunCatalogPublicationBeforeMainActor()
+        let retired = await oldApplication.value
+        XCTAssertEqual(retired.outcome, "rejected:stale_connection")
+        // Also cover the final cross-actor notification hop: even an already-enqueued
+        // old signal cannot resolve the successor's generation.
+        await MCPRoutingWaiter.notifyRouted(runID: observer.runID, generation: oldGeneration)
+        await MCPRoutingWaiter.notifyFailed(runID: observer.runID, generation: oldGeneration)
+        let staleOutcome = await MCPRoutingWaiter.shared.currentTerminalOutcome(runID: observer.runID)
+        XCTAssertNil(staleOutcome, "retired completion must not signal the successor waiter")
+        let pending = await manager.debugPendingPolicySnapshot(for: clientName)
+        XCTAssertTrue(pending.contains { $0.runID == observer.runID })
+
+        await manager.debugInstallDirectAdmissionConnectionForTesting(
+            connectionID: successorConnectionID,
+            connection: CancelledAttemptRouteTestConnection(),
+            pendingClientID: clientName
+        )
+        let applied = await manager.debugApplyPendingPolicy(
+            clientName: clientName,
+            connectionID: successorConnectionID,
+            clientPid: Int(getpid()),
+            requireRunRouting: true
+        )
+        XCTAssertEqual(applied.outcome, "applied")
+        let outcome = await MCPRoutingWaiter.shared.currentTerminalOutcome(runID: observer.runID)
+        XCTAssertEqual(outcome, .routed)
+        await successor.cancelAndCleanup()
+        await manager.removeConnection(oldConnectionID)
+        await manager.removeConnection(successorConnectionID)
+    }
+
     func testAuthoritativeRouteOwnerRequiresTrustedPeerDescendant() async throws {
         #if DEBUG
             let observer = try await makeRoutedObserver()
