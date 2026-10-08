@@ -2,8 +2,10 @@ import AppKit
 import Darwin
 import Foundation
 import Logging
+import RepoPromptFileSystem
 import RepoPromptProcess
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import Sparkle
 import SwiftUI
 
@@ -58,6 +60,8 @@ struct RepoPromptFileLogHandler: LogHandler {
 
 struct RepoPromptSwiftUIApp: App {
     init() {
+        let appInitSpan = StartupPhaseLog.begin(.appInit)
+        defer { appInitSpan.end() }
         LoggingSystem.bootstrap { label in
             var handler = RepoPromptFileLogHandler(label: label)
             #if DEBUG
@@ -124,8 +128,13 @@ struct RepoPromptSwiftUIApp: App {
     /// Global version manager for the entire app
     @StateObject private var versionManager = VersionManager()
 
-    /// Tracks all WindowState objects across multiple windows (singleton)
-    @StateObject private var windowStatesManager = WindowStatesManager.shared
+    /// Tracks all WindowState objects across multiple windows (singleton).
+    /// Deliberately not observed: the scene and commands only read it inside actions, and observing
+    /// it here re-evaluated the whole App scene body on every window open/close. Computed rather than
+    /// stored so the singleton is still first created after `init()` bootstraps logging/telemetry.
+    private var windowStatesManager: WindowStatesManager {
+        WindowStatesManager.shared
+    }
 
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
     @StateObject private var fontScale = FontScaleManager.shared
@@ -196,6 +205,9 @@ struct RepoPromptSwiftUIApp: App {
 @MainActor
 public enum RepoPromptApplication {
     public static func main() {
+        if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
+        let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
         let defaultsOutcome: IdentityTransitionDiagnosticEvent.Outcome = switch defaultsReport.outcome {
         case .skipped: .skipped
@@ -218,6 +230,9 @@ public enum RepoPromptApplication {
         CodexRuntimeAuthority.initializeLaunchSnapshot()
 
         SecureStorageIdentityMigrationBootstrap.prepareIfConfigured()
+        GlobalSettingsStore.installProcessApplicationEventBridge()
+        FileSystemAppIntegration.installHooks()
+        bootstrapSpan.end()
         RepoPromptSwiftUIApp.main()
     }
 }

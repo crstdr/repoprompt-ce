@@ -1,5 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProviderQuota
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -168,9 +170,9 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
 
 @MainActor
 extension AgentComposerSubmissionAttemptTests {
-    func testGlobalRouterOwnsFreshTaskModelPresentationUntilDisabled() throws {
+    func testGlobalRouterOwnsFreshTaskModelPresentationUntilDisabled() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
-        let (viewModel, store) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
@@ -191,9 +193,9 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertEqual(session.selectedModelRaw, AgentModel.claudeHaiku.rawValue)
     }
 
-    func testGlobalRouterOwnsFreshTaskWithSelectedPromptWorkflow() throws {
+    func testGlobalRouterOwnsFreshTaskWithSelectedPromptWorkflow() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
-        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
@@ -209,12 +211,12 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(props.areModelControlsDisabled)
     }
 
-    func testMissingRouterCredentialPreservesPersistedEnablementIntent() throws {
+    func testMissingRouterCredentialPreservesPersistedEnablementIntent() async throws {
         let backend = ComposerRoutingBackend(
             outcome: .selectLast,
             readiness: .needsConfiguration(generation: 1, reason: "Validate a TypeSafe API key.")
         )
-        let (viewModel, store) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
         XCTAssertTrue(store.modelRouterConfiguration().enabled)
 
         viewModel.handleModelRouterRuntimeChanged()
@@ -230,7 +232,7 @@ extension AgentComposerSubmissionAttemptTests {
             outcome: .selectLast,
             readiness: .needsConfiguration(generation: 1, reason: "Validate a TypeSafe API key.")
         )
-        let (viewModel, store) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
@@ -252,7 +254,7 @@ extension AgentComposerSubmissionAttemptTests {
             outcome: .selectLast,
             readiness: .needsConfiguration(generation: 1, reason: "Validate a TypeSafe API key.")
         )
-        let (viewModel, store) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
 
         let routed = try await viewModel.routeSubagentTargetIfEnabled(task: "Explore the parser", surface: .general)
         XCTAssertNil(routed)
@@ -261,7 +263,7 @@ extension AgentComposerSubmissionAttemptTests {
 
     func testFakeReadyRouterCommitsSelectedExecutableTargetAtSubmitBoundary() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
-        let (viewModel, store) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
@@ -295,7 +297,7 @@ extension AgentComposerSubmissionAttemptTests {
 
     func testFakeRouterAbstentionSubmitsWithCurrentSelection() async throws {
         let backend = ComposerRoutingBackend(outcome: .abstain)
-        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
@@ -320,7 +322,7 @@ extension AgentComposerSubmissionAttemptTests {
 
     func testLongComposerTaskStillRoutesOnMaskedExcerpt() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
-        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
@@ -346,7 +348,7 @@ extension AgentComposerSubmissionAttemptTests {
 
     func testLongSubagentTaskStillRoutesOnBoundedExcerpt() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
-        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
         let task = "Investigate a concurrency bug. "
             + String(repeating: "background context ", count: 300)
             + " Finally, review the cancellation path."
@@ -364,7 +366,7 @@ extension AgentComposerSubmissionAttemptTests {
 
     func testEffortAbstentionKeepsJevSelectedModelWithProviderDefaultEffort() async throws {
         let backend = ComposerRoutingBackend(outcome: .abstainEffort)
-        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
 
         let selected = try await viewModel.routeSubagentTargetIfEnabled(
             task: "Implement parser and tests", surface: .general
@@ -378,7 +380,7 @@ extension AgentComposerSubmissionAttemptTests {
 
     func testModelAbstentionLeavesSubagentRoleDefaultInControl() async throws {
         let backend = ComposerRoutingBackend(outcome: .abstain)
-        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
         let selected = try await viewModel.routeSubagentTargetIfEnabled(
             task: "Implement parser and tests", surface: .general
         )
@@ -387,7 +389,7 @@ extension AgentComposerSubmissionAttemptTests {
 
     func testGlobalRouterRoutesSubagentRequestWithScopeGuidanceAndTargetIdentity() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
-        let (viewModel, store) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
         XCTAssertTrue(store.setModelRouterCustomInstructions("Prefer Claude Opus for execution."))
 
         let selected = try await viewModel.routeSubagentTargetIfEnabled(
@@ -404,22 +406,60 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(requests.allSatisfy { $0.candidates.allSatisfy { !$0.targetDescription.isEmpty } })
     }
 
+    func testRoutingFixtureWaitsForDelayedInitialReadiness() async throws {
+        let readinessGate = TestReleaseFence(name: "composer initial readiness")
+        let backend = StagedCancellationRoutingBackend(readinessGate: readinessGate)
+        var fixtureReady = false
+        let setupTask = Task { @MainActor in
+            _ = try await makeRoutingViewModel(backend: backend)
+            fixtureReady = true
+        }
+        defer {
+            readinessGate.release()
+            setupTask.cancel()
+        }
+        guard await readinessGate.waitUntilEntered(timeout: 5) else { return }
+        XCTAssertFalse(fixtureReady, "Fixture must not permit routing before readiness publication")
+        readinessGate.release()
+        try await AsyncTestWait.waitUntil("composer fixture ready after publication", timeout: 5) {
+            fixtureReady
+        }
+        try await setupTask.value
+        let requestCount = await backend.requestCount
+        XCTAssertEqual(requestCount, 0)
+    }
+
     func testCancellationAfterModelSelectionDoesNotStartEffortRouting() async throws {
         let backend = StagedCancellationRoutingBackend()
-        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
+        var routingResult: Result<AgentRoutingExecutableTarget?, Error>?
         let routingTask = Task { @MainActor in
-            try await viewModel.routeSubagentTargetIfEnabled(
-                task: "Review the concurrency boundary",
-                surface: .general
-            )
+            do {
+                let target = try await viewModel.routeSubagentTargetIfEnabled(
+                    task: "Review the concurrency boundary",
+                    surface: .general
+                )
+                routingResult = .success(target)
+            } catch {
+                routingResult = .failure(error)
+            }
         }
-        await backend.waitUntilFirstStageStarted()
+        defer {
+            routingTask.cancel()
+            Task { await backend.cancelPendingStage() }
+        }
+        try await AsyncTestWait.waitUntil("cancellation test model stage started", timeout: 5) {
+            await backend.requestCount == 1
+        }
 
         routingTask.cancel()
         await backend.completeFirstStageSelection()
 
+        try await AsyncTestWait.waitUntil("cancelled routing task completed", timeout: 5) {
+            routingResult != nil
+        }
         do {
-            _ = try await routingTask.value
+            _ = try XCTUnwrap(routingResult).get()
             XCTFail("Cancelled routing must not produce a target")
         } catch AgentModeViewModel.GlobalModelRoutingError.cancelled {
             // Expected.
@@ -430,7 +470,7 @@ extension AgentComposerSubmissionAttemptTests {
 
     func testNewDestinationOwnsVisibleCancelAndRejectsSecondSubmit() async throws {
         let backend = SuspendedComposerRoutingBackend()
-        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
         let sourceTabID = UUID()
         let destinationTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(sourceTabID)
@@ -484,9 +524,87 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(destinationSession.items.isEmpty)
     }
 
+    func testUsageBalancingRoutesFreshComposerAndSubagentWithoutJev() async throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast, readiness: .needsConfiguration(generation: 1, reason: "No key"))
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
+        store.setModelRouterEnabled(false)
+        store.setUsageBalancingEnabled(true)
+        XCTAssertTrue(store.setModelRouterCustomInstructions("Prefer Claude for execution"))
+        let advisor = AgentUsageBalancer()
+        viewModel.modelRouterRuntime?.usageBalancer = advisor
+        let now = Date(), reset = ISO8601DateFormatter().string(from: now.addingTimeInterval(18000))
+        for (provider, used) in [(AgentProviderKind.codexExec, 95), (.claudeCode, 10)] {
+            let value = try ClaudeAccountUsageMapper.snapshot(data: Data("{\"five_hour\":{\"utilization\":\(used),\"resets_at\":\"\(reset)\"}}".utf8), account: .init(lineage: .anthropicFirstParty, opaqueAccountID: nil, credentialProfileID: "test"), observedAt: now)
+            advisor.update(value, provider: provider.rawValue)
+        }
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-6.1-sol-high"
+        let baseline = viewModel.executableTarget(for: session)
+        let peer = try XCTUnwrap(viewModel.localUsageDecision(basedOn: baseline, scope: .primarySession, surface: .general))
+        XCTAssertEqual(peer.candidate.target.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        XCTAssertTrue(viewModel.makeStatusPillsSnapshot().modelRouter.usageBalancing)
+        XCTAssertFalse(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
+        let subagent = try await viewModel.routeSubagentTargetIfEnabled(task: "Implement parser", surface: .headless, baseline: baseline)
+        XCTAssertEqual(subagent?.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        let pinned = try await viewModel.routeSubagentTargetIfEnabled(task: "Implement parser", surface: .headless, baseline: baseline, allowUsageBalance: false)
+        XCTAssertNil(pinned)
+        store.setModelRouterEnabled(true) // Configured but unavailable Jev must remain visible in the audit.
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Implement parser")
+        let result = await viewModel.submitUserTurnAfterFreshTaskRouting(text: "Implement parser", claim: claim, session: session, destinationTabID: tabID)
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(session.selectedAgent, .claudeCode)
+        let audit = try XCTUnwrap(session.automationTurnAudit.last?.router)
+        XCTAssertTrue(audit.configured)
+        XCTAssertEqual(audit.decision, .unavailable)
+        XCTAssertFalse(audit.judgmentRequested)
+        XCTAssertNotNil(audit.usageBalancingReason)
+        XCTAssertEqual(audit.usageBalancingProviderRaw, AgentProviderKind.claudeCode.rawValue)
+        XCTAssertFalse(AgentTaskRoutingCandidateBuilder.isPaidFast(viewModel.executableTarget(for: session)))
+        XCTAssertFalse(viewModel.freshTaskRoutingEligibility(session: session, text: "Follow up"))
+        store.setUsageBalancingEnabled(false)
+        XCTAssertNil(viewModel.localUsageDecision(basedOn: baseline, scope: .primarySession, surface: .general), "Disabled balancing keeps the starting model")
+        let requests = await backend.requests
+        XCTAssertTrue(requests.isEmpty, "Independent balancing must not request Jev or require a credential")
+    }
+
+    func testUsageBalancedAuditCannotDispatchAfterModelOrProviderChange() async throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast, readiness: .needsConfiguration(generation: 1, reason: "No key"))
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
+        store.setModelRouterEnabled(false)
+        store.setUsageBalancingEnabled(true)
+        store.setAutoEffortEnabled(true)
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-6.1-sol-high"
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Implement parser")
+        let staleAudit = AgentAutomationTurnAudit.Feature(
+            configured: false,
+            eligible: true,
+            judgmentRequested: false,
+            decision: .selected,
+            chosenModelRaw: "claude-opus-5-5-high",
+            usageBalancingReason: "usage_balance_evenPace",
+            usageBalancingProviderRaw: "claudeCode"
+        )
+        let result = await viewModel.submitUserTurnAfterAutoEffort(text: "Implement parser", claim: claim, session: session, destinationTabID: tabID, routerAudit: staleAudit)
+        guard case .blocked = result else { return XCTFail("A changed balancing target must never silently dispatch") }
+        XCTAssertTrue(session.items.isEmpty)
+        XCTAssertTrue(session.automationTurnAudit.isEmpty)
+        XCTAssertEqual(session.selectedAgent, .codexExec)
+        let baseline = viewModel.executableTarget(for: session)
+        session.selectedAgent = .claudeCode
+        viewModel.restoreUsageStartingTarget(baseline, on: session)
+        XCTAssertEqual(viewModel.executableTarget(for: session), baseline)
+    }
+
     private func makeRoutingViewModel(
         backend: any AgentTaskRouterBackend
-    ) throws -> (AgentModeViewModel, GlobalSettingsStore) {
+    ) async throws -> (AgentModeViewModel, GlobalSettingsStore) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "AgentComposer.router.\(UUID())"))
@@ -500,6 +618,11 @@ extension AgentComposerSubmissionAttemptTests {
             providers: [.claudeCode, .codexExec]
         )
         let runtime = try AgentTaskRouterRuntime(registrations: [.init(backend: backend)])
+        // Runtime initialization publishes readiness asynchronously. A submit before that
+        // publication skips routing entirely, so suspended backends would never be entered.
+        try await AsyncTestWait.waitUntil("composer fake router initial readiness", timeout: 5) {
+            runtime.backendReadiness(backend.id) != nil
+        }
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Routing transaction test must not start Codex")
@@ -608,25 +731,30 @@ private actor StagedCancellationRoutingBackend: AgentTaskRouterBackend {
     nonisolated let displayName = "Staged cancellation"
     private(set) var requestCount = 0
     private var firstRequest: AgentTaskRoutingRequest?
-    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
     private var firstStageCompletion: CheckedContinuation<AgentTaskRoutingBackendOutcome, Never>?
+    private var isClosed = false
+    private let readinessGate: TestReleaseFence?
 
-    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
-        .ready(generation: 1, policyVersion: "fake-v1")
+    init(readinessGate: TestReleaseFence? = nil) {
+        self.readinessGate = readinessGate
+    }
+
+    func readinessSnapshot() async -> AgentTaskRouterBackendReadiness {
+        await readinessGate?.enterAndWait()
+        return .ready(generation: 1, policyVersion: "fake-v1")
     }
 
     func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
         requestCount += 1
-        guard requestCount == 1 else { return .cancelled }
+        guard requestCount == 1, !isClosed else { return .cancelled }
         firstRequest = request
-        startedWaiters.forEach { $0.resume() }
-        startedWaiters.removeAll()
         return await withCheckedContinuation { firstStageCompletion = $0 }
     }
 
-    func waitUntilFirstStageStarted() async {
-        if firstRequest != nil { return }
-        await withCheckedContinuation { startedWaiters.append($0) }
+    func cancelPendingStage() {
+        isClosed = true
+        firstStageCompletion?.resume(returning: .cancelled)
+        firstStageCompletion = nil
     }
 
     func completeFirstStageSelection() {

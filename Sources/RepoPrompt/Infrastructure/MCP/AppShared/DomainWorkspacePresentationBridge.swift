@@ -448,6 +448,8 @@ final class DomainWorkspacePresentationBridge {
     }
 
     private func projectInitial(_ snapshot: DomainWorkspaceCatalogSnapshot, runID: UUID) async {
+        let projectionSpan = StartupPhaseLog.begin(.bridgeInitialProjection, window: client.windowID)
+        defer { projectionSpan.end() }
         var initial = snapshot
         if initial.workspaces.isEmpty,
            let candidate = workspaceManager?.runtimeOwnedDefaultWorkspaceCandidate()

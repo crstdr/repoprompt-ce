@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptWorkspaceCore
 import XCTest
@@ -432,7 +433,18 @@ final class ContentReadCancellationTests: XCTestCase {
             let binder = MCPAppToolBinder(windowID: 952) { _, _, arguments, implementation in
                 try await runAppBinderProviderTask {
                     try await implementation(
-                        MCPAppToolInvocation(toolName: MCPWindowToolName.readFile, windowID: 952),
+                        MCPAppToolInvocation(
+                            toolName: MCPWindowToolName.readFile,
+                            windowID: 952,
+                            context: .trustedLocal(
+                                toolName: MCPWindowToolName.readFile,
+                                metadata: MCPRequestMetadata(
+                                    connectionID: connectionID,
+                                    clientName: "ContentReadCancellationTests",
+                                    windowID: 952
+                                )
+                            )
+                        ),
                         arguments
                     )
                 }

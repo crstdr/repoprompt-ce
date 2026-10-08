@@ -57,6 +57,12 @@ enum AgentSessionLaneMCPToolService {
 
     static func render(_ receipt: AgentSessionLaneCreateReceipt) -> Value {
         if receipt.result == .refused {
+            if receipt.reason == .modelUnavailable {
+                return .object([
+                    "result": .string("model_unavailable"),
+                    "hint": .string("Refresh agent_manage.list_agents in the destination window and retry with an exact available model_id, or omit model_id to use role defaults. No lane was allocated.")
+                ])
+            }
             if receipt.reason == .laneLimitReached {
                 return .object([
                     "result": .string(AgentSessionLaneCreateReceipt.Reason.laneLimitReached.rawValue),
@@ -77,6 +83,7 @@ enum AgentSessionLaneMCPToolService {
         }
         if let sessionID = receipt.sessionID { fields["session_id"] = .string(sessionID.uuidString) }
         if let sessionName = receipt.sessionName { fields["session_name"] = .string(sessionName) }
+        if let workspaceName = receipt.workspaceName { fields["workspace"] = .string(workspaceName) }
         if !receipt.linked, let reason = receipt.reason {
             fields["link_reason"] = .string(reason.rawValue)
         }

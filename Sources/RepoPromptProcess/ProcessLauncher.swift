@@ -43,19 +43,32 @@ package enum ProcessLauncherError: Error {
     }
 }
 
+package typealias ProviderProcessLaunchPolicy = RepoPromptShared.ProviderProcessLaunchPolicy
+
 package enum ProcessLauncher {
+    package enum Purpose: Equatable {
+        case tool
+        case provider
+    }
+
     package static func spawn(
         command: String,
         arguments: [String],
         environment: [String: String],
-        workingDirectory: String?
+        workingDirectory: String?,
+        purpose: Purpose = .provider,
+        allowsProviderProcessLaunchForTesting: Bool = false,
+        terminalDescriptor: Int32? = nil
     ) throws -> SpawnedProcess {
         try spawn(
             command: command,
             arguments: arguments,
             environment: environment,
             workingDirectory: workingDirectory,
-            initializationFailure: nil
+            initializationFailure: nil,
+            terminalDescriptor: terminalDescriptor,
+            purpose: purpose,
+            allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting
         )
     }
 
@@ -81,7 +94,9 @@ package enum ProcessLauncher {
                 arguments: arguments,
                 environment: environment,
                 workingDirectory: workingDirectory,
-                initializationFailure: failure
+                initializationFailure: failure,
+                purpose: .tool,
+                allowsProviderProcessLaunchForTesting: false
             )
         }
     #endif
@@ -96,8 +111,15 @@ package enum ProcessLauncher {
         arguments: [String],
         environment: [String: String],
         workingDirectory: String?,
-        initializationFailure: InitializationFailure?
+        initializationFailure: InitializationFailure?,
+        terminalDescriptor: Int32? = nil,
+        purpose: Purpose,
+        allowsProviderProcessLaunchForTesting: Bool
     ) throws -> SpawnedProcess {
+        if purpose == .provider {
+            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
+        }
+
         var stdinPipe: [Int32] = [-1, -1]
         var stdoutPipe: [Int32] = [-1, -1]
         var stderrPipe: [Int32] = [-1, -1]
@@ -184,9 +206,9 @@ package enum ProcessLauncher {
             }
         }
 
-        try checkFileAction("adddup2(stdin)", result: posix_spawn_file_actions_adddup2(&fileActions, stdinPipe[0], STDIN_FILENO))
-        try checkFileAction("adddup2(stdout)", result: posix_spawn_file_actions_adddup2(&fileActions, stdoutPipe[1], STDOUT_FILENO))
-        try checkFileAction("adddup2(stderr)", result: posix_spawn_file_actions_adddup2(&fileActions, stderrPipe[1], STDERR_FILENO))
+        try checkFileAction("adddup2(stdin)", result: posix_spawn_file_actions_adddup2(&fileActions, terminalDescriptor ?? stdinPipe[0], STDIN_FILENO))
+        try checkFileAction("adddup2(stdout)", result: posix_spawn_file_actions_adddup2(&fileActions, terminalDescriptor ?? stdoutPipe[1], STDOUT_FILENO))
+        try checkFileAction("adddup2(stderr)", result: posix_spawn_file_actions_adddup2(&fileActions, terminalDescriptor ?? stderrPipe[1], STDERR_FILENO))
         try checkFileAction("addclose(stdin write)", result: posix_spawn_file_actions_addclose(&fileActions, stdinPipe[1]))
         try checkFileAction("addclose(stdout read)", result: posix_spawn_file_actions_addclose(&fileActions, stdoutPipe[0]))
         try checkFileAction("addclose(stderr read)", result: posix_spawn_file_actions_addclose(&fileActions, stderrPipe[0]))

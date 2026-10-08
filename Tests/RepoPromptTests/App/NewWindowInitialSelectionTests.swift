@@ -2,7 +2,9 @@ import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 #if DEBUG
@@ -1564,9 +1566,9 @@ import XCTest
             }
             runtime = nil
             for seed in seeds {
-                await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceURL(for: seed))
+                await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceURL(for: seed))
             }
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: indexURL)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: indexURL)
             if changedDefaults {
                 restore(previousStoragePreference, forKey: "GlobalCustomStorageURL")
                 restore(previousOnboardingPreference, forKey: "agentOnboardingHasSeen")

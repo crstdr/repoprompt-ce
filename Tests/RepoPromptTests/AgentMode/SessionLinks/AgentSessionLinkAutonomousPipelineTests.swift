@@ -536,7 +536,27 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         viewModelsByWindowID[windowID] = viewModel
     }
 
-    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+    func agentSessionLinkCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        viewModelsByWindowID[endpoint.windowID]?.agentSessionLinkCandidate(for: endpoint, includeLocation: includeLocation)
+    }
+
+    func agentSessionLinkCandidates(
+        forSessionIDs sessionIDs: Set<UUID>, includeLocation: Bool
+    ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+        var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
+        for windowID in viewModelsByWindowID.keys.sorted() {
+            guard let viewModel = viewModelsByWindowID[windowID] else { continue }
+            let local = viewModel.agentSessionLinkCandidates(forSessionIDs: sessionIDs, includeLocation: includeLocation)
+            for sessionID in sessionIDs {
+                result[sessionID, default: []] += local[sessionID] ?? []
+            }
+        }
+        return result
+    }
+
+    func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
         viewModelsByWindowID.keys.sorted().flatMap { windowID in
             viewModelsByWindowID[windowID]?.agentSessionLinkCandidates(isWindowClosing: false) ?? []
         }
@@ -788,6 +808,7 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
 /// Minimal native runtime stub: the pipeline only needs a delivered send to reach its provider
 /// handoff, so nothing here touches a process, a socket, or the filesystem.
 private actor AutonomousPipelineStubNativeController: NativeAgentRuntimeControlling {
+    private var configuration = SessionLinkNativeConfigurationFixture()
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
 
     init() {
@@ -815,7 +836,8 @@ private actor AutonomousPipelineStubNativeController: NativeAgentRuntimeControll
         effortLevel _: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
-        NativeAgentRuntimeSessionRef(sessionID: "autonomous-pipeline-stub")
+        configuration.replaceProcess()
+        return NativeAgentRuntimeSessionRef(sessionID: "autonomous-pipeline-stub")
     }
 
     func currentSessionRef() -> NativeAgentRuntimeSessionRef {
@@ -825,7 +847,18 @@ private actor AutonomousPipelineStubNativeController: NativeAgentRuntimeControll
     func applyModelAndEffort(
         model _: String?,
         effortLevel _: NativeAgentRuntimeEffortLevel?
-    ) async throws {}
+    ) async throws {
+        _ = configuration.apply()
+    }
+
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        configuration.apply()
+    }
+
+    func sendUserMessage(_: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try configuration.validate(proof)
+        return UUID()
+    }
 
     func sendUserMessage(_: String) async throws -> UUID {
         UUID()
@@ -835,7 +868,10 @@ private actor AutonomousPipelineStubNativeController: NativeAgentRuntimeControll
         .noTurnInFlight
     }
 
-    func shutdown() {}
+    func shutdown() {
+        configuration.replaceProcess()
+    }
+
     func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) {}
 }
 

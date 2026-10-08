@@ -1,11 +1,56 @@
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 #if DEBUG
     @MainActor
     final class AgentAdmissionRecoveryTests: XCTestCase {
+        func testToolAdmissionPolicySnapshotPreservesTaskRoleMapping() {
+            let cases: [(AgentModelCatalog.TaskLabelKind?, MCPClientTaskRole)] = [
+                (nil, .direct), (.explore, .explore), (.engineer, .engineer),
+                (.pair, .engineer), (.design, .engineer)
+            ]
+            for (taskLabelKind, expectedRole) in cases {
+                let snapshot = MCPToolAdmissionPolicy.clientPolicySnapshot(
+                    restricted: ["git"],
+                    additional: ["ask_user"],
+                    taskLabelKind: taskLabelKind,
+                    allowsAgentExternalControlTools: false
+                )
+                XCTAssertEqual(snapshot, MCPDomainClientPolicySnapshot(
+                    restrictedToolNames: ["git"],
+                    additionalToolNames: ["ask_user"],
+                    role: expectedRole,
+                    allowsAgentExternalControlTools: false,
+                    hasExactAgentSessionLinkGrant: false
+                ))
+            }
+        }
+
+        func testToolAdmissionPolicySnapshotDoesNotPromoteAdditionalGrantToExactLinkAuthority() {
+            let ordinaryGrant = MCPToolAdmissionPolicy.clientPolicySnapshot(
+                restricted: ["agent_session_link"],
+                additional: ["agent_session_link"],
+                taskLabelKind: .explore,
+                allowsAgentExternalControlTools: true
+            )
+            XCTAssertFalse(ordinaryGrant.hasExactAgentSessionLinkGrant)
+            let exactGrant = MCPToolAdmissionPolicy.clientPolicySnapshot(
+                restricted: ordinaryGrant.restrictedToolNames,
+                additional: ordinaryGrant.additionalToolNames,
+                taskLabelKind: .explore,
+                allowsAgentExternalControlTools: true,
+                hasExactAgentSessionLinkGrant: true
+            )
+            XCTAssertTrue(exactGrant.hasExactAgentSessionLinkGrant)
+            XCTAssertEqual(exactGrant.role, ordinaryGrant.role)
+            XCTAssertEqual(exactGrant.restrictedToolNames, ordinaryGrant.restrictedToolNames)
+            XCTAssertEqual(exactGrant.additionalToolNames, ordinaryGrant.additionalToolNames)
+            XCTAssertEqual(exactGrant.allowsAgentExternalControlTools, ordinaryGrant.allowsAgentExternalControlTools)
+        }
+
         private actor RecoveryCoalescingGate {
             private var firstCallerSuspended = false
             private var firstCallerReleased = false
@@ -172,7 +217,7 @@ import XCTest
                 .appendingPathComponent("AgentAdmissionRecoveryTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
@@ -182,7 +227,7 @@ import XCTest
                 _ = await runtime.shutdown()
             }
             runtimes.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -635,7 +680,9 @@ import XCTest
             let gate = await installFirstAuthoritySaveGate(fixture)
             let awaitedOwnSaves = Observation()
             fixture.manager.agentAdmissionWillAwaitOwnSavesHandlerForTesting = { id, count in
-                if id == workspaceID { awaitedOwnSaves.count = count }
+                if id == workspaceID {
+                    awaitedOwnSaves.count = count
+                }
             }
 
             let createdTab = await fixture.prompt.createBackgroundComposeTab(strategy: .blank, name: "Agent target")
@@ -792,7 +839,9 @@ import XCTest
             let gate = await installFirstAuthoritySaveGate(fixture)
             let awaitedOwnSaves = Observation()
             fixture.manager.agentAdmissionWillAwaitOwnSavesHandlerForTesting = { id, count in
-                if id == workspaceID { awaitedOwnSaves.count = count }
+                if id == workspaceID {
+                    awaitedOwnSaves.count = count
+                }
             }
             let createdTab = await fixture.prompt.createBackgroundComposeTab(strategy: .blank, name: "Cancelled start")
             let backgroundTab = try XCTUnwrap(createdTab)
@@ -2496,13 +2545,13 @@ import XCTest
                 sessionID: sessionID,
                 replacementTabID: UUID()
             )
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.setAtomicWriteGateForTesting {
+            await WorkspaceDiskWriterComposition.processWriter.setAtomicWriteGateForTesting {
                 try? FileManager.default.removeItem(at: fileURL)
                 try? FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
             }
 
             let outcome = await manager.recoverProvisionalAgentAdmission(identity)
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.setAtomicWriteGateForTesting(nil)
+            await WorkspaceDiskWriterComposition.processWriter.setAtomicWriteGateForTesting(nil)
 
             XCTAssertEqual(outcome, .failed(.durabilityUncertain))
             XCTAssertEqual(manager.workspace(withID: workspace.id), managerBefore)
