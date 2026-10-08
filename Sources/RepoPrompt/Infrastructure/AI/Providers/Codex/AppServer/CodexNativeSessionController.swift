@@ -8645,11 +8645,10 @@ final class CodexNativeSessionController {
             if lowered.hasPrefix("mcp__") { return raw }
             return "mcp__\(MCPIntegrationHelper.computerUseMCPServerName)__\(raw)"
         }
-        // A foreign or conflicting attestation carrying a companion-looking name must
-        // never group: strip the claimed prefix and fail closed.
-        if !attestedServers.isEmpty,
-           let stripped = MCPIntegrationHelper.computerUseCompanionToolName(raw)
-        {
+        // Anything short of an exact companion attestation — foreign, conflicting, or
+        // absent — carrying a companion-looking name must never group: strip the
+        // claimed prefix and fail closed.
+        if let stripped = MCPIntegrationHelper.computerUseCompanionToolName(raw) {
             return stripped
         }
 

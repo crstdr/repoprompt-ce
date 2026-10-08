@@ -83,6 +83,12 @@ final class CodexComputerUseCompanionToolNameTests: XCTestCase {
         XCTAssertEqual(name, "click")
     }
 
+    func testMissingAttestationWithCompanionLookingNameFailsClosed() async {
+        // No server fields at all: the claimed prefix is stripped rather than trusted.
+        let name = await emittedToolCallName(serverFields: [:], tool: "mcp__computer-use__click")
+        XCTAssertEqual(name, "click")
+    }
+
     func testConflictingServerAliasesFailClosed() async {
         let name = await emittedToolCallName(
             serverFields: ["server": .string("computer-use"), "mcp_server": .string("other-server")],

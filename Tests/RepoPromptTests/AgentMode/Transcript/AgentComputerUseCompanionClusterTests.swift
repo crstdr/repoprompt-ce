@@ -3,7 +3,7 @@ import Foundation
 import XCTest
 
 final class AgentComputerUseCompanionClusterTests: XCTestCase {
-    private func pairs(_ name: String, _ id: UUID, _ seq: inout Int) -> [AgentChatItem] {
+    private func pairs(_ name: String, _ id: UUID?, _ seq: inout Int) -> [AgentChatItem] {
         defer { seq += 2 }
         return [
             .toolCall(name: name, invocationID: id, argsJSON: "{}", sequenceIndex: seq),
@@ -69,6 +69,18 @@ final class AgentComputerUseCompanionClusterTests: XCTestCase {
         let kinds = blocks(for: items).map(\.kind)
         XCTAssertEqual(kinds.count(where: { $0 == .standaloneTool }), 2)
         XCTAssertFalse(kinds.contains(.activityCluster))
+    }
+
+    func testInvocationlessPairsCountAsLogicalCalls() throws {
+        var seq = 1
+        var items: [AgentChatItem] = [.user("drive", sequenceIndex: 0)]
+        // No invocationID: import pairs call/result by name into one execution each.
+        // The label must still count calls (2), not re-derived row identities (4).
+        items += pairs("mcp__computer-use__click", nil, &seq)
+        items += pairs("mcp__computer-use__screenshot", nil, &seq)
+        let cluster = try XCTUnwrap(blocks(for: items).first { $0.kind == .activityCluster })
+        XCTAssertEqual(cluster.clusterSummary?.toolCount, 2)
+        XCTAssertEqual(cluster.clusterSummary?.collapsedDisplay?.title, "Computer Use · 2 actions")
     }
 
     func testContinuationFragmentAfterBoundaryDoesNotMerge() {
@@ -154,6 +166,24 @@ final class AgentComputerUseCompanionClusterTests: XCTestCase {
         let display = grouped.groupedHistory?.summary.collapsedDisplay
         XCTAssertFalse(display?.title.hasPrefix("Computer Use") ?? true)
         XCTAssertNotNil(display?.count)
+    }
+
+    func testNestedClusterInsideGroupedHistoryKeepsGenericLabels() throws {
+        var seq = 1
+        var items: [AgentChatItem] = [.user("drive", sequenceIndex: 0)]
+        items += companion("click", &seq) + companion("click", &seq)
+        for _ in 0 ..< 9 {
+            items += pairs("read_file", UUID(), &seq)
+        }
+        // The cluster sits beyond the detailed tail, so it nests inside grouped history;
+        // neither the outer row nor the nested tool summary may reuse the companion label.
+        let grouped = try XCTUnwrap(blocks(for: items).first { $0.kind == .groupedHistory })
+        XCTAssertFalse(
+            grouped.groupedHistory?.summary.collapsedDisplay?.title.hasPrefix("Computer Use") ?? true
+        )
+        XCTAssertFalse(
+            grouped.groupedHistory?.summary.toolSummary?.collapsedDisplay?.title.hasPrefix("Computer Use") ?? true
+        )
     }
 
     func testProjectionRealScaleWithinBudget() {

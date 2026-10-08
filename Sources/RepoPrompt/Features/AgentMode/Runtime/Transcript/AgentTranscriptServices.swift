@@ -1460,6 +1460,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
 
 private struct ClusterSummaryCacheKey: Hashable {
     let rowIDs: [UUID]
+    let isComputerUseCompanionRun: Bool
 }
 
 private final class AgentTranscriptProjectionBuildContext {
@@ -7541,7 +7542,8 @@ enum AgentTranscriptProjectionBuilder {
             clusterSummary: clusterSummary(
                 for: rows,
                 context: context,
-                isComputerUseCompanionRun: isComputerUseCompanionRun
+                isComputerUseCompanionRun: isComputerUseCompanionRun,
+                logicalRowGroups: isComputerUseCompanionRun ? childBlocks.map(\.rows) : nil
             ),
             defaultPresentation: .collapsed
         )
@@ -7913,44 +7915,74 @@ enum AgentTranscriptProjectionBuilder {
     private static func clusterSummary(
         for rows: [AgentChatItem],
         context: AgentTranscriptProjectionBuildContext,
-        isComputerUseCompanionRun: Bool = false
+        isComputerUseCompanionRun: Bool = false,
+        logicalRowGroups: [[AgentChatItem]]? = nil
     ) -> AgentTranscriptClusterSummary? {
         guard !rows.isEmpty else { return nil }
-        let cacheKey = ClusterSummaryCacheKey(rowIDs: rows.map(\.id))
+        let cacheKey = ClusterSummaryCacheKey(
+            rowIDs: rows.map(\.id),
+            isComputerUseCompanionRun: isComputerUseCompanionRun
+        )
         if let cached = context.clusterSummaryByRowIDs[cacheKey] {
             return cached
         }
-        let groupedExecutions = Dictionary(grouping: rows.compactMap { row -> (AgentChatItem, AgentTranscriptToolExecution)? in
-            guard let execution = AgentTranscriptToolNormalizer.toolExecution(
-                for: row,
-                context: context.processingContext
-            ) else { return nil }
-            return (row, execution)
-        }, by: { $0.1.stableExecutionID })
-        let orderedExecutionGroups = groupedExecutions.values
-            .map { grouped in
-                grouped.sorted { lhs, rhs in
+        // Companion clusters preserve the merger's logical grouping: one leaf is one
+        // execution even when rows re-derive distinct IDs (e.g. nil invocationID).
+        // Every other caller groups rows by the derived stable execution ID.
+        let toolExecutions: [AgentTranscriptToolExecution]
+        if let logicalRowGroups {
+            toolExecutions = logicalRowGroups.compactMap { groupRows in
+                let entries = groupRows.compactMap { row -> (AgentChatItem, AgentTranscriptToolExecution)? in
+                    guard let execution = AgentTranscriptToolNormalizer.toolExecution(
+                        for: row,
+                        context: context.processingContext
+                    ) else { return nil }
+                    return (row, execution)
+                }
+                let ordered = entries.sorted { lhs, rhs in
                     if lhs.0.sequenceIndex == rhs.0.sequenceIndex {
                         return lhs.0.timestamp < rhs.0.timestamp
                     }
                     return lhs.0.sequenceIndex < rhs.0.sequenceIndex
                 }
-            }
-            .sorted { lhs, rhs in
-                guard let lhsLast = lhs.last?.0 else { return false }
-                guard let rhsLast = rhs.last?.0 else { return true }
-                if lhsLast.sequenceIndex == rhsLast.sequenceIndex {
-                    if lhsLast.timestamp == rhsLast.timestamp {
-                        return lhsLast.id.uuidString < rhsLast.id.uuidString
-                    }
-                    return lhsLast.timestamp < rhsLast.timestamp
+                guard let latestExecution = ordered.last?.1 else { return nil }
+                return ordered.dropLast().reduce(latestExecution) { partial, entry in
+                    mergedToolExecutionMetadata(partial, with: entry.1)
                 }
-                return lhsLast.sequenceIndex < rhsLast.sequenceIndex
             }
-        let toolExecutions: [AgentTranscriptToolExecution] = orderedExecutionGroups.compactMap { orderedGroup in
-            guard let latestExecution = orderedGroup.last?.1 else { return nil }
-            return orderedGroup.dropLast().reduce(latestExecution) { partial, entry in
-                mergedToolExecutionMetadata(partial, with: entry.1)
+        } else {
+            let groupedExecutions = Dictionary(grouping: rows.compactMap { row -> (AgentChatItem, AgentTranscriptToolExecution)? in
+                guard let execution = AgentTranscriptToolNormalizer.toolExecution(
+                    for: row,
+                    context: context.processingContext
+                ) else { return nil }
+                return (row, execution)
+            }, by: { $0.1.stableExecutionID })
+            let orderedExecutionGroups = groupedExecutions.values
+                .map { grouped in
+                    grouped.sorted { lhs, rhs in
+                        if lhs.0.sequenceIndex == rhs.0.sequenceIndex {
+                            return lhs.0.timestamp < rhs.0.timestamp
+                        }
+                        return lhs.0.sequenceIndex < rhs.0.sequenceIndex
+                    }
+                }
+                .sorted { lhs, rhs in
+                    guard let lhsLast = lhs.last?.0 else { return false }
+                    guard let rhsLast = rhs.last?.0 else { return true }
+                    if lhsLast.sequenceIndex == rhsLast.sequenceIndex {
+                        if lhsLast.timestamp == rhsLast.timestamp {
+                            return lhsLast.id.uuidString < rhsLast.id.uuidString
+                        }
+                        return lhsLast.timestamp < rhsLast.timestamp
+                    }
+                    return lhsLast.sequenceIndex < rhsLast.sequenceIndex
+                }
+            toolExecutions = orderedExecutionGroups.compactMap { orderedGroup in
+                guard let latestExecution = orderedGroup.last?.1 else { return nil }
+                return orderedGroup.dropLast().reduce(latestExecution) { partial, entry in
+                    mergedToolExecutionMetadata(partial, with: entry.1)
+                }
             }
         }
         let toolNames = Array(NSOrderedSet(array: toolExecutions.compactMap {
