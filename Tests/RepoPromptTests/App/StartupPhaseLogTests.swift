@@ -35,7 +35,7 @@ final class StartupPhaseLogTests: XCTestCase {
     /// window ordinal, elapsed/span milliseconds and integer fields -- nothing
     /// user-identifying can appear because no string values are ever rendered.
     func testEmittedMarkersCarryOnlyPhaseDurationsOrdinalsAndCounts() {
-        let recorder = Recorder(ticks: [125.0, 125.25, 126.0])
+        let recorder = Recorder(ticks: [125.0, 125.25, 125.25, 126.0])
         StartupPhaseLog.installForTesting(
             StartupPhaseLog.Runtime(
                 uptime: { recorder.uptime() },
@@ -77,5 +77,60 @@ final class StartupPhaseLogTests: XCTestCase {
         XCTAssertEqual(StartupPhaseLog.elapsedMilliseconds(now: 100.4, processStart: 100.0), 400)
         XCTAssertEqual(StartupPhaseLog.spanMilliseconds(from: 10.5, to: 10.0), 0)
         XCTAssertEqual(StartupPhaseLog.spanMilliseconds(from: 10.0, to: 10.75), 750)
+    }
+
+    /// The span clock starts after begin emission returns, so a cold or descheduled
+    /// emitter is charged to the marker path, not the measured phase. Here emission
+    /// consumes 4.4s of the scripted clock; span_ms must exclude it while the begin
+    /// line still records the request-time elapsed_ms.
+    func testSpanClockStartsAfterBeginEmission() {
+        let recorder = Recorder(ticks: [125.0, 129.4, 131.0])
+        StartupPhaseLog.installForTesting(
+            StartupPhaseLog.Runtime(
+                uptime: { recorder.uptime() },
+                processStartUptime: 100.0,
+                emit: { recorder.emit($0) }
+            )
+        )
+
+        let span = StartupPhaseLog.begin(.appInit)
+        span.end()
+
+        XCTAssertEqual(
+            recorder.emissions,
+            [
+                "phase=appInit boundary=begin elapsed_ms=25000",
+                "phase=appInit boundary=end elapsed_ms=31000 span_ms=1600"
+            ]
+        )
+    }
+
+    /// Phase names are fixed enum raw values -- letters only -- so no call site can
+    /// interpolate names or identifiers into a marker.
+    func testPhaseRawValuesAreFixedLetterOnlyNames() {
+        for phase in StartupPhaseLog.Phase.allCases {
+            XCTAssertNotNil(
+                phase.rawValue.wholeMatch(of: #/^[a-zA-Z]+$/#),
+                "phase name must be letters only: \(phase.rawValue)"
+            )
+        }
+    }
+
+    /// The restore span records the switch request's actual outcome as a bounded
+    /// integer code, not a discarded result or a logged string.
+    func testSwitchOutcomeMappingCoversEverySwitchResult() {
+        XCTAssertEqual(StartupPhaseLog.SwitchOutcome(.switched), .accepted)
+        XCTAssertEqual(StartupPhaseLog.SwitchOutcome(.blocked("busy")), .blocked)
+        XCTAssertEqual(StartupPhaseLog.SwitchOutcome(.cancelled("superseded")), .cancelled)
+        XCTAssertEqual(
+            Set(
+                [
+                    StartupPhaseLog.SwitchOutcome.accepted.rawValue,
+                    StartupPhaseLog.SwitchOutcome.blocked.rawValue,
+                    StartupPhaseLog.SwitchOutcome.cancelled.rawValue
+                ]
+            ).count,
+            3
+        )
     }
 }
