@@ -89,6 +89,8 @@ extension Notification.Name {
     /// Posted when a compose tab is linked to or unlinked from a persistent Agent session.
     /// userInfo: ["tabID": UUID, "windowID": Int, "previousSessionID": UUID?, "sessionID": UUID?]
     static let agentSessionBindingDidChange = Notification.Name("agentSessionBindingDidChange")
+    /// Payload-free, MainActor presentation refresh; grants no authority.
+    static let agentSessionLinkCandidatesDidChange = Notification.Name("agentSessionLinkCandidatesDidChange")
 
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.
