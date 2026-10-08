@@ -183,17 +183,6 @@ final class AgentTranscriptPanePresentationTests: XCTestCase {
         XCTAssertEqual(presentation, .unavailable(.persistenceSuppressed, retry: nil))
     }
 
-    /// §4.4 row 9: a still-current saved target whose workspace became unusable settles explicitly.
-    func testSavedTargetWithUnavailableWorkspaceIsUnavailableWithoutRetry() {
-        let scope = savedScope
-        let presentation = resolve(
-            target: target(scope: scope),
-            record: savedSettledRecord(scope, .workspaceUnavailable)
-        )
-
-        XCTAssertEqual(presentation, .unavailable(.workspaceUnavailable, retry: nil))
-    }
-
     /// §4.4 row 1: load evidence from the previous incarnation is rejected, never shown as a failure.
     func testPreviousIncarnationLoadOutcomeIsRejectedForReboundTarget() {
         let current = reboundSavedScope

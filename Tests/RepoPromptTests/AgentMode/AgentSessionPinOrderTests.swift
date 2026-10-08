@@ -128,15 +128,6 @@ final class AgentSidebarRestoreCharacterizationTests: XCTestCase {
             groups: stableGroups,
             sections: stableSections
         )
-        // Index completion alone no longer releases: the baseline waits for the selected side.
-        assertProjection(
-            "5 index complete before selected hydration",
-            build(tabs, entries: full, baseline: baseline),
-            rows: "2/102/-/0/-7200/-7200/-;3/103/-/0/-1440/-/-;4/-/-/0/-2880/-/-;1/101/-/0/0/0/-",
-            groups: stableGroups,
-            sections: stableSections
-        )
-
         let live = hydratedSelectedSession()
         assertProjection(
             "6 selected hydration before index complete",

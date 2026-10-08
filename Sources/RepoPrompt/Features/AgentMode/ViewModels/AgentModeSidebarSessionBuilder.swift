@@ -674,9 +674,7 @@ struct AgentModeSidebarSessionBuilder {
                 pinnedOrderByTabID: context.pinnedOrderByTabID
             )
         }
-        return sidebarSessionsPreservingFlatOrder(
-            prefixedPinnedSidebarSessions(baseSortedSessions)
-        )
+        return prefixedPinnedSidebarSessions(baseSortedSessions)
     }
 
     private func prefixedPinnedSidebarSessions(_ sessions: [SidebarSession]) -> [SidebarSession] {
@@ -684,47 +682,6 @@ struct AgentModeSidebarSessionBuilder {
         guard !pinned.isEmpty else { return sessions }
         let unpinned = sessions.filter { !$0.isPinned }
         return pinned + unpinned
-    }
-
-    /// Preserves the incoming row order while annotating child depth only when the
-    /// parent already appears earlier in the list. This avoids visible row movement
-    /// during persisted restore while still surfacing limited thread structure.
-    private func sidebarSessionsPreservingFlatOrder(_ flat: [SidebarSession]) -> [SidebarSession] {
-        var sessionIDToIndex: [UUID: Int] = [:]
-        for (index, session) in flat.enumerated() {
-            if let sessionID = session.sessionID {
-                sessionIDToIndex[sessionID] = index
-            }
-        }
-
-        var cachedDepthByIndex: [Int: Int] = [:]
-        var visiting = Set<Int>()
-
-        func stableDepth(for index: Int) -> Int {
-            if let cached = cachedDepthByIndex[index] {
-                return cached
-            }
-            guard let parentSessionID = flat[index].parentSessionID,
-                  let sessionID = flat[index].sessionID,
-                  parentSessionID != sessionID,
-                  let parentIndex = sessionIDToIndex[parentSessionID],
-                  parentIndex < index,
-                  !visiting.contains(index)
-            else {
-                cachedDepthByIndex[index] = 0
-                return 0
-            }
-
-            visiting.insert(index)
-            let depth = stableDepth(for: parentIndex) + 1
-            visiting.remove(index)
-            cachedDepthByIndex[index] = depth
-            return depth
-        }
-
-        return flat.enumerated().map { index, session in
-            row(session, depth: stableDepth(for: index))
-        }
     }
 
     /// Builds a thread-aware flattened list from flat sidebar sessions.

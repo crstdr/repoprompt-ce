@@ -105,7 +105,6 @@ enum AgentTranscriptPanePresentation: Equatable {
             case .loadFailed: return .unavailable(.loadFailed, retry: retry)
             case .cancelled: return .unavailable(.interrupted, retry: retry)
             case .persistenceSuppressed: return .unavailable(.persistenceSuppressed, retry: nil)
-            case .workspaceUnavailable: return .unavailable(.workspaceUnavailable, retry: nil)
             }
         }
     }

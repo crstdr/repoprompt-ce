@@ -55,7 +55,6 @@ enum AgentPersistedLoadExit: Equatable {
     case cancelled
     case sourceRevisionSuperseded
     case persistenceSuppressed
-    case workspaceUnavailable
 }
 
 struct AgentSessionPresentationRecord: Equatable {

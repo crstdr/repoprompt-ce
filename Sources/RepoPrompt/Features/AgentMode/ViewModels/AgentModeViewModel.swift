@@ -4655,7 +4655,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if retainsCancelledLocalDrift(session) {
             workspaceSwitchInFlight = false
             activeSessionLoadInProgressTabID = nil
-            publishRetainedLocalProjection(session, refresh: false)
+            publishRetainedLocalProjection(session)
             return
         }
 
@@ -4684,7 +4684,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // of the strict loading frame (§4.3).
             if retainsCancelledLocalDrift(session) {
                 activeSessionLoadInProgressTabID = nil
-                publishRetainedLocalProjection(session, refresh: false)
+                publishRetainedLocalProjection(session)
                 return
             }
             applySessionToBindings(session)
@@ -6100,14 +6100,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// completion, recording proof or marking the binding hydrated. Revalidates synchronously right
     /// before publication.
     @discardableResult
-    private func publishRetainedLocalProjection(_ session: TabSession, refresh: Bool) -> Bool {
+    private func publishRetainedLocalProjection(_ session: TabSession) -> Bool {
         guard session.tabID == currentTabID,
               retainsCancelledLocalDrift(session),
               canSynchronizeDerivedTranscript(for: session, requiringLoadedPersistedState: false)
         else { return false }
-        if refresh {
-            refreshDerivedTranscriptState(for: session, reason: .liveMutation, publishActivePresentation: false)
-        }
         guard retainsCancelledLocalDrift(session) else { return false }
         return publishTranscriptPresentation(from: session)
     }
@@ -6184,7 +6181,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             case .loadFailed: return .settled(.loadFailed)
             case .cancelled: return .settled(.interrupted)
             case .persistenceSuppressed: return .settled(.persistenceSuppressed)
-            case .workspaceUnavailable: return .settled(.workspaceUnavailable)
             case .payloadApplied:
                 // Settled only once this scope's projection committed: the published content carries
                 // this exact scope (independent of display precedence).
@@ -13953,7 +13949,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         } else if publishActivePresentation {
             // Retained cancelled-drift scope: publish this already-built local projection (§4.3).
-            publishRetainedLocalProjection(session, refresh: false)
+            publishRetainedLocalProjection(session)
         }
     }
 
