@@ -564,8 +564,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             "the scope is the observer session, not a link and not a global preference"
         )
         XCTAssertTrue(
-            tooltip.contains("Off by default"),
-            "the default has to be visible where the control is"
+            tooltip.contains("On by default"),
+            "the default has to be visible where the control is — and it is enabled by default"
         )
         let accessibilityHint = AgentMonitorAutoWakeCopy.accessibilityHint
         XCTAssertTrue(

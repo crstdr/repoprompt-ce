@@ -330,7 +330,9 @@ private struct BulkActionChipLabel: View {
     }
 
     private var foreground: Color {
-        if isDestructive { return .red }
+        if isDestructive {
+            return .red
+        }
         return isHovered ? Color(NSColor.labelColor) : .secondary
     }
 
@@ -560,17 +562,15 @@ struct AgentModeSessionsListView: View {
                         let copySessionIDAction: (() -> Bool)? = copySessionIDTarget.map { target in
                             { agentModeVM.copyAgentSessionID(target: target) }
                         }
-                        let isOverseer = session.sessionID.map { sessionID in
-                            agentModeVM.agentSessionLinkIsOverseer(
+                        let oversightRole = session.sessionID.map { sessionID in
+                            agentModeVM.agentSidebarOversightRole(
                                 tabID: session.tabID,
                                 expectedSessionID: sessionID
                             )
-                        } ?? false
+                        } ?? .none
                         let sidebarOversightSummaryResolver: (@MainActor () -> AgentSidebarOversightSummary?)? =
                             session.sessionID.map { expectedSessionID in
-                                { @MainActor in
-                                    agentModeVM.agentSidebarOversightSummary(tabID: session.tabID, expectedSessionID: expectedSessionID)
-                                }
+                                { @MainActor in agentModeVM.agentSidebarOversightSummary(tabID: session.tabID, expectedSessionID: expectedSessionID) }
                             }
                         let sidebarOversightMenuResolver: (@MainActor () -> AgentSidebarOversightMenuProps?)? =
                             session.sessionID.map { expectedSessionID in
@@ -591,19 +591,55 @@ struct AgentModeSessionsListView: View {
                                     )
                                 }
                             }
+                        // Hoisted into locals so the row's long memberwise call stays
+                        // inside the type-checker's time budget.
+                        let resolveOverseerCandidate: (@MainActor (String) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)? = {
+                            raw in
+                            guard let rowSessionID = session.sessionID else {
+                                return .failure(AgentOversightResolutionMessage(
+                                    message: AgentOversightUICopy.oversightUnavailableMessage
+                                ))
+                            }
+                            return await agentModeVM.resolveSidebarOverseerCandidate(
+                                rawSessionID: raw,
+                                excludingTargetSessionID: rowSessionID
+                            )
+                        }
+                        let resolveTargetCandidate: (@MainActor (String) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)? = {
+                            raw in
+                            guard let endpoint = sidebarOversightTargetEndpointResolver?() else {
+                                return .failure(AgentOversightResolutionMessage(
+                                    message: AgentOversightUICopy.staleSelectionMessage
+                                ))
+                            }
+                            return agentModeVM.resolveSidebarTargetCandidate(
+                                rawSessionID: raw,
+                                observerEndpoint: endpoint
+                            )
+                        }
 
                         let creator = session.sessionID.flatMap {
-                            agentModeVM.agentSessionLinkLaneCreator(for: $0)
+                            agentModeVM.agentSidebarLaneCreator(tabID: session.tabID, expectedSessionID: $0)
                         }
+                        let prepareOversight: @MainActor () -> Void = {
+                            guard let sessionID = session.sessionID, let workspaceID = snapshot.workspaceID,
+                                  agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+                            else { return }
+                            agentModeVM.prepareSidebarOversightSession(
+                                tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID
+                            )
+                        }
+
                         AgentSessionRow(
                             title: session.title,
                             isActive: session.tabID == currentTabID,
-                            isOverseer: isOverseer,
-                            createdByLabel: creator?.label,
+                            oversightRole: oversightRole,
+                            creatorSessionID: creator?.sessionID,
+                            creatorDisplayName: creator?.label,
                             onOpenCreator: {
                                 guard let targetSessionID = session.sessionID,
                                       let creatorSessionID = creator?.sessionID,
-                                      agentModeVM.agentSessionLinkLaneCreatorSessionID(for: targetSessionID) == creatorSessionID
+                                      agentModeVM.agentSessionLinkLaneCreatorSessionID(tabID: session.tabID, expectedSessionID: targetSessionID) == creatorSessionID
                                 else { return }
                                 Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
                             },
@@ -671,6 +707,10 @@ struct AgentModeSessionsListView: View {
                             onCopySessionID: copySessionIDAction,
                             resolveSidebarOversightSummary: sidebarOversightSummaryResolver,
                             resolveSidebarOversightMenu: sidebarOversightMenuResolver,
+                            prepareSidebarOversightMenu: prepareOversight,
+                            sidebarOversightUnavailableReason: session.sessionID == nil
+                                ? AgentOversightUICopy.oversightAvailableAfterFirstMessage
+                                : nil,
                             resolveSidebarOversightTargetEndpoint:
                             sidebarOversightTargetEndpointResolver,
                             onAddSidebarOversight: { observerEndpoint, targetEndpoint in
@@ -686,8 +726,29 @@ struct AgentModeSessionsListView: View {
                                     expectedReference: reference
                                 )
                             },
+                            onAddOutboundOversight: { observerEndpoint, targetEndpoint in
+                                await agentModeVM.addAgentOversightLink(
+                                    observerEndpoint: observerEndpoint,
+                                    targetEndpoint: targetEndpoint
+                                )
+                            },
+                            resolveOverseerSessionIDCandidate: resolveOverseerCandidate,
+                            resolveTargetSessionIDCandidate: resolveTargetCandidate,
+                            onOpenLinkedSession: { endpoint in
+                                Task {
+                                    await AppDeepLinkRouter.shared.route(
+                                        agentSession: AgentSessionDeepLinkRoute(
+                                            windowID: endpoint.windowID,
+                                            workspaceID: endpoint.workspaceID,
+                                            tabID: endpoint.tabID,
+                                            sessionID: endpoint.sessionID
+                                        )
+                                    )
+                                }
+                            },
                             sessionIDCopyAction: .systemClipboard(sessionID: session.sessionID)
                         )
+                        .task(id: session.sessionID) { prepareOversight() }
                     }
 
                     if snapshot.hasMoreSessions {
@@ -817,6 +878,7 @@ struct AgentModeSessionsListView: View {
                                     selectionState: selectionState,
                                     renderedOrder: snapshot.renderedSelectionOrder,
                                     agentModeVM: agentModeVM,
+                                    creatorDisplayNames: agentModeVM.sidebarCreatorDisplayNames,
                                     promptManager: promptManager
                                 )
                             }
@@ -849,10 +911,7 @@ struct AgentModeSessionsListView: View {
         ) { _ in
             sessionLinkProjectionRevision &+= 1
         }
-        .onReceive(
-            NotificationCenter.default.publisher(for: .agentSessionLinkCandidatesDidChange)
-                .receive(on: DispatchQueue.main)
-        ) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .agentSessionLinkCandidatesDidChange).receive(on: DispatchQueue.main)) { _ in
             sessionLinkProjectionRevision &+= 1
         }
         .task(id: activeWorkspaceID) {
@@ -872,7 +931,9 @@ struct AgentModeSessionsListView: View {
                 renderedOrder: selectionRenderIdentity.renderedOrder,
                 workspaceID: selectionRenderIdentity.workspaceID
             )
-            if snapshot.renderedSelectionOrder.isEmpty { showingBulkDeleteConfirmation = false }
+            if snapshot.renderedSelectionOrder.isEmpty {
+                showingBulkDeleteConfirmation = false
+            }
         }
     }
 
@@ -1001,7 +1062,9 @@ struct AgentModeSessionsListView: View {
                 }
             }
 
-            if let notice = selectionState.notice { bulkNotice(notice) }
+            if let notice = selectionState.notice {
+                bulkNotice(notice)
+            }
         }
         .padding(.horizontal, bulkBarInnerHorizontalPadding)
         .padding(.vertical, bulkBarInnerVerticalPadding)
@@ -1500,6 +1563,7 @@ struct ArchivedSessionsList: View {
     let selectionState: AgentSidebarSelectionState
     let renderedOrder: [AgentSidebarSelectionIdentity]
     let agentModeVM: AgentModeViewModel
+    let creatorDisplayNames: [UUID: String]
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject private var fontScale = FontScaleManager.shared
 
@@ -1554,7 +1618,12 @@ struct ArchivedSessionsList: View {
                 )
                 let stashedSessionID = sessionIDByStashedTabID[stashed.id]
                 let creator = stashedSessionID.flatMap {
-                    agentModeVM.agentSessionLinkLaneCreator(for: $0)
+                    agentModeVM.agentSidebarLaneCreator(
+                        tabID: stashed.tab.id,
+                        expectedSessionID: $0,
+                        names: creatorDisplayNames,
+                        archived: true
+                    )
                 }
                 AgentStashedSessionRow(
                     stashed: stashed,
@@ -1562,7 +1631,7 @@ struct ArchivedSessionsList: View {
                     onOpenCreator: {
                         guard let stashedSessionID,
                               let creatorSessionID = creator?.sessionID,
-                              agentModeVM.agentSessionLinkLaneCreatorSessionID(for: stashedSessionID) == creatorSessionID
+                              agentModeVM.agentSessionLinkLaneCreatorSessionID(tabID: stashed.tab.id, expectedSessionID: stashedSessionID) == creatorSessionID
                         else { return }
                         Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
                     },
@@ -1592,7 +1661,8 @@ struct ArchivedSessionsList: View {
                     onDelete: { deleteArchived(stashed) },
                     sessionIDCopyAction: .systemClipboard(
                         sessionID: sessionIDByStashedTabID[stashed.id]
-                    )
+                    ),
+                    metrics: AgentStashedSessionRowMetrics(fontPreset: fontPreset)
                 )
             }
             if hasMore {
@@ -1610,5 +1680,23 @@ struct ArchivedSessionsList: View {
             }
         }
         .padding(.top, fontPreset.scaledClamped(4, max: 6))
+    }
+}
+
+// MARK: - Stashed Row Metrics
+
+extension AgentStashedSessionRowMetrics {
+    /// The sidebar owns the App-layer font managers; the row file itself stays free of them.
+    init(fontPreset: FontScalePreset) {
+        rowMinHeight = fontPreset.scaledClamped(30, min: 30, max: 40)
+        rowHorizontalPadding = fontPreset.scaledClamped(10, max: 14)
+        rowVerticalPadding = fontPreset.scaledClamped(6, max: 8)
+        rowCornerRadius = fontPreset.scaledClamped(16, max: 20)
+        rowSpacing = fontPreset.scaledClamped(8, max: 11)
+        titlePinSpacing = fontPreset.scaledClamped(6, max: 8)
+        titleVStackSpacing = fontPreset.scaledClamped(2, max: 3)
+        leadingIconSize = fontPreset.scaledClamped(12, max: 15)
+        pinIconSize = fontPreset.scaledClamped(10, max: 13)
+        titleFont = fontPreset.swiftUIFont(sizeAtNormal: 13)
     }
 }
