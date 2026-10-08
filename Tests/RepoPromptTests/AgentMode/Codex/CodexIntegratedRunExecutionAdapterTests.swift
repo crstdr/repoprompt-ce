@@ -166,17 +166,22 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let executable = root.appendingPathComponent("mock-codex")
+        // Keep the bounded version probe independent of Python's cold startup. This test
+        // exercises approval provenance, not external-runtime version detection.
         // Inert JSON-RPC peer: never Codex, never model/companion/TCC activity.
         let script = """
-        #!/usr/bin/python3
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+            printf 'codex 0.160.1\\n'
+            exit 0
+        fi
+        exec /usr/bin/python3 -u -c '
         import json, sys
-        if '--version' in sys.argv:
-            print('codex 0.160.1')
-            sys.exit(0)
         for line in sys.stdin:
             message = json.loads(line)
-            if 'method' in message and 'id' in message:
-                print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
+            if "method" in message and "id" in message:
+                print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+        '
         """
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
