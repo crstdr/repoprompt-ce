@@ -38,7 +38,6 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             mcpServerEnabler: mcpServerEnabler,
             testCodexComputerUseCompanionReady: companionReady,
             testCodexComputerUseReservedEntryExists: { false },
-            testCodexComputerUseHasActiveLink: { _ in false },
             testCodexLeaseRoutingTimeoutMs: 5000,
             testCodexRouteOwnerValidator: routeOwnerValidator
         )
@@ -169,81 +168,6 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         ])
     }
 
-    func testQA90ComputerUseSetupOwnershipDriftFailsClosed() async throws {
-        try await assertComputerUseSetupOwnershipDrift(manageTooling: false)
-    }
-
-    func testComputerUseSetupOwnershipDriftCleansPIDOwnedLease() async throws {
-        try await assertComputerUseSetupOwnershipDrift(manageTooling: true)
-    }
-
-    private func assertComputerUseSetupOwnershipDrift(manageTooling: Bool) async throws {
-        CodexComputerUseWorkflow.setEnabledForTesting(true)
-        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
-        for scenario in ["linked", "mcp-controlled"] {
-            let gate = TestReleaseFence(name: "QA90 suspended companion setup")
-            let fixture = manageTooling ? makeFixture([]) : nil
-            let session = fixture?.session ?? AgentTabSession(tabID: UUID())
-            session.selectedAgent = .codexExec
-            session.hasLoadedPersistedState = true
-            session.runState = .running
-            if fixture == nil { session.beginRunAttempt(source: "qa90") }
-            let committedThreadID = session.codexConversationID
-            session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-            var linked = false
-            var admittedFlags: [Bool] = []
-            var created: WedgeFakeCodexController?
-            var installedRunID: UUID?
-            let coordinator = CodexAgentModeCoordinator(
-                windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-                codexControllerFactory: { runID, _, _, _, _, _, enabled, _ in
-                    admittedFlags.append(enabled)
-                    let fake = WedgeFakeCodexController(runID: runID, responses: [.suspendedSuccess("qa90", gate)])
-                    created = fake
-                    return fake
-                },
-                connectionPolicyInstaller: { clientName, windowID, tools, oneShot, reason, ttl, tabID, runID, additional, purpose, label, externalControl, requiresPID in
-                    installedRunID = runID
-                    XCTAssertTrue(requiresPID)
-                    await ServerNetworkManager.shared.installClientConnectionPolicy(
-                        for: clientName, windowID: windowID, restrictedTools: tools,
-                        oneShot: oneShot, reason: reason, ttl: ttl, tabID: tabID,
-                        runID: runID, additionalTools: additional, purpose: purpose,
-                        taskLabelKind: label, allowsAgentExternalControlTools: externalControl,
-                        requiresExpectedAgentPID: requiresPID
-                    )
-                },
-                shouldManageCodexTooling: manageTooling, computerUseCompanionReady: { true },
-                computerUseReservedEntryExists: { false }, computerUseHasActiveLink: { _ in linked },
-                codexHookApprovalSettings: GlobalSettingsStore.shared
-            )
-            if let fixture { coordinator.attach(viewModel: fixture.viewModel) }
-            let startup = Task { await coordinator.ensureCodexNativeSession(session: session) }
-            let entered = await gate.waitUntilEntered(timeout: 4)
-            XCTAssertTrue(entered)
-            if manageTooling, let installedRunID {
-                let pendingPolicy = await hasPendingPolicy(for: installedRunID)
-                XCTAssertTrue(pendingPolicy, "The probe must cross the real PID-owned lease boundary")
-            }
-            if scenario == "linked" { linked = true }
-            else { session.mcpControlActivationGeneration &+= 1 }
-            gate.release()
-            await startup.value
-            XCTAssertEqual(admittedFlags, [true], "Probe must cross the armed setup boundary")
-            XCTAssertNotEqual(session.codexControllerFeatureState?.computerUseEnabled, true, "Newly excluded session must not retain a companion-enabled controller")
-            XCTAssertNil(session.pendingCodexComputerUseActivation, "Excluded activation must be cleared")
-            XCTAssertEqual(created?.startedTurnCount, 0)
-            XCTAssertEqual(session.codexConversationID, committedThreadID, "An excluded startup must never publish its returned thread")
-            XCTAssertFalse(coordinator.test_hasPendingCodexStart(for: session))
-            if let installedRunID {
-                let policyRemains = await hasPendingPolicy(for: installedRunID)
-                XCTAssertFalse(policyRemains, "Excluded startup must release its PID-owned policy")
-            }
-            await coordinator.shutdownCodexSession(session)
-            XCTAssertGreaterThanOrEqual(created?.shutdownCount ?? 0, 1)
-        }
-    }
-
     func testComputerUseIconProjectionIsPureAndHidesIneligibleChats() throws {
         var discoveries = 0
         let fixture = makeFixture([], companionReady: { discoveries += 1
@@ -265,10 +189,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(vm.computerUseComposerProps(session: session), .hidden)
         session.parentSessionID = nil
         session.mcpControlActivationGeneration = 1
-        XCTAssertEqual(vm.computerUseComposerProps(session: session), .hidden)
+        XCTAssertTrue(vm.computerUseComposerProps(session: session).isVisible)
         session.mcpControlActivationGeneration = 0
         session.createdByOverseerSessionID = UUID()
-        XCTAssertEqual(vm.computerUseComposerProps(session: session), .hidden)
+        XCTAssertTrue(vm.computerUseComposerProps(session: session).isVisible)
         session.createdByOverseerSessionID = nil
         _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: session.tabID)
@@ -283,8 +207,40 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 providerDisplayName: nil
             )], recentNotices: [], canAddReason: nil
         )
-        XCTAssertEqual(vm.computerUseComposerProps(session: session), .hidden)
+        XCTAssertTrue(vm.computerUseComposerProps(session: session).isVisible)
         XCTAssertEqual(discoveries, 0, "Painting must never discover or provision the companion")
+    }
+
+    func testComputerUseMCPTopLevelCanArmButChildAndDeliveredCommandsCannot() async {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture([])
+        let vm = fixture.viewModel
+        let session = fixture.session
+        session.runState = .idle
+        session.isMCPOriginated = true
+        session.createdByOverseerSessionID = UUID()
+        session.mcpControlActivationGeneration = 1
+        for local in [false, true] {
+            let result = vm.submitUserTurn(text: "/computer-use inspect the screen", tabID: session.tabID, isLocalComposerInput: local)
+            guard case .blocked = result else { return XCTFail("Only an admitted composer claim may arm") }
+            XCTAssertFalse(session.isCodexComputerUseArmed)
+        }
+        await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
+        XCTAssertTrue(session.isCodexComputerUseArmed)
+        let admitted = await fixture.coordinator.test_computerUseForNextTurn(session: session)
+        XCTAssertTrue(admitted)
+        await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
+        session.parentSessionID = UUID()
+        await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
+        XCTAssertFalse(session.isCodexComputerUseArmed)
+        let childMessage = await vm.armComputerUseForLocalUser(session: session)
+        XCTAssertEqual(childMessage, CodexComputerUseWorkflow.ineligibleMessage)
+        let detached = AgentTabSession(tabID: UUID())
+        detached.selectedAgent = .codexExec
+        let detachedMessage = await vm.armComputerUseForLocalUser(session: detached)
+        XCTAssertEqual(detachedMessage, CodexComputerUseWorkflow.ineligibleMessage)
+        XCTAssertEqual(CodexComputerUseWorkflow.ineligibleMessage, "Computer Use requires a top-level native Codex session with its own tab, the feature enabled, and an available companion. Enable it locally in that tab.")
     }
 
     func testComputerUseIconOptInCancelArmAndDisarm() async {
@@ -520,10 +476,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await coordinator.shutdownCodexSession(restored.session)
     }
 
-    func testComputerUseMidTurnOwnershipRevocationInterruptsAndRetiresController() async throws {
+    func testComputerUseMidTurnDisarmInterruptsAndRetiresController() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
-        for reason in ["session-link", "mcp-control"] {
+        for reason in ["user-off", "setting-off"] {
             let fixture = makeFixture([])
             _ = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(fixture.session))
             let coordinator = makeComputerUseCoordinator(fixture: fixture) { runID, _ in
@@ -534,13 +490,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             await coordinator.ensureCodexNativeSession(session: session)
             let controller = try XCTUnwrap(session.codexController as? WedgeFakeCodexController)
             await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "computer-use-turn"), session: session, sourceController: controller)
-            if reason == "session-link" {
-                let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
-                await fixture.viewModel.agentSessionLinkWillActivate(endpoint)
-            } else {
-                await coordinator.revokeCodexComputerUse(session: session, reason: reason)
-                session.mcpControlActivationGeneration &+= 1
-            }
+            await coordinator.revokeCodexComputerUse(session: session, reason: reason)
             XCTAssertNil(session.pendingCodexComputerUseActivation)
             XCTAssertNil(session.codexController)
             XCTAssertNil(session.codexControllerFeatureState)
@@ -562,7 +512,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             codexControllerFactory: { runID, _, _, _, _, _, enabled, _ in factory(runID, enabled) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, computerUseCompanionReady: { true },
-            computerUseReservedEntryExists: { false }, computerUseHasActiveLink: { _ in false },
+            computerUseReservedEntryExists: { false },
             codexHookApprovalSettings: GlobalSettingsStore.shared
         )
         coordinator.attach(viewModel: fixture.viewModel)
@@ -575,8 +525,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let fixture = makeFixture([])
         let gate = TestReleaseFence(name: "Computer Use final scope validation")
         var routeOwned = true
-        var routeValidated = false
-        weak var coordinatorForProbe: CodexAgentModeCoordinator?
+        var routeChecks = 0
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
             codexControllerFactory: { runID, _, _, _, _, _, _, _ in
@@ -592,16 +541,13 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 )
             },
             routeOwnerValidator: { _, _, _, _ in
-                routeValidated = true
+                routeChecks += 1
+                if routeChecks == 2 { await gate.enterAndWait() }
                 return routeOwned
             },
             shouldManageCodexTooling: true, computerUseCompanionReady: { true },
-            computerUseReservedEntryExists: { false }, computerUseHasActiveLink: { session in
-                if routeValidated, coordinatorForProbe?.test_hasPendingCodexStart(for: session) == true { await gate.enterAndWait() }
-                return false
-            }, codexHookApprovalSettings: GlobalSettingsStore.shared
+            computerUseReservedEntryExists: { false }, codexHookApprovalSettings: GlobalSettingsStore.shared
         )
-        coordinatorForProbe = coordinator
         coordinator.attach(viewModel: fixture.viewModel)
         let session = fixture.session
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
@@ -714,7 +660,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(controller.interruptedTurnIDs, ["armed-turn"])
     }
 
-    func testComputerUseOwnershipClaimJoinsAlreadyDetachedCompanionRetirement() async throws {
+    func testComputerUseDisarmJoinsAlreadyDetachedCompanionRetirement() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
         let fixture = makeFixture([])
@@ -737,7 +683,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         var claimCompleted = false
         let claim = Task {
             claimBegan = true
-            await coordinator.revokeCodexComputerUse(session: session, reason: "mcp-control")
+            await coordinator.revokeCodexComputerUse(session: session, reason: "setting-off")
             claimCompleted = true
         }
         try await AsyncTestWait.waitUntil("ownership claim begins", timeout: 4) { claimBegan }
@@ -761,7 +707,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await coordinator.ensureCodexNativeSession(session: session)
         let controller = try XCTUnwrap(session.codexController as? WedgeFakeCodexController)
         controller.shutdownGate = gate
-        let first = Task { await coordinator.revokeCodexComputerUse(session: session, reason: "session-link") }
+        let first = Task { await coordinator.revokeCodexComputerUse(session: session, reason: "user-off") }
         let entered = await gate.waitUntilEntered(timeout: 4)
         XCTAssertTrue(entered)
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
@@ -771,7 +717,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         var secondCompleted = false
         let second = Task {
             secondBegan = true
-            await coordinator.revokeCodexComputerUse(session: session, reason: "mcp-control")
+            await coordinator.revokeCodexComputerUse(session: session, reason: "setting-off")
             secondCompleted = true
         }
         try await AsyncTestWait.waitUntil("second revocation begins", timeout: 4) { secondBegan }
