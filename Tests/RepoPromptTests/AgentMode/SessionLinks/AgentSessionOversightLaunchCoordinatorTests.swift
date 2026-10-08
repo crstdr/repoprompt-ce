@@ -17,7 +17,20 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     /// Endpoint host with a full window topology: descriptors, discovery levels, and a restore
     /// topology reason. The focused bridge tests elsewhere rely on the protocol defaults instead.
     private final class FakeHost: AgentSessionLinkEndpointHost {
-        var candidates: [AgentSessionLinkEndpointCandidate] = []
+        var candidates: [AgentSessionLinkEndpointCandidate] = [] {
+            didSet {
+                byEndpoint = Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
+                bySession = Dictionary(grouping: candidates, by: \.sessionID)
+            }
+        }
+
+        private var byEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate] = [:]
+        private var bySession: [UUID: [AgentSessionLinkEndpointCandidate]] = [:]
+        private(set) var projectionCount = 0
+        private(set) var candidateCallCount = 0
+        private(set) var boundedCandidateVisits = 0
+        private(set) var fullCandidateVisits = 0
+        var beforeUUIDCensus: (() -> Void)?
         /// Drift only after the coordinator's descriptor-backed classification snapshot. Bootstrap
         /// presentation reads candidates too, so a raw call index is not an establishment boundary.
         var candidatesAfterClassification: [AgentSessionLinkEndpointCandidate]?
@@ -45,16 +58,25 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         func agentSessionLinkCandidate(
             for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation _: Bool
         ) -> AgentSessionLinkEndpointCandidate? {
-            candidates.first { $0.domainEndpoint == endpoint }
+            let candidate = byEndpoint[endpoint]
+            boundedCandidateVisits += candidate == nil ? 0 : 1
+            return candidate
         }
 
         func agentSessionLinkCandidates(
             forSessionIDs sessionIDs: Set<UUID>, includeLocation _: Bool
         ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
-            Dictionary(uniqueKeysWithValues: sessionIDs.map { id in (id, candidates.filter { $0.sessionID == id }) })
+            beforeUUIDCensus?()
+            return Dictionary(uniqueKeysWithValues: sessionIDs.map { id in
+                let matches = bySession[id] ?? []
+                boundedCandidateVisits += matches.count
+                return (id, matches)
+            })
         }
 
         func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
+            candidateCallCount += 1
+            fullCandidateVisits += candidates.count
             let snapshot = candidates
             if classificationSnapshotPending, let successor = candidatesAfterClassification {
                 classificationSnapshotPending = false
@@ -117,7 +139,9 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         func agentSessionLinkPublishProjection(
             _: AgentMonitorPillProps,
             to _: DomainAgentSessionLinkEndpointIdentity
-        ) {}
+        ) {
+            projectionCount += 1
+        }
 
         func agentSessionLinkPublishPromptInventory(
             _: AgentSessionLinkPromptInventory,
@@ -482,6 +506,167 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertLessThan(restartTime, budget)
         restarted.host.hydrationHandler = nil
         print("RESTORE_SCALE chats=\(chatCount) windows=3 overseers=3 links=10 launch=\(launchTime) reopen=\(reopenTime) restart=\(restartTime) budget=5s/phase")
+    }
+
+    func testScaleRestoreRefreshAndMenuBudgets() async throws {
+        var baselineWork: (fullReads: Int, boundedVisits: Int)?
+        for chatCount in [30, 300] {
+            let candidates = (0 ..< chatCount).map { index in
+                makeReadyCandidate(windowID: index % 3 + 1, sessionID: UUID())
+            }
+            let intents = (0 ..< 10).map { index in
+                AgentSessionOversightIntent(
+                    observerSessionID: candidates[index / 2].sessionID,
+                    targetSessionID: candidates[5 + index].sessionID
+                )
+            }
+            try JSONEncoder().encode(AgentSessionOversightIntentDocument(links: intents)).write(
+                to: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename)
+            )
+            let fixture = makeFixture()
+            defer { fixture.bridge.freezeForTermination() }
+            fixture.host.candidates = candidates
+            fixture.host.descriptors = candidates.map { descriptor(for: $0) }
+            fixture.host.discovery = (1 ... 3).map { windowID in
+                AgentSessionLinkDiscoveryState(
+                    epoch: AgentSessionLinkDiscoveryEpoch(windowID: windowID, workspaceID: UUID(), generation: 1),
+                    isComplete: true
+                )
+            }
+            func milliseconds(since start: ContinuousClock.Instant) -> Double {
+                let elapsed = start.duration(to: .now).components
+                return Double(elapsed.seconds) * 1000 + Double(elapsed.attoseconds) / 1e15
+            }
+            let restoreStart = ContinuousClock.now
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            await fixture.bridge.test_settleProjections()
+            let restoreMS = milliseconds(since: restoreStart)
+            XCTAssertLessThanOrEqual(restoreMS, 1000, "READY 300/3/5/10 restore budget")
+            for intent in intents {
+                XCTAssertEqual(fixture.bridge.test_launchEntryState(for: intent), .active)
+            }
+            let activeCount = await fixture.authority.snapshot().activeLinkCount
+            XCTAssertEqual(activeCount, 10)
+            XCTAssertLessThanOrEqual(fixture.host.projectionCount, 35, "At most two endpoints per activation plus one 15-endpoint full drain, never 300 chats per link")
+            let restoreReads = fixture.host.candidateCallCount
+            let restoreVisits = fixture.host.boundedCandidateVisits
+            let restorePublications = fixture.host.projectionCount
+            let restoreFullVisits = fixture.host.fullCandidateVisits
+            if let baselineWork {
+                XCTAssertEqual(restoreReads, baselineWork.fullReads, "Full discovery count must not grow with unrelated chats")
+                XCTAssertEqual(restoreVisits, baselineWork.boundedVisits, "Include fork display-name fallbacks in the bounded-work comparison")
+            } else {
+                baselineWork = (restoreReads, restoreVisits)
+            }
+            XCTAssertLessThanOrEqual(restoreReads, 5, "Only initial topology/discovery and final drain may enumerate")
+            XCTAssertLessThanOrEqual(fixture.host.fullCandidateVisits, 5 * chatCount)
+            XCTAssertLessThanOrEqual(restoreVisits, 500, "Per-link proof and membership work must not scale with unrelated chats")
+            let subject = candidates[chatCount - 1]
+            let expectedInputs = await fixture.authority.projectionInputs(forEndpoint: subject.domainEndpoint)
+            let expectedMenu = AgentSidebarOversightMenuProjection.make(target: subject, inputs: expectedInputs, candidates: candidates)
+            var refreshSamples: [Double] = []
+            var menuSamples: [Double] = []
+            for sample in 0 ... 20 {
+                let reads = fixture.host.candidateCallCount
+                let start = ContinuousClock.now
+                await fixture.bridge.test_settleProjections()
+                let refreshMS = milliseconds(since: start)
+                XCTAssertEqual(fixture.host.candidateCallCount - reads, 2)
+                let summaryReads = fixture.host.candidateCallCount
+                XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: subject.domainEndpoint)?.availableObserverCount, 5)
+                XCTAssertEqual(fixture.host.candidateCallCount, summaryReads, "Closed row must not enumerate candidates")
+                let menuStart = ContinuousClock.now
+                let menu = fixture.bridge.sidebarOversightMenu(for: subject.domainEndpoint)
+                let menuMS = milliseconds(since: menuStart)
+                XCTAssertEqual(menu, expectedMenu)
+                XCTAssertEqual(fixture.host.candidateCallCount - summaryReads, 1)
+                if sample > 0 { refreshSamples.append(refreshMS)
+                    menuSamples.append(menuMS)
+                }
+            }
+            let sparseReads = fixture.host.candidateCallCount
+            await fixture.bridge.test_refreshStatus(sessionIDs: [candidates[0].sessionID])
+            XCTAssertEqual(fixture.host.candidateCallCount, sparseReads, "Sparse status performs no full discovery")
+            XCTAssertLessThanOrEqual(refreshSamples.sorted()[18], 50, "Warm full refresh nearest-rank p95 budget")
+            XCTAssertLessThanOrEqual(menuSamples.sorted()[18], 50, "Open-time menu nearest-rank p95 budget")
+            XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+            XCTAssertTrue(fixture.host.hydrationRequests.isEmpty)
+            print("OVERSIGHT_SCALE chats=\(chatCount) windows=3 observers=5 links=10 restoreMS=\(restoreMS) restoreReads=\(restoreReads) restoreVisits=\(restoreVisits) fullVisits=\(restoreFullVisits) publications=\(restorePublications) refreshMS=\(refreshSamples) menuMS=\(menuSamples)")
+        }
+    }
+
+    func testDuplicateArrivingAfterClassificationStillRefusesUUIDRestore() async throws {
+        try seedSavedPair()
+        let fixture = makeFixture()
+        defer { fixture.bridge.freezeForTermination() }
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        let duplicate = makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+        fixture.host.candidates = [observer, target]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+        fixture.host.beforeUUIDCensus = { fixture.host.candidates = [observer, target, duplicate] }
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let snapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(snapshot.activeLinkCount, 0)
+        XCTAssertEqual(snapshot.pendingReservationCount, 0)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.activationFailed))
+    }
+
+    func testBothExactHydrationProofsAreFreshAfterReservation() async throws {
+        for driftObserver in [false, true] {
+            try seedSavedPair()
+            let fixture = makeFixture()
+            defer { fixture.bridge.freezeForTermination() }
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+            let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+            let drifting = driftObserver ? observer : target
+            let binding = try XCTUnwrap(drifting.restorationReadiness.bindingToken)
+            fixture.host.candidates = [observer, target]
+            fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+            fixture.bridge.test_afterReservationBeforeActivation = { _ in
+                let current = self.withReadiness(drifting, .terminal(binding, .sourceRevisionSuperseded))
+                fixture.host.candidates = driftObserver ? [current, target] : [observer, current]
+            }
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let snapshot = await fixture.authority.snapshot()
+            let token = await fixture.store.token(for: pair)
+            XCTAssertEqual(snapshot.activeLinkCount, 0)
+            XCTAssertEqual(snapshot.pendingReservationCount, 0)
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+            XCTAssertNotNil(token, "Transient exact proof drift must wait, not retire")
+        }
+    }
+
+    func testDirtyPassRestartsDiscoveryBeforeReservingALaterPair() async throws {
+        let candidates = (1 ... 4).map { makeReadyCandidate(windowID: $0, sessionID: UUID()) }
+        let pairs = [0, 2].map {
+            AgentSessionOversightIntent(observerSessionID: candidates[$0].sessionID, targetSessionID: candidates[$0 + 1].sessionID)
+        }
+        try JSONEncoder().encode(AgentSessionOversightIntentDocument(links: pairs)).write(
+            to: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename)
+        )
+        let fixture = makeFixture()
+        defer { fixture.bridge.freezeForTermination() }
+        fixture.host.candidates = candidates
+        fixture.host.descriptors = candidates.map { descriptor(for: $0) }
+        let epoch = fixture.host.discovery[0].epoch
+        fixture.bridge.test_afterReservationBeforeActivation = { _ in
+            fixture.bridge.test_afterReservationBeforeActivation = nil
+            fixture.host.discovery = [AgentSessionLinkDiscoveryState(epoch: epoch, isComplete: false)]
+            fixture.bridge.noteTopologyMayHaveChanged()
+        }
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1, "A dirty pass cannot spend the later pair's allowance")
+        fixture.host.discovery = [AgentSessionLinkDiscoveryState(epoch: epoch, isComplete: true)]
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let snapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(snapshot.activeLinkCount, 2)
+        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 2)
     }
 
     // MARK: - Same-process window reopen

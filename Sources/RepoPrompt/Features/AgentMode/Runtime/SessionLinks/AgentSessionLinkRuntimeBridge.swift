@@ -1234,6 +1234,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     #if DEBUG
         var test_afterPresentationSnapshot: (@MainActor () async -> Void)?
+        var test_afterMonitorProjection: (@MainActor () async -> Void)?
         /// Fault injection for native tracking tests: hide coherent UI inputs without installing
         /// another catalog or blocking AppKit's nested run loop on an async authority turn.
         var test_menuCatalogUnavailable = false
@@ -2990,7 +2991,9 @@ final class AgentSessionLinkRuntimeBridge {
         let observerSessionID = pair.observerSessionID
         let targetSessionID = pair.targetSessionID
 
-        let candidates = host.agentSessionLinkCandidates()
+        let candidates = host.agentSessionLinkCandidates(
+            forSessionIDs: [observerSessionID, targetSessionID], includeLocation: true
+        ).values.flatMap(\.self)
         let observer: AgentSessionLinkEndpointCandidate
         switch resolveAddCandidate(
             sessionID: observerSessionID,
@@ -3053,7 +3056,7 @@ final class AgentSessionLinkRuntimeBridge {
         let observerEndpoint = observer.domainEndpoint
         let targetEndpoint = target.domainEndpoint
         // Exact callers add one more incarnation fence immediately before reservation. Ordinary
-        // Add/restoration pass no expectations and retain their existing candidate-read count.
+        // Add/restoration retain the UUID-unique initial resolution above.
         if !expectedEndpoints.isEmpty,
            !liveCandidatesStillMatch(expectedEndpoints, pair: pair)
         {
@@ -3228,14 +3231,10 @@ final class AgentSessionLinkRuntimeBridge {
         #endif
         // Synchronous seed: revalidate both live identities on MainActor, then build the initial
         // sanitized snapshot before the link can become visible to any operation.
-        let liveCandidates = host.agentSessionLinkCandidates()
-        guard !isFrozenForTermination, let liveTarget = liveCandidates.first(where: { $0.domainEndpoint == targetEndpoint }),
-              liveCandidates.contains(where: { $0.domainEndpoint == observerEndpoint }),
-              expectedEndpoints.isEmpty || liveCandidatesMatch(
-                  expectedEndpoints,
-                  pair: pair,
-                  candidates: liveCandidates
-              )
+        guard !isFrozenForTermination,
+              let liveObserver = host.agentSessionLinkCandidate(for: observerEndpoint, includeLocation: true),
+              let liveTarget = host.agentSessionLinkCandidate(for: targetEndpoint, includeLocation: true),
+              expectedEndpoints.isEmpty || liveCandidatesStillMatch(expectedEndpoints, pair: pair)
         else {
             await authority.abandonReservation(reservation)
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
@@ -3245,7 +3244,7 @@ final class AgentSessionLinkRuntimeBridge {
         // that rebound during the reserve hop can present the same endpoint identity with a fresh
         // pending proof, and reauthorizing that would grant against a transcript this process has
         // not proved it read.
-        if let proof, !proof.matches(liveCandidates: liveCandidates) {
+        if let proof, !proof.matches(observer: liveObserver, target: liveTarget) {
             await authority.abandonReservation(reservation)
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
             return EstablishmentResult(outcome: .failed(.rebinding))
@@ -3442,8 +3441,11 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Whether both proved incarnations are still live with the same authoritative hydration proof.
     private func liveCandidatesStillMatch(_ proof: AgentSessionOversightRestorationProof) -> Bool {
-        guard let host else { return false }
-        return proof.matches(liveCandidates: host.agentSessionLinkCandidates())
+        guard let host,
+              let observer = host.agentSessionLinkCandidate(for: proof.observerEndpoint, includeLocation: true),
+              let target = host.agentSessionLinkCandidate(for: proof.targetEndpoint, includeLocation: true)
+        else { return false }
+        return proof.matches(observer: observer, target: target)
     }
 
     private func liveCandidatesStillMatch(
@@ -3451,11 +3453,19 @@ final class AgentSessionLinkRuntimeBridge {
         pair: AgentSessionOversightIntent
     ) -> Bool {
         guard let host else { return false }
-        return liveCandidatesMatch(
-            expectations,
-            pair: pair,
-            candidates: host.agentSessionLinkCandidates()
-        )
+        // Exact expectations address their presented incarnation. An unspecified endpoint keeps
+        // the pasted-UUID resolver's ambiguity policy, with only that UUID's fresh census.
+        var requestedIDs = Set<UUID>()
+        if expectations.observer == nil { requestedIDs.insert(pair.observerSessionID) }
+        if expectations.target == nil { requestedIDs.insert(pair.targetSessionID) }
+        var candidates = requestedIDs.isEmpty ? [] : host.agentSessionLinkCandidates(
+            forSessionIDs: requestedIDs, includeLocation: true
+        ).values.flatMap(\.self)
+        for endpoint in [expectations.observer, expectations.target].compactMap(\.self) {
+            guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: true) else { return false }
+            candidates.append(candidate)
+        }
+        return liveCandidatesMatch(expectations, pair: pair, candidates: candidates)
     }
 
     private func liveCandidatesMatch(
@@ -4155,7 +4165,7 @@ final class AgentSessionLinkRuntimeBridge {
         var fullCandidates: [AgentSessionLinkEndpointCandidate] = []
         if scope.isFull {
             await sweepStaleEndpoints(liveCandidates: host.agentSessionLinkCandidates(includeLocation: false))
-            guard !isFrozenForTermination else { return }
+            guard !isFrozenForTermination, self.host === host else { return }
             fullCandidates = host.agentSessionLinkCandidates(includeLocation: false)
         }
         let previousCatalog = menuCatalog
@@ -4208,7 +4218,7 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         for endpoint in endpoints {
-            guard !isFrozenForTermination else { return }
+            guard !isFrozenForTermination, self.host === host else { return }
             // Re-read exact ownership after the authority hop; a displaced endpoint cannot clear
             // or label its successor. UI empty defaults never enter this publication path.
             guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: true),
@@ -4217,14 +4227,13 @@ final class AgentSessionLinkRuntimeBridge {
                 projectedEndpoints.remove(endpoint)
                 continue
             }
-            let projection = await makeProjection(
+            guard let projection = await makeProjection(
                 for: candidate,
                 inputs: inputs,
                 candidatesByEndpoint: scope.isFull ? fullMap : presentationCandidates(for: endpoint, inputs: inputs)
-            )
-            guard !isFrozenForTermination, self.host === host,
-                  host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil
-            else { continue }
+            ) else { return }
+            guard !isFrozenForTermination, self.host === host else { return }
+            guard host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil else { continue }
             host.agentSessionLinkPublishProjection(projection.props, to: endpoint)
             // Membership holds and inventory revisions remain the publication fence.
             host.agentSessionLinkPublishPromptInventory(projection.promptInventory, to: endpoint)
@@ -4238,10 +4247,15 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         if availabilityChanged { notifyCandidateAvailabilityChanged() }
+        // A missing observer cannot reconcile its last-link projection. Retire that exact queue
+        // even during sparse refreshes, looking up only existing reducer owners through the host index.
+        let livePassiveOwners = Set(passiveNoticesByObserver.keys.filter {
+            host.agentSessionLinkCandidate(for: $0, includeLocation: false) != nil
+        })
+        prunePassiveNotices(liveEndpoints: livePassiveOwners)
         if scope.isFull {
             let live = Set(fullCandidates.map(\.domainEndpoint))
             projectedEndpoints.formIntersection(live)
-            prunePassiveNotices(liveEndpoints: live)
             await reconcilePendingSends()
         }
     }
@@ -4350,22 +4364,27 @@ final class AgentSessionLinkRuntimeBridge {
         for candidate: AgentSessionLinkEndpointCandidate,
         inputs: DomainAgentSessionLinkEndpointProjectionInputs,
         candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate]
-    ) async -> EndpointProjection {
+    ) async -> EndpointProjection? {
+        guard !isFrozenForTermination, let host else { return nil }
         let monitor = await makeMonitorProjection(
             for: candidate, inputs: inputs, candidatesByEndpoint: candidatesByEndpoint,
             collectsStatusSamples: true
         )
+        #if DEBUG
+            await test_afterMonitorProjection?()
+        #endif
+        guard !isFrozenForTermination, self.host === host else { return nil }
         // Reconciled here rather than inside the row builder, because this is the only pass that is
         // authoritative about membership *and* status at once.
         // One post-await snapshot serves both eligibility and app-wide UUID uniqueness. Empty,
         // unrelated chats need neither. Do not share this freshness-sensitive snapshot across hops.
         let needsFreshCandidates = passiveNoticesByObserver[candidate.domainEndpoint] != nil
             || !monitor.statusSamples.isEmpty || !inputs.outbound.items.isEmpty
-        let freshCandidates = needsFreshCandidates ? host?.agentSessionLinkCandidates(
+        let freshCandidates = needsFreshCandidates ? host.agentSessionLinkCandidates(
             forSessionIDs: Set(inputs.outbound.items.map(\.targetSessionID)), includeLocation: false
-        ).values.flatMap(\.self) ?? [] : []
+        ).values.flatMap(\.self) : []
         let currentCandidate = needsFreshCandidates
-            ? host?.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: false) : nil
+            ? host.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: false) : nil
         let passiveNotices = reconcilePassiveNotices(
             for: candidate,
             samples: monitor.statusSamples,

@@ -1624,15 +1624,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     func testSeedFailureRollsBackTheReservationAndLeavesNoActiveLink() async {
         let fixture = makeFixture()
-        // Drift between the resolution read and the post-reservation revalidation read.
-        //
-        // Add takes three candidate snapshots: (1) the pre-persistence preflight that renders the
-        // popover's message, (2) the shared establishment path's own fresh resolution, and (3) the
-        // post-reservation revalidation. Only a drift landing after (2) exercises the seed rollback;
-        // dropping the target before (2) is an ordinary `.notFound` resolution failure instead.
-        fixture.host.onCandidatesRead = { [weak host = fixture.host] count in
-            guard count == 3, let host else { return }
-            host.candidates = [fixture.observer]
+        // Rebind after reservation, preserving the UUID but replacing the exact incarnation.
+        fixture.bridge.test_beforeSynchronousSeed = {
+            fixture.host.candidates = [fixture.observer, self.makeCandidate(
+                windowID: fixture.target.windowID, sessionID: fixture.target.sessionID,
+                workspaceID: fixture.target.workspaceID, tabID: fixture.target.tabID,
+                displayName: "Replacement"
+            )]
         }
         let outcome = await addLink(fixture)
         XCTAssertEqual(outcome, .failed(.rebinding))
@@ -3348,6 +3346,39 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
     }
 
+    func testSparseRefreshRetiresMissingPassiveOwnerWithoutTouchingLiveSibling() async throws {
+        let fixture = makeFixture()
+        let sibling = makeCandidate(windowID: 3, displayName: "Live observer")
+        fixture.host.candidates.append(sibling)
+        guard case .added = await addLink(fixture),
+              case .added = await fixture.bridge.addMonitorLink(
+                  observerEndpoint: sibling.domainEndpoint,
+                  targetEndpoint: fixture.target.domainEndpoint
+              )
+        else { return XCTFail("missing active links") }
+        await settlePassive(fixture)
+        await publishTargetActivity(fixture, status: .running, activity: 200)
+        await publishTargetActivity(fixture, status: .idle, activity: 300)
+        let retired = try XCTUnwrap(passiveSnapshot(fixture))
+        let receipt = AgentSessionLinkPassiveStatusNotices.Receipt(snapshot: retired)
+
+        // Close an exact observer while another observer keeps the same target live. Its missing
+        // candidate prevents ordinary last-link projection reconciliation from clearing the queue.
+        fixture.host.candidates = [fixture.target, sibling]
+        await fixture.bridge.invalidate(endpoint: fixture.observer.domainEndpoint, reason: .observerEndpointInvalidated)
+        await fixture.authority.clearRecentRevocationNotices(forEndpoint: fixture.observer.domainEndpoint)
+        let liveQueue = try XCTUnwrap(passiveSnapshot(fixture, observer: sibling))
+        let fullReads = fixture.host.candidateReadCount
+        await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.target.sessionID])
+        XCTAssertEqual(fixture.host.candidateReadCount, fullReads, "Sparse cleanup must not enumerate global candidates")
+        XCTAssertEqual(passiveSnapshot(fixture, observer: sibling), liveQueue, "Unrelated live ownership and its queued edge remain intact")
+
+        let publications = fixture.host.passiveNoticePublicationCount
+        fixture.bridge.applyPassiveMonitorNoticeReceipt(receipt, observerEndpoint: fixture.observer.domainEndpoint)
+        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, publications, "A delayed receipt must find no retired reducer to republish")
+        XCTAssertEqual(passiveSnapshot(fixture), retired, "Nothing may publish to the closed incarnation")
+    }
+
     func testPassiveReceiptAppliesOncePerQueueRevisionAndRepublishesImmediately() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
@@ -4109,6 +4140,30 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await fixture.bridge.test_settleMonitorProjectionRefresh()
         XCTAssertNotNil(fixture.bridge.sidebarOversightMenu(for: third.domainEndpoint))
         XCTAssertNil(replacementHost.publishedInventoriesByEndpoint[third.domainEndpoint])
+    }
+
+    func testRefreshAbandonsPublicationsWhenFrozenAfterStatusCollection() async {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        await fixture.bridge.test_settleProjections()
+        await fixture.bridge.test_settleCandidateAvailabilityNotifications()
+        let gate = TestReleaseFence(name: "status collection completed")
+        defer { gate.release() }
+        fixture.bridge.test_afterMonitorProjection = { await gate.enterAndWait() }
+        let refresh = Task { @MainActor in
+            await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID])
+        }
+        guard await gate.waitUntilEntered() else { return }
+        fixture.bridge.freezeForTermination()
+        let props = fixture.host.publishedPropsByEndpoint
+        let inventories = fixture.host.publishedInventoriesByEndpoint
+        let passive = fixture.host.publishedPassiveNoticesByEndpoint
+        gate.release()
+        await refresh.value
+        XCTAssertEqual(fixture.host.publishedPropsByEndpoint, props)
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint, inventories)
+        XCTAssertEqual(fixture.host.publishedPassiveNoticesByEndpoint, passive)
+        XCTAssertNil(fixture.bridge.sidebarOversightSummary(for: fixture.observer.domainEndpoint))
     }
 
     func testSparseCatalogClearsEvictedNoticesAndSerializedEqualRevisionDismissal() async throws {

@@ -59,13 +59,15 @@ extension AgentModeViewModel {
     /// - Parameter isWindowClosing: the owning window's `isClosing` flag. A closing window's tabs are
     ///   never offered as endpoints.
     func agentSessionLinkCandidates(isWindowClosing: Bool, includeLocation: Bool = true) -> [AgentSessionLinkEndpointCandidate] {
-        guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else { return [] }
-        return workspace.composeTabs.compactMap { tab in
-            guard let sessionID = tab.activeAgentSessionID else { return nil }
-            return agentSessionLinkCandidate(
-                workspaceID: workspace.id, tabID: tab.id, sessionID: sessionID,
-                tabName: tab.name, isWindowClosing: isWindowClosing, includeLocation: includeLocation
-            )
+        guard let workspaceManager else { return [] }
+        return workspaceManager.workspaces.filter { $0.id == workspaceManager.activeWorkspaceID }.flatMap { workspace in
+            workspace.composeTabs.compactMap { tab in
+                guard let sessionID = tab.activeAgentSessionID else { return nil }
+                return agentSessionLinkCandidate(
+                    tabID: tab.id, sessionID: sessionID, tabName: tab.name,
+                    isWindowClosing: isWindowClosing, includeLocation: includeLocation
+                )
+            }
         }
     }
 
@@ -89,10 +91,10 @@ extension AgentModeViewModel {
         var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
         guard let workspaceManager, let workspaceID = workspaceManager.activeWorkspaceID else { return result }
         for sessionID in sessionIDs {
-            result[sessionID] = workspaceManager.oversightTabs(workspaceID: workspaceID, sessionID: sessionID)
+            result[sessionID] = workspaceManager.agentSessionLifecycleTabs(workspaceID: workspaceID, sessionID: sessionID)
                 .compactMap { tab in
                     agentSessionLinkCandidate(
-                        workspaceID: workspaceID, tabID: tab.id, sessionID: sessionID,
+                        tabID: tab.id, sessionID: sessionID,
                         tabName: tab.name, isWindowClosing: false, includeLocation: includeLocation
                     )
                 }

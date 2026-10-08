@@ -1026,21 +1026,15 @@ class WorkspaceManagerViewModel: ObservableObject {
                 },
                 uniquingKeysWith: { _, _ in [:] }
             )
-            oversightSessionTabIDs = Dictionary(
-                workspaces.map { workspace in
-                    (workspace.id, Dictionary(grouping: workspace.composeTabs.compactMap { tab in
-                        tab.activeAgentSessionID.map { ($0, tab.id) }
-                    }, by: { $0.0 }).mapValues { $0.map(\.1) })
-                },
-                uniquingKeysWith: { _, _ in [:] }
-            )
             // Lifecycle lookup has different duplicate semantics from model routing: preserve the
             // first exact tab/session match in array order, including across duplicate workspace IDs.
             // These positions are derived alongside the routing indexes, never a second authority.
             lifecycleBindingPositions.removeAll(keepingCapacity: true)
+            lifecycleSessionPositions.removeAll(keepingCapacity: true)
             for (workspaceIndex, workspace) in workspaces.enumerated() {
                 for (tabIndex, tab) in workspace.composeTabs.enumerated() {
                     guard let sessionID = tab.activeAgentSessionID else { continue }
+                    lifecycleSessionPositions[workspace.id, default: [:]][sessionID, default: []].append((workspaceIndex, tabIndex))
                     let key = LifecycleBindingKey(tabID: tab.id, sessionID: sessionID)
                     if lifecycleBindingPositions[key] == nil {
                         lifecycleBindingPositions[key] = (workspaceIndex, tabIndex)
@@ -1073,17 +1067,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    /// Metadata addresses only: runtime eligibility and binding generations are never cached.
-    private var oversightSessionTabIDs: [UUID: [UUID: [UUID]]] = [:]
-
-    func oversightTabs(workspaceID: UUID, sessionID: UUID) -> [ComposeTabState] {
-        (oversightSessionTabIDs[workspaceID]?[sessionID] ?? []).compactMap { tabID in
-            guard let tab = modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
-                  tab.activeAgentSessionID == sessionID else { return nil }
-            return tab
-        }
-    }
-
     private struct LifecycleBindingKey: Hashable {
         let tabID: UUID
         let sessionID: UUID
@@ -1111,6 +1094,23 @@ class WorkspaceManagerViewModel: ObservableObject {
         let tab = workspaces[position.workspace].composeTabs[position.tab]
         guard tab.id == tabID, tab.activeAgentSessionID == sessionID else { return nil }
         return workspaces[position.workspace].id
+    }
+
+    /// Complementary UUID addresses in the lifecycle index. Preserve every metadata occurrence,
+    /// including duplicate workspace/tab IDs: the full lifecycle census retains that multiplicity.
+    /// Generations and runtime eligibility are still read live by the lifecycle adapter.
+    private var lifecycleSessionPositions: [UUID: [UUID: [(workspace: Int, tab: Int)]]] = [:]
+
+    func agentSessionLifecycleTabs(workspaceID: UUID, sessionID: UUID) -> [ComposeTabState] {
+        guard activeWorkspaceID == workspaceID else { return [] }
+        return (lifecycleSessionPositions[workspaceID]?[sessionID] ?? []).compactMap { position in
+            guard workspaces.indices.contains(position.workspace),
+                  workspaces[position.workspace].id == workspaceID,
+                  workspaces[position.workspace].composeTabs.indices.contains(position.tab)
+            else { return nil }
+            let tab = workspaces[position.workspace].composeTabs[position.tab]
+            return tab.activeAgentSessionID == sessionID ? tab : nil
+        }
     }
 
     private var modelRoutingTabIndexes: [UUID: [UUID: Int]] = [:]
