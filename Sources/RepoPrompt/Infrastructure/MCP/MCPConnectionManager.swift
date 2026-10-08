@@ -11714,15 +11714,47 @@ actor ServerNetworkManager {
             return .rejected(runID: policyRunID, reason: "session_token_bound_to_other_run")
         }
 
+        let pendingPolicyApplicationID = UUID()
+        let routingAuthorityGeneration = policy.runID.map {
+            runRoutingAuthorityGenerationByRunID[$0, default: 0]
+        }
+        pendingPolicyApplicationIDByConnectionID[connectionID] = pendingPolicyApplicationID
+        if let runID = policy.runID {
+            pendingPolicyApplicationIDByRunID[runID] = pendingPolicyApplicationID
+        }
+
+        // Capture readiness ownership before any application await. A restarted process may
+        // acquire a new waiter for this same run while this application's tail is suspended.
+        let routingWaitGeneration: UUID? = if requireRunRouting, let runID = policy.runID {
+            await MCPRoutingWaiter.generation(runID: runID)
+        } else {
+            nil
+        }
+
+        guard isPendingPolicyApplicationOwner(
+            pendingPolicyApplicationID,
+            connectionID: connectionID,
+            runID: policy.runID,
+            routingAuthorityGeneration: routingAuthorityGeneration
+        ) else {
+            if policy.oneShot {
+                _ = rollbackOneShotPendingPolicyReservation(
+                    id: policy.id, key: matchedQueueEntry.key, connectionID: connectionID
+                )
+            }
+            finishPendingPolicyApplication(pendingPolicyApplicationID, connectionID: connectionID, runID: policy.runID)
+            return .rejected(runID: policy.runID, reason: "stale_connection")
+        }
+
         // This is the authoritative child-observation boundary: the connection has
         // matched and reserved the exact run-owned name/PID policy and passed existing
         // run-affinity checks, but run-route installation has not started. Observation
         // remains sticky if a later route installation is rolled back.
-        if requireRunRouting, let runID = policy.runID {
+        if requireRunRouting, let runID = policy.runID, let routingWaitGeneration {
             #if DEBUG
                 await debugSuspendPendingPolicyObservationIfNeeded()
             #endif
-            let wasFirstObservation = await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
+            let wasFirstObservation = await MCPRoutingWaiter.notifyConnectionObserved(runID: runID, generation: routingWaitGeneration)
             #if DEBUG
                 if wasFirstObservation {
                     debugRecordRunRoutingEvent(
@@ -11739,6 +11771,21 @@ actor ServerNetworkManager {
             #endif
         }
 
+        guard isPendingPolicyApplicationOwner(
+            pendingPolicyApplicationID,
+            connectionID: connectionID,
+            runID: policy.runID,
+            routingAuthorityGeneration: routingAuthorityGeneration
+        ) else {
+            if policy.oneShot {
+                _ = rollbackOneShotPendingPolicyReservation(
+                    id: policy.id, key: matchedQueueEntry.key, connectionID: connectionID
+                )
+            }
+            finishPendingPolicyApplication(pendingPolicyApplicationID, connectionID: connectionID, runID: policy.runID)
+            return .rejected(runID: policy.runID, reason: "stale_connection")
+        }
+
         let restorePoint = PendingPolicyRestorePoint(
             restrictedTools: restrictedToolsByConnection[connectionID],
             additionalTools: additionalToolsByConnection[connectionID],
@@ -11751,15 +11798,6 @@ actor ServerNetworkManager {
             runPolicyState: policy.runID.flatMap { runPolicyStateByRunID[$0] },
             runWindowID: policy.runID.flatMap { presentationWindowByRun[$0] }
         )
-        let pendingPolicyApplicationID = UUID()
-        let routingAuthorityGeneration = policy.runID.map {
-            runRoutingAuthorityGenerationByRunID[$0, default: 0]
-        }
-        pendingPolicyApplicationIDByConnectionID[connectionID] = pendingPolicyApplicationID
-        if let runID = policy.runID {
-            pendingPolicyApplicationIDByRunID[runID] = pendingPolicyApplicationID
-        }
-
         // Stage the complete policy before registering the run mapping. The mapping
         // signals MCPRoutingWaiter, so restrictions and run identity must already be
         // visible before the bootstrap gate can be released.
@@ -11808,6 +11846,7 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
+                routingWaitGeneration: routingWaitGeneration,
                 signalRoutingFailure: false
             )
             return .rejected(runID: policy.runID, reason: "stale_connection")
@@ -11861,6 +11900,7 @@ actor ServerNetworkManager {
                     connectionID: connectionID,
                     restorePoint: restorePoint,
                     applicationID: pendingPolicyApplicationID,
+                    routingWaitGeneration: routingWaitGeneration,
                     pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
                 )
                 return .rejected(
@@ -11908,6 +11948,7 @@ actor ServerNetworkManager {
                     connectionID: connectionID,
                     restorePoint: restorePoint,
                     applicationID: pendingPolicyApplicationID,
+                    routingWaitGeneration: routingWaitGeneration,
                     pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken,
                     signalRoutingFailure: false
                 )
@@ -11928,6 +11969,7 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
+                routingWaitGeneration: routingWaitGeneration,
                 pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
             )
             return .rejected(runID: policy.runID, reason: "policy_removed")
@@ -11938,6 +11980,33 @@ actor ServerNetworkManager {
                 runID: runID,
                 successorConnectionID: connectionID
             )
+        }
+
+        // Catalog publication crosses actors after one-shot consumption. Revocation or a
+        // successor install during that await must also fence this completion tail.
+        guard isPendingPolicyApplicationOwner(
+            pendingPolicyApplicationID,
+            connectionID: connectionID,
+            runID: policy.runID,
+            routingAuthorityGeneration: routingAuthorityGeneration
+        ),
+            isPendingPolicyApplicationCurrent(
+                connectionID: connectionID,
+                clientName: clientName,
+                expectedLifecycleGeneration: expectedLifecycleGeneration
+            )
+        else {
+            await rollbackPendingPolicyApplication(
+                policy,
+                clientName: clientName,
+                connectionID: connectionID,
+                restorePoint: restorePoint,
+                applicationID: pendingPolicyApplicationID,
+                routingWaitGeneration: routingWaitGeneration,
+                pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken,
+                signalRoutingFailure: false
+            )
+            return .rejected(runID: policy.runID, reason: "stale_connection")
         }
 
         finishPendingPolicyApplication(
@@ -11951,8 +12020,8 @@ actor ServerNetworkManager {
                 windowID: policy.windowID
             )
         }
-        if requireRunRouting, let runID = policy.runID {
-            await MCPRoutingWaiter.notifyRouted(runID: runID)
+        if requireRunRouting, let runID = policy.runID, let routingWaitGeneration {
+            await MCPRoutingWaiter.notifyRouted(runID: runID, generation: routingWaitGeneration)
         }
 
         let grantDescription = Self.describeGrantedTools(restricted: policy.restrictedTools)
@@ -12052,6 +12121,7 @@ actor ServerNetworkManager {
         connectionID: UUID,
         restorePoint: PendingPolicyRestorePoint,
         applicationID: UUID,
+        routingWaitGeneration: UUID? = nil,
         pendingPolicyRunIDMappingToken: MCPServerViewModel.PendingPolicyRunIDMappingToken? = nil,
         signalRoutingFailure: Bool = true
     ) async {
@@ -12064,7 +12134,8 @@ actor ServerNetworkManager {
                         pendingPolicyRunIDMappingToken,
                         clientName: clientName,
                         windowID: policy.windowID,
-                        signalRoutingFailure: signalRoutingFailure
+                        signalRoutingFailure: signalRoutingFailure && routingWaitGeneration != nil,
+                        routingWaitGeneration: routingWaitGeneration
                     )
                 }
                 window.mcpServer.removeTabContext(
@@ -12076,7 +12147,8 @@ actor ServerNetworkManager {
                 window.mcpServer.cleanupRunIDMapping(
                     runID: runID,
                     connectionID: connectionID,
-                    signalRoutingFailure: signalRoutingFailure
+                    signalRoutingFailure: signalRoutingFailure && routingWaitGeneration != nil,
+                    routingWaitGeneration: routingWaitGeneration
                 )
                 return .restored
             }
