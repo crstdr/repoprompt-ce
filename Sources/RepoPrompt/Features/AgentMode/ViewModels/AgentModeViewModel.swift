@@ -602,6 +602,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Written only by `AgentModeViewModel+SessionLinks`; nothing else should mutate it.
     var monitorPillPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
 
+    /// In-memory palette-slot assignments for overseer sessions, reconciled inside the
+    /// projection mutation boundary so a row re-rendered by the oversight-change notification
+    /// always reads a settled map. Stores slots only; roles stay live via the projections.
+    let agentOversightColourAllocator = AgentOversightColourAllocator()
+
     /// Latest process-wide durable-oversight level, broadcast by the bridge.
     ///
     /// Stored per window rather than read on demand so a link-free tab — which never receives an
@@ -3732,14 +3737,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> AgentSessionLifecycleAuthority.Identity? {
         guard let session = sessions[tabID],
               session.activeAgentSessionID == expectedSessionID,
-              let workspace = workspaceManager?.workspaces.first(where: { workspace in
-                  workspace.composeTabs.contains(where: {
-                      $0.id == tabID && $0.activeAgentSessionID == expectedSessionID
-                  })
-              })
+              let workspaceID = workspaceManager?.agentSessionLifecycleWorkspaceID(
+                  tabID: tabID, sessionID: expectedSessionID
+              )
         else { return nil }
         return AgentSessionLifecycleAuthority.Identity(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             tabID: tabID,
             sessionID: expectedSessionID,
             persistentBindingGeneration: session.persistentSessionBindingIdentity?.generation,
@@ -5140,6 +5143,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         sessionID: UUID?
     ) {
+        // Native row providers capture the UUID from the sidebar's cached row.
+        // Publish identity changes even when no index refresh is in flight.
+        syncSidebarUIState(refresh: true, reason: .sessionList)
         guard let token = activeSessionIndexRefreshToken,
               sessionIndexStore.isOwnerCurrent(token.owner),
               activeSessionIndexRefreshValidTabIDs.contains(tabID)
@@ -7094,7 +7100,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             case "accept":
                 "Allow this action"
             case "accept_for_session":
-                "Allow this action for the rest of the session"
+                approval.sessionApprovalScope == .editsSession
+                    ? "Allow edits for the rest of this session" : "Allow this action for the rest of the session"
             case "accept_with_amendment":
                 "Allow with exec policy amendment (provide amendment field)"
             case "decline":
@@ -7109,8 +7116,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, includeAliases: Bool = true) -> [String] {
-        var labels = approval.supportsPlainApprove ? ["accept", "accept_for_session"] : ["accept_for_session"]
-        if approval.kind == .commandExecution {
+        var labels = approval.supportsPlainApprove ? ["accept"] : []
+        if approval.supportsAlwaysAllow {
+            labels.append("accept_for_session")
+        }
+        if approval.kind == .commandExecution, approval.sessionApprovalScope == nil {
             labels.append("accept_with_amendment")
         }
         labels.append("decline")
@@ -8064,11 +8074,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         intent: WorktreeBindingTransitionIntent,
         invocation: WorktreeBindingMutationInvocationIdentity? = nil,
         startupContext: WorktreeStartupContext? = nil,
-        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:]
+        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:],
+        beforeCommit: (@MainActor () async throws -> Void)? = nil
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
+        // Exact no-ops do not mutate presentation, ownership, persistence, or provider state.
+        if session.worktreeBindings == desiredBindings { return session.worktreeBindings }
         if !desiredBindings.isEmpty {
             do {
                 try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
@@ -8080,22 +8093,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw ExecutionLocationTransitionError.stale
         }
         session.worktreeBindingTransitionInProgress = true
-        defer { session.worktreeBindingTransitionInProgress = false }
+        var ownsExecutionLocationGate = false
+        defer {
+            session.worktreeBindingTransitionInProgress = false
+            if ownsExecutionLocationGate {
+                session.isChangingExecutionLocation = false
+                syncComposerUIState(tabID: session.tabID)
+                syncStatusPillsUIState()
+            }
+        }
         if let startupContext {
             WorktreeStartupInstrumentation.record(.bindingTransitionStarted, context: startupContext)
         }
         let previousBindings = session.worktreeBindings
         let previousDestination = executionDestinationIdentity(in: previousBindings)
         let nextDestination = executionDestinationIdentity(in: desiredBindings)
+        // Secondary bindings are execution authority too: changing only a secondary root must
+        // not reroute MCP tools beneath a still-running native provider.
+        let executionRootsChanged = previousDestination != nextDestination
+            || Self.executionRootMappings(previousBindings) != Self.executionRootMappings(desiredBindings)
         let changedDuringActiveRun = session.runState.isActive
-        let preservesInvokingCodexController = shouldPreserveInvokingCodexController(
-            for: session,
-            intent: intent,
-            invocation: invocation,
-            destinationChanged: previousDestination != nextDestination
-        )
 
-        if changedDuringActiveRun, previousDestination != nextDestination {
+        if changedDuringActiveRun, executionRootsChanged {
             switch intent {
             case .userExecutionLocationChange(confirmation: .activeRunStop):
                 break
@@ -8108,6 +8127,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             case .initialSend:
                 throw MCPError.invalidParams("A running Agent thread cannot apply an initial execution location.")
             }
+        }
+
+        if executionRootsChanged, case .externalManagement = intent {
+            try requireIdleWorktreeBindingTransition(session)
+            // Reuse the existing execution-location gate so composer, managed sends, and
+            // automatic follow-ups cannot reserve the next turn while preparation awaits.
+            session.isChangingExecutionLocation = true
+            ownsExecutionLocationGate = true
+            syncComposerUIState(tabID: session.tabID)
+            syncStatusPillsUIState()
+            try await requireIdleProviderForWorktreeBindingTransition(session)
+            guard sessions[session.tabID] === session,
+                  session.activeAgentSessionID == sessionID,
+                  session.worktreeBindings == previousBindings
+            else { throw ExecutionLocationTransitionError.stale }
+            try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
         }
 
         let materializer = promptManager.map {
@@ -8132,6 +8167,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         var ownershipCommitted = preparation == nil
+        var providerContextInvalidated = false
+        var bindingsPublished = false
         do {
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
@@ -8141,7 +8178,33 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 throw ExecutionLocationTransitionError.stale
             }
 
-            if previousDestination != nextDestination {
+            try Task.checkCancellation()
+            if executionRootsChanged, case .externalManagement = intent {
+                try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
+                try await requireIdleProviderForWorktreeBindingTransition(session)
+                guard sessions[session.tabID] === session,
+                      session.activeAgentSessionID == sessionID,
+                      session.worktreeBindings == previousBindings
+                else { throw ExecutionLocationTransitionError.stale }
+                try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
+            }
+            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
+            // Provisional root preparation is abortable. Only now may the caller mark the
+            // protected mutation committed and persist visual identity; ordinary rejection
+            // above must remain a pre-commit, actionable error.
+            try await beforeCommit?()
+            try Task.checkCancellation()
+            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
+            guard sessions[session.tabID] === session,
+                  session.activeAgentSessionID == sessionID,
+                  session.worktreeBindings == previousBindings,
+                  session.runState.isActive == changedDuringActiveRun
+            else { throw ExecutionLocationTransitionError.stale }
+            if executionRootsChanged, case .externalManagement = intent {
+                try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
+            }
+
+            if executionRootsChanged {
                 if changedDuringActiveRun {
                     switch intent {
                     case .userExecutionLocationChange(confirmation: .activeRunStop):
@@ -8168,9 +8231,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 if !changedDuringActiveRun {
                     await stageResumeRecoveryHandoffIfNeeded(for: session)
                 }
-                if !preservesInvokingCodexController {
-                    await invalidateProviderContextForExecutionLocationChange(session)
-                }
+                providerContextInvalidated = true
+                await invalidateProviderContextForExecutionLocationChange(session)
                 guard sessions[session.tabID] === session,
                       session.activeAgentSessionID == sessionID,
                       session.worktreeBindings == previousBindings,
@@ -8180,18 +8242,138 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             }
 
+            // Native teardown and handoff may await. A path reused for a different Git
+            // identity must not become the newly published execution authority.
+            try Task.checkCancellation()
+            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
             if let materializer, let preparation {
                 _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
             }
             _ = commitWorktreeBindings(desiredBindings, to: session)
+            bindingsPublished = true
+            if previousBindings != desiredBindings, case .externalManagement = intent {
+                guard let workspaceID = workspaceManager?.activeWorkspace?.id else {
+                    throw ExecutionLocationTransitionError.unavailable(
+                        "The worktree binding changed, but its owning workspace is unavailable for required persistence. Inspect the session before retrying."
+                    )
+                }
+                if case let .failure(failure) = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID) {
+                    throw ExecutionLocationTransitionError.unavailable(failure.message)
+                }
+                guard sessions[session.tabID] === session,
+                      session.activeAgentSessionID == sessionID,
+                      session.worktreeBindings == desiredBindings
+                else { throw ExecutionLocationTransitionError.stale }
+            }
             return session.worktreeBindings
         } catch {
             if !ownershipCommitted, let materializer, let preparation {
                 await materializer.abort(preparation)
             }
+            if providerContextInvalidated, !bindingsPublished,
+               sessions[session.tabID] === session,
+               session.activeAgentSessionID == sessionID,
+               session.worktreeBindings == previousBindings
+            {
+                // Native retirement cannot be undone. Keep the old execution binding and
+                // staged handoff, and make its fresh-runtime recovery explicit and durable.
+                let message = "The worktree switch did not apply. The previous execution binding is unchanged, but its provider runtime was retired. The next user message will restart at the previous location using the retained handoff; no turn was replayed. Cause: \(error.localizedDescription)"
+                session.appendItem(.system(message, sequenceIndex: session.nextSequenceIndex))
+                session.isDirty = true
+                syncTranscriptUIState()
+                let recoverySave: Result<Void, AgentSessionPersistenceFailure> = if let workspaceID = workspaceManager?.activeWorkspace?.id {
+                    // Cancellation of the switch must not suppress saving its recovery state.
+                    await Task { @MainActor in
+                        await self.flushSaveRequired(for: session.tabID, workspaceID: workspaceID)
+                    }.value
+                } else {
+                    .failure(.init(operation: .save, tabID: session.tabID, message: "The owning workspace is unavailable."))
+                }
+                if case let .failure(failure) = recoverySave {
+                    scheduleSave(for: session)
+                    throw ExecutionLocationTransitionError.unavailable("\(message) Recovery persistence failed: \(failure.message). Inspect the session before retrying.")
+                }
+                throw ExecutionLocationTransitionError.unavailable(message)
+            }
             throw error
         }
+    }
+
+    private static func executionRootMappings(_ bindings: [AgentSessionWorktreeBinding]) -> [String: ExecutionDestinationIdentity] {
+        bindings.reduce(into: [:]) { mappings, binding in
+            let logical = standardizedWorkspacePath(binding.logicalRootPath) ?? binding.logicalRootPath
+            mappings[logical] = ExecutionDestinationIdentity(
+                repositoryID: binding.repositoryID,
+                worktreeID: binding.worktreeID,
+                path: standardizedWorkspacePath(binding.worktreeRootPath) ?? binding.worktreeRootPath
+            )
+        }
+    }
+
+    private func requireIdleWorktreeBindingTransition(
+        _ session: TabSession,
+        ownsExecutionLocationGate: Bool = false
+    ) throws {
+        guard !session.runState.isActive,
+              session.activeRunLiveness == nil,
+              session.agentTask == nil,
+              !session.terminalCommitInProgress,
+              !session.bindingTransitionInProgress,
+              !session.isComposerSubmissionInFlight,
+              !session.isPreparingInitialWorktree,
+              ownsExecutionLocationGate || !session.isChangingExecutionLocation,
+              !session.mcpFollowUpRunPending,
+              session.pendingSupersedingTurnCompletions == 0,
+              session.pendingInstructions.isEmpty,
+              session.pendingClaudeSteeringInstructions.isEmpty,
+              session.pendingACPSteeringInstructions.isEmpty,
+              session.claudeSteeringFlushTask == nil,
+              session.acpSteeringFlushTask == nil,
+              session.codexNativeToolLiveness.inFlight.isEmpty,
+              session.oversight.pendingAutoWake == nil,
+              !session.selfCompactState.blocksOverseerDelivery,
+              !session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
+              !session.isSettlingACPBackgroundCompaction,
+              !session.hasBindingBlockingInteraction
+        else {
+            throw MCPError.invalidParams(
+                "Wait until this Agent session is idle with no queued work or pending interactions before changing its execution worktree. The current turn is not migrated or replayed."
+            )
+        }
+    }
+
+    private func requireIdleProviderForWorktreeBindingTransition(_ session: TabSession) async throws {
+        let claudeController = session.claudeController
+        let acpController = session.acpController
+        let codexController = session.codexController
+        if let controller = claudeController, await controller.hasTurnInFlight {
+            throw MCPError.invalidParams("The Claude runtime still has a turn in flight. Wait for it to settle before switching worktrees.")
+        }
+        if let controller = acpController, await controller.hasExecutionInFlight {
+            throw MCPError.invalidParams("The ACP runtime still has execution in flight. Wait for it to settle before switching worktrees.")
+        }
+        if let controller = codexController {
+            let snapshot: CodexNativeSessionController.ThreadSnapshot
+            do {
+                // Match the existing queued-fallback idle probe, not the transport's much
+                // longer ordinary request deadline, while next-turn admission is gated.
+                snapshot = try await controller.readThreadSnapshot(includeTurns: false, timeout: 2)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MCPError.invalidParams("Could not verify that the Codex runtime is idle. Its execution binding and runtime were not changed. Wait for it to settle and inspect the session before retrying. \(error.localizedDescription)")
+            }
+            let outstandingTools = await controller.outstandingBlockingNativeToolCallNames()
+            guard snapshot.runtimeStatus == .idle, !snapshot.hasActiveTurn, outstandingTools.isEmpty else {
+                throw MCPError.invalidParams("The Codex runtime still has a turn or native tool in flight. Wait for it to settle before switching worktrees.")
+            }
+        }
+        guard session.claudeController === claudeController,
+              session.acpController === acpController,
+              session.codexController === codexController
+        else { throw ExecutionLocationTransitionError.stale }
+        try Task.checkCancellation()
     }
 
     private struct ExecutionDestinationIdentity: Equatable {
@@ -8320,29 +8502,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             throw error
         }
-    }
-
-    /// Preserves only the exact Codex process currently executing an externally routed
-    /// binding mutation. The existing controller workspace-path key forces replacement
-    /// before the next turn can run at the newly committed execution destination.
-    private func shouldPreserveInvokingCodexController(
-        for session: TabSession,
-        intent: WorktreeBindingTransitionIntent,
-        invocation: WorktreeBindingMutationInvocationIdentity?,
-        destinationChanged: Bool
-    ) -> Bool {
-        guard destinationChanged,
-              case .externalManagement = intent,
-              let invocation,
-              invocation.provider == .codexExec,
-              invocation.sessionID == session.activeAgentSessionID,
-              invocation.runID == session.runID,
-              session.selectedAgent == .codexExec,
-              session.codexController != nil
-        else {
-            return false
-        }
-        return true
     }
 
     private func invalidateProviderContextForExecutionLocationChange(_ session: TabSession) async {
@@ -11446,10 +11605,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 decision = .accept
             case "accept_for_session", "always_allow", "approve_for_session":
+                guard approval.supportsAlwaysAllow else {
+                    throw MCPError.invalidParams(
+                        "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", ")). No response was applied."
+                    )
+                }
                 decision = .acceptForSession
             case "accept_with_amendment", "amend":
-                guard approval.kind == .commandExecution else {
-                    throw MCPError.invalidParams("accept_with_amendment is only supported for command approvals.")
+                guard approval.kind == .commandExecution, approval.sessionApprovalScope == nil else {
+                    throw MCPError.invalidParams(
+                        "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", ")). No response was applied."
+                    )
                 }
                 let amendment = payload.amendment?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 guard !amendment.isEmpty else {
@@ -13166,17 +13332,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     retainedPayloadByItemID: session.ephemeralToolResultPayloadByItemID
                 )
             if canApplyWorkingItems, trimmedWorkingItems != session.items {
-                let retainedPayloadByItemID = session.ephemeralToolResultPayloadByItemID
-                let retainedPayloadRevisionByItemID = session.ephemeralToolResultPayloadRevisionByItemID
-                let retainedTrimmedItemIDs = Set(trimmedWorkingItems.map(\.id))
-                session.setItemsSilently(trimmedWorkingItems, reason: .retentionCompaction)
-                session.replaceEphemeralToolResultPayloadMap(
-                    retainedPayloadByItemID.filter { retainedTrimmedItemIDs.contains($0.key) },
-                    liveItemIDs: retainedTrimmedItemIDs
-                )
-                session.ephemeralToolResultPayloadRevisionByItemID = retainedPayloadRevisionByItemID.filter {
-                    retainedTrimmedItemIDs.contains($0.key) && session.ephemeralToolResultPayloadByItemID[$0.key] != nil
-                }
+                session.setItemsSilentlyForRetentionCompaction(trimmedWorkingItems)
                 markDerivedTranscriptSynchronized(
                     for: session,
                     projectionProtection: builtPresentation.projectionProtection

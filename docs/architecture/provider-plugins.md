@@ -235,10 +235,30 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 #### Current Grok MCP launch policy
 
 - Agent Mode, Context Builder discovery, model discovery and one-shot (Oracle/Chat) launches set `GROK_CLAUDE_MCPS_ENABLED=0` and `GROK_CURSOR_MCPS_ENABLED=0` as process-local overrides. This isolates Claude Code and Cursor MCP imports, including project-local Cursor imports. It does not change `HOME`, `GROK_HOME`, credentials or the user's configuration files.
+- **MCP output budget:** Fresh ACP launches for Agent Mode, Context Builder and model discovery set `GROK_MAX_MCP_OUTPUT_BYTES=100000` (decimal bytes), replacing higher or lower inherited native caps; Oracle/Chat one-shots do not receive this override.
+  - **Precedence:** This value wins over `MAX_MCP_OUTPUT_BYTES` and user/trusted-project `[mcp] max_output_bytes`. Grok's `requirements.toml` or session/tool truncation limits can override it. Oversized results may still be truncated and saved to files.
 - Agent Mode and Context Builder inject the fixed server name `RepoPromptCEGrokRuntime`, with exact client-ID hint `grok-shell-RepoPromptCEGrokRuntime`. Grok renders its tools as `RepoPromptCEGrokRuntime__<tool>`; RPCE recognizes these aliases for known RepoPrompt tools while retaining canonical internal tool identities. Other providers keep `RepoPromptCE`.
 - The Grok-only name avoids the recorded collision with an imported `RepoPromptCE`: Grok drops client servers whose names match disabled imports, on both new and loaded sessions. It is not collision-proof if the user also configured or disabled `RepoPromptCEGrokRuntime` itself. Existing Grok grants for the old server name are not migrated, so users may see renewed permission prompts.
 - Model discovery injects no RPCE server and always uses the existing neutral `RepoPromptGrokBuildACPDiscovery` temporary directory, reusing one verified session there rather than following subscribed workspaces. Closing a window cancels its discovery subscription, not the shared polling service.
 - **Project-config limit:** Grok's project `.mcp.json` is not controlled by the two import switches. Neutral polling avoids the user's project file, but Context Builder and Agent Mode retain their real workspace and may still load it. Grok-native MCP configuration is not filtered or rewritten by this policy.
+
+#### Grok background-feature launch policy
+
+- Agent Mode and model discovery set `GROK_MEMORY=0`, `GROK_SUBAGENTS=0`, `GROK_WORKFLOWS=0` and `GROK_AUTO_WAKE=0` to disable Grok's memory, subagents, workflows and auto-wake. Switch behavior is source-verified against Grok 1.0.45 (`2bdd1d6a`), not live-proven; pinned/remote settings can affect feature-specific resolution, and auto-wake requirements pins can override the environment. Imported hooks are separate and not controlled by these switches. In the pinned source, an explicit `/workflow resume` of an existing resumable workflow record in a loaded session is not gated by `GROK_WORKFLOWS` ([`ManageOp::Resume`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/workflow.rs)); this is not observed live, and passive or model-initiated restart is not established.
+- `GrokBuildAgentConfig.backgroundFeatureEnvironment` defaults to empty, leaving the ACP caller's background policy unchanged (Context Builder). One-shot (Oracle/Chat) is a separate path that never reads this field and remains unchanged. No user configuration or global environment is changed.
+- The ACP launch adapter merges this policy once; the MCP import-isolation overrides above win on a collision, and stored-key injection as `XAI_API_KEY` remains unchanged. Headless and polling config reconstructions preserve the caller's background-feature environment.
+
+#### Grok one-shot safety policy
+
+- One-shot (Oracle/Chat) request children additionally set `GROK_CLAUDE_HOOKS_ENABLED=0` and `GROK_CURSOR_HOOKS_ENABLED=0` as process-local overrides. These disable imported Claude/Cursor hook-file discovery, not Grok-native or config-layer hooks.
+- `GROK_SESSION_SEARCH=0` requests indexing off for that child; higher-priority requirements/MDM pins can override it. `GROK_STORAGE_MODE=local` prevents account-history writeback, including after late settings arrive. It does not erase earlier uploads or change inference traffic, and is not a blanket upload/network prohibition.
+- The overrides do not erase existing index rows or prevent other Grok processes from indexing retained files. Successful request cleanup removes its owned artifacts; cleanup failures can leave them behind. Missing-source rows can be pruned both at bootstrap and through queued updates, not necessarily immediately. These control semantics are source-verified at Grok 1.0.45 (`2bdd1d6a`), not live-proven.
+
+#### Grok cancellation boundaries
+
+- **Turn cancellation:** stopping or steering an active ACP turn sends a bare `session/cancel` with only `sessionId`. [Grok's cancellation handler](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/cancel.rs) cancels every non-workflow subagent in that session, including earlier turns' background children, and kills running foreground commands. These effects are source-verified at Grok 1.0.45, not limited to the current turn.
+- **Idle `stop_session`:** MCP `agent_manage.stop_session` cancels only an active RPCE run. For an idle session it returns `stop_requested: false`, sends no `session/cancel` and leaves the controller alive; it is not background-work cleanup.
+- **Controller teardown:** `ACPAgentSessionController.shutdown()` calls `cancelPrompt()` whenever a session ID exists, including when idle. It attempts the same bare cancellation before closing stdio and terminating the provider process, so a received cancel has the subagent and foreground-command effects above. Teardown is distinct from an idle `stop_session`; the launch policy does not change either path.
 
 ## How a new provider plugs in
 
