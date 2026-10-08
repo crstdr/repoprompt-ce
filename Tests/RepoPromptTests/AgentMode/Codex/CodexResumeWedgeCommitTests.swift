@@ -228,6 +228,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
         await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
         XCTAssertTrue(session.isCodexComputerUseArmed)
+        let activation = session.pendingCodexComputerUseActivation?.id
+        let delivered = vm.submitUserTurn(text: "/computer-use inspect the screen", tabID: session.tabID, isLocalComposerInput: false)
+        guard case .blocked = delivered else { return XCTFail("Delivered input cannot drive an armed chat") }
+        XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activation)
         let admitted = await fixture.coordinator.test_computerUseForNextTurn(session: session)
         XCTAssertTrue(admitted)
         await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
@@ -620,6 +624,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
         session.codexConversationID = "armed-thread"
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        let activation = session.pendingCodexComputerUseActivation?.id
         session.beginRunAttempt(source: "armed-stop-test")
         await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "armed-turn"), session: session, sourceController: controller)
         addTeardownBlock { @MainActor in
@@ -656,6 +661,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         _ = try await acquisition.value
         XCTAssertTrue(acquisitionCompleted)
         XCTAssertNotNil(session.mcpControlContext)
+        XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activation)
         XCTAssertEqual(controller.shutdownCount, 1)
         XCTAssertEqual(controller.interruptedTurnIDs, ["armed-turn"])
     }
