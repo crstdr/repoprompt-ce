@@ -169,11 +169,19 @@ enum CodexComputerUseWorkflow {
 
     private static let approvalLogger = Logger(subsystem: "com.repoprompt.agents", category: "CodexComputerUse")
 
-    static func logApprovalDecision(path: String, server: String?, armed: Bool, approvalPolicy: CodexAgentToolPreferences.ApprovalPolicy, sandboxMode: CodexAgentToolPreferences.SandboxMode, outcome: String) {
+    enum ApprovalDecisionPath: String {
+        case mcpElicitation
+        case permissions
+        case approval
+        case requestUserInput
+        case other
+    }
+
+    static func logApprovalDecision(path: ApprovalDecisionPath, server: String?, armed: Bool, approvalPolicy: CodexAgentToolPreferences.ApprovalPolicy, sandboxMode: CodexAgentToolPreferences.SandboxMode, outcome: String) {
         guard armed else { return }
         let server = server ?? "unspecified"
         let mode = approvalPolicy.persistedValue + "/" + sandboxMode.persistedValue
-        approvalLogger.notice("Computer Use approval path=\(path, privacy: .public) server=\(server, privacy: .private) armed=true mode=\(mode, privacy: .public) outcome=\(outcome, privacy: .public)")
+        approvalLogger.notice("Computer Use approval path=\(path.rawValue, privacy: .public) server=\(server, privacy: .private) armed=true mode=\(mode, privacy: .public) outcome=\(outcome, privacy: .public)")
     }
 
     static func automaticallyApprovesCompanion(

@@ -4819,7 +4819,7 @@ final class CodexNativeSessionController {
             let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
             let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
             if autoApproveHost || autoApproveCompanion {
-                logComputerUseApprovalDecision(method: method, params: params, outcome: "accept")
+                logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
                 await respondToServerRequest(
                     id: request.id,
                     result: [
@@ -4846,7 +4846,7 @@ final class CodexNativeSessionController {
                 )
                 return
             }
-            logComputerUseApprovalDecision(method: method, params: params, outcome: "surface")
+            logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "surface")
             await emit(.mcpElicitationRequest(elicitationRequest))
         case .permissions:
             let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
@@ -4860,14 +4860,14 @@ final class CodexNativeSessionController {
                    currentTurnID: routingCurrentTurnID
                )
             {
-                logComputerUseApprovalDecision(method: method, params: params, outcome: "accept")
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await respondToServerRequest(id: request.id, result: [
                     "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
                 ])
                 return
             }
             if let approvalResult = hostApprovalResult {
-                logComputerUseApprovalDecision(method: method, params: params, outcome: "accept")
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await respondToServerRequest(id: request.id, result: approvalResult)
                 return
             }
@@ -4887,7 +4887,7 @@ final class CodexNativeSessionController {
                 )
                 return
             }
-            logComputerUseApprovalDecision(method: method, params: params, outcome: "surface")
+            logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "surface")
             await emit(.permissionsRequest(permissionsRequest))
         case .dynamicToolUnsupported:
             await emitServerRequestIssue(
@@ -4988,10 +4988,10 @@ final class CodexNativeSessionController {
         }
     }
 
-    private func logComputerUseApprovalDecision(method: String, params: [String: Any], outcome: String) {
+    private func logComputerUseApprovalDecision(path: CodexComputerUseWorkflow.ApprovalDecisionPath, params: [String: Any], outcome: String) {
         guard computerUseRequiresUserReview else { return }
         CodexComputerUseWorkflow.logApprovalDecision(
-            path: method, server: params["serverName"] as? String, armed: computerUseRequiresUserReview,
+            path: path, server: params["serverName"] as? String, armed: computerUseRequiresUserReview,
             approvalPolicy: options.approvalPolicyProvider(), sandboxMode: options.sandboxModeProvider(), outcome: outcome
         )
     }
