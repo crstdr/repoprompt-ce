@@ -186,6 +186,22 @@ final class AgentComputerUseCompanionClusterTests: XCTestCase {
         )
     }
 
+    func testProbeWithZeroTailLimitCollapsesAllToolLeaves() {
+        var seq = 1
+        var items: [AgentChatItem] = [.user("drive", sequenceIndex: 0)]
+        items += companion("click", &seq) + companion("click", &seq)
+        let turn = AgentTranscriptIO.importLegacyItems(items).turns[0]
+        XCTAssertTrue(AgentTranscriptProjectionBuilder.groupedHistoryWouldCollapse(
+            in: turn,
+            detailedToolTailLimit: 0
+        ))
+        let emptyTurn = AgentTranscriptIO.importLegacyItems([.user("drive", sequenceIndex: 0)]).turns[0]
+        XCTAssertFalse(AgentTranscriptProjectionBuilder.groupedHistoryWouldCollapse(
+            in: emptyTurn,
+            detailedToolTailLimit: 0
+        ))
+    }
+
     func testProjectionRealScaleWithinBudget() {
         var seq = 1
         var items: [AgentChatItem] = [.user("drive", sequenceIndex: 0)]
@@ -204,7 +220,8 @@ final class AgentComputerUseCompanionClusterTests: XCTestCase {
         _ = AgentTranscriptProjectionBuilder.build(from: transcript)
         let elapsed = Date().timeIntervalSince(start)
         print("CU-COLLAPSE-SCALE-MS \(Int(elapsed * 1000))")
-        // Measured ~300ms on this machine; the budget keeps 16x headroom for slower hosts.
-        XCTAssertLessThan(elapsed, 5.0, "leaf post-pass must stay linear")
+        // ~300ms on base, ~380ms with the merge (cluster summaries are the real cost);
+        // the budget keeps 5x headroom for slower hosts.
+        XCTAssertLessThan(elapsed, 2.0, "leaf post-pass must stay linear")
     }
 }

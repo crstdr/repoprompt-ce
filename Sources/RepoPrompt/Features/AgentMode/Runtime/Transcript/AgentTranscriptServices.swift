@@ -6284,30 +6284,66 @@ enum AgentTranscriptProjectionBuilder {
         return updatedTranscript
     }
 
-    fileprivate static func groupedHistoryWouldCollapse(
+    /// Internal for tests; production callers stay inside this enum.
+    static func groupedHistoryWouldCollapse(
         in turn: AgentTranscriptTurn,
         detailedToolTailLimit: Int
     ) -> Bool {
         guard turn.retentionTier == .full else { return false }
         var emittedConclusionActivityIDs = Set<UUID>()
-        let context = AgentTranscriptProjectionBuildContext()
         for span in turn.responseSpans {
-            let leafBlocks = fullSpanLeafBlocks(
+            let leafDescriptors = fullSpanLeafDescriptors(
                 for: span,
                 in: turn,
-                archived: false,
-                context: context,
                 emittedConclusionActivityIDs: &emittedConclusionActivityIDs
             )
-            if groupedHistoryCollapsePlan(
-                in: leafBlocks,
-                spanID: span.id,
+            if groupedHistoryDescriptorsWouldCollapse(
+                leafDescriptors,
                 detailedToolTailLimit: detailedToolTailLimit
-            ) != nil {
+            ) {
                 return true
             }
         }
         return false
+    }
+
+    /// Descriptor-level mirror of `groupedHistoryCollapsePlan`'s nil/non-nil decision so
+    /// the probe answers "would collapse" without constructing blocks or cluster
+    /// summaries. Per-span leaves share one spanID, so the plan's cross-span walk-back
+    /// guard has no descriptor equivalent.
+    private static func groupedHistoryDescriptorsWouldCollapse(
+        _ leafDescriptors: [CollapsibleLeafDescriptor],
+        detailedToolTailLimit: Int
+    ) -> Bool {
+        let contentDescriptors = leafDescriptors.filter { $0.kind != .conclusion }
+        let toolIndices = contentDescriptors.indices.filter {
+            contentDescriptors[$0].kind == .standaloneTool || contentDescriptors[$0].kind == .activityCluster
+        }
+        guard !toolIndices.isEmpty else { return false }
+        let collapsedPrefix: ArraySlice<CollapsibleLeafDescriptor>
+        if detailedToolTailLimit <= 0 {
+            collapsedPrefix = contentDescriptors[...]
+        } else {
+            guard toolIndices.count > detailedToolTailLimit else { return false }
+            let firstKeptToolIndex = toolIndices[toolIndices.count - detailedToolTailLimit]
+            var detailedStartIndex = firstKeptToolIndex
+            while detailedStartIndex > 0 {
+                let previousDescriptor = contentDescriptors[detailedStartIndex - 1]
+                if previousDescriptor.kind == .standaloneTool || previousDescriptor.kind == .activityCluster {
+                    break
+                }
+                detailedStartIndex -= 1
+            }
+            collapsedPrefix = contentDescriptors.prefix(detailedStartIndex)
+        }
+        guard !collapsedPrefix.isEmpty else { return false }
+        // The plan returns nil when the whole prefix buffers into one leading assistant.
+        if collapsedPrefix.count == 1,
+           shouldBufferLeadingAssistant(in: collapsedPrefix)
+        {
+            return false
+        }
+        return true
     }
 
     fileprivate static func normalizedFrozenDetailedToolTailLimit(for turn: AgentTranscriptTurn) -> Int? {
