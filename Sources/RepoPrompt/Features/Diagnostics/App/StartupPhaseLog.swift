@@ -26,6 +26,36 @@ enum StartupPhaseLog {
         case windowAppeared
         case restoreEntryAssigned
         case restoreWorkspace
+        case managerInitialized
+        case initCallbackEnqueue
+        case initCallbackStart
+        case restoreDispatchEnqueue
+        case initialDefaultSwitch
+        case rootReconciliationJoin
+        case tokenSchedulerStop
+        case switchRestoreState
+        case forcedTokenRecount
+        case immediateRecount
+        case switchHydrationJoin
+        case switchSelectionReplay
+        case switchListenerNotify
+    }
+
+    /// Bounded integer codes for a workspace-switch request outcome, so markers can
+    /// record the actual result of a restore's switch request without logging result
+    /// or workspace-identifying strings.
+    enum SwitchOutcome: Int {
+        case accepted = 1
+        case blocked = 2
+        case cancelled = 3
+
+        init(_ result: WorkspaceSwitchResult) {
+            switch result {
+            case .switched: self = .accepted
+            case .blocked: self = .blocked
+            case .cancelled: self = .cancelled
+            }
+        }
     }
 
     /// Clock and emission seam; tests substitute a scripted clock and a capture sink.
@@ -93,20 +123,25 @@ enum StartupPhaseLog {
         )
     }
 
+    /// The emitted `begin` line keeps the request-time `elapsed_ms`, but the returned
+    /// span starts from a clock sample taken *after* emission returns. A cold or
+    /// descheduled emitter (observed at first logger use during appInit) is therefore
+    /// charged to the marker path instead of the measured phase; the delay stays
+    /// visible as `(end elapsed_ms - span_ms) - begin elapsed_ms`.
     static func begin(_ phase: Phase, window: Int? = nil) -> Span {
         let runtime = runtime()
-        let startUptime = runtime.uptime()
+        let requestedUptime = runtime.uptime()
         runtime.emit(
             render(
                 phase: phase,
                 boundary: "begin",
                 window: window,
-                elapsedMS: elapsedMilliseconds(now: startUptime, processStart: runtime.processStartUptime),
+                elapsedMS: elapsedMilliseconds(now: requestedUptime, processStart: runtime.processStartUptime),
                 spanMS: nil,
                 fields: [:]
             )
         )
-        return Span(phase: phase, window: window, startUptime: startUptime, runtime: runtime)
+        return Span(phase: phase, window: window, startUptime: runtime.uptime(), runtime: runtime)
     }
 
     static func elapsedMilliseconds(now: TimeInterval, processStart: TimeInterval) -> Int {
