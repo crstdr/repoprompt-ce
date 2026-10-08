@@ -19,6 +19,67 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
     }
 
+    func testComputerUseOrdinaryStopBlocksLinkAuthorityUntilRetirementCompletes() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Stop must not install a controller") }
+        )
+        let workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: fixture.target.tabID, name: "Stop ownership barrier"
+        )
+        let session = viewModel.session(for: fixture.target.tabID)
+        session.selectedAgent = .codexExec
+        session.hasLoadedPersistedState = true
+        session.runState = .running
+        session.beginRunAttempt(source: "armed-stop-test")
+        let controller = WedgeFakeCodexController(
+            runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session), responses: []
+        )
+        let gate = TestReleaseFence(name: "ordinary Stop companion retirement before Link")
+        controller.shutdownGate = gate
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        session.codexConversationID = "armed-thread"
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        let coordinator = viewModel.test_codexCoordinator
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "armed-turn"), session: session, sourceController: controller)
+        addTeardownBlock { @MainActor in
+            gate.release()
+            await coordinator.shutdownCodexSession(session)
+            withExtendedLifetime(workspace) {}
+        }
+        await viewModel.cancelAgentRun(tabID: session.tabID)
+        let entered = await gate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered)
+        XCTAssertNil(session.codexController)
+        XCTAssertNil(session.codexControllerFeatureState)
+        XCTAssertNotNil(session.pendingCodexComputerUseActivation, "Per-chat arming survives ordinary Stop")
+        var revocationBegan = false
+        var revocationCompleted = false
+        fixture.host.beforeActivation = { endpoint in
+            guard endpoint == fixture.target.domainEndpoint else { return }
+            revocationBegan = true
+            await coordinator.revokeCodexComputerUse(session: session, reason: "session-link")
+            revocationCompleted = true
+        }
+        let acquisition = Task { await addLink(fixture) }
+        try await AsyncTestWait.waitUntil("Link acquisition enters revocation", timeout: 4) { revocationBegan }
+        XCTAssertFalse(revocationCompleted)
+        let linkedWhileRetiring = await fixture.authority.hasActiveLink(endpoint: fixture.target.domainEndpoint)
+        XCTAssertFalse(linkedWhileRetiring, "Authority must not publish before the armed controller stops")
+        gate.release()
+        guard case .added = await acquisition.value else { return XCTFail("Link acquisition must complete after retirement") }
+        XCTAssertTrue(revocationCompleted)
+        let linkedAfterRetirement = await fixture.authority.hasActiveLink(endpoint: fixture.target.domainEndpoint)
+        XCTAssertTrue(linkedAfterRetirement)
+        XCTAssertEqual(controller.shutdownCount, 1)
+        XCTAssertEqual(controller.interruptedTurnIDs, ["armed-turn"])
+    }
+
     func testLinkActivationHoldsComputerUseAdmissionAcrossRetirementAndPublication() async {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }

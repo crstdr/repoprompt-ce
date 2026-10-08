@@ -659,6 +659,57 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
     }
 
+    func testComputerUseOrdinaryStopBlocksMCPControlUntilRetirementCompletes() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture([])
+        let session = fixture.session
+        let sessionID = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(session))
+        let controller = WedgeFakeCodexController(
+            runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session), responses: []
+        )
+        let gate = TestReleaseFence(name: "ordinary Stop companion retirement before MCP control")
+        controller.shutdownGate = gate
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        session.codexConversationID = "armed-thread"
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        session.beginRunAttempt(source: "armed-stop-test")
+        await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "armed-turn"), session: session, sourceController: controller)
+        addTeardownBlock { @MainActor in
+            gate.release()
+            await fixture.viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+            await fixture.coordinator.shutdownCodexSession(session)
+        }
+        await fixture.viewModel.cancelAgentRun(tabID: session.tabID)
+        let entered = await gate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered)
+        XCTAssertNil(session.codexController)
+        XCTAssertNil(session.codexControllerFeatureState)
+        XCTAssertNotNil(session.pendingCodexComputerUseActivation, "Per-chat arming survives ordinary Stop")
+        let generation = session.mcpControlActivationGeneration
+        var acquisitionBegan = false
+        var acquisitionCompleted = false
+        let acquisition = Task {
+            acquisitionBegan = true
+            let context = try await fixture.viewModel.mcpActivateControlContext(
+                forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil
+            )
+            acquisitionCompleted = true
+            return context
+        }
+        try await AsyncTestWait.waitUntil("MCP acquisition enters revocation", timeout: 4) { acquisitionBegan }
+        XCTAssertFalse(acquisitionCompleted)
+        XCTAssertEqual(session.mcpControlActivationGeneration, generation, "Control must not publish before the armed controller stops")
+        XCTAssertNil(session.mcpControlContext)
+        gate.release()
+        _ = try await acquisition.value
+        XCTAssertTrue(acquisitionCompleted)
+        XCTAssertNotNil(session.mcpControlContext)
+        XCTAssertEqual(controller.shutdownCount, 1)
+        XCTAssertEqual(controller.interruptedTurnIDs, ["armed-turn"])
+    }
+
     func testComputerUseOwnershipClaimJoinsAlreadyDetachedCompanionRetirement() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
@@ -1647,7 +1698,7 @@ private final class WedgeControllerFactory {
     }
 }
 
-private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
+final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
     enum Response {
         case timeout
         case discoveryFailure
