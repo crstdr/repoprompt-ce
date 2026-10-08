@@ -1275,6 +1275,11 @@ final class CodexNativeSessionController {
             }
         }
 
+        // Armed scopes must re-detect effective collisions on the recovered transport before
+        // re-binding, rather than trusting server names captured by the original start.
+        if computerUseRequiresUserReview {
+            try await inspectComputerUseEffectiveConfiguration()
+        }
         let configOverrides = try await runtimeConfigOverrides()
         let result: [String: Any]
         var startedFreshReplacement = false

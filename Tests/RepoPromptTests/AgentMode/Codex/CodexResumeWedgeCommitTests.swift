@@ -156,6 +156,19 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
     }
 
+    func testArmedRequestUserInputCardSubmitRequiresOneShotSelection() {
+        let request = makeLegacyApprovalRequest()
+        let questionID = "mcp_tool_call_approval_read_file"
+        let empty = [questionID: AgentRequestUserInputQuestionDraft()]
+        let allowOnce = [questionID: AgentRequestUserInputQuestionDraft(selectedOptionIndex: 0)]
+        let remembered = [questionID: AgentRequestUserInputQuestionDraft(selectedOptionIndex: 1)]
+
+        XCTAssertFalse(AgentRequestUserInputCard.canSubmit(request: request, drafts: empty, allowsRememberedDecision: false))
+        XCTAssertTrue(AgentRequestUserInputCard.canSubmit(request: request, drafts: allowOnce, allowsRememberedDecision: false))
+        XCTAssertFalse(AgentRequestUserInputCard.canSubmit(request: request, drafts: remembered, allowsRememberedDecision: false))
+        XCTAssertTrue(AgentRequestUserInputCard.canSubmit(request: request, drafts: empty, allowsRememberedDecision: true))
+    }
+
     private func makeLegacyApprovalRequest() -> AgentRequestUserInputRequest {
         .init(requestID: .int(91), method: "item/tool/requestUserInput", threadID: Self.oldThreadID, turnID: "legacy-turn", itemID: "legacy-approval", questions: [
             .init(id: "mcp_tool_call_approval_read_file", header: "MCP approval", question: "Allow this tool?", isOther: true, isSecret: false, options: [
