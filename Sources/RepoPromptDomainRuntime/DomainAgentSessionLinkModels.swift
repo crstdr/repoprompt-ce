@@ -365,9 +365,6 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
     package let targetSessionID: UUID
     package let displayName: String?
     package let capabilities: Set<DomainAgentSessionLinkCapability>
-    /// Grant creation time — host-side ordering input only (e.g. "first overseer by link
-    /// creation"); inventories keep their deterministic UUID ordering regardless.
-    package let createdAt: Date
 
     package init(
         linkID: UUID,
@@ -375,8 +372,7 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
         observerSessionID: UUID,
         targetSessionID: UUID,
         displayName: String?,
-        capabilities: Set<DomainAgentSessionLinkCapability>,
-        createdAt: Date
+        capabilities: Set<DomainAgentSessionLinkCapability>
     ) {
         self.linkID = linkID
         self.generation = generation
@@ -387,7 +383,6 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
             maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
         )
         self.capabilities = capabilities
-        self.createdAt = createdAt
     }
 
     package var capabilityNames: [String] {

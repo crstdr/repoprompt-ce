@@ -526,11 +526,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(withPersistence.autoWakeTargetSessionIDs, [targetID])
         XCTAssertTrue(published.withCanAddReason("changed").autoWakeOnUpdatesEnabled)
         XCTAssertEqual(published.withCanAddReason("changed").autoWakeTargetSessionIDs, [targetID])
-        // The Add reason is also the inverse menu's ineligible reason; everything else is preserved.
-        XCTAssertEqual(
-            published.withCanAddReason("changed").sidebarOversightMenu,
-            menu.withObserverIneligibleReason("changed")
-        )
+        XCTAssertEqual(published.withCanAddReason("changed").sidebarOversightMenu, menu)
     }
 
     /// The switch is the only place the user learns what Auto-wake does, so its copy has to carry the
@@ -580,8 +576,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             "the scope is the observer session, not a link and not a global preference"
         )
         XCTAssertTrue(
-            tooltip.contains("On by default"),
-            "the default has to be visible where the control is — and it is enabled by default"
+            tooltip.contains("Off by default"),
+            "the default has to be visible where the control is"
         )
         let accessibilityHint = AgentMonitorAutoWakeCopy.accessibilityHint
         XCTAssertTrue(
