@@ -317,8 +317,7 @@ enum MCPIntegrationHelper {
     /// Computer Use companion server (`mcp__computer-use__<tool>`). Transcript-side
     /// normalization rewrites `-` to `_`, so the `mcp__computer_use__` form is also accepted.
     static func computerUseCompanionToolName(_ rawName: String?) -> String? {
-        guard let lowered = trimmedLowercasedToolName(rawName) else { return nil }
-        let name = stripFunctionsPrefix(from: lowered)
+        guard let name = trimmedLowercasedToolName(rawName) else { return nil }
         guard name.hasPrefix("mcp__") else { return nil }
         let remainder = name.dropFirst("mcp__".count)
         guard let separator = remainder.range(of: "__"),

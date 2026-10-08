@@ -8613,14 +8613,20 @@ final class CodexNativeSessionController {
         return false
     }
 
-    private func isComputerUseCompanionCandidate(_ candidate: [String: Any]) -> Bool {
-        guard let server = stringValue(from: candidate, keys: [
+    /// Server identity attested by the provider payload. Populated aliases must agree:
+    /// a conflicting payload yields multiple names and fails closed downstream.
+    private func attestedMCPServerNames(in candidate: [String: Any]) -> Set<String> {
+        var names = Set<String>()
+        for key in [
             "server", "serverName", "server_name", "mcpServer", "mcp_server", "mcpServerName", "mcp_server_name"
-        ]) else { return false }
-        return server
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "_", with: "-") == Self.computerUseMCPServerName
+        ] {
+            guard let value = stringValue(from: candidate, keys: [key])?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !value.isEmpty
+            else { continue }
+            names.insert(value.lowercased().replacingOccurrences(of: "_", with: "-"))
+        }
+        return names
     }
 
     private func normalizedToolName(from candidate: [String: Any]) -> String? {
@@ -8630,6 +8636,22 @@ final class CodexNativeSessionController {
         let typeRaw = normalizedTypeString(from: candidate)
         let raw = (explicitName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         let lowered = raw.lowercased()
+
+        // The provider-attested server outranks generic action aliases, so companion
+        // calls keep provenance even when the action name resembles a shell or web tool.
+        let attestedServers = attestedMCPServerNames(in: candidate)
+        if !raw.isEmpty, attestedServers == [Self.computerUseMCPServerName] {
+            // Already-qualified names carry their own provenance.
+            if lowered.hasPrefix("mcp__") { return raw }
+            return "mcp__\(MCPIntegrationHelper.computerUseMCPServerName)__\(raw)"
+        }
+        // A foreign or conflicting attestation carrying a companion-looking name must
+        // never group: strip the claimed prefix and fail closed.
+        if !attestedServers.isEmpty,
+           let stripped = MCPIntegrationHelper.computerUseCompanionToolName(raw)
+        {
+            return stripped
+        }
 
         if lowered == "local_shell"
             || lowered == "shell"
@@ -8646,11 +8668,6 @@ final class CodexNativeSessionController {
             if isRepoPromptToolCandidate(candidate, toolName: raw) {
                 let normalized = MCPIntegrationHelper.normalizedRepoPromptToolName(raw)
                 return "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__\(normalized)"
-            }
-            // The reserved companion server gets the same qualified treatment so its
-            // calls keep provenance and can collapse into one transcript cluster.
-            if !lowered.hasPrefix("mcp__"), isComputerUseCompanionCandidate(candidate) {
-                return "mcp__\(MCPIntegrationHelper.computerUseMCPServerName)__\(raw)"
             }
             return raw
         }

@@ -71,6 +71,23 @@ final class AgentComputerUseCompanionClusterTests: XCTestCase {
         XCTAssertFalse(kinds.contains(.activityCluster))
     }
 
+    func testContinuationFragmentAfterBoundaryDoesNotMerge() {
+        var seq = 1
+        let callA = UUID(), callB = UUID(), foreign = UUID()
+        var items: [AgentChatItem] = [.user("drive", sequenceIndex: 0)]
+        // Execution A's call/result is split by a foreign call; its trailing fragment
+        // must not re-join a run with B — one call can never be counted twice.
+        items.append(.toolCall(name: "mcp__computer-use__click", invocationID: callA, argsJSON: "{}", sequenceIndex: seq))
+        seq += 1
+        items += pairs("read_file", foreign, &seq)
+        items.append(.toolResult(name: "mcp__computer-use__click", invocationID: callA, resultJSON: "{}", isError: false, sequenceIndex: seq))
+        seq += 1
+        items += pairs("mcp__computer-use__screenshot", callB, &seq)
+        let kinds = blocks(for: items).map(\.kind)
+        XCTAssertEqual(kinds.count(where: { $0 == .standaloneTool }), 4)
+        XCTAssertFalse(kinds.contains(.activityCluster))
+    }
+
     func testLeafDescriptorAndKindsPathsMirrorMerge() {
         var seq = 1
         var items: [AgentChatItem] = [.user("drive", sequenceIndex: 0)]
@@ -107,6 +124,36 @@ final class AgentComputerUseCompanionClusterTests: XCTestCase {
         }
         XCTAssertEqual(toolBlocks.map(\.kind), [.activityCluster])
         XCTAssertEqual(try XCTUnwrap(toolBlocks.first).clusterSummary?.toolCount, 10)
+    }
+
+    func testClusterCountsAsOneTailLeafWithinBudget() {
+        var seq = 1
+        var items: [AgentChatItem] = [.user("drive", sequenceIndex: 0)]
+        items += companion("click", &seq) + companion("click", &seq)
+        for _ in 0 ..< 7 {
+            items += pairs("read_file", UUID(), &seq)
+        }
+        // The cluster plus seven tools is exactly the detailed-tail budget: no grouping.
+        let kinds = blocks(for: items).map(\.kind).filter { $0 != .request }
+        XCTAssertEqual(kinds, [.activityCluster] + Array(repeating: .standaloneTool, count: 7))
+    }
+
+    func testCompanionOnlyGroupedHistoryKeepsGenericLabel() throws {
+        var seq = 1
+        var items: [AgentChatItem] = [.user("drive", sequenceIndex: 0)]
+        // Nine note-separated singletons exceed the tail budget; the collapsed group is
+        // generic history, not a companion cluster, so it must not claim the label.
+        for index in 0 ..< 9 {
+            items += companion("click", &seq)
+            if index < 8 {
+                items.append(.assistant("step", sequenceIndex: seq))
+                seq += 1
+            }
+        }
+        let grouped = try XCTUnwrap(blocks(for: items).first { $0.kind == .groupedHistory })
+        let display = grouped.groupedHistory?.summary.collapsedDisplay
+        XCTAssertFalse(display?.title.hasPrefix("Computer Use") ?? true)
+        XCTAssertNotNil(display?.count)
     }
 
     func testProjectionRealScaleWithinBudget() {

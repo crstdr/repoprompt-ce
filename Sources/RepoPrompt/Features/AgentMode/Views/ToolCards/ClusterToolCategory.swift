@@ -173,17 +173,10 @@ enum ClusterToolCategory {
         toolNameCounts: [String: Int],
         containsRunningWork: Bool
     ) -> SummaryTitleSemantic {
-        let sourceNames = toolNameCounts.isEmpty ? toolNames : Array(toolNameCounts.keys)
-        // A cluster made purely of reserved companion calls keeps its own label even
-        // while actions are still running.
-        if !sourceNames.isEmpty,
-           sourceNames.allSatisfy({ MCPIntegrationHelper.isComputerUseCompanionToolName($0) })
-        {
-            return .computerUse
-        }
         if containsRunningWork {
             return .running
         }
+        let sourceNames = toolNameCounts.isEmpty ? toolNames : Array(toolNameCounts.keys)
         var hasNavigation = false
         var hasEdit = false
         var hasExecution = false
