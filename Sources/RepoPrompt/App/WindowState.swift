@@ -548,6 +548,19 @@ class WindowState: ObservableObject {
 
     #if DEBUG
         convenience init(
+            agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory,
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory
+        ) {
+            self.init(
+                contextBuilderProviderFactory: contextBuilderProviderFactory,
+                loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: nil,
+                agentModeViewModelFactory: agentModeViewModelFactory
+            )
+        }
+
+        convenience init(
             contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
             domainRuntime: MCPDomainRuntime,
             keyManager: KeyManager,
@@ -620,7 +633,8 @@ class WindowState: ObservableObject {
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         domainRuntimeOverride: MCPDomainRuntime?,
-        keyManager injectedKeyManager: KeyManager? = nil
+        keyManager injectedKeyManager: KeyManager? = nil,
+        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -645,7 +659,8 @@ class WindowState: ObservableObject {
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            agentModeViewModelFactory: agentModeViewModelFactory
         )
         compositionSpan.end()
 

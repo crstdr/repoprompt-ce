@@ -712,7 +712,8 @@ package actor DomainAgentSessionLinkAuthority {
             observerSessionID: record.grant.observer.sessionID,
             targetSessionID: record.grant.target.sessionID,
             displayName: outbound ? targets[record.grant.target.sessionID]?.snapshot.displayName : nil,
-            capabilities: record.grant.capabilities
+            capabilities: record.grant.capabilities,
+            createdAt: record.grant.createdAt
         )
     }
 

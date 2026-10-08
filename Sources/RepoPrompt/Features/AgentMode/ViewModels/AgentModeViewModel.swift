@@ -2,6 +2,7 @@ import Combine
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
@@ -601,6 +602,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ///
     /// Written only by `AgentModeViewModel+SessionLinks`; nothing else should mutate it.
     var monitorPillPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
+
+    /// In-memory palette-slot assignments for overseer sessions, reconciled inside the
+    /// projection mutation boundary so a row re-rendered by the oversight-change notification
+    /// always reads a settled map. Stores slots only; roles stay live via the projections.
+    let agentOversightColourAllocator = AgentOversightColourAllocator()
+
+    var sidebarCreatorDisplayNames: [UUID: String] = [:]
 
     /// Latest process-wide durable-oversight level, broadcast by the bridge.
     ///
@@ -5247,6 +5255,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         sessionID: UUID?
     ) {
+        // Native row providers capture the UUID from the sidebar's cached row.
+        // Publish identity changes even when no index refresh is in flight.
+        syncSidebarUIState(refresh: true, reason: .sessionList)
         guard let token = activeSessionIndexRefreshToken,
               sessionIndexStore.isOwnerCurrent(token.owner),
               activeSessionIndexRefreshValidTabIDs.contains(tabID)
@@ -5268,6 +5279,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         refreshSessionListCache(for: workspace, owner: token.owner)
+    }
+
+    /// Identity-only preparation of already-loaded state. Never mounts, hydrates, or resumes.
+    /// A repaired binding remains pending: menu activity cannot earn restoration authority.
+    func prepareSidebarOversightSession(tabID: UUID, sessionID: UUID, workspaceID: UUID) {
+        guard let session = sessions[tabID], session.activeAgentSessionID == nil,
+              session.hasLoadedPersistedState, session.persistedLoadTask == nil,
+              !session.bindingTransitionInProgress, !bindingHasSynchronousOwnership(session), !session.isDirty,
+              !Task.isCancelled, workspaceManager?.activeWorkspaceID == workspaceID,
+              agentSessionLinkComposeTabDescriptors().contains(where: {
+                  $0.tabID == tabID && $0.sessionID == sessionID && $0.workspaceID == workspaceID
+              }),
+              AgentSessionLinkRuntimeBridge.shared.canPrepareSidebarSession(.init(
+                  windowID: windowID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
+              )),
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+        else { return }
+        _ = installPersistentSessionBinding(
+            sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
+        )
+        if currentTabID == session.tabID {
+            publishTranscriptPresentation(from: session)
+        }
     }
 
     private enum PersistentSessionBindingMutationTarget {
