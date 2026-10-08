@@ -2436,8 +2436,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func initialDefaultActivationMayProceed(_ attempt: InitialDefaultActivationAttempt) -> Bool {
-        initialDefaultActivationAttempt === attempt
-            && !attempt.isSuperseded
+        !attempt.isSuperseded
             && !Task.isCancelled
             && !isPreparingForWindowClose
             && !hasEstablishedWorkspaceSelection
@@ -2498,7 +2497,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func runInitialDefaultActivation(attempt: InitialDefaultActivationAttempt) async {
-        defer { finishInitialDefaultActivation(attempt) }
+        defer { finishInitialDefaultActivation() }
         guard initialDefaultActivationMayProceed(attempt) else { return }
         #if DEBUG
             if let initialDefaultResolutionHandlerForTesting {
@@ -2525,13 +2524,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
-    /// Clears matching ownership before initialization callbacks, with no suspension between,
+    /// Clears one-shot startup ownership before initialization callbacks, with no suspension between,
     /// so a queued restore released here never mistakes finished startup for an admitted switch.
-    private func finishInitialDefaultActivation(_ attempt: InitialDefaultActivationAttempt) {
-        if initialDefaultActivationAttempt === attempt {
-            initialDefaultActivationAttempt = nil
-            initialDefaultActivationTask = nil
-        }
+    private func finishInitialDefaultActivation() {
+        initialDefaultActivationAttempt = nil
+        initialDefaultActivationTask = nil
         completeInitialization()
     }
 
@@ -5551,10 +5548,6 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         var hasEstablishedWorkspaceSelectionForTesting: Bool {
             hasEstablishedWorkspaceSelection
-        }
-
-        var hasInitialDefaultActivationAttemptForTesting: Bool {
-            initialDefaultActivationAttempt != nil
         }
 
         /// Inserts/removes a manager-owned active restore ID and republishes the normal union.
