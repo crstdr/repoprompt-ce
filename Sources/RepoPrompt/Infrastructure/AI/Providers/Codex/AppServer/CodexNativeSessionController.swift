@@ -296,7 +296,7 @@ final class CodexNativeSessionController {
     private static let maxPendingTurnFailures = 64
     private static let hookTrustWriteMutex = AsyncMutex()
     private static let maxHookTrustWriteSettlementDeadline: TimeInterval = 30
-    private static let computerUseMCPServerName = "computer-use"
+    private static let computerUseMCPServerName = MCPIntegrationHelper.computerUseMCPServerName
     // Controller-scoped: never follows a live settings toggle while requests are outstanding.
     private var computerUseRequiresUserReview = false
     private var computerUseAutoApprovalRevoked = false
@@ -8613,6 +8613,16 @@ final class CodexNativeSessionController {
         return false
     }
 
+    private func isComputerUseCompanionCandidate(_ candidate: [String: Any]) -> Bool {
+        guard let server = stringValue(from: candidate, keys: [
+            "server", "serverName", "server_name", "mcpServer", "mcp_server", "mcpServerName", "mcp_server_name"
+        ]) else { return false }
+        return server
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-") == Self.computerUseMCPServerName
+    }
+
     private func normalizedToolName(from candidate: [String: Any]) -> String? {
         let explicitName = stringValue(from: candidate, keys: [
             "name", "toolName", "tool_name", "functionName", "function_name", "callName", "call_name"
@@ -8636,6 +8646,11 @@ final class CodexNativeSessionController {
             if isRepoPromptToolCandidate(candidate, toolName: raw) {
                 let normalized = MCPIntegrationHelper.normalizedRepoPromptToolName(raw)
                 return "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__\(normalized)"
+            }
+            // The reserved companion server gets the same qualified treatment so its
+            // calls keep provenance and can collapse into one transcript cluster.
+            if !lowered.hasPrefix("mcp__"), isComputerUseCompanionCandidate(candidate) {
+                return "mcp__\(MCPIntegrationHelper.computerUseMCPServerName)__\(raw)"
             }
             return raw
         }

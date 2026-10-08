@@ -1471,7 +1471,7 @@ private final class AgentTranscriptProjectionBuildContext {
     }
 }
 
-private struct CollapsibleLeafDescriptor {
+struct CollapsibleLeafDescriptor {
     let kind: AgentTranscriptRenderBlockKind
     let rowCount: Int
     let containsProgressNote: Bool
@@ -1829,6 +1829,8 @@ enum AgentTranscriptSummaryTextFormatter {
             toolNameCounts: summary.toolNameCounts,
             containsRunningWork: summary.containsRunningWork
         ) {
+        case .computerUse:
+            return "Computer Use · \(summary.toolCount) actions"
         case .running:
             return "Running"
         case .exploredAndEdited:
@@ -1869,9 +1871,17 @@ enum AgentTranscriptSummaryTextFormatter {
     ) -> AgentTranscriptCollapsedSummaryDisplay {
         let narration = summary?.shortNarration?.trimmingCharacters(in: .whitespacesAndNewlines)
         let toolGroupText = collapsedToolGroupText(summary?.toolGroups ?? [])
+        // The companion label already carries "N actions"; a second count badge would repeat it.
+        let isComputerUseCluster = summary.map {
+            ClusterToolCategory.summaryTitleSemantic(
+                toolNames: $0.toolNames,
+                toolNameCounts: $0.toolNameCounts,
+                containsRunningWork: $0.containsRunningWork
+            ) == .computerUse
+        } ?? false
         return AgentTranscriptCollapsedSummaryDisplay(
             title: summaryTitle(for: summary, fallbackCount: fallbackCount),
-            count: fallbackCount > 0 ? fallbackCount : nil,
+            count: isComputerUseCluster ? nil : (fallbackCount > 0 ? fallbackCount : nil),
             detailText: collapsedDetailText(
                 narration: summary?.shortNarration,
                 toolGroups: summary?.toolGroups ?? [],
@@ -4269,6 +4279,7 @@ enum AgentTranscriptIO {
             containsRunningWork: false
         )
         switch semantic {
+        case .computerUse: parts.append("Computer Use · \(summary.toolCount) actions")
         case .running: parts.append("Running")
         case .exploredAndEdited: parts.append("Explored & edited")
         case .madeChanges: parts.append("Made changes")
@@ -5571,6 +5582,7 @@ enum AgentTranscriptProjectionBuilder {
                     for: span,
                     in: turn,
                     archived: false,
+                    context: context,
                     emittedConclusionActivityIDs: &emittedConclusionActivityIDs
                 )
                 guard let plan = groupedHistoryCollapsePlan(
@@ -6277,11 +6289,13 @@ enum AgentTranscriptProjectionBuilder {
     ) -> Bool {
         guard turn.retentionTier == .full else { return false }
         var emittedConclusionActivityIDs = Set<UUID>()
+        let context = AgentTranscriptProjectionBuildContext()
         for span in turn.responseSpans {
             let leafBlocks = fullSpanLeafBlocks(
                 for: span,
                 in: turn,
                 archived: false,
+                context: context,
                 emittedConclusionActivityIDs: &emittedConclusionActivityIDs
             )
             if groupedHistoryCollapsePlan(
@@ -6648,7 +6662,7 @@ enum AgentTranscriptProjectionBuilder {
         return collapsedBlockCount(for: leafDescriptors, detailedToolTailLimit: detailedToolTailLimit)
     }
 
-    private static func fullSpanLeafBlockKinds(
+    static func fullSpanLeafBlockKinds(
         for span: AgentTranscriptProviderResponseSpan,
         in turn: AgentTranscriptTurn,
         emittedConclusionActivityIDs: inout Set<UUID>
@@ -6660,6 +6674,7 @@ enum AgentTranscriptProjectionBuilder {
             return lhs.sequenceIndex < rhs.sequenceIndex
         }
         var kinds: [AgentTranscriptRenderBlockKind] = []
+        var leafIsCompanion: [Bool] = []
         var currentToolExecutionID: String?
         for activity in orderedActivities {
             guard !isSuppressedActivity(activity) else { continue }
@@ -6668,25 +6683,31 @@ enum AgentTranscriptProjectionBuilder {
                 currentToolExecutionID = nil
                 if emittedConclusionActivityIDs.insert(activity.id).inserted {
                     kinds.append(.conclusion)
+                    leafIsCompanion.append(false)
                 }
             case .standaloneTool:
                 let stableExecutionID = activity.toolExecution?.stableExecutionID
                 if currentToolExecutionID != stableExecutionID {
                     kinds.append(.standaloneTool)
+                    leafIsCompanion.append(
+                        MCPIntegrationHelper.isComputerUseCompanionToolName(activity.toolExecution?.toolName)
+                    )
                     currentToolExecutionID = stableExecutionID
                 }
             case .standaloneAssistant:
                 currentToolExecutionID = nil
                 kinds.append(.standaloneAssistant)
+                leafIsCompanion.append(false)
             case .standaloneNote:
                 currentToolExecutionID = nil
                 kinds.append(.standaloneNote)
+                leafIsCompanion.append(false)
             }
         }
-        return kinds
+        return mergedComputerUseCompanionLeafKinds(kinds, isCompanionLeaf: leafIsCompanion)
     }
 
-    private static func fullSpanLeafDescriptors(
+    static func fullSpanLeafDescriptors(
         for span: AgentTranscriptProviderResponseSpan,
         in turn: AgentTranscriptTurn,
         emittedConclusionActivityIDs: inout Set<UUID>
@@ -6698,14 +6719,18 @@ enum AgentTranscriptProjectionBuilder {
             return lhs.sequenceIndex < rhs.sequenceIndex
         }
         var descriptors: [CollapsibleLeafDescriptor] = []
+        var leafIsCompanion: [Bool] = []
         var currentToolExecutionID: String?
         var currentToolRowCount = 0
+        var currentToolIsCompanion = false
 
         func flushStandaloneToolDescriptor() {
             guard currentToolRowCount > 0 else { return }
             descriptors.append(.init(kind: .standaloneTool, rowCount: currentToolRowCount))
+            leafIsCompanion.append(currentToolIsCompanion)
             currentToolExecutionID = nil
             currentToolRowCount = 0
+            currentToolIsCompanion = false
         }
 
         for activity in orderedActivities {
@@ -6715,6 +6740,7 @@ enum AgentTranscriptProjectionBuilder {
                 flushStandaloneToolDescriptor()
                 if emittedConclusionActivityIDs.insert(activity.id).inserted {
                     descriptors.append(.init(kind: .conclusion, rowCount: 1))
+                    leafIsCompanion.append(false)
                 }
             case .standaloneTool:
                 let stableExecutionID = activity.toolExecution?.stableExecutionID
@@ -6726,6 +6752,9 @@ enum AgentTranscriptProjectionBuilder {
                     flushStandaloneToolDescriptor()
                     currentToolExecutionID = stableExecutionID
                     currentToolRowCount = 1
+                    currentToolIsCompanion = MCPIntegrationHelper.isComputerUseCompanionToolName(
+                        activity.toolExecution?.toolName
+                    )
                 }
             case .standaloneAssistant:
                 flushStandaloneToolDescriptor()
@@ -6733,6 +6762,7 @@ enum AgentTranscriptProjectionBuilder {
                     kind: .standaloneAssistant,
                     rowCount: 1
                 ))
+                leafIsCompanion.append(false)
             case .standaloneNote:
                 flushStandaloneToolDescriptor()
                 descriptors.append(.init(
@@ -6740,11 +6770,101 @@ enum AgentTranscriptProjectionBuilder {
                     rowCount: 1,
                     containsProgressNote: activity.itemKind == .thinking
                 ))
+                leafIsCompanion.append(false)
             }
         }
 
         flushStandaloneToolDescriptor()
-        return descriptors
+        return mergedComputerUseCompanionLeafDescriptors(descriptors, isCompanionLeaf: leafIsCompanion)
+    }
+
+    /// One merge mechanic shared by the block, kind, and descriptor projections so all
+    /// three collapse the same runs: each run of >= 2 consecutive companion-flagged
+    /// leaves becomes one leaf produced by `makeCluster`. Singletons stay untouched.
+    private static func mergedComputerUseCompanionLeaves<Leaf>(
+        _ leaves: [Leaf],
+        isCompanionLeaf: [Bool],
+        makeCluster: (ArraySlice<Leaf>) -> Leaf
+    ) -> [Leaf] {
+        var mergeByStart: [Int: Int] = [:]
+        var index = 0
+        while index < isCompanionLeaf.count {
+            guard isCompanionLeaf[index] else {
+                index += 1
+                continue
+            }
+            var end = index + 1
+            while end < isCompanionLeaf.count, isCompanionLeaf[end] {
+                end += 1
+            }
+            if end - index >= 2 {
+                mergeByStart[index] = end - index
+            }
+            index = end
+        }
+        guard !mergeByStart.isEmpty else { return leaves }
+        var merged: [Leaf] = []
+        merged.reserveCapacity(leaves.count)
+        index = 0
+        while index < leaves.count {
+            if let length = mergeByStart[index] {
+                merged.append(makeCluster(leaves[index ..< index + length]))
+                index += length
+            } else {
+                merged.append(leaves[index])
+                index += 1
+            }
+        }
+        return merged
+    }
+
+    /// A leaf block joins a companion cluster only when it is a standalone tool execution
+    /// qualified with the reserved companion server; any other tool ends the run.
+    private static func isComputerUseCompanionLeafBlock(_ block: AgentTranscriptRenderBlock) -> Bool {
+        guard block.kind == .standaloneTool else { return false }
+        return block.rows.contains { MCPIntegrationHelper.isComputerUseCompanionToolName($0.toolName) }
+    }
+
+    /// Consecutive companion executions collapse into one expandable activity cluster.
+    private static func mergeComputerUseCompanionToolBlocks(
+        in blocks: [AgentTranscriptRenderBlock],
+        turn: AgentTranscriptTurn,
+        spanID: UUID,
+        archived: Bool,
+        context: AgentTranscriptProjectionBuildContext
+    ) -> [AgentTranscriptRenderBlock] {
+        mergedComputerUseCompanionLeaves(
+            blocks,
+            isCompanionLeaf: blocks.map { isComputerUseCompanionLeafBlock($0) }
+        ) { childBlocks in
+            activityClusterBlock(
+                for: Array(childBlocks),
+                turn: turn,
+                spanID: spanID,
+                archived: archived,
+                context: context
+            )
+        }
+    }
+
+    /// Kind-path mirror of `mergeComputerUseCompanionToolBlocks` so tool-tail budgeting
+    /// counts the same collapsed runs the renderer emits.
+    private static func mergedComputerUseCompanionLeafKinds(
+        _ kinds: [AgentTranscriptRenderBlockKind],
+        isCompanionLeaf: [Bool]
+    ) -> [AgentTranscriptRenderBlockKind] {
+        mergedComputerUseCompanionLeaves(kinds, isCompanionLeaf: isCompanionLeaf) { _ in .activityCluster }
+    }
+
+    /// Descriptor-path mirror: a merged cluster presents one row, matching
+    /// `presentedItemCount(for:)` for `.activityCluster`.
+    private static func mergedComputerUseCompanionLeafDescriptors(
+        _ descriptors: [CollapsibleLeafDescriptor],
+        isCompanionLeaf: [Bool]
+    ) -> [CollapsibleLeafDescriptor] {
+        mergedComputerUseCompanionLeaves(descriptors, isCompanionLeaf: isCompanionLeaf) { _ in
+            .init(kind: .activityCluster, rowCount: 1)
+        }
     }
 
     private static func collapsedBlockCount(
@@ -7034,6 +7154,7 @@ enum AgentTranscriptProjectionBuilder {
                 for: span,
                 in: turn,
                 archived: archived,
+                context: context,
                 emittedConclusionActivityIDs: &emittedConclusionActivityIDs
             )
             blocks.append(contentsOf: collapseOlderHistory(
@@ -7100,6 +7221,7 @@ enum AgentTranscriptProjectionBuilder {
                 for: span,
                 in: turn,
                 archived: archived,
+                context: context,
                 emittedConclusionActivityIDs: &emittedConclusionActivityIDs
             )
             let contentBlocks = leafBlocks.filter { $0.kind != .conclusion }
@@ -7196,6 +7318,7 @@ enum AgentTranscriptProjectionBuilder {
         for span: AgentTranscriptProviderResponseSpan,
         in turn: AgentTranscriptTurn,
         archived: Bool,
+        context: AgentTranscriptProjectionBuildContext,
         emittedConclusionActivityIDs: inout Set<UUID>
     ) -> [AgentTranscriptRenderBlock] {
         let orderedActivities = span.activities.sorted { lhs, rhs in
@@ -7257,7 +7380,13 @@ enum AgentTranscriptProjectionBuilder {
         }
 
         flushStandaloneToolActivities()
-        return blocks
+        return mergeComputerUseCompanionToolBlocks(
+            in: blocks,
+            turn: turn,
+            spanID: span.id,
+            archived: archived,
+            context: context
+        )
     }
 
     private static func isDisplaylessAssistant(_ activity: AgentTranscriptActivity) -> Bool {
@@ -7855,6 +7984,8 @@ enum AgentTranscriptProjectionBuilder {
             toolNameCounts: summary.toolNameCounts,
             containsRunningWork: summary.containsRunningWork
         ) {
+        case .computerUse:
+            return "Computer Use · \(summary.toolCount) actions"
         case .running:
             return "Running"
         case .exploredAndEdited:
