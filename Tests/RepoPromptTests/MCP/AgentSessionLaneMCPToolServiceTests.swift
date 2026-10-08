@@ -66,8 +66,7 @@ final class AgentSessionLaneMCPToolServiceTests: XCTestCase {
                 observerSessionID: observerID,
                 targetSessionID: targetID,
                 displayName: "Lane",
-                capabilities: DomainAgentSessionLinkCapability.version1,
-                createdAt: Date(timeIntervalSince1970: 0)
+                capabilities: DomainAgentSessionLinkCapability.version1
             )]
         )
         let annotated = AgentSessionLinkPromptInventory(inventory) { $0 == targetID }

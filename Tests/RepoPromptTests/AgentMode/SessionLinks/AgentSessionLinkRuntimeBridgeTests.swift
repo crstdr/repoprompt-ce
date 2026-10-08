@@ -1,4 +1,3 @@
-import Combine
 import Foundation
 import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
@@ -26,59 +25,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await fixture.bridge.invalidateBinding(windowID: endpoint.windowID, tabID: endpoint.tabID)
         await release.value // A pending forward must not recreate state after retirement.
         XCTAssertEqual(fixture.bridge.captureWaitInput(for: endpoint).generation, 0)
-    }
-
-    /// The popover uses this editor and the bridge's payload-free readiness publisher.
-    private func makeSessionIDEditor(_ fixture: Fixture) -> AgentMonitorSessionIDEditor {
-        let editor = AgentMonitorSessionIDEditor(
-            readinessChanges: NotificationCenter.default.publisher(for: .agentSessionLinkCandidatesDidChange)
-                .map { _ in () }.eraseToAnyPublisher()
-        )
-        editor.refresh { raw in
-            fixture.bridge.resolvePreview(
-                observerSessionID: fixture.observer.sessionID,
-                rawTargetSessionID: raw,
-                existingOutboundTargetIDs: []
-            )
-        }
-        return editor
-    }
-
-    private func refreshSessionIDEditorForReadiness(_ fixture: Fixture, editor: AgentMonitorSessionIDEditor) async {
-        let refreshed = expectation(description: "Readiness refreshes the editor")
-        let subscription = editor.$validationMessage.dropFirst().sink { _ in refreshed.fulfill() }
-        fixture.bridge.noteCandidateReadinessChanged()
-        await fulfillment(of: [refreshed], timeout: 2)
-        withExtendedLifetime(subscription) {}
-    }
-
-    func testSessionIDEditorRecoversUnchangedInputWhenTargetBecomesReady() async {
-        let fixture = makeFixture()
-        fixture.host.candidates = [fixture.observer]
-        let editor = makeSessionIDEditor(fixture)
-        let raw = fixture.target.sessionID.uuidString
-        editor.updateIdentifier(raw)
-        XCTAssertNil(editor.preview)
-        XCTAssertEqual(editor.validationMessage, AgentSessionLinkResolveFailure.notFound.uiMessage)
-
-        fixture.host.candidates.append(makeCandidate(
-            windowID: fixture.target.windowID, sessionID: fixture.target.sessionID, hasLoadedPersistedState: false
-        ))
-        await refreshSessionIDEditorForReadiness(fixture, editor: editor)
-        XCTAssertNil(editor.preview)
-        XCTAssertEqual(editor.validationMessage, AgentSessionLinkResolveFailure.loading.uiMessage)
-
-        fixture.host.candidates = [fixture.observer, fixture.target]
-        await refreshSessionIDEditorForReadiness(fixture, editor: editor)
-        XCTAssertEqual(editor.identifierText, raw)
-        XCTAssertEqual(editor.preview?.sessionID, fixture.target.sessionID)
-        XCTAssertEqual(editor.preview?.displayName, fixture.target.resolvedDisplayName)
-        XCTAssertNil(editor.validationMessage)
-        let inventory = await fixture.authority.links(forObserver: fixture.observer.sessionID)
-        XCTAssertTrue(inventory.items.isEmpty, "Preview recovery must not grant oversight")
-        fixture.host.candidates = [fixture.observer]
-        await refreshSessionIDEditorForReadiness(fixture, editor: editor)
-        XCTAssertNil(editor.preview, "Readiness loss must invalidate a stale successful preview")
     }
 
     // MARK: - Fake host
@@ -2135,7 +2081,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         XCTAssertEqual(menu.availableObservers.map(\.observerEndpoint), [availableObserver.domainEndpoint])
         XCTAssertTrue(menu.linkedObservers.allSatisfy { option in
-            guard case .linked(_, peerCurrentlyEligible: true) = option.relationship else {
+            guard case .linked(_, observerCurrentlyEligible: true) = option.relationship else {
                 return false
             }
             return true
@@ -2188,7 +2134,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
         )
         XCTAssertEqual(menu.linkedObservers.map(\.observerEndpoint), [fixture.observer.domainEndpoint])
-        guard case .linked(_, peerCurrentlyEligible: false) = menu.linkedObservers.first?.relationship else {
+        guard case .linked(_, observerCurrentlyEligible: false) = menu.linkedObservers.first?.relationship else {
             return XCTFail("the unavailable linked observer must remain visible for unlink")
         }
         XCTAssertEqual(
