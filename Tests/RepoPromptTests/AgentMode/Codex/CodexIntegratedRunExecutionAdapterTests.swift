@@ -248,7 +248,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         _ = try await controller.test_computerUseApprovalPolicy()
         armed = false
         var events = controller.events.makeAsyncIterator()
-        await controller.test_handleServerRequest(method: "item/permissions/requestApproval", params: ["serverName": .string("RepoPromptCE"), "toolName": .string("read_file"), "threadId": .string("thread"), "turnId": .string("turn"), "itemId": .string("permission-item"), "cwd": .string("/tmp"), "reason": .string("Allow computer interaction?"), "permissions": .object(["network": .object(["enabled": .bool(true)])])])
+        await controller.test_handleServerRequest(method: "item/permissions/requestApproval", params: ["threadId": .string("thread"), "turnId": .string("turn"), "itemId": .string("permission-item"), "cwd": .string("/tmp"), "reason": .string("Allow computer interaction?"), "permissions": .object(["network": .object(["enabled": .bool(true)])])])
         guard case let .permissionsRequest(request) = await events.next() else {
             XCTFail("Permission requests must reach the one-shot user UI")
             await controller.shutdown()
