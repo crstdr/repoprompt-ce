@@ -978,8 +978,6 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         package var agentSessionHandoffInstructions: String?
         package var subagentDefaultWaitSeconds: Int?
-        /// App-global UI preference; skips only the confirmation dialog, never authority.
-        package var suppressOversightLinkConfirmation: Bool?
 
         package init(
             proEditAgentMode: Bool? = nil,
@@ -1002,8 +1000,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil,
-            subagentDefaultWaitSeconds: Int? = nil,
-            suppressOversightLinkConfirmation: Bool? = nil
+            subagentDefaultWaitSeconds: Int? = nil
         ) {
             self.proEditAgentMode = proEditAgentMode
             self.proEditAgentKind = proEditAgentKind
@@ -1026,7 +1023,6 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions
             self.subagentDefaultWaitSeconds = subagentDefaultWaitSeconds
-            self.suppressOversightLinkConfirmation = suppressOversightLinkConfirmation
         }
     }
 }

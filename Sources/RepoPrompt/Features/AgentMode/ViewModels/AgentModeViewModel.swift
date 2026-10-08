@@ -602,11 +602,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Written only by `AgentModeViewModel+SessionLinks`; nothing else should mutate it.
     var monitorPillPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
 
-    /// In-memory palette-slot assignments for overseer sessions, reconciled inside the
-    /// projection mutation boundary so a row re-rendered by the oversight-change notification
-    /// always reads a settled map. Stores slots only; roles stay live via the projections.
-    let agentOversightColourAllocator = AgentOversightColourAllocator()
-
     /// Latest process-wide durable-oversight level, broadcast by the bridge.
     ///
     /// Stored per window rather than read on demand so a link-free tab — which never receives an
@@ -3679,18 +3674,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func installAgentSessionLifecycleProjectionAuthority() {
-        workspaceManager?.setAgentSessionProjectionReconciler { [weak self] projected, current in
+        workspaceManager?.setAgentSessionProjectionReconciler { [weak self] projected, current, repairBaselines in
             guard let self else {
                 return AgentSessionLifecycleAuthority.ProjectionOutcome(
                     workspaces: projected,
                     protectedWorkspaceIDs: [],
-                    protectedClaimCount: 0
+                    protectedClaimCount: 0,
+                    newlyRequiredRepairWorkspaceIDs: []
                 )
             }
             return sessionLifecycleAuthority.reconcileProjection(
                 projectedWorkspaces: projected,
                 currentWorkspaces: current,
-                claims: agentSessionLifecycleProtectionClaims(in: current)
+                claims: agentSessionLifecycleProtectionClaims(in: current),
+                repairBaselines: repairBaselines
             )
         }
     }
@@ -5143,9 +5140,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         sessionID: UUID?
     ) {
-        // Native row providers capture the UUID from the sidebar's cached row.
-        // Publish identity changes even when no index refresh is in flight.
-        syncSidebarUIState(refresh: true, reason: .sessionList)
         guard let token = activeSessionIndexRefreshToken,
               sessionIndexStore.isOwnerCurrent(token.owner),
               activeSessionIndexRefreshValidTabIDs.contains(tabID)

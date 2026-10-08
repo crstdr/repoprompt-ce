@@ -50,6 +50,7 @@ struct WindowContentView: View {
             .onAppear {
                 StartupPhaseLog.mark(.windowAppeared, window: windowState.windowID)
                 windowStatesManager.registerWindowState(windowState)
+                MCPExternalEventsMonitor.shared.scheduleCleanupOnce()
 
                 // Install the openWindow action into AppWindowOpener for programmatic window creation
                 AppWindowOpener.shared.install {

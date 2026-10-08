@@ -1030,9 +1030,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             // first exact tab/session match in array order, including across duplicate workspace IDs.
             // These positions are derived alongside the routing indexes, never a second authority.
             lifecycleBindingPositions.removeAll(keepingCapacity: true)
+            lifecycleSessionPositions.removeAll(keepingCapacity: true)
             for (workspaceIndex, workspace) in workspaces.enumerated() {
                 for (tabIndex, tab) in workspace.composeTabs.enumerated() {
                     guard let sessionID = tab.activeAgentSessionID else { continue }
+                    lifecycleSessionPositions[workspace.id, default: [:]][sessionID, default: []].append((workspaceIndex, tabIndex))
                     let key = LifecycleBindingKey(tabID: tab.id, sessionID: sessionID)
                     if lifecycleBindingPositions[key] == nil {
                         lifecycleBindingPositions[key] = (workspaceIndex, tabIndex)
@@ -1070,6 +1072,23 @@ class WorkspaceManagerViewModel: ObservableObject {
         let tab = workspaces[position.workspace].composeTabs[position.tab]
         guard tab.id == tabID, tab.activeAgentSessionID == sessionID else { return nil }
         return workspaces[position.workspace].id
+    }
+
+    /// Complementary UUID addresses in the lifecycle index. Preserve every metadata occurrence,
+    /// including duplicate workspace/tab IDs: the full lifecycle census retains that multiplicity.
+    /// Generations and runtime eligibility are still read live by the lifecycle adapter.
+    private var lifecycleSessionPositions: [UUID: [UUID: [(workspace: Int, tab: Int)]]] = [:]
+
+    func agentSessionLifecycleTabs(workspaceID: UUID, sessionID: UUID) -> [ComposeTabState] {
+        guard activeWorkspaceID == workspaceID else { return [] }
+        return (lifecycleSessionPositions[workspaceID]?[sessionID] ?? []).compactMap { position in
+            guard workspaces.indices.contains(position.workspace),
+                  workspaces[position.workspace].id == workspaceID,
+                  workspaces[position.workspace].composeTabs.indices.contains(position.tab)
+            else { return nil }
+            let tab = workspaces[position.workspace].composeTabs[position.tab]
+            return tab.activeAgentSessionID == sessionID ? tab : nil
+        }
     }
 
     private var modelRoutingTabIndexes: [UUID: [UUID: Int]] = [:]
@@ -2837,7 +2856,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     private let workspaceAgentAdmissionCoordinator: WorkspaceAgentAdmissionCoordinator
     private var agentSessionProjectionReconciler: ((
         _ projectedWorkspaces: [WorkspaceModel],
-        _ currentWorkspaces: [WorkspaceModel]
+        _ currentWorkspaces: [WorkspaceModel],
+        _ repairBaselines: [UUID: AgentSessionLifecycleAuthority.ProjectionRepairBaseline]
     ) -> AgentSessionLifecycleAuthority.ProjectionOutcome)?
     private var lastDomainProjectionSequence: UInt64 = 0
     private lazy var checkoutRefreshService = WorkspaceCheckoutRefreshService(
@@ -2862,7 +2882,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     func setAgentSessionProjectionReconciler(
         _ reconciler: @escaping (
             _ projectedWorkspaces: [WorkspaceModel],
-            _ currentWorkspaces: [WorkspaceModel]
+            _ currentWorkspaces: [WorkspaceModel],
+            _ repairBaselines: [UUID: AgentSessionLifecycleAuthority.ProjectionRepairBaseline]
         ) -> AgentSessionLifecycleAuthority.ProjectionOutcome
     ) {
         agentSessionProjectionReconciler = reconciler
@@ -7565,6 +7586,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         let staleWorkspaceIDs = Set(revisionsByWorkspaceID.compactMap { id, revision in
             isOlderDomainRevision(revision, workspaceID: id) ? id : nil
         })
+        var repairBaselines: [UUID: AgentSessionLifecycleAuthority.ProjectionRepairBaseline] = [:]
+        for workspaceID in persistedWorkspaceIDs where !staleWorkspaceIDs.contains(workspaceID) {
+            if let revision = revisionsByWorkspaceID[workspaceID], let digest = digestsByWorkspaceID[workspaceID] {
+                repairBaselines[workspaceID] = .working(revision: revision.workingRevision, digest: digest)
+            }
+        }
+        for workspace in workspaces where !workspace.isEphemeral && !persistedWorkspaceIDs.contains(workspace.id) {
+            // A failed decode or a still-publishing creation is not canonical absence.
+            if revisionsByWorkspaceID[workspace.id] == nil, digestsByWorkspaceID[workspace.id] == nil,
+               workspaceCreationTasksByID[workspace.id] == nil,
+               pendingPersistentWorkspaceCreationsByWorkspaceID[workspace.id] == nil
+            {
+                repairBaselines[workspace.id] = .absent
+            }
+        }
         let rootPreparedProjection = persistedProjection.map { presentation in
             if staleWorkspaceIDs.contains(presentation.id), let current = workspace(withID: presentation.id) {
                 return current
@@ -7621,7 +7657,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         let lifecycleProjection = agentSessionProjectionReconciler?(
             localProjection,
-            workspaces
+            workspaces,
+            repairBaselines
         )
         let reconciledWorkspaces = lifecycleProjection?.workspaces ?? localProjection
         workspaces = reconciledWorkspaces
@@ -7679,7 +7716,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if previousActiveWorkspaceID != activeWorkspaceID, let activeWorkspaceID {
             requestRootReconciliation(workspaceID: activeWorkspaceID)
         }
-        if let protectedWorkspaceIDs = lifecycleProjection?.protectedWorkspaceIDs {
+        if let protectedWorkspaceIDs = lifecycleProjection?.newlyRequiredRepairWorkspaceIDs {
             for workspaceID in protectedWorkspaceIDs {
                 bumpStateVersion(for: workspaceID)
             }
@@ -10252,9 +10289,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         if refreshedWorkspace != currentWorkspace {
             var projected = workspaces
             projected[currentIndex] = refreshedWorkspace
-            let lifecycleProjection = agentSessionProjectionReconciler?(projected, workspaces)
+            let lifecycleProjection = agentSessionProjectionReconciler?(
+                projected,
+                workspaces,
+                [workspaceID: .working(revision: snapshot.revisions.workingRevision, digest: snapshot.document.contentDigest)]
+            )
             workspaces = lifecycleProjection?.workspaces ?? projected
-            if let protectedWorkspaceIDs = lifecycleProjection?.protectedWorkspaceIDs {
+            if let protectedWorkspaceIDs = lifecycleProjection?.newlyRequiredRepairWorkspaceIDs {
                 for protectedWorkspaceID in protectedWorkspaceIDs {
                     bumpStateVersion(for: protectedWorkspaceID)
                 }
@@ -11509,7 +11550,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 )
                 let lifecycleProjection = agentSessionProjectionReconciler?(
                     localProjection,
-                    workspaces
+                    workspaces,
+                    [:]
                 )
                 workspaces = lifecycleProjection?.workspaces ?? localProjection
             }
