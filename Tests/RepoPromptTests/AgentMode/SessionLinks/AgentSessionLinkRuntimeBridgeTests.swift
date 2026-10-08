@@ -1420,15 +1420,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     func testSeedFailureRollsBackTheReservationAndLeavesNoActiveLink() async {
         let fixture = makeFixture()
-        // Drift between the resolution read and the post-reservation revalidation read.
-        //
-        // Add takes three candidate snapshots: (1) the pre-persistence preflight that renders the
-        // popover's message, (2) the shared establishment path's own fresh resolution, and (3) the
-        // post-reservation revalidation. Only a drift landing after (2) exercises the seed rollback;
-        // dropping the target before (2) is an ordinary `.notFound` resolution failure instead.
-        fixture.host.onCandidatesRead = { [weak host = fixture.host] count in
-            guard count == 3, let host else { return }
-            host.candidates = [fixture.observer]
+        // Rebind after reservation, preserving the UUID but replacing the exact incarnation.
+        fixture.bridge.test_beforeSynchronousSeed = {
+            fixture.host.candidates = [fixture.observer, self.makeCandidate(
+                windowID: fixture.target.windowID, sessionID: fixture.target.sessionID,
+                workspaceID: fixture.target.workspaceID, tabID: fixture.target.tabID,
+                displayName: "Replacement"
+            )]
         }
         let outcome = await addLink(fixture)
         XCTAssertEqual(outcome, .failed(.rebinding))
