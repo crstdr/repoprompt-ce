@@ -65,6 +65,10 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             revocationCompleted = true
         }
         let acquisition = Task { await addLink(fixture) }
+        addTeardownBlock { @MainActor in
+            gate.release()
+            _ = await acquisition.value
+        }
         try await AsyncTestWait.waitUntil("Link acquisition enters revocation", timeout: 4) { revocationBegan }
         XCTAssertFalse(revocationCompleted)
         let linkedWhileRetiring = await fixture.authority.hasActiveLink(endpoint: fixture.target.domainEndpoint)

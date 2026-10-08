@@ -6760,7 +6760,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             goalSupportEnabled: wantsGoalSupport,
             reasoningSummariesEnabled: wantsReasoningSummaries,
             memoriesEnabled: wantsMemories,
-            capabilities: wantsComputerUse ? .disabled : wantsCapabilities
+            capabilities: wantsComputerUse ? .computerUse : wantsCapabilities
         )
         if let existingController = session.codexController,
            session.codexControllerFeatureState != desiredFeatureState
@@ -6876,7 +6876,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 goalSupportEnabled: CodexGoalSupport.isEnabled,
                 reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
                 memoriesEnabled: CodexMemories.isEnabled,
-                capabilities: refreshedWantsComputerUse ? .disabled : codexCapabilitiesForLaunch(session.isMCPRelated)
+                capabilities: refreshedWantsComputerUse ? .computerUse : codexCapabilitiesForLaunch(session.isMCPRelated)
             )
 
             if let existingController = session.codexController,
@@ -9630,6 +9630,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.scheduleSaveForCommandOutput(tabID: session.tabID, minInterval: 2.0)
         case let .approvalRequest(request):
             guard session.runState.isActive else { return }
+            CodexComputerUseWorkflow.logApprovalDecision(
+                path: request.method, server: nil, armed: session.codexControllerFeatureState?.computerUseEnabled == true,
+                approvalPolicy: session.permissionProfile.codexApprovalPolicy, sandboxMode: session.permissionProfile.codexSandboxMode, outcome: "surface"
+            )
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             session.pendingApproval = request
@@ -9682,6 +9686,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                ?? (autoApproveCompanion ? request.companionOneShotAutoApprovalResponse : nil),
                let controller = session.codexController
             {
+                CodexComputerUseWorkflow.logApprovalDecision(
+                    path: request.method, server: request.repoPromptAutoApprovalVerified ? MCPIntegrationHelper.repoPromptMCPServerName : "computer-use", armed: true,
+                    approvalPolicy: session.permissionProfile.codexApprovalPolicy, sandboxMode: session.permissionProfile.codexSandboxMode, outcome: "accept"
+                )
                 await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
                 return
             }
@@ -9690,6 +9698,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let alreadyQueued = session.queuedUserInputRequests.contains { $0.requestID == request.requestID }
             guard !alreadyPending, !alreadyQueued else {
                 return
+            }
+            if request.questions.contains(where: \.isLegacyMCPToolApproval) {
+                CodexComputerUseWorkflow.logApprovalDecision(
+                    path: request.method, server: request.repoPromptAutoApprovalVerified ? MCPIntegrationHelper.repoPromptMCPServerName : (request.computerUseCompanionVerified ? "computer-use" : nil), armed: computerUseArmed,
+                    approvalPolicy: session.permissionProfile.codexApprovalPolicy, sandboxMode: session.permissionProfile.codexSandboxMode, outcome: "surface"
+                )
             }
             if session.pendingUserInputRequest == nil {
                 session.pendingUserInputRequest = request

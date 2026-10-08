@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import RepoPromptSettingsCore
 
 extension Notification.Name {
@@ -165,6 +166,15 @@ enum CodexComputerUseWorkflow {
             CodexNativeFeatureGate.computerUse.setEnabledForTesting(value)
         }
     #endif
+
+    private static let approvalLogger = Logger(subsystem: "com.repoprompt.agents", category: "CodexComputerUse")
+
+    static func logApprovalDecision(path: String, server: String?, armed: Bool, approvalPolicy: CodexAgentToolPreferences.ApprovalPolicy, sandboxMode: CodexAgentToolPreferences.SandboxMode, outcome: String) {
+        guard armed else { return }
+        let server = server ?? "unspecified"
+        let mode = approvalPolicy.persistedValue + "/" + sandboxMode.persistedValue
+        approvalLogger.notice("Computer Use approval path=\(path, privacy: .public) server=\(server, privacy: .private) armed=true mode=\(mode, privacy: .public) outcome=\(outcome, privacy: .public)")
+    }
 
     static func automaticallyApprovesCompanion(
         armed: Bool,
