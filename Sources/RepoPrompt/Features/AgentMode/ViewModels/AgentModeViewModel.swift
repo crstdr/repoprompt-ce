@@ -2699,7 +2699,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexHookApprovalSettingsProvider: (any CodexHookApprovalSettingsProviding)? = nil,
             testCodexComputerUseCompanionReady: @escaping () -> Bool = { CodexNativeSessionController.computerUseClientPath() != nil },
             testCodexComputerUseReservedEntryExists: @escaping () -> Bool = { CodexNativeSessionController.hasReservedComputerUseEntry(MCPIntegrationHelper.codexMCPServerEntries()) },
-            testCodexComputerUseHasActiveLink: ((AgentTabSession) async -> Bool)? = nil,
             testCodexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
             testCodexActiveAgentRunWaitQuery: CodexAgentRunWaitQuery? = nil,
             testCodexActiveAgentRunWaitDrain: CodexAgentRunWaitDrain? = nil,
@@ -2781,7 +2780,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 codexCapabilitiesForLaunch: testCodexCapabilitiesForLaunch,
                 computerUseCompanionReady: testCodexComputerUseCompanionReady,
                 computerUseReservedEntryExists: testCodexComputerUseReservedEntryExists,
-                computerUseHasActiveLink: testCodexComputerUseHasActiveLink,
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
                 codexHookApprovalSettings: testCodexHookApprovalSettingsProvider ?? GlobalSettingsStore.shared,
                 activeToolQuery: testCodexActiveToolQuery
@@ -10089,8 +10087,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
         }
-        let releaseComputerUseAdmission = session.holdCodexComputerUseAdmission()
-        defer { releaseComputerUseAdmission() }
         if requireInactiveRunState, session.runState.isActive {
             throw MCPError.invalidParams(
                 "The requested agent session is already running and cannot be reactivated for inactive MCP control."
@@ -10128,7 +10124,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         try mcpRequireActivationOwnerFence(residentActivationTarget, session: session)
         try MCPAgentRunStartExecutionScope.current?.checkAdmission()
-        await codexCoordinator.revokeCodexComputerUse(session: session, reason: "mcp-control")
+        await codexCoordinator.awaitCodexComputerUseRetirement(for: session.tabID)
         try mcpRequireActivationOwnerFence(residentActivationTarget, session: session)
         try MCPAgentRunStartExecutionScope.current?.checkAdmission()
         session.mcpControlCleanupTask?.cancel()
@@ -17367,7 +17363,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         taggedFiles: [AgentTaggedFileAttachment],
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
-        stagedCodexComputerUseActivationID: UUID?,
         managedTurn: AgentNoncomposerTurn? = nil,
         message: String
     ) {
@@ -17382,10 +17377,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             reason: "waiting instruction was not accepted by the provider"
         )
         rollbackAgentTurnUserAnchor(turnRuntimeAnchorRollback, session: session)
-        clearPendingCodexComputerUseActivationIfMatched(
-            session: session,
-            activationID: stagedCodexComputerUseActivationID
-        )
         // A managed steer reports the withdrawal to its overseer and leaves the target user's
         // composer exactly as it was.
         if let managedTurn {
@@ -17415,7 +17406,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         draftText: String,
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
-        stagedCodexComputerUseActivationID: UUID?,
         managedTurn: AgentNoncomposerTurn? = nil
     ) {
         let expectedWaitID = session.instructionWaitID
@@ -17457,7 +17447,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
@@ -17482,7 +17471,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
@@ -17502,7 +17490,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: waitingInstructionReadinessErrorMessage(readiness)
                 )
@@ -17520,7 +17507,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "RepoPrompt MCP routing changed before provider dispatch. Your instruction was restored."
                 )
@@ -17538,7 +17524,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
@@ -17562,7 +17547,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "RepoPrompt MCP catalog input was unavailable. Your instruction was restored."
                 )
@@ -17586,7 +17570,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
@@ -17760,6 +17743,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard stopFence?.permitsStart(of: session) ?? true else {
             return .blocked(message: "This scheduled run was cancelled by Stop.")
         }
+        if nativePreparedTurn?.shouldEnableCodexComputerUse == true, !session.isCodexComputerUseArmed {
+            return .blocked(message: "Enable Computer Use in this tab before submitting /computer-use.")
+        }
         if nativePreparedTurn?.shouldEnableCodexComputerUse == true || session.pendingCodexComputerUseActivation != nil || session.codexControllerFeatureState?.computerUseEnabled == true {
             guard isLocalComposerInput, managedTurn == nil, codexAttemptID == nil else {
                 return .blocked(message: "Computer Use accepts only local-user input for the existing operation.")
@@ -17794,14 +17780,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             bubbleText = "Included \(taggedFilesToSend.count) file\(taggedFilesToSend.count == 1 ? "" : "s")"
         }
-        var stagedCodexComputerUseActivationID: UUID?
-        if nativePreparedTurn?.shouldEnableCodexComputerUse == true,
-           session.pendingCodexComputerUseActivation == nil
-        {
-            stagedCodexComputerUseActivationID = codexCoordinator.stageCodexComputerUseActivationIfNeeded(session: session)
-        }
-        // A rejected follow-up must not revoke authority established by an earlier turn.
-
         // Prepend interview instruction to the user message if enabled (first message only).
         // A managed steer carries its own RepoPrompt-framed provider text and never consumes the
         // target user's interview preference.
@@ -17976,7 +17954,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 draftText: restorationDraftText,
                 selectedWorkflow: restorationSelectedWorkflow,
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                 managedTurn: managedTurn
             )
             return UserTurnSubmissionResult.submitted
@@ -18058,10 +18035,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 }
                 if sendOutcome?.didSend != true {
-                    self.clearPendingCodexComputerUseActivationIfMatched(
-                        session: session,
-                        activationID: stagedCodexComputerUseActivationID
-                    )
                     if codexAttemptID != nil {
                         self.removeUnconfirmedOptimisticCodexUserItem(
                             session: session,
@@ -18213,7 +18186,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     draftText: restorationDraftText,
                     selectedWorkflow: restorationSelectedWorkflow,
                     selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn
                 )
                 return UserTurnSubmissionResult.submitted
@@ -18624,18 +18596,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 shouldEnableCodexComputerUse: false
             )
         }
-    }
-
-    private func clearPendingCodexComputerUseActivationIfMatched(
-        session: TabSession,
-        activationID: UUID?
-    ) {
-        guard let activationID,
-              session.pendingCodexComputerUseActivation?.id == activationID
-        else {
-            return
-        }
-        session.pendingCodexComputerUseActivation = nil
     }
 
     private func validateNativeSlashCommandUsage(
