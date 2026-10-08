@@ -142,10 +142,10 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         }
     }
 
-    func testElicitationUnderNeverFullAccessIsEmittedNotAutoaccepted() async throws {
-        for server in ["computer-use", "RepoPromptCE"] {
+    func testElicitationUnderStricterPolicyIsEmittedNotAutoaccepted() async throws {
+        for server in ["computer-use", "NotRepoPromptCE"] {
             var armed = true
-            let controller = makeController(options: .agentModeDefault(approvalPolicyProvider: { .never }, sandboxModeProvider: { .dangerFullAccess }, computerUseEnabledProvider: { armed }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" }, mcpServerEntriesProvider: { [] }))
+            let controller = makeController(options: .agentModeDefault(approvalPolicyProvider: { .onRequest }, sandboxModeProvider: { .dangerFullAccess }, computerUseEnabledProvider: { armed }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" }, mcpServerEntriesProvider: { [] }))
             _ = try await controller.test_computerUseApprovalPolicy()
             armed = false
             var events = controller.events.makeAsyncIterator()
@@ -158,6 +158,82 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
             XCTAssertEqual(request.serverName, server)
             XCTAssertEqual(request.requestID, .int(42))
             await controller.shutdown()
+        }
+    }
+
+    func testArmedElicitationAutoApprovalRequiresRepoPromptProvenance() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("mock-codex")
+        // Inert JSON-RPC peer: never Codex, never model/companion/TCC activity.
+        let script = """
+        #!/usr/bin/python3
+        import json, sys
+        if '--version' in sys.argv:
+            print('codex 0.160.1')
+            sys.exit(0)
+        for line in sys.stdin:
+            message = json.loads(line)
+            if 'method' in message and 'id' in message:
+                print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
+        """
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let cases: [(Bool, String?, String, Bool, Bool, Bool)] = [
+            (true, "RepoPromptCE", "apply_edits", true, true, false),
+            (false, "RepoPromptCE", "apply_edits", true, true, false),
+            (true, "computer-use", "apply_edits", true, true, false),
+            (true, "computer-use", "apply_edits", false, true, true),
+            (true, "computer-use", "apply_edits", false, false, false),
+            (false, "computer-use", "apply_edits", false, true, false),
+            (true, "computer-use", "mcp__OtherServer__apply_edits", false, true, false),
+            (true, "NotRepoPromptCE", "mcp__RepoPromptCE__apply_edits", false, true, false),
+            (true, nil, "apply_edits", false, true, false),
+            (true, "RepoPromptCE", "mcp__OtherServer__apply_edits", false, true, false)
+        ]
+        for (enabled, server, tool, autoApproved, fullAccess, revoked) in cases {
+            let recorder = MCPApprovalWireRecorder()
+            let environment = ["HOME": root.path, "PATH": "/usr/bin:/bin"]
+            let client = CodexAppServerClient(
+                writeFrameHandler: { descriptor, frame in
+                    try FDWriteSupport.writeAll(frame, to: descriptor)
+                    recorder.record(frame)
+                },
+                processEnvironmentBuilder: { _ in
+                    ProcessEnvironmentResult(environment: environment, launchContext: .detect(from: environment), shellEnvironmentSource: .capturedLoginShell)
+                }, runtimeStatePreparer: { _ in },
+                launchSnapshot: .init(selection: .external(path: executable.path)), provisionsRepoPromptMCPOnStart: false
+            )
+            await client.updateProcessLaunchPolicy(featurePolicy: .defaultDisabled, modelReasoningSummary: nil)
+            try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await client.startIfNeeded() }
+            var armed = enabled
+            let controller = CodexNativeSessionController(client: client, runID: UUID(), tabID: UUID(), windowID: 1, workspacePaths: .uniform(nil), options: .agentModeDefault(approvalPolicyProvider: { fullAccess ? .never : .onRequest }, sandboxModeProvider: { .dangerFullAccess }, computerUseEnabledProvider: { armed }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" }, mcpServerEntriesProvider: { [] }))
+            _ = try await controller.test_computerUseApprovalPolicy()
+            try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await client.startIfNeeded() }
+            armed = false
+            if revoked { controller.revokeComputerUseAutoApproval() }
+            var params: [String: CodexJSONValue] = ["toolName": .string(tool), "threadId": .string("thread"), "turnId": .string("turn"), "message": .string("Approve app tool call?"), "requestedSchema": .object(["type": .string("object"), "properties": .object([:])])]
+            if let server { params["serverName"] = .string(server) }
+            await controller.test_handleServerRequest(method: "mcpServer/elicitation/request", params: params)
+            var permissionParams = params
+            permissionParams["itemId"] = .string("permission")
+            permissionParams["cwd"] = .string(root.path)
+            permissionParams["permissions"] = .object(["network": .object(["enabled": .bool(true)])])
+            await controller.test_handleServerRequest(method: "item/permissions/requestApproval", params: permissionParams)
+            let hostTypedAutoApproved = server == "RepoPromptCE" && autoApproved
+            XCTAssertEqual(recorder.permissionScopes, autoApproved && !hostTypedAutoApproved ? ["turn"] : [], "Typed companion grants must follow the same policy without remembered consent")
+            await controller.shutdown()
+            if autoApproved {
+                XCTAssertEqual(recorder.actions, hostTypedAutoApproved ? ["accept", "accept"] : ["accept"], "Genuine host typed permissions must match the unarmed base response while armed")
+            } else {
+                XCTAssertTrue(recorder.actions.isEmpty)
+                var events = controller.events.makeAsyncIterator()
+                guard case let .mcpElicitationRequest(request) = await events.next() else { return XCTFail("Unverified or companion request must be surfaced") }
+                XCTAssertEqual(request.serverName, server)
+                XCTAssertEqual(request.toolName, tool)
+                guard case .permissionsRequest = await events.next() else { return XCTFail("Strict companion and unverified typed requests must surface") }
+            }
         }
     }
 
@@ -181,7 +257,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         let coordinator = makeCoordinator()
         coordinator.submitPermissionsDecision(session: session, request: request, decision: .acceptForSession)
         XCTAssertEqual(session.pendingPermissionsRequest?.id, request.id, "Remembered approval must not be submitted")
-        coordinator.test_clearComputerUseAfterTurn(session: session)
+        await coordinator.revokeCodexComputerUse(session: session, reason: "user-off")
         XCTAssertNil(session.pendingPermissionsRequest)
         XCTAssertNil(session.codexController)
         XCTAssertNil(session.codexControllerFeatureState)
@@ -448,5 +524,29 @@ private final class OffStartupRequestRecorder: @unchecked Sendable {
 
     var methods: [String] {
         lock.withLock { recorded }
+    }
+}
+
+private final class MCPApprovalWireRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedActions: [String] = []
+    private var recordedPermissionScopes: [String] = []
+
+    func record(_ frame: Data) {
+        guard let packet = try? JSONSerialization.jsonObject(with: frame) as? [String: Any],
+              packet["id"] as? Int == 42,
+              let result = packet["result"] as? [String: Any] else { return }
+        lock.withLock {
+            if let action = result["action"] as? String { recordedActions.append(action) }
+            if result["permissions"] != nil, let scope = result["scope"] as? String { recordedPermissionScopes.append(scope) }
+        }
+    }
+
+    var permissionScopes: [String] {
+        lock.withLock { recordedPermissionScopes }
+    }
+
+    var actions: [String] {
+        lock.withLock { recordedActions }
     }
 }

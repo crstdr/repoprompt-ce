@@ -24,7 +24,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
 
     private func makeFixture(
         _ plans: [[WedgeFakeCodexController.Response]],
-        routeOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true }
+        routeOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true },
+        companionReady: @escaping () -> Bool = { true }
     ) -> Fixture {
         let factory = WedgeControllerFactory(plans: plans)
         let tabID = UUID()
@@ -34,6 +35,9 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             shouldManageCodexTooling: true,
             codexControllerFactory: { runID, _, _, _, _, _ in factory.make(runID: runID) },
             mcpServerEnabler: { true },
+            testCodexComputerUseCompanionReady: companionReady,
+            testCodexComputerUseReservedEntryExists: { false },
+            testCodexComputerUseHasActiveLink: { _ in false },
             testCodexLeaseRoutingTimeoutMs: 5000,
             testCodexRouteOwnerValidator: routeOwnerValidator
         )
@@ -109,6 +113,47 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             await fixture.coordinator.shutdownCodexSession(session)
         }
         CodexComputerUseWorkflow.setEnabledForTesting(nil)
+    }
+
+    func testArmedLegacyApprovalsRequireRepoPromptProvenanceAndRemainOneShot() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let cases: [(String?, String, Bool, Bool)] = [
+            ("RepoPromptCE", "apply_edits", true, true),
+            ("computer-use", "apply_edits", true, true),
+            ("computer-use", "apply_edits", false, false),
+            ("NotRepoPromptCE", "mcp__RepoPromptCE__apply_edits", false, true),
+            (nil, "apply_edits", false, true),
+            ("RepoPromptCE", "mcp__OtherServer__apply_edits", false, true)
+        ]
+        for (server, tool, autoApproved, fullAccess) in cases {
+            let fixture = makeFixture([])
+            fixture.session.permissionProfile = .providerOverride(.codex(fullAccess ? .fullAccess : .autoReview))
+            let controller = WedgeFakeCodexController(runID: UUID(), responses: [])
+            fixture.session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+            fixture.session.codexController = controller
+            fixture.session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+            var params: [String: Any] = [
+                "threadId": Self.oldThreadID, "turnId": "legacy-turn", "itemId": "legacy-approval", "toolName": tool,
+                "questions": [["id": "mcp_tool_call_approval_apply_edits", "header": "MCP approval", "question": "Allow this tool?", "options": [
+                    ["label": "Allow for this session", "description": "Remember"],
+                    ["label": "Allow", "description": "One call"],
+                    ["label": "Cancel", "description": "Refuse"]
+                ]]]
+            ]
+            if let server { params["serverName"] = server }
+            let request = try XCTUnwrap(CodexNativeSessionController.parseRequestUserInputRequest(requestID: .int(91), method: "item/tool/requestUserInput", params: params, activeThreadID: Self.oldThreadID, currentTurnID: "legacy-turn"))
+            await fixture.coordinator.test_handleCodexNativeEvent(.requestUserInput(request), session: fixture.session, sourceController: controller)
+            if autoApproved {
+                XCTAssertNil(fixture.session.pendingUserInputRequest, "Verified RepoPrompt tools must retain their normal approval policy")
+                try await AsyncTestWait.waitUntil("verified RepoPrompt one-shot answer", timeout: 2) { controller.qaResponseCount == 1 }
+                XCTAssertEqual(controller.qaUserInputAnswers, ["mcp_tool_call_approval_apply_edits": ["Allow"]], "Arming must not add remembered permission")
+            } else {
+                XCTAssertEqual(fixture.session.pendingUserInputRequest?.id, request.id)
+                XCTAssertEqual(controller.qaResponseCount, 0)
+            }
+            await fixture.coordinator.shutdownCodexSession(fixture.session)
+        }
     }
 
     private func makeLegacyApprovalRequest() -> AgentRequestUserInputRequest {
@@ -198,7 +243,80 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
     }
 
-    func testQA90ProviderCompletionDisarmsBeforeOneOrdinarySend() async throws {
+    func testComputerUseIconProjectionIsPureAndHidesIneligibleChats() throws {
+        var discoveries = 0
+        let fixture = makeFixture([], companionReady: { discoveries += 1
+            return true
+        })
+        let vm = fixture.viewModel
+        let session = fixture.session
+        session.runState = .idle
+        XCTAssertTrue(vm.computerUseComposerProps(session: session).isVisible)
+        XCTAssertFalse(vm.computerUseComposerProps(session: session).isOn)
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        XCTAssertTrue(vm.computerUseComposerProps(session: session).isOn)
+        for provider in [AgentProviderKind.claudeCode, .cursor] {
+            session.selectedAgent = provider
+            XCTAssertEqual(vm.computerUseComposerProps(session: session), .hidden)
+        }
+        session.selectedAgent = .codexExec
+        session.parentSessionID = UUID()
+        XCTAssertEqual(vm.computerUseComposerProps(session: session), .hidden)
+        session.parentSessionID = nil
+        session.mcpControlActivationGeneration = 1
+        XCTAssertEqual(vm.computerUseComposerProps(session: session), .hidden)
+        session.mcpControlActivationGeneration = 0
+        session.createdByOverseerSessionID = UUID()
+        XCTAssertEqual(vm.computerUseComposerProps(session: session), .hidden)
+        session.createdByOverseerSessionID = nil
+        _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: session.tabID)
+        vm.monitorPillPropsByEndpoint[endpoint] = .init(
+            sessionID: session.activeAgentSessionID, endpoint: endpoint, sidebarOversightMenu: nil, outbound: [],
+            inbound: [.init(
+                linkID: UUID(),
+                generation: 1,
+                observerSessionID: UUID(),
+                observerEndpoint: endpoint,
+                displayName: "Observer",
+                providerDisplayName: nil
+            )], recentNotices: [], canAddReason: nil
+        )
+        XCTAssertEqual(vm.computerUseComposerProps(session: session), .hidden)
+        XCTAssertEqual(discoveries, 0, "Painting must never discover or provision the companion")
+    }
+
+    func testComputerUseIconOptInCancelArmAndDisarm() async {
+        CodexComputerUseWorkflow.setEnabledForTesting(nil)
+        let settings = GlobalSettingsStore.shared
+        let wasEnabled = settings.codexComputerUseEnabled()
+        settings.setCodexComputerUseEnabled(false, commit: false)
+        defer { settings.setCodexComputerUseEnabled(wasEnabled, commit: false) }
+        var discoveries = 0
+        let fixture = makeFixture([], companionReady: { discoveries += 1
+            return true
+        })
+        let session = fixture.session
+        let vm = fixture.viewModel
+        XCTAssertEqual(vm.currentTabID, session.tabID)
+        session.runState = .idle
+        let cancelled = await vm.armComputerUseForLocalUser(session: session, confirmOptIn: { false })
+        XCTAssertEqual(cancelled, "")
+        XCTAssertFalse(settings.codexComputerUseEnabled())
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertEqual(discoveries, 0)
+        let accepted = await vm.armComputerUseForLocalUser(session: session, confirmOptIn: { true })
+        XCTAssertNil(accepted)
+        XCTAssertTrue(settings.codexComputerUseEnabled())
+        XCTAssertTrue(vm.computerUseComposerProps(session: session).isOn)
+        XCTAssertGreaterThan(discoveries, 0)
+        await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertFalse(vm.computerUseComposerProps(session: session).isOn)
+        XCTAssertTrue(settings.codexComputerUseEnabled(), "Per-chat off must not change the global preference")
+    }
+
+    func testComputerUsePersistsAcrossCompletedLocalUserTurns() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
         let fixture = makeFixture([])
@@ -286,18 +404,119 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "computer-use-turn", status: .completed), session: session, sourceController: controller)
         XCTAssertEqual(publications, 1)
         XCTAssertEqual(session.runState, .completed)
+        let activationID = try XCTUnwrap(session.pendingCodexComputerUseActivation?.id)
+        XCTAssertTrue(session.codexController === controller)
+        XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
+        XCTAssertEqual(controller.shutdownCount, 0)
+        session.beginRunAttempt(source: "computer-use.next-local-send")
+        let next = await coordinator.sendCodexNativeMessage(session: session, text: "ordinary local follow-up", attachments: [], fallbackContext: context(true))
+        XCTAssertTrue(next.didSend)
+        XCTAssertEqual(flags, [true], "Later local turns must reuse the armed controller without reconnecting")
+        XCTAssertEqual(controller.startedTurnCount, 2)
+        XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activationID)
+        let nonLocal = await coordinator.sendCodexNativeMessage(session: session, text: "non-local second-turn steer", attachments: [], fallbackContext: context(false))
+        guard case .preDispatchRejected = nonLocal else { return XCTFail("Arming must not authorize non-local input on later turns") }
+        XCTAssertEqual(controller.startedTurnCount, 2)
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "second-local-turn"), session: session, sourceController: controller)
+        await coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "second-local-turn", status: .completed), session: session, sourceController: controller)
+        XCTAssertEqual(session.runState, .completed)
+        await coordinator.revokeCodexComputerUse(session: session, reason: "user-off")
+        XCTAssertEqual(session.runState, .completed, "Disarming an idle chat must not overwrite successful completion")
         XCTAssertNil(session.pendingCodexComputerUseActivation)
-        XCTAssertNil(session.codexController)
-        XCTAssertNil(session.codexControllerFeatureState)
-        XCTAssertTrue(session.codexNeedsReconnect)
-        try await AsyncTestWait.waitUntil("armed controller retired", timeout: 4) { controller.shutdownCount == 1 }
-        session.beginRunAttempt(source: "qa90.next-ordinary-local-send")
-        let ordinary = await coordinator.sendCodexNativeMessage(session: session, text: "ordinary next turn", attachments: [], fallbackContext: context(true))
+        session.beginRunAttempt(source: "computer-use.disarmed-local-send")
+        let ordinary = await coordinator.sendCodexNativeMessage(session: session, text: "ordinary after off", attachments: [], fallbackContext: context(true))
         XCTAssertTrue(ordinary.didSend)
-        XCTAssertEqual(flags, [true, false], "Settlement must not let an ordinary next turn inherit the companion")
-        XCTAssertEqual(controllers.last?.startedTurnCount, 1)
-        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertEqual(flags, [true, false], "An ordinary turn after disarming must have no companion")
         await coordinator.shutdownCodexSession(session)
+    }
+
+    func testComputerUseOffAndSettingsOffRevokeBeforeRetirementCompletes() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        for trigger in ["command", "setting"] {
+            CodexComputerUseWorkflow.setEnabledForTesting(true)
+            let fixture = makeFixture([])
+            let session = fixture.session
+            let otherChat = fixture.viewModel.session(for: UUID())
+            otherChat.selectedAgent = .codexExec
+            otherChat.runState = .idle
+            otherChat.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+            let controller = WedgeFakeCodexController(runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session), responses: [])
+            let gate = TestReleaseFence(name: "session-scoped Computer Use off retirement")
+            controller.shutdownGate = gate
+            session.codexController = controller
+            session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+            session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+            await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "armed-turn"), session: session, sourceController: controller)
+            if trigger == "command" {
+                let rejected = fixture.viewModel.submitUserTurn(text: "/computer-use off", tabID: session.tabID, isLocalComposerInput: false)
+                guard case .blocked = rejected else { return XCTFail("Non-local input cannot toggle Computer Use") }
+                XCTAssertTrue(session.isCodexComputerUseArmed)
+                XCTAssertEqual(fixture.viewModel.submitUserTurn(text: "/computer-use off", tabID: session.tabID), .submitted)
+            } else {
+                CodexComputerUseWorkflow.setEnabledForTesting(false)
+                CodexComputerUseWorkflow.postDidChangeIfNeeded(previousValue: true, currentValue: false)
+                // Re-enabling globally must not undo this chat's revocation or admission fence.
+                CodexComputerUseWorkflow.setEnabledForTesting(true)
+            }
+            XCTAssertFalse(session.codexComputerUseOwnershipTransitionHolds.isEmpty)
+            let entered = await gate.waitUntilEntered(timeout: 4)
+            XCTAssertTrue(entered)
+            XCTAssertFalse(session.isCodexComputerUseArmed)
+            XCTAssertNil(session.codexController)
+            XCTAssertNil(session.codexControllerFeatureState)
+            XCTAssertEqual(controller.interruptedTurnIDs, ["armed-turn"])
+            XCTAssertEqual(controller.startedTurnCount, 0, "Off must not dispatch a model turn")
+            XCTAssertTrue(fixture.factory.controllers.isEmpty, "Off must not start or reconnect Codex")
+            if trigger == "setting" {
+                try await AsyncTestWait.waitUntil("Global off disarms every chat", timeout: 4) {
+                    !otherChat.isCodexComputerUseArmed
+                }
+            } else {
+                XCTAssertTrue(otherChat.isCodexComputerUseArmed, "Local off affects only this chat")
+            }
+            gate.release()
+            try await AsyncTestWait.waitUntil("Computer Use off retirement releases admission", timeout: 4) {
+                controller.shutdownCount == 1 && session.codexComputerUseOwnershipTransitionHolds.isEmpty
+            }
+            await fixture.coordinator.shutdownCodexSession(session)
+        }
+    }
+
+    func testComputerUseProviderSwitchRevokesApprovalBeforeAsyncRetirement() async {
+        let fixture = makeFixture([])
+        let session = fixture.session
+        let controller = WedgeFakeCodexController(runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session), responses: [])
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        fixture.coordinator.handleProviderSwitch(from: .codexExec, to: .claudeCode, session: session)
+        XCTAssertTrue(controller.computerUseAutoApprovalRevoked, "Provider change must revoke before the retirement task can run")
+        XCTAssertFalse(session.isCodexComputerUseArmed)
+        await fixture.coordinator.shutdownCodexSession(session)
+    }
+
+    func testComputerUseSessionShutdownAndPersistedRestoreDoNotRearm() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture([])
+        fixture.session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        var saved = AgentSession(id: UUID(), name: "Computer Use persistence test")
+        fixture.coordinator.applyCodexPersistence(from: fixture.session, to: &saved)
+        let encoded = try JSONEncoder().encode(saved)
+        await fixture.coordinator.shutdownCodexSession(fixture.session)
+        XCTAssertFalse(fixture.session.isCodexComputerUseArmed)
+        let restored = makeFixture([])
+        try restored.coordinator.restoreCodexMetadata(from: JSONDecoder().decode(AgentSession.self, from: encoded), session: restored.session)
+        var flags: [Bool] = []
+        let coordinator = makeComputerUseCoordinator(fixture: restored) { runID, enabled in
+            flags.append(enabled)
+            return WedgeFakeCodexController(runID: runID, responses: [.success("restored-thread")])
+        }
+        await coordinator.ensureCodexNativeSession(session: restored.session)
+        XCTAssertFalse(restored.session.isCodexComputerUseArmed)
+        XCTAssertEqual(flags, [false], "Restoring the same Codex conversation with the setting on must not restore Computer Use authority")
+        await coordinator.shutdownCodexSession(restored.session)
     }
 
     func testComputerUseMidTurnOwnershipRevocationInterruptsAndRetiresController() async throws {
@@ -937,6 +1156,7 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
         }
     }
 
+    var computerUseAutoApprovalRevoked = false
     var shutdownGate: TestReleaseFence?
     private let continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
     let events: AsyncStream<CodexNativeSessionController.Event>
@@ -1049,6 +1269,10 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
     func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
         lock.withLock { interrupts.append(expectedTurnID) }
         return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
+    }
+
+    func revokeComputerUseAutoApproval() {
+        computerUseAutoApprovalRevoked = true
     }
 
     func shutdown() async {
