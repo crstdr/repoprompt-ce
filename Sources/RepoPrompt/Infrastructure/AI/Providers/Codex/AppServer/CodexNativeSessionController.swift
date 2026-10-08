@@ -2869,7 +2869,7 @@ final class CodexNativeSessionController {
                 goalsEnabled: options.goalSupportEnabledProvider(),
                 memoriesEnabled: options.memoriesEnabledProvider?() ?? false,
                 computerUseEnabled: computerUseRequiresUserReview && computerUseAcceptedClientPath != nil,
-                capabilities: computerUseRequiresUserReview ? .disabled : options.capabilitiesProvider()
+                capabilities: computerUseRequiresUserReview ? .computerUse : options.capabilitiesProvider()
             )
         }
     }
@@ -4817,7 +4817,9 @@ final class CodexNativeSessionController {
             await handleChatgptAuthTokensRefreshServerRequest(request.id, method: method, params: params)
         case .mcpElicitation:
             let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
-            if Self.isRepoPromptMCPElicitationRequest(params: params) || autoApproveCompanion {
+            let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
+            if autoApproveHost || autoApproveCompanion {
+                logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
                 await respondToServerRequest(
                     id: request.id,
                     result: [
@@ -4844,9 +4846,12 @@ final class CodexNativeSessionController {
                 )
                 return
             }
+            logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "surface")
             await emit(.mcpElicitationRequest(elicitationRequest))
         case .permissions:
-            if shouldAutoApproveComputerUseCompanion(params: params),
+            let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
+            let hostApprovalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params)
+            if autoApproveCompanion,
                let permission = Self.parsePermissionsRequest(
                    requestID: request.id,
                    method: method,
@@ -4855,12 +4860,14 @@ final class CodexNativeSessionController {
                    currentTurnID: routingCurrentTurnID
                )
             {
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await respondToServerRequest(id: request.id, result: [
                     "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
                 ])
                 return
             }
-            if let approvalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params) {
+            if let approvalResult = hostApprovalResult {
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await respondToServerRequest(id: request.id, result: approvalResult)
                 return
             }
@@ -4880,6 +4887,7 @@ final class CodexNativeSessionController {
                 )
                 return
             }
+            logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "surface")
             await emit(.permissionsRequest(permissionsRequest))
         case .dynamicToolUnsupported:
             await emitServerRequestIssue(
@@ -4978,6 +4986,14 @@ final class CodexNativeSessionController {
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
         }
+    }
+
+    private func logComputerUseApprovalDecision(path: CodexComputerUseWorkflow.ApprovalDecisionPath, params: [String: Any], outcome: String) {
+        guard computerUseRequiresUserReview else { return }
+        CodexComputerUseWorkflow.logApprovalDecision(
+            path: path, server: params["serverName"] as? String, armed: computerUseRequiresUserReview,
+            approvalPolicy: options.approvalPolicyProvider(), sandboxMode: options.sandboxModeProvider(), outcome: outcome
+        )
     }
 
     private func shouldAutoApproveComputerUseCompanion(params: [String: Any]) -> Bool {
@@ -9324,7 +9340,7 @@ final class CodexNativeSessionController {
                 goalsEnabled: goalSupportEnabled,
                 memoriesEnabled: memoriesEnabled,
                 computerUseEnabled: readyComputerUse,
-                capabilities: computerUseEnabled ? .disabled : capabilities
+                capabilities: computerUseEnabled ? .computerUse : capabilities
             )
         )
         let mcpOverrides = appServerMCPServerOverrides(
