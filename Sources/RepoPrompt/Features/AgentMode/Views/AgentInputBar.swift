@@ -188,6 +188,9 @@ struct AgentInputBar: View {
         AgentStatusPillsRow(
             agentModeVM: agentModeVM,
             statusPillsUI: statusPillsUI,
+            computerUse: composerUI.props.computerUse,
+            computerUseTarget: composerUI.props.submitTarget,
+            toggleComputerUse: composerActions.toggleComputerUse,
             openContextDrawerFiles: openContextDrawerFiles,
             oracleViewModel: oracleViewModel,
             promptManager: promptManager,
@@ -713,25 +716,6 @@ struct AgentComposerView: View, Equatable {
                 .hoverTooltip("Attach Images")
                 .transaction { transaction in
                     transaction.animation = nil
-                }
-
-                if props.computerUse.isVisible, let target = props.submitTarget,
-                   target.route == .existingAgentSession
-                {
-                    Button {
-                        Task { await actions.toggleComputerUse(target.tabID, target.expectedSourceTabSessionIdentity) }
-                    } label: {
-                        Image(systemName: "cursorarrow")
-                            .font(.system(size: 15))
-                            .foregroundStyle(props.computerUse.isOn ? Color.white : Color.secondary)
-                            .frame(width: 28, height: 28)
-                            .background(props.computerUse.isOn ? Color.accentColor : Color.clear, in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(props.computerUse.isBusy)
-                    .hoverTooltip("Computer Use \(props.computerUse.isOn ? "on" : "off") for this chat")
-                    .accessibilityLabel("Computer Use \(props.computerUse.isOn ? "on" : "off") for this chat")
-                    .accessibilityAddTraits(props.computerUse.isOn ? .isSelected : [])
                 }
 
                 if props.isRoutingFreshTask, let tabID = props.currentTabID {
