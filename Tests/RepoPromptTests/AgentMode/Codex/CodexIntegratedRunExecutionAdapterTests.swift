@@ -242,6 +242,160 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         }
     }
 
+    func testArmedStartupRetainsOnlyMCPElicitationCapability() async throws {
+        let ordinaryCapabilities = CodexCapabilitySettings(appsEnabled: true, pluginsEnabled: true, mcpElicitationEnabled: false, toolSuggestionsEnabled: true)
+        for armed in [true, false] {
+            let options = CodexNativeSessionController.Options.agentModeDefault(
+                approvalPolicyProvider: { .never }, sandboxModeProvider: { .dangerFullAccess },
+                approvalReviewerProvider: { .autoReview }, capabilitiesProvider: { ordinaryCapabilities },
+                computerUseEnabledProvider: { armed }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" },
+                mcpServerEntriesProvider: { [] }
+            )
+            let controller = makeController(options: options, requestExecutor: { _, _, _ in ["config": [:]] })
+            let threadConfig = try await controller.test_computerUseStartupConfig()
+            XCTAssertEqual(threadConfig["features.tool_call_mcp_elicitation"] as? Bool, armed)
+            for key in ["features.apps", "features.plugins", "features.tool_suggest"] {
+                XCTAssertEqual(threadConfig[key] as? Bool, !armed, key)
+            }
+            let policy = try await controller.test_computerUseApprovalPolicy()
+            XCTAssertEqual(policy.0, armed ? .onRequest : .never)
+            XCTAssertEqual(policy.1, armed ? .user : .autoReview)
+            await controller.shutdown()
+        }
+    }
+
+    func testArmedProductionElicitationEnvelopePreservesHostAndForeignConsent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("mock-codex")
+        // Inert wire peer: never a model, companion, or desktop operation. Reports actual launch
+        // flags so the protocol-selection regression is checked alongside the decoded envelope.
+        let script = """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then printf 'codex 0.160.1\n'; exit 0; fi
+        exec /usr/bin/python3 -u -c '
+        import json, sys
+        binding = {}
+        for line in sys.stdin:
+            message = json.loads(line)
+            if "method" in message and "id" in message:
+                method = message["method"]
+                result = {}
+                if method == "test/launchArgs": result = {"args": sys.argv[1:], "binding": binding}
+                if method == "config/read": result = {"config": {}}
+                if method in ("thread/start", "thread/resume"):
+                    binding = message.get("params", {})
+                    result = {"thread": {"id": "thread"}}
+                print(json.dumps({"id": message["id"], "result": result}), flush=True)
+        ' "$@"
+        """
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        for (server, fullAccess, accepted) in [("RepoPromptCE", true, true), ("computer-use", false, false), ("OtherServer", true, false), ("RepoPromptCE-lookalike", true, false)] {
+            let recorder = MCPApprovalWireRecorder()
+            let environment = ["HOME": root.path, "PATH": "/usr/bin:/bin"]
+            let client = CodexAppServerClient(
+                writeFrameHandler: { descriptor, frame in
+                    try FDWriteSupport.writeAll(frame, to: descriptor)
+                    recorder.record(frame)
+                },
+                processEnvironmentBuilder: { _ in
+                    ProcessEnvironmentResult(environment: environment, launchContext: .detect(from: environment), shellEnvironmentSource: .capturedLoginShell)
+                }, runtimeStatePreparer: { _ in },
+                launchSnapshot: .init(selection: .external(path: executable.path)), provisionsRepoPromptMCPOnStart: false
+            )
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.runState = .running
+            session.codexConversationID = "thread"
+            session.beginRunAttempt(source: "production-elicitation-replay")
+            let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+            session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+            session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .init(appsEnabled: false, pluginsEnabled: false, mcpElicitationEnabled: true, toolSuggestionsEnabled: false))
+            let controller = CodexNativeSessionController(
+                client: client, runID: runID, tabID: session.tabID, windowID: 1, workspacePaths: .uniform(nil),
+                options: .agentModeDefault(approvalPolicyProvider: { fullAccess ? .never : .onRequest }, sandboxModeProvider: { .dangerFullAccess }, computerUseEnabledProvider: { true }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" }, mcpServerEntriesProvider: { [] })
+            )
+            session.codexController = controller
+            addTeardownBlock { await controller.shutdown() }
+            let existing = server == "RepoPromptCE" ? CodexNativeSessionController.SessionRef(conversationID: "thread", rolloutPath: nil, model: nil, reasoningEffort: nil) : nil
+            _ = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                try await controller.startOrResume(existing: existing, baseInstructions: "")
+            }
+            let launch = try await client.request(method: "test/launchArgs", params: [:])
+            let elicitationEnabled = (launch["args"] as? [String])?.contains("features.tool_call_mcp_elicitation=true") == true
+            XCTAssertTrue(elicitationEnabled)
+            let binding = try XCTUnwrap(launch["binding"] as? [String: Any])
+            let threadConfig = try XCTUnwrap(binding["config"] as? [String: Any])
+            XCTAssertEqual(threadConfig["features.tool_call_mcp_elicitation"] as? Bool, true)
+            for key in ["features.apps", "features.plugins", "features.tool_suggest"] {
+                XCTAssertEqual(threadConfig[key] as? Bool, false, key)
+            }
+            XCTAssertEqual(binding["approvalPolicy"] as? String, "on-request")
+            XCTAssertEqual(binding["approvalsReviewer"] as? String, "user")
+            let coordinator = makeCoordinator()
+            let dispatch = Task {
+                for await event in controller.events {
+                    await coordinator.test_handleCodexNativeEvent(event, session: session, sourceController: controller)
+                }
+            }
+            addTeardownBlock { @MainActor in
+                await controller.shutdown()
+                dispatch.cancel()
+                await dispatch.value
+            }
+            // Pinned producer shape: serverName is top-level; form/message/schema are nested,
+            // with no invented toolName. Wording is deliberately insufficient authority.
+            let envelope: [String: Any] = [
+                "id": 42, "method": "mcpServer/elicitation/request",
+                "params": [
+                    "serverName": server,
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "request": [
+                        "type": "form",
+                        "message": "Allow RepoPromptCE MCP server to run apply_edits?",
+                        "requestedSchema": ["type": "object", "properties": [:]],
+                        "_meta": ["codex_approval_kind": "mcp_tool_call"]
+                    ]
+                ]
+            ]
+            // The pinned producer falls back to provenance-free questions when the launch flag is off.
+            // Choose its wire shape from the actual process policy so the old host-card symptom fails here.
+            let legacy: [String: Any] = [
+                "id": 42, "method": "item/tool/requestUserInput",
+                "params": [
+                    "threadId": "thread", "turnId": "turn", "itemId": "approval",
+                    "questions": [[
+                        "id": "mcp_tool_call_approval_apply_edits", "header": "Approve app tool call?",
+                        "question": "Allow RepoPromptCE MCP server to run apply_edits?",
+                        "isOther": false, "isSecret": false,
+                        "options": [
+                            ["label": "Allow", "description": "One call"],
+                            ["label": "Cancel", "description": "Refuse"]
+                        ]
+                    ]]
+                ]
+            ]
+            try await client.debugIngestRawStdoutLine(JSONSerialization.data(withJSONObject: elicitationEnabled ? envelope : legacy))
+            try await AsyncTestWait.waitUntil("production envelope decision for \(server)", timeout: 4) {
+                recorder.actions == ["accept"] || session.pendingMCPElicitationRequest != nil || session.pendingUserInputRequest != nil
+            }
+            XCTAssertNil(session.pendingUserInputRequest, "Structured approvals must not become Agent Questions")
+            XCTAssertNil(session.pendingApproval)
+            if accepted {
+                XCTAssertNil(session.pendingMCPElicitationRequest, "Host apply_edits must not show a card")
+                XCTAssertEqual(recorder.actions, ["accept"])
+            } else {
+                XCTAssertEqual(session.pendingMCPElicitationRequest?.serverName, server)
+                XCTAssertTrue(recorder.actions.isEmpty, "Foreign and strict companion approvals require user consent")
+            }
+            await controller.shutdown()
+            await dispatch.value
+        }
+    }
+
     func testPermissionRequestIsSurfacedAndCannotBeRememberedOrSurviveTeardown() async throws {
         var armed = true
         let controller = makeController(options: .agentModeDefault(approvalPolicyProvider: { .never }, sandboxModeProvider: { .dangerFullAccess }, computerUseEnabledProvider: { armed }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" }, mcpServerEntriesProvider: { [] }))

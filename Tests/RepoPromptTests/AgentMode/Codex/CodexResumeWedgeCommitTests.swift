@@ -698,6 +698,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             acquisitionCompleted = true
             return context
         }
+        addTeardownBlock { @MainActor in
+            gate.release()
+            _ = try? await acquisition.value
+        }
         try await AsyncTestWait.waitUntil("MCP acquisition enters revocation", timeout: 4) { acquisitionBegan }
         XCTAssertFalse(acquisitionCompleted)
         XCTAssertEqual(session.mcpControlActivationGeneration, generation, "Control must not publish before the armed controller stops")
