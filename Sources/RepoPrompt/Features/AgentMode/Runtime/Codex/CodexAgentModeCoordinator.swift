@@ -9756,7 +9756,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case let .approvalRequest(request):
             guard session.runState.isActive else { return }
             CodexComputerUseWorkflow.logApprovalDecision(
-                path: request.method, server: nil, armed: session.codexControllerFeatureState?.computerUseEnabled == true,
+                path: .approval, server: nil, armed: session.codexControllerFeatureState?.computerUseEnabled == true,
                 approvalPolicy: session.permissionProfile.codexApprovalPolicy, sandboxMode: session.permissionProfile.codexSandboxMode, outcome: "surface"
             )
             clearCodexPendingAuthRetryTurn(session)
@@ -9812,7 +9812,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                let controller = session.codexController
             {
                 CodexComputerUseWorkflow.logApprovalDecision(
-                    path: request.method, server: request.repoPromptAutoApprovalVerified ? MCPIntegrationHelper.repoPromptMCPServerName : "computer-use", armed: true,
+                    path: .requestUserInput, server: request.repoPromptAutoApprovalVerified ? MCPIntegrationHelper.repoPromptMCPServerName : "computer-use", armed: true,
                     approvalPolicy: session.permissionProfile.codexApprovalPolicy, sandboxMode: session.permissionProfile.codexSandboxMode, outcome: "accept"
                 )
                 await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
@@ -9826,7 +9826,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             if request.questions.contains(where: \.isLegacyMCPToolApproval) {
                 CodexComputerUseWorkflow.logApprovalDecision(
-                    path: request.method, server: request.repoPromptAutoApprovalVerified ? MCPIntegrationHelper.repoPromptMCPServerName : (request.computerUseCompanionVerified ? "computer-use" : nil), armed: computerUseArmed,
+                    path: .requestUserInput, server: request.repoPromptAutoApprovalVerified ? MCPIntegrationHelper.repoPromptMCPServerName : (request.computerUseCompanionVerified ? "computer-use" : nil), armed: computerUseArmed,
                     approvalPolicy: session.permissionProfile.codexApprovalPolicy, sandboxMode: session.permissionProfile.codexSandboxMode, outcome: "surface"
                 )
             }
