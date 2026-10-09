@@ -7644,10 +7644,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
         let isSelfNote = selfCompactDispatchID?.stage == .note
         let computerUseActivationID = session.pendingCodexComputerUseActivation?.id
-        let isLocalUserInput = fallbackContext?.isLocalUserInput == true && fallbackContext?.origin == .manual && !isSelfNote
         if computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled == true {
-            guard isLocalUserInput else {
-                return .preDispatchRejected(message: "Computer Use accepts only local-user input for the existing operation.")
+            guard !isSelfNote else {
+                return .preDispatchRejected(message: "Computer Use does not accept self-compaction notes for the existing operation.")
             }
         }
         if isSelfNote {
@@ -8170,7 +8169,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard await validateCodexComputerUseScope(session: session, controller: controller, activationID: computerUseActivationID) else { return false }
             guard computerUseActivationID != nil else { return true }
             // The scope check suspends. Reapply the original physical route/Stop fences after it.
-            return isLocalUserInput && !Task.isCancelled
+            return !Task.isCancelled
                 && effectiveStopFence.permitsStart(of: session)
                 && session.runID == sendRunID
                 && session.activeRunAttemptID == sendRunAttemptIDAtEntry

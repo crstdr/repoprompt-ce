@@ -17639,9 +17639,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if nativePreparedTurn?.shouldEnableCodexComputerUse == true, !session.isCodexComputerUseArmed {
             return .blocked(message: "Enable Computer Use in this tab before submitting /computer-use.")
         }
-        if nativePreparedTurn?.shouldEnableCodexComputerUse == true || session.pendingCodexComputerUseActivation != nil || session.codexControllerFeatureState?.computerUseEnabled == true {
+        if nativePreparedTurn?.shouldEnableCodexComputerUse == true {
             guard isLocalComposerInput, managedTurn == nil, codexAttemptID == nil else {
-                return .blocked(message: "Computer Use accepts only local-user input for the existing operation.")
+                return .blocked(message: "Enable Computer Use in this tab before submitting /computer-use.")
             }
         }
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
@@ -17677,7 +17677,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // A managed steer carries its own RepoPrompt-framed provider text and never consumes the
         // target user's interview preference.
         var effectiveUserText = managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText
-        if managedTurn == nil, nativePreparedTurn == nil, session.isCodexComputerUseArmed, isLocalComposerInput {
+        if nativePreparedTurn == nil, session.isCodexComputerUseArmed {
             effectiveUserText = CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: effectiveUserText)
         }
         if managedTurn == nil,

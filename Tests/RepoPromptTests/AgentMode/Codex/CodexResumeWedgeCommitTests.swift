@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -251,7 +252,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertTrue(session.isCodexComputerUseArmed)
         let activation = session.pendingCodexComputerUseActivation?.id
         let delivered = vm.submitUserTurn(text: "/computer-use inspect the screen", tabID: session.tabID, isLocalComposerInput: false)
-        guard case .blocked = delivered else { return XCTFail("Delivered input cannot drive an armed chat") }
+        guard case .blocked = delivered else { return XCTFail("Delivered /computer-use cannot acquire local consent") }
         XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activation)
         let admitted = await fixture.coordinator.test_computerUseForNextTurn(session: session)
         XCTAssertTrue(admitted)
@@ -322,6 +323,87 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(result, .submitted)
         XCTAssertTrue(session.isCodexComputerUseArmed)
         try await assertComputerUseProviderStart(fixture, session: session)
+    }
+
+    func testLocallyArmedChatRunsRemoteSessionLinkSendWithComputerUse() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = try makeSubmissionFixture()
+        let vm = fixture.viewModel
+        let session = fixture.session
+        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
+            tabID: session.tabID, sessionID: sessionID, tabName: "Target", isWindowClosing: false
+        ))
+        vm.test_setAgentSessionSaver { _, _, _ in
+            FileManager.default.temporaryDirectory.appendingPathComponent("linked-send-test.json")
+        }
+        await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
+        let request = computerUseRemoteRequest("inspect the screen")
+        let outcome = await vm.agentSessionLinkPerformSend(
+            to: candidate, request: request,
+            liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
+            commitAuthorization: { .committed }
+        )
+        guard case let .delivered(delivery) = outcome else { return XCTFail("Expected delivery: \(outcome)") }
+        XCTAssertEqual(delivery.deliveryState, .runStarted)
+        try await assertComputerUseProviderStart(fixture, session: session)
+        let envelope = AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: request.observerSessionID, sourceName: request.observerDisplayName,
+            linkID: request.linkID, linkGeneration: request.linkGeneration,
+            message: request.message, framing: request.framing
+        )
+        let expected = CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: envelope)
+        XCTAssertEqual(fixture.factory.controllers.first?.startedTexts, [expected])
+        XCTAssertEqual(session.items.first(where: { $0.kind == .user })?.dispatchedProviderText, expected)
+    }
+
+    func testLocallyArmedChatRunsManagedSteerWithComputerUse() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = try makeSubmissionFixture()
+        let vm = fixture.viewModel
+        let session = fixture.session
+        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
+            tabID: session.tabID, sessionID: sessionID, tabName: "Target", isWindowClosing: false
+        ))
+        await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
+        XCTAssertEqual(vm.submitUserTurn(text: "inspect the screen", tabID: session.tabID), .submitted)
+        try await assertComputerUseProviderStart(fixture, session: session)
+        let controller = try XCTUnwrap(fixture.factory.controllers.first)
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "armed-turn"), session: session, sourceController: controller
+        )
+        let request = computerUseRemoteRequest("continue remotely")
+        let envelope = AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: request.observerSessionID, sourceName: request.observerDisplayName,
+            linkID: request.linkID, linkGeneration: request.linkGeneration,
+            message: request.message, framing: .management
+        )
+        let sink = AgentSessionLinkManagedSteerSink()
+        XCTAssertTrue(vm.submitAgentSessionLinkManagedSteer(
+            tabID: session.tabID, session: session, displayText: request.message,
+            turn: .init(candidate: candidate, providerText: envelope, attribution: request.attribution, sink: sink),
+            route: .codex
+        ))
+        let outcome = await sink.awaitOutcome(timeoutSeconds: 4)
+        XCTAssertEqual(outcome, .delivered(.steered))
+        XCTAssertEqual(controller.steeredTexts, [CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: envelope)])
+        XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [true])
+        XCTAssertTrue(session.isCodexComputerUseArmed)
+        XCTAssertEqual(controller.startedTurnCount, 1)
+    }
+
+    private func computerUseRemoteRequest(_ text: String) -> AgentSessionLinkSendRequest {
+        .init(
+            linkID: UUID(), linkGeneration: 1,
+            observerEndpoint: DomainAgentSessionLinkEndpointIdentity(
+                windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
+                persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+            ),
+            observerDisplayName: "Observer", message: text, workflow: nil
+        )
     }
 
     func testRemoteMCPGoalInLocallyArmedChatStartsComputerUseController() async throws {
@@ -566,9 +648,9 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(controller.steeredTexts, ["continue locally"])
         for nonLocal in [nil, context(false), context(true, origin: .mcp(attemptID: UUID()))] {
             let result = await coordinator.sendCodexNativeMessage(session: session, text: "untrusted input", attachments: [], fallbackContext: nonLocal)
-            guard case .preDispatchRejected = result else { return XCTFail("Non-local input must be explicitly rejected") }
+            XCTAssertTrue(result.didSend, "Local consent authorizes remote turns in the armed chat")
         }
-        XCTAssertEqual(controller.steeredTexts, ["continue locally"])
+        XCTAssertEqual(controller.steeredTexts, ["continue locally", "untrusted input", "untrusted input", "untrusted input"])
         XCTAssertEqual(controller.startedTurnCount, 1)
         XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
 
@@ -586,7 +668,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(controller.startedTurnCount, 2)
         XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activationID)
         let nonLocal = await coordinator.sendCodexNativeMessage(session: session, text: "non-local second-turn steer", attachments: [], fallbackContext: context(false))
-        guard case .preDispatchRejected = nonLocal else { return XCTFail("Arming must not authorize non-local input on later turns") }
+        XCTAssertTrue(nonLocal.didSend, "Arming authorizes remote input on later turns")
         XCTAssertEqual(controller.startedTurnCount, 2)
         await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "second-local-turn"), session: session, sourceController: controller)
         await coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "second-local-turn", status: .completed), session: session, sourceController: controller)
