@@ -789,6 +789,7 @@ allowed_tracked_docs=(
   "docs/architecture/actionable-macos-notifications.md"
   "docs/architecture/agent-session-oversight-auto-wake.md"
   "docs/architecture/apple-identity-migration.md"
+  "docs/architecture/ci-test-gates.md"
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
@@ -859,6 +860,7 @@ print_matches \
 bundle_main_allowed_roots=(
   "Sources/RepoPrompt/"
   "Sources/RepoPromptSecureStorage/"
+  "Sources/RepoPromptSettingsCore/"
 )
 bundle_main_hits="$(grep -R -n -E '(^|[^A-Za-z0-9_])(Bundle\.main|NSImage\(named:)' Sources --include='*.swift' || true)"
 for allowed_root in "${bundle_main_allowed_roots[@]}"; do
@@ -872,7 +874,9 @@ fi
 # process-wide defaults; an app adapter must supply such configuration.
 if ! python3 Scripts/swift_imports.py --forbid-ui \
   Sources/RepoPromptFoundation Sources/RepoPromptInstrumentation \
-  Sources/RepoPromptProcess Sources/RepoPromptRegexCore; then
+  Sources/RepoPromptProcess Sources/RepoPromptRegexCore \
+  Sources/RepoPromptFileSystem Sources/RepoPromptVCS \
+  Sources/RepoPromptPersistence Sources/RepoPromptSettingsCore; then
   fail "UI framework import in app-free target"
 fi
 if [[ -d Sources/RepoPromptProcess ]]; then

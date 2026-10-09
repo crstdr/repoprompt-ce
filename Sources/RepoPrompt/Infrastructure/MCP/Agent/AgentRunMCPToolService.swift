@@ -2,7 +2,9 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptShared
+import RepoPromptVCS
 
 struct OracleExportFile: Equatable {
     let path: String
@@ -254,7 +256,7 @@ private let agentRunExpiredHandleRecoveryNote = [
 
 @MainActor
 struct AgentRunMCPToolService {
-    typealias RequestMetadata = MCPServerViewModel.RequestMetadata
+    typealias RequestMetadata = MCPRequestMetadata
     typealias HeartbeatOperation = @Sendable () async throws -> Value
 
     static func requireWritableWorkspaceAuthority(_ issue: DomainWorkspaceAuthorityIssue?) throws {
@@ -540,13 +542,23 @@ struct AgentRunMCPToolService {
         var selection: AgentMCPSelectionResolver.ResolvedSelection
         var routedReasoningEffortRaw: String?
         var routerSelectedTarget = false
+        let shouldRouteStart = Self.shouldRouteModelForStart(requestedModelID: requestedModelID, hasExplicitModelParameters: args["model_parameters"] != nil)
+        let canBalanceStart = shouldRouteStart && resolvedTabID == nil && agentModeVM.modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled
+        let usageBaseline: AgentMCPSelectionResolver.ResolvedSelection? = canBalanceStart ? try? AgentMCPSelectionResolver.resolve(
+            modelID: requestedModelID, defaultTaskLabel: defaultTaskLabel,
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
+        ) : nil
+        let baselineTarget = usageBaseline.flatMap { value -> AgentRoutingExecutableTarget? in
+            guard let agent = value.agentRaw, let model = value.modelRaw else { return nil }
+            return .init(agentRaw: agent, modelRaw: model, reasoningEffortRaw: nil, modelParameters: value.modelParameterSelections)
+        }
         do {
-            if Self.shouldRouteModelForStart(
-                requestedModelID: requestedModelID,
-                hasExplicitModelParameters: args["model_parameters"] != nil
-            ), let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
+            if shouldRouteStart, let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
-                surface: .general
+                surface: .general,
+                baseline: baselineTarget,
+                allowUsageBalance: resolvedTabID == nil && usageBaseline?.usageBalancingEligible == true
             ) {
                 selection = AgentMCPSelectionResolver.ResolvedSelection(
                     agentRaw: routed.agentRaw,
@@ -566,7 +578,7 @@ struct AgentRunMCPToolService {
                     ])
                 #endif
             } else {
-                selection = try AgentMCPSelectionResolver.resolve(
+                selection = try usageBaseline ?? AgentMCPSelectionResolver.resolve(
                     modelID: requestedModelID,
                     defaultTaskLabel: defaultTaskLabel,
                     availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,

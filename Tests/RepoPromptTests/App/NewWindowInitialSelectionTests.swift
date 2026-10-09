@@ -3,7 +3,9 @@ import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import SwiftUI
 import XCTest
 
@@ -3198,8 +3200,10 @@ import XCTest
                         ),
                         tab: protectedTab, isLive: true, isActive: true, isPinned: false, hasActiveRun: true
                     )
-                    manager.setAgentSessionProjectionReconciler { projected, current in
-                        lifecycle.reconcileProjection(projectedWorkspaces: projected, currentWorkspaces: current, claims: [claim])
+                    manager.setAgentSessionProjectionReconciler { projected, current, repairBaselines in
+                        lifecycle.reconcileProjection(
+                            projectedWorkspaces: projected, currentWorkspaces: current, claims: [claim], repairBaselines: repairBaselines
+                        )
                     }
                     var models = try f.decoded(base)
                     let projectedA = try XCTUnwrap(models.firstIndex { $0.id == Fixture.aardvarkID })
@@ -4320,9 +4324,9 @@ import XCTest
             }
             runtime = nil
             for seed in seeds {
-                await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceURL(for: seed))
+                await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceURL(for: seed))
             }
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: indexURL)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: indexURL)
             if changedDefaults {
                 restore(previousStoragePreference, forKey: "GlobalCustomStorageURL")
                 restore(previousOnboardingPreference, forKey: "agentOnboardingHasSeen")

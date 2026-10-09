@@ -3,6 +3,7 @@ import Combine
 import Foundation
 import os
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 import SwiftUI
 
@@ -232,6 +233,16 @@ class WindowState: ObservableObject {
 
     /// Called whenever `isCurrentlyFocused` changes.
     var onFocusChanged: ((Bool) -> Void)?
+
+    // MARK: - Presentation Visibility
+
+    /// Whether this window is presented on screen (see `WindowPresentationVisibility`). Unlike
+    /// focus, a visible non-key window counts as visible. Presentation-only: consumed solely to stop
+    /// decorative animation in hidden windows. `true` until an attached window is sampled.
+    @Published private(set) var isPresentationVisible: Bool = true
+
+    private var presentationVisibilityCancellables = Set<AnyCancellable>()
+    private weak var presentationVisibilityObservedWindow: NSWindow?
 
     // MARK: - Per-Window View Models
 
@@ -467,6 +478,8 @@ class WindowState: ObservableObject {
     private var pendingFocusUpdateTask: Task<Void, Never>?
     /// Lazily scheduled task to coalesce focus side-effects outside of mutation scopes.
     private var pendingFocusSideEffectsTask: Task<Void, Never>?
+    /// Lazily scheduled task to coalesce presentation-visibility samples outside of mutation scopes.
+    private var pendingPresentationVisibilityTask: Task<Void, Never>?
 
     private var shouldSuppressObservationSideEffects: Bool {
         // Avoid SwiftUI observation churn during teardown/termination.
@@ -475,10 +488,13 @@ class WindowState: ObservableObject {
 
     func beginClose() {
         guard !isClosing else { return }
+        let manager = windowStatesManager ?? WindowStatesManager.shared
+        if !manager.isTerminating {
+            AgentSessionLinkRuntimeBridge.shared.noteOversightWindowClosing(windowID: windowID)
+        }
         isClosing = true
         failUnstartedCommandsForWindowClose()
 
-        let manager = windowStatesManager ?? WindowStatesManager.shared
         if !manager.isTerminating {
             manager.markWindowAsExplicitlyClosing(windowID: windowID)
         }
@@ -489,6 +505,9 @@ class WindowState: ObservableObject {
         closeCoordinator.beginClose()
         onFocusChanged = nil
         removeFocusObservers()
+        removePresentationVisibilityObservers()
+        pendingPresentationVisibilityTask?.cancel()
+        pendingPresentationVisibilityTask = nil
         pendingWindowTitleUpdateTask?.cancel()
         pendingWindowTitleUpdateTask = nil
         pendingFocusUpdateTask?.cancel()
@@ -530,6 +549,19 @@ class WindowState: ObservableObject {
     }
 
     #if DEBUG
+        convenience init(
+            agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory,
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory
+        ) {
+            self.init(
+                contextBuilderProviderFactory: contextBuilderProviderFactory,
+                loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: nil,
+                agentModeViewModelFactory: agentModeViewModelFactory
+            )
+        }
+
         convenience init(
             contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
             domainRuntime: MCPDomainRuntime,
@@ -620,7 +652,8 @@ class WindowState: ObservableObject {
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         domainRuntimeOverride: MCPDomainRuntime?,
-        keyManager injectedKeyManager: KeyManager? = nil
+        keyManager injectedKeyManager: KeyManager? = nil,
+        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -634,6 +667,7 @@ class WindowState: ObservableObject {
         // ️⃣ Connect to the global WindowStatesManager singleton
         windowStatesManager = manager
 
+        let compositionSpan = StartupPhaseLog.begin(.windowComposition, window: windowID)
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
@@ -644,8 +678,10 @@ class WindowState: ObservableObject {
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            agentModeViewModelFactory: agentModeViewModelFactory
         )
+        compositionSpan.end()
 
         workspaceFileContextStore = composition.workspaceFileContextStore
         workspaceSearchService = composition.workspaceSearchService
@@ -698,8 +734,10 @@ class WindowState: ObservableObject {
         // Process any queued commands once the workspace is initialized
         workspaceManager.onceInitialized { [weak self] in
             guard let self else { return }
+            StartupPhaseLog.mark(.initCallbackEnqueue, window: windowID)
             Task {
                 guard !self.isClosing else { return }
+                StartupPhaseLog.mark(.initCallbackStart, window: self.windowID)
                 self.applyPendingRestoreEntryIfPossible()
                 await self.processCommands()
             }
@@ -792,17 +830,31 @@ class WindowState: ObservableObject {
     /// Uses deferred title update to avoid triggering layout during window lifecycle events
     /// (REPOPROMPT-1K4 fix).
     func attachWindow(_ window: NSWindow?) {
+        performWindowAttachment(window, update: updateAttachedWindow)
+    }
+
+    /// The admission boundary is window-independent so a deferred attach can be tested without
+    /// opening an AppKit window. Detach must still clean up after closing has begun.
+    func performWindowAttachment<Window>(_ window: Window?, update: (Window?) -> Void) {
+        // WindowAccessor may deliver its deferred callback after the idempotent beginClose ran.
+        guard window == nil || !isClosing else { return }
+        update(window)
+    }
+
+    private func updateAttachedWindow(_ window: NSWindow?) {
         // Detach path (always do the cleanup even if both are nil)
         if window == nil {
             let oldWindow = nsWindow
             detachTitlebarAccessoryControllers(from: oldWindow)
             nsWindow = nil
             removeFocusObservers()
+            removePresentationVisibilityObservers()
             pendingWindowTitleUpdateTask?.cancel()
             pendingWindowTitleUpdateTask = nil
             pendingFocusUpdateTask?.cancel()
             pendingFocusUpdateTask = nil
             scheduleFocusUpdate(false)
+            schedulePresentationVisibilityUpdate(from: nil)
             return
         }
         guard let window else { return }
@@ -811,6 +863,7 @@ class WindowState: ObservableObject {
             configureWindowChrome(for: window)
             ensureWindowDelegateProxy(for: window)
             scheduleFocusUpdate(from: window)
+            schedulePresentationVisibilityUpdate(from: window)
             requestWindowTitleUpdate(reason: .windowAttached)
             applyAgentTitlebarAccessoryIfPossible()
             return
@@ -829,11 +882,14 @@ class WindowState: ObservableObject {
         configureWindowChrome(for: window)
         installFocusObservers(for: window)
         scheduleFocusUpdate(from: window)
+        installPresentationVisibilityObservers(for: window)
+        schedulePresentationVisibilityUpdate(from: window)
         ensureWindowDelegateProxy(for: window)
         // Use deferred update to avoid recursive layout issues
         requestWindowTitleUpdate(reason: .windowAttached)
         // Install Agent mode titlebar accessory if requested before window was attached
         applyAgentTitlebarAccessoryIfPossible()
+        StartupPhaseLog.mark(.windowAttached, window: windowID)
     }
 
     private func configureWindowChrome(for window: NSWindow) {
@@ -911,6 +967,55 @@ class WindowState: ObservableObject {
     private func removeFocusObservers() {
         focusCancellables.removeAll()
         focusObservedWindow = nil
+    }
+
+    private func installPresentationVisibilityObservers(for window: NSWindow) {
+        guard !isClosing, presentationVisibilityObservedWindow !== window else { return }
+        removePresentationVisibilityObservers()
+        presentationVisibilityObservedWindow = window
+
+        let nc = NotificationCenter.default
+        let publishers = WindowPresentationVisibility.windowNotifications.map {
+            nc.publisher(for: $0, object: window)
+        } + WindowPresentationVisibility.applicationNotifications.map {
+            nc.publisher(for: $0)
+        }
+        for publisher in publishers {
+            publisher
+                .receive(on: RunLoop.main)
+                .sink { [weak self, weak window] _ in
+                    guard let self, let window else { return }
+                    schedulePresentationVisibilityUpdate(from: window)
+                }
+                .store(in: &presentationVisibilityCancellables)
+        }
+    }
+
+    private func removePresentationVisibilityObservers() {
+        presentationVisibilityCancellables.removeAll()
+        presentationVisibilityObservedWindow = nil
+    }
+
+    /// Samples after a yield so a notification delivered mid-update never publishes in place, and
+    /// only for the window still attached; `nil` (detached) restores the unknown-is-visible default.
+    private func schedulePresentationVisibilityUpdate(from window: NSWindow?) {
+        guard !shouldSuppressObservationSideEffects else { return }
+        pendingPresentationVisibilityTask?.cancel()
+        pendingPresentationVisibilityTask = Task { [weak self, weak window] in
+            guard let self else { return }
+            await Task.yield()
+            guard !Task.isCancelled, !shouldSuppressObservationSideEffects else { return }
+            let visible: Bool
+            if let window {
+                guard nsWindow === window else { return }
+                visible = WindowPresentationVisibility.sample(window)
+            } else {
+                guard nsWindow == nil else { return }
+                visible = true
+            }
+            guard isPresentationVisible != visible else { return }
+            isPresentationVisible = visible
+        }
     }
 
     private func setFocused(_ focused: Bool) {
@@ -1517,6 +1622,7 @@ class WindowState: ObservableObject {
         // displaced completion runs so reentrant capture or explicit intent sees it.
         let displacedCompletion = restoreLifetime.accept(entry, completion: completion)
         displacedCompletion?()
+        StartupPhaseLog.mark(.restoreEntryAssigned, window: windowID)
         applyPendingRestoreEntryIfPossible()
     }
 
@@ -1534,6 +1640,7 @@ class WindowState: ObservableObject {
         // acceptance arrives before it finishes.
         guard let dispatch = restoreLifetime.takePendingForDispatch() else { return }
 
+        StartupPhaseLog.mark(.restoreDispatchEnqueue, window: windowID)
         Task {
             if !self.isClosing {
                 await restoreWorkspace(from: dispatch.entry, acceptanceSequence: dispatch.acceptanceSequence)
@@ -1543,6 +1650,16 @@ class WindowState: ObservableObject {
     }
 
     private func restoreWorkspace(from entry: WindowSessionEntry, acceptanceSequence: UInt64) async {
+        let restoreSpan = StartupPhaseLog.begin(.restoreWorkspace, window: windowID)
+        var resolvedTarget = 0
+        var switchOutcome: StartupPhaseLog.SwitchOutcome?
+        defer {
+            var fields = ["resolved": resolvedTarget]
+            if let switchOutcome {
+                fields["switch_result"] = switchOutcome.rawValue
+            }
+            restoreSpan.end(extraFields: fields)
+        }
         #if DEBUG
             let restoreStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
@@ -1551,6 +1668,7 @@ class WindowState: ObservableObject {
         // switch took, so releasing on resolution alone would let a refused switch persist the
         // Default fallback over the snapshot.
         if let target = resolveWorkspace(for: entry) {
+            resolvedTarget = 1
             #if DEBUG
                 WorkspaceRestorePerfLog.log(
                     "restore.window workspaceResolved windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(target.id)) workspaceName=\(target.name) entryWorkspaceID=\(WorkspaceRestorePerfLog.shortID(entry.workspaceID))"
@@ -1564,7 +1682,9 @@ class WindowState: ObservableObject {
                 // acceptance so it never releases a newer one.
                 restoreLifetime.releaseProtection(forDispatchedAcceptance: acceptanceSequence)
             }
-            _ = await workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
+            switchOutcome = await StartupPhaseLog.SwitchOutcome(
+                workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
+            )
             #if DEBUG
                 if let restoreStartMS {
                     WorkspaceRestorePerfLog.log(
@@ -2578,6 +2698,7 @@ class WindowState: ObservableObject {
         // memory and prevent stale windows from multiplying catalog snapshot work.
         domainWorkspacePresentationBridge?.stop()
         await mcpServer.unregisterDomainRoutingWindow()
+        mcpServer.stopServiceObservation()
 
         // App-level termination already coordinates agent/session and MCP shutdown.
         // Skip duplicate per-window teardown work on quit so close latency stays bounded.

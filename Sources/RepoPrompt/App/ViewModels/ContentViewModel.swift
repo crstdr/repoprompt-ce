@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptSettingsCore
 import SwiftUI
 
 // MARK: - App Root Route
@@ -66,7 +67,12 @@ class ContentViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 guard let self else { return }
-                didConsumeWorkspaceRoute(synchronizeRouteWithCapturedSelection())
+                let readID = synchronizeRouteWithCapturedSelection()
+                #if DEBUG
+                    workspaceRouteConsumptionHandlerForTesting?(readID)
+                #else
+                    _ = readID
+                #endif
             }
             .store(in: &cancellables)
 
@@ -82,13 +88,6 @@ class ContentViewModel: ObservableObject {
                 self?.objectWillChange.send()
             }
             .store(in: &cancellables)
-    }
-
-    /// Passive observation only: direct route synchronization is not a publisher consumption.
-    private func didConsumeWorkspaceRoute(_ readID: UUID?) {
-        #if DEBUG
-            workspaceRouteConsumptionHandlerForTesting?(readID)
-        #endif
     }
 
     // MARK: - Route Management
@@ -128,11 +127,6 @@ class ContentViewModel: ObservableObject {
         } else {
             rootRoute = .main
         }
-    }
-
-    /// Keeps route in sync when workspace changes (e.g. exit to fallback, or open workspace).
-    func syncRouteWithWorkspaceState() {
-        synchronizeRouteWithCapturedSelection()
     }
 
     /// Shared route body; returns the active ID it actually evaluated.

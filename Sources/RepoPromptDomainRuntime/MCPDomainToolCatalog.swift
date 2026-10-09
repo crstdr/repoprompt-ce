@@ -32,7 +32,7 @@ package enum MCPWindowToolName {
     package static let agentRun = "agent_run"
     package static let agentManage = "agent_manage"
     package static let agentSessionLink = "agent_session_link"
-    package static let agentSelf = "agent_self"
+    package static let agentSelf = "self_compact"
     package static let history = "history"
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
@@ -308,7 +308,7 @@ package enum MCPDomainToolCatalog {
         .init(name: MCPWindowToolName.agentSessionLink, scope: .window, capability: .agentSessionLinkControl, admissionClass: .control, operationPolicy: .init(
             operations: [
                 "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact", "set_waiting_on",
-                "snooze_auto_wake", "request_attention", "respond", "steer", "stop", "create_lane", "retire_lane"
+                "snooze_auto_wake", "request_attention", "respond", "steer", "stop", "create_lane", "retire_lane", "set_model"
             ],
             normalization: .trimmedLowercased
         )),

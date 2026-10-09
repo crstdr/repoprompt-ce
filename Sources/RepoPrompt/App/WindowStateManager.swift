@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  WindowStateManager.swift
 //  RepoPrompt
@@ -534,6 +536,9 @@ class WindowStatesManager: ObservableObject {
     /// App-global bundled router registry plus shared backend credential/readiness authorities.
     let modelRouterRuntime = AgentTaskRouterRuntime()
 
+    /// Default-off, app-scoped usage observers; construction starts no provider process.
+    let providerQuotaRuntime = ProviderQuotaRuntime()
+
     /// Serializes workspace activation and deletion claims across every app window.
     let workspaceActivityCoordinator = WorkspaceActivityCoordinator()
 
@@ -544,6 +549,7 @@ class WindowStatesManager: ObservableObject {
 
     /// Prevent accidental secondary instances
     private init() {
+        modelRouterRuntime.usageBalancer = providerQuotaRuntime.usageAdvisor
         autoRestoreWorkspacesEnabled = UserDefaults.standard.object(forKey: WindowStatesManager.autoRestoreDefaultsKey) as? Bool ?? false
         GlobalSettingsStore.shared.objectWillChange
             .receive(on: RunLoop.main)
@@ -560,7 +566,24 @@ class WindowStatesManager: ObservableObject {
     // ──────────────────────────────────────────────────────────────
 
     /// All active windows in the order they were created
-    @Published var allWindows: [WindowState] = []
+    @Published var allWindows: [WindowState] = [] {
+        didSet {
+            modelRoutingWindowIndexes = Dictionary(
+                allWindows.enumerated().map { ($1.windowID, $0) },
+                uniquingKeysWith: { _, _ in -1 }
+            )
+        }
+    }
+
+    private var modelRoutingWindowIndexes: [Int: Int] = [:]
+
+    /// Read-only exact lookup for configuration-only routing. Never falls back to discovery.
+    func modelRoutingWindow(withID id: Int) -> WindowState? {
+        guard !isTerminating, let index = modelRoutingWindowIndexes[id],
+              allWindows.indices.contains(index), allWindows[index].windowID == id,
+              !allWindows[index].isClosing else { return nil }
+        return allWindows[index]
+    }
 
     /// Any incoming URLs that arrived before a window was ready
     @Published var pendingURLs: [URL] = []
@@ -1047,9 +1070,11 @@ class WindowStatesManager: ObservableObject {
         // If we have pending URLs that arrived *before* any windows,
         // route them through the app router so scoped routes are parsed before
         // choosing a target window. Drain once and preserve ordering.
+        // Only drain when non-empty: assigning the @Published array publishes objectWillChange even
+        // for an empty removeAll, which would invalidate every manager observer a second time.
         let urlsToRoute = pendingURLs
-        pendingURLs.removeAll()
         if !urlsToRoute.isEmpty {
+            pendingURLs.removeAll()
             Task { @MainActor in
                 for url in urlsToRoute {
                     await AppDeepLinkRouter.shared.route(url: url, preferredLegacyWindow: state)
@@ -1316,9 +1341,11 @@ class WindowStatesManager: ObservableObject {
             participants: participants,
             additionalTeardown: {
                 await CodexModelPollingService.shared.suspendForManagedSignOut()
+                await WindowStatesManager.shared.providerQuotaRuntime.codex.handleSignOutOrAccountChange()
             },
             failedLogoutRecovery: {
                 await CodexModelPollingService.shared.resumeAfterManagedAuthentication()
+                await WindowStatesManager.shared.providerQuotaRuntime.codex.resumeAfterManagedAuthentication()
             }
         )
     }
@@ -1350,6 +1377,9 @@ class WindowStatesManager: ObservableObject {
         }
         // Stop dedicated CLI model polling so background refreshes cannot race shutdown.
         await CodexModelPollingService.shared.shutdown()
+        await providerQuotaRuntime.codex.shutdown()
+        await providerQuotaRuntime.claude.shutdown()
+        await providerQuotaRuntime.claudeTelemetry.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
         await GrokBuildACPModelPollingService.shared.shutdown()

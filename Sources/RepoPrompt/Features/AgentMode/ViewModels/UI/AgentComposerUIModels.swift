@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 struct AgentComposerDraftRestorationOperation: Equatable {
     struct Fragment: Equatable {
@@ -274,6 +275,7 @@ struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
     let configID: String
     let displayName: String
     let selectedValueRaw: String
+    var savedValueRaw: String?
     let selectedDisplayName: String
     let choices: [ACPModelParameterChoice]
     /// OpenCode only: the demand-scoped discovery key this control's metadata came from. The
@@ -291,7 +293,7 @@ struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
     }
 
     var isSavedValueUnavailable: Bool {
-        providerID == .openCode && !choices.contains { $0.rawValue == selectedValueRaw }
+        (providerID == .openCode || providerID == .cursor) && !choices.contains { $0.rawValue == selectedValueRaw }
     }
 
     var tooltip: String {
@@ -324,11 +326,11 @@ struct AgentComposerProps: Equatable {
     let isGlobalModelRouterControllingFreshTask: Bool
     let unavailableSelectedAgentMessage: String?
     let selectedAgent: AgentProviderKind
-    let selectedModelRaw: String
-    let selectedModelDisplayName: String
-    let selectedReasoningEffortRaw: String?
-    let selectedReasoningEffortDisplayName: String
-    let acpModelParameterControls: [AgentComposerModelParameterControlProps]
+    var selectedModelRaw: String
+    var selectedModelDisplayName: String
+    var selectedReasoningEffortRaw: String?
+    var selectedReasoningEffortDisplayName: String
+    var acpModelParameterControls: [AgentComposerModelParameterControlProps]
     let availableAgents: [AgentProviderKind]
     let isProviderPickerLockedForCurrentTab: Bool
     let lockedAgentSelectionMessage: String?

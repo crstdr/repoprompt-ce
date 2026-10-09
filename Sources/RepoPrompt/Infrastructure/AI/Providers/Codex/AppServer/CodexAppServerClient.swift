@@ -2,59 +2,11 @@ import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
 import RepoPromptProcess
+import RepoPromptProviderQuota
 
-enum CodexJSONValue: Equatable {
-    case string(String)
-    case number(Double)
-    case bool(Bool)
-    case object([String: CodexJSONValue])
-    case array([CodexJSONValue])
-    case null
-
-    func toAny() -> Any {
-        switch self {
-        case let .string(value):
-            value
-        case let .number(value):
-            value
-        case let .bool(value):
-            value
-        case let .object(value):
-            value.mapValues { $0.toAny() }
-        case let .array(value):
-            value.map { $0.toAny() }
-        case .null:
-            NSNull()
-        }
-    }
-
-    static func from(_ value: Any) -> CodexJSONValue? {
-        switch value {
-        case let string as String:
-            return .string(string)
-        case let number as NSNumber:
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
-                return .bool(number.boolValue)
-            }
-            return .number(number.doubleValue)
-        case let dict as [String: Any]:
-            var output: [String: CodexJSONValue] = [:]
-            for (key, value) in dict {
-                if let converted = CodexJSONValue.from(value) {
-                    output[key] = converted
-                }
-            }
-            return .object(output)
-        case let array as [Any]:
-            let converted = array.compactMap { CodexJSONValue.from($0) }
-            return .array(converted)
-        case _ as NSNull:
-            return .null
-        default:
-            return nil
-        }
-    }
-}
+/// Preserve the app's transport vocabulary while sharing the same typed boundary value
+/// with the app-free quota runtime. Encoding/decoding behavior is unchanged.
+typealias CodexJSONValue = RepoPromptProviderQuota.CodexJSONValue
 
 enum CodexAppServerRequestID: Hashable {
     case int(Int)
@@ -346,6 +298,40 @@ actor CodexAppServerClient {
         let processFamilyCleanupWasCompleted: Bool
     }
 
+    /// Only the Codex rollout-path lookup diagnostic is eligible for a fresh fallback.
+    /// Generic missing-file errors can describe unrelated configuration or workspace files.
+    static func isMissingRolloutPathResolutionMessage(
+        _ message: String,
+        expectedRolloutPath: String? = nil
+    ) -> Bool {
+        guard let reportedPath = missingRolloutPathResolutionPath(message) else { return false }
+        guard let expectedRolloutPath else { return true }
+        return URL(fileURLWithPath: reportedPath).standardizedFileURL.path
+            == URL(fileURLWithPath: expectedRolloutPath).standardizedFileURL.path
+    }
+
+    private static func missingRolloutPathResolutionPath(_ message: String) -> String? {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = trimmed.lowercased()
+        let prefix = "failed to resolve rollout path"
+        guard normalized.hasPrefix(prefix) else { return nil }
+        let detail = trimmed.dropFirst(prefix.count)
+        guard detail.first == " " || detail.first == ":" else { return nil }
+        let reason = "file does not exist"
+        let suffix = normalized.hasSuffix("\(reason).") ? "\(reason)." : reason
+        guard normalized.hasSuffix(suffix) else { return nil }
+        var reportedPath = String(detail.dropLast(suffix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard reportedPath.hasSuffix(":") else { return nil }
+        reportedPath.removeLast()
+        reportedPath = reportedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if reportedPath.hasPrefix(":") { reportedPath.removeFirst() }
+        reportedPath = reportedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        reportedPath = reportedPath.trimmingCharacters(in: CharacterSet(charactersIn: "'\"`"))
+        guard reportedPath.hasPrefix("/") else { return nil }
+        return reportedPath
+    }
+
     static func isTimeoutError(_ error: Error) -> Bool {
         if let clientError = error as? ClientError,
            case let .requestFailed(failure) = clientError
@@ -581,6 +567,15 @@ actor CodexAppServerClient {
     func clearExpectedAgentPIDRegistration() async {
         expectedAgentPIDRegistration = nil
         await clearRegisteredExpectedAgentPIDIfNeeded()
+    }
+
+    /// Returns only the PID currently registered for this run and live transport.
+    func activeExpectedAgentPID(for runID: UUID) -> pid_t? {
+        guard let registeredExpectedAgentPID,
+              registeredExpectedAgentPID.runID == runID,
+              activeTransport?.process.pid == registeredExpectedAgentPID.pid
+        else { return nil }
+        return registeredExpectedAgentPID.pid
     }
 
     private func registerExpectedAgentPIDIfNeeded(for pid: pid_t) async {
@@ -1566,6 +1561,7 @@ actor CodexAppServerClient {
     }
 
     private func startProcess(startupAuthority: UInt64) async throws {
+        try ProviderProcessLaunchPolicy.check()
         let runtime = try await prepareRuntimeForLaunch()
         guard let launchContext = preparedRuntimeLaunchContext else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
@@ -1600,7 +1596,8 @@ actor CodexAppServerClient {
                 command: resolution.resolvedCommand,
                 arguments: args,
                 environment: environment,
-                workingDirectory: launchDirectory
+                workingDirectory: launchDirectory,
+                purpose: .provider
             )
         } catch let error as ProcessLauncherError {
             guard let mappedError = Self.executableUnavailableSpawnError(error) else {

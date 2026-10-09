@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 
 // MARK: - Git Backend
 
@@ -16,6 +17,15 @@ actor GitBackend: VCSBackend {
 
     init(gitService: GitService = GitService()) {
         self.gitService = gitService
+    }
+
+    func invalidateUntrackedStats(at root: URL) async {
+        await gitService.invalidateUntrackedStats(at: root)
+    }
+
+    /// The environment this backend's Git subprocesses inherit.
+    func gitProcessEnvironment() async -> [String: String] {
+        await gitService.preparedProcessEnvironment()
     }
 
     // MARK: - Repository Discovery

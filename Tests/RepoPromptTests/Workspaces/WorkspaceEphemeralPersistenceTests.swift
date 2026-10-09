@@ -1,6 +1,7 @@
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 #if DEBUG
@@ -20,13 +21,13 @@ import XCTest
                 .appendingPathComponent("WorkspaceEphemeralPersistenceTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
             managers.forEach { $0.prepareForWindowClose() }
             managers.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -35,6 +36,52 @@ import XCTest
             }
             GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
             try await super.tearDown()
+        }
+
+        func testPersistedInitializationBuildsLifecycleIndexBeforeAnyModelMutation() throws {
+            let sessionID = UUID()
+            let sharedTab = ComposeTabState(name: "Shared binding", activeAgentSessionID: sessionID)
+            let laterTab = ComposeTabState(name: "Later exact binding", activeAgentSessionID: sessionID)
+            var otherBinding = laterTab
+            otherBinding.activeAgentSessionID = UUID()
+            let first = WorkspaceModel(
+                name: "First persisted", repoPaths: [],
+                composeTabs: [otherBinding, sharedTab], activeComposeTabID: sharedTab.id
+            )
+            let second = WorkspaceModel(
+                name: "Second persisted", repoPaths: [],
+                composeTabs: [laterTab, sharedTab], activeComposeTabID: laterTab.id
+            )
+            try writeWorkspace(first)
+            try writeWorkspace(second)
+            try writeLegacyIndex([first, second])
+
+            // Read immediately after the real initializer's direct `workspaces = loaded`, without
+            // activation, an await, or any post-init workspace assignment repairing the indexes.
+            let manager = makeManager(windowID: -795)
+            XCTAssertEqual(manager.workspaces.map(\.id), [first.id, second.id])
+            XCTAssertNil(manager.activeWorkspaceID)
+            manager.test_lifecycleBindingTabValidationCount = 0
+            for tab in first.composeTabs + second.composeTabs {
+                let expectedSessionID = try XCTUnwrap(tab.activeAgentSessionID)
+                let scan = manager.workspaces.first { workspace in
+                    workspace.composeTabs.contains {
+                        $0.id == tab.id && $0.activeAgentSessionID == expectedSessionID
+                    }
+                }
+                XCTAssertEqual(manager.agentSessionLifecycleWorkspaceID(
+                    tabID: tab.id, sessionID: expectedSessionID
+                ), try XCTUnwrap(scan).id)
+            }
+            XCTAssertEqual(manager.test_lifecycleBindingTabValidationCount, 4)
+            XCTAssertNil(manager.agentSessionLifecycleWorkspaceID(tabID: laterTab.id, sessionID: UUID()))
+            // Selecting only changes activeWorkspaceID; it never rebuilds metadata indexes.
+            // Query before any await or workspaces/tab mutation can repair an initialization gap.
+            manager.activeWorkspace = first
+            XCTAssertEqual(manager.agentSessionLifecycleTabs(workspaceID: first.id, sessionID: sessionID), [sharedTab])
+            manager.activeWorkspace = second
+            XCTAssertEqual(manager.agentSessionLifecycleTabs(workspaceID: second.id, sessionID: sessionID), [laterTab, sharedTab])
+            XCTAssertEqual(manager.workspaces.map(\.id), [first.id, second.id])
         }
 
         func testLibraryRecencyIgnoresBackgroundSavesAndGroupsTemporaryWork() throws {
@@ -131,7 +178,7 @@ import XCTest
             await manager.awaitInitialized()
             await manager.setWorkspaceLibraryMembership(workspace, saved: true)
             let url = manager.workspaceFileURL(for: workspace)
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: url)
             let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
             XCTAssertEqual(saved.isSavedWorkspace, true)
             XCTAssertFalse(saved.isTemporaryWorkspace)

@@ -11,6 +11,8 @@ struct AgentTaskRoutingCandidateBuilder {
         let utilityTier: String
         let target: AgentRoutingExecutableTarget
         let descriptor: AgentTaskRoutingCandidateDescriptor
+        var usagePeerClass: String?
+        var usageModelAliases: Set<String> = []
     }
 
     enum BuildError: Error, Equatable { case noAvailableTargets }
@@ -28,6 +30,17 @@ struct AgentTaskRoutingCandidateBuilder {
         let modelClass: String
         let preferredCodexFamily: String?
         let rubric: String
+
+        /// Explicit substitution constraints, not a claim of identical model capabilities.
+        var usagePeerClass: String? {
+            switch modelClass {
+            case "gpt-luna", "claude-haiku": "light"
+            case "gpt-5.6-terra", "claude-sonnet": "balanced"
+            case "gpt-sol", "claude-opus": "strong"
+            case "gpt-6-astra", "claude-fable": "frontier"
+            default: nil
+            }
+        }
 
         init(
             provider: AgentProviderKind,
@@ -63,16 +76,16 @@ struct AgentTaskRoutingCandidateBuilder {
         surface: AgentModelCatalog.AgentSelectionSurface = .general,
         roleDefaults: [RoleDefaultReference] = []
     ) throws -> [Candidate] {
-        let definitions = Self.modelDefinitions.filter {
-            allowedProviders.contains($0.provider)
-                && surface.allows($0.provider)
-                && AgentModelCatalog.isAgentAvailable($0.provider, availability: availability)
-        }
+        let definitions = eligibleDefinitions(
+            allowedProviders: allowedProviders,
+            availability: availability,
+            surface: surface
+        )
         var seenTargets: Set<AgentRoutingExecutableTarget> = []
         let candidates = definitions.compactMap { definition -> Candidate? in
-            guard let option = resolveModelOption(definition, availability: availability),
-                  let baseModelRaw = Self.baseModelRaw(option.rawValue, provider: definition.provider)
-            else { return nil }
+            guard let baseModelRaw = resolvedBaseModelRaw(definition, availability: availability) else {
+                return nil
+            }
             let target = AgentRoutingExecutableTarget(
                 agentRaw: definition.provider.rawValue,
                 modelRaw: baseModelRaw,
@@ -105,16 +118,40 @@ struct AgentTaskRoutingCandidateBuilder {
                     ),
                     rubricVersion: AgentTaskRoutingModelProfileCatalog.rubricVersion,
                     rubric: definition.rubric
-                )
+                ),
+                usagePeerClass: definition.usagePeerClass,
+                usageModelAliases: Set([baseModelRaw] + (definition.provider == .claudeCode ? definition.baseModelAliases.filter { ["opus", "sonnet", "haiku", "fable"].contains($0) } : []))
             )
         }
         guard !candidates.isEmpty else { throw BuildError.noAvailableTargets }
         return candidates
     }
 
+    /// Whether `build` would return at least one candidate for the same inputs, without building any.
+    ///
+    /// Exactly equivalent to `(try? build(...)) != nil`: `build` is non-empty iff some eligible
+    /// definition resolves a base model, because the first such definition's target is always new to
+    /// its empty `seenTargets` set. This stops at that first definition and never mints opaque keys,
+    /// resolves display names, or renders descriptions, so availability checks on hot presentation
+    /// paths (the Model Router status pill) stay cheap.
+    func hasAvailableTarget(
+        allowedProviders: Set<AgentProviderKind>,
+        availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface = .general
+    ) -> Bool {
+        eligibleDefinitions(
+            allowedProviders: allowedProviders,
+            availability: availability,
+            surface: surface
+        ).contains { definition in
+            resolvedBaseModelRaw(definition, availability: availability) != nil
+        }
+    }
+
     func buildEfforts(
         for model: Candidate,
-        availability: AgentModelCatalog.AvailabilityContext
+        availability: AgentModelCatalog.AvailabilityContext,
+        allowPaidFast: Bool = false
     ) throws -> [Candidate] {
         guard let provider = AgentProviderKind(rawValue: model.target.agentRaw) else {
             throw BuildError.noAvailableTargets
@@ -125,6 +162,7 @@ struct AgentTaskRoutingCandidateBuilder {
         let options = modelOptions(provider, availability)
         var targets: [(AgentRoutingExecutableTarget, String)] = []
         for option in options where !option.isPlaceholderDefault {
+            guard allowPaidFast || provider != .codexExec || CodexModelSpecifier(raw: option.rawValue).serviceTier == nil else { continue }
             guard Self.baseModelRaw(option.rawValue, provider: provider)?.lowercased() == selectedBase else { continue }
             let target = Self.executableTarget(option.rawValue, provider: provider)
             targets.append((target, option.displayName))
@@ -159,6 +197,55 @@ struct AgentTaskRoutingCandidateBuilder {
         }
         guard !candidates.isEmpty else { throw BuildError.noAvailableTargets }
         return candidates
+    }
+
+    /// Same catalog-owned peer classes for local composer/role starts and Jev recommendations.
+    /// The selected target is retained exactly; unsupported/default identities are not guessed.
+    func usageCandidates(
+        basedOn target: AgentRoutingExecutableTarget,
+        allowedProviders: Set<AgentProviderKind>,
+        availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface
+    ) -> (selected: Candidate, candidates: [Candidate])? {
+        guard target.modelParameters.isEmpty, !Self.isPaidFast(target),
+              let provider = AgentProviderKind(rawValue: target.agentRaw),
+              let base = Self.baseModelRaw(target.modelRaw, provider: provider),
+              let models = try? build(allowedProviders: allowedProviders, availability: availability, surface: surface),
+              let definition = Self.modelDefinitions.first(where: { definition in
+                  definition.provider == provider && (definition.baseModelAliases.contains(base) || models.contains {
+                      $0.target.agentRaw == provider.rawValue && $0.target.modelRaw == base && $0.usagePeerClass == definition.usagePeerClass
+                  })
+              }), let peerClass = definition.usagePeerClass else { return nil }
+        let selectedKey = opaqueKey()
+        let selected = Candidate(
+            opaqueKey: selectedKey,
+            utilityTier: definition.modelClass,
+            target: target,
+            descriptor: .init(opaqueKey: selectedKey, roleLabels: [], targetDescription: "Local starting choice", rubricVersion: "local", rubric: ""),
+            usagePeerClass: peerClass,
+            usageModelAliases: Set([base] + definition.baseModelAliases.filter { ["opus", "sonnet", "haiku", "fable"].contains($0) })
+        )
+        let effort = Self.effortRaw(target, provider: provider)
+        let peers = models.filter { $0.usagePeerClass == peerClass && $0.target.agentRaw != provider.rawValue }.compactMap { model -> Candidate? in
+            guard let effort else { return model }
+            guard let efforts = try? buildEfforts(for: model, availability: availability),
+                  let peerProvider = AgentProviderKind(rawValue: model.target.agentRaw),
+                  let match = efforts.first(where: { Self.effortRaw($0.target, provider: peerProvider) == effort }) else { return nil }
+            return Candidate(
+                opaqueKey: model.opaqueKey,
+                utilityTier: model.utilityTier,
+                target: match.target,
+                descriptor: model.descriptor,
+                usagePeerClass: model.usagePeerClass,
+                usageModelAliases: model.usageModelAliases
+            )
+        }
+        return (selected, [selected] + peers)
+    }
+
+    static func isPaidFast(_ target: AgentRoutingExecutableTarget) -> Bool {
+        (target.agentRaw == AgentProviderKind.codexExec.rawValue && CodexModelSpecifier(raw: target.modelRaw).serviceTier != nil)
+            || target.modelParameters.contains { $0.configID == "fast" && $0.valueRaw == "true" }
     }
 
     static func availableProviders(
@@ -236,11 +323,34 @@ struct AgentTaskRoutingCandidateBuilder {
         )
     ]
 
+    private func eligibleDefinitions(
+        allowedProviders: Set<AgentProviderKind>,
+        availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface
+    ) -> [ModelDefinition] {
+        Self.modelDefinitions.filter {
+            allowedProviders.contains($0.provider)
+                && surface.allows($0.provider)
+                && AgentModelCatalog.isAgentAvailable($0.provider, availability: availability)
+        }
+    }
+
+    /// The base model `build` would target for this definition, or `nil` when it contributes none.
+    private func resolvedBaseModelRaw(
+        _ definition: ModelDefinition,
+        availability: AgentModelCatalog.AvailabilityContext
+    ) -> String? {
+        guard let option = resolveModelOption(definition, availability: availability) else { return nil }
+        return Self.baseModelRaw(option.rawValue, provider: definition.provider)
+    }
+
     private func resolveModelOption(
         _ definition: ModelDefinition,
         availability: AgentModelCatalog.AvailabilityContext
     ) -> AgentModelOption? {
-        let options = modelOptions(definition.provider, availability)
+        let options = modelOptions(definition.provider, availability).filter {
+            definition.provider != .codexExec || CodexModelSpecifier(raw: $0.rawValue).serviceTier == nil
+        }
         if let family = definition.preferredCodexFamily,
            let option = AgentModelCatalog.preferredCodexFamilyOption(family, from: options)
         {
@@ -264,8 +374,8 @@ struct AgentTaskRoutingCandidateBuilder {
 
     private static func effortRaw(_ target: AgentRoutingExecutableTarget, provider: AgentProviderKind) -> String? {
         switch provider {
-        case .codexExec: target.reasoningEffortRaw
-        case .claudeCode: ClaudeModelSpecifier(raw: target.modelRaw).effortLevel?.rawValue
+        case .codexExec: target.reasoningEffortRaw ?? CodexModelSpecifier(raw: target.modelRaw).reasoningEffort?.rawValue
+        case .claudeCode: target.reasoningEffortRaw ?? ClaudeModelSpecifier(raw: target.modelRaw).effortLevel?.rawValue
         default: nil
         }
     }

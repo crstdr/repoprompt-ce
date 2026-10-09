@@ -24,6 +24,86 @@ defect in this subsystem.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
+## Same-process window reopen
+
+Window close still revokes live authority, leases, queues, and wakes. Before teardown, the runtime
+bridge captures only reference-backed saved pairs in the existing launch coordinator. Its current
+parked reference owns restoration or an already-admitted Unlink; historical closed references only
+fence late cleanup. Exact endpoints, durable token, and assertion generation fence both paths.
+Parking survives transient hydration and sequential closes until a valid restoration proof enters
+the ordinary establishment path. Unlink and committed deletion forget intent; failed removal uses
+the existing cleanup warning/retry. Parking is process-local, preserves no capabilities, and adds no
+UI or MCP state; cold launch keeps its existing restoration policy.
+Hydration need is derived from current readiness on existing reconciliation events; the loader owns
+loaded/in-flight deduplication. Queued passive work must still match its complete discovery owner and
+persisted descriptor before admission, so an abandoned request cannot suppress successor recovery.
+
+## Route authority is independent of tool discovery
+
+A provider input never waits for a returned tool catalog. For native Claude/Codex runs with exact
+outbound oversight, `qualifyProviderInputRoute` obtains the existing server-actor route token:
+run, endpoint incarnation, connection, routing authority generation and connection lifecycle generation.
+After each suspension it rechecks the session/run/endpoint; the immutable result travels to the final
+bidirectional MainActor mapping fence. Controller/configuration/attempt ownership, Stop, physical
+acquisition and cancelled-before-dispatch tombstones remain independent hard gates. A real route
+failure still refuses or uses the existing bounded route recovery. Unknown, absent or stale tool names
+are not route failures and never trigger send-time controller recycling.
+
+Prompt carry and wake admission read exact published membership and the claim epoch, not catalog
+freshness. Required rendered content, current authority, budget and provider acceptance still own
+claims/receipts; catalog refresh cannot acknowledge them. ACP's existing route/startup and dispatch
+fences remain in place without importing a native pre-discovery requirement into deferred clients.
+Catalog observations and `tools/list_changed` remain discovery/usability signals. This changes no
+MCP tool name, schema, operation, caller identity or per-call authorization contract.
+
+## Configuration-only model selection
+
+`set_model(session_id, model_id)` requires the exact original **Manage** lease and a fully idle,
+loaded target of the same agent kind. The target owns the final authority hop; after it returns,
+endpoint identity, readiness, destination availability, and advertised membership are checked and
+configuration committed synchronously. A concurrent composer claim wins. Revocation/relink before
+that hop cannot substitute a new grant; later revocation does not undo an already admitted commit.
+Busy/loading/settling refusals are retryable, never queued. Even identical selections pass every gate.
+
+`AgentAdvertisedModelCatalog` indexes full compound IDs when ordinary catalogue producers run.
+Admission performs bounded memory lookups only: no persistence warming, full catalogue flattening,
+provider discovery, or legacy resolver fallback. Registry/backend changes invalidate the index;
+a cold index tells the caller to refresh `agent_manage.list_agents` in the destination window.
+`create_lane` accepts either an explicit `model_id` using this same admission or the existing
+`role`/default path; specifying both is an error. Explicit selection never silently substitutes a role.
+
+The `set_model` transport and service caller resolvers read only already-installed connection/run/context maps.
+They refuse cold, pending, displaced, ambiguous, or terminal routes actionably instead of invoking generic
+run recovery (rehydration, binding, session creation, selection mirroring, or routing persistence). Explicit
+routing hints must match that exact installed route. Its original endpoint and routing/lifecycle generations
+travel with dispatch identity through the final provider-entry fences; a successor cannot replace the caller.
+Window and workspace-qualified tab indexes are derived by their existing owners on array mutation;
+authorization and catalog reachability use the existing link authority's derived pair/outbound indexes and
+inbound target membership. No call rebuilds an index or sweeps windows, workspaces, tabs, catalogs, or links.
+Dashboard close-safety projections are derived on dashboard replacement rather than rescanned during tool
+registration/completion. Generic operations retain their recovery behavior.
+
+This is a routing specialization, not a permission fast path. Early live-link visibility, restricted-tool/role
+policy, enabled-server checks, connection/resource admission, cancellation, catalog-generation ownership,
+domain connection-generation validation, and exact Manage authorization still run. The model-only domain
+security context deliberately grants **no** verified-process assurance, filesystem roots, or ephemeral mutation
+capabilities: this operation does not belong to the protected filesystem family and authorizes solely through
+its exact Manage lease. Thus no executable `lstat`, root canonicalization, or cold domain-registration repair
+is needed merely to construct unused filesystem authority. Generic security-context construction is unchanged.
+
+Model endpoint checks enforce the same observer eligibility and endpoint/deletion predicates as generic
+revalidation, but **deny without eager persistent cleanup**; normal lifecycle invalidation owns cleanup.
+These paths are decision-equivalent, not side-effect-equivalent. Transport-wide logging, per-run event
+observer delivery, and deferred ordinary save/dashboard/publication remain ordinary infrastructure costs;
+this is not a claim that the entire transport or its callbacks are O(1).
+
+Acceptance changes per-session model/effort and narrow active UI projections, schedules persistence
+and existing MCP publication, and leaves identities, provider sessions, ACP pins, draft, and staged
+handoff intact. It does not start/resume/apply/reset a provider; the next ordinary turn applies the
+configuration. Native ordinary sends require a current configuration proof, independently owned by
+the native runtime. Default/auto selections do not promise a provider reset, and automatic effort
+routing may still choose effort for a later turn.
+
 ## Autonomy is grant-scoped and prompt-governed
 
 The user's exact direct grant is the whole structural delegation. Target-bearing observer operations
@@ -229,6 +309,14 @@ commit still uses `commitSendAuthorization(requiresManagement: true)`, and revoc
 fence releases the uncommitted reservation without delivery.
 
 ### Inspecting and answering prompts
+
+Accepted local composer input advances
+an in-memory generation for the exact observer endpoint and cancels its older waits, including
+requests delayed between routing and admission. New-generation waits may park in the same run.
+Authority release precedes Claude/ACP's MCP-idle gate and Codex's steering drain. This affects
+neither managed/cross-session input nor mutations or child providers. A route snapshot just after
+the input bump may still park. Cancellation uses the
+existing result with metadata-only `wake_reason: local_user_input` and re-fenced survivor rows.
 
 Managed `poll` and `wait` may return the target's current pending approval, permission, MCP
 elicitation, or question beside the sanitized snapshot, with free text through the oversight redactor
@@ -717,10 +805,10 @@ while the link authority says that exact endpoint holds a live grant in either d
 ordinary code. `notifyToolListChangedForAgentSession` republishes the observation with the returned
 presence **preserved** and any-link presence recomputed, so a grant restored against a live run whose
 client has not re-read `tools/list` lands on exactly `hasAgentSessionLink == false` plus
-`hasAnyActiveLink == true`. For outbound observers, `agentSessionLinkPromptContext` then fails closed
-and the `session.runID == nil` cold-bootstrap exception is unreachable while that run identity persists.
-An inbound-only created lane instead loses access to inverse `request_attention`. The repair uses
-any-link membership, while prompt readiness and observer operations remain strictly outbound-only.
+`hasAnyActiveLink == true`. A client may therefore lack usable observer tools or inverse `request_attention` even though the
+server still authorizes current calls. This no longer withholds `agentSessionLinkPromptContext` or
+blocks a send: discovery repair is separate from route proof and current operation authority.
+The repair uses any-link membership; observer operations remain strictly outbound-only.
 
 The repair is Codex-only, bounded to **one controller replacement per repair cycle**, and made of
 parts that already existed:
@@ -761,8 +849,8 @@ and `AgentSessionLinkCodexCatalogRepair.isStuckProjection` names it.
 What the publish guard proves is *identity*, not route currency: the projection carries a route token
 naming this tab's current endpoint, for this session object's current run, at a revision no lower than
 the stored one. It does not prove the observing connection still owns the authoritative route when the
-repair actually runs; only `hasCurrentRunCatalogRouteTokenInCurrentMCPServer` proves that, and it
-additionally demands the positive catalog presence this state by definition lacks. The accepted bound
+repair actually runs; native dispatch instead qualifies its own actor-owned route token and checks
+the exact bidirectional mapping immediately before entry, independently of positive catalog presence. The accepted bound
 is therefore that a projection may already be one connection generation stale by the time the repair
 runs, costing one controller replacement on a session that was going to reconnect anyway — bounded by
 the cycle record, and no more accurate than an authority round trip that can go stale the same way.
@@ -782,10 +870,9 @@ anything healed (`projectionResolvesCycle` is deliberately not the negation of `
 
 **The repair retires the process run** (`invalidateCodexControllerForReconnect(… preserveRunID: false)`)
 and that is the point rather than a side effect. `codexConversationID` and `codexRolloutPath` are
-deliberately untouched, so the next start resumes the same Codex conversation while `runID == nil`
-lets the cold-bootstrap exception admit the *already published* passive snapshot. Preserving the run
-instead would leave the same false projection gating admission with no way to reach a successor
-catalog short of a route-successor protocol, which this design exists to avoid. Late completions from
+deliberately untouched, so the next ordinary start resumes the same Codex conversation and can initialize a successor
+catalog. Run retirement remains the existing bounded discovery repair mechanism, not a prerequisite
+for admitting the already published passive snapshot or a reason to wait during provider dispatch. Late completions from
 the retired route stay safe through the existing `session.runID == projection.runID` publish guard and
 `completeRunCatalogObservation`'s ownership rule.
 
