@@ -1,8 +1,5 @@
 import Foundation
-import os
 import RepoPromptInstrumentation
-
-private let agentSessionLinkAutoWakeLog = Logger(subsystem: "com.repoprompt.agents", category: "AutoWake")
 
 // The wake coordinator: temporary admission policy for one observer's automatic lane-update turns.
 //
@@ -1840,7 +1837,7 @@ extension AgentModeViewModel {
         if let predicate = agentSessionLinkAutoWakeRouteRefusal(session) {
             if let refusalPhase {
                 // Closed predicate vocabulary and the existing phase only: no endpoint or content.
-                agentSessionLinkAutoWakeLog.notice("route_refused predicate=\(predicate.rawValue, privacy: .public) phase=\(String(describing: refusalPhase), privacy: .public)")
+                AgentSessionLinkAutoWakeDiagnostics.routeRefused(predicate: predicate, phase: refusalPhase)
             }
             return nil
         }
@@ -1857,15 +1854,7 @@ extension AgentModeViewModel {
     /// Reused rather than restated so a blocker can never be enforced for one caller and forgotten
     /// for the other. `pendingOversightAutoWake` is excluded because *this* attempt is it, and the
     /// waiting-prompt pair is excluded because it is a route rather than a blocker.
-    private enum AutoWakeRouteRefusal: String {
-        case hasLoadedPersistedState, bindingTransitionInProgress, terminalCommitInProgress
-        case mcpFollowUpRunPending, selfCompactBlocksNotificationWake, isComposerSubmissionInFlight
-        case isPreparingInitialWorktree, isChangingExecutionLocation, pendingInstructions
-        case pendingACPSteeringInstructions, pendingClaudeSteeringInstructions, isSettlingACPBackgroundCompaction
-        case pendingAskUser, pendingUserInputRequest, pendingApproval, pendingPermissionsRequest
-        case pendingMCPElicitationRequest, pendingApplyEditsReview, pendingWorktreeMergeReview
-        case runStateIsActive, waitingForUserWithoutContinuation
-    }
+    private typealias AutoWakeRouteRefusal = AgentSessionLinkAutoWakeDiagnostics.GatePredicate
 
     /// First refusing predicate, shared by routing and its bounded release-safe diagnostic.
     private func agentSessionLinkAutoWakeRouteRefusal(_ session: TabSession) -> AutoWakeRouteRefusal? {
