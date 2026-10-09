@@ -25,15 +25,20 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     private func makeFixture(
         _ plans: [[WedgeFakeCodexController.Response]],
         routeOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true },
-        companionReady: @escaping () -> Bool = { true }
+        companionReady: @escaping () -> Bool = { true },
+        freshSession: Bool = false,
+        shouldManageCodexTooling: Bool = true
     ) -> Fixture {
         let factory = WedgeControllerFactory(plans: plans)
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.temporaryDirectory.path,
-            shouldManageCodexTooling: true,
+            shouldManageCodexTooling: shouldManageCodexTooling,
             codexControllerFactory: { runID, _, _, _, _, _ in factory.make(runID: runID) },
+            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _ in
+                factory.make(runID: runID, computerUseEnabled: enabled)
+            },
             mcpServerEnabler: { true },
             testCodexComputerUseCompanionReady: companionReady,
             testCodexComputerUseReservedEntryExists: { false },
@@ -48,16 +53,20 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
         session.hasLoadedPersistedState = true
-        session.codexConversationID = Self.oldThreadID
-        session.codexRolloutPath = Self.oldRolloutPath
-        session.providerCleanupHandle = ProviderConversationCleanupHandle(
-            provider: AgentProviderKind.codexExec.rawValue,
-            conversationID: Self.oldThreadID,
-            rolloutPath: Self.oldRolloutPath
-        )
-        session.codexNeedsReconnect = true
-        session.runState = .running
-        session.beginRunAttempt(source: "codex-resume-wedge-test")
+        if freshSession {
+            session.runState = .idle
+        } else {
+            session.codexConversationID = Self.oldThreadID
+            session.codexRolloutPath = Self.oldRolloutPath
+            session.providerCleanupHandle = ProviderConversationCleanupHandle(
+                provider: AgentProviderKind.codexExec.rawValue,
+                conversationID: Self.oldThreadID,
+                rolloutPath: Self.oldRolloutPath
+            )
+            session.codexNeedsReconnect = true
+            session.runState = .running
+            session.beginRunAttempt(source: "codex-resume-wedge-test")
+        }
         return Fixture(
             viewModel: viewModel,
             workspaceManager: workspaceManager,
@@ -257,6 +266,195 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let detachedMessage = await vm.armComputerUseForLocalUser(session: detached)
         XCTAssertEqual(detachedMessage, CodexComputerUseWorkflow.ineligibleMessage)
         XCTAssertEqual(CodexComputerUseWorkflow.ineligibleMessage, "Computer Use requires a top-level native Codex session with its own tab, the feature enabled, and an available companion. Enable it locally in that tab.")
+    }
+
+    func testLocalComputerUseComposerFirstSendArmsOnlyFreshDestinationAndStartsProvider() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = try makeSubmissionFixture()
+        let vm = fixture.viewModel
+        let source = fixture.session
+        let destinationTabID = UUID()
+        let text = "/computer-use inspect the screen"
+        let claim = try claimLocalComposerTurn(text, session: source, viewModel: vm)
+        XCTAssertEqual(claim.attempt.target.route, .createAgentSessionFromSourceTab)
+
+        let result = await vm.executeComposerSubmitAttempt(
+            text: text,
+            claim: claim,
+            createAndActivateSessionTab: {
+                var workspace = fixture.workspaceManager.workspaces[0]
+                workspace.composeTabs.append(ComposeTabState(id: destinationTabID, name: "Computer Use destination"))
+                workspace.activeComposeTabID = destinationTabID
+                fixture.workspaceManager.workspaces = [workspace]
+                fixture.workspaceManager.activeWorkspace = workspace
+                _ = vm.session(for: destinationTabID)
+                vm.test_setCurrentTabIDOverride(destinationTabID)
+                return destinationTabID
+            }
+        )
+        XCTAssertEqual(result, .submitted)
+        let destination = try XCTUnwrap(vm.sessions[destinationTabID])
+        XCTAssertTrue(destination.isCodexComputerUseArmed)
+        XCTAssertFalse(source.isCodexComputerUseArmed)
+        XCTAssertTrue(source.items.isEmpty, "The source must not receive the destination's turn")
+        try await assertComputerUseProviderStart(fixture, session: destination)
+    }
+
+    func testLocalComputerUseComposerExistingSessionArmsAndStartsProvider() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = try makeSubmissionFixture()
+        let vm = fixture.viewModel
+        let session = fixture.session
+        _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let text = "/computer-use inspect the screen"
+        let claim = try claimLocalComposerTurn(text, session: session, viewModel: vm)
+        XCTAssertNotEqual(claim.attempt.target.route, .createAgentSessionFromSourceTab)
+        let result = await vm.executeComposerSubmitAttempt(
+            text: text,
+            claim: claim,
+            createAndActivateSessionTab: {
+                XCTFail("An existing session must not create a destination")
+                return nil
+            }
+        )
+        XCTAssertEqual(result, .submitted)
+        XCTAssertTrue(session.isCodexComputerUseArmed)
+        try await assertComputerUseProviderStart(fixture, session: session)
+    }
+
+    func testRemoteMCPGoalInLocallyArmedChatStartsComputerUseController() async throws {
+        try await assertRemoteMCPGoalStart(locallyArmed: true)
+    }
+
+    func testRemoteMCPGoalInUnarmedChatStartsOrdinaryControllerWithoutArming() async throws {
+        try await assertRemoteMCPGoalStart(locallyArmed: false)
+    }
+
+    func testDeliveredComputerUseCannotArmOrStartControllerInUnarmedChat() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = try makeSubmissionFixture()
+        let vm = fixture.viewModel
+        let session = fixture.session
+        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        _ = try await vm.mcpActivateControlContext(
+            forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil
+        )
+        do {
+            _ = try await vm.mcpDispatchInstruction(
+                sessionID: sessionID, text: "/computer-use inspect the screen", allowStartingRun: true
+            )
+            XCTFail("Delivered /computer-use must not acquire local consent")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Enable Computer Use in this tab before submitting /computer-use."))
+        }
+        XCTAssertFalse(session.isCodexComputerUseArmed)
+        XCTAssertNil(session.codexController)
+        XCTAssertNil(session.codexControllerFeatureState)
+        XCTAssertTrue(fixture.factory.controllers.isEmpty)
+        XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [])
+        XCTAssertTrue(session.items.isEmpty)
+    }
+
+    private func makeSubmissionFixture() throws -> Fixture {
+        let fixture = makeFixture([[.success("submission-thread")]], freshSession: true, shouldManageCodexTooling: false)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let suiteName = "CodexResumeWedge.composer.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        )
+        store.setModelRouterEnabled(false)
+        store.setUsageBalancingEnabled(false)
+        store.setAutoEffortEnabled(false)
+        fixture.viewModel.modelRouterSettingsStore = store
+        addTeardownBlock { @MainActor in
+            for session in Array(fixture.viewModel.sessions.values) {
+                if let context = session.mcpControlContext {
+                    await fixture.viewModel.mcpDeactivateControlContext(sessionID: context.sessionID, cleanupSessionStore: true)
+                }
+                await fixture.coordinator.shutdownCodexSession(session)
+            }
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        return fixture
+    }
+
+    private func claimLocalComposerTurn(
+        _ text: String,
+        session: AgentTabSession,
+        viewModel: AgentModeViewModel
+    ) throws -> AgentModeViewModel.AgentComposerSubmitClaim {
+        let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: text
+        )
+        guard case let .claimed(claim) = viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: true) else {
+            throw NSError(domain: "CodexResumeWedge.composerClaim", code: 1)
+        }
+        return claim
+    }
+
+    private func assertComputerUseProviderStart(_ fixture: Fixture, session: AgentTabSession) async throws {
+        try await AsyncTestWait.waitUntil("claimed Computer Use turn reaches fake provider", timeout: 4) {
+            fixture.factory.controllers.first?.startedTurnCount == 1
+        }
+        let controller = try XCTUnwrap(fixture.factory.controllers.first)
+        XCTAssertEqual(fixture.factory.controllers.count, 1)
+        XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [true])
+        XCTAssertTrue(session.codexController === controller)
+        XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
+        XCTAssertEqual(controller.receivedExistingIDs.count, 1)
+        XCTAssertEqual(controller.receivedExistingIDs, [nil])
+        XCTAssertEqual(controller.startedTurnCount, 1)
+        let providerText = try XCTUnwrap(controller.startedTexts.first)
+        XCTAssertTrue(providerText.contains("inspect the screen"))
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+    }
+
+    private func assertRemoteMCPGoalStart(locallyArmed: Bool) async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        CodexGoalSupport.setEnabledForTesting(true)
+        defer {
+            CodexComputerUseWorkflow.setEnabledForTesting(nil)
+            CodexGoalSupport.setEnabledForTesting(nil)
+        }
+        let fixture = try makeSubmissionFixture()
+        let vm = fixture.viewModel
+        let session = fixture.session
+        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        if locallyArmed {
+            await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
+            XCTAssertTrue(session.isCodexComputerUseArmed)
+        }
+        let activationID = session.pendingCodexComputerUseActivation?.id
+        _ = try await vm.mcpActivateControlContext(
+            forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil
+        )
+        let delivery = try await vm.mcpDispatchInstruction(
+            sessionID: sessionID, text: "/goal inspect the screen", allowStartingRun: true
+        )
+        XCTAssertEqual(delivery, .startedRun)
+        try await AsyncTestWait.waitUntil("remote goal reaches fake native controller", timeout: 4) {
+            fixture.factory.controllers.first?.goalObjectives == ["inspect the screen"]
+                && session.items.contains { $0.text == "Set Codex goal: inspect the screen" }
+        }
+        let controller = try XCTUnwrap(fixture.factory.controllers.first)
+        XCTAssertEqual(fixture.factory.controllers.count, 1)
+        XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [locallyArmed])
+        XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, locallyArmed)
+        XCTAssertTrue(session.codexController === controller)
+        XCTAssertEqual(controller.receivedExistingIDs.count, 1)
+        XCTAssertEqual(controller.receivedExistingIDs, [nil])
+        XCTAssertEqual(controller.goalObjectives, ["inspect the screen"])
+        XCTAssertEqual(controller.startedTurnCount, 0, "/goal uses native control, not an ordinary model turn")
+        XCTAssertEqual(session.isCodexComputerUseArmed, locallyArmed)
+        XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activationID)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
     }
 
     func testComputerUseIconOptInCancelArmAndDisarm() async {
@@ -1207,12 +1405,14 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
 private final class WedgeControllerFactory {
     private var plans: [[WedgeFakeCodexController.Response]]
     private(set) var controllers: [WedgeFakeCodexController] = []
+    private(set) var computerUseEnabledFlags: [Bool] = []
 
     init(plans: [[WedgeFakeCodexController.Response]]) {
         self.plans = plans
     }
 
-    func make(runID: UUID) -> WedgeFakeCodexController {
+    func make(runID: UUID, computerUseEnabled: Bool = false) -> WedgeFakeCodexController {
+        computerUseEnabledFlags.append(computerUseEnabled)
         let controller = WedgeFakeCodexController(
             runID: runID,
             responses: plans.isEmpty ? [] : plans.removeFirst()
@@ -1238,6 +1438,8 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     private var existingIDs: [String?] = []
     private var active = false
     private var turnCount = 0
+    private var turnTexts: [String] = []
+    private var goals: [String] = []
     private var steers: [String] = []
     private var interrupts: [String] = []
     private var shutdowns = 0
@@ -1283,6 +1485,22 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
 
     var startedTurnCount: Int {
         lock.withLock { turnCount }
+    }
+
+    var startedTexts: [String] {
+        lock.withLock { turnTexts }
+    }
+
+    var goalObjectives: [String] {
+        lock.withLock { goals }
+    }
+
+    func setThreadGoalObjective(_ objective: String) async throws -> CodexNativeSessionController.ThreadGoal {
+        lock.withLock { goals.append(objective) }
+        return .init(
+            threadID: "submission-thread", objective: objective, status: .active,
+            tokenBudget: nil, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 0, updatedAt: 0
+        )
     }
 
     var steeredTexts: [String] {
@@ -1367,13 +1585,14 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     }
 
     func startUserTurn(
-        text _: String,
+        text: String,
         images _: [AgentImageAttachment],
         model _: String?,
         reasoningEffort _: String?,
         serviceTier _: String?
     ) async throws -> CodexTurnStartReceipt {
         let count = lock.withLock { () -> Int in
+            turnTexts.append(text)
             turnCount += 1
             return turnCount
         }
