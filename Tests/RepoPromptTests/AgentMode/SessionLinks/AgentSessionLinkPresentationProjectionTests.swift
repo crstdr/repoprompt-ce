@@ -228,6 +228,17 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
     }
 
+    func testProjectionOverlayPreservesLinkedSummary() throws {
+        let fixture = try makeFixture()
+        let published = props(endpoint: fixture.endpoint)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        let stored = try XCTUnwrap(fixture.viewModel.monitorPillPropsByEndpoint[fixture.endpoint])
+        XCTAssertTrue(try XCTUnwrap(stored.outbound.first).isAutoWakeEffectivelySelected)
+        XCTAssertEqual(stored.outbound.map(\.targetEndpoint), published.outbound.map(\.targetEndpoint))
+        XCTAssertEqual(stored.outbound.map(\.displayName), published.outbound.map(\.displayName))
+    }
+
     func testProjectionPublicationStoresAndSynchronizesBeforeOneOwnerScopedNotification() throws {
         let fixture = try makeFixture()
         let published = props(endpoint: fixture.endpoint)

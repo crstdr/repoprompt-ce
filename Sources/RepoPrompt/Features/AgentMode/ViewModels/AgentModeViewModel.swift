@@ -7,6 +7,7 @@ import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import SwiftUI
@@ -22,7 +23,11 @@ struct AgentContextUsage: Codable, Equatable {
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
 @MainActor
 final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownParticipant {
-    @TaskLocal private static var mcpRunEpochTransitionToken: UUID?
+    // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+    private nonisolated static let mcpRunEpochTransitionTokenTaskLocal = BoxedTaskLocal<UUID?>(nil)
+    private nonisolated static var mcpRunEpochTransitionToken: UUID? {
+        mcpRunEpochTransitionTokenTaskLocal.get()
+    }
 
     nonisolated static func steeringDebugLog(_ message: @autoclosure () -> String) {
         #if DEBUG
@@ -782,6 +787,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let outcome: AgentTaskRoutingBackendOutcome
         var judgmentRequested = false
         var effortFallback = false
+        var usageBalancingReason: String?
     }
 
     struct FreshTaskRoutingOwnership {
@@ -6920,7 +6926,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
         do {
-            return try await Self.$mcpRunEpochTransitionToken.withValue(token) {
+            return try await Self.mcpRunEpochTransitionTokenTaskLocal.withValue(token) {
                 try await operation()
             }
         } catch {
@@ -17767,9 +17773,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if nativePreparedTurn?.shouldEnableCodexComputerUse == true, !session.isCodexComputerUseArmed {
             return .blocked(message: "Enable Computer Use in this tab before submitting /computer-use.")
         }
-        if nativePreparedTurn?.shouldEnableCodexComputerUse == true || session.pendingCodexComputerUseActivation != nil || session.codexControllerFeatureState?.computerUseEnabled == true {
+        if nativePreparedTurn?.shouldEnableCodexComputerUse == true {
             guard isLocalComposerInput, managedTurn == nil, codexAttemptID == nil else {
-                return .blocked(message: "Computer Use accepts only local-user input for the existing operation.")
+                return .blocked(message: "Enable Computer Use in this tab before submitting /computer-use.")
             }
         }
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
@@ -17805,7 +17811,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // A managed steer carries its own RepoPrompt-framed provider text and never consumes the
         // target user's interview preference.
         var effectiveUserText = managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText
-        if managedTurn == nil, nativePreparedTurn == nil, session.isCodexComputerUseArmed, isLocalComposerInput {
+        if nativePreparedTurn == nil, session.isCodexComputerUseArmed {
             effectiveUserText = CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: effectiveUserText)
         }
         if managedTurn == nil,

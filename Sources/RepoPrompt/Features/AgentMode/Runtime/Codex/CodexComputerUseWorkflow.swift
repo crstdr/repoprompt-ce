@@ -216,7 +216,7 @@ enum CodexComputerUseWorkflow {
 
         return """
         <computer_use_workflow>
-        The user explicitly armed Computer Use for this chat in RepoPrompt Agent Mode. It remains available for later local-user turns until /computer-use off or the session ends.
+        The user explicitly armed Computer Use for this chat in RepoPrompt Agent Mode. It remains available for later turns in this chat until /computer-use off or the session ends.
 
         Use the installed computer-use companion's MCP tools only when they are available in this session. Do not install or enable plugins, browser integrations, or app connectors for this workflow. If exact computer-use tool names are not already visible, use tool search first; useful searches include "computer use", "browser", "screen", "click", "type", or app/site-specific terms from the user's request. If no computer-use tools are available, say so plainly and ask the user to enable or install the required Codex computer-use capability instead of hallucinating tool calls.
 
