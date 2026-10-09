@@ -16454,19 +16454,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
-            if let invocation = resolvedNativeSlashCommand(in: text, session: preparedSession),
-               invocation.command == .computerUse,
-               !CodexComputerUseWorkflow.isOffCommand(argumentsText: invocation.argumentsText)
-            {
-                if let message = await armComputerUseForLocalUser(session: preparedSession) { return .blocked(message: message) }
-                guard composerSubmitClaimIsCurrent(claim) else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
-            }
             let pendingState = Self.pendingUserTurnState(from: preparedSession)
             guard let initialLocation = target.expectedInitialStartLocation,
                   initialLocation != .local,
                   pendingState.initialStartLocation == initialLocation
             else {
-                let result = await submitUserTurnAfterFreshTaskRouting(
+                let result = await submitClaimedComposerUserTurn(
                     text: text,
                     claim: claim,
                     session: preparedSession,
@@ -16534,7 +16527,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if target.tabID == currentTabID {
                 applySessionToBindings(preparedSession)
             }
-            let result = await submitUserTurnAfterFreshTaskRouting(
+            let result = await submitClaimedComposerUserTurn(
                 text: text,
                 claim: claim,
                 session: preparedSession,
@@ -16673,7 +16666,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if destinationTabID == currentTabID {
                 applySessionToBindings(destinationSession)
             }
-            let result = await submitUserTurnAfterFreshTaskRouting(
+            let result = await submitClaimedComposerUserTurn(
                 text: text,
                 claim: claim,
                 session: destinationSession,
@@ -16691,6 +16684,34 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             clearComposerDraftIfUnchanged(for: claim)
             return result
         }
+    }
+
+    /// Local consent belongs to the validated destination, not the source tab that
+    /// supplied the draft. Raw MCP/delivered submissions never pass through this seam.
+    private func submitClaimedComposerUserTurn(
+        text: String,
+        claim: AgentComposerSubmitClaim,
+        session: TabSession,
+        destinationTabID: UUID
+    ) async -> UserTurnSubmissionResult {
+        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
+        if let invocation = resolvedNativeSlashCommand(in: text, session: session),
+           invocation.command == .computerUse,
+           !CodexComputerUseWorkflow.isOffCommand(argumentsText: invocation.argumentsText)
+        {
+            if let message = await armComputerUseForLocalUser(session: session) { return .blocked(message: message) }
+            guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+                return .blocked(message: Self.staleComposerSubmitTargetMessage)
+            }
+        }
+        return await submitUserTurnAfterFreshTaskRouting(
+            text: text,
+            claim: claim,
+            session: session,
+            destinationTabID: destinationTabID
+        )
     }
 
     @discardableResult
