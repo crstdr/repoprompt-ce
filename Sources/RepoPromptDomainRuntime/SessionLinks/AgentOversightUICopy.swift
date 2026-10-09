@@ -88,7 +88,6 @@ package enum AgentOversightUICopy {
     package static let overseenBySectionLabel = "Overseen by"
     /// Group headings inside Unlink ▸ name the action instead of the relationship: the row's
     /// overseers sit under "Unlink overseer", the sessions it oversees under "Unlink overseen".
-    /// Renamed from the shared section labels, Cristian 2026-10-09.
     package static let unlinkOverseerSectionLabel = "Unlink overseer"
     package static let unlinkOverseenSectionLabel = "Unlink overseen"
     /// Creator-collapse variants of the section labels: the combined label when the creator is
