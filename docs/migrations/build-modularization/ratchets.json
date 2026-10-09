@@ -1,5 +1,5 @@
 {
-  "description": "Fork upstream sync 2026-10-09: exact measured merged tree of fork dcf320937 and upstream f4c1dd3de, retaining fork-only behavior and Computer Use consent/collapse/admission parity with upstream PR #1284. Zero numeric headroom; metrics equal the measured merged tree.",
+  "description": "Fork upstream sync 2026-10-09 plus workspace restoration #1143: exact measured merged tree, retaining fork-only behavior and Computer Use consent/collapse/admission parity with #1284. Zero numeric headroom.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -23,12 +23,12 @@
     "app_share_permille": 789,
     "app_shared_accessor_uses": 1268,
     "app_static_shared_declarations": 89,
-    "app_target_swift_files": 1074,
-    "app_target_swift_lines": 611247,
+    "app_target_swift_files": 1075,
+    "app_target_swift_lines": 611959,
     "app_userdefaults_standard_uses": 229,
     "app_wrong_way_file_edges": 977,
-    "first_party_swift_lines": 774081,
+    "first_party_swift_lines": 774793,
     "tests_sleep_calls": 74,
-    "tests_testable_import_app_files": 335
+    "tests_testable_import_app_files": 336
   }
 }
