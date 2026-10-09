@@ -1338,8 +1338,7 @@ final class AgentSidebarHostedTapTests: XCTestCase {
             ),
             sessionIndex: Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),
             sessionListSortDates: [:],
-            sessionListCacheReady: true,
-            sidebarRestoreFrozenOrderByTabID: [:],
+            restoreBaseline: nil,
             mcpControlledTabIDs: []
         ).build()
     }
