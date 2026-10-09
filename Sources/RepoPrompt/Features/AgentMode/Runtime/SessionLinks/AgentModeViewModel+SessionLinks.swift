@@ -131,8 +131,6 @@ extension AgentModeViewModel {
     func beginAgentSessionLinkDiscoveryEpoch(workspaceID: UUID?) -> AgentSessionLinkDiscoveryEpoch {
         agentSessionLinkDiscoveryGeneration &+= 1
         agentSessionLinkDiscoveryWorkspaceID = workspaceID
-        // Discovery state is pane presentation input (§4.2); it grants no session-link authority.
-        syncTranscriptUIState()
         return AgentSessionLinkDiscoveryEpoch(
             windowID: windowID,
             workspaceID: workspaceID,
@@ -166,7 +164,6 @@ extension AgentModeViewModel {
             return
         }
         agentSessionLinkDiscoveryCompletedGeneration = epoch.generation
-        syncTranscriptUIState()
         #if DEBUG
             restorePerfRecorder.event(
                 "oversight.discovery",

@@ -58,7 +58,6 @@ extension AgentModeViewModel {
             return
         }
 
-        admitSidebarRestoreCoverageForOwnerWorkspace()
         #if DEBUG
             let fingerprintStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
@@ -103,19 +102,6 @@ extension AgentModeViewModel {
                 fingerprintDelta: fingerprintDelta
             )
         #endif
-    }
-
-    /// Coverage admission precedes row publication (§5.4): new rows of the baseline owner's own
-    /// workspace join before the fingerprint, so the revision change invalidates every consuming cache.
-    /// Tabs from a lagging outgoing projection are never admitted into the successor's baseline.
-    private func admitSidebarRestoreCoverageForOwnerWorkspace() {
-        guard let workspaceID = ownerValidatedSidebarRestoreBaseline?.owner.workspaceID else { return }
-        if let snapshot = promptManager?.sidebarWorkspaceSnapshot {
-            guard snapshot.workspaceID == workspaceID else { return }
-            sessionIndexStore.admitSidebarRestoreCoverage(snapshot.composeTabs + snapshot.stashedTabs.map(\.tab))
-        } else if let workspace = workspaceManager?.activeWorkspace, workspace.id == workspaceID {
-            sessionIndexStore.admitSidebarRestoreCoverage(workspace.composeTabs)
-        }
     }
 
     func setSessionSidebarSearchText(_ text: String) {
@@ -369,13 +355,7 @@ extension AgentModeViewModel {
         let trimmedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let keys: [AgentSidebarThreadKey]
         let state: SidebarCollapseAllState
-        let restorePresentation = sidebarRestorePresentationKey
-        if restorePresentation.isOwnerPending || restorePresentation.baselineRevision != nil {
-            // Flat restore/owner pending: no thread tree is shown, so collapse-all is unavailable
-            // rather than reporting a misleading all-collapsed state (§5.6).
-            keys = []
-            state = .hidden
-        } else if trimmedSearch.isEmpty {
+        if trimmedSearch.isEmpty {
             keys = collapsibleSidebarThreadKeys(
                 for: tabs,
                 currentTabID: currentTabID,
@@ -385,10 +365,7 @@ extension AgentModeViewModel {
             if keys.isEmpty {
                 state = .hidden
             } else {
-                let collapsedThreadKeys = effectiveCollapsedSidebarThreadKeys(
-                    in: sidebarSessions(for: tabs),
-                    searchText: searchText
-                )
+                let collapsedThreadKeys = ui.sessionSidebar.snapshot.collapsedThreadKeys
                 let allCollapsed = keys.allSatisfy { collapsedThreadKeys.contains($0) }
                 state = allCollapsed ? .canExpand : .canCollapse
             }
@@ -602,7 +579,7 @@ extension AgentModeViewModel {
             sessionSignatures: signatures,
             sessionIndex: ownerValidatedSessionIndex,
             sessionListSortDates: ownerValidatedSessionListSortDates,
-            sidebarRestorePresentation: sidebarRestorePresentationKey
+            sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID
         )
     }
 }
@@ -648,7 +625,7 @@ extension AgentModeViewModel {
             if previous.sessionListCacheReady != sessionListCacheReady { categories.insert("sessionListCacheReady") }
             if previous.tabsWithActiveAgentRun != tabsWithActiveAgentRun { categories.insert("tabsWithActiveAgentRun") }
             if previous.mcpControlledTabIDs != mcpControlledTabIDs { categories.insert("mcpControlledTabIDs") }
-            if previous.sidebarRestorePresentation != sidebarRestorePresentation { categories.insert("sidebarRestorePresentation") }
+            if previous.sidebarRestoreFrozenOrderByTabID != sidebarRestoreFrozenOrderByTabID { categories.insert("sidebarRestoreFrozenOrder") }
 
             let tabChanges = debugTabMetadataChanges(from: previous, categories: &categories)
             let sessionChanges = debugSessionSignatureChanges(from: previous, categories: &categories)
@@ -801,7 +778,7 @@ extension AgentModeViewModel {
                 "session.parentSessionID", "session.hasLoadedPersistedState", "session.itemsIsEmpty",
                 "session.transcriptTurnsIsEmpty", "session.runState",
                 "session.lastActivityAt", "session.lastUserMessageAt", "sessionIndex", "sessionListSortDates",
-                "sidebarRestorePresentation"
+                "sidebarRestoreFrozenOrder"
             ]
             return preferredOrder.filter(categories.contains) + categories.subtracting(preferredOrder).sorted()
         }

@@ -1052,10 +1052,9 @@ class WindowStatesManager: ObservableObject {
         state.workspaceManager.addWorkspaceDidSwitchListener(label: "windowStateManager") { [weak self, weak state] newWorkspace in
             guard let self, let state else { return }
             let number = recordWorkspaceSwitch(forWindowID: state.windowID, to: newWorkspace)
-            // Publish the workspace-qualified pair; the window refreshes its coherent title.
-            state.setWorkspaceInstanceAssignment(newWorkspace.flatMap { workspace in
-                number.map { WorkspaceInstanceAssignment(workspaceID: workspace.id, number: $0) }
-            })
+            // Publish to the window so UI can react (e.g., in the title)
+            state.workspaceInstanceNumber = number
+            state.requestWindowTitleUpdate(reason: .workspaceChanged)
             persistWindowSession(reason: "workspaceSwitch")
         }
 
@@ -1064,7 +1063,8 @@ class WindowStatesManager: ObservableObject {
         // Assign an initial instance number if the workspace is already set
         if let ws = state.workspaceManager.activeWorkspace {
             let n = recordWorkspaceSwitch(forWindowID: state.windowID, to: ws)
-            state.setWorkspaceInstanceAssignment(n.map { WorkspaceInstanceAssignment(workspaceID: ws.id, number: $0) })
+            state.workspaceInstanceNumber = n
+            state.requestWindowTitleUpdate(reason: .workspaceChanged)
         }
 
         // If we have pending URLs that arrived *before* any windows,
@@ -1307,39 +1307,6 @@ class WindowStatesManager: ObservableObject {
             if !isTerminating {
                 terminationWindowSnapshot.removeAll()
             }
-        }
-
-        /// Opaque instance-allocator state, so a test can seed exact numbering from an empty
-        /// allocator and then restore the process-wide history. Allocation policy is unchanged.
-        struct InstanceAllocatorStateForTesting {
-            fileprivate var next: [UUID: Int] = [:]
-            fileprivate var assigned: [Int: (workspaceID: UUID, number: Int)] = [:]
-            fileprivate var history: [Int: [UUID: Int]] = [:]
-            fileprivate var restored: [UUID: [Int]] = [:]
-
-            init() {}
-        }
-
-        /// Seeds instance numbers from `snapshot` exactly as session restore does.
-        func preseedInstanceNumberStateForTesting(from snapshot: WindowSessionSnapshot?) {
-            preseedInstanceNumberState(from: snapshot)
-        }
-
-        /// Installs `state` (empty by default) and returns the state it replaced.
-        @discardableResult
-        func replaceInstanceAllocatorStateForTesting(
-            _ state: InstanceAllocatorStateForTesting = InstanceAllocatorStateForTesting()
-        ) -> InstanceAllocatorStateForTesting {
-            var previous = InstanceAllocatorStateForTesting()
-            previous.next = nextInstanceNumberByWorkspace
-            previous.assigned = assignedInstanceByWindowID
-            previous.history = windowWorkspaceNumberHistory
-            previous.restored = restoredInstanceNumbersByWorkspace
-            nextInstanceNumberByWorkspace = state.next
-            assignedInstanceByWindowID = state.assigned
-            windowWorkspaceNumberHistory = state.history
-            restoredInstanceNumbersByWorkspace = state.restored
-            return previous
         }
     #endif
 
