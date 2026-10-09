@@ -2233,13 +2233,22 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         // keys are delivered. Re-drive the key intent step by step on a timer — one Down per
         // observed highlight move until the submenu's root item is highlighted, then Right —
         // escaping a wrong submenu with Left, for ~4 s per session, over a few whole-open retries.
+        // Every attempt re-arms the cold catalog so the retry opens a fresh cold root and must
+        // still prove the cold → ready transition on that same root: a retry that lands on an
+        // already-ready root fails the cold check instead of passing vacuously.
         var attempts = 0
         while openings == 0 && attempts < 4 {
             attempts += 1
+            AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
+            await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
             var driver: Timer?
             _ = try await open(in: fixture, cancelAfterOpening: false, timeout: 5, whileTracking: { root in
                 guard let submenu = root.items.first(where: { $0.title == AgentOversightUICopy.overseeNewTitle })?.submenu else {
                     XCTFail("Missing candidate submenu")
+                    return root.cancelTracking()
+                }
+                guard submenu.items.map(\.title) == [AgentOversightUICopy.oversightMenuUnavailableMessage] else {
+                    XCTFail("Retry opened an already-ready root instead of the cold projection")
                     return root.cancelTracking()
                 }
                 let rootItems = root.items
@@ -2251,6 +2260,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                     openings += 1
                     XCTAssertTrue(child.items.contains { $0.title == target.menuLabel && $0.isEnabled })
                     XCTAssertTrue(zip(root.items, rootItems).allSatisfy { $0 === $1 })
+                    XCTAssertTrue(root.items.contains { $0.submenu === child })
                     XCTAssertTrue(fixture.window.stableMenuPresenter.openMenu === root)
                     root.cancelTracking()
                 }
