@@ -358,41 +358,51 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(session.items.first(where: { $0.kind == .user })?.dispatchedProviderText, expected)
     }
 
-    func testLocallyArmedChatRunsManagedSteerWithComputerUse() async throws {
+    func testManagedSteerStoresExactProviderPayloadInArmedAndUnarmedChats() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
-        let fixture = try makeSubmissionFixture()
-        let vm = fixture.viewModel
-        let session = fixture.session
-        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
-        let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
-            tabID: session.tabID, sessionID: sessionID, tabName: "Target", isWindowClosing: false
-        ))
-        await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
-        XCTAssertEqual(vm.submitUserTurn(text: "inspect the screen", tabID: session.tabID), .submitted)
-        try await assertComputerUseProviderStart(fixture, session: session)
-        let controller = try XCTUnwrap(fixture.factory.controllers.first)
-        await fixture.coordinator.test_handleCodexNativeEvent(
-            .turnStarted(turnID: "armed-turn"), session: session, sourceController: controller
-        )
-        let request = computerUseRemoteRequest("continue remotely")
-        let envelope = AgentSessionLinkMessageEnvelope.render(
-            sourceSessionID: request.observerSessionID, sourceName: request.observerDisplayName,
-            linkID: request.linkID, linkGeneration: request.linkGeneration,
-            message: request.message, framing: .management
-        )
-        let sink = AgentSessionLinkManagedSteerSink()
-        XCTAssertTrue(vm.submitAgentSessionLinkManagedSteer(
-            tabID: session.tabID, session: session, displayText: request.message,
-            turn: .init(candidate: candidate, providerText: envelope, attribution: request.attribution, sink: sink),
-            route: .codex
-        ))
-        let outcome = await sink.awaitOutcome(timeoutSeconds: 4)
-        XCTAssertEqual(outcome, .delivered(.steered))
-        XCTAssertEqual(controller.steeredTexts, [CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: envelope)])
-        XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [true])
-        XCTAssertTrue(session.isCodexComputerUseArmed)
-        XCTAssertEqual(controller.startedTurnCount, 1)
+        for armed in [true, false] {
+            let fixture = try makeSubmissionFixture()
+            let vm = fixture.viewModel
+            let session = fixture.session
+            let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+            let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
+                tabID: session.tabID, sessionID: sessionID, tabName: "Target", isWindowClosing: false
+            ))
+            if armed {
+                await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
+            }
+            XCTAssertEqual(vm.submitUserTurn(text: "inspect the screen", tabID: session.tabID), .submitted)
+            try await AsyncTestWait.waitUntil("initial turn reaches fake provider", timeout: 4) {
+                fixture.factory.controllers.first?.startedTurnCount == 1
+            }
+            let controller = try XCTUnwrap(fixture.factory.controllers.first)
+            await fixture.coordinator.test_handleCodexNativeEvent(
+                .turnStarted(turnID: "armed-turn"), session: session, sourceController: controller
+            )
+            let request = computerUseRemoteRequest("continue remotely")
+            let envelope = AgentSessionLinkMessageEnvelope.render(
+                sourceSessionID: request.observerSessionID, sourceName: request.observerDisplayName,
+                linkID: request.linkID, linkGeneration: request.linkGeneration,
+                message: request.message, framing: .management
+            )
+            let sink = AgentSessionLinkManagedSteerSink()
+            XCTAssertTrue(vm.submitAgentSessionLinkManagedSteer(
+                tabID: session.tabID, session: session, displayText: request.message,
+                turn: .init(candidate: candidate, providerText: envelope, attribution: request.attribution, sink: sink),
+                route: .codex
+            ))
+            let outcome = await sink.awaitOutcome(timeoutSeconds: 4)
+            XCTAssertEqual(outcome, .delivered(.steered))
+            let expected = armed ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: envelope) : envelope
+            XCTAssertEqual(controller.steeredTexts, [expected])
+            let row = try XCTUnwrap(session.items.last(where: { $0.kind == .user }))
+            XCTAssertEqual(row.dispatchedProviderText, controller.steeredTexts.last, "Stored managed payload must equal transport payload (armed: \(armed))")
+            XCTAssertEqual(row.dispatchedProviderText, expected)
+            XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [armed])
+            XCTAssertEqual(session.isCodexComputerUseArmed, armed)
+            XCTAssertEqual(controller.startedTurnCount, 1)
+        }
     }
 
     private func computerUseRemoteRequest(_ text: String) -> AgentSessionLinkSendRequest {

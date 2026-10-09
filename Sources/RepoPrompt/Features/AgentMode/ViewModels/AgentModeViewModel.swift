@@ -17738,7 +17738,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sequenceIndex: session.nextSequenceIndex,
             workflow: activeWorkflow,
             crossSessionAttribution: managedTurn?.attribution,
-            dispatchedProviderText: managedTurn?.providerText
+            dispatchedProviderText: managedTurn != nil ? wrappedText : nil
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
