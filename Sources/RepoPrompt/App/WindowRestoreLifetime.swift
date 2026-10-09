@@ -45,19 +45,13 @@ struct WindowRestoreLifetime {
         case captureLive
     }
 
-    private struct Pending {
-        let entry: WindowSessionEntry
-        let completion: (() -> Void)?
-        let acceptanceSequence: UInt64
-    }
-
     private struct Protection {
         let entry: WindowSessionEntry
         let acceptanceSequence: UInt64
     }
 
     private var acceptanceSequence: UInt64 = 0
-    private var pending: Pending?
+    private var pending: Dispatch?
     private var protection: Protection?
 
     var hasPendingEntry: Bool {
@@ -78,7 +72,7 @@ struct WindowRestoreLifetime {
         assert(!entry.isEphemeral, "Ephemeral entries are completed by the owner, never accepted")
         acceptanceSequence &+= 1
         let displaced = pending?.completion
-        pending = Pending(entry: entry, completion: completion, acceptanceSequence: acceptanceSequence)
+        pending = Dispatch(entry: entry, completion: completion, acceptanceSequence: acceptanceSequence)
         // A System-intended entry needs no protection: its fallback and intended state coincide.
         protection = entry.isSystemWorkspace
             ? nil
@@ -98,11 +92,7 @@ struct WindowRestoreLifetime {
     mutating func takePendingForDispatch() -> Dispatch? {
         guard let taken = pending else { return nil }
         pending = nil
-        return Dispatch(
-            entry: taken.entry,
-            completion: taken.completion,
-            acceptanceSequence: taken.acceptanceSequence
-        )
+        return taken
     }
 
     /// A real (non-System) selection was published. Releases protection only for acceptances

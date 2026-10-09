@@ -154,7 +154,7 @@ final class AgentSidebarRestoreCharacterizationTests: XCTestCase {
         for (now, calendar) in [(day.addingTimeInterval(86400), calendar), (day, shifted)] {
             let sections = AgentSidebarDateSectionBuilder.activeSections(for: rows, now: now, calendar: calendar)
             XCTAssertEqual(
-                sections.map { "\(label($0.id)):\($0.bucket)" }.joined(separator: ";"),
+                sections.map { "\(label($0.groups.first?.id)):\($0.bucket)" }.joined(separator: ";"),
                 "2:today;3:yesterday;4:previous"
             )
         }
@@ -331,6 +331,7 @@ final class AgentSidebarRestoreCharacterizationTests: XCTestCase {
     }
 
     /// Serializers only: no sorting, date-bucket, threading, or collapse policy.
+    /// Section UUIDs encode bucket/ordinal; snapshots label the first rendered thread group instead.
     private func assertProjection(
         _ stage: String,
         _ rows: [Row],
@@ -346,7 +347,7 @@ final class AgentSidebarRestoreCharacterizationTests: XCTestCase {
         let groups = AgentSidebarDateSectionBuilder.activeGroups(for: rows, now: day, calendar: calendar)
         let groupText = groups.map { "\(label($0.id)):\($0.bucket):\($0.rows.map { label($0.id) }.joined(separator: ","))" }.joined(separator: ";")
         let sections = AgentSidebarDateSectionBuilder.activeSections(for: rows, now: day, calendar: calendar)
-        let sectionText = sections.map { "\(label($0.id)):\($0.bucket):\($0.groups.flatMap(\.rows).map { label($0.id) }.joined(separator: ","))" }.joined(separator: ";")
+        let sectionText = sections.map { "\(label($0.groups.first?.id)):\($0.bucket):\($0.groups.flatMap(\.rows).map { label($0.id) }.joined(separator: ","))" }.joined(separator: ";")
         print("SIDEBAR_RESTORE_STAGE | \(stage) | \(rowText) | \(groupText) | \(sectionText)")
         XCTAssertEqual(rowText, expectedRows, stage, file: file, line: line)
         XCTAssertEqual(groupText, expectedGroups, stage, file: file, line: line)

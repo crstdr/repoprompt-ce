@@ -39,6 +39,29 @@ enum AgentSidebarDateSectionBucket: CaseIterable, Hashable, Identifiable {
         }
         return .previous
     }
+
+    /// Model identity for one contiguous run of this bucket.
+    ///
+    /// The sidebar list does not use this as a `ForEach` key. Each row is keyed
+    /// by its own id. `ordinal` keeps a second run of the same day (a pinned
+    /// group separated from later unpinned rows) distinct from the first.
+    func sectionID(ordinal: Int) -> UUID {
+        let bucketByte: UInt8 = switch self {
+        case .today:
+            1
+        case .yesterday:
+            2
+        case .previous:
+            3
+        }
+        return UUID(uuid: (
+            0xB7, 0xA1, 0xD0, bucketByte,
+            0x00, 0x00,
+            0x40, 0x00,
+            0x80, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, UInt8(clamping: ordinal)
+        ))
+    }
 }
 
 /// Settlement of the selected tab's restoration, derived from the same presentation records and loader

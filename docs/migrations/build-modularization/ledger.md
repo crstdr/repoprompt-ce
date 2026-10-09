@@ -32,16 +32,22 @@ Local tooling-half validation on 2026-09-30: `make conductor-selftest` passed; `
 
 ## Ratchet policy
 
-- **Gated by build-free guardrails:** `app_files_over_5000_lines`, `app_files_over_2000_lines`, `app_static_shared_declarations`, and `tests_testable_import_app_files` are non-increasing; `app_target_swift_lines` has a fixed 2,000-line allowance over its recorded baseline.
+- **Gated by build-free guardrails:** `app_files_over_5000_lines`, `app_files_over_2000_lines`, `app_static_shared_declarations`, and `tests_testable_import_app_files` are non-increasing. Missing or invalid baseline configuration remains a failure.
 - **Gated by the build-producing CI job:** index wrong-way edges and largest cycle; type-check body and expression budgets. Index freshness must be proven by source hashes before comparing counts.
-- **Tracked, not gated:** `app_shared_accessor_uses`, `app_userdefaults_standard_uses`, lexical `app_wrong_way_file_edges`, lexical `app_largest_cycle_components`, and `tests_sleep_calls`. The lexical graph can add false edges from identifier collisions; the sleep regex also counts fake-clock declarations.
+- **Tracked, not gated:** `app_target_swift_lines` (visible advisory above baseline plus the unchanged 2,000-line headroom), `app_shared_accessor_uses`, `app_userdefaults_standard_uses`, lexical `app_wrong_way_file_edges`, lexical `app_largest_cycle_components`, and `tests_sleep_calls`. The lexical graph can add false edges from identifier collisions; the sleep regex also counts fake-clock declarations.
 - Lower a baseline with `update` in the slice that improves it. Raising one requires `update --allow-regression` plus a justification entry here.
+
+**2026-10-03 PR 4 maintainer policy decision.** The user explicitly makes the App-line reference advisory, superseding the earlier hard-ceiling and proposed +177 allowance decisions. No numeric baseline is raised: `app_target_swift_lines` remains 649,794, headroom 2,000, advisory reference 651,794. Pinned main `a877f1ea` has 651,988 App lines (+194); the pending PR 4 merge has 651,971 (+177), a PR 4 contribution of −17. Excess remains visible even when another mandatory ratchet fails. All four non-increasing metrics, dependency/security/test gates and baseline/configuration failures remain mandatory; `update` still refuses unapproved baseline increases. The earlier actual guardrail exit1 is retained as historical failure, not retrospectively passed. Policy regression checks and final commit/push preflights must execute before publication; optional current-main full-suite/package/live checks remain pending, including incomplete ticket `51d89061-0945-4554-b73b-12d601485397` (zero executed tests).
+
+**2026-10-03 PR 4/#1148 test-import alignment.** The maintainer explicitly authorizes only `tests_testable_import_app_files` 332 → 333 for the already-merged #1148 coverage at `274fd59d12585e26d53a8457dbd5c5b5014b7441`. Its new `MCPStateSubscriptionTests.swift` necessarily imports App: all six unchanged tests exercise real `MCPService` subscriber fan-out, seed/unsubscribe/approval state and `MCPServerViewModel` lifetime/window presentation with App dependencies and DEBUG hooks. Preserve the complete upstream file and assertions; no consolidation, deletion, Shared substitute, public/SPI exposure or suppression. CI run `37109785395`, job `111165298080`, checked synthetic merge `10d61881d4feb4b8300b4001c2cfd4878d343f4d` and failed the genuine 333 > 332 ratchet before compilation; that failure remains historical, not passed. This is a one-file structural-baseline alignment, not a relaxed check: counts above 333 still fail. App baseline 649,794/headroom 2,000/advisory reference 651,794, every other baseline/list and all dependency/security/test/configuration gates remain unchanged. Exact merged-head guardrails, eight focused methods, style and later commit/push preflights remain pending validator execution.
 
 **2026-10-01 PR 2/main reconciliation.** Merging current `origin/main` (#1134–#1136) into PR 2 put the app target at 649,172 Swift lines, 242 above the earlier 648,930 ceiling. Regenerated `ratchets.json` with `update --allow-regression` against the merged tree: the recorded app-line baseline is now 649,172 with the same fixed 2,000-line headroom. The non-increasing gate counts remain unchanged; tracked-only counts reflect the merged source. This is a baseline reconciliation for existing feature work and PR 2, not a change to the guardrail policy.
 
 **2026-10-01 PR 2/#1137 reconciliation.** Merging `origin/main` at `773a0f2e` added three tests with an exact `@testable import RepoPromptApp` line. The new Devin catalog, Context Builder prompt, and MCP policy tests exercise app-owned types; the fourth new Devin test uses an SPI-prefixed import and is not counted by this lexical metric. Regenerated `ratchets.json` with `update --allow-regression` against the merged tree: the test-import baseline is 332 rather than 329. The app-line baseline and tracked metrics were also refreshed for the new Devin catalog. This reconciles upstream app-level test coverage without weakening the non-increasing rule for later changes.
 
 **2026-10-01 #1143 reconciliation.** Merging `origin/main` at `7d9cecd2` into the #1128 new-window chooser fix adds one test file with an exact `@testable import RepoPromptApp` line: `NewWindowInitialSelectionTests`. It is a composition suite. It drives `WindowState`, `DomainWorkspacePresentationBridge`, `ContentViewModel`, and `WorkspaceManagerViewModel` together against a real `MCPDomainRuntime`, so it cannot move to a module test target. The PR's projection-observer test support was folded into the existing `WorkspaceAuthorityRootTestFixture.swift` rather than adding a second file. Regenerated `ratchets.json` with `update --allow-regression` against the merged tree: the test-import baseline is 333 rather than 332. The app-line baseline was refreshed to include the fix's source (+628 lines). The non-increasing rule for later changes is unchanged.
+
+**2026-10-08 #1143 simplification follow-up.** Applied the four static-equivalence cuts from the review of `493d6205`: remove unused route/startup test surface, consolidate the identical pending/dispatch restore payload, and remove one-shot startup replacement checks. App source falls from 650,635 to 650,611 Swift lines (24 fewer); execution/protection separation, route scheduling, startup joins, and cancellation checks remain unchanged. Regenerated measurements show 650,611 app lines and 749,091 first-party lines. The recorded baseline of 650,498 predates the 137-line restore-lifetime addition at the reviewed head; it remains unchanged because the measured total is within the existing 2,000-line allowance and this deletion-only follow-up should not raise the baseline. Non-increasing gate counts are unchanged. The projection generation counter is intentionally retained pending separate zero-sequence, same-sequence, and stop/restart equivalence validation.
 
 ## Baseline — 2026-09-28 (`589cecc5`)
 
@@ -66,6 +72,33 @@ Conductor timings (last 3,000 jobs, net of queue):
 `update --allow-regression`, because main moved between the baseline and this branch landing. No change on this branch worsens a gated metric.
 - **Gated:** `tests_sleep_calls` 47 → 49. Both come from main: #1067 added a fake clock whose `func sleep(_:)` declaration the regex counts (`ContextBuilderGroupedSupervisionTests`), and #1092 added a 2 ms `Task.sleep` poll (`AgentAdmissionRecoveryTests`).
 - **Tracked (refreshed, not gated):** app files 1,160 → 1,161, app lines 648,091 → 651,485, files over 2,000 lines 50 → 51, `.shared` uses 1,220 → 1,222, wrong-way edges 1,102 → 1,104, `@testable import RepoPromptApp` test files 319 → 324. Of these, this branch adds 2 app lines (the P0.6 access change) and 1 `@testable` file (the P0.6 goldens); the rest is main (`origin/main` alone measures 651,483 lines and 323 files).
+
+## Ratchet exception — advertised model admission (2026-09-30)
+
+`app_static_shared_declarations`: **102 → 103**, solely for
+`AgentAdvertisedModelCatalog.shared`. Generated with
+`python3 Scripts/modularization_metrics.py update --allow-regression --baseline /tmp/overseer-model-selection-ratchets.generated.json`;
+only this justified metric is adopted in `ratchets.json`. Other baselines stay unchanged;
+`app_files_over_5000_lines` remains 17. This is an explicit one-owner exception, not a
+relaxation of the gate or a rename to evade its `shared` count.
+
+The new owner is the process-memory index of exact advertised compound model IDs and their
+precomputed effort decomposition, shared by `set_model` and explicit `create_lane(model_id:)`.
+Ordinary catalogue producers populate it; ACP/Codex/backend configuration changes invalidate it.
+Admission only performs bounded memory lookups and refuses a cold index actionably. It never
+warms persistence, scans the full catalogue, discovers models, or calls a provider. Keeping this
+projection separate prevents the legacy discovery/resolution paths (including Codex effort parsing
+that can consult persistence) from leaking into the configuration-only transaction.
+
+Alternatives inspected: `AgentACPModelRegistry` owns ACP provider snapshots and store warming;
+`AgentCodexModelRegistry` owns Codex snapshots. Neither is a coherent owner for Claude, ACP,
+Codex, and other advertised targets together. `AgentModelCatalog` is a stateless catalogue facade;
+adding a differently named static cache there would preserve the new global lifetime while merely
+hiding it from the ratchet. Reworking all catalogue lifetimes/injection is outside this bounded
+feature and would add risk without strengthening its no-I/O contract. The index has no authority,
+provider lifecycle, or persistence ownership; independently constructed instances support admission
+tests. Future catalogue-service extraction should absorb this projection and remove this singleton,
+not duplicate it in individual registries. No other new global owner is authorized by this exception.
 
 ## Decisions
 
@@ -1006,6 +1039,13 @@ then passed all 36 cases, including the timed-out case. The final full
 These timings are post-move observations only, not a before/after performance
 claim.
 
+## PR 3 WorkspaceContext prep (2026-10-01)
+
+This in-place C1/C2 slice removes WorkspaceContext, Search, and CodeMap's outbound references to Features, view models, and MCP implementation files. S8 now uses file search projections and feature-side path adapters; S9 stores selection values in WorkspaceContext and receives neutral workspace/tab values from the workspace manager; S17 uses neutral prompt/workspace values and a search-readiness contract. Startup and debug diagnostics use injected recorders from `WindowStateComposition`, following the PR 2 instrumentation contract pattern. The read-only, root-scoped `WorkspaceContextRootSnapshot` retains catalog and lifetime leases and has a Sendable/currentness contract test. No files or package targets move in this PR.
+
+Compiler-index readiness baseline on 101 files: 55 outbound target files, 168 outbound file edges, 1,040 symbols. The final index and validation tickets are recorded in `/tmp/rpce-pr-reviews/pr3-impl.md` for this worktree. FileSystem/VCS and other Infrastructure remain for subsequent milestones.
+
+
 ## #1112 restoration-presentation test ownership exception — 2026-10-02
 
 Atila approved one increase of `tests_testable_import_app_files`, from 333 to
@@ -1021,3 +1061,249 @@ This exception does not raise the app-source line baseline or its 2,000-line
 headroom, change other ratchets, or authorize wider production visibility.
 The approval was relayed by Atila's delegated #1112 overseer during implementation.
 Guardrails must still pass on the integrated change.
+
+2026-10-09: Atila reaffirmed the same single-file exception for `Tests/RepoPromptTests/AgentMode/Transcript/AgentTranscriptRestorationPresentationTests.swift` against main’s lowered baseline (327→328); the exception was not widened.
+
+
+## PR 4 MCP server prep — bounded source handoff (2026-10-02)
+
+Base/current fetched origin/main at start: `61ab8b285fa5a9281587ec9712404bfe7b5c528f`;
+clean isolated `modularization/pr4-mcp-server-seams`, zero ahead/behind at fetch.
+No fast-forward was needed. Published claims and frozen interfaces are in
+`/tmp/rpce-pr-reviews/pr4-{claims,interfaces}.md` (scratch coordination artifacts).
+
+### Split map and preserved owners
+
+- **S5 values:** single approved `MCPInvocationContext.swift`; nested compatibility
+  aliases remain in existing VM extensions. Snapshot defaults, mutable value-copy
+  behavior, revision/generation values, root projection and lifetime equality are
+  unchanged. Live MainActor capture/validate and synchronous atomic
+  `performIfGenerationCurrent` remain in the existing main VM extension.
+- **S6 app ingress:** manager captures connection/tool/invocation/window evidence;
+  TaskLocal bridges only the unchanged DomainRuntime args-only binding. Binder/VM
+  synchronously capture before suspension, pass the same explicit provider packet,
+  and revalidate exact connection/catalog/window ownership at the existing gates.
+  Oracle, control, AskUser and ContextBuilder receive context or injected app
+  purpose/progress callbacks. A missing or mismatched packet throws; DEBUG uses an
+  injected redacted existing adapter sink. Explicit local test compatibility never
+  becomes network authorization.
+- **D3 policy projection:** `MCPToolAdmissionPolicy.clientPolicySnapshot` is the
+  original app mapping, consumed at the four existing dispatch/catalog sites.
+  Admission-decision and settlement-result aliases refer to the existing domain
+  types. No callback ordering, permit registry, cancellation, settlement lease,
+  delivery fence or wire-ID/replay ownership moves.
+- **DomainRuntime/MCPCore/CLI/headless:** untouched. No file moves or new targets.
+  Only one approved new source file; no new test files or ratchet increases.
+
+### Actual async boundaries
+
+Manager resolved operation explicitly receives the packet through the existing
+watchdog/provider closures, scopes its diagnostic sink and packet around host
+invocation, and preserves the host's structured Task and existing security scopes.
+The VM captures before runTool, carries the packet through its start-gated Task,
+and reestablishes the bridge immediately around the provider. Heartbeat task-group
+children explicitly retain/reestablish the captured packet. Global window tools
+capture before MainActor and approval awaits; their helpers receive the packet or
+captured identity values. Domain reads retain the host packet alongside (not in
+place of) the separate DomainRead invocation identity. Continuation-only start,
+idle, connection and file-resolution waiters carry existing exact tokens/results
+and do not discover new routing authority on resume. No request-authority
+DispatchQueue or detached hop was found in these integration-owned app adapters.
+
+### Authorization qualification
+
+The retained nonthrowing metadata helper is **not an authorization boundary**.
+An absent metadata value can classify as administrative in compatibility code.
+Safety depends on strict mandatory network binder/read ingress and preserving the
+scoped explicit packet across the structured Host Task, runTool/start gate and
+heartbeat. Carrier-free MCPService getters return nil rather than looking up a
+live successor connection/client/window. Independent Sol production-caller audit
+found no audited contextless production adapter entry; parent spot-checked the
+complete inventory. Do not turn fixture compatibility into network authorization.
+
+### Local v8 validation evidence (dedicated validator)
+
+| Check | Conductor ticket / accounting | Result |
+| --- | --- | --- |
+| Exact network/context regressions | `b41db62d-a832-4197-9b6b-5f93c2577b36` | PASS: 6 executed, 6 passed |
+| Affected source suites | `e0a24bd2-8275-47e9-95a9-ab867070e9cb` | PASS: 195 executed, 195 passed |
+| Exact repaired fixture regressions, v8 | `4dd2173c-3cc0-48f7-8caa-a6a20d1992d0` | PASS: 11 executed, 11 passed |
+| Three repaired suites, v8 | `776e86c5-912c-4b83-9063-8f4e2a9f1161` | PASS: 78 executed, 78 passed |
+| Broad frozen-source run, v8 | `c6cb5b47-e9e3-4aad-8f6c-42285c5a1296` | PASS: 4,142 executed; 4,140 passed; 0 failed; 2 skipped |
+| DomainRuntime / MCPCore in broad-v8 | Same broad ticket, per-module identities | PASS: 268 / 66 respectively |
+| Final v8 formatter | `590321dc-e976-44fa-b196-3a12c56e2c64` | Completed, exit 0 |
+| Final v8 lint | `d4f0eb5e-966f-4d29-850d-217e8794caf9` | Completed, exit 0 |
+| Final v8 guardrails | `0c4a4894-3072-44a9-8c82-678c7ca61965` | Completed, exit 0; ratchets unchanged |
+
+Identity counts, raw logs, original failures and freeze evidence remain under
+`/tmp/rpce-pr-reviews/pr4-local-receipts/`. The v8 all-Swift/source manifest covers
+1,849 files; validator and precommit checks found drift `[]`. Integration preserves
+that manifest and makes documentation-only changes after the tested freeze. These
+checks are validator execution evidence, not claims of integration-run tests.
+
+The earlier broad-v7 ticket `b5b53855-287c-4f24-85c9-fe2d3c4219c9` remains a
+**FAILED** historical receipt: 4,142 executed, 4,129 passed, 11 failed, 2 skipped.
+The complete source/receipt audit classified all 11 as test-only direct materialized
+adapter fixtures missing the mandatory carrier. Overseer approved only mechanical
+matching trusted-local scopes at those same entries, retaining prerequisite drains,
+physical race/collision/cancellation gates and all assertions. The exact 11 and the
+broader v8 run now provide the rerun evidence; source triage alone was not a pass.
+The extra CancellationError in the first file-actions method was a repeat-validation
+obligation, not discarded. Its exact method passes in v8.
+
+Mechanical fixture adaptations are enumerated in the scratch PR draft and audit:
+ContextBuilderSelectionPrerequisiteTests (3 methods),
+MCPSelectionPrerequisiteErrorTests (4), MCPReadMutationPathContractTests (4), existing
+OracleGroupBoundary service fixture and the single ContentReadCancellationTests
+constructor near original line 435. The protected final-materialization/rollback
+regression near original line 850 is unchanged. Hoisted-type references in existing
+authority/recovery tests are mechanical; no new test files or ratchet increases.
+
+### Ref provenance and remaining acceptance
+
+The tested branch remains based on `61ab8b285fa5a9281587ec9712404bfe7b5c528f`.
+Immediately before local commit, an explicit fetch found current origin/main
+`64b9352eec13e0252500d429f64ca9d1dd5e49fd` (four commits ahead of the tested base).
+No rebase, merge, stash, history rewrite or source mutation integrates that newer
+main here. Current-main integration and revalidation require separate coordination.
+
+**NOT_RUN:** final-head `make dev-build` debug package, live CE MCP E2E (approval,
+denial, multiwindow, cancellation, replay), and headless initialize/list/read-only
+runtime checks. Dedicated validator owns these next gates. Live lifecycle requires
+separate explicit overseer approval. Local commit authorization is not push/PR or
+lifecycle authorization; no integration engineer builds/tests/formatter were run.
+
+## PR5 — B1–B4 platform extraction (2026-10-04)
+
+Base: `3fbf7d0d41a4fe04c1bc701327afd297ccaeaf74`, branch
+`modularization/pr5-platform`. Three disjoint Sol engineers owned FileSystem,
+VCS, and SettingsCore; the coordinator owned Persistence, manifests, app
+composition, and integration. PR6 WorkspaceContext extraction is not included.
+
+- **B1:** FileSystem owns watchers/FSEvents, ignore compilation and neutral
+  matching contracts, content reads, seed-plan reading, and the generic injected
+  disk writer. App metrics/recording, settings policy, authenticated seed-plan
+  adapters, and workspace write policy remain app-owned.
+- **B2:** VCS owns app-free repository/worktree queries and reusable parsers and
+  values. GitService and feature-dependent receipt/presentation authority stay
+  app-owned; no full GitService rewrite.
+- **B3:** Persistence owns CodeMapArtifacts and DurableArtifacts plus canonical
+  selection contribution values. App source-snapshot verification adapters retain
+  the original raw-byte/OID/digest guards. Presets remain deferred.
+- **B4:** SettingsCore owns the document, file store, neutral values and store,
+  including `.shared` compatibility and immutable global-ignore settings.
+  Application catalogs, notification mapping, UI normalization and bootstrap stay
+  app-owned. Persisted keys and compatibility literals are unchanged.
+
+`Sources/RepoPromptShared`, `Sources/RepoPromptDomainRuntime`,
+`Sources/RepoPromptMCP`, and the frozen prototype are untouched. Reliability
+transport/bootstrap/Exec-reporting repairs are not absorbed. Contributor overlaps
+in GitService/receipts stay at their original app paths; moved root-manifest and
+settings fixes require path reconciliation against their exact contributor heads,
+not blanket deferral or unreviewed cherry-picks.
+
+### Executed receipts
+
+| Boundary | Conductor ticket | Actual result |
+| --- | --- | --- |
+| App product | `231c341a-3c12-4eff-9f80-22d8565dee0b` | PASS |
+| MCP product | `f9e08926-d451-4d47-a78f-c50ceb82bb79` | PASS |
+| Content reads + compatibility goldens | `9fdd0a5c-051d-499d-8316-e3e768aababa` | 40 tests, zero failures |
+| Final platform owners + focused app integration | `deb667b5-66db-44cc-8c87-aa59a4bc0ec5` | 61 owning tests + 97 app tests, zero failures |
+| Event-bridge fixture regressions | `30f34235-741b-414c-829e-ffd576050374` | 12 tests, zero failures |
+| Broad final Swift source validation | `46a276bf-e38f-40ff-9ed0-fab61ce555a0` | 4,399 tests, four skipped, zero failures; 14 targets |
+| Pinned formatter + strict lint | `a4c64972-916f-4805-b49d-896de7145a2d` | PASS; 0/1,632 files require formatting |
+
+Guardrails passed, including 36 target rows, placement, dependency edges, licenses,
+headless fences and 15 metrics tests. Nested-sandbox SwiftPM manifest evaluation
+failed first; the approved unsandboxed guardrail invocation passed. This is a
+validation-environment receipt, not a source defect.
+
+Historical failed receipts are retained: focused content reads
+`010cf4d8-a793-450b-905f-0480a165f5a1` and broad
+`e89816c4-9ff6-454e-9933-a90beb1d0317`. The former exposed lost host TaskLocal
+attribution across the existing detached read worker; a captured app-owned
+attribution adapter restores the original tag without new tasks, locks or unsafe
+annotations. Its final-materialization gate failure remains unattributed despite
+subsequent focused and broad passes; it is not labeled inherited. The latter
+exposed three app test hosts bypassing startup notification-bridge installation;
+explicit fixture adapters repaired delivery without weakening any assertions.
+
+Disk-writer injection preserves independent selection keys when incoming records
+are nil; the owning contract regression exercises this behavior. Source review
+confirms normalization writeback forwards the manager's injected writer, but no
+committed integration regression directly injects a non-default manager writer.
+That routing contract remains a coverage gap, not a claimed executed test. No
+timeout widening, retry sleeps, authorization weakening or assertion removal was
+used to repair failures.
+
+The four gated metrics tighten to 16 files over 5,000 lines, 47 over 2,000,
+326 app-testable imports and 89 app static shared declarations. App line count
+remains advisory; its numeric baseline and headroom are unchanged. Tracked sleep
+count growth (59 to 64) is disclosed, not silently baselined upward.
+
+**NOT_RUN:** debug packaging, visible-app lifecycle, live CE MCP acceptance and
+paid provider calls. No timing benchmark is claimed; conductor execution/queue
+and global-wait accounting are available in the ticket logs. Exact-head hosted
+checks and fresh milestone Astra review remain acceptance gates.
+
+### Independent milestone review
+
+Read-only Astra XHigh review of exact `2467154530eb0b31f2d196dde1f1dfcc3647cee5`
+found no demonstrated B1–B4 behavior, security or authority regression. It confirmed
+preserved read cancellation/permit ownership, authenticated seed-plan readers,
+raw artifact provenance/OID/byte-count/digest/CAS guards, and settings startup/event
+boundaries. Review report: `/tmp/pr5-astra-246715453-review.md` (local artifact,
+not a hosted check or new test execution).
+
+Its P3 evidence finding is corrected above: injected manager normalization routing
+is source-reviewed, not directly covered by a committed injection regression.
+Direct app raw-source-adapter mismatch coverage is also an explicit gap; owning
+container corruption/hostile-file tests validate a different layer. Duplicate pure
+delta coalescing in the app and FileSystem is a non-blocking future divergence risk,
+not a demonstrated current algorithm mismatch. The historical final-materialization
+failure remains unattributed; broad GREEN is not causal proof of its disposition.
+
+### V194 injected write-backend contract resolution
+
+The PR5 coordinator owns this B1 repair. Revised-head review at `838a583a2`
+correctly left historical V194 (revised audit row 197) unresolved: the async
+`atomicWrite` callback controlled queued writes, while eligible normalization
+bypassed it and performed physical I/O. This was not cleared by eight hosted
+GREEN checks. The default physical app behavior matched main, but the custom
+write-backend contract was defective, not merely a mechanical-audit classification.
+
+Concrete regression receipt `11a451db-f630-4804-be31-0baedcefd6a6` executed one
+case, `testNormalizationDoesNotBypassInjectedBackendFailure`, and failed both the
+refusal and unchanged-file assertions: normalization returned success and replaced
+the real file despite the injected backend refusing writes. No production source
+had changed before this RED execution.
+
+The intended contract is now explicit: `WorkspaceDiskWriteBackend` requires both
+`queuedAtomicWrite` (async) and `normalizationAtomicWrite` (synchronous), with no
+implicit physical fallback when choosing a custom backend. It is a write backend,
+not a virtual filesystem; file-stamp reads remain filesystem-owned. The default
+`.physical` backend performs the same atomic writes as main. Normalization's
+pending-slot check, size/mtime checks, synchronous backend call, and successful
+selection recording remain one non-suspending actor operation. No `await`, task,
+lock, retry, timeout inflation, or authority bypass was inserted into that critical
+section. Application composition still uses the default process-owned writer.
+
+Focused correction receipt `769a00a9-582d-4897-96b6-811a40f6c37e` executed **seven
+owning contract tests, all passed**: the five new normalization regressions cover
+backend refusal without physical mutation, custom backend dispatch without physical
+mutation, default physical behavior, stale size/date rejection, and pending-write
+rejection. The two existing selection-key and in-flight/coalescing tests retain
+their original assertions. The extra DecodeWork selector matched no app tests;
+this receipt is not claimed as app integration coverage. Revised-head full tests,
+style, hosted checks and independent delta review are separate subsequent gates.
+
+The other 257 strict-audit rows at `838a583a2` retain their exact-path/owner intended
+adaptation dispositions; the strict tool remains FAIL, not suppressed or made GREEN.
+This repair resolves a substantive injected-backend defect but does not make the
+extraction a pure move. Manager-injected normalization routing and direct app
+raw-source-adapter mismatch coverage remain separately disclosed gaps, not tests
+supplied by these owning writer or neutral container suites. The historical
+final-materialization and graph authority failures remain unattributed; subsequent
+GREEN execution is not causal explanation. No typed-path claimed source or
+separately owned reliability source was modified.

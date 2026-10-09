@@ -220,20 +220,6 @@ package final class CLIProcessRunner {
         }
     }
 
-    private func terminateChild(_ p: SpawnedProcess, sendSigterm: Bool) {
-        // Only the waitpid-driven cleanup should close stdout/stderr. Here we just stop input
-        // and request termination so reader threads aren't left blocked on a closed read end.
-        p.stdin?.closeFile()
-        if sendSigterm {
-            ProcessTermination.signalProcessGroupOrPID(
-                pid: p.pid,
-                processGroupID: p.processGroupID,
-                signal: SIGTERM,
-                logger: { [weak self] message in self?.log(message) }
-            )
-        }
-    }
-
     @inline(__always)
     private static func isRunnableExecutable(_ path: String) -> Bool {
         var isDir: ObjCBool = false
@@ -253,7 +239,10 @@ package final class CLIProcessRunner {
         additionalRemovedKeys: Set<String> = [],
         cancelChildOnTaskCancellation: Bool = false
     ) async throws -> Result {
-        try await gate.withPermit { [self] in
+        if config.processPurpose == .provider {
+            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: config.allowsProviderProcessLaunchForTesting)
+        }
+        return try await gate.withPermit { [self] in
             let environment = await resolvedEnvironment(
                 additionalEnvironment: additionalEnvironment,
                 additionalRemovedKeys: additionalRemovedKeys
@@ -337,7 +326,9 @@ package final class CLIProcessRunner {
                     command: resolvedCommand,
                     arguments: arguments,
                     environment: environment,
-                    workingDirectory: workingDirectory
+                    workingDirectory: workingDirectory,
+                    purpose: config.processPurpose,
+                    allowsProviderProcessLaunchForTesting: config.allowsProviderProcessLaunchForTesting
                 )
             } catch let launcherError as ProcessLauncherError {
                 log("Failed to spawn \(resolvedCommand): \(launcherError)")
@@ -430,7 +421,8 @@ package final class CLIProcessRunner {
                             return result
                         } onCancel: {
                             spawned.stdin?.closeFile()
-                            terminateChild(spawned, sendSigterm: true)
+                            // Let the waiter own cancellation signalling and reaping. It may
+                            // already have reaped the child before this handler runs.
                             waitTask.cancel()
                         }
                     } else {
@@ -476,6 +468,9 @@ package final class CLIProcessRunner {
         onProcessStarted: (@Sendable (pid_t) async -> Void)? = nil,
         onProcessTerminated: (@Sendable (pid_t) async -> Void)? = nil
     ) async throws -> AsyncThrowingStream<StreamEvent, Error> {
+        if config.processPurpose == .provider {
+            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: config.allowsProviderProcessLaunchForTesting)
+        }
         // Hold the permit for the entire lifetime of the child process
         ProcessDiagnostics.log("🔵 [GATE] Acquiring gate...")
         guard await gate.acquire() else { throw CancellationError() }
@@ -577,7 +572,9 @@ package final class CLIProcessRunner {
                 command: resolvedCommand,
                 arguments: arguments,
                 environment: environment,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                purpose: config.processPurpose,
+                allowsProviderProcessLaunchForTesting: config.allowsProviderProcessLaunchForTesting
             )
         } catch let launcherError as ProcessLauncherError {
             log("Failed to spawn \(resolvedCommand): \(launcherError)")

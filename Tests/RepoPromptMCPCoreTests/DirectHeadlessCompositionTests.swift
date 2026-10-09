@@ -8,6 +8,22 @@ import RepoPromptTestSupport
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
+    func testDirectProviderProcessRefusesBeforeSpawnAndOrdinaryToolStillRuns() async throws {
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: marker) }
+        do {
+            _ = try await DirectProcess.run(
+                "/bin/sh", arguments: ["-c", "touch \"$1\"", "fixture", marker.path], isProvider: true
+            )
+            XCTFail("Direct provider processes must fail closed under XCTest")
+        } catch {
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        let output = try await DirectProcess.run("/usr/bin/printf", arguments: ["tool-ok"], isProvider: false)
+        XCTAssertEqual(output, "tool-ok")
+    }
+
     func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
         let root = try RepoRoot.url()
         let snapshotURL = root.appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")
@@ -64,6 +80,21 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             XCTAssertEqual(itemProperties["value"]?.objectValue?["type"], .string("string"))
             XCTAssertTrue(definition.description.contains("model_parameters"), toolName)
         }
+    }
+
+    func testCanonicalAskOracleAdvertisesImageAttachments() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "ask_oracle"))
+        XCTAssertTrue(definition.description.contains("`images`"), "ask_oracle description must document images")
+        let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        let images = try XCTUnwrap(properties["images"]?.objectValue)
+        XCTAssertEqual(images["type"], .string("array"))
+        XCTAssertEqual(images["maxItems"], .int(OracleImageAttachmentLimits.production.maxCount))
+        let items = try XCTUnwrap(images["items"]?.objectValue)
+        XCTAssertEqual(items["required"], .array([.string("path")]))
+        let itemProperties = try XCTUnwrap(items["properties"]?.objectValue)
+        XCTAssertEqual(itemProperties["path"]?.objectValue?["type"], .string("string"))
+        XCTAssertEqual(itemProperties["title"]?.objectValue?["type"], .string("string"))
     }
 
     func testHeadlessLaunchRejectsUnsupportedModelParametersBeforeProviderStartup() throws {

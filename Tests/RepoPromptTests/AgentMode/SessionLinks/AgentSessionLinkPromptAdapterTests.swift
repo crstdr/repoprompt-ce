@@ -1,5 +1,7 @@
 import Foundation
+import MCP
 import RepoPromptSecureStorage
+import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -314,6 +316,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let viewModel: AgentModeViewModel
         let coordinator: CodexAgentModeCoordinator
         let controller: MonitorFakeCodexController
+        let dispatches: MonitorCodexDispatchRecorder
         let session: AgentModeViewModel.TabSession
         let sessionID: UUID
         let tabID: UUID
@@ -321,16 +324,29 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let authRecovery: MonitorStubCodexAuthRecovery
         /// Retained: the view model holds its workspace manager weakly.
         let workspaceManager: WorkspaceManagerViewModel
+
+        var startedTurns: [String] {
+            dispatches.startedTurns
+        }
     }
 
     private func makeFixture() throws -> Fixture {
-        let controller = MonitorFakeCodexController()
+        let dispatches = MonitorCodexDispatchRecorder()
+        let controller = MonitorFakeCodexController(dispatches: dispatches)
+        var initialController: MonitorFakeCodexController? = controller
+        var startOrResumeHook: (@Sendable () async -> Void)?
         let authRecovery = MonitorStubCodexAuthRecovery()
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.temporaryDirectory.path,
-            codexControllerFactory: { _, _, _, _, _, _ in controller },
+            codexControllerFactory: { _, _, _, _, _, _ in
+                // Controllers are single-use: shutdown permanently finishes their event stream.
+                let next = initialController ?? MonitorFakeCodexController(dispatches: dispatches)
+                initialController = nil
+                next.setStartOrResumeHook(startOrResumeHook)
+                return next
+            },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true },
             testCodexManagedAuthRecovery: authRecovery
@@ -353,13 +369,15 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             tabID: tabID
         )
         inventories.append(inventory)
-        controller.setStartOrResumeHook { [weak inventory] in
+        startOrResumeHook = { [weak inventory] in
             await inventory?.republishCurrentCodexCatalog()
         }
+        controller.setStartOrResumeHook(startOrResumeHook)
         return Fixture(
             viewModel: viewModel,
             coordinator: viewModel.test_codexCoordinator,
             controller: controller,
+            dispatches: dispatches,
             session: session,
             sessionID: sessionID,
             tabID: tabID,
@@ -367,6 +385,21 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             authRecovery: authRecovery,
             workspaceManager: workspaceManager
         )
+    }
+
+    private func assertReplayUsedFreshController(
+        _ fixture: Fixture,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let replacement = try XCTUnwrap(
+            fixture.session.codexController as? MonitorFakeCodexController,
+            file: file,
+            line: line
+        )
+        XCTAssertFalse(replacement === fixture.controller, file: file, line: line)
+        XCTAssertEqual(fixture.controller.startedTurns.count, 1, file: file, line: line)
+        XCTAssertEqual(replacement.startedTurns.count, 1, file: file, line: line)
     }
 
     private func prepareAutoWake(_ fixture: Fixture) throws -> UUID {
@@ -430,7 +463,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         return wakeID
     }
 
-    func testManualCatalogReadinessTimeoutRestoresExactOptimisticSubmission() async throws {
+    func testManualMissingRouteRestoresExactOptimisticSubmission() async throws {
         #if DEBUG
             let fixture = try makeFixture()
             fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabID)
@@ -487,6 +520,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 hasAgentSessionLink: nil
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(unready, to: endpoint)
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in nil }
 
             let existing = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
             fixture.session.appendItem(existing)
@@ -502,7 +536,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             )
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
 
-            try await AsyncTestWait.waitUntil("manual readiness timeout rollback") {
+            try await AsyncTestWait.waitUntil("manual route refusal rollback") {
                 await MainActor.run {
                     fixture.viewModel.draftRestorationEvent?.text == rawDraft
                 }
@@ -510,7 +544,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             XCTAssertEqual(fixture.session.items.filter { $0.kind == .user }.map(\.id), [existing.id])
             XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), rawDraft)
             XCTAssertTrue(
-                fixture.viewModel.draftRestorationEvent?.message.contains("catalog readiness timed out") == true,
+                fixture.viewModel.draftRestorationEvent?.message.contains("route qualification was unavailable") == true,
                 "unexpected restoration message: \(fixture.viewModel.draftRestorationEvent?.message ?? "nil")"
             )
             XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
@@ -521,7 +555,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         #endif
     }
 
-    func testManualParkedCatalogWaiterSupersessionRestoresExactOptimisticSubmission() async throws {
+    func testManualRouteQualificationSupersessionRestoresExactOptimisticSubmission() async throws {
         #if DEBUG
             let fixture = try makeFixture()
             fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabID)
@@ -613,12 +647,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
 
             await authorityGate.waitUntilEntered()
-            await manager.cleanupRunRoutingState(for: runID, windowID: endpoint.windowID)
+            // Rebind the process run while qualification is suspended. No catalog event is needed.
+            fixture.session.installRunID(UUID())
             await authorityGate.open()
-            try await AsyncTestWait.waitUntil("catalog waiter to park") {
-                await manager.debugHasRunCatalogState(for: runID)
-            }
-            await manager.cleanupRunRoutingState(for: runID, windowID: endpoint.windowID)
 
             try await AsyncTestWait.waitUntil("manual readiness supersession rollback") {
                 await MainActor.run {
@@ -632,12 +663,13 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             XCTAssertEqual(fixture.session.selectedWorkflow, workflow)
             XCTAssertEqual(fixture.viewModel.selectedWorkflow, workflow)
             XCTAssertTrue(
-                fixture.viewModel.draftRestorationEvent?.message.contains("catalog readiness was superseded") == true,
+                fixture.viewModel.draftRestorationEvent?.message.contains("route qualification was superseded") == true,
                 "unexpected restoration message: \(fixture.viewModel.draftRestorationEvent?.message ?? "nil")"
             )
-            XCTAssertTrue(fixture.controller.startedTurns.isEmpty)
+            XCTAssertTrue(fixture.startedTurns.isEmpty)
             XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
             XCTAssertNil(fixture.session.codexPendingAuthRetryTurn)
+            await manager.cleanupRunRoutingState(for: runID, windowID: endpoint.windowID)
         #else
             throw XCTSkip("Catalog observation diagnostics require DEBUG helpers.")
         #endif
@@ -694,12 +726,12 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 routeIsCurrent && candidate == expectedRouteToken && requestedTabID == fixture.tabID
             }
             let afterReadinessGate = CatalogAuthorityGate()
-            fixture.viewModel.test_agentSessionLinkAfterProviderInputCatalogReadiness = {
+            fixture.viewModel.test_agentSessionLinkAfterProviderInputRouteReadiness = {
                 _ = await afterReadinessGate.requirement()
             }
             addTeardownBlock { @MainActor in
                 await afterReadinessGate.open()
-                fixture.viewModel.test_agentSessionLinkAfterProviderInputCatalogReadiness = nil
+                fixture.viewModel.test_agentSessionLinkAfterProviderInputRouteReadiness = nil
             }
 
             let existing = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
@@ -728,10 +760,10 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             XCTAssertEqual(fixture.session.items.filter { $0.kind == .user }.map(\.id), [existing.id])
             XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), rawDraft)
             XCTAssertTrue(
-                fixture.viewModel.draftRestorationEvent?.message.contains("catalog route changed") == true,
+                fixture.viewModel.draftRestorationEvent?.message.contains("MCP route changed") == true,
                 "unexpected restoration message: \(fixture.viewModel.draftRestorationEvent?.message ?? "nil")"
             )
-            XCTAssertTrue(fixture.controller.startedTurns.isEmpty)
+            XCTAssertTrue(fixture.startedTurns.isEmpty)
             XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
             XCTAssertNil(fixture.session.codexPendingAuthRetryTurn)
         #else
@@ -763,7 +795,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 return XCTFail("Expected a definite fresh-start pre-dispatch rejection")
             }
             XCTAssertTrue(message.contains("Your message was restored"))
-            XCTAssertTrue(fixture.controller.startedTurns.isEmpty)
+            XCTAssertTrue(fixture.startedTurns.isEmpty)
             XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
             XCTAssertNil(fixture.session.codexPendingAuthRetryTurn)
             XCTAssertEqual(fixture.session.runState, .failed)
@@ -833,7 +865,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             selfCompactDispatchID: dispatchID
         )
         XCTAssertEqual(outcome, .sent)
-        XCTAssertEqual(fixture.controller.startedTurns.last, AgentSelfCompactNoteEnvelope.frame(note))
+        XCTAssertEqual(fixture.startedTurns.last, AgentSelfCompactNoteEnvelope.frame(note))
         XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
         XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .noteAccepted)
         XCTAssertEqual(fixture.session.oversight.waitingOn, declaration)
@@ -842,7 +874,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         XCTAssertEqual(fixture.session.draftText, "unsent draft")
         XCTAssertEqual(fixture.session.selectedWorkflow, workflow)
         XCTAssertEqual(fixture.session.pendingImageAttachments, [attachment])
-        XCTAssertFalse(fixture.controller.startedTurns.contains { $0.contains("keep staged handoff") })
+        XCTAssertFalse(fixture.startedTurns.contains { $0.contains("keep staged handoff") })
     }
 
     func testInitialStartCarriesExactlyOneSupplementThenGoesQuiet() async throws {
@@ -856,7 +888,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             attachments: []
         )
 
-        let first = try XCTUnwrap(fixture.controller.startedTurns.first)
+        let first = try XCTUnwrap(fixture.startedTurns.first)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(first, userContent: "first turn")
         XCTAssertTrue(
             first.contains("mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__agent_session_link"),
@@ -871,7 +903,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             attachments: []
         )
 
-        let second = try XCTUnwrap(fixture.controller.startedTurns.last)
+        let second = try XCTUnwrap(fixture.startedTurns.last)
         MonitorSupplementAssertions.assertCarriesNoSupplement(second)
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
@@ -895,7 +927,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             attachments: []
         )
 
-        let second = try XCTUnwrap(fixture.controller.startedTurns.last)
+        let second = try XCTUnwrap(fixture.startedTurns.last)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(second, userContent: "turn two")
         XCTAssertTrue(second.contains("count=\"2\""))
     }
@@ -918,7 +950,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             text: "after revoke",
             attachments: []
         )
-        let closing = try XCTUnwrap(fixture.controller.startedTurns.last)
+        let closing = try XCTUnwrap(fixture.startedTurns.last)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(closing, userContent: "after revoke")
         XCTAssertTrue(closing.contains("status=\"ended\""))
 
@@ -930,7 +962,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             attachments: []
         )
         try MonitorSupplementAssertions.assertCarriesNoSupplement(
-            XCTUnwrap(fixture.controller.startedTurns.last)
+            XCTUnwrap(fixture.startedTurns.last)
         )
     }
 
@@ -1023,6 +1055,18 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
         fixture.controller.steerFailure = nil
         await fixture.inventory.publishCodex(revision: 2, targetCount: 3)
+        let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        let catalog = try XCTUnwrap(fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint])
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+            .init(
+                runID: catalog.runID,
+                routeToken: catalog.routeToken,
+                projectionRevision: catalog.projectionRevision + 1,
+                hasAgentSessionLink: false,
+                hasAnyActiveLink: true
+            ),
+            to: endpoint
+        )
         // Only now may the head drain, so "drain time" provably means "after revision 2".
         fixture.controller.threadRuntimeStatus = .idle
 
@@ -1038,12 +1082,12 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         // decided whether the suite passed, which is what made this read as a timing flake.
         try await AsyncTestWait.waitUntil("the queued Codex fallback entry to dispatch", timeout: 5) {
             await MainActor.run {
-                fixture.controller.startedTurns.contains { $0.hasPrefix("queued instruction") }
+                fixture.startedTurns.contains { $0.hasPrefix("queued instruction") }
             }
         }
 
         let dispatched = try XCTUnwrap(
-            fixture.controller.startedTurns.last { $0.hasPrefix("queued instruction") }
+            fixture.startedTurns.last { $0.hasPrefix("queued instruction") }
         )
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(
             dispatched,
@@ -1053,7 +1097,42 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             dispatched.contains("count=\"3\""),
             "a queued entry must render membership at drain time, not at enqueue time"
         )
+        XCTAssertEqual(fixture.startedTurns.count(where: { $0.hasPrefix("queued instruction") }), 1)
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
+    }
+
+    func testQueuedFallbackMissingRouteRefusesWithoutStartingAnotherTurn() async throws {
+        #if DEBUG
+            let fixture = try makeFixture()
+            await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+            fixture.session.beginRunAttempt(source: "test.codex.fallback.route-refusal")
+            _ = await fixture.coordinator.sendCodexNativeMessage(
+                session: fixture.session, text: "seed turn", attachments: []
+            )
+            await fixture.coordinator.test_handleCodexNativeEvent(
+                .turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller
+            )
+            fixture.controller.threadRuntimeStatus = .active(activeFlags: ["turn"])
+            fixture.controller.steerFailure = .noActiveTurn(
+                CodexAppServerClient.RequestFailure(method: "turn/steer", code: nil, message: "no active turn", data: nil)
+            )
+            let outcome = await fixture.coordinator.sendCodexNativeMessage(
+                session: fixture.session, text: "queued route refusal", attachments: []
+            )
+            guard case .queuedFallback = outcome else { return XCTFail("expected fallback, got \(outcome)") }
+            fixture.controller.steerFailure = nil
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in nil }
+            fixture.controller.threadRuntimeStatus = .idle
+            try await AsyncTestWait.waitUntil("the fallback route refusal to settle") {
+                await MainActor.run {
+                    fixture.session.codexFallbackQueue.isEmpty && fixture.session.codexFallbackDispatchInFlight == nil
+                }
+            }
+            XCTAssertEqual(fixture.startedTurns.count, 1, "only the seed physically dispatched")
+            XCTAssertFalse(fixture.startedTurns.contains { $0.hasPrefix("queued route refusal") })
+        #else
+            throw XCTSkip("Route authority seam requires DEBUG helpers.")
+        #endif
     }
 
     // MARK: Auto-wake dispatch identity
@@ -1182,7 +1261,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             attachments: []
         )
 
-        let original = try XCTUnwrap(fixture.controller.startedTurns.last)
+        let original = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertFalse(original.isEmpty)
         XCTAssertEqual(MonitorSupplementAssertions.fragmentCount(in: original), 1)
         XCTAssertNil(fixture.session.oversight.pendingAutoWake, "the accepted wake must be settled")
@@ -1203,8 +1282,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             sourceController: fixture.controller
         )
 
-        XCTAssertEqual(fixture.controller.startedTurns.count, 2)
-        let replay = try XCTUnwrap(fixture.controller.startedTurns.last)
+        XCTAssertEqual(fixture.startedTurns.count, 2)
+        let replay = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertFalse(replay.isEmpty)
         XCTAssertEqual(replay, original, "the settled wake must replay its exact accepted envelope")
     }
@@ -1219,7 +1298,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             text: "",
             attachments: []
         )
-        XCTAssertEqual(fixture.controller.startedTurns.count, 1)
+        XCTAssertEqual(fixture.startedTurns.count, 1)
 
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
@@ -1243,7 +1322,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let didRefresh = await fixture.authRecovery.didRefresh
         XCTAssertTrue(didRefresh, "managed-auth recovery must reach its replay fence")
         XCTAssertEqual(
-            fixture.controller.startedTurns.count,
+            fixture.startedTurns.count,
             1,
             "invalid AutoWake authority must not make a second provider call"
         )
@@ -1258,7 +1337,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             text: "auth turn",
             attachments: []
         )
-        let original = try XCTUnwrap(fixture.controller.startedTurns.last)
+        let original = try XCTUnwrap(fixture.startedTurns.last)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(original, userContent: "auth turn")
 
         // The provider accepted the dispatch, then failed it with an auth-classified error. Managed
@@ -1278,8 +1357,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
         let didRefresh = await fixture.authRecovery.didRefresh
         XCTAssertTrue(didRefresh, "the recovery path must have run")
-        XCTAssertEqual(fixture.controller.startedTurns.count, 2, "the turn must have been replayed")
-        let replay = try XCTUnwrap(fixture.controller.startedTurns.last)
+        XCTAssertEqual(fixture.startedTurns.count, 2, "the turn must have been replayed")
+        try assertReplayUsedFreshController(fixture)
+        let replay = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertEqual(replay, original, "the replay must be byte-identical to the accepted dispatch")
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(replay, userContent: "auth turn")
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
@@ -1295,7 +1375,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             attachments: []
         )
         try MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(
-            XCTUnwrap(fixture.controller.startedTurns.last),
+            XCTUnwrap(fixture.startedTurns.last),
             userContent: "withheld turn"
         )
 
@@ -1318,8 +1398,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             sourceController: fixture.controller
         )
 
-        XCTAssertEqual(fixture.controller.startedTurns.count, 2, "the turn must have been replayed")
-        let replay = try XCTUnwrap(fixture.controller.startedTurns.last)
+        XCTAssertEqual(fixture.startedTurns.count, 2, "the turn must have been replayed")
+        let replay = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertEqual(replay, "withheld turn")
         MonitorSupplementAssertions.assertCarriesNoSupplement(replay)
 
@@ -1339,7 +1419,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             text: "later turn",
             attachments: []
         )
-        let later = try XCTUnwrap(fixture.controller.startedTurns.last)
+        let later = try XCTUnwrap(fixture.startedTurns.last)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(later, userContent: "later turn")
         XCTAssertTrue(later.contains("status=\"ended\""), "the closing notice must remain owed")
     }
@@ -1353,7 +1433,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             text: "issue turn",
             attachments: []
         )
-        let original = try XCTUnwrap(fixture.controller.startedTurns.last)
+        let original = try XCTUnwrap(fixture.startedTurns.last)
 
         await fixture.coordinator.test_handleCodexNativeEvent(
             .serverRequestIssue(.init(
@@ -1368,10 +1448,11 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
         let didRefresh = await fixture.authRecovery.didRefresh
         XCTAssertTrue(didRefresh)
-        XCTAssertEqual(fixture.controller.startedTurns.count, 2)
-        XCTAssertEqual(try XCTUnwrap(fixture.controller.startedTurns.last), original)
+        XCTAssertEqual(fixture.startedTurns.count, 2)
+        try assertReplayUsedFreshController(fixture)
+        XCTAssertEqual(try XCTUnwrap(fixture.startedTurns.last), original)
         try MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(
-            XCTUnwrap(fixture.controller.startedTurns.last),
+            XCTUnwrap(fixture.startedTurns.last),
             userContent: "issue turn"
         )
     }
@@ -1385,7 +1466,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             text: "churn turn",
             attachments: []
         )
-        XCTAssertTrue(try XCTUnwrap(fixture.controller.startedTurns.last).contains("count=\"1\""))
+        XCTAssertTrue(try XCTUnwrap(fixture.startedTurns.last).contains("count=\"1\""))
 
         // A monitor is added while the failed turn is being recovered.
         await fixture.inventory.publishCodex(revision: 2, targetCount: 3)
@@ -1401,7 +1482,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             sourceController: fixture.controller
         )
 
-        let replay = try XCTUnwrap(fixture.controller.startedTurns.last)
+        XCTAssertEqual(fixture.startedTurns.count, 2)
+        try assertReplayUsedFreshController(fixture)
+        let replay = try XCTUnwrap(fixture.startedTurns.last)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(replay, userContent: "churn turn")
         XCTAssertTrue(replay.contains("count=\"3\""), "the replay must ship the current membership")
 
@@ -1414,7 +1497,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             attachments: []
         )
         try MonitorSupplementAssertions.assertCarriesNoSupplement(
-            XCTUnwrap(fixture.controller.startedTurns.last)
+            XCTUnwrap(fixture.startedTurns.last)
         )
     }
 
@@ -1440,8 +1523,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             text: "",
             attachments: []
         )
-        let accepted = try XCTUnwrap(fixture.controller.startedTurns.last)
-        XCTAssertEqual(fixture.controller.startedTurns.count, 1)
+        let accepted = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertEqual(fixture.startedTurns.count, 1)
         XCTAssertNil(fixture.session.oversight.pendingAutoWake, "the accepted wake must be settled")
         XCTAssertEqual(
             fixture.viewModel.agentSessionLinkPromptClaimStore
@@ -1476,7 +1559,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let didRefresh = await fixture.authRecovery.didRefresh
         XCTAssertTrue(didRefresh, "recovery must reach the replay fence rather than stopping before it")
         XCTAssertEqual(
-            fixture.controller.startedTurns,
+            fixture.startedTurns,
             [accepted],
             "a malformed reserved-family identity must make no second provider call and ship no raw text"
         )
@@ -1527,11 +1610,13 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let inventory: MonitorInventoryPublisher
         /// Retained: the view model holds its workspace manager weakly.
         let workspaceManager: WorkspaceManagerViewModel
+        let mcpServer: MCPServerViewModel?
     }
 
     private func makeFixture(
         agent: AgentProviderKind,
-        claudeController: MonitorFakeNativeController? = nil
+        claudeController: MonitorFakeNativeController? = nil,
+        withMCPServer: Bool = false
     ) throws -> Fixture {
         let tabID = UUID()
         // A real run resolves its workspace before it reaches a provider, so the runner-level suites
@@ -1540,8 +1625,9 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let keyManager = KeyManager(
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
         )
+        let aiQueriesService = AIQueriesService(keyManager: keyManager)
         let apiSettings = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            aiQueriesService: aiQueriesService,
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )
@@ -1566,17 +1652,47 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         manager.workspaces = [workspace]
         manager.activeWorkspace = workspace
 
+        let mcpServer: MCPServerViewModel? = if withMCPServer {
+            MCPServerViewModel(
+                service: MCPService(
+                    hostBootstrapOperation: {},
+                    controllerStartOperation: {},
+                    controllerFullShutdownOperation: {}
+                ),
+                promptVM: prompt,
+                oracleVM: OracleViewModel(
+                    aiQueriesService: aiQueriesService,
+                    promptViewModel: prompt,
+                    workspaceManager: manager,
+                    chatData: ChatDataService()
+                ),
+                workspaceManager: manager,
+                windowID: 1,
+                workspaceSearch: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                    throw MCPError.internalError("search is not used by route removal tests")
+                },
+                ensureGitDataRootLoaded: { _, _ in
+                    throw MCPError.internalError("Git-data loading is not used by route removal tests")
+                }
+            )
+        } else {
+            nil
+        }
+
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 LifecycleNoopCodexController(recorder: LifecycleRecorder())
             },
-            claudeControllerFactory: claudeController.map { controller in
-                { _, _, _, _ in controller }
+            // A session may recycle a pre-seeded fake when its launch metadata is absent.
+            // Never let that replacement fall through to the real provider factory.
+            claudeControllerFactory: { _, _, _, _ in
+                claudeController ?? MonitorFakeNativeController()
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
-            mcpServerEnabler: { true }
+            mcpServerEnabler: { true },
+            testMCPServer: mcpServer
         )
         retained.append(viewModel)
         viewModel.workspaceManager = manager
@@ -1599,7 +1715,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 observerSessionID: sessionID,
                 tabID: tabID
             ),
-            workspaceManager: manager
+            workspaceManager: manager,
+            mcpServer: mcpServer
         )
     }
 
@@ -1629,11 +1746,15 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let controller = MonitorFakeNativeController()
         let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 2)
-        fixture.session.claudeController = controller
         let intent = try claudeRunIntent(
             for: fixture.session,
             source: "test.claude.native.supplement"
         )
+        let startup = await fixture.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(
+            session: fixture.session,
+            intent: intent
+        )
+        XCTAssertEqual(startup, .ready)
 
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
@@ -1663,15 +1784,255 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         try MonitorSupplementAssertions.assertCarriesNoSupplement(XCTUnwrap(after.last))
     }
 
+    func testClaudeNativeStaleCatalogSendsOnceWithoutRecyclingController() async throws {
+        let controller = MonitorFakeNativeController()
+        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        fixture.inventory.publish(revision: 0, targetCount: 0)
+        fixture.session.installRunID(UUID())
+        fixture.session.claudeController = controller
+        let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.stale-catalog")
+        // Establish ordinary launch settings before measuring catalog-triggered recycling.
+        let seed = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: fixture.session, text: "seed", attachments: [],
+            intent: intent, allowsCatalogRouteControllerRecovery: false
+        )
+        XCTAssertEqual(seed, .sent)
+        let initialShutdownCount = await controller.shutdownCount
+        fixture.inventory.publish(revision: 1, targetCount: 1)
+        let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        let projection = try XCTUnwrap(fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint])
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+            .init(
+                runID: projection.runID,
+                routeToken: projection.routeToken,
+                projectionRevision: projection.projectionRevision + 1,
+                hasAgentSessionLink: false,
+                hasAnyActiveLink: true
+            ),
+            to: endpoint
+        )
+        let outcome = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: fixture.session, text: "oversight despite stale tools", attachments: [],
+            intent: intent, allowsCatalogRouteControllerRecovery: true
+        )
+        XCTAssertEqual(outcome, .sent)
+        let sent = await controller.sentMessages
+        XCTAssertEqual(sent.count, 2)
+        try MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(
+            XCTUnwrap(sent.last), userContent: "oversight despite stale tools"
+        )
+        let shutdownCount = await controller.shutdownCount
+        XCTAssertEqual(shutdownCount, initialShutdownCount)
+        XCTAssertTrue(fixture.session.claudeController === controller)
+        let next = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+            "next turn", session: fixture.session,
+            dispatchID: .claudeNativeSend(projection.runID)
+        )
+        MonitorSupplementAssertions.assertCarriesNoSupplement(next.text)
+    }
+
+    func testClaudeConnectionRemovalDuringConfigurationRefusesAndPreservesMessage() async throws {
+        try await assertClaudeClosedConnectionDuringConfiguration(pauseTermination: false)
+    }
+
+    func testClaudeTerminalConnectionDuringConfigurationRefusesAndPreservesMessage() async throws {
+        try await assertClaudeClosedConnectionDuringConfiguration(pauseTermination: true)
+    }
+
+    private func assertClaudeClosedConnectionDuringConfiguration(pauseTermination: Bool) async throws {
+        #if DEBUG
+            let controller = MonitorFakeNativeController()
+            let fixture = try makeFixture(agent: .claudeCode, claudeController: controller, withMCPServer: true)
+            let server = try XCTUnwrap(fixture.mcpServer)
+            fixture.inventory.publish(revision: 0, targetCount: 0)
+            fixture.session.installRunID(UUID())
+            fixture.session.claudeController = controller
+            let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.removing-route")
+            let seed = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "seed", attachments: [],
+                intent: intent, allowsCatalogRouteControllerRecovery: false
+            )
+            XCTAssertEqual(seed, .sent)
+            fixture.inventory.publish(revision: 1, targetCount: 1)
+            let runID = try XCTUnwrap(fixture.session.runID)
+            let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+            let connectionID = UUID()
+            let manager = ServerNetworkManager.shared
+            let transportBaseline = await manager.debugTransportState()
+            // Direct admission starts the shared manager even without a listener. Removing
+            // only the connection leaves that owner active for later routed-runtime tests.
+            // Register first so the gate/connection teardown below runs before restoration.
+            addTeardownBlock {
+                if !transportBaseline.isRunning { await manager.stop() }
+                await manager.setEnabled(transportBaseline.isEnabled)
+                let restored = await manager.debugTransportState()
+                XCTAssertEqual(restored, transportBaseline, "Fixture must restore its shared transport ownership")
+            }
+            let removalGate = CatalogAuthorityGate()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: connectionID,
+                connection: MonitorRemovalConnection(gate: removalGate, pauseTermination: pauseTermination)
+            )
+            let state = await manager.debugDirectAdmissionStateForTesting(connectionID: connectionID)
+            let token = try AgentSessionLinkRunCatalogRouteToken(
+                runID: runID, observerEndpoint: endpoint, connectionID: connectionID,
+                routingAuthorityGeneration: 1,
+                connectionLifecycleGeneration: XCTUnwrap(state.connectionLifecycleGeneration)
+            )
+            try server.bindTabForConnection(
+                connectionID: connectionID, clientName: nil, tabID: fixture.tabID,
+                workspaceID: XCTUnwrap(fixture.workspaceManager.activeWorkspaceID),
+                windowID: endpoint.windowID, runID: runID
+            )
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in token }
+            // Exercise the production final fence, not a simulated route-current boolean.
+            fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in
+                server.hasCurrentRunCatalogRouteToken(candidate, expectedTabID: tabID)
+            }
+            XCTAssertTrue(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            let configurationGate = CatalogAuthorityGate()
+            await controller.setConfigurationGate(configurationGate)
+            addTeardownBlock { @MainActor in
+                await configurationGate.open()
+                await removalGate.open()
+                await manager.debugRemoveConnection(connectionID)
+            }
+            let confirmed = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
+            fixture.session.appendItem(confirmed)
+            let rawDraft = "preserve removing-route input"
+            fixture.viewModel.storeDraftText(for: fixture.tabID, rawDraft)
+            XCTAssertEqual(
+                fixture.viewModel.submitUserTurn(
+                    text: rawDraft.trimmingCharacters(in: .whitespacesAndNewlines),
+                    tabID: fixture.tabID, rawDraftText: rawDraft
+                ),
+                .submitted
+            )
+            fixture.viewModel.storeDraftText(for: fixture.tabID, "")
+            await configurationGate.waitUntilEntered()
+            let removal = Task {
+                if pauseTermination {
+                    await manager.terminateConnection(connectionID, reason: .runCompleted)
+                } else {
+                    await manager.removeConnection(connectionID)
+                }
+            }
+            // Hold either terminal commitment BEFORE removal, or removal BEFORE mapping cleanup.
+            await removalGate.waitUntilEntered()
+            let removalHasBegun = await manager.debugHasConnectionRemovalOperation(for: connectionID)
+            XCTAssertEqual(removalHasBegun, !pauseTermination)
+            XCTAssertTrue(server.hasCurrentRunRouteMapping(
+                runID: runID, connectionID: connectionID, expectedTabID: fixture.tabID
+            ), "retained mappings must reproduce the unsafe cleanup interval")
+            XCTAssertFalse(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            await configurationGate.open()
+            try await AsyncTestWait.waitUntil("removing-route refusal or physical send") {
+                let refused = await MainActor.run {
+                    fixture.session.items.contains {
+                        $0.kind == .error && $0.text.contains("[route:configuration-fence]")
+                    }
+                }
+                if refused { return true }
+                return await controller.sentCount > 1
+            }
+            let sent = await controller.sentMessages
+            XCTAssertEqual(sent, ["seed"], "removal must cause definite no-call, not an uncertain write")
+            XCTAssertEqual(
+                fixture.session.items.filter { $0.kind == .user }.map(\.text),
+                [confirmed.text, rawDraft],
+                "native refusal preserves the unsent message in the transcript for retry"
+            )
+            XCTAssertTrue(fixture.session.items.contains {
+                $0.kind == .error && $0.text.contains("No provider message was sent")
+            })
+            XCTAssertNil(fixture.viewModel.agentSessionLinkPromptClaimStore.test_lastAcceptedRevision(
+                observerSessionID: fixture.sessionID
+            ))
+            await removalGate.open()
+            await removal.value
+        #else
+            throw XCTSkip("Connection lifecycle diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testClaudeFirstLinkDuringConfigurationRequiresCurrentRoute() async throws {
+        let controller = MonitorFakeNativeController()
+        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        fixture.inventory.publish(revision: 0, targetCount: 0)
+        fixture.session.installRunID(UUID())
+        fixture.session.claudeController = controller
+        let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.late-link")
+        let gate = CatalogAuthorityGate()
+        await controller.setConfigurationGate(gate)
+        addTeardownBlock { await gate.open() }
+        let send = Task { @MainActor in
+            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "late first link", attachments: [],
+                intent: intent, allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await gate.waitUntilEntered()
+        fixture.inventory.publish(revision: 1, targetCount: 1)
+        fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in nil }
+        await gate.open()
+        let outcome = await send.value
+        guard case .failed = outcome else { return XCTFail("Expected a real route refusal") }
+        let sent = await controller.sentMessages
+        XCTAssertTrue(sent.isEmpty, "a stale link-less qualification cannot send a new supplement")
+    }
+
+    func testClaudeFirstLinkDuringConfigurationRequalifiesWithoutCatalogRefresh() async throws {
+        let controller = MonitorFakeNativeController()
+        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        fixture.inventory.publish(revision: 0, targetCount: 0)
+        fixture.session.installRunID(UUID())
+        fixture.session.claudeController = controller
+        let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.late-link.valid")
+        let gate = CatalogAuthorityGate()
+        await controller.setConfigurationGate(gate)
+        addTeardownBlock { await gate.open() }
+        let send = Task { @MainActor in
+            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "late linked turn", attachments: [],
+                intent: intent, allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await gate.waitUntilEntered()
+        fixture.inventory.publish(revision: 1, targetCount: 1)
+        let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        let projection = try XCTUnwrap(fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint])
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+            .init(
+                runID: projection.runID,
+                routeToken: projection.routeToken,
+                projectionRevision: projection.projectionRevision + 1,
+                hasAgentSessionLink: false,
+                hasAnyActiveLink: true
+            ), to: endpoint
+        )
+        await gate.open()
+        let outcome = await send.value
+        XCTAssertEqual(outcome, .sent)
+        let sent = await controller.sentMessages
+        XCTAssertEqual(sent.count, 1)
+        try MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(
+            XCTUnwrap(sent.first), userContent: "late linked turn"
+        )
+    }
+
     func testClaudeNativeRevocationDeliversOneClosingNotice() async throws {
         let controller = MonitorFakeNativeController()
         let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 1)
-        fixture.session.claudeController = controller
         let intent = try claudeRunIntent(
             for: fixture.session,
             source: "test.claude.native.revocation"
         )
+        let startup = await fixture.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(
+            session: fixture.session,
+            intent: intent
+        )
+        XCTAssertEqual(startup, .ready)
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "linked",
@@ -1695,16 +2056,42 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         XCTAssertTrue(closing.contains("status=\"ended\""))
     }
 
-    func testClaudeNativeLostCatalogRouteRecyclesControllerBeforeDispatch() async throws {
-        try await assertClaudeNativeLostCatalogRouteRecovery(
-            readiness: [.timedOut, .ready],
+    func testClaudeNativeLosingPreseededFakeRefusesRealProviderReplacement() async throws {
+        let fake = MonitorFakeNativeController()
+        // Intentionally use the production factory to reproduce a fixture that loses its fake.
+        let coordinator = ClaudeAgentModeCoordinator(windowID: 1, workspacePathProvider: { _ in nil })
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.installRunID(UUID())
+        session.claudeController = fake
+        let intent = try claudeRunIntent(for: session, source: "test.claude.lost-fake-refusal")
+
+        let outcome = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
+
+        guard case let .failed(message) = outcome else {
+            return XCTFail("Losing a fake must refuse real provider launch, got \(outcome)")
+        }
+        XCTAssertTrue(message.contains("Provider process launch refused under XCTest"), message)
+        let shutdowns = await fake.shutdownCount
+        let sends = await fake.sentCount
+        XCTAssertEqual(shutdowns, 1, "Missing launch metadata must reproduce fake retirement")
+        XCTAssertEqual(sends, 0)
+        XCTAssertFalse(session.claudeController === fake)
+        await session.claudeController?.shutdown()
+    }
+
+    func testClaudeNativeMissingRouteRecoversBeforeDispatch() async throws {
+        try await assertClaudeNativeLostRouteRecovery(
+            readiness: [false, true],
             finalRoutePresence: [true]
         )
     }
 
-    func testClaudeNativeFinalCatalogFenceLossRecyclesControllerBeforeDispatch() async throws {
-        try await assertClaudeNativeLostCatalogRouteRecovery(
-            readiness: [.ready, .ready],
+    func testClaudeNativeFinalRouteFenceLossRecoversBeforeDispatch() async throws {
+        try await assertClaudeNativeLostRouteRecovery(
+            readiness: [true, true],
             finalRoutePresence: [false, true]
         )
     }
@@ -1741,8 +2128,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
                 prependPendingHandoff: { text, _ in text },
-                ensureAgentSessionLinkProviderInputCatalogReady: { _ in .timedOut },
-                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in false },
+                qualifyAgentSessionLinkProviderInputRoute: { _ in .unavailable },
+                hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
                 decorateAgentSessionLinkPrompt: { text, _, _ in
                     .init(text: text, claim: nil, mustAbortDispatch: false)
                 },
@@ -1782,8 +2169,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         XCTAssertTrue(session.claudeController === controller)
     }
 
-    private func assertClaudeNativeLostCatalogRouteRecovery(
-        readiness: [AgentModeViewModel.ProviderInputCatalogReadiness],
+    private func assertClaudeNativeLostRouteRecovery(
+        readiness: [Bool],
         finalRoutePresence: [Bool]
     ) async throws {
         let firstController = MonitorFakeNativeController()
@@ -1806,6 +2193,15 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         session.runState = .running
         let ownership = session.beginRunAttempt(source: "test.claude.catalog-route-recovery")
 
+        let endpoint = try DomainAgentSessionLinkEndpointIdentity(
+            windowID: 1, workspaceID: UUID(), tabID: session.tabID,
+            sessionID: XCTUnwrap(session.activeAgentSessionID),
+            persistentBindingGeneration: UUID(), bindingTransitionGeneration: 0
+        )
+        let routeToken = AgentSessionLinkRunCatalogRouteToken(
+            runID: runID, observerEndpoint: endpoint, connectionID: UUID(),
+            routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1
+        )
         var pendingReadiness = readiness
         var pendingFinalRoutePresence = finalRoutePresence
         var physicalDispatchNotAttemptedCount = 0
@@ -1816,11 +2212,12 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
                 prependPendingHandoff: { text, _ in text },
-                ensureAgentSessionLinkProviderInputCatalogReady: { _ in
-                    pendingReadiness.removeFirst()
+                qualifyAgentSessionLinkProviderInputRoute: { _ in
+                    pendingReadiness.removeFirst() ? .ready(routeToken) : .unavailable
                 },
-                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in
-                    pendingFinalRoutePresence.removeFirst()
+                hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in
+                    // Route state persists through the additional post-configuration proof fence.
+                    pendingFinalRoutePresence.isEmpty ? finalRoutePresence.last == true : pendingFinalRoutePresence.removeFirst()
                 },
                 decorateAgentSessionLinkPrompt: { text, _, _ in
                     .init(text: text, claim: nil, mustAbortDispatch: false)
@@ -1903,10 +2300,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 to: endpoint
             )
 
-            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
-            XCTAssertEqual(readiness, .ready)
+            let readiness = await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
+            XCTAssertEqual(readiness, .ready(routeToken))
             XCTAssertTrue(
-                fixture.viewModel.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: fixture.session)
+                fixture.viewModel.agentSessionLinkHasCurrentProviderInputRoute(for: fixture.session, qualification: readiness)
             )
         #else
             throw XCTSkip("Catalog route seams require DEBUG helpers.")
@@ -1922,7 +2319,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             )
             fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in false }
 
-            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
+            let readiness = await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
             XCTAssertEqual(readiness, .notRequired)
         #else
             throw XCTSkip("Catalog route seams require DEBUG helpers.")
@@ -1960,10 +2357,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 to: endpoint
             )
 
-            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
-            XCTAssertEqual(readiness, .ready)
+            let readiness = await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
+            XCTAssertEqual(readiness, .ready(routeToken))
             XCTAssertFalse(
-                fixture.viewModel.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: fixture.session)
+                fixture.viewModel.agentSessionLinkHasCurrentProviderInputRoute(for: fixture.session, qualification: readiness)
             )
         #else
             throw XCTSkip("Catalog route seams require DEBUG helpers.")
@@ -2017,7 +2414,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(unready, to: endpoint)
 
             let readiness = Task { @MainActor in
-                await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
+                await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
             }
             let readyProjection = AgentSessionLinkRunCatalogProjection(
                 runID: runID,
@@ -2044,7 +2441,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #endif
     }
 
-    func testCodexContinuationCatalogTimeoutRestoresInstructionWithoutResumingProvider() async throws {
+    func testCodexContinuationMissingRouteRestoresInstructionWithoutResumingProvider() async throws {
         #if DEBUG
             let fixture = try makeFixture(agent: .codexExec)
             fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
@@ -2066,6 +2463,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 hasAgentSessionLink: nil
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(unready, to: endpoint)
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in nil }
 
             let controller = LifecycleNoopCodexController(recorder: LifecycleRecorder())
             fixture.session.codexController = controller
@@ -2092,7 +2490,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
 
             try await AsyncTestWait.waitUntil(
-                "continuation readiness timeout rollback",
+                "continuation route refusal rollback",
                 timeout: 15
             ) {
                 await MainActor.run { fixture.viewModel.draftRestorationEvent?.text == rawDraft }
@@ -2103,7 +2501,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             XCTAssertTrue(fixture.session.items.allSatisfy { $0.kind != .user })
             XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), rawDraft)
             XCTAssertTrue(
-                fixture.viewModel.draftRestorationEvent?.message.contains("catalog readiness timed out") == true
+                fixture.viewModel.draftRestorationEvent?.message.contains("route qualification was unavailable") == true
             )
 
             cancelWaitingInstructionForTest(fixture.session)
@@ -2177,19 +2575,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
 
             await authorityGate.open()
-            let readyProjection = AgentSessionLinkRunCatalogProjection(
-                runID: runID,
-                routeToken: routeToken,
-                projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true,
-                hasAnyActiveLink: true
-            )
-            fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(readyProjection, to: endpoint)
-            _ = await manager.debugPublishRunCatalogObservation(
-                routeToken: routeToken,
-                hasAgentSessionLink: true
-            )
-
+            // Both submissions raced under an unknown catalog; do not heal it to resume.
             let response = try await waiting.value
             XCTAssertTrue(try XCTUnwrap(response.text).contains("first instruction"))
             try await AsyncTestWait.waitUntil("the queued second instruction to restore") {
@@ -2208,7 +2594,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #endif
     }
 
-    func testCodexResumedContinuationWaitsForServerObservedCatalogReadiness() async throws {
+    func testCodexResumedContinuationProceedsWithoutCatalogRefresh() async throws {
         #if DEBUG
             let fixture = try makeFixture(agent: .codexExec)
             let authorityGate = CatalogAuthorityGate()
@@ -2261,36 +2647,24 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             await authorityGate.waitUntilEntered()
             XCTAssertNotNil(
                 fixture.session.instructionContinuation,
-                "active-link input must remain suspended while the exact catalog is unready"
+                "active-link input remains suspended until exact route qualification finishes"
             )
             XCTAssertEqual(fixture.session.instructionWaitID, expectedWaitID)
             XCTAssertEqual(fixture.session.codexController.map(ObjectIdentifier.init), expectedControllerID)
             await authorityGate.open()
 
-            let expectedReady = AgentSessionLinkRunCatalogProjection(
-                runID: runID,
-                routeToken: routeToken,
-                projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true,
-                hasAnyActiveLink: true
-            )
-            fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(expectedReady, to: endpoint)
-            let ready = await manager.debugPublishRunCatalogObservation(
-                routeToken: routeToken,
-                hasAgentSessionLink: true
-            )
-            XCTAssertEqual(ready, expectedReady)
-            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
-            XCTAssertEqual(readiness, .ready)
+            // Never publish a ready catalog: the route, not tools/list, admits this continuation.
+            let readiness = await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
+            XCTAssertEqual(readiness, .ready(routeToken))
             try? await AsyncTestWait.waitUntil(
-                "exact readiness to resume the continuation"
+                "exact route qualification to resume the continuation"
             ) {
                 await MainActor.run { fixture.session.instructionContinuation == nil }
             }
             guard fixture.session.instructionContinuation == nil else {
                 cancelWaitingInstructionForTest(fixture.session)
                 _ = try? await waiting.value
-                return XCTFail("exact readiness did not resume the waiting continuation")
+                return XCTFail("exact route qualification did not resume the waiting continuation")
             }
             let response = try await waiting.value
             try MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(
@@ -2335,7 +2709,61 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
 // MARK: - Non-Codex fakes
 
+private actor MonitorRemovalConnection: MCPServerConnection {
+    let gate: CatalogAuthorityGate
+    let pauseTermination: Bool
+
+    init(gate: CatalogAuthorityGate, pauseTermination: Bool) {
+        self.gate = gate
+        self.pauseTermination = pauseTermination
+    }
+
+    nonisolated var isFilesystemBacked: Bool {
+        false
+    }
+
+    nonisolated var connectionFolderURL: URL? {
+        nil
+    }
+
+    nonisolated var capabilityToken: String? {
+        nil
+    }
+
+    func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
+    func stop() async {}
+    func abortForExecutionWatchdog(context _: MCPExecutionWatchdogTerminalContext) async {}
+    func notifyToolListChanged() async {}
+    func connectionState() -> ConnectionStateSnapshot {
+        .ready
+    }
+
+    func isViableForRetention() -> Bool {
+        true
+    }
+
+    func secondsSinceLastActivity() async -> TimeInterval {
+        0
+    }
+
+    func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
+        nil
+    }
+
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        if !pauseTermination { _ = await gate.requirement() }
+        return nil
+    }
+
+    func terminate(reason _: TerminationReason, message _: String?) async {
+        if pauseTermination { _ = await gate.requirement() }
+    }
+
+    func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
+}
+
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
+    private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
     private(set) var shutdownCount = 0
     private(set) var startOrResumeExistingSessionIDs: [String?] = []
@@ -2390,6 +2818,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         effortLevel _: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
+        configuration.replaceProcess()
         startOrResumeExistingSessionIDs.append(existingSessionID)
         if rejectResume, existingSessionID != nil { throw NativeAgentRuntimeControllerError.processNotRunning }
         return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
@@ -2399,7 +2828,29 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         NativeAgentRuntimeSessionRef(sessionID: "monitor-native-session")
     }
 
-    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {}
+    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {
+        _ = configuration.apply()
+    }
+
+    private var configurationGate: CatalogAuthorityGate?
+
+    fileprivate func setConfigurationGate(_ gate: CatalogAuthorityGate?) {
+        configurationGate = gate
+    }
+
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        if let configurationGate {
+            _ = await configurationGate.requirement()
+        }
+        return configuration.apply()
+    }
+
+    func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try configuration.validate(proof)
+        sentMessages.append(text)
+        if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
+        return UUID()
+    }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
@@ -2412,6 +2863,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func shutdown() async {
+        configuration.replaceProcess()
         shutdownCount += 1
         continuation?.finish()
     }
@@ -2421,7 +2873,25 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
 
 // MARK: - Codex fakes
 
+/// Provider calls span controller lifetimes, while each fake keeps its own connection state.
+final class MonitorCodexDispatchRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started: [String] = []
+
+    var startedTurns: [String] {
+        lock.withLock { started }
+    }
+
+    func recordStart(_ text: String) -> Int {
+        lock.withLock {
+            started.append(text)
+            return started.count
+        }
+    }
+}
+
 final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
+    private let dispatches: MonitorCodexDispatchRecorder
     private let lock = NSLock()
     private var started: [String] = []
     private var steered: [String] = []
@@ -2441,7 +2911,8 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private let continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
     private let stream: AsyncStream<CodexNativeSessionController.Event>
 
-    init() {
+    init(dispatches: MonitorCodexDispatchRecorder) {
+        self.dispatches = dispatches
         var storedContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation!
         stream = AsyncStream { storedContinuation = $0 }
         continuation = storedContinuation
@@ -2516,7 +2987,8 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
         lock.lock()
         started.append(text)
         lock.unlock()
-        return CodexTurnStartReceipt(provisionalSubmissionID: "sub-\(started.count)")
+        let submissionNumber = dispatches.recordStart(text)
+        return CodexTurnStartReceipt(provisionalSubmissionID: "sub-\(submissionNumber)")
     }
 
     func steerUserTurn(
