@@ -1789,6 +1789,16 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         }
     }
 
+    /// Identity holder for the submenu a key driver is steering toward, safe to read from
+    /// the driver's `@Sendable` timer callback.
+    private final class TrackedSubmenu: @unchecked Sendable {
+        let submenu: NSMenu
+
+        init(_ submenu: NSMenu) {
+            self.submenu = submenu
+        }
+    }
+
     func testColdRightClickShowsEightOutboundAndInbound() async throws {
         let fixture = try await makeFixture()
         for index in 1 ... 8 {
@@ -2206,9 +2216,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
         defer { AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false }
         var observer: SubmenuOpeningObserver?
-        var timeout: Timer?
         var openings = 0
-        defer { timeout?.invalidate() }
 
         func postKey(_ code: UInt16, character: String) {
             guard let event = NSEvent.keyEvent(
@@ -2219,40 +2227,95 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             NSApp.postEvent(event, atStart: false)
         }
 
-        _ = try await open(in: fixture, cancelAfterOpening: false, whileTracking: { root in
-            guard let submenu = root.items.first(where: { $0.title == AgentOversightUICopy.overseeNewTitle })?.submenu else {
-                XCTFail("Missing candidate submenu")
-                return root.cancelTracking()
+        // Synthetic arrow keys race AppKit's tracking loop in a headless host: events can be
+        // dropped, consumed in bursts that carry the highlight past the target between polls,
+        // or land before the loop consumes key input — and a popup session can end before the
+        // keys are delivered. Re-drive the key intent step by step on a timer — one Down per
+        // observed highlight move until the submenu's root item is highlighted, then Right —
+        // escaping a wrong submenu with Left, for ~4 s per session, over a few whole-open retries.
+        var attempts = 0
+        while openings == 0 && attempts < 4 {
+            attempts += 1
+            var driver: Timer?
+            _ = try await open(in: fixture, cancelAfterOpening: false, timeout: 5, whileTracking: { root in
+                guard let submenu = root.items.first(where: { $0.title == AgentOversightUICopy.overseeNewTitle })?.submenu else {
+                    XCTFail("Missing candidate submenu")
+                    return root.cancelTracking()
+                }
+                let rootItems = root.items
+                AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false
+                let forwarding = SubmenuOpeningObserver(delegate: submenu.delegate)
+                observer = forwarding
+                submenu.delegate = forwarding
+                forwarding.onOpen = { child in
+                    openings += 1
+                    XCTAssertTrue(child.items.contains { $0.title == target.menuLabel && $0.isEnabled })
+                    XCTAssertTrue(zip(root.items, rootItems).allSatisfy { $0 === $1 })
+                    XCTAssertTrue(fixture.window.stableMenuPresenter.openMenu === root)
+                    root.cancelTracking()
+                }
+                guard let submenuIndex = root.items.firstIndex(where: { $0.submenu === submenu }) else {
+                    XCTFail("candidate submenu is not a root item")
+                    return root.cancelTracking()
+                }
+                let submenuBox = TrackedSubmenu(submenu)
+                let attempt = attempts
+                var ticks = 0
+                var stallTicks = 0
+                var lastIndex = -2
+                var mayStep = true
+                let timer = Timer(timeInterval: 0.1, repeats: true) { driverTimer in
+                    MainActor.assumeIsolated {
+                        ticks += 1
+                        let stillTracking = fixture.window.stableMenuPresenter.openMenu === root
+                        guard openings == 0, stillTracking, attempt == attempts, ticks <= 40 else {
+                            driverTimer.invalidate()
+                            if openings == 0, stillTracking { root.cancelTracking() }
+                            return
+                        }
+                        // The projection refresh can insert or replace root items while the menu
+                        // tracks, so the target's index is re-resolved every tick; if the item
+                        // itself was rebuilt, abandon this session and let a retry reopen fresh.
+                        guard let targetIndex = root.items.firstIndex(where: { $0.submenu === submenuBox.submenu }) else {
+                            driverTimer.invalidate()
+                            root.cancelTracking()
+                            return
+                        }
+                        let highlightedIndex = root.highlightedItem.flatMap { item in root.items.firstIndex { $0 === item } } ?? -1
+                        if highlightedIndex != lastIndex {
+                            lastIndex = highlightedIndex
+                            stallTicks = 0
+                            mayStep = true
+                        } else {
+                            stallTicks += 1
+                            if stallTicks >= 4 { mayStep = true }
+                        }
+                        if highlightedIndex == targetIndex {
+                            postKey(124, character: "\u{F703}")
+                        } else if stallTicks >= 6 {
+                            postKey(123, character: "\u{F702}")
+                            stallTicks = 0
+                        } else if mayStep {
+                            postKey(125, character: "\u{F701}")
+                            mayStep = false
+                        }
+                    }
+                }
+                driver = timer
+                RunLoop.main.add(timer, forMode: .common)
+                for _ in 0 ... submenuIndex {
+                    postKey(125, character: "\u{F701}")
+                }
+                postKey(124, character: "\u{F703}")
+            })
+            driver?.invalidate()
+            if openings == 0 {
+                // A dead tracking loop can leave a backlog of unconsumed synthetic key events
+                // that would otherwise land in the next attempt's fresh session; pump the main
+                // run loop so they dispatch harmlessly while no menu is tracking.
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.4))
             }
-            let rootItems = root.items
-            AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false
-            let forwarding = SubmenuOpeningObserver(delegate: submenu.delegate)
-            observer = forwarding
-            submenu.delegate = forwarding
-            forwarding.onOpen = { child in
-                openings += 1
-                XCTAssertTrue(child.items.contains { $0.title == target.menuLabel && $0.isEnabled })
-                XCTAssertTrue(zip(root.items, rootItems).allSatisfy { $0 === $1 })
-                XCTAssertTrue(fixture.window.stableMenuPresenter.openMenu === root)
-                root.cancelTracking()
-            }
-            let watchdog = Timer(timeInterval: 1, repeats: false) { _ in
-                MainActor.assumeIsolated { root.cancelTracking() }
-            }
-            timeout = watchdog
-            RunLoop.main.add(watchdog, forMode: .common)
-            // Down-arrow once per root position before the submenu's own, then Right to open:
-            // the first Down highlights item 0, so the count follows the item's index, not a
-            // fixed press count.
-            guard let submenuIndex = root.items.firstIndex(where: { $0.submenu === submenu }) else {
-                XCTFail("candidate submenu is not a root item")
-                return root.cancelTracking()
-            }
-            for _ in 0 ... submenuIndex {
-                postKey(125, character: "\u{F701}")
-            }
-            postKey(124, character: "\u{F703}")
-        })
+        }
         withExtendedLifetime(observer) {}
         XCTAssertEqual(openings, 1, "AppKit must display the submenu while the original root tracks")
     }
@@ -2433,7 +2496,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
 
     private func open(
         in fixture: Fixture, via opening: Opening = .rightClick,
-        cancelAfterOpening: Bool = true,
+        cancelAfterOpening: Bool = true, timeout: TimeInterval = 3,
         whileTracking: ((NSMenu) -> Void)? = nil
     ) async throws -> NSMenu {
         let region = try mountedRegion(in: fixture)
@@ -2476,7 +2539,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 NSApp.sendEvent(event)
             }
         }
-        await fulfillment(of: [finished], timeout: 3)
+        await fulfillment(of: [finished], timeout: timeout)
         return try XCTUnwrap(tracked, "Actual native opening must track a menu")
     }
 
