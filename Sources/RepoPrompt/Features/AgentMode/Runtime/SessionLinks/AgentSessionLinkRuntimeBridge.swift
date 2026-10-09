@@ -1065,12 +1065,6 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
-    /// App-wide live candidates through the installed host, for Feature-layer callers that must
-    /// resolve a peer's live name without reaching the App-layer session store directly.
-    func agentSessionLinkAppWideCandidates() -> [AgentSessionLinkEndpointCandidate] {
-        host?.agentSessionLinkCandidates() ?? []
-    }
-
     /// `NSWindow` for a logical window ID through the installed host — nil when absent or no host.
     func agentSessionLinkSheetWindow(windowID: Int?) -> NSWindow? {
         guard let windowID else { return nil }

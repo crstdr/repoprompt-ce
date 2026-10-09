@@ -38,6 +38,8 @@ enum AgentMCPSelectionResolver {
         /// drops the user's choice and runs at the provider default; `agent_explore` shipped that
         /// bug. Capture it with the resolution — never re-read role settings after awaited setup.
         let modelParameterSelections: [ACPModelParameterSelection]
+        /// Captured with role resolution. Explicit IDs and stored role overrides are not rebalanced.
+        var usageBalancingEligible = false
     }
 
     /// Resolves a `model_id` string into agent + model components.
@@ -73,7 +75,8 @@ enum AgentMCPSelectionResolver {
                     agentRaw: resolved.selection.agent.rawValue,
                     modelRaw: resolved.selection.modelRaw,
                     taskLabelKind: defaultKind,
-                    modelParameterSelections: resolved.modelParameters
+                    modelParameterSelections: resolved.modelParameters,
+                    usageBalancingEligible: resolved.usageBalancingEligible
                 )
             }
             return ResolvedSelection(
@@ -99,7 +102,8 @@ enum AgentMCPSelectionResolver {
                     agentRaw: resolved.selection.agent.rawValue,
                     modelRaw: resolved.selection.modelRaw,
                     taskLabelKind: entry.kind,
-                    modelParameterSelections: resolved.modelParameters
+                    modelParameterSelections: resolved.modelParameters,
+                    usageBalancingEligible: resolved.usageBalancingEligible
                 )
             }
             let knownLabels = AgentModelCatalog.taskLabels.map(\.label).joined(separator: ", ")
@@ -166,7 +170,7 @@ enum AgentMCPSelectionResolver {
         surface: AgentModelCatalog.AgentSelectionSurface,
         workspacePath: String?,
         cursorCatalogRefresh: CursorCatalogRefresh?
-    ) async throws -> (selection: AgentModelCatalog.NormalizedAgentSelection, modelParameters: [ACPModelParameterSelection])? {
+    ) async throws -> (selection: AgentModelCatalog.NormalizedAgentSelection, modelParameters: [ACPModelParameterSelection], usageBalancingEligible: Bool)? {
         if let providerSelection = roleSelectionProvider?(role, availability) {
             guard surface.allows(providerSelection.agent) else {
                 throw MCPError.invalidParams(
@@ -177,7 +181,7 @@ enum AgentMCPSelectionResolver {
                 providerSelection, role: role, availability: availability,
                 workspacePath: workspacePath, cursorCatalogRefresh: cursorCatalogRefresh
             )
-            return (providerSelection, [])
+            return (providerSelection, [], false)
         }
         if let resolution = MCPAgentRoleDefaultsService.effectiveSelection(
             for: role,
@@ -193,7 +197,7 @@ enum AgentMCPSelectionResolver {
                 resolution.effective, role: role, availability: availability,
                 workspacePath: workspacePath, cursorCatalogRefresh: cursorCatalogRefresh
             )
-            return (resolution.effective, resolution.modelParameters)
+            return (resolution.effective, resolution.modelParameters, !resolution.hasStoredOverride)
         }
         guard let fallback = AgentModelCatalog.resolveTaskLabelKind(role, availability: availability) else {
             return nil
@@ -203,7 +207,7 @@ enum AgentMCPSelectionResolver {
                 "Agent '\(fallback.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
             )
         }
-        return (fallback, [])
+        return (fallback, [], true)
     }
 
     /// A role's stored Cursor model is preserved through restoration and refresh rather than being

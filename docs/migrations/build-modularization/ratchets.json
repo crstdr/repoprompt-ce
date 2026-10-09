@@ -1,5 +1,5 @@
 {
-  "description": "Fork upstream sync 2026-10-06: exact measured merged tree of fork main 0650d15d and approved upstream 7a1b5635a, retaining fork-only behavior and upstream idle worktree admission/recovery. Zero numeric headroom; all metrics equal the measured merged tree.",
+  "description": "Fork upstream sync 2026-10-09 plus workspace restoration #1143/#1205, excluding #1193 pending its instance-number capture fix: exact measured tree retaining fork-only behavior, Computer Use consent/collapse/admission parity with #1284, and upstream-sync notification deduplication. Zero numeric headroom.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -20,15 +20,15 @@
     "app_files_over_2000_lines": 47,
     "app_files_over_5000_lines": 16,
     "app_largest_cycle_components": 64,
-    "app_share_permille": 792,
-    "app_shared_accessor_uses": 1229,
+    "app_share_permille": 790,
+    "app_shared_accessor_uses": 1269,
     "app_static_shared_declarations": 89,
-    "app_target_swift_files": 1061,
-    "app_target_swift_lines": 605945,
+    "app_target_swift_files": 1076,
+    "app_target_swift_lines": 613031,
     "app_userdefaults_standard_uses": 229,
-    "app_wrong_way_file_edges": 964,
-    "first_party_swift_lines": 765076,
-    "tests_sleep_calls": 67,
-    "tests_testable_import_app_files": 331
+    "app_wrong_way_file_edges": 977,
+    "first_party_swift_lines": 775892,
+    "tests_sleep_calls": 74,
+    "tests_testable_import_app_files": 336
   }
 }
