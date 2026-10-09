@@ -494,7 +494,23 @@ struct AgentRequestUserInputCard: View {
                 Label("Submit Answers", systemImage: "checkmark.circle.fill")
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!Self.canSubmit(
+                request: request,
+                drafts: draftsByQuestionID,
+                allowsRememberedDecision: allowsRememberedDecision
+            ))
         }
+    }
+
+    /// Armed CU chats only accept the same one-shot answers the coordinator enforces;
+    /// disabling Submit avoids a silent no-op when the draft would be rejected.
+    static func canSubmit(
+        request: AgentRequestUserInputRequest,
+        drafts: [String: AgentRequestUserInputQuestionDraft],
+        allowsRememberedDecision: Bool
+    ) -> Bool {
+        guard !allowsRememberedDecision else { return true }
+        return request.allowsComputerUseResponse(request.buildResponse(from: drafts))
     }
 
     private func notePlaceholder(for question: AgentRequestUserInputQuestion) -> String {

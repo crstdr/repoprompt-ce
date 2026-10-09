@@ -439,18 +439,7 @@ struct AgentSessionRow: View {
         }
     }
 
-    private func sidebarOversightMenuAccessibilityValue(
-        _ menu: AgentSidebarOversightMenuProps
-    ) -> String {
-        AgentOversightUICopy.overseeByMenuAccessibilityValue(
-            overseenByCount: menu.linkedObservers.count,
-            availableCount: menu.availableObservers.count
-        )
-    }
-
-    /// Resolves the live props and builds the item tree once per menu activation —
-    /// `StableMenuButton` evaluates `items:` on click inside AppKit's main-thread action
-    /// dispatch, so `assumeIsolated` matches the resolver's `@MainActor` contract without a
+    /// Resolves the full menu only when the AppKit trigger opens it, on the main actor without a
     /// Task hop. `allowsDirectMutations` repeats the render-time mount gate: it closes the
     /// small window where a click lands between a mode flip and the re-render that removes
     /// the trigger; the action handlers then revalidate exact endpoints as before.

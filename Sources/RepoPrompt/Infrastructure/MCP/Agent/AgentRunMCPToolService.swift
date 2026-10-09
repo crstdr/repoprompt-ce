@@ -557,13 +557,26 @@ struct AgentRunMCPToolService {
         // rejected as unknown. This step makes no provider request; the resolver may discover
         // Cursor models on demand if no snapshot exists.
         await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+        let shouldRouteStart = Self.shouldRouteModelForStart(requestedModelID: requestedModelID, hasExplicitModelParameters: args["model_parameters"] != nil)
+        let canBalanceStart = shouldRouteStart && resolvedTabID == nil && agentModeVM.modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled
         do {
-            if Self.shouldRouteModelForStart(
-                requestedModelID: requestedModelID,
-                hasExplicitModelParameters: args["model_parameters"] != nil
-            ), let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
+            let usageBaseline: AgentMCPSelectionResolver.ResolvedSelection? = canBalanceStart ? try? await AgentMCPSelectionResolver.resolve(
+                modelID: requestedModelID, defaultTaskLabel: defaultTaskLabel,
+                availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+                workspaceID: workspace.id,
+                workspacePath: workspace.repoPaths.first
+            ) : nil
+            // Baseline lookup is best-effort, but cancellation during Cursor discovery must propagate.
+            try Task.checkCancellation()
+            let baselineTarget = usageBaseline.flatMap { value -> AgentRoutingExecutableTarget? in
+                guard let agent = value.agentRaw, let model = value.modelRaw else { return nil }
+                return .init(agentRaw: agent, modelRaw: model, reasoningEffortRaw: nil, modelParameters: value.modelParameterSelections)
+            }
+            if shouldRouteStart, let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
-                surface: .general
+                surface: .general,
+                baseline: baselineTarget,
+                allowUsageBalance: resolvedTabID == nil && usageBaseline?.usageBalancingEligible == true
             ) {
                 selection = AgentMCPSelectionResolver.ResolvedSelection(
                     agentRaw: routed.agentRaw,
@@ -582,6 +595,8 @@ struct AgentRunMCPToolService {
                         "overrodeRequestedModel": "false"
                     ])
                 #endif
+            } else if let usageBaseline {
+                selection = usageBaseline
             } else {
                 selection = try await AgentMCPSelectionResolver.resolve(
                     modelID: requestedModelID,
@@ -744,7 +759,7 @@ struct AgentRunMCPToolService {
             }
             #if DEBUG
                 if let worktreeStartupBenchmarkToken {
-                    try await WorktreeStartupBenchmarkDiagnostics.$currentPendingStart.withValue(
+                    try await WorktreeStartupBenchmarkDiagnostics.currentPendingStartTaskLocal.withValue(
                         DebugWorktreeStartupBenchmarkPendingStart(
                             token: worktreeStartupBenchmarkToken,
                             startAttemptID: UUID()
