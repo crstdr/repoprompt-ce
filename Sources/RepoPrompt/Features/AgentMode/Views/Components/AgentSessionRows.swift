@@ -313,6 +313,16 @@ struct AgentSessionRow: View {
             && resolveSidebarOversightSummary?() == nil
     }
 
+    /// Fallback reason for a session-ID row whose menu resolved nil. A live bound endpoint
+    /// means the chat is open in this window and the bridge simply has not installed the
+    /// catalog yet, so reopening the menu can help; no bound endpoint means the chat is not
+    /// open here, and opening it is what installs the binding.
+    private var sidebarOversightMenuUnavailableFallback: String {
+        resolveSidebarOversightTargetEndpoint?() != nil
+            ? AgentOversightUICopy.oversightMenuUnavailableMessage
+            : AgentOversightUICopy.oversightMenuOpenChatMessage
+    }
+
     private func currentContextMenuSnapshot() -> ContextMenuSnapshot {
         if allowsDirectMutations { prepareSidebarOversightMenu?() }
         let menu = presentableSidebarOversightMenu
@@ -325,7 +335,7 @@ struct AgentSessionRow: View {
            onAddSidebarOversight != nil,
            onStopSidebarOversight != nil
         {
-            unavailableReason = AgentOversightUICopy.oversightMenuUnavailableMessage
+            unavailableReason = sidebarOversightMenuUnavailableFallback
         }
         return ContextMenuSnapshot(
             isInteractionEnabled: isInteractionEnabled,
@@ -505,7 +515,7 @@ struct AgentSessionRow: View {
                             diagnoseSidebarOversightMenuUnavailable?()
                         }
                         let reason = sidebarOversightUnavailableReason
-                            ?? AgentOversightUICopy.oversightMenuUnavailableMessage
+                            ?? sidebarOversightMenuUnavailableFallback
                         return .submenu(item.title, accessibilityValue: reason, items: [.message(reason)])
                     }
                     return sidebarOversightMenuItems(menu).first { $0.title == item.title } ?? item
