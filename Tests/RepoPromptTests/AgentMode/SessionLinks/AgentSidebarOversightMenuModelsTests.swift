@@ -2237,7 +2237,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         // still prove the cold → ready transition on that same root: a retry that lands on an
         // already-ready root fails the cold check instead of passing vacuously.
         var attempts = 0
-        while openings == 0 && attempts < 4 {
+        while openings == 0, attempts < 4 {
             attempts += 1
             AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
             await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
