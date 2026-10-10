@@ -1612,9 +1612,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         confirmedDomainReadRegistrationsByWorkspaceID[token.workspaceID] = token
     }
 
-    /// Drops confirmed and pending read registrations whose workspace was removed from the
-    /// projected catalog or whose projected digest moved. An unavailable member may retain its
-    /// last-known presentation digest; that does not establish current canonical read freshness.
+    /// Drops confirmed and pending read registrations whose workspace was removed, became
+    /// unavailable, or whose projected digest moved. Retained presentation metadata is not proof
+    /// that the authority still holds a read overlay for the window's last-known model.
     func invalidateConfirmedDomainReadRegistrations(
         previousDigestsByWorkspaceID: [UUID: String],
         projectedDigestsByWorkspaceID: [UUID: String]
@@ -8612,7 +8612,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         let retainedWorkspaceIDs = Set(retainedWorkspaces.map(\.id))
         let persistedWorkspaceIDs = decodedWorkspaceIDs.union(retainedWorkspaceIDs)
-        let retainedDigests = domainWorkspaceDigestsByID.filter { retainedWorkspaceIDs.contains($0.key) }
         // Canonical System evidence comes from the incoming persisted projection, before any
         // local ephemeral/creation/session reconciliation can append records.
         let canonicalSystemWorkspaceIDs = Set(persistedProjection.filter(\.isSystemWorkspace).map(\.id))
@@ -8675,8 +8674,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             // re-validated against the projected digests.
             invalidateConfirmedDomainReadRegistrations(
                 previousDigestsByWorkspaceID: domainWorkspaceDigestsByID,
-                projectedDigestsByWorkspaceID: digestsByWorkspaceID.filter { decodedWorkspaceIDs.contains($0.key) }
-                    .merging(retainedDigests) { incoming, _ in incoming }
+                projectedDigestsByWorkspaceID: digestsByWorkspaceID.filter {
+                    decodedWorkspaceIDs.contains($0.key) && !unavailableWorkspaceIDs.contains($0.key)
+                }
             )
             let projectedFileURLs = fileURLsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) && !staleWorkspaceIDs.contains($0.key) }
             domainWorkspaceFileURLsByID = projectedFileURLs.merging(domainWorkspaceFileURLsByID.filter { staleWorkspaceIDs.contains($0.key) || retainedWorkspaceIDs.contains($0.key) }) { incoming, _ in incoming }
@@ -8879,9 +8879,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         lastDomainProjectionSequence = publicationSequence
         invalidateConfirmedDomainReadRegistrations(
             previousDigestsByWorkspaceID: domainWorkspaceDigestsByID,
-            projectedDigestsByWorkspaceID: digestsByWorkspaceID.merging(
-                domainWorkspaceDigestsByID.filter { unavailableWorkspaceIDs.contains($0.key) }
-            ) { incoming, _ in incoming }
+            projectedDigestsByWorkspaceID: digestsByWorkspaceID.filter { !unavailableWorkspaceIDs.contains($0.key) }
         )
         applyDomainMetadataSnapshot(
             revisions: revisionsByWorkspaceID, digests: digestsByWorkspaceID, health: healthByWorkspaceID,
