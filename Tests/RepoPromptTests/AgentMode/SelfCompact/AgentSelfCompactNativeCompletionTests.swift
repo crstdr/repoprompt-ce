@@ -751,7 +751,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
                 "Context compaction was requested by this session.",
                 "Scheduled self-compaction was cancelled before it reached the provider.",
                 "Self-compaction could not start. The continuation note was retained for recovery.",
-                "The provider did not confirm that compaction finished. The continuation note will be attached to the next message in this session.",
+                "Compaction is not confirmed yet. The session resumes when it is, or with your next message.",
                 "A continuation note from before compaction was restored to this session."
             ]
         )
