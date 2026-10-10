@@ -133,6 +133,29 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.bridge.captureWaitInput(for: endpoint).generation, 0)
     }
 
+    func testAttentionCountReadDoesNotAcknowledgeAndLastUnlinkClearsIt() async throws {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture) else { return XCTFail("link admission failed") }
+        let result = await fixture.bridge.requestAttention(
+            targetEndpoint: fixture.target.domainEndpoint, observerSessionID: fixture.observer.sessionID
+        )
+        XCTAssertEqual(result, .accepted(hasWaitingOn: false))
+        let before = try XCTUnwrap(passiveSnapshot(fixture))
+        XCTAssertEqual(fixture.bridge.pendingAttentionOccurrenceCount(for: fixture.observer.domainEndpoint), 1)
+        XCTAssertEqual(fixture.bridge.pendingAttentionOccurrenceCount(for: fixture.observer.domainEndpoint), 1)
+        XCTAssertEqual(passiveSnapshot(fixture), before, "reading must not acknowledge, refresh or re-publish")
+        XCTAssertEqual(fixture.bridge.pendingAttentionOccurrenceCount(for: fixture.target.domainEndpoint), 0)
+        let resolvedReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(resolvedReference)
+        let stopped = await fixture.bridge.stopMonitorLink(
+            observerSessionID: fixture.observer.sessionID, targetSessionID: fixture.target.sessionID,
+            linkID: reference.linkID, generation: reference.generation
+        )
+        XCTAssertEqual(stopped, .stopped)
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        XCTAssertEqual(fixture.bridge.pendingAttentionOccurrenceCount(for: fixture.observer.domainEndpoint), 0)
+    }
+
     /// The popover uses this editor and the bridge's payload-free readiness publisher.
     private func makeSessionIDEditor(_ fixture: Fixture) -> AgentMonitorSessionIDEditor {
         let editor = AgentMonitorSessionIDEditor(
