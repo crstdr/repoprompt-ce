@@ -10131,7 +10131,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     if let active = state.active,
                        active.compactRunID == session.runID,
                        active.compactRunAttemptID == session.activeRunAttemptID,
-                       active.phase == .dispatchingCompact || active.phase == .awaitingCompactTurn
+                       active.canAcceptCompactConfirmation
                     {
                         state.active?.compactTurnSucceeded = true
                         session.selfCompactState = state
