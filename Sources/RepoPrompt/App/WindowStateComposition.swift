@@ -70,6 +70,8 @@ struct WindowStateComposition {
 
 @MainActor
 enum WindowStateCompositionFactory {
+    typealias AgentModeViewModelFactory = (Int, PromptViewModel, WorkspaceManagerViewModel, MCPServerViewModel) -> AgentModeViewModel
+
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
@@ -84,7 +86,8 @@ enum WindowStateCompositionFactory {
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
-        modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil
+        modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil,
+        agentModeViewModelFactory: AgentModeViewModelFactory? = nil
     ) -> WindowStateComposition {
         WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
         WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())
@@ -172,6 +175,13 @@ enum WindowStateCompositionFactory {
         let domainWorkspacePresentationBridge = domainWorkspaceClient.map {
             DomainWorkspacePresentationBridge(workspaceManager: workspaceManager, client: $0)
         }
+        if let bridge = domainWorkspacePresentationBridge {
+            // Weak captures: the Bridge already holds the manager weakly; no retain cycle or new owner.
+            workspaceManager.installDomainCatalogRefresh(
+                request: { [weak bridge] isRetry in bridge?.requestCatalogRefresh(isRetry: isRetry) },
+                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() }
+            )
+        }
         domainWorkspacePresentationBridge?.start()
         let selectionCoordinator = WorkspaceSelectionCoordinator(
             workspaceManager: workspaceManager,
@@ -248,7 +258,7 @@ enum WindowStateCompositionFactory {
         )
 
         // 13) Agent mode (for minimal agent UI)
-        let agentModeViewModel = AgentModeViewModel(
+        let agentModeViewModel = agentModeViewModelFactory?(windowID, promptManager, workspaceManager, mcpServer) ?? AgentModeViewModel(
             windowID: windowID,
             promptManager: promptManager,
             workspaceManager: workspaceManager,
