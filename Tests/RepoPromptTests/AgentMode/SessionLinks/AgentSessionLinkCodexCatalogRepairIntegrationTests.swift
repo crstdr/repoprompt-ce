@@ -328,6 +328,23 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
+        func testUnrelatedConnectionAndRunPolicyChurnPreservesPendingBootstrap() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(activate: true, proofMutation: .unrelatedRoute)
+            }
+        }
+
+        func testExactConnectionPolicyABADuringQualificationRejectsPendingBootstrap() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(activate: true, proofMutation: .exactConnectionPolicyABA)
+            }
+        }
+
+        private enum ProofMutation {
+            case unrelatedRoute
+            case exactConnectionPolicyABA
+        }
+
         func testInboundCreationPromotesReducedCatalogToFullDuringHeldTurn() async throws {
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 try await self.exerciseLiveDiscovery(inbound: true)
@@ -335,7 +352,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
 
         private func exerciseLiveDiscovery(
-            activate: Bool = false, inbound: Bool = false, originalQualificationFamilyABA: Bool = false
+            activate: Bool = false, inbound: Bool = false, originalQualificationFamilyABA: Bool = false,
+            proofMutation: ProofMutation? = nil
         ) async throws {
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let manager = ServerNetworkManager.shared
@@ -352,6 +370,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let disabledCatalogGate = DiscoveryCatalogGate()
             let qualificationGate = DiscoveryCatalogGate()
             var pendingBootstrap: Task<PersistentMCPTestRPCResponse, Error>?
+            let unrelatedRunID = UUID()
+            let unrelatedClientName = "proof-unrelated-\(UUID())"
+            var unrelatedTransport: PersistentMCPTestEndpoint?
             var catalogDisabledForTesting = false
             var delayedCatalog: Task<Set<String>, Error>?
             let registration = try await AppDomainRuntimeComposition.shared.register(window.mcpServer.windowMCPToolCatalogService)
@@ -367,6 +388,15 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if catalogDisabledForTesting { await manager.setEnabled(true) }
                 if let grant { await bridge.revokeLink(linkID: grant.linkID, generation: grant.generation) }
                 await provider.shutdown()
+                if let unrelatedTransport {
+                    unrelatedTransport.client.close()
+                    await unrelatedTransport.connectionManager.stop()
+                    await manager.debugRemoveConnection(unrelatedTransport.connectionID)
+                }
+                if case .unrelatedRoute? = proofMutation {
+                    await manager.clearClientConnectionPolicy(for: unrelatedClientName, windowID: window.windowID, runID: unrelatedRunID)
+                    await manager.cleanupRunRoutingState(for: unrelatedRunID, windowID: window.windowID)
+                }
                 if let transport {
                     transport.client.close()
                     await transport.connectionManager.stop()
@@ -462,7 +492,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(route.observerEndpoint, endpoint)
                 XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], connection.connectionID)
 
-                if originalQualificationFamilyABA {
+                if originalQualificationFamilyABA || proofMutation != nil {
                     let registered = expectation(description: "Exact observed proof registered before async qualification")
                     await manager.debugSetAfterBecomeOverseerProofRegistrationForTesting { _, sampledEndpoint in
                         guard sampledEndpoint == endpoint else { return }
@@ -473,6 +503,66 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         try await connection.callTool(name: MCPWindowToolName.becomeOverseer, arguments: [:], timeoutSeconds: 5)
                     }
                     await fulfillment(of: [registered], timeout: 2)
+                    if let proofMutation {
+                        switch proofMutation {
+                        case .unrelatedRoute:
+                            target.installRunID(unrelatedRunID)
+                            await manager.installClientConnectionPolicy(
+                                for: unrelatedClientName, windowID: window.windowID,
+                                restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true,
+                                reason: "Unrelated route churn while bootstrap is parked", ttl: 60, tabID: targetTab,
+                                runID: unrelatedRunID, additionalTools: nil, purpose: .agentModeRun,
+                                taskLabelKind: nil, allowsAgentExternalControlTools: false
+                            )
+                            let unrelated = try await PersistentMCPTestEndpoint.make(
+                                label: "unrelated-proof-route", networkManager: manager,
+                                clientName: unrelatedClientName, requiredToolNames: [MCPWindowToolName.readFile]
+                            )
+                            unrelatedTransport = unrelated
+                            let unrelatedPolicy = await manager.debugConnectionPolicyState(for: unrelated.connectionID)
+                            XCTAssertEqual(unrelatedPolicy.purpose, .agentModeRun)
+                            XCTAssertEqual(unrelatedPolicy.windowID, window.windowID)
+                            unrelated.client.close()
+                            await unrelated.connectionManager.stop()
+                            await manager.debugRemoveConnection(unrelated.connectionID)
+                            unrelatedTransport = nil
+                            await manager.clearClientConnectionPolicy(for: unrelatedClientName, windowID: window.windowID, runID: unrelatedRunID)
+                            await manager.cleanupRunRoutingState(for: unrelatedRunID, windowID: window.windowID)
+                        case .exactConnectionPolicyABA:
+                            await manager.debugSetAdditionalTools(
+                                for: connection.connectionID, additionalTools: policy.additionalTools.union([MCPWindowToolName.getFileTree])
+                            )
+                            await manager.debugSetAdditionalTools(for: connection.connectionID, additionalTools: policy.additionalTools)
+                            let restored = await manager.debugConnectionPolicyState(for: connection.connectionID)
+                            XCTAssertEqual(restored.additionalTools, policy.additionalTools)
+                        }
+                        let routeAfter = await manager.authoritativeRunCatalogRouteToken(runID: runID, windowID: window.windowID, tabID: observerTab)
+                        XCTAssertEqual(routeAfter, route, "The original exact route remains current; policy ABA must still revoke its old proof")
+                        let policyAfter = await manager.debugConnectionPolicyState(for: connection.connectionID)
+                        XCTAssertEqual(policyAfter.restrictedTools, policy.restrictedTools)
+                        XCTAssertEqual(policyAfter.additionalTools, policy.additionalTools)
+                        XCTAssertEqual(policyAfter.purpose, policy.purpose)
+                        XCTAssertEqual(policyAfter.windowID, policy.windowID)
+                        await manager.debugSetAfterBecomeOverseerProofRegistrationForTesting(nil)
+                        await qualificationGate.release()
+                        let response = try await XCTUnwrap(pendingBootstrap).value
+                        let result = try XCTUnwrap(try MCPExportWatchdogIntegrationTests.responseObject(from: response)["result"] as? [String: Any])
+                        let links = await authority.links(forObserver: observerID)
+                        XCTAssertTrue(links.items.isEmpty, "Bootstrap never manufactures a link")
+                        switch proofMutation {
+                        case .unrelatedRoute:
+                            XCTAssertNotEqual(result["isError"] as? Bool, true, "Unrelated connection/run churn must not revoke this invocation: \(response.rawJSON)")
+                            XCTAssertNotNil(observer.oversight.overseerActivation)
+                            let tools = try await provider.listTools()
+                            XCTAssertTrue(tools.contains(MCPWindowToolName.agentSessionLink))
+                            XCTAssertFalse(tools.contains(MCPWindowToolName.becomeOverseer))
+                        case .exactConnectionPolicyABA:
+                            XCTAssertEqual(result["isError"] as? Bool, true, "Exact-connection policy ABA must latch revocation: \(response.rawJSON)")
+                            XCTAssertNil(observer.oversight.overseerActivation)
+                        }
+                        await cleanup()
+                        return
+                    }
                     let store = ToolAvailabilityStore.shared
                     let beforeDisabled = store.disabledTools
                     let beforePersisted = UserDefaults.standard.object(forKey: "mcp.disabledTools") as? [String]
