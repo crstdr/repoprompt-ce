@@ -1837,7 +1837,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let menu = try await open(in: fixture)
         for title in [AgentOversightUICopy.overseeNewTitle, AgentOversightUICopy.overseeByTitle] {
             let submenu = try XCTUnwrap(menu.items.first { $0.title == title }?.submenu)
-            XCTAssertEqual(submenu.items.map(\.title), ["Not available yet — reopen this menu"])
+            XCTAssertEqual(submenu.items.map(\.title), ["Open the chat to enable linking"])
             XCTAssertFalse(submenu.items[0].isEnabled)
         }
     }
