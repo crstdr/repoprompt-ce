@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
@@ -2489,6 +2490,106 @@ import XCTest
                                 "unknown scoped evidence revokes older bulk (inventory=\(inventoryPath), missing=\(missingRecord))"
                             )
                         }
+                    }
+                }
+            }
+        }
+
+        func testRetainedUnavailableMemberReregistersScopedReadAfterCanonicalTransition() async throws {
+            for metadataOnly in [false, true] {
+                for pendingRegistration in [false, true] {
+                    try await Fixture.run { f in
+                        let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                        let previousWindows = WindowStatesManager.shared.allWindows
+                        WindowStatesManager.shared.allWindows = [window]
+                        defer { WindowStatesManager.shared.allWindows = previousWindows }
+                        let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: window.windowID)
+                        let base = await client.snapshot()
+                        XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                            base, projection: .full(f.decoded(base)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                        ).receipt)
+                        manager.activeWorkspace = manager.workspace(withID: Fixture.aardvarkID)
+                        let retained = try XCTUnwrap(manager.activeWorkspace)
+                        // Establish the retained/unknown membership before registering D1. A
+                        // subsequent unchanged membership can legitimately use the metadata path.
+                        let initiallyUnavailable = f.catalog(
+                            base, sequence: base.publicationSequence, catalogRevision: base.catalogRevision,
+                            dropping: [retained.id], unavailable: [retained.id]
+                        )
+                        XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                            initiallyUnavailable, projection: .full(f.decoded(initiallyUnavailable)),
+                            preferredActiveWorkspaceID: retained.id, rootMapPolicy: .snapshotMetadata
+                        ).receipt)
+                        let tabID = try XCTUnwrap(retained.activeComposeTabID)
+                        let invocation = ToolInvocationContext.trustedLocal(
+                            toolName: "workspace_context",
+                            metadata: MCPRequestMetadata(
+                                connectionID: UUID(), clientName: "Retained read fixture", windowID: window.windowID,
+                                tabContextHint: MCPTabContextHint(tabID: tabID, workspaceID: retained.id, windowID: window.windowID)
+                            )
+                        )
+                        let firstRead = try await window.mcpServer.resolveDomainReadContext(
+                            toolName: "workspace_context", requirement: .workspaceRequired, invocationContext: invocation
+                        )
+                        window.mcpServer.releaseDomainReadAppExecutionContext(for: firstRead)
+                        XCTAssertTrue(manager.debugDomainReadRegistrationStateExistsForWorkspace(retained.id))
+                        var pending: WorkspaceManagerViewModel.DomainReadRegistrationToken?
+                        if pendingRegistration {
+                            manager.invalidateDomainReadRegistration(for: retained.id)
+                            pending = manager.domainReadRegistrationToken(for: retained, fileURL: manager.workspaceFileURL(for: retained))
+                            XCTAssertNotNil(pending)
+                            _ = try await client.registerForRead(retained, fileURL: manager.workspaceFileURL(for: retained))
+                        }
+                        let original = try XCTUnwrap(base.workspaces.first { $0.document.workspaceID == retained.id })
+                        var changed = retained
+                        changed.currentPromptText = "Canonical D2 is not the retained window D1"
+                        changed.composeTabs[0].name = "Canonical D2 context"
+                        let outcome = try await client.replaceWorking(
+                            changed, fileURL: original.document.fileURL, expectedWorkspaceRevision: original.revisions.workingRevision
+                        )
+                        XCTAssertEqual(outcome.disposition, .applied)
+                        let beforeProjectionSnapshot = await client.workspaceSnapshot(retained.id)
+                        let beforeProjectionRead = try XCTUnwrap(beforeProjectionSnapshot)
+                        XCTAssertEqual(try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                            documentBytes: beforeProjectionRead.document.documentBytes, fileURL: beforeProjectionRead.document.fileURL
+                        ).currentPromptText, changed.currentPromptText, "canonical transition removed the existing D1 read overlay")
+                        let canonical = await client.snapshot()
+                        let unavailable = f.catalog(
+                            canonical, sequence: canonical.publicationSequence, catalogRevision: canonical.catalogRevision,
+                            dropping: [retained.id], unavailable: [retained.id]
+                        )
+                        XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                            unavailable, projection: metadataOnly ? .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration) : .full(f.decoded(unavailable)),
+                            preferredActiveWorkspaceID: retained.id, rootMapPolicy: .snapshotMetadata
+                        ).receipt)
+                        XCTAssertEqual(manager.activeWorkspaceID, retained.id)
+                        XCTAssertEqual(manager.activeWorkspace?.currentPromptText, retained.currentPromptText)
+                        XCTAssertNotNil(manager.workspaceChooserPresentation.failure)
+                        XCTAssertFalse(manager.debugDomainReadRegistrationStateExistsForWorkspace(retained.id))
+                        if let pending { manager.confirmDomainReadRegistration(pending) }
+                        XCTAssertFalse(manager.debugDomainReadRegistrationStateExistsForWorkspace(retained.id), "old pending token cannot re-confirm after projection invalidation")
+                        let nextRead = try await window.mcpServer.resolveDomainReadContext(
+                            toolName: "workspace_context", requirement: .workspaceRequired, invocationContext: invocation
+                        )
+                        defer { window.mcpServer.releaseDomainReadAppExecutionContext(for: nextRead) }
+                        let handle = try XCTUnwrap(nextRead.handle)
+                        let contextSnapshot = await f.runtime.contextStore.snapshot(handle.context)
+                        XCTAssertEqual(contextSnapshot?.metadata.name, retained.composeTabs[0].name, "real scoped context read must match retained window D1")
+                        let routedSnapshot = await f.runtime.contextStore.workspaceSnapshot(retained.id)
+                        let readSnapshot = try XCTUnwrap(routedSnapshot)
+                        XCTAssertEqual(
+                            try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                                documentBytes: readSnapshot.document.documentBytes, fileURL: readSnapshot.document.fileURL
+                            ).currentPromptText,
+                            retained.currentPromptText,
+                            "scoped read must represent retained D1, not canonical D2 (metadata=\(metadataOnly), pending=\(pendingRegistration))"
+                        )
+                        XCTAssertNil(manager.domainReadRegistrationToken(
+                            for: retained, fileURL: manager.workspaceFileURL(for: retained)
+                        ), "steady reads still reuse the newly confirmed registration")
+                        let canonicalRead = await client.canonicalWorkspaceSnapshot(retained.id)
+                        let durable = try XCTUnwrap(canonicalRead)
+                        XCTAssertEqual(durable.document.contentDigest, beforeProjectionRead.document.contentDigest, "read registration must not mutate canonical D2")
                     }
                 }
             }
