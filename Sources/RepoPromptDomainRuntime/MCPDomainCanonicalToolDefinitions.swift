@@ -1114,6 +1114,10 @@ package enum MCPDomainCanonicalToolDefinitions {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
         definitions.insert(agentSelfDefinition, at: insertion)
+        guard let bootstrapInsertion = definitions.firstIndex(where: { $0.name == MCPWindowToolName.agentSelf }) else {
+            preconditionFailure("Missing oversight bootstrap insertion point")
+        }
+        definitions.insert(becomeOverseerDefinition, at: bootstrapInsertion)
         guard definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
@@ -1122,6 +1126,13 @@ package enum MCPDomainCanonicalToolDefinitions {
             .map(advertiseOracleImageAttachments)
             .map(advertiseWorktreeListPagination)
     }
+
+    private static let becomeOverseerDefinition = MCPDomainToolDefinition(
+        name: MCPWindowToolName.becomeOverseer,
+        description: "Unlock oversight: create, message, steer and monitor persistent agents (lanes) in any workspace.",
+        inputSchema: .object(["type": .string("object"), "properties": .object([:])]),
+        annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
+    )
 
     private static let agentSelfDefinition = MCPDomainToolDefinition(
         name: MCPWindowToolName.agentSelf,

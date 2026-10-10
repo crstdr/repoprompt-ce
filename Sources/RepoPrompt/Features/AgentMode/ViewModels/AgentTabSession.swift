@@ -301,6 +301,7 @@ final class AgentTabSession: ObservableObject {
     /// exact session may act as an oversight observer.
     var mcpControlContext: AgentModeViewModel.AgentMCPControlContext? {
         didSet {
+            if mcpControlContext != nil { oversight.overseerActivation = nil }
             guard oldValue?.taskLabelKind != mcpControlContext?.taskLabelKind
                 || (oldValue == nil) != (mcpControlContext == nil)
             else {
@@ -338,6 +339,7 @@ final class AgentTabSession: ObservableObject {
     /// Whether this session was originally created by an MCP client.
     var isMCPOriginated: Bool = false {
         didSet {
+            if isMCPOriginated { oversight.overseerActivation = nil }
             if oldValue != isMCPOriginated { AgentSessionLinkCandidateReadinessSignal.didChange() }
         }
     }
@@ -1342,11 +1344,17 @@ final class AgentTabSession: ObservableObject {
     var saveRequestGeneration: UInt64 = 0
     var parentSessionID: UUID? {
         didSet {
+            if parentSessionID != nil { oversight.overseerActivation = nil }
             if (oldValue == nil) != (parentSessionID == nil) { AgentSessionLinkCandidateReadinessSignal.didChange() }
         }
     }
 
-    var createdByOverseerSessionID: UUID?
+    var createdByOverseerSessionID: UUID? {
+        didSet {
+            if createdByOverseerSessionID != nil { oversight.overseerActivation = nil }
+        }
+    }
+
     var hasLoadedPersistedState: Bool = false {
         didSet {
             if oldValue != hasLoadedPersistedState {
@@ -1533,6 +1541,7 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func beginPersistentBindingTransition() -> UInt64 {
+        oversight.overseerActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
         // incoming incarnation.
         restorationReadiness = .unbound
@@ -1549,6 +1558,7 @@ final class AgentTabSession: ObservableObject {
 
     func installPersistentSessionBinding(_ binding: AgentPersistentSessionBindingIdentity?) {
         precondition(binding == nil || binding?.tabID == tabID)
+        if persistentSessionBindingIdentity != binding { oversight.overseerActivation = nil }
         persistentSessionBindingIdentity = binding
         bindingTransitionInProgress = false
         restorationReadiness = currentRestorationBindingToken.map { .pending($0) } ?? .unbound

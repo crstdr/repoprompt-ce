@@ -2005,6 +2005,23 @@
     },
     {
       "annotations" : {
+        "destructiveHint" : false,
+        "idempotentHint" : true,
+        "openWorldHint" : false,
+        "readOnlyHint" : false
+      },
+      "description" : "Unlock oversight: create, message, steer and monitor persistent agents (lanes) in any workspace.",
+      "inputSchema" : {
+        "properties" : {
+
+        },
+        "type" : "object"
+      },
+      "isEnabledByDefault" : true,
+      "name" : "become_overseer"
+    },
+    {
+      "annotations" : {
         "destructiveHint" : true,
         "idempotentHint" : false,
         "openWorldHint" : true,
