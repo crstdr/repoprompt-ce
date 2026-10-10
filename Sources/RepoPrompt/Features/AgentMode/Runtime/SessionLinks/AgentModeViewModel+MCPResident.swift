@@ -181,6 +181,7 @@ extension AgentModeViewModel {
         _ target: MCPResidentTarget, text: String, workflow: AgentWorkflowDefinition?,
         windowIsAvailable: @escaping @MainActor () -> Bool
     ) async throws -> MCPInstructionDispatch {
+        try Task.checkCancellation()
         guard windowIsAvailable(), mcpResidentTargetIsCurrent(target) else {
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
         }
