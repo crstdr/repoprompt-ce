@@ -1265,30 +1265,69 @@ actor ServerNetworkManager {
     #endif
 
     private var connections: [UUID: any MCPServerConnection] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet {
+            revokeBecomeOverseerActivationProofs { route in
+                let id = route.connectionID
+                return connections[id].map { ObjectIdentifier($0 as AnyObject) }
+                    != newValue[id].map { ObjectIdentifier($0 as AnyObject) }
+            }
+        }
     }
 
     private var connectionsBeingRemoved: Set<UUID> {
         get { connectionLifecycleState.removingConnections }
         _modify {
-            revokeBecomeOverseerActivationProofs()
-            yield &connectionLifecycleState.removingConnections
+            guard !becomeOverseerActivationProofs.isEmpty else {
+                yield &connectionLifecycleState.removingConnections
+                return
+            }
+            let oldValue = connectionLifecycleState.removingConnections
+            var newValue = oldValue
+            defer {
+                revokeBecomeOverseerActivationProofs {
+                    oldValue.contains($0.connectionID) != newValue.contains($0.connectionID)
+                }
+                connectionLifecycleState.removingConnections = newValue
+            }
+            yield &newValue
         }
     }
 
     private var executionWatchdogTerminalConnections: Set<UUID> {
         get { connectionLifecycleState.watchdogTerminalConnections }
         _modify {
-            revokeBecomeOverseerActivationProofs()
-            yield &connectionLifecycleState.watchdogTerminalConnections
+            guard !becomeOverseerActivationProofs.isEmpty else {
+                yield &connectionLifecycleState.watchdogTerminalConnections
+                return
+            }
+            let oldValue = connectionLifecycleState.watchdogTerminalConnections
+            var newValue = oldValue
+            defer {
+                revokeBecomeOverseerActivationProofs {
+                    oldValue.contains($0.connectionID) != newValue.contains($0.connectionID)
+                }
+                connectionLifecycleState.watchdogTerminalConnections = newValue
+            }
+            yield &newValue
         }
     }
 
     private var transportTerminalConnections: Set<UUID> {
         get { connectionLifecycleState.transportTerminalConnections }
         _modify {
-            revokeBecomeOverseerActivationProofs()
-            yield &connectionLifecycleState.transportTerminalConnections
+            guard !becomeOverseerActivationProofs.isEmpty else {
+                yield &connectionLifecycleState.transportTerminalConnections
+                return
+            }
+            let oldValue = connectionLifecycleState.transportTerminalConnections
+            var newValue = oldValue
+            defer {
+                revokeBecomeOverseerActivationProofs {
+                    oldValue.contains($0.connectionID) != newValue.contains($0.connectionID)
+                }
+                connectionLifecycleState.transportTerminalConnections = newValue
+            }
+            yield &newValue
         }
     }
 
@@ -1296,8 +1335,19 @@ actor ServerNetworkManager {
     private var connectionLifecycleGenerationByID: [UUID: UInt64] {
         get { connectionLifecycleState.connectionGenerations }
         _modify {
-            revokeBecomeOverseerActivationProofs()
-            yield &connectionLifecycleState.connectionGenerations
+            guard !becomeOverseerActivationProofs.isEmpty else {
+                yield &connectionLifecycleState.connectionGenerations
+                return
+            }
+            let oldValue = connectionLifecycleState.connectionGenerations
+            var newValue = oldValue
+            defer {
+                revokeBecomeOverseerActivationProofs {
+                    oldValue[$0.connectionID] != newValue[$0.connectionID]
+                }
+                connectionLifecycleState.connectionGenerations = newValue
+            }
+            yield &newValue
         }
     }
 
@@ -1634,20 +1684,20 @@ actor ServerNetworkManager {
 
     /// Per-connection restriction + routing state
     private var restrictedToolsByConnection: [UUID: Set<String>] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { restrictedToolsByConnection[$0.connectionID] != newValue[$0.connectionID] } }
     }
 
     private var additionalToolsByConnection: [UUID: Set<String>] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { additionalToolsByConnection[$0.connectionID] != newValue[$0.connectionID] } }
     }
 
     private var runPurposeByConnection: [UUID: MCPRunPurpose] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { runPurposeByConnection[$0.connectionID] != newValue[$0.connectionID] } }
     }
 
     private var resolvedPresentationWindowByConnection: [UUID: Int] = [:]
     private var preassignedConnections: Set<UUID> = [] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { preassignedConnections.contains($0.connectionID) != newValue.contains($0.connectionID) } }
     }
 
     /// Tracks the window count at the time each connection was established.
@@ -1692,7 +1742,7 @@ actor ServerNetworkManager {
 
     /// Run-scoped policy state captured when the first connection for a run is admitted.
     /// Used to rehydrate later handover/reconnect connections from server-maintained run mapping.
-    private struct RunConnectionPolicyState {
+    private struct RunConnectionPolicyState: Equatable {
         let windowID: Int
         let workspaceID: UUID?
         let tabID: UUID?
@@ -1765,31 +1815,31 @@ actor ServerNetworkManager {
     private var expectedAgentPIDsByClient: [String: Set<pid_t>] = [:]
     private var expectedAgentPIDsByRunID: [UUID: Set<pid_t>] = [:]
     private var runPolicyStateByRunID: [UUID: RunConnectionPolicyState] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { runPolicyStateByRunID[$0.runID] != newValue[$0.runID] } }
     }
 
     private var admittedPolicyRunIDs: Set<UUID> = [] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { admittedPolicyRunIDs.contains($0.runID) != newValue.contains($0.runID) } }
     }
 
     private var presentationWindowByRun: [UUID: Int] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { presentationWindowByRun[$0.runID] != newValue[$0.runID] } }
     }
 
     private var pendingPolicyApplicationIDByConnectionID: [UUID: UUID] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { pendingPolicyApplicationIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] } }
     }
 
     private var pendingPolicyApplicationIDByRunID: [UUID: UUID] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { pendingPolicyApplicationIDByRunID[$0.runID] != newValue[$0.runID] } }
     }
 
     private var runRoutingAuthorityGenerationByRunID: [UUID: UInt64] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { runRoutingAuthorityGenerationByRunID[$0.runID] != newValue[$0.runID] } }
     }
 
     private var revocationFenceGenerationByRunID: [UUID: UInt64] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { revocationFenceGenerationByRunID[$0.runID] != newValue[$0.runID] } }
     }
 
     private struct RunCatalogObservation: Equatable {
@@ -1847,12 +1897,12 @@ actor ServerNetworkManager {
 
     /// 🆕 Per-connection → windowID routing map
     private var presentationWindowByConnection: [UUID: Int] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { presentationWindowByConnection[$0.connectionID] != newValue[$0.connectionID] } }
     }
 
     private var windowBindingTransactions: [UUID: (mutex: AsyncMutex, users: Int)] = [:]
     private var runIDByConnectionID: [UUID: UUID] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet { revokeBecomeOverseerActivationProofs { runIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] } }
     }
 
     // Connection-lane ownership lives in RepoPromptDomainRuntime.
@@ -3174,15 +3224,24 @@ actor ServerNetworkManager {
     /// Request lifetimes only, not a route/role index. Weak references never retain an invocation.
     private var becomeOverseerActivationProofs: [UUID: WeakBecomeOverseerActivationProof] = [:]
 
-    /// Called before authoritative writes, including _modify access to synchronous lifecycle state.
-    /// Conservatively revoke outstanding bootstrap invocations on any route/policy mutation. No
-    /// ordinary catalog path walks this collection; with no bootstrap in flight this is a no-op.
-    private func revokeBecomeOverseerActivationProofs() {
+    /// Revoke before publishing an affected connection/run write. Lifecycle _modify stages its
+    /// proposed value until this fence runs; comparing after a backing-state write would be too late.
+    /// Revocation is sticky across ABA. Only global lifecycle/enablement writers use the default.
+    /// No ordinary catalog path walks this request-only registry; an empty registry is a no-op.
+    private func revokeBecomeOverseerActivationProofs(
+        where isAffected: (AgentSessionLinkRunCatalogRouteToken) -> Bool = { _ in true }
+    ) {
         guard !becomeOverseerActivationProofs.isEmpty else { return }
         let proofs = becomeOverseerActivationProofs
-        becomeOverseerActivationProofs.removeAll()
-        for proof in proofs.values {
-            proof.value?.invalidate()
+        for (invocationID, entry) in proofs {
+            guard let proof = entry.value else {
+                becomeOverseerActivationProofs.removeValue(forKey: invocationID)
+                continue
+            }
+            if isAffected(proof.routeToken) {
+                proof.invalidate()
+                becomeOverseerActivationProofs.removeValue(forKey: invocationID)
+            }
         }
     }
 
