@@ -102,7 +102,7 @@ package enum AgentOversightUICopy {
     /// has no session ID yet (fresh chat before the first send). Approved by Cristian 2026-10-01.
     package static let oversightAvailableAfterFirstMessage = "Available after the first message"
     /// A frozen submenu cannot promise that waiting will make its choices appear.
-    package static let oversightMenuUnavailableMessage = "Not available yet — reopen this menu"
+    package static let oversightMenuUnavailableMessage = "Open the chat to enable linking"
 
     /// VoiceOver hint on a linked/creator jump item: selecting it opens that session.
     package static func openHint(_ displayName: String) -> String {
