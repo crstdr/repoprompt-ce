@@ -727,7 +727,6 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         // Pending slots are published before the fixture enters the artifact builder. Gate that
         // admitted batch, not future admission: an early admission hold can prevent the very
         // first publication that the pull loop needs in order to commit and pause.
-        guard await artifactBuild.waitUntilEntered(timeout: 30) else { return }
         let paused = await pullPause.waitUntilEntered(timeout: 30, failOnTimeout: false)
         XCTAssertTrue(paused, "The committed pull pause must be entered before releasing the builder")
         XCTAssertFalse(pauses.values.isEmpty, "The pull loop must be paused before indexing completes")
