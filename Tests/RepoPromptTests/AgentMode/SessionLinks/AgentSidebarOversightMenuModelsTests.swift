@@ -2346,8 +2346,10 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             driver?.invalidate()
             if openings == 0 {
                 // A dead tracking loop can leave a backlog of unconsumed synthetic key events
-                // that would otherwise land in the next attempt's fresh session; pump the main
-                // run loop so they dispatch harmlessly while no menu is tracking.
+                // that would otherwise land in the next attempt's fresh session; spinning the
+                // main run loop does not dequeue NSApplication's event queue, so drain and
+                // discard pending key events before letting the run loop settle.
+                while NSApp.nextEvent(matching: .keyDown, until: .distantPast, inMode: .default, dequeue: true) != nil {}
                 RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.4))
             }
         }
