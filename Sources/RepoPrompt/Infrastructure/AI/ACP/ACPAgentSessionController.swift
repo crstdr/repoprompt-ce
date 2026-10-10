@@ -1061,6 +1061,7 @@ actor ACPAgentSessionController {
                 // closed: only an `Ok` echoing the requested base model may update local
                 // model authority — missing, malformed, or mismatched acknowledgements leave
                 // the session's real current model unknown, so local state must not move.
+                let selectionBaselineSequence = inboundMessageSequence
                 let selectionResponse: RequestResponse
                 do {
                     selectionResponse = try await sendRequestResponse(
@@ -1098,21 +1099,33 @@ actor ACPAgentSessionController {
                         "Grok Build did not confirm model '\(canonicalModel)': unexpected session/set_model acknowledgement \(String(describing: modelOutcome))"
                     )
                 }
+                #if DEBUG
+                    await debugSuspendConfigurationMutationPostcheckIfNeeded()
+                #endif
+                // Never overwrite a different-base report that arrived after this acknowledgement.
+                if let reported = discoveredSessionModels,
+                   reported.currentModelRaw != baseModel,
+                   let reportSequence = reported.currentEffortInboundSequence,
+                   reportSequence > selectionResponse.inboundSequence
+                {
+                    throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested model '\(baseModel)'")
+                }
                 // The selection was already validated as a snapshot member; never append
                 // recovery options here — an appended compound would lack effortVariant
                 // provenance and later read back as a real base.
                 let updatedOptions = discoveredSessionModels?.options
                     ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID)?.options
                     ?? []
-                // The Ok confirms only the base model. An effort-bearing mutation leaves
-                // the session's active effort UNCONFIRMED (grok applies advertised efforts
-                // but never echoes them), so record it as unknown until a fresh session
-                // config parse confirms it; a model-only request preserves the last
-                // confirmed effort.
+                // The Ok confirms only the base. Preserve effort only from a report that
+                // arrived after dispatch and names this acknowledged base; a newer model-only
+                // or mode-only snapshot cannot turn old effort into fresh confirmation.
+                let reported = discoveredSessionModels
+                let hasFreshEffortReport = reported?.currentModelRaw == baseModel
+                    && reported?.currentEffortInboundSequence.map { $0 > selectionBaselineSequence } == true
                 let updated = ACPDiscoveredSessionModels(
                     options: updatedOptions,
                     currentModelRaw: baseModel,
-                    currentEffortRaw: resolvedEffort == nil ? discoveredSessionModels?.currentEffortRaw : nil
+                    currentEffortRaw: hasFreshEffortReport ? reported?.currentEffortRaw : nil
                 )
                 discoveredSessionModels = updated
                 publishDiscoveredSessionModelsIfGloballyAuthoritative(updated)
@@ -2514,7 +2527,7 @@ actor ACPAgentSessionController {
         switch method {
         case "initialize", "authenticate", "session/new", "session/load":
             requestTimeouts.bootstrapSeconds
-        case "cursor/list_available_models", "session/set_config_option":
+        case "cursor/list_available_models", "session/set_config_option", "session/set_model":
             requestTimeouts.operationalSeconds
         default:
             nil
@@ -2978,7 +2991,7 @@ actor ACPAgentSessionController {
             sessionModeFailureReason = reason
             diagnose(.info("ACP session advertised a malformed modern mode config option: \(reason)"))
         }
-        applyDiscoveredSessionModels(from: response)
+        applyDiscoveredSessionModels(from: response, inboundSequence: inboundSequence)
         lastAppliedConfigurationSequence = inboundSequence
     }
 
@@ -3311,19 +3324,35 @@ actor ACPAgentSessionController {
             diagnose(.info("Invalidated session mode authority after malformed modern snapshot: \(reason)"))
         }
         let response: [String: Any] = ["configOptions": configOptions]
-        applyDiscoveredSessionModels(from: response)
+        applyDiscoveredSessionModels(from: response, inboundSequence: inboundSequence)
         lastAppliedConfigurationSequence = inboundSequence
     }
 
-    private func applyDiscoveredSessionModels(from response: [String: Any]) {
-        // A configOptions-only update carries no replacement for a live direct-model snapshot.
-        // Preserve both its session authority and the provider-owned effort wire state instead
-        // of routing the incomplete response through the direct parser as `.absent`.
-        if provider is ACPDirectSessionModelProvider,
+    private func applyDiscoveredSessionModels(from response: [String: Any], inboundSequence: UInt64) {
+        // A config-only report may update current direct effort authority, but it never
+        // replaces the live direct catalog or the provider-owned advertisement/wire mapping.
+        if let directProvider = provider as? ACPDirectSessionModelProvider,
            response["models"] == nil,
            sessionModelDirectSelectionSupported,
            sessionModelSnapshotHasLiveAuthority
         {
+            guard let models = discoveredSessionModels,
+                  let configOptions = response["configOptions"] as? [[String: Any]],
+                  let sessionID,
+                  let report = directProvider.parseDirectSessionEffortReport(
+                      from: configOptions, sessionID: sessionID, options: models.options
+                  )
+            else { return }
+            var updated = ACPDiscoveredSessionModels(
+                options: models.options,
+                currentModelRaw: report.baseModelRaw,
+                currentEffortRaw: report.effortRaw,
+                modelParameterSets: models.modelParameterSets,
+                hasModelParameterMetadata: models.hasModelParameterMetadata
+            )
+            updated.currentEffortInboundSequence = inboundSequence
+            discoveredSessionModels = updated
+            publishDiscoveredSessionModelsIfGloballyAuthoritative(updated)
             return
         }
 
@@ -4028,34 +4057,25 @@ actor ACPAgentSessionController {
             return nil
         }
 
-        let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity:
-            [
-                .optionID("always"),
-                .optionID("allow_always"),
-                .kind("allow_always"),
-                .optionID("once"),
-                .optionID("allow_once"),
-                .kind("allow_once")
-            ]
-        case .devin:
-            []
+        let selectedOptionID: String? = switch provider.providerID {
         case .grokBuild:
-            // Strict RepoPrompt MCP auto-approval is per-request: never select Grok's
-            // session-scoped `allow-edits-session` here.
-            [
-                .optionID("allow-once"),
-                .optionID("once"),
-                .optionID("allow_once"),
-                .kind("allow_once")
-            ]
-        }
-
-        let filteredOptions = safePermissionOptionsForAutoSelection(options)
-        let selectedOptionID: String? = if provider.providerID == .devin {
-            filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
-        } else {
-            optionID(for: filteredOptions, preferences: preferences)
+            // Strict RepoPrompt MCP auto-approval must remain genuinely one-time,
+            // even when Grok mislabels a broader option's ID or kind.
+            preferredAllowOptionID(for: options, sessionScoped: false)
+        case .devin:
+            safePermissionOptionsForAutoSelection(options).first(where: { $0.optionID == "allow_once" })?.optionID
+        case .openCode, .cursor, .antigravity:
+            optionID(
+                for: safePermissionOptionsForAutoSelection(options),
+                preferences: [
+                    .optionID("always"),
+                    .optionID("allow_always"),
+                    .kind("allow_always"),
+                    .optionID("once"),
+                    .optionID("allow_once"),
+                    .kind("allow_once")
+                ]
+            )
         }
         guard let selectedOptionID else { return nil }
         return AutoApprovalSelection(optionID: selectedOptionID, match: match)
