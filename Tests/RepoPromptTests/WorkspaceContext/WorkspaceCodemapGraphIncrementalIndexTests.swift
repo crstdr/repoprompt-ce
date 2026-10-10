@@ -696,8 +696,8 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         let repository = try ReviewGitRepositoryFixture(name: #function)
         let rootURL = try repository.makeRepository(named: "root", files: sources)
         // The gate never opens on its own: a pause ends only through a flush or cancellation.
-        let gate = CodemapGraphIndexGate()
-        await gate.close()
+        let pullPause = TestReleaseFence(name: "committed graph pull pause")
+        let artifactBuild = TestReleaseFence(name: "graph index artifact build")
         let pauses = CodemapLockedValues<UInt64>()
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -707,12 +707,14 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
             ),
             graphPullPause: WorkspaceCodemapGraphPullPause { applyNanoseconds in
                 pauses.append(applyNanoseconds)
-                await gate.pass()
-            }
+                await pullPause.enterAndWait()
+            },
+            beforeArtifactBuild: { _ in await artifactBuild.enterAndWait() }
         )
         let store = fixture.makeStore()
         addTeardownBlock {
-            await gate.open()
+            artifactBuild.release()
+            pullPause.release()
             await fixture.shutdown()
             repository.cleanup()
         }
@@ -722,23 +724,18 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         let engine = try fixture.runtime().bindingEngine()
         let rootEpoch = try await waitForGraphIndexRoot(engine: engine, rootID: loaded.id)
 
-        // Hold further pages until the pull loop has committed and entered the gated pause, so
-        // the completing publication provably arrives while the loop is paused.
-        let hold = await engine.debugAcquireGraphIndexAdmissionHold(
-            rootEpoch: rootEpoch,
-            expiresAfterMilliseconds: 600_000
-        )
-        let holdID = try XCTUnwrap(hold?.holdID)
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(30))
-        while pauses.values.isEmpty, clock.now < deadline {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        // Pending slots are published before the fixture enters the artifact builder. Gate that
+        // admitted batch, not future admission: an early admission hold can prevent the very
+        // first publication that the pull loop needs in order to commit and pause.
+        guard await artifactBuild.waitUntilEntered(timeout: 30) else { return }
+        let paused = await pullPause.waitUntilEntered(timeout: 30, failOnTimeout: false)
+        XCTAssertTrue(paused, "The committed pull pause must be entered before releasing the builder")
         XCTAssertFalse(pauses.values.isEmpty, "The pull loop must be paused before indexing completes")
+        guard paused else { return }
         let completedBeforePause = await engine.accounting().graphIndexRoots
             .first { $0.rootEpoch == rootEpoch }?.phase == .complete
-        XCTAssertFalse(completedBeforePause, "The admission hold must keep indexing incomplete")
-        _ = await engine.debugReleaseGraphIndexAdmissionHold(holdID, rootEpoch: rootEpoch)
+        XCTAssertFalse(completedBeforePause, "The artifact-build fence must keep indexing incomplete")
+        artifactBuild.release()
 
         let completed = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
         XCTAssertEqual(completed.progress.counts.processedCandidateCount, UInt64(fileCount))
