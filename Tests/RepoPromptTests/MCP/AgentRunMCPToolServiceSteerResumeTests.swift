@@ -400,6 +400,118 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertFalse(hasActiveRegistration)
     }
 
+    func testResidentSteerCancelledDuringCallerResolutionDoesNotAcceptInput() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.selectedAgent = .claudeCode
+        session.runState = .running
+        session.installRunID(UUID())
+        // Keep accepted steering queued so a provider flush cannot hide an erroneous admission.
+        session.isMCPInstructionDispatchInProgress = true
+        viewModel.storeDraftText(for: session.tabID, "local draft")
+        viewModel.interviewFirst = true
+        let transcript = session.transcript
+        let items = session.items
+        let audit = session.automationTurnAudit
+        let composerToken = session.composerSubmissionToken
+        let controlGeneration = session.mcpControlActivationGeneration
+        let callerResolution = ResidentSteerGate()
+        let service = makeService(window: window, resolveCaller: { _, _ in
+            await callerResolution.wait()
+            return nil
+        })
+        let task = Task { @MainActor in
+            try await service.execute(args: [
+                "op": .string("steer"), "session_id": .string(sessionID.uuidString),
+                "message": .string("cancelled client task"), "wait": .bool(false)
+            ])
+        }
+        defer {
+            task.cancel()
+            callerResolution.release()
+        }
+        try await AsyncTestWait.waitUntil("caller resolution parked") {
+            await MainActor.run { callerResolution.isWaiting }
+        }
+        task.cancel()
+        callerResolution.release()
+        do {
+            _ = try await task.value
+            XCTFail("Cancellation before resident admission must throw")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "Expected ordinary cancellation, got: \(error)")
+        }
+        XCTAssertEqual(session.items, items)
+        XCTAssertEqual(session.transcript, transcript)
+        XCTAssertEqual(session.automationTurnAudit, audit)
+        XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty, "No Claude interrupt may be queued")
+        XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertTrue(session.pendingInstructions.isEmpty)
+        XCTAssertNil(session.claudeSteeringFlushTask)
+        XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.isEmpty)
+        XCTAssertEqual(session.composerSubmissionToken, composerToken)
+        XCTAssertFalse(session.isComposerSubmissionInFlight)
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "local draft")
+        XCTAssertTrue(viewModel.interviewFirst)
+        XCTAssertEqual(session.mcpControlActivationGeneration, controlGeneration)
+        XCTAssertNil(session.mcpControlContext)
+        XCTAssertFalse(session.isMCPOriginated)
+        let registered = await AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)
+        XCTAssertFalse(registered)
+    }
+
+    func testResidentSteerCancellationAfterAcceptanceRetainsQueuedInput() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.selectedAgent = .claudeCode
+        session.runState = .running
+        session.isMCPInstructionDispatchInProgress = true
+        let service = makeService(window: window)
+        var acceptedValue: Value?
+        let callerCompletion = ResidentSteerGate()
+        let task = Task { @MainActor in
+            acceptedValue = try await service.execute(args: [
+                "op": .string("steer"), "session_id": .string(sessionID.uuidString),
+                "message": .string("accepted client task"), "wait": .bool(false)
+            ])
+            await callerCompletion.wait()
+            try Task.checkCancellation()
+        }
+        defer {
+            task.cancel()
+            callerCompletion.release()
+        }
+        try await AsyncTestWait.waitUntil("resident steer accepted") {
+            await MainActor.run { callerCompletion.isWaiting }
+        }
+        let acceptedItems = session.items
+        let acceptedTranscript = session.transcript
+        let acceptedAudit = session.automationTurnAudit
+        let acceptedQueue = session.pendingClaudeSteeringInstructions
+        XCTAssertEqual(acceptedValue?.objectValue?["_meta"]?.objectValue?["delivery"], .string("queued_claude_interrupt"))
+        XCTAssertEqual(acceptedQueue.count, 1)
+        XCTAssertEqual(session.items.last { $0.kind == .user }?.text, AgentModeViewModel.mcpResidentTaskFrame("accepted client task"))
+        task.cancel()
+        callerCompletion.release()
+        do {
+            try await task.value
+            XCTFail("Caller completion must observe cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(session.items, acceptedItems)
+        XCTAssertEqual(session.transcript, acceptedTranscript)
+        XCTAssertEqual(session.automationTurnAudit, acceptedAudit)
+        XCTAssertEqual(session.pendingClaudeSteeringInstructions, acceptedQueue)
+        XCTAssertNil(session.mcpControlContext)
+        XCTAssertFalse(session.isMCPOriginated)
+    }
+
     func testResidentActiveClaudeSessionQueuesWithoutCapture() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -407,11 +519,28 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
         session.selectedAgent = .claudeCode
         session.runState = .running
-        let service = makeService(window: window)
-        let value = try await service.execute(args: [
-            "op": .string("steer"), "session_id": .string(sessionID.uuidString),
-            "message": .string("active client task"), "wait": .bool(false)
-        ])
+        session.isMCPInstructionDispatchInProgress = true
+        let callerResolution = ResidentSteerGate()
+        let service = makeService(window: window, resolveCaller: { _, _ in
+            await callerResolution.wait()
+            return nil
+        })
+        let task = Task { @MainActor in
+            try await service.execute(args: [
+                "op": .string("steer"), "session_id": .string(sessionID.uuidString),
+                "message": .string("active client task"), "wait": .bool(false)
+            ])
+        }
+        defer {
+            task.cancel()
+            callerResolution.release()
+        }
+        try await AsyncTestWait.waitUntil("uncancelled caller resolution parked") {
+            await MainActor.run { callerResolution.isWaiting }
+        }
+        callerResolution.release()
+        let value = try await task.value
+        XCTAssertEqual(session.pendingClaudeSteeringInstructions.count, 1)
         XCTAssertEqual(value.objectValue?["_meta"]?.objectValue?["delivery"], .string("queued_claude_interrupt"))
         XCTAssertEqual(session.items.last { $0.kind == .user }?.text, AgentModeViewModel.mcpResidentTaskFrame("active client task"))
         XCTAssertNil(session.mcpControlContext)
@@ -522,6 +651,26 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertNil(session.mcpControlContext)
     }
 
+    /// Release is latched even if timeout cleanup runs before the task reaches its gate.
+    @MainActor
+    private final class ResidentSteerGate {
+        private var released = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        private(set) var isWaiting = false
+
+        func wait() async {
+            guard !released else { return }
+            isWaiting = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func release() {
+            released = true
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
     private func legacyExpiredValue(sessionID: UUID) -> Value {
         .object([
             "session_id": .string(sessionID.uuidString), "status": .string("expired"),
@@ -590,7 +739,10 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         return session
     }
 
-    private func makeService(window: WindowState, requestedTabID: UUID? = nil) -> AgentRunMCPToolService {
+    private func makeService(
+        window: WindowState, requestedTabID: UUID? = nil,
+        resolveCaller: @escaping AgentSessionTargetOperationGuard.SpawnParentSessionResolver = { _, _ in nil }
+    ) -> AgentRunMCPToolService {
         AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
@@ -603,7 +755,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in requestedTabID },
             resolveSpawnParentSourceTabID: { _ in nil },
-            resolveSpawnParentSessionID: { _, _ in nil },
+            resolveSpawnParentSessionID: resolveCaller,
             withHeartbeat: { _, _, _, _, operation in try await operation() },
             startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
                 throw MCPError.internalError("startRun should not be used by steer resume tests")
