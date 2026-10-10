@@ -72,6 +72,67 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertFalse(registered)
     }
 
+    /// Fork combination: an external `agent_run steer` with `wait:false` leaves the resident
+    /// session's ordinary origin/control/parent provenance untouched, so its own in-app Agent
+    /// route remains eligible for explicit `become_overseer` bootstrap afterwards.
+    func testResidentSteerRetainsOrdinaryProvenanceAndBootstrapEligibility() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.isMCPOriginated = false
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .codexExec
+        session.installRunID(UUID())
+        session.runState = .waitingForUser
+        session.instructionWaitID = UUID()
+        let resumed = Task { @MainActor in
+            try await withCheckedThrowingContinuation { session.instructionContinuation = $0 }
+        }
+        try await AsyncTestWait.waitUntil("instruction continuation") {
+            await MainActor.run { session.instructionContinuation != nil }
+        }
+        let service = makeService(window: window)
+        _ = try await service.execute(args: [
+            "op": .string("steer"), "session_id": .string(sessionID.uuidString),
+            "message": .string("resident steer"), "wait": .bool(false), "timeout_seconds": .int(0)
+        ])
+        _ = try await resumed.value
+        // Origin/control/parent provenance is unchanged: external steer never captures.
+        XCTAssertNil(session.mcpControlContext)
+        XCTAssertFalse(session.isMCPOriginated)
+        XCTAssertNil(session.parentSessionID)
+        XCTAssertNil(session.createdByOverseerSessionID)
+        let registered = await AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)
+        XCTAssertFalse(registered)
+        // The same session's own installed route is still bootstrap-eligible through the real
+        // bridge/host path, and activation commits on the session object without inventing a grant.
+        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        let eligible = bridge.overseerBootstrapState(for: endpoint)
+        XCTAssertNotNil(eligible)
+        XCTAssertNil(eligible?.activation)
+        let tool = BecomeOverseerMCPToolService(
+            captureRequestMetadata: {
+                .init(connectionID: UUID(), clientName: "resident-own-route", windowID: window.windowID)
+            },
+            resolveObserverEndpoint: { _ in endpoint },
+            isEnabled: { true }, bridge: bridge,
+            prepareActivationCommit: { _, _ in
+                .init(commitIfCurrent: { $0() }, invalidate: {})
+            }
+        )
+        let result = try await tool.execute(args: [:])
+        XCTAssertEqual(result, .string(BecomeOverseerMCPToolService.nextTurnResult))
+        XCTAssertNotNil(session.oversight.overseerActivation)
+        XCTAssertNotNil(bridge.overseerBootstrapState(for: endpoint)?.activation)
+        let anyLink = await bridge.hasActiveLink(endpoint: endpoint)
+        XCTAssertFalse(anyLink)
+        let outbound = await bridge.hasActiveOutboundLink(observerEndpoint: endpoint)
+        XCTAssertFalse(outbound)
+    }
+
     func testResidentMessageAndWaitRefusesBeforeSubmission() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
