@@ -1842,6 +1842,30 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         }
     }
 
+    func testColdRightClickShowsOpenChatHintForUnopenedPersistedRow() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        let tabID = fixture.tabs[0].id
+        let sessionID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let persisted = fixture.vm.session(for: tabID)
+        persisted.selectedAgent = .devin
+        persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
+        persisted.providerSessionID = "hosted-persisted-acp-session"
+        await fixture.vm.flushSave(for: tabID)
+        fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
+        fixture.vm.test_removeSession(tabID: tabID)
+        await settleHostedPublication(in: fixture)
+        XCTAssertNil(fixture.vm.sessions[tabID], "Unopened in this window: no live bound session")
+        XCTAssertNil(fixture.vm.agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: sessionID))
+        XCTAssertNil(fixture.vm.agentSidebarOversightMenuProps(tabID: tabID, expectedSessionID: sessionID))
+
+        let menu = try await open(in: fixture)
+        for title in [AgentOversightUICopy.overseeNewTitle, AgentOversightUICopy.overseeByTitle] {
+            let submenu = try XCTUnwrap(menu.items.first { $0.title == title }?.submenu)
+            XCTAssertEqual(submenu.items.map(\.title), ["Open the chat to enable linking"])
+            XCTAssertFalse(submenu.items[0].isEnabled)
+        }
+    }
+
     func testColdControlClickShowsInboundOnly() async throws {
         let fixture = try await makeFixture(peerCount: 2)
         try await add(from: 1, to: 0, in: fixture)
