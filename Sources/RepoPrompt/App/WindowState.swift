@@ -734,6 +734,34 @@ class WindowState: ObservableObject {
             self?.retirePendingRestoreEntry()
         }
 
+        // Installed before yielding. Lookup does not consume execution: startup revalidates
+        // authority/admission first, then atomically takes this exact accepted entry. A non-System
+        // entry resolving to System stays pending until ordinary restore can release its protection.
+        workspaceManager.initialWorkspaceRestoreCandidate = { [weak self] in
+            guard let self, !isClosing,
+                  let pending = restoreLifetime.pendingDispatch,
+                  let target = resolveWorkspace(for: pending.entry),
+                  pending.entry.isSystemWorkspace || !target.isSystemWorkspace
+            else { return nil }
+            let sequence = pending.acceptanceSequence
+            let targetID = target.id
+            return (target, { [weak self] in
+                guard let self, !isClosing,
+                      let current = restoreLifetime.pendingDispatch,
+                      current.acceptanceSequence == sequence,
+                      let resolved = resolveWorkspace(for: current.entry),
+                      resolved.id == targetID,
+                      current.entry.isSystemWorkspace || !resolved.isSystemWorkspace,
+                      let dispatch = restoreLifetime.takePendingForDispatch()
+                else { return nil }
+                if dispatch.entry.isSystemWorkspace, resolved.isSystemWorkspace {
+                    restoreLifetime.releaseProtection(forDispatchedAcceptance: sequence)
+                }
+                StartupPhaseLog.mark(.restoreDispatchEnqueue, window: windowID)
+                return dispatch
+            })
+        }
+
         // Process any queued commands once the workspace is initialized
         workspaceManager.onceInitialized { [weak self] in
             guard let self else { return }
@@ -1759,7 +1787,12 @@ class WindowState: ObservableObject {
     private func resolveWorkspace(for entry: WindowSessionEntry) -> WorkspaceModel? {
         let workspaces = workspaceManager.workspaces
 
-        if let id = entry.workspaceID, let match = workspaces.first(where: { $0.id == id }) {
+        // System intent must never resolve to a user namesake or a stale user ID/path.
+        if entry.isSystemWorkspace {
+            return workspaces.first(where: { $0.isSystemWorkspace })
+        }
+
+        if let match = workspaceManager.workspace(withID: entry.workspaceID) {
             return match
         }
 
@@ -1776,12 +1809,6 @@ class WindowState: ObservableObject {
 
         if let name = entry.workspaceName, !name.isEmpty,
            let match = workspaces.first(where: { $0.name == name })
-        {
-            return match
-        }
-
-        if entry.isSystemWorkspace,
-           let match = workspaces.first(where: { $0.isSystemWorkspace })
         {
             return match
         }

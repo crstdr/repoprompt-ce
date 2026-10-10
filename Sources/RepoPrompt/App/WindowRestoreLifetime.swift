@@ -58,6 +58,12 @@ struct WindowRestoreLifetime {
         pending != nil
     }
 
+    /// A read-only candidate, not an execution transfer. Only `takePendingForDispatch` owns
+    /// consumption; callers must never invoke the snapshot's completion.
+    var pendingDispatch: Dispatch? {
+        pending
+    }
+
     var protectedEntry: WindowSessionEntry? {
         protection?.entry
     }

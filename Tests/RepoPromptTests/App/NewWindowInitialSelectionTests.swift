@@ -239,25 +239,46 @@ import XCTest
                 XCTAssertEqual(recovery.count, 0)
             }
 
-            // Published startup held at hydration spawn: explicit open joins hydration, then publishes.
-            try await Fixture.run { f in
-                let window = f.makeWindow()
-                let manager = window.workspaceManager
-                let hold = f.holdHydrationSpawn(manager, of: Fixture.defaultID)
-                let recovery = f.countRecoveryBegins(manager)
-                let recorder = f.makeRecorder(manager: manager)
-                try await f.wait(hold.entered)
-                try await f.awaitCaughtUpWithCatalogBaseline(window)
-                let superseded = f.observeSupersession(manager)
-                let target = try XCTUnwrap(manager.workspace(withID: Fixture.requestedID))
-                let open = f.startOwned { await manager.requestWorkspaceSwitch(to: target) }
-                try await f.wait(superseded)
-                hold.gate.release()
-                let result = await open.value
-                XCTAssertTrue(result.didSwitch, "\(result)")
-                XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
-                XCTAssertEqual(recorder.emittedIDs.count(where: { $0 == Fixture.defaultID }), 1)
-                XCTAssertEqual(recovery.count, 0)
+            // Default and consumed saved startup share the same published-operation join owner.
+            for savedFirst in [false, true] {
+                try await Fixture.run { f in
+                    let window = f.makeWindow()
+                    let manager = window.workspaceManager
+                    let initial = savedFirst ? f.holdInitialResolution(manager) : nil
+                    let initialID = savedFirst ? Fixture.requestedID : Fixture.defaultID
+                    let hold = f.holdHydrationSpawn(manager, of: initialID)
+                    let recovery = f.countRecoveryBegins(manager)
+                    let recorder = f.makeRecorder(manager: manager)
+                    let admissions = StartupAdmissionRecorder(manager)
+                    var completions = 0
+                    if let initial {
+                        try await f.wait(initial.entered)
+                        try await f.awaitCaughtUpWithCatalogBaseline(window)
+                        window.applyWindowRestoreEntry(f.restoreEntry(for: initialID, window: window)) { completions += 1 }
+                        initial.gate.release()
+                    }
+                    try await f.wait(hold.entered)
+                    try await f.awaitCaughtUpWithCatalogBaseline(window)
+                    let superseded = f.observeSupersession(manager)
+                    let targetID = savedFirst ? Fixture.aardvarkID : Fixture.requestedID
+                    let target = try XCTUnwrap(manager.workspace(withID: targetID))
+                    let open = f.startOwned { await manager.requestWorkspaceSwitch(to: target) }
+                    try await f.wait(superseded)
+                    if savedFirst {
+                        XCTAssertEqual(completions, 0)
+                        XCTAssertEqual(admissions.targets, [initialID], "Explicit successor joins published saved owner")
+                    }
+                    hold.gate.release()
+                    let result = await open.value
+                    XCTAssertTrue(result.didSwitch, "\(result)")
+                    XCTAssertEqual(manager.activeWorkspaceID, targetID)
+                    XCTAssertEqual(recorder.emittedIDs.count(where: { $0 == initialID }), 1)
+                    XCTAssertEqual(recovery.count, 0)
+                    if savedFirst {
+                        XCTAssertEqual(completions, 1)
+                        XCTAssertEqual(admissions.targets, [initialID, targetID])
+                    }
+                }
             }
 
             // Same-ID reactivation of published startup joins instead of returning concurrent-blocked.
@@ -623,8 +644,20 @@ import XCTest
                     try await f.awaitCaughtUpWithCatalogBaseline(window)
 
                     let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
+                    let admissions = StartupAdmissionRecorder(manager)
+                    var order: [String] = []
+                    manager.setWorkspaceSwitchDidFinishHandlerForTesting { _ in order.append("settled") }
+                    manager.onceInitialized { order.append("initialized") }
                     let restored = Signal("restore completion")
-                    window.applyWindowRestoreEntry(entry) { restored.fire() }
+                    window.applyWindowRestoreEntry(entry) {
+                        if !failsStartup {
+                            XCTAssertFalse(manager.isInitialized)
+                            XCTAssertNil(manager.activeWorkspaceSwitch)
+                            XCTAssertFalse(manager.isSwitchingWorkspace)
+                        }
+                        order.append("accepted")
+                        restored.fire()
+                    }
                     XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, Fixture.requestedID, "armed at acceptance")
                     XCTAssertEqual(
                         window.sessionCaptureCandidate().entry?.workspaceID,
@@ -640,6 +673,8 @@ import XCTest
                     try await f.acknowledgeRouteConsumption(routeRecorder)
                     try await f.acknowledgeWindowObservers(window)
                     XCTAssertEqual(restored.count, 1)
+                    XCTAssertEqual(admissions.targets, [Fixture.requestedID], "One saved admission, zero transient Default")
+                    if !failsStartup { XCTAssertEqual(order, ["settled", "accepted", "initialized"]) }
                     XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
                     XCTAssertEqual(route.rootRoute, .main)
                     XCTAssertNil(window.protectedRestoreEntryForTesting)
@@ -799,9 +834,9 @@ import XCTest
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
                 try await f.awaitCaughtUpWithCatalogBaseline(window)
-                XCTAssertNil(manager.activeWorkspaceID)
-                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "initial_default_selection")
-                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.workspaceID, Fixture.namesakeID)
+                XCTAssertNotEqual(manager.activeWorkspaceID, Fixture.namesakeID)
+                XCTAssertEqual(manager.activeWorkspace?.isSystemWorkspace, true)
+                XCTAssertNil(manager.domainWorkspaceAuthorityIssue)
                 let namesake = try XCTUnwrap(manager.workspace(withID: Fixture.namesakeID))
                 XCTAssertFalse(namesake.isSystemWorkspace, "Namesake is not reclassified")
                 XCTAssertEqual(namesake.name, "Default")
@@ -936,6 +971,410 @@ import XCTest
                 XCTAssertNil(manager.activeWorkspaceSwitch)
                 XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice, "No blocked notice on close")
                 XCTAssertFalse(manager.test_isPollTimerActive)
+            }
+        }
+
+        // MARK: Saved-first startup dispatch ownership
+
+        func testSavedStartupCanonicalClassificationRejectsAfterAdmissionAndRebuildsSystemReadiness() async throws {
+            try await assertCanonicalStartupRejection(failFallback: false)
+        }
+
+        func testPristineSavedFailureHasOneTerminalFailedSystemFallback() async throws {
+            try await assertCanonicalStartupRejection(failFallback: true)
+        }
+
+        private func assertCanonicalStartupRejection(failFallback: Bool) async throws {
+            try await Fixture.run { f in
+                let (window, hold) = try await f.readyWindowAtInitialResolution()
+                let manager = window.workspaceManager
+                let recorder = f.makeRecorder(manager: manager)
+                let admissions = StartupAdmissionRecorder(manager)
+                let completed = Signal("failed saved dispatch completed")
+                var readinessResets = 0
+                manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                    readinessResets += 1
+                    guard readinessResets == 1 else { return }
+                    XCTAssertEqual(manager.activeWorkspaceSwitch?.targetWorkspaceID, Fixture.requestedID)
+                    XCTAssertFalse(window.hasPendingRestoreEntryForTesting, "Actual Dispatch transferred before mutation")
+                    XCTAssertNil(manager.activeWorkspaceID)
+                    await window.joinDomainWorkspaceBridgeForTesting()
+                    let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -1199)
+                    let record = await client.canonicalWorkspaceSnapshot(Fixture.requestedID)
+                    guard let record else { return XCTFail("Missing canonical saved target") }
+                    var working = Fixture.model(id: Fixture.requestedID, name: "Z requested")
+                    working.lastUsed = working.lastUsed.addingTimeInterval(60)
+                    let outcome = try? await client.replaceWorking(
+                        working,
+                        fileURL: record.document.fileURL,
+                        expectedWorkspaceRevision: record.revisions.workingRevision
+                    )
+                    XCTAssertEqual(outcome?.disposition, .applied)
+                    working.consolidatedIntoWorkspaceID = Fixture.aardvarkID
+                    try? f.writeDocument(working)
+                }
+                if failFallback {
+                    manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting { id in
+                        guard id == Fixture.defaultID, let index = manager.workspaces.firstIndex(where: { $0.id == id }) else { return }
+                        manager.workspaces[index].isSystemWorkspace = false
+                    }
+                }
+                window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.requestedID, window: window)) {
+                    XCTAssertFalse(manager.isInitialized)
+                    XCTAssertNil(manager.activeWorkspaceSwitch)
+                    XCTAssertFalse(manager.isSwitchingWorkspace)
+                    XCTAssertEqual(manager.activeWorkspaceID, failFallback ? nil : Fixture.defaultID)
+                    completed.fire()
+                }
+                hold.gate.release()
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                try await f.wait(completed)
+                try await f.acknowledgeWindowObservers(window)
+                XCTAssertEqual(completed.count, 1)
+                XCTAssertEqual(admissions.targets, [Fixture.requestedID, Fixture.defaultID])
+                XCTAssertEqual(readinessResets, 2)
+                XCTAssertFalse(recorder.emittedIDs.contains(Fixture.requestedID))
+                XCTAssertTrue(manager.isInitialized)
+                if failFallback {
+                    XCTAssertNil(manager.activeWorkspaceID)
+                    XCTAssertFalse(manager.workspaceSearchReadinessState.isSearchAdmissible)
+                    XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "initial_default_selection")
+                } else {
+                    XCTAssertEqual(manager.activeWorkspace?.isSystemWorkspace, true)
+                    XCTAssertTrue(manager.workspaceSearchReadinessState.isSearchAdmissible)
+                    XCTAssertEqual(manager.workspaceSearchReadinessState.ticket?.workspaceID, Fixture.defaultID)
+                }
+                XCTAssertEqual(manager.workspaceSearchReadinessWaiterCountForTesting, 0)
+                XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, Fixture.requestedID)
+                XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, Fixture.requestedID)
+            }
+        }
+
+        func testSystemIntendedRestoreNeverSelectsStaleUserIdentityAndNamesakeRequiresAcceptance() async throws {
+            for intendedSystem in [false, true] {
+                try await Fixture.run(seeds: Fixture.namesakeSeeds) { f in
+                    let (window, hold) = try await f.readyWindowAtInitialResolution()
+                    let manager = window.workspaceManager
+                    let recorder = f.makeRecorder(manager: manager)
+                    let admissions = StartupAdmissionRecorder(manager)
+                    var entry = f.restoreEntry(for: Fixture.namesakeID, window: window)
+                    entry.isSystemWorkspace = intendedSystem
+                    let completed = Signal("namesake restore completed")
+                    window.applyWindowRestoreEntry(entry) { completed.fire() }
+                    hold.gate.release()
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    try await f.wait(completed)
+                    XCTAssertEqual(completed.count, 1)
+                    XCTAssertEqual(admissions.targets.count, 1)
+                    if intendedSystem {
+                        XCTAssertTrue(manager.activeWorkspace?.isSystemWorkspace == true)
+                        XCTAssertFalse(recorder.emittedIDs.contains(Fixture.namesakeID))
+                    } else {
+                        XCTAssertEqual(manager.activeWorkspaceID, Fixture.namesakeID)
+                        XCTAssertFalse(manager.activeWorkspace?.isSystemWorkspace ?? true)
+                    }
+                }
+            }
+        }
+
+        func testNonSystemEntryResolvingToSystemReleasesProtectionAfterStartupSettles() async throws {
+            for resolvesByName in [false, true] {
+                try await Fixture.run { f in
+                    let (window, resolution) = try await f.readyWindowAtInitialResolution()
+                    let manager = window.workspaceManager
+                    let publication = f.holdPublication(manager, of: Fixture.defaultID)
+                    let admissions = StartupAdmissionRecorder(manager)
+                    var entry = f.restoreEntry(for: Fixture.defaultID, window: window)
+                    entry.isSystemWorkspace = false
+                    if resolvesByName { entry.workspaceID = UUID(uuidString: "90000000-0000-0000-0000-000000000009")! }
+                    let completed = Signal("non-System entry resolved to live System")
+                    window.applyWindowRestoreEntry(entry) {
+                        XCTAssertTrue(manager.isInitialized, "Mismatch uses ordinary post-initialization restore")
+                        XCTAssertNil(manager.activeWorkspaceSwitch)
+                        XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
+                        completed.fire()
+                    }
+                    resolution.gate.release()
+                    try await f.wait(publication.entered)
+                    XCTAssertTrue(window.hasPendingRestoreEntryForTesting, "Startup must not consume the mismatch")
+                    XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, entry.workspaceID)
+                    XCTAssertEqual(window.sessionCaptureCandidate().entry?.isSystemWorkspace, false)
+                    XCTAssertEqual(completed.count, 0)
+                    publication.gate.release()
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    try await f.wait(completed)
+                    try await f.acknowledgeWindowObservers(window)
+                    XCTAssertEqual(completed.count, 1)
+                    XCTAssertEqual(admissions.targets, [Fixture.defaultID], "Ordinary restore is a settled same-ID no-op")
+                    XCTAssertFalse(window.hasPendingRestoreEntryForTesting)
+                    XCTAssertNil(window.protectedRestoreEntryForTesting)
+                    let captured = try XCTUnwrap(window.sessionCaptureCandidate().entry)
+                    XCTAssertEqual(captured.workspaceID, Fixture.defaultID)
+                    XCTAssertTrue(captured.isSystemWorkspace, "Capture records live System, not the stale accepted flag")
+                }
+            }
+        }
+
+        func testUnavailableSystemAtPublicationKeepsNonSystemRestoreProtection() async throws {
+            try await Fixture.run { f in
+                let (window, resolution) = try await f.readyWindowAtInitialResolution()
+                let manager = window.workspaceManager
+                let publication = f.holdPublication(manager, of: Fixture.defaultID)
+                let recorder = f.makeRecorder(manager: manager)
+                let admissions = StartupAdmissionRecorder(manager)
+                var entry = f.restoreEntry(for: Fixture.defaultID, window: window)
+                entry.isSystemWorkspace = false
+                let completed = Signal("unavailable System restore completed")
+                window.applyWindowRestoreEntry(entry) { completed.fire() }
+                resolution.gate.release()
+                try await f.wait(publication.entered)
+                XCTAssertTrue(window.hasPendingRestoreEntryForTesting)
+                XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, entry.workspaceID)
+                XCTAssertEqual(completed.count, 0)
+                // Lose the projected target at the final System publication boundary. Startup must
+                // reject it, and ordinary restore has no resolved/live System that can end protection.
+                await window.joinDomainWorkspaceBridgeForTesting()
+                manager.workspaces.removeAll { $0.id == Fixture.defaultID }
+                publication.gate.release()
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                try await f.wait(completed)
+                try await f.acknowledgeWindowObservers(window)
+                XCTAssertEqual(completed.count, 1)
+                XCTAssertEqual(admissions.targets, [Fixture.defaultID])
+                XCTAssertTrue(manager.isInitialized)
+                XCTAssertNil(manager.activeWorkspaceID)
+                XCTAssertFalse(recorder.emittedIDs.contains(Fixture.defaultID))
+                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "initial_default_selection")
+                XCTAssertFalse(window.hasPendingRestoreEntryForTesting)
+                XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, entry.workspaceID)
+                let captured = try XCTUnwrap(window.sessionCaptureCandidate().entry)
+                XCTAssertEqual(captured.workspaceID, entry.workspaceID)
+                XCTAssertFalse(captured.isSystemWorkspace, "Terminal failure preserves the accepted snapshot")
+            }
+        }
+
+        func testAcceptedSystemReclassificationCannotPublishNonSystemIdentity() async throws {
+            enum Mutation: CaseIterable { case localAtPublication, canonicalAtPublication }
+            for mutation in Mutation.allCases {
+                try await Fixture.run { f in
+                    let (window, resolution) = try await f.readyWindowAtInitialResolution()
+                    let manager = window.workspaceManager
+                    let publication = f.holdPublication(manager, of: Fixture.defaultID)
+                    let recorder = f.makeRecorder(manager: manager)
+                    let completed = Signal("System intended completion")
+                    window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.defaultID, window: window)) {
+                        XCTAssertFalse(manager.isInitialized)
+                        completed.fire()
+                    }
+                    resolution.gate.release()
+                    try await f.wait(publication.entered)
+                    if mutation == .localAtPublication {
+                        let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.defaultID })
+                        manager.workspaces[index].isSystemWorkspace = false
+                    } else {
+                        await self.reclassifyCanonicalSystem(f, window: window)
+                    }
+                    publication.gate.release()
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    try await f.wait(completed)
+                    XCTAssertEqual(completed.count, 1)
+                    XCTAssertFalse(recorder.emittedIDs.contains(Fixture.defaultID), "System-intended dispatch cannot acquire non-System permission")
+                    XCTAssertNil(manager.activeWorkspaceID)
+                }
+            }
+        }
+
+        func testCloseDuringSavedStartupCannotPublishOrHydrateAfterClose() async throws {
+            try await Fixture.run { f in
+                let (window, resolution) = try await f.readyWindowAtInitialResolution()
+                let manager = window.workspaceManager
+                let publication = f.holdPublication(manager, of: Fixture.requestedID)
+                let recorder = f.makeRecorder(manager: manager)
+                let admissions = StartupAdmissionRecorder(manager)
+                let completed = Signal("closed saved dispatch completion")
+                var hydrationSpawns = 0
+                manager.setWorkspaceRootHydrationWillSpawnHandlerForTesting { _ in hydrationSpawns += 1 }
+                window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.requestedID, window: window)) { completed.fire() }
+                resolution.gate.release()
+                try await f.wait(publication.entered)
+                XCTAssertFalse(window.hasPendingRestoreEntryForTesting)
+                window.beginClose()
+                publication.gate.release()
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                try await f.wait(completed)
+                XCTAssertEqual(completed.count, 1)
+                XCTAssertEqual(admissions.targets, [Fixture.requestedID])
+                XCTAssertTrue(recorder.emittedIDs.allSatisfy { $0 == nil })
+                XCTAssertEqual(hydrationSpawns, 0)
+                XCTAssertNil(manager.activeWorkspaceSwitch)
+                XCTAssertFalse(manager.test_isPollTimerActive)
+                XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, Fixture.requestedID)
+            }
+        }
+
+        func testPublishedSavedRecoveryFailureOwnsCleanupWithoutSecondFallbackAdmission() async throws {
+            try await Fixture.run { f in
+                let (window, resolution) = try await f.readyWindowAtInitialResolution()
+                let manager = window.workspaceManager
+                let hydration = f.holdHydrationSpawn(manager, of: Fixture.requestedID)
+                let recovery = f.countRecoveryBegins(manager)
+                let admissions = StartupAdmissionRecorder(manager)
+                let completed = Signal("published saved failure completion")
+                window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.requestedID, window: window)) {
+                    XCTAssertFalse(manager.isInitialized)
+                    XCTAssertNil(manager.activeWorkspaceSwitch)
+                    completed.fire()
+                }
+                manager.setWorkspaceSwitchRecoveryWillBeginHandlerForTesting {
+                    recovery.increment()
+                    await self.reclassifyCanonicalSystem(f, window: window)
+                }
+                resolution.gate.release()
+                try await f.wait(hydration.entered)
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
+                await manager.cancelCurrentWorkspaceSwitchAndReturnToSystem()
+                hydration.gate.release()
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                try await f.wait(completed)
+                XCTAssertEqual(completed.count, 1)
+                XCTAssertEqual(recovery.count, 1)
+                XCTAssertEqual(admissions.targets, [Fixture.requestedID], "No new fallback after owned recovery failure")
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID, "Failed recovery retains the published selection")
+                XCTAssertNotNil(manager.pendingWorkspaceSwitchBlockedNotice)
+                XCTAssertFalse(manager.workspaceSearchReadinessState.isSearchAdmissible)
+                XCTAssertTrue(manager.isInitialized)
+            }
+        }
+
+        private func reclassifyCanonicalSystem(_ f: Fixture, window: WindowState) async {
+            await window.joinDomainWorkspaceBridgeForTesting()
+            let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -1199)
+            let before = await client.canonicalWorkspaceSnapshot(Fixture.defaultID)
+            guard let record = before else { return XCTFail("Missing canonical System") }
+            var user = Fixture.model(id: Fixture.defaultID, name: "Default")
+            user.lastUsed = user.lastUsed.addingTimeInterval(60)
+            let outcome = try? await client.replaceWorking(
+                user,
+                fileURL: record.document.fileURL,
+                expectedWorkspaceRevision: record.revisions.workingRevision
+            )
+            XCTAssertEqual(outcome?.disposition, .applied)
+            let after = await client.canonicalWorkspaceSnapshot(Fixture.defaultID)
+            XCTAssertEqual(after?.document.metadata.isSystemWorkspace, false)
+        }
+
+        func testActualSavedLifetimesKeepOversightTopologyAndCurrentDiscoveryIndependent() async throws {
+            try await Fixture.run { f in
+                let windows = [f.makeWindow(), f.makeWindow()]
+                for window in windows {
+                    WindowStatesManager.shared.registerWindowState(window)
+                }
+                defer { windows.forEach { WindowStatesManager.shared.unregisterWindowState($0) } }
+                let resolutions = windows.map { f.holdInitialResolution($0.workspaceManager) }
+                let publication = f.holdPublication(windows[1].workspaceManager, of: Fixture.requestedID)
+                for (index, window) in windows.enumerated() {
+                    try await f.wait(resolutions[index].entered)
+                    try await f.awaitCaughtUpWithCatalogBaseline(window)
+                }
+                var persistenceGate = WindowSessionRestorePersistenceGate()
+                persistenceGate.beginRestoreSessionLoad()
+                persistenceGate.finishRestoreSessionLoad(pendingEntryCount: 2)
+                var completions = [0, 0]
+                let admissions = windows.map { StartupAdmissionRecorder($0.workspaceManager) }
+                for (index, window) in windows.enumerated() {
+                    persistenceGate.consumePendingRestoreEntry()
+                    persistenceGate.beginRestoringWindow(window.windowID)
+                    window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.requestedID, window: window)) {
+                        XCTAssertFalse(window.workspaceManager.isInitialized)
+                        XCTAssertNil(window.workspaceManager.activeWorkspaceSwitch)
+                        completions[index] += 1
+                        persistenceGate.finishRestoringWindow(window.windowID)
+                    }
+                }
+                let host = AgentSessionOversightLaunchCoordinatorTests.FakeHost()
+                host.restoreTopology = { persistenceGate.isRestoreInProgress ? .pending : .completeAllEntriesConsumed }
+                let candidates = windows.map { window in
+                    let sessionID = UUID()
+                    let tabID = UUID()
+                    return AgentSessionLinkEndpointCandidate(
+                        windowID: window.windowID, workspaceID: Fixture.requestedID, tabID: tabID,
+                        sessionID: sessionID, persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1,
+                        isTopLevel: true, hasLoadedPersistedState: true, bindingTransitionInProgress: false,
+                        isClosing: false, isMCPControlled: false, isMCPOriginated: false,
+                        roleAllowsOutboundMonitoring: true, displayName: "Saved endpoint", providerDisplayName: "Test",
+                        locationLabel: nil, restorationReadiness: .authoritative(
+                            AgentSessionRestorationBindingToken(
+                                bindingIdentity: .init(tabID: tabID, sessionID: sessionID),
+                                bindingTransitionGeneration: 1
+                            ), .persistedPayloadApplied
+                        )
+                    )
+                }
+                host.candidates = candidates
+                host.descriptors = candidates.map { .init(
+                    windowID: $0.windowID,
+                    workspaceID: $0.workspaceID,
+                    tabID: $0.tabID,
+                    sessionID: $0.sessionID
+                ) }
+                host.discovery = windows.map { .init(epoch: .init(
+                    windowID: $0.windowID,
+                    workspaceID: Fixture.requestedID,
+                    generation: 1
+                ), isComplete: true) }
+                let pair = AgentSessionOversightIntent(observerSessionID: candidates[0].sessionID, targetSessionID: candidates[1].sessionID)
+                let intentURL = f.base.appendingPathComponent(AgentSessionOversightIntentStore.filename)
+                try JSONEncoder().encode(AgentSessionOversightIntentDocument(links: [pair])).write(to: intentURL)
+                let store = AgentSessionOversightIntentStore(
+                    fileURL: intentURL,
+                    backupsDirectoryURL: f.base.appendingPathComponent("Backups"),
+                    mode: .enabled
+                )
+                let authority = DomainAgentSessionLinkAuthority(identity: .init(
+                    runtimeID: UUID(),
+                    lifecycleGeneration: 1,
+                    processID: 1,
+                    mode: .app,
+                    createdAt: Date(timeIntervalSince1970: 0)
+                ))
+                let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+                defer { bridge.freezeForTermination() }
+                await bridge.bootstrapIntentStore(store)
+                resolutions.forEach { $0.gate.release() }
+                try await f.wait(publication.entered)
+                await windows[0].workspaceManager.awaitInitialWorkspaceActivationCompletion()
+                XCTAssertEqual(completions, [1, 0])
+                XCTAssertTrue(persistenceGate.isRestoreInProgress)
+                XCTAssertTrue(host.discovery.allSatisfy(\.isComplete))
+                bridge.noteTopologyMayHaveChanged()
+                await bridge.test_settleLaunchReconciliation()
+                XCTAssertEqual(bridge.test_launchReservationStartCount(), 0, "Complete discovery does not waive real restore topology")
+                let before = await authority.snapshot()
+                XCTAssertEqual(before.activeLinkCount, 0)
+                // Actual entry completion cannot credit a newer incomplete discovery level.
+                host.discovery[1] = .init(epoch: .init(
+                    windowID: windows[1].windowID,
+                    workspaceID: Fixture.requestedID,
+                    generation: 2
+                ), isComplete: false)
+                publication.gate.release()
+                await windows[1].workspaceManager.awaitInitialWorkspaceActivationCompletion()
+                XCTAssertEqual(completions, [1, 1])
+                XCTAssertFalse(persistenceGate.isRestoreInProgress, "Only actual callbacks finished the gate")
+                XCTAssertTrue(windows.allSatisfy(\.workspaceManager.isInitialized))
+                bridge.noteTopologyMayHaveChanged()
+                await bridge.test_settleLaunchReconciliation()
+                XCTAssertEqual(bridge.test_launchReservationStartCount(), 0, "Consumed entries do not waive current discovery")
+                host.discovery[1] = .init(epoch: host.discovery[1].epoch, isComplete: true)
+                for _ in 0 ..< 3 {
+                    bridge.noteTopologyMayHaveChanged()
+                    await bridge.test_settleLaunchReconciliation()
+                    let snapshot = await authority.snapshot()
+                    XCTAssertEqual(snapshot.activeLinkCount, 1)
+                    XCTAssertEqual(bridge.test_launchReservationStartCount(), 1)
+                }
+                XCTAssertEqual(admissions.map(\.targets), [[Fixture.requestedID], [Fixture.requestedID]])
+                XCTAssertEqual(host.providerTaskRequests, 0)
             }
         }
 
@@ -3471,6 +3910,19 @@ import XCTest
     // MARK: - Fixture
 
     @MainActor
+    private final class StartupAdmissionRecorder {
+        private(set) var targets: [UUID] = []
+        private var seen: Set<UUID> = []
+        private var observation: AnyCancellable?
+        init(_ manager: WorkspaceManagerViewModel) {
+            observation = manager.$activeWorkspaceSwitch.sink { [weak self] activity in
+                guard let self, let activity, seen.insert(activity.operationID).inserted else { return }
+                targets.append(activity.targetWorkspaceID)
+            }
+        }
+    }
+
+    @MainActor
     private final class Signal {
         let expectation: XCTestExpectation
         private(set) var count = 0
@@ -3960,6 +4412,14 @@ import XCTest
             return window
         }
 
+        func readyWindowAtInitialResolution() async throws -> (WindowState, Hold) {
+            let window = makeWindow()
+            let hold = holdInitialResolution(window.workspaceManager)
+            try await wait(hold.entered)
+            try await awaitCaughtUpWithCatalogBaseline(window)
+            return (window, hold)
+        }
+
         func projectionObserver(for window: WindowState) -> DomainWorkspaceProjectionObserver {
             guard let observer = projectionObserversByWindowID[window.windowID] else {
                 preconditionFailure("Window fixture is missing its projection observer")
@@ -4368,6 +4828,9 @@ import XCTest
                 manager.setInitialDefaultResolutionHandlerForTesting(nil)
                 manager.setInitialDefaultActivationDidSupersedeHandlerForTesting(nil)
                 manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting(nil)
+                manager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting(nil)
+                manager.setWorkspaceSwitchDidFinishHandlerForTesting(nil)
+                manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
                 manager.setWorkspaceRootHydrationWillSpawnHandlerForTesting(nil)
                 manager.setWorkspaceSwitchRecoveryWillBeginHandlerForTesting(nil)
                 manager.setCatalogRecordDecodeFailureForTesting(nil)
@@ -4601,6 +5064,125 @@ final class WindowRestoreLifetimeTests: XCTestCase {
         )
     }
 }
+
+// MARK: - Durable startup saved-target scale
+
+#if DEBUG
+    @MainActor
+    final class StartupSavedTargetScaleTests: XCTestCase {
+        func testTwentyEightColdWindowsConsumeSavedTargetsWithoutDefaultActivation() async throws {
+            let targets = (0 ..< 28).map { index in
+                var target = WorkspaceModel(name: "QA restore \(index)", repoPaths: [])
+                target.composeTabs = (0 ..< 10).map { chatIndex in
+                    ComposeTabState(
+                        id: UUID(), activeChatSessionID: UUID(),
+                        activeAgentSessionID: index < 20 && chatIndex == 0 ? UUID() : nil
+                    )
+                }
+                target.activeComposeTabID = target.composeTabs[0].id
+                return target
+            }
+            try await NewWindowInitialSelectionFixture.run(seeds: targets, deferredStart: true) { f in
+                let chatService = ChatDataService()
+                var agentSessionIDs: [UUID] = []
+                // Populate all documents before constructing any window or starting the runtime.
+                for target in targets {
+                    for (chatIndex, tab) in target.composeTabs.enumerated() {
+                        let chat = try ChatSession(
+                            id: XCTUnwrap(tab.activeChatSessionID), workspaceID: target.id, composeTabID: tab.id,
+                            name: "QA chat \(chatIndex)", messages: (0 ..< 4).map { index in
+                                StoredMessage(isUser: index.isMultiple(of: 2), rawText: String(repeating: "synthetic history ", count: 4), sequenceIndex: index)
+                            }
+                        )
+                        _ = try await chatService.saveChatSession(chat, for: target)
+                    }
+                    if let agentID = target.composeTabs[0].activeAgentSessionID {
+                        let agent = AgentSession(
+                            id: agentID, workspaceID: target.id, composeTabID: target.composeTabs[0].id,
+                            name: "QA linked endpoint", items: (0 ..< 4).map { index in
+                                AgentChatItemPersist(from: AgentChatItem(
+                                    kind: index.isMultiple(of: 2) ? .user : .assistant,
+                                    text: String(repeating: "synthetic history ", count: 4), sequenceIndex: index
+                                ))
+                            }, agentKind: "codexExec", agentModel: "gpt-6.1-sol",
+                            lastRunState: AgentSessionRunState.completed.rawValue, autoWakeOnOversightUpdates: false
+                        )
+                        _ = try await AgentSessionDataService.shared.saveAgentSession(agent, for: target)
+                        let decoded = try await AgentSessionDataService.shared.loadAgentSession(id: agentID, for: target)
+                        XCTAssertEqual(decoded?.id, agentID)
+                        XCTAssertEqual(decoded?.workspaceID, target.id)
+                        XCTAssertEqual(decoded?.composeTabID, target.composeTabs[0].id)
+                        XCTAssertEqual(decoded?.items.count, 4)
+                        agentSessionIDs.append(agentID)
+                    }
+                }
+                XCTAssertEqual(targets.flatMap(\.composeTabs).count, 280)
+                XCTAssertEqual(agentSessionIDs.count, 20)
+                let intents = (0 ..< 10).map { index in AgentSessionOversightIntent(
+                    observerSessionID: agentSessionIDs[index * 2], targetSessionID: agentSessionIDs[index * 2 + 1]
+                ) }
+                let intentURL = f.base.appendingPathComponent(AgentSessionOversightIntentStore.filename)
+                try JSONEncoder().encode(AgentSessionOversightIntentDocument(links: intents)).write(to: intentURL)
+                let store = AgentSessionOversightIntentStore(
+                    fileURL: intentURL, backupsDirectoryURL: f.base.appendingPathComponent("Backups"), mode: .enabled
+                )
+                guard case let .ready(loaded) = await store.loadForLaunch() else {
+                    return XCTFail("Expected valid persisted intents")
+                }
+                XCTAssertEqual(loaded.pairs.count, 10)
+                let completed = XCTestExpectation(description: "all accepted restores completed")
+                completed.expectedFulfillmentCount = 28
+                var counts = Array(repeating: 0, count: 28)
+                var operations: [UUID: (window: Int, target: UUID)] = [:]
+                var observations: [AnyCancellable] = []
+                var windows: [WindowState] = []
+                defer {
+                    observations.forEach { $0.cancel() }
+                    windows.forEach { WindowStatesManager.shared.unregisterWindowState($0) }
+                }
+                // Baseline order: construct/register/observe/accept all 28, then runtime.start.
+                // No chooser, bootstrap or prewarm wait manufactures saved-target eligibility.
+                for (index, target) in targets.enumerated() {
+                    let window = f.makeWindow()
+                    windows.append(window)
+                    WindowStatesManager.shared.registerWindowState(window)
+                    observations.append(window.workspaceManager.$activeWorkspaceSwitch.sink { activity in
+                        guard let activity else { return }
+                        if let original = operations[activity.operationID] {
+                            XCTAssertEqual(activity.targetWorkspaceID, original.target, "No recovery/retarget")
+                        } else {
+                            operations[activity.operationID] = (index, activity.targetWorkspaceID)
+                        }
+                    })
+                    window.applyWindowRestoreEntry(f.restoreEntry(for: target.id, window: window)) {
+                        counts[index] += 1
+                        XCTAssertFalse(window.workspaceManager.isInitialized)
+                        XCTAssertEqual(window.workspaceManager.activeWorkspaceID, target.id)
+                        XCTAssertNil(window.workspaceManager.activeWorkspaceSwitch)
+                        XCTAssertFalse(window.workspaceManager.isSwitchingWorkspace)
+                        completed.fulfill()
+                    }
+                }
+                f.startRuntime()
+                let result = await XCTWaiter.fulfillment(of: [completed], timeout: 120)
+                XCTAssertEqual(result, .completed)
+                for window in windows {
+                    await window.workspaceManager.awaitInitialWorkspaceActivationCompletion()
+                }
+                XCTAssertEqual(counts, Array(repeating: 1, count: 28))
+                XCTAssertEqual(operations.count, 28, "Zero transient Default or duplicate saved admission")
+                for (index, window) in windows.enumerated() {
+                    XCTAssertTrue(window.workspaceManager.isInitialized)
+                    XCTAssertEqual(window.workspaceManager.activeWorkspaceID, targets[index].id)
+                    XCTAssertNil(window.workspaceManager.activeWorkspaceSwitch)
+                    XCTAssertFalse(window.workspaceManager.isSwitchingWorkspace)
+                    XCTAssertEqual(window.promptManager.currentComposeTabs, targets[index].composeTabs)
+                    XCTAssertEqual(operations.values.filter { $0.window == index }.map(\.target), [targets[index].id])
+                }
+            }
+        }
+    }
+#endif
 
 @MainActor
 final class WorkspaceChooserPublicationTests: XCTestCase {

@@ -2871,15 +2871,21 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// second selection authority and never resets, so a later loss of selection is recoverable
     /// while an untouched window never has a first selection invented by catalog projection.
     private var hasEstablishedWorkspaceSelection = false
-    /// One-shot ownership of the constructor's initial System Default activation. Retained until
+    /// One-shot ownership of the constructor's initial workspace activation. Retained until
     /// its task finishes cleanup, even after supersession.
-    private var initialDefaultActivationAttempt: InitialDefaultActivationAttempt?
-    private var initialDefaultActivationTask: Task<Void, Never>?
+    private var initialWorkspaceActivationAttempt: InitialWorkspaceActivationAttempt?
+    private var initialWorkspaceActivationTask: Task<Void, Never>?
     /// Set as the first statement of `prepareForWindowClose`; never reset.
     private(set) var isPreparingForWindowClose = false
     /// Synchronous Window hook fired when a non-startup activation is requested, before any
     /// await, so a not-yet-dispatched restore can be retired in favor of explicit intent.
     var onNonStartupWorkspaceActivationRequested: (@MainActor () -> Void)?
+    /// Window supplies an accepted target without transferring execution. Its synchronous
+    /// consumer rechecks the existing acceptance sequence immediately before switch admission.
+    var initialWorkspaceRestoreCandidate: (@MainActor () -> (
+        target: WorkspaceModel,
+        consume: @MainActor () -> WindowRestoreLifetime.Dispatch?
+    )?)?
 
     /// Computed property to get/set the active workspace using the cache
     var activeWorkspace: WorkspaceModel? {
@@ -2902,10 +2908,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         hasEstablishedWorkspaceSelection = true
     }
 
-    // MARK: - Initial Default activation ownership
+    // MARK: - Initial workspace activation ownership
 
     @MainActor
-    private final class InitialDefaultActivationAttempt {
+    private final class InitialWorkspaceActivationAttempt {
         /// Monotonic: explicit intent or close revokes startup permission for good.
         var isSuperseded = false
         /// Linked only after actual switch admission.
@@ -2914,22 +2920,22 @@ class WorkspaceManagerViewModel: ObservableObject {
         var didPublishSelection = false
     }
 
-    private func initialDefaultActivationMayProceed(_ attempt: InitialDefaultActivationAttempt) -> Bool {
+    private func initialWorkspaceActivationMayProceed(_ attempt: InitialWorkspaceActivationAttempt) -> Bool {
         !attempt.isSuperseded
             && !Task.isCancelled
             && !isPreparingForWindowClose
             && !hasEstablishedWorkspaceSelection
     }
 
-    private func initialDefaultAttempt(owning operationID: UUID) -> InitialDefaultActivationAttempt? {
-        guard let attempt = initialDefaultActivationAttempt,
+    private func initialWorkspaceAttempt(owning operationID: UUID) -> InitialWorkspaceActivationAttempt? {
+        guard let attempt = initialWorkspaceActivationAttempt,
               attempt.switchOperationID == operationID
         else { return nil }
         return attempt
     }
 
-    private func markInitialDefaultActivationSuperseded() {
-        guard let attempt = initialDefaultActivationAttempt, !attempt.isSuperseded else { return }
+    private func markInitialWorkspaceActivationSuperseded() {
+        guard let attempt = initialWorkspaceActivationAttempt, !attempt.isSuperseded else { return }
         attempt.isSuperseded = true
         #if DEBUG
             initialDefaultActivationDidSupersedeHandlerForTesting?()
@@ -2939,15 +2945,15 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Explicit (non-startup) activation entry: revoke startup first, then let Window retire any
     /// not-yet-dispatched restore. Harmless when repeated by wrapper entry points.
     private func noteNonStartupWorkspaceActivationRequested() {
-        markInitialDefaultActivationSuperseded()
+        markInitialWorkspaceActivationSuperseded()
         onNonStartupWorkspaceActivationRequested?()
     }
 
     /// Joins startup only when its recorded operation currently owns the switch. An unresolved
-    /// Default lookup never delays explicit activation.
-    private func joinAdmittedInitialDefaultActivationIfNeeded() async {
-        guard let attempt = initialDefaultActivationAttempt,
-              let task = initialDefaultActivationTask,
+    /// System lookup never delays explicit activation.
+    private func joinAdmittedInitialWorkspaceActivationIfNeeded() async {
+        guard let attempt = initialWorkspaceActivationAttempt,
+              let task = initialWorkspaceActivationTask,
               let operationID = attempt.switchOperationID,
               activeWorkspaceSwitch?.operationID == operationID
         else { return }
@@ -2964,10 +2970,10 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private func preAdmissionInterruption(
         for workspace: WorkspaceModel,
-        initialDefaultAttempt: InitialDefaultActivationAttempt?
+        initialWorkspaceAttempt: InitialWorkspaceActivationAttempt?
     ) -> WorkspaceSwitchResult? {
-        if let initialDefaultAttempt {
-            guard initialDefaultActivationMayProceed(initialDefaultAttempt) else {
+        if let initialWorkspaceAttempt {
+            guard initialWorkspaceActivationMayProceed(initialWorkspaceAttempt) else {
                 return .cancelled("Initial workspace activation was superseded before admission.")
             }
             return nil
@@ -2975,43 +2981,108 @@ class WorkspaceManagerViewModel: ObservableObject {
         return explicitActivationCancellation(for: workspace)
     }
 
-    private func runInitialDefaultActivation(attempt: InitialDefaultActivationAttempt) async {
-        let initialSwitchSpan = StartupPhaseLog.begin(.initialDefaultSwitch, window: promptViewModel.windowID)
+    private func runInitialWorkspaceActivation(attempt: InitialWorkspaceActivationAttempt) async {
+        // Only an actual transfer owns completion. Candidate lookup and failed eligibility leave
+        // the entry pending for Window's ordinary post-initialization restore path.
+        var dispatch: WindowRestoreLifetime.Dispatch?
+        var restoreSpan: StartupPhaseLog.Span?
+        var restoreOutcome: StartupPhaseLog.SwitchOutcome?
+        var initialSystemSpan: StartupPhaseLog.Span?
         defer {
-            initialSwitchSpan.end()
-            finishInitialDefaultActivation()
+            finishInitialWorkspaceActivation(dispatch: dispatch)
+            if let restoreSpan {
+                var fields = ["resolved": 1, "dispatched": dispatch == nil ? 0 : 1]
+                if let restoreOutcome { fields["switch_result"] = restoreOutcome.rawValue }
+                restoreSpan.end(extraFields: fields)
+            }
+            initialSystemSpan?.end()
         }
-        guard initialDefaultActivationMayProceed(attempt) else { return }
+        guard initialWorkspaceActivationMayProceed(attempt) else { return }
         #if DEBUG
             if let initialDefaultResolutionHandlerForTesting {
                 guard await initialDefaultResolutionHandlerForTesting() == .proceed else { return }
-                guard initialDefaultActivationMayProceed(attempt) else { return }
+                guard initialWorkspaceActivationMayProceed(attempt) else { return }
             }
         #endif
-        guard let candidate = await findOrCreatePublishedDefaultWorkspace(),
-              initialDefaultActivationMayProceed(attempt)
+        // Establish canonical fallback availability without running its activation pipeline.
+        guard let system = await publishedFallbackWorkspace(getOrCreateInitialSystemWorkspace()),
+              initialWorkspaceActivationMayProceed(attempt)
         else { return }
-        // The Default lookup is name-based; never automatically activate a user namesake.
-        guard candidate.isSystemWorkspace,
-              workspace(withID: candidate.id)?.isSystemWorkspace == true
+        guard system.isSystemWorkspace,
+              workspace(withID: system.id)?.isSystemWorkspace == true
         else {
-            reportInitialDefaultNonSystemCandidate(workspaceID: candidate.id)
+            reportInitialDefaultNonSystemCandidate(workspaceID: system.id)
             return
         }
+        if initialRestoreChooserIsCurrent(),
+           let candidate = initialWorkspaceRestoreCandidate?(),
+           initialRestoreTargetIsEligible(candidate.target)
+        {
+            restoreSpan = StartupPhaseLog.begin(.restoreWorkspace, window: promptViewModel.windowID)
+            let outcome = await performDirectWorkspaceSwitch(
+                to: candidate.target,
+                saveState: true,
+                reason: "restore",
+                deletionToken: nil,
+                initialWorkspaceAttempt: attempt,
+                consumeInitialRestore: {
+                    guard let consumed = candidate.consume() else { return false }
+                    dispatch = consumed
+                    return true
+                }
+            )
+            restoreOutcome = StartupPhaseLog.SwitchOutcome(outcome.result)
+            guard outcome.permitsInitialFallback,
+                  initialWorkspaceActivationMayProceed(attempt)
+            else { return }
+        }
+        // At most one new System operation, and only after pristine failure was captured before
+        // operation cleanup. Destructive/published failure belongs to same-operation recovery.
+        initialSystemSpan = StartupPhaseLog.begin(.initialDefaultSwitch, window: promptViewModel.windowID)
         _ = await performDirectWorkspaceSwitch(
-            to: candidate,
+            to: system,
             saveState: false,
             reason: "internal",
             deletionToken: nil,
-            initialDefaultAttempt: attempt
+            initialWorkspaceAttempt: attempt
         )
     }
 
-    /// Clears one-shot startup ownership before initialization callbacks, with no suspension between,
-    /// so a queued restore released here never mistakes finished startup for an admitted switch.
-    private func finishInitialDefaultActivation() {
-        initialDefaultActivationAttempt = nil
-        initialDefaultActivationTask = nil
+    private func initialRestoreChooserIsCurrent() -> Bool {
+        guard case let .ready(catalog, .current) = workspaceChooserPresentation else { return false }
+        guard domainWorkspaceAuthorityClient != nil else {
+            if case .local = catalog.source { return true }
+            return false
+        }
+        guard admitsDomainSelfEcho(baselineGeneration: domainCatalogReconciliationGeneration),
+              case let .authority(stamp) = catalog.source,
+              stamp.reconciliationGeneration == domainCatalogReconciliationGeneration,
+              stamp.publicationSequence >= lastDomainProjectionSequence
+        else { return false }
+        // A global catalog-revision floor is deliberately not a target admission requirement.
+        return true
+    }
+
+    private func initialRestoreTargetIsEligible(_ target: WorkspaceModel) -> Bool {
+        guard initialRestoreChooserIsCurrent(),
+              !target.isEphemeral,
+              target.consolidatedIntoWorkspaceID == nil,
+              let current = workspace(withID: target.id),
+              !current.isEphemeral,
+              current.consolidatedIntoWorkspaceID == nil,
+              !pendingConsolidatedRestoreIDs.contains(target.id)
+        else { return false }
+        guard domainWorkspaceAuthorityClient != nil else { return true }
+        return acceptedCatalogMembership?.contains(target.id) == true
+            && domainWorkspaceHealthByID[target.id] == .writable
+    }
+
+    /// Clears startup ownership, completes only its consumed dispatch, then drains initialization
+    /// callbacks. No suspension: reentrant completion observes settled selection and no owner.
+    private func finishInitialWorkspaceActivation(dispatch: WindowRestoreLifetime.Dispatch?) {
+        initialWorkspaceActivationAttempt = nil
+        initialWorkspaceActivationTask = nil
+        dispatch?.completion?()
         completeInitialization()
     }
 
@@ -3025,25 +3096,78 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Startup-only publication fence, evaluated after the existing authority checks and DEBUG
     /// gate. Marks publication in the same MainActor turn as the caller's assignment.
-    private func initialDefaultPublicationRejection(
+    private func initialWorkspacePublicationRejection(
         operationID: UUID,
-        workspaceID: UUID
-    ) -> WorkspaceSwitchResult? {
-        guard let attempt = initialDefaultAttempt(owning: operationID) else { return nil }
+        workspaceID: UUID,
+        admittedTargetIsSystemWorkspace: Bool
+    ) async -> WorkspaceSwitchResult? {
+        guard let attempt = initialWorkspaceAttempt(owning: operationID) else { return nil }
         // Closing fences startup recovery too; supersession does not (recovery is not a new
         // startup publication).
         if isPreparingForWindowClose {
             return .cancelled("Initial workspace activation was cancelled because the window is closing.")
         }
+        let requiresSystemIdentity = admittedTargetIsSystemWorkspace
+            || (recoveringWorkspaceSwitchOperationID != operationID && activeWorkspaceSwitch?.reason != "restore")
+        if requiresSystemIdentity, let client = domainWorkspaceAuthorityClient {
+            guard ownsWorkspaceSwitchOperation(operationID) else {
+                return .cancelled("Initial workspace activation lost operation ownership before System verification.")
+            }
+            // Projected metadata can lag canonical reclassification (including while the DEBUG
+            // publication gate is held). Read only this target, never the catalog or a new fallback.
+            let canonical = await client.canonicalWorkspaceSnapshot(workspaceID)
+            guard initialWorkspaceAttempt(owning: operationID) === attempt,
+                  ownsWorkspaceSwitchOperation(operationID)
+            else {
+                return .cancelled("Initial workspace activation lost operation ownership during System verification.")
+            }
+            if isPreparingForWindowClose {
+                return .cancelled("Initial workspace activation was cancelled because the window is closing.")
+            }
+            // Owned recovery keeps its existing supersession/cancellation bypass, not permission
+            // to publish a canonical non-System workspace as System.
+            if recoveringWorkspaceSwitchOperationID != operationID,
+               !initialWorkspaceActivationMayProceed(attempt)
+            {
+                return .cancelled("Initial workspace activation was superseded during System verification.")
+            }
+            guard let canonical else {
+                return .cancelled("Initial workspace activation could not verify its canonical System identity.")
+            }
+            do {
+                let decoded = try Self.decodeDomainWorkspaceProjection(
+                    documentBytes: canonical.document.documentBytes,
+                    fileURL: canonical.document.fileURL
+                )
+                guard canonical.document.workspaceID == workspaceID,
+                      canonical.document.metadata.isSystemWorkspace,
+                      decoded.id == workspaceID,
+                      decoded.isSystemWorkspace
+                else {
+                    reportInitialDefaultNonSystemCandidate(workspaceID: workspaceID)
+                    return .cancelled("Initial workspace activation rejected a canonical non-System candidate.")
+                }
+            } catch {
+                reportDomainProjectionFailure(error)
+                return .cancelled("Initial workspace activation could not decode its canonical System identity.")
+            }
+        }
+        if requiresSystemIdentity, workspace(withID: workspaceID)?.isSystemWorkspace != true {
+            reportInitialDefaultNonSystemCandidate(workspaceID: workspaceID)
+            return .cancelled("Initial workspace activation rejected a non-System candidate.")
+        }
         guard recoveringWorkspaceSwitchOperationID != operationID else { return nil }
         guard ownsWorkspaceSwitchOperation(operationID),
-              initialDefaultActivationMayProceed(attempt)
+              initialWorkspaceActivationMayProceed(attempt)
         else {
             return .cancelled("Initial workspace activation was superseded before publication.")
         }
-        guard workspace(withID: workspaceID)?.isSystemWorkspace == true else {
-            reportInitialDefaultNonSystemCandidate(workspaceID: workspaceID)
-            return .cancelled("Initial workspace activation rejected a non-System candidate.")
+        guard let activity = activeWorkspaceSwitch,
+              activity.operationID == operationID,
+              activity.targetWorkspaceID == workspaceID,
+              workspace(withID: workspaceID) != nil
+        else {
+            return .cancelled("Initial workspace activation lost its admitted target before publication.")
         }
         attempt.didPublishSelection = true
         return nil
@@ -3051,8 +3175,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Lifecycle join of owned startup work; never mutates selection or retries.
     func awaitInitialWorkspaceActivationCompletion() async {
-        if let initialDefaultActivationTask {
-            await initialDefaultActivationTask.value
+        if let initialWorkspaceActivationTask {
+            await initialWorkspaceActivationTask.value
         }
     }
 
@@ -4462,10 +4586,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         } else if activeWorkspace == nil {
             // Stored synchronously on the MainActor, before the task can advance, so Window and
             // tests can install callbacks/hooks before startup runs.
-            let attempt = InitialDefaultActivationAttempt()
-            initialDefaultActivationAttempt = attempt
-            initialDefaultActivationTask = Task { [weak self] in
-                await self?.runInitialDefaultActivation(attempt: attempt)
+            let attempt = InitialWorkspaceActivationAttempt()
+            initialWorkspaceActivationAttempt = attempt
+            initialWorkspaceActivationTask = Task { [weak self] in
+                await self?.runInitialWorkspaceActivation(attempt: attempt)
             }
         } else {
             // Already has an active workspace
@@ -4474,7 +4598,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     deinit {
-        initialDefaultActivationTask?.cancel()
+        initialWorkspaceActivationTask?.cancel()
         pollTimer?.invalidate()
         pollTimer = nil
         pollTimerSaveTask?.cancel()
@@ -4499,8 +4623,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         isPreparingForWindowClose = true
         domainCatalogRefreshCancellation?()
         // Revoke and cancel startup; its handle stays retained so teardown can join it.
-        markInitialDefaultActivationSuperseded()
-        initialDefaultActivationTask?.cancel()
+        markInitialWorkspaceActivationSuperseded()
+        initialWorkspaceActivationTask?.cancel()
         beginRootReconciliationShutdown()
         workspaceActivityCoordinator.unregister(ownerID: instanceID)
         stopPollTimer()
@@ -5510,7 +5634,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // unpublished startup that unloaded no roots, or any unfinished startup while the window
         // closes, retires without recovery, clearing, readiness invalidation, or blocked notice.
         if !originalResult.didSwitch,
-           let attempt = initialDefaultAttempt(owning: operationID),
+           let attempt = initialWorkspaceAttempt(owning: operationID),
            isPreparingForWindowClose
            || (
                attempt.isSuperseded
@@ -5562,7 +5686,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 explicitlyReturnToSystem: explicitlyRequestedRecovery,
                 allowExpiredDeletionRecovery: deletionTokenExpired && crossedDestructiveBoundary
             )
-            let isClosingStartup = isPreparingForWindowClose && initialDefaultAttempt(owning: operationID) != nil
+            let isClosingStartup = isPreparingForWindowClose && initialWorkspaceAttempt(owning: operationID) != nil
             if !recoveryResult.didSwitch, !isClosingStartup {
                 let detail = recoveryResult.message ?? "Unknown recovery failure."
                 let message = "Workspace switch recovery could not restore a usable workspace: \(detail)"
@@ -5596,7 +5720,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             return .cancelled("Workspace switch recovery was cancelled because deletion teardown timed out.")
         }
 
-        let fallback = workspaces.first(where: { $0.isSystemWorkspace }) ?? getOrCreateSystemWorkspace()
+        let fallback: WorkspaceModel = if initialWorkspaceAttempt(owning: operationID) != nil {
+            getOrCreateInitialSystemWorkspace()
+        } else {
+            workspaces.first(where: { $0.isSystemWorkspace }) ?? getOrCreateSystemWorkspace()
+        }
         var recoveryTargets: [WorkspaceModel] = []
         if !explicitlyReturnToSystem,
            let previousWorkspaceID = originalActivity.previousWorkspaceID,
@@ -5742,7 +5870,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Startup-only checks. Closing fences startup including its recovery; supersession does
         // not apply to recovery, which reuses the operation ID but is not a startup publication.
         // Published startup is not aborted merely because explicit intent arrived.
-        if let attempt = initialDefaultAttempt(owning: operationID) {
+        if let attempt = initialWorkspaceAttempt(owning: operationID) {
             if isPreparingForWindowClose {
                 return .cancelled("Initial workspace activation was cancelled because the window is closing at \(boundary).")
             }
@@ -5797,7 +5925,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     @MainActor
     func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
         noteNonStartupWorkspaceActivationRequested()
-        await joinAdmittedInitialDefaultActivationIfNeeded()
+        await joinAdmittedInitialWorkspaceActivationIfNeeded()
         if let cancellation = explicitActivationCancellation(for: newWorkspace) {
             return cancellation
         }
@@ -5807,45 +5935,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         if let cancellation = explicitActivationCancellation(for: newWorkspace) {
             return cancellation
         }
-        let currentBeforeAdmission = workspace(withID: newWorkspace.id)
-        if newWorkspace.consolidatedIntoWorkspaceID != nil
-            || currentBeforeAdmission?.consolidatedIntoWorkspaceID != nil
-        {
-            return userVisibleWorkspaceSwitchResult(
-                .blocked("Workspace \"\(newWorkspace.name)\" is a consolidated recovery copy. Restore it before opening it.")
-            )
-        }
-        if activeConsolidatedRestoreIDs.contains(newWorkspace.id) {
-            return userVisibleWorkspaceSwitchResult(
-                .blocked("Workspace \"\(newWorkspace.name)\" is still being restored and cannot be opened yet.")
-            )
-        }
-
-        let isSuspectIncompleteRestore = authorityIncompleteConsolidatedRestoreIDs.contains(newWorkspace.id)
-            || domainWorkspaceRevisionsByID[newWorkspace.id]?.dirtyRevision != nil
-        if isSuspectIncompleteRestore {
-            let classification = await refreshAuthorityConsolidatedRestoreClassification(
-                workspaceID: newWorkspace.id
-            )
-            if let cancellation = explicitActivationCancellation(for: newWorkspace) {
-                return cancellation
-            }
-            let currentAfterAdmission = workspace(withID: newWorkspace.id)
-            let classificationBlocksSwitch = switch classification {
-            case .clear:
-                false
-            case .unowned, .retired, .incomplete(_), .unavailable, .stale:
-                true
-            }
-            if newWorkspace.consolidatedIntoWorkspaceID != nil
-                || currentAfterAdmission?.consolidatedIntoWorkspaceID != nil
-                || pendingConsolidatedRestoreIDs.contains(newWorkspace.id)
-                || classificationBlocksSwitch
-            {
-                return userVisibleWorkspaceSwitchResult(
-                    .blocked("Workspace \"\(newWorkspace.name)\" has not finished restoration and cannot be opened yet.")
-                )
-            }
+        if let preflight = await workspaceRequestPreflight(to: newWorkspace, initialWorkspaceAttempt: nil) {
+            return userVisibleWorkspaceSwitchResult(preflight)
         }
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace) {
             return userVisibleWorkspaceSwitchResult(
@@ -5896,6 +5987,49 @@ class WorkspaceManagerViewModel: ObservableObject {
             originalResult: operationResult
         )
         return userVisibleWorkspaceSwitchResult(finalResult)
+    }
+
+    /// Shared request-only policy. Direct lifecycle/deletion switches intentionally keep their
+    /// existing policy; an accepted saved startup must be at least as strict as a restore request.
+    private func workspaceRequestPreflight(
+        to newWorkspace: WorkspaceModel,
+        initialWorkspaceAttempt: InitialWorkspaceActivationAttempt?
+    ) async -> WorkspaceSwitchResult? {
+        let currentBeforeAdmission = workspace(withID: newWorkspace.id)
+        if newWorkspace.consolidatedIntoWorkspaceID != nil
+            || currentBeforeAdmission?.consolidatedIntoWorkspaceID != nil
+        {
+            return .blocked("Workspace \"\(newWorkspace.name)\" is a consolidated recovery copy. Restore it before opening it.")
+        }
+        if activeConsolidatedRestoreIDs.contains(newWorkspace.id) {
+            return .blocked("Workspace \"\(newWorkspace.name)\" is still being restored and cannot be opened yet.")
+        }
+
+        let isSuspectIncompleteRestore = authorityIncompleteConsolidatedRestoreIDs.contains(newWorkspace.id)
+            || domainWorkspaceRevisionsByID[newWorkspace.id]?.dirtyRevision != nil
+        if isSuspectIncompleteRestore {
+            let classification = await refreshAuthorityConsolidatedRestoreClassification(
+                workspaceID: newWorkspace.id
+            )
+            if let cancellation = preAdmissionInterruption(for: newWorkspace, initialWorkspaceAttempt: initialWorkspaceAttempt) {
+                return cancellation
+            }
+            let currentAfterAdmission = workspace(withID: newWorkspace.id)
+            let classificationBlocksSwitch = switch classification {
+            case .clear:
+                false
+            case .unowned, .retired, .incomplete(_), .unavailable, .stale:
+                true
+            }
+            if newWorkspace.consolidatedIntoWorkspaceID != nil
+                || currentAfterAdmission?.consolidatedIntoWorkspaceID != nil
+                || pendingConsolidatedRestoreIDs.contains(newWorkspace.id)
+                || classificationBlocksSwitch
+            {
+                return .blocked("Workspace \"\(newWorkspace.name)\" has not finished restoration and cannot be opened yet.")
+            }
+        }
+        return nil
     }
 
     private func userVisibleWorkspaceSwitchResult(
@@ -6401,7 +6535,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         noteNonStartupWorkspaceActivationRequested()
         // Join an admitted (possibly published) startup first so a same-ID reactivation of its
         // target waits for it instead of returning concurrent-blocked.
-        await joinAdmittedInitialDefaultActivationIfNeeded()
+        await joinAdmittedInitialWorkspaceActivationIfNeeded()
         if let cancellation = explicitActivationCancellation(for: workspace) {
             return cancellation
         }
@@ -6411,8 +6545,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 saveState: false,
                 reason: reason,
                 deletionToken: nil,
-                initialDefaultAttempt: nil
-            )
+                initialWorkspaceAttempt: nil
+            ).result
         }
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: workspace) {
             return concurrentResult
@@ -6459,66 +6593,116 @@ class WorkspaceManagerViewModel: ObservableObject {
             saveState: saveState,
             reason: reason,
             deletionToken: deletionToken,
-            initialDefaultAttempt: nil
-        )
+            initialWorkspaceAttempt: nil
+        ).result
     }
 
-    /// Shared direct-switch body. Only the constructor's startup runner passes an attempt;
-    /// every other caller is ordinary explicit activation that already superseded startup.
+    /// Existing common direct-switch pipeline. Public direct entry points expose only the result;
+    /// startup also uses the pristine disposition captured before operation recovery/cleanup.
     private func performDirectWorkspaceSwitch(
         to newWorkspace: WorkspaceModel,
         saveState: Bool,
         reason: String,
         deletionToken: WorkspaceDeletionCancellationToken?,
-        initialDefaultAttempt: InitialDefaultActivationAttempt?
-    ) async -> WorkspaceSwitchResult {
-        if initialDefaultAttempt == nil {
-            await joinAdmittedInitialDefaultActivationIfNeeded()
+        initialWorkspaceAttempt: InitialWorkspaceActivationAttempt?,
+        consumeInitialRestore: (@MainActor () -> Bool)? = nil
+    ) async -> (result: WorkspaceSwitchResult, permitsInitialFallback: Bool) {
+        let previousWorkspaceID = activeWorkspaceID
+        func refused(_ result: WorkspaceSwitchResult) -> (result: WorkspaceSwitchResult, permitsInitialFallback: Bool) {
+            let pristine = initialWorkspaceAttempt.map {
+                initialWorkspaceActivationMayProceed($0)
+                    && !$0.didPublishSelection
+                    && activeWorkspaceSwitch == nil
+                    && activeWorkspaceID == previousWorkspaceID
+            } ?? false
+            return (result, pristine)
+        }
+        if initialWorkspaceAttempt == nil {
+            await joinAdmittedInitialWorkspaceActivationIfNeeded()
         }
         guard deletionToken?.isActive ?? true else {
-            return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out.")
+            return refused(.cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out."))
         }
-        if let interruption = preAdmissionInterruption(for: newWorkspace, initialDefaultAttempt: initialDefaultAttempt) {
-            return interruption
+        if let interruption = preAdmissionInterruption(for: newWorkspace, initialWorkspaceAttempt: initialWorkspaceAttempt) {
+            return refused(interruption)
         }
         if let creationResult = await workspaceCreationBarrierResult(workspaceID: newWorkspace.id) {
-            return creationResult
+            return refused(creationResult)
         }
         guard deletionToken?.isActive ?? true else {
-            return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out.")
+            return refused(.cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out."))
         }
-        if let interruption = preAdmissionInterruption(for: newWorkspace, initialDefaultAttempt: initialDefaultAttempt) {
-            return interruption
+        if let interruption = preAdmissionInterruption(for: newWorkspace, initialWorkspaceAttempt: initialWorkspaceAttempt) {
+            return refused(interruption)
+        }
+        if consumeInitialRestore != nil,
+           let preflight = await workspaceRequestPreflight(to: newWorkspace, initialWorkspaceAttempt: initialWorkspaceAttempt)
+        {
+            return refused(preflight)
         }
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace) {
-            return concurrentResult
+            return refused(concurrentResult)
         }
         if newWorkspace.id == activeWorkspaceID {
-            return .blocked("Already on workspace \"\(newWorkspace.name)\".")
+            return refused(.blocked("Already on workspace \"\(newWorkspace.name)\"."))
         }
         if isRefreshing {
-            return .blocked("Cannot switch workspaces while refresh is in progress.")
+            return refused(.blocked("Cannot switch workspaces while refresh is in progress."))
+        }
+        if consumeInitialRestore != nil, isChatBusy || activeSessionSnapshot().hasActiveSessions {
+            return refused(.blocked("Cannot restore an initial workspace while chat or sessions are active."))
         }
         guard let activationLease = workspaceActivityCoordinator.beginActivation(workspaceID: newWorkspace.id) else {
-            return .blocked("Workspace \"\(newWorkspace.name)\" is being deleted and cannot be activated.")
+            return refused(.blocked("Workspace \"\(newWorkspace.name)\" is being deleted and cannot be activated."))
         }
         defer { workspaceActivityCoordinator.endActivation(activationLease) }
         #if DEBUG
             await workspaceActivationLeaseDidAcquireHandlerForTesting?(newWorkspace.id)
         #endif
-        if let interruption = preAdmissionInterruption(for: newWorkspace, initialDefaultAttempt: initialDefaultAttempt) {
-            return interruption
+        // Classification may itself await, so repeat its request policy after the lease gate and
+        // then recheck all derived startup eligibility in the same turn as consumption/admission.
+        if consumeInitialRestore != nil,
+           let preflight = await workspaceRequestPreflight(to: newWorkspace, initialWorkspaceAttempt: initialWorkspaceAttempt)
+        {
+            return refused(preflight)
+        }
+        if let interruption = preAdmissionInterruption(for: newWorkspace, initialWorkspaceAttempt: initialWorkspaceAttempt) {
+            return refused(interruption)
+        }
+        if let consumeInitialRestore {
+            guard initialRestoreTargetIsEligible(newWorkspace),
+                  !isRefreshing, !isChatBusy, !activeSessionSnapshot().hasActiveSessions
+            else {
+                return refused(.blocked("Initial restore target is no longer eligible for admission."))
+            }
+            guard consumeInitialRestore() else {
+                return refused(.cancelled("Initial restore acceptance changed before admission."))
+            }
+            // Consumption can synchronously reenter Window (for example close). The returned
+            // Dispatch is still owed completion, but revoked startup may never admit a switch.
+            if let interruption = preAdmissionInterruption(for: newWorkspace, initialWorkspaceAttempt: initialWorkspaceAttempt) {
+                return refused(interruption)
+            }
+        } else if initialWorkspaceAttempt != nil {
+            guard newWorkspace.isSystemWorkspace,
+                  workspace(withID: newWorkspace.id)?.isSystemWorkspace == true
+            else {
+                reportInitialDefaultNonSystemCandidate(workspaceID: newWorkspace.id)
+                return refused(.cancelled("Initial workspace activation rejected a non-System fallback."))
+            }
         }
         guard let operationID = beginWorkspaceSwitchOperation(
             to: newWorkspace,
             reason: reason,
             deletionToken: deletionToken
         ) else {
-            return concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace)
-                ?? .blocked("Workspace switch already in progress.")
+            return refused(
+                concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace)
+                    ?? .blocked("Workspace switch already in progress.")
+            )
         }
         // Link startup ownership immediately on admission, before any suspension.
-        initialDefaultAttempt?.switchOperationID = operationID
+        initialWorkspaceAttempt?.switchOperationID = operationID
         let operationResult = await performWorkspaceSwitch(
             to: newWorkspace,
             saveState: saveState,
@@ -6526,10 +6710,24 @@ class WorkspaceManagerViewModel: ObservableObject {
             operationID: operationID,
             deletionToken: deletionToken
         )
-        return await completeWorkspaceSwitchOperation(
+        // Do not infer this from the final result: same-operation recovery can publish a usable
+        // workspace while preserving the original failure, and cleanup clears the boundary markers.
+        let permitsInitialFallback = !operationResult.didSwitch
+            && initialWorkspaceAttempt.map {
+                initialWorkspaceActivationMayProceed($0)
+                    && $0.switchOperationID == operationID
+                    && !$0.didPublishSelection
+                    && ownsWorkspaceSwitchOperation(operationID)
+                    && rootsUnloadedWorkspaceSwitchOperationID != operationID
+                    && activeWorkspaceID == activeWorkspaceSwitch?.previousWorkspaceID
+                    && committedWorkspaceSwitchOperationID != operationID
+                    && returnToSystemAfterSwitchCancellationOperationID != operationID
+            } == true
+        let result = await completeWorkspaceSwitchOperation(
             operationID,
             originalResult: operationResult
         )
+        return (result, permitsInitialFallback)
     }
 
     private func performWorkspaceSwitch(
@@ -6785,9 +6983,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             ) {
                 return cancellation
             }
-            if let rejection = initialDefaultPublicationRejection(
+            if let rejection = await initialWorkspacePublicationRejection(
                 operationID: operationID,
-                workspaceID: loadedWorkspace.id
+                workspaceID: loadedWorkspace.id,
+                admittedTargetIsSystemWorkspace: newWorkspace.isSystemWorkspace
             ) {
                 return rejection
             }
@@ -6834,9 +7033,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                 ) {
                     return cancellation
                 }
-                if let rejection = initialDefaultPublicationRejection(
+                if let rejection = await initialWorkspacePublicationRejection(
                     operationID: operationID,
-                    workspaceID: upgraded.id
+                    workspaceID: upgraded.id,
+                    admittedTargetIsSystemWorkspace: newWorkspace.isSystemWorkspace
                 ) {
                     return rejection
                 }
@@ -6915,7 +7115,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             #endif
             // Releasing a gate after close must not launch fresh startup-owned hydration.
             // Scoped to startup/close so ordinary switch behavior is unchanged.
-            if isPreparingForWindowClose || initialDefaultAttempt(owning: operationID) != nil,
+            if isPreparingForWindowClose || initialWorkspaceAttempt(owning: operationID) != nil,
                let cancellation = cancellationResult(
                    operationID: operationID,
                    targetWorkspace: newWorkspace,
@@ -7121,10 +7321,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             return cancellation
         }
 
-        // Mark as initialized at the end
-        completeInitialization()
+        // Startup (including its owned recovery) settles the actual accepted-entry completion
+        // before initialization. Ordinary switches retain their existing initialization boundary.
+        if initialWorkspaceAttempt(owning: operationID) == nil {
+            completeInitialization()
+            logWorkspaceSwitch("completeInitialization called workspace=\"\(activeWS.name)\"")
+        }
         shouldSchedulePostSwitchGitDataLoad = true
-        logWorkspaceSwitch("completeInitialization called workspace=\"\(activeWS.name)\"")
         return .switched
     }
 
@@ -8733,10 +8936,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     /// A never-established window never gets a first selection invented from catalog order:
-    /// the initial Default attempt or any admitted switch owns activation, and otherwise only an
+    /// the initial workspace attempt or any admitted switch owns activation, and otherwise only an
     /// eligible canonical System workspace may be adopted. No workspace is created here.
     private func reconcileFirstProjectedWorkspaceSelection(canonicalSystemWorkspaceIDs: Set<UUID>) {
-        guard initialDefaultActivationAttempt == nil, activeWorkspaceSwitch == nil else { return }
+        guard initialWorkspaceActivationAttempt == nil, activeWorkspaceSwitch == nil else { return }
         let systemCandidate = workspaces.first { workspace in
             canonicalSystemWorkspaceIDs.contains(workspace.id)
                 && workspace.isSystemWorkspace
@@ -16602,8 +16805,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         return ws
     }
 
+    /// System intent for startup and its first-activation recovery only. Ordinary name-based
+    /// Default helpers retain their existing behavior outside this bounded startup seam.
+    private func getOrCreateInitialSystemWorkspace() -> WorkspaceModel {
+        workspaces.first(where: { $0.isSystemWorkspace }) ?? createSystemWorkspace()
+    }
+
     private func findOrCreatePublishedDefaultWorkspace() async -> WorkspaceModel? {
         guard let fallback = findOrCreateDefaultWorkspace() else { return nil }
+        return await publishedFallbackWorkspace(fallback)
+    }
+
+    private func publishedFallbackWorkspace(_ fallback: WorkspaceModel) async -> WorkspaceModel? {
         guard let domainWorkspaceAuthorityClient else { return fallback }
         let authorityWaitSpan = StartupPhaseLog.begin(
             .authorityBootstrapWait,
@@ -16650,6 +16863,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         if let existing = workspaces.first(where: { $0.name == "Default" }) {
             return existing
         }
+        return createSystemWorkspace()
+    }
+
+    private func createSystemWorkspace() -> WorkspaceModel {
         var ws = WorkspaceModel(name: "Default", repoPaths: [])
         ws.isSystemWorkspace = true
         workspaces.append(ws)

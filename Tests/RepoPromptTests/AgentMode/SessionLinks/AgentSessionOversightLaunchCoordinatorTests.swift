@@ -16,7 +16,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
     /// Endpoint host with a full window topology: descriptors, discovery levels, and a restore
     /// topology reason. The focused bridge tests elsewhere rely on the protocol defaults instead.
-    private final class FakeHost: AgentSessionLinkEndpointHost {
+    final class FakeHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = [] {
             didSet {
                 byEndpoint = Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
@@ -39,6 +39,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         var descriptors: [AgentSessionLinkComposeTabDescriptor] = []
         var discovery: [AgentSessionLinkDiscoveryState] = []
         var topology: AgentSessionOversightRestoreTopologyState = .completeAllEntriesConsumed
+        var restoreTopology: (() -> AgentSessionOversightRestoreTopologyState)?
         private(set) var publishedPresentations: [AgentSessionOversightPersistencePresentation] = []
         var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
         private(set) var providerTaskRequests = 0
@@ -97,7 +98,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         }
 
         func agentSessionLinkRestoreTopologyState() -> AgentSessionOversightRestoreTopologyState {
-            topology
+            restoreTopology?() ?? topology
         }
 
         func agentSessionLinkPublishPersistencePresentation(
