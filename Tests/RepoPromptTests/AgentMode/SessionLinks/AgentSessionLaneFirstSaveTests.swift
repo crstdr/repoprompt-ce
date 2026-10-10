@@ -62,6 +62,21 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         await cleanup()
     }
 
+    /// Model denied-role ownership at the property boundary: public MCP activation correctly
+    /// refuses to capture an app-owned linked overseer. These races test proof revocation and
+    /// rollback, not capture admission; the production didSet and release path still run.
+    private func installDeniedRoleControlFixture(on session: AgentTabSession, sessionID: UUID) async {
+        let registration = await AgentRunSessionStore.register(sessionID: sessionID)
+        session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+            sessionID: sessionID, activationID: UUID(), registration: registration,
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+            originatingConnectionID: nil,
+            interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
+            suppressUserNotifications: true, forceAutoEditEnabled: false,
+            autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore
+        )
+    }
+
     private func withSecondRegisteredWindow(_ body: (WindowState) async throws -> Void) async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -181,30 +196,13 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 }
             }
             let consumeActivation: @MainActor () async throws -> Void = {
-                // Fork fixture seam (same as the nested-release helper above): upstream consumes
-                // each opt-in through a real MCP control attach/release. The fork's resident guard
-                // intentionally refuses that production schedule whenever the caller oversees the
-                // parked A — prove the refusal, then retire the activation at owner level. This
-                // does not claim production reachability through the blocked control path.
-                do {
-                    _ = try await viewModel.mcpActivateControlContext(
-                        forTabID: creatorTabID, sessionID: creatorID, originatingConnectionID: nil,
-                        taskLabelKind: .explore, markSessionAsMCPOriginated: false
-                    )
-                    XCTFail("resident guard must refuse control capture of an overseeing session")
-                } catch {
-                    XCTAssertTrue(
-                        String(describing: error).contains("oversees other sessions"),
-                        "expected resident overseer refusal, got \(error)"
-                    )
-                }
-                creator.oversight.overseerActivation = nil
+                await self.installDeniedRoleControlFixture(on: creator, sessionID: creatorID)
                 XCTAssertNil(creator.oversight.overseerActivation)
                 await bridge.test_auditObserverEligibility()
                 await bridge.test_settleLaunchReconciliation()
                 await viewModel.mcpDeactivateControlContext(sessionID: creatorID, cleanupSessionStore: true)
                 let returned = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
-                XCTAssertNil(returned.activation, "fixture-invalidated activation must not restore opt-in")
+                XCTAssertNil(returned.activation, "real role release cannot restore an old opt-in")
             }
             let optIn: @MainActor () async throws -> AgentSessionOverseerActivation = {
                 let noLink = await authority.hasActiveLink(endpoint: endpoint)
@@ -440,29 +438,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     let a1 = start("Lifecycle-A1")
                     tasks.append(a1)
                     await fulfillment(of: [otherParked], timeout: 10)
-                    // Fork fixture seam (same as the nested-release helper below): upstream
-                    // consumes the pending activation through a real MCP control attach/release.
-                    // The fork's resident subsystem intentionally refuses that production
-                    // schedule for an app-owned session overseeing parked A — prove the refusal,
-                    // then retire the activation at owner level to exercise the same
-                    // entry-mutation/sample-stability invariant; this does not claim production
-                    // reachability through the blocked control path.
-                    do {
-                        _ = try await viewModel.mcpActivateControlContext(
-                            forTabID: creatorTabID, sessionID: creatorID, originatingConnectionID: nil,
-                            taskLabelKind: .explore, markSessionAsMCPOriginated: false
-                        )
-                        XCTFail("resident guard must refuse control capture of an overseeing session")
-                    } catch {
-                        XCTAssertTrue(
-                            String(describing: error).contains("oversees other sessions"),
-                            "expected resident overseer refusal, got \(error)"
-                        )
-                    }
-                    creator.oversight.overseerActivation = nil
+                    await self.installDeniedRoleControlFixture(on: creator, sessionID: creatorID)
                     XCTAssertNil(creator.oversight.overseerActivation)
-                    await bridge.test_auditObserverEligibility()
-                    await bridge.test_settleLaunchReconciliation()
                     await viewModel.mcpDeactivateControlContext(sessionID: creatorID, cleanupSessionStore: true)
                     XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint)?.activation)
                     let mutationParked = XCTestExpectation(description: "exact entry owner paused before cap release")
@@ -618,39 +595,16 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 let beforeControl = await authority.links(forObserver: creatorID)
                 XCTAssertEqual(beforeControl.items.map(\.targetSessionID), [pairA.targetSessionID])
                 XCTAssertNotNil(creator.oversight.overseerActivation)
-                // Fork fixture seam: upstream consumes the pending activation through a real MCP
-                // control attach/release. This fork's resident subsystem intentionally refuses
-                // that production schedule for an app-owned session overseeing pending A
-                // (`mcpRequireResidentActivationFence` — control capture would revoke its links).
-                // Prove the refusal, then retire the activation at owner level to exercise the
-                // same transaction-settlement invariant; this does not claim production
-                // reachability through the blocked control path.
-                do {
-                    _ = try await viewModel.mcpActivateControlContext(
-                        forTabID: creatorTabID, sessionID: creatorID, originatingConnectionID: nil,
-                        taskLabelKind: .explore, markSessionAsMCPOriginated: false
-                    )
-                    XCTFail("resident guard must refuse control capture of an overseeing session")
-                } catch {
-                    XCTAssertTrue(
-                        String(describing: error).contains("oversees other sessions"),
-                        "expected resident overseer refusal, got \(error)"
-                    )
-                }
-                creator.oversight.overseerActivation = nil
+                await self.installDeniedRoleControlFixture(on: creator, sessionID: creatorID)
                 XCTAssertNil(creator.oversight.overseerActivation)
-                // Upstream's control capture disqualifies the endpoint (nil bootstrap state); the
-                // fork session stays resident-eligible, so consumption reads as a live state with
-                // no activation.
-                XCTAssertNotNil(viewModel.agentSessionLinkBootstrapState(for: endpoint))
-                XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint)?.activation)
+                XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint))
                 await bridge.test_auditObserverEligibility()
                 await bridge.test_settleLaunchReconciliation()
                 let duringControl = await authority.hasActiveLink(endpoint: endpoint)
                 XCTAssertTrue(duringControl, "the pending A grant is not yet in the completed-observer audit set")
                 await viewModel.mcpDeactivateControlContext(sessionID: creatorID, cleanupSessionStore: true)
                 let ordinaryAgain = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
-                XCTAssertNil(ordinaryAgain.activation, "fixture-invalidated activation must not restore opt-in")
+                XCTAssertNil(ordinaryAgain.activation, "real control release must not restore opt-in")
                 await bridge.test_auditObserverEligibility()
                 await bridge.test_settleLaunchReconciliation()
                 var stableReference: DomainAgentSessionLinkReference?
