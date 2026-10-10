@@ -3092,7 +3092,7 @@ actor ServerNetworkManager {
 
     private func liveSessionLinkGrantSnapshot(connectionID: UUID, modelOnly: Bool = false) async -> LiveSessionLinkGrantSnapshot? {
         #if DEBUG
-            return await AgentSessionLinkCatalogReadScope.$isRoleLookup.withValue(true) {
+            return await AgentSessionLinkCatalogReadScope.isRoleLookupTaskLocal.withValue(true) {
                 await readLiveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: modelOnly)
             }
         #else

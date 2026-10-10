@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 // Cross-window endpoint source for oversight links.
 //
@@ -9,7 +10,10 @@ import RepoPromptDomainRuntime
 // respect to window state.
 #if DEBUG
     enum AgentSessionLinkCatalogReadScope {
-        @TaskLocal static var isRoleLookup = false
+        static let isRoleLookupTaskLocal = BoxedTaskLocal<Bool>(false)
+        static var isRoleLookup: Bool {
+            isRoleLookupTaskLocal.get()
+        }
     }
 
     /// Opt-in counters for the bounded actual-route catalog regression fixture.
