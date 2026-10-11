@@ -5968,15 +5968,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
                 return false
             }
-            // This replay bypasses `sendCodexNativeMessage`, so it must reproduce that path's
-            // oversight composition after both readiness gates and against the original logical
-            // dispatch ID. An accepted Auto-wake is already settled: it may replay only its exact
-            // accepted fragment, never raw text or a newly minted lane claim. Ordinary turns keep
-            // the current-claim, exact-accepted-claim, then raw-text ordering.
+            // This replay bypasses `sendCodexNativeMessage`, so it must preserve accepted input
+            // after both readiness gates and against the original logical dispatch ID.
+            // Recovery follows possible handoff: reuse only the stored accepted baseline, never
+            // harvest a fresh claim or optional input. New updates remain owed to a fresh turn.
+            // An accepted Auto-wake must still refuse if its exact accepted authority is gone.
             //
             // Classified by reserved dispatch-ID family rather than by a parsed wake ID, so a
             // malformed Auto-wake identity takes the restrictive branch and is refused instead of
-            // falling through to the ordinary replay that may mint a fresh claim or send raw text.
+            // falling through to the ordinary replay that may send raw stored text.
             let originalMonitoringDispatchID = replayTurn.monitoringDispatchID
                 ?? replayTurn.monitoringClaim?.dispatchID
             let monitoring: AgentSessionLinkDecoratedProviderText?
@@ -6022,16 +6022,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 monitoring = nil
                 replayText = AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: acknowledged)
             } else {
-                monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
-                    replayTurn.text,
-                    session: session,
-                    dispatchID: replayDispatchID
-                )
-                let requiredLaneUnavailable = monitoring?.mustAbortDispatch == true
-                    || (
-                        monitoring == nil
-                            && AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID)
-                    )
+                monitoring = nil
+                let requiredLaneUnavailable = AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID)
                 guard !requiredLaneUnavailable else {
                     viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                         for: session,
@@ -6039,14 +6031,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     )
                     return false
                 }
-                replayText = if let monitoring, monitoring.claim != nil {
-                    monitoring.text
-                } else if let acknowledged = replayTurn.monitoringClaim,
-                          viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
-                              acknowledged,
-                              for: session,
-                              dispatchID: replayDispatchID
-                          ) == true
+                replayText = if let acknowledged = replayTurn.monitoringClaim,
+                                viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                                    acknowledged,
+                                    for: session,
+                                    dispatchID: replayDispatchID
+                                ) == true
                 {
                     AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: acknowledged)
                 } else {
@@ -6065,7 +6055,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return false
             }
             acquiredAgentSessionLinkPhysicalDispatch = true
-            var releasedReplayClaim: AgentSessionLinkOutboundPromptClaim?
             try await startCodexHookGateOwnerTurn(
                 ownerToken: hookGateDispatchOwnerToken,
                 controller: controller,
@@ -6086,23 +6075,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                           session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
                           viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true else { throw CancellationError() }
                 }
-                let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
-                if monitoring?.claim?.localInput != nil {
-                    guard !Task.isCancelled, computerUseRecoveryStopFence.permitsStart(of: session),
-                          session.runID == runID, session.runState.isActive,
-                          session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
-                          session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
-                          computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
-                          computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
-                          viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
-                    else { throw CancellationError() }
-                }
-                let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: replayDispatchID, claim: monitoring?.claim, proof: $0) }
-                guard released?.mustAbortDispatch != true else { throw CancellationError() }
-                releasedReplayClaim = released?.claim
-                let inputText = monitoring?.claim != nil ? (released?.text(replayTurn.text) ?? replayText) : replayText
                 let receipt = try await controller.startUserTurn(
-                    text: inputText,
+                    text: replayText,
                     images: replayTurn.images,
                     model: replayTurn.model,
                     reasoningEffort: replayTurn.reasoningEffort,
@@ -6120,7 +6094,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return receipt
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: releasedReplayClaim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: nil)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
