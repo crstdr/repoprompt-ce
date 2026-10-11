@@ -14,6 +14,9 @@ struct AgentSessionLinkRetainedLocalInputIndex {
         let keptCharacterCount: Int
         let fullSanitizedCharacterCount: Int
         let truncated: Bool
+        /// Derived only from the Read-bounded, sanitized representation. Keep escaping on the
+        /// existing bounded settlement path, rather than repeating it for every claim candidate.
+        let escapedBody: String
 
         static func project(_ item: AgentChatItem) -> Content? {
             guard item.kind == .user, item.userInputOrigin == .localComposer,
@@ -29,7 +32,8 @@ struct AgentSessionLinkRetainedLocalInputIndex {
                     excerptEnd: "",
                     keptCharacterCount: safe.count,
                     fullSanitizedCharacterCount: fullCount,
-                    truncated: false
+                    truncated: false,
+                    escapedBody: AgentSessionLinkMessageEnvelope.escaped(safe)
                 )
             }
             // Read exposes a byte-bounded prefix. Never recover tail text outside that prefix.
@@ -46,7 +50,8 @@ struct AgentSessionLinkRetainedLocalInputIndex {
                 excerptEnd: end,
                 keptCharacterCount: start.count + end.count,
                 fullSanitizedCharacterCount: fullCount,
-                truncated: true
+                truncated: true,
+                escapedBody: "<start>\(AgentSessionLinkMessageEnvelope.escaped(start))</start><end>\(AgentSessionLinkMessageEnvelope.escaped(end))</end>"
             )
         }
     }
@@ -72,7 +77,6 @@ struct AgentSessionLinkRetainedLocalInputIndex {
     struct Seed {
         struct Row {
             let itemID: UUID
-            let sequenceIndex: Int
             let timestamp: Date
             let content: Content
         }
@@ -86,7 +90,7 @@ struct AgentSessionLinkRetainedLocalInputIndex {
             guard let content = Content.project(item) else { return }
             if trackedIDs.contains(item.id) { trackedRows[item.id] = content }
             totalCount += 1
-            rows.append(Row(itemID: item.id, sequenceIndex: item.sequenceIndex, timestamp: item.timestamp, content: content))
+            rows.append(Row(itemID: item.id, timestamp: item.timestamp, content: content))
             if rows.count > capacity { rows.removeFirst() }
         }
     }

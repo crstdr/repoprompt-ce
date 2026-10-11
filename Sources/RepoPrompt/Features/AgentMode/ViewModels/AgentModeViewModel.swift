@@ -21073,6 +21073,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(waitID: session.instructionWaitID ?? UUID())
             let monitoring = agentSessionLinkDecoratedProviderText(text, session: session, dispatchID: dispatchID)
             let inputFence = AgentRunStartStopFence(session: session)
+            var returnedInstruction = false
+            defer {
+                // The new optional proof suspends after this entry left the queue. Until return,
+                // retain its recovery ownership without replaying into a rebound session.
+                if !returnedInstruction, monitoring.claim?.localInput != nil,
+                   sessions[session.tabID] === session,
+                   inputFence.binding == session.persistentSessionBindingIdentity
+                {
+                    if inputFence.permitsStart(of: session) {
+                        session.pendingInstructions.insert(queuedText, at: 0)
+                        session.isDirty = true
+                    } else if let draft = queuedText.localDraftText {
+                        restoreComposerDraft(
+                            tabID: session.tabID, text: draft,
+                            message: "Restored local queued instruction after cancelled Read proof",
+                            strategy: .prependAlways
+                        )
+                    }
+                }
+            }
             let proof = await agentSessionLinkProveProviderInput(for: session, claim: monitoring.claim)
             if monitoring.claim?.localInput != nil {
                 guard !Task.isCancelled, sessions[session.tabID] === session, inputFence.permitsStart(of: session) else { throw CancellationError() }
@@ -21085,6 +21105,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard !released.mustAbortDispatch else { throw CancellationError() }
             let response = UserInstructionResponse(text: released.text(text), timedOut: false, elapsedSeconds: 0)
             acceptAgentSessionLinkPromptClaim(released.claim)
+            returnedInstruction = true
             return response
         }
 

@@ -780,8 +780,6 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         var notices: Notices
         let store = AgentSessionLinkOutboundPromptClaimStore()
         var renderCount = 0
-        var readAllowed = true
-        var harvestVisits = 0
 
         init(count: Int = 1) {
             targets = (0 ..< count).map { AgentSessionLinkLocalInputTests.endpoint($0 + 1) }
@@ -839,7 +837,6 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         func decorate(_ baseline: AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration? {
             let offers = (baseline.passiveBatch?.entries ?? []).compactMap { entry -> Notices.LocalInputOffer? in
                 guard let position = references.firstIndex(of: entry.reference) else { return nil }
-                harvestVisits += 1
                 return notices.localInputOffer(for: sources()[position])
             }
             return AgentSessionLinkPrompts.decorateLocalInputs(baseline, offers: offers)
@@ -1088,6 +1085,7 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         let record = try XCTUnwrap(index.records.first)
         let element = try XCTUnwrap(AgentSessionLinkPrompts.localInputElement(record))
         XCTAssertEqual(element, "<user_input_excerpt at=\"2026-10-11T10:00:00Z\" size=\"600 of 2431 characters\"><start>\(AgentSessionLinkMessageEnvelope.escaped(head))</start><end>\(AgentSessionLinkMessageEnvelope.escaped(tail))</end></user_input_excerpt>")
+        XCTAssertEqual(record.content?.escapedBody, "<start>\(AgentSessionLinkMessageEnvelope.escaped(head))</start><end>\(AgentSessionLinkMessageEnvelope.escaped(tail))</end>")
         XCTAssertFalse(element.contains("<change>"))
         XCTAssertFalse(element.contains("<guidance>"))
         XCTAssertTrue(element.contains("&lt;\u{301}"))
@@ -1153,9 +1151,10 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         XCTAssertEqual(index.records.map(\.ordinal), [1, 2])
         XCTAssertEqual(index.records.map(\.sourcePosition), [6, 3])
         var edited = a
-        edited.text = "A changed"
+        edited.text = "A changed <&\""
         index.replace(edited, at: 3)
         XCTAssertNotEqual(index.records[1].contentVersion, before[1].contentVersion)
+        XCTAssertEqual(index.records[1].content?.escapedBody, AgentSessionLinkMessageEnvelope.escaped(edited.text))
         index.remove(at: 6, itemID: b.id)
         XCTAssertNil(index.records[0].content)
         var seed = Index.Seed(trackedIDs: Set(index.records.map(\.itemID)))
