@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import Foundation
-import OSLog
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -8006,20 +8005,6 @@ final class AgentSessionLinkRuntimeBridge {
         return await receipt(true, nil, firstTask, firstTaskReason)
     }
 
-    /// Fork-only diagnostic channel naming the post-unlink check that refused inside `retireLane`.
-    private static let retireLaneLogger = Logger(
-        subsystem: "com.repoprompt.agents",
-        category: "AgentSessionLinkRetire"
-    )
-
-    private static func logRetireLaneDebug(_ message: @autoclosure () -> String) {
-        #if DEBUG
-            guard UserDefaults.standard.bool(forKey: "enableAgentSessionLinkDebugLogging") else { return }
-            let rendered = message()
-            retireLaneLogger.debug("\(rendered, privacy: .public)")
-        #endif
-    }
-
     /// Exact-inventory proof that the granted link is still the target's only live relationship and
     /// no send is in flight on it. Runs before preflight and again immediately before unlinking.
     private func retireRelationshipFence(
@@ -8167,9 +8152,18 @@ final class AgentSessionLinkRuntimeBridge {
             ) ? nil : "commit"
         }
         if let postUnlinkRefusal {
-            Self.logRetireLaneDebug(
-                "retireLane post-unlink refusal=\(postUnlinkRefusal) target=\(AgentMonitorSessionIDFormatter.short(targetSessionID))"
-            )
+            #if DEBUG
+                // Fork-only diagnostic: fields stay enum-like labels and shortID prefixes, per the
+                // SessionLinks diagnostics redaction boundary.
+                restorePerfRecorder.event(
+                    "oversight.retire",
+                    fields: [
+                        "outcome": "unlinked_not_stashed",
+                        "refusal": postUnlinkRefusal,
+                        "target": restorePerfRecorder.shortID(targetSessionID)
+                    ]
+                )
+            #endif
             return .unlinkedNotStashed(sessionID: targetSessionID)
         }
         return .retired(sessionID: targetSessionID)
