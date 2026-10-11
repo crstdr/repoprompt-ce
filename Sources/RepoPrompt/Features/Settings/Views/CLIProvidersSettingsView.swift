@@ -1805,7 +1805,7 @@ struct CLIProvidersSettingsView: View {
     }
 
     private func loadDetectedCodexExecutables() async {
-        guard detectedCodexExecutables == nil else { return }
+        guard detectedCodexExecutables == nil, !isDetectingCodexExecutables else { return }
         isDetectingCodexExecutables = true
         defer { isDetectingCodexExecutables = false }
         let detected = await CodexExecutableDetection.detectOnSystem()

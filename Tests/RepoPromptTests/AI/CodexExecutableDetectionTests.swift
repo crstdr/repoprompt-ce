@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import RepoPromptApp
 import RepoPromptProcess
@@ -66,6 +67,37 @@ final class CodexExecutableDetectionTests: XCTestCase {
         )
 
         XCTAssertTrue(detected.isEmpty)
+    }
+
+    func testDetectExecutablesSkipsSpecialFiles() throws {
+        let bin = try makeDirectory("fifo-bin")
+        let fifo = bin.appendingPathComponent("codex")
+        XCTAssertEqual(mkfifo(fifo.path, 0o755), 0)
+
+        // The fifo satisfies exists + executable but is not a regular file.
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: fifo.path))
+        let detected = CLIExecutableDiscovery.detectExecutables(
+            named: "codex",
+            inDirectories: [bin.path]
+        )
+
+        XCTAssertTrue(detected.isEmpty)
+    }
+
+    func testDetectExecutablesAbsolutizesRelativeSearchDirectories() throws {
+        let bin = try makeDirectory("relative-bin")
+        let executable = try makeExecutable(in: bin)
+
+        let detected = CLIExecutableDiscovery.detectExecutables(
+            named: "codex",
+            inDirectories: ["relative-bin", "./relative-bin"],
+            baseDirectoryPath: temporaryDirectory.path
+        )
+
+        XCTAssertEqual(detected.count, 1)
+        XCTAssertEqual(detected.first?.path, executable.path)
+        XCTAssertEqual(detected.first?.directory, bin.path)
+        XCTAssertTrue((detected.first?.path as NSString?)?.isAbsolutePath == true)
     }
 
     func testDetectExcludesBundledRuntimePath() throws {
