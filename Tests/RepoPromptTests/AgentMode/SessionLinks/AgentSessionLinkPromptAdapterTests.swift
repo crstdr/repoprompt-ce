@@ -878,7 +878,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
     }
 
     func testLocalInputCodexLateReadRefusalKeepsBaselineAndStopOrCancellationPreventsHandoff() async throws {
-        for mode in ["revoked", "stop", "cancel"] {
+        for mode in ["revoked", "stop", "cancel", "computerUse"] {
             let fixture = try makeFixture()
             await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
             fixture.session.beginRunAttempt(source: "test.codex.localInput.\(mode)")
@@ -903,16 +903,96 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             XCTAssertTrue(fixture.startedTurns.isEmpty, "Read proof precedes physical input")
             if mode == "stop" { fixture.session.stopState.invalidateScheduledStarts() }
             if mode == "cancel" { send.cancel() }
+            let featureState = fixture.session.codexControllerFeatureState
+            if mode == "computerUse" {
+                fixture.session.codexControllerFeatureState?.computerUseEnabled = true
+                XCTAssertEqual(fixture.session.codexControllerFeatureState?.computerUseEnabled, true)
+            }
             gate.release()
             _ = await send.value
+            fixture.session.codexControllerFeatureState = featureState
             if mode == "revoked" {
                 let text = try XCTUnwrap(fixture.startedTurns.first)
                 XCTAssertEqual(fixture.startedTurns.count, 1)
                 XCTAssertEqual(text, try AgentSessionLinkPromptComposer.decorated("existing task", fragment: XCTUnwrap(baseline)))
                 XCTAssertFalse(text.contains("must not escape"))
             } else {
-                XCTAssertTrue(fixture.startedTurns.isEmpty, "existing final Stop/task fence wins during proof")
+                XCTAssertTrue(fixture.startedTurns.isEmpty, "existing final Stop/task/Computer Use fence wins during proof")
             }
+        }
+    }
+
+    func testLocalInputCodexReadCancellationKeepsParkedNoteAndDisclosureForLaterStartAndSteer() async throws {
+        for steer in [false, true] {
+            let fixture = try makeFixture()
+            await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+            fixture.session.beginRunAttempt(source: "test.localInput.parked.prime")
+            _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "prime", attachments: [])
+            if steer {
+                fixture.controller.markActiveTurn(id: "turn-1")
+                await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
+            } else {
+                fixture.session.runState = .idle
+                fixture.session.beginRunAttempt(source: "test.localInput.parked.start")
+            }
+            let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+            addTeardownBlock { @MainActor in await input.cleanup() }
+            await input.correction("PARKED-READ-CORRECTION")
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            let owner = try AgentSelfCompactOwner(
+                windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID,
+                sessionID: endpoint.sessionID, persistentBindingGeneration: XCTUnwrap(endpoint.persistentBindingGeneration),
+                bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
+                runID: XCTUnwrap(fixture.session.runID), runAttemptID: UUID()
+            )
+            var state = AgentSelfCompactState()
+            _ = state.reserve(note: "preserve parked continuation", idempotencyKey: "parked-read-cancellation", owner: owner)
+            state.active?.compactTurnSucceeded = true
+            state.active?.phase = .parked
+            fixture.session.selfCompactState = state
+            let parked = try XCTUnwrap(state.parkedNote)
+            let startsBefore = fixture.startedTurns.count
+            let steersBefore = fixture.controller.steeredTurns.count
+            let gate = TestReleaseFence(name: "parked Codex optional Read cancellation")
+            fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+                await gate.enterAndWait()
+                return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+            }
+            let send = Task { @MainActor in
+                await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "ordinary task", attachments: [])
+            }
+            defer { gate.release()
+                send.cancel()
+            }
+            let entered = await gate.waitUntilEntered()
+            XCTAssertTrue(entered)
+            send.cancel()
+            gate.release()
+            _ = await send.value
+            XCTAssertEqual(fixture.startedTurns.count, startsBefore)
+            XCTAssertEqual(fixture.controller.steeredTurns.count, steersBefore)
+            XCTAssertEqual(fixture.session.selfCompactState.parkedNote?.dispatchID, parked.dispatchID)
+            XCTAssertEqual(fixture.session.selfCompactState.active?.noteDispatchStarted, false)
+            XCTAssertNil(fixture.session.selfCompactState.latest)
+            let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
+            let snapshot = try XCTUnwrap(input.host.publishedPassiveNoticesByEndpoint[input.observer])
+            let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+            XCTAssertNotNil(input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: baseline))
+            fixture.viewModel.test_agentSessionLinkLocalInputReadProof = nil
+            if !steer {
+                fixture.session.runState = .idle
+                fixture.session.beginRunAttempt(source: "test.localInput.parked.retryStart")
+            }
+            let retried = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "later valid task", attachments: [])
+            XCTAssertEqual(retried, .sent)
+            let text = try XCTUnwrap(steer ? fixture.controller.steeredTurns.last : fixture.startedTurns.last)
+            XCTAssertTrue(text.hasPrefix(parked.frame + "\n\n"))
+            XCTAssertEqual(text.components(separatedBy: parked.frame).count - 1, 1)
+            XCTAssertTrue(text.contains("PARKED-READ-CORRECTION"))
+            XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .noteAccepted)
+            XCTAssertEqual(fixture.session.selfCompactState.latest?.noteDelivery, .prepended)
+            XCTAssertNil(fixture.session.selfCompactState.parkedNote)
+            try input.assertConsumed()
         }
     }
 
@@ -2885,6 +2965,56 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #else
             throw XCTSkip("Catalog observation diagnostics require DEBUG helpers.")
         #endif
+    }
+
+    func testLocalInputDequeuedInstructionDuringReadProofRecoversQueueOrStoppedDraftExactlyOnce() async throws {
+        for stopped in [false, true] {
+            let fixture = try makeFixture(agent: .claudeCode)
+            let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+            addTeardownBlock { @MainActor in await input.cleanup() }
+            await input.correction("QUEUE-RECOVERY-CORRECTION")
+            let queued = AgentTabSession.PendingInstruction(providerText: "provider queued input", localDraftText: "distinct local draft")
+            fixture.session.pendingInstructions = [queued]
+            let gate = TestReleaseFence(name: "dequeued instruction optional Read cancellation")
+            fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+                await gate.enterAndWait()
+                return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+            }
+            let waiting = Task { @MainActor in try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
+            defer { gate.release()
+                waiting.cancel()
+            }
+            let entered = await gate.waitUntilEntered()
+            XCTAssertTrue(entered)
+            XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+            if stopped { fixture.session.stopState.invalidateScheduledStarts() }
+            waiting.cancel()
+            gate.release()
+            do {
+                _ = try await waiting.value
+                XCTFail("cancelled queued input must never return to the provider")
+            } catch is CancellationError {} catch { XCTFail("unexpected error: \(error)") }
+            if stopped {
+                XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+                XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "distinct local draft")
+            } else {
+                XCTAssertEqual(fixture.session.pendingInstructions, [queued])
+                XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "")
+            }
+            let snapshot = try XCTUnwrap(input.host.publishedPassiveNoticesByEndpoint[input.observer])
+            let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
+            let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+            XCTAssertNotNil(input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: baseline))
+            if !stopped {
+                fixture.viewModel.test_agentSessionLinkLocalInputReadProof = nil
+                let response = try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID)
+                let acceptedText = try XCTUnwrap(response.text)
+                XCTAssertTrue(acceptedText.contains("provider queued input"))
+                XCTAssertTrue(acceptedText.contains("QUEUE-RECOVERY-CORRECTION"))
+                try input.assertConsumed()
+                XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+            }
+        }
     }
 
     func testLocalInputRealAuthorityWaitingContinuationPhysicalResume() async throws {

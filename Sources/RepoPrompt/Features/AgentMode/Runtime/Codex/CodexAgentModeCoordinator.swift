@@ -6091,6 +6091,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     guard !Task.isCancelled, computerUseRecoveryStopFence.permitsStart(of: session),
                           session.runID == runID, session.runState.isActive,
                           session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
+                          session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
+                          computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
+                          computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
                           viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
                     else { throw CancellationError() }
                 }
@@ -8356,6 +8359,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             }
                             viewModel?.scheduleSave(for: session.tabID)
                         }
+                        guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
+                        let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+                        if monitoring?.claim?.localInput != nil {
+                            guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
+                                  session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
+                                  session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
+                                  session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
+                                  computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
+                                  computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
+                                  isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                            else { throw CancellationError() }
+                        }
+                        // A parked note remains unattempted throughout optional Read proof.
+                        // Claim it before synchronous frontier consumption, with no intervening await.
                         if let noteDispatchID {
                             guard session.selfCompactNoteDispatchIsCurrent(noteDispatchID) else {
                                 throw CancellationError()
@@ -8369,17 +8386,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         }
                         let receipt: CodexTurnStartReceipt
                         do {
-                            guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
-                            let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
-                            if monitoring?.claim?.localInput != nil {
-                                guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
-                                      session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
-                                      session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
-                                      isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
-                                else { throw CancellationError() }
-                            }
                             let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
-                            guard released?.mustAbortDispatch != true else { throw CancellationError() }
+                            guard released?.mustAbortDispatch != true else {
+                                if let noteDispatchID {
+                                    var state = session.selfCompactState
+                                    _ = state.noteDefinitivelyNotAttempted(noteDispatchID)
+                                    session.selfCompactState = state
+                                    viewModel?.scheduleSave(for: session.tabID)
+                                }
+                                throw CancellationError()
+                            }
                             releasedMonitoringClaim = released?.claim
                             let baseText = released?.text(text) ?? monitoring?.text ?? text
                             let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
@@ -8440,6 +8456,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     viewModel?.scheduleSave(for: session.tabID)
                 }
                 do {
+                    let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+                    if monitoring?.claim?.localInput != nil {
+                        guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
+                              session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
+                              session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
+                              session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
+                              computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
+                              computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
+                              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                        else { throw CancellationError() }
+                    }
                     if let parkedNote {
                         guard session.selfCompactNoteDispatchIsCurrent(parkedNote.dispatchID) else {
                             return .cancelled
@@ -8449,16 +8476,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         session.selfCompactState = state
                         viewModel?.scheduleSave(for: session.tabID)
                     }
-                    let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
-                    if monitoring?.claim?.localInput != nil {
-                        guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
-                              session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
-                              session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
-                              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
-                        else { throw CancellationError() }
-                    }
                     let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
-                    guard released?.mustAbortDispatch != true else { throw CancellationError() }
+                    guard released?.mustAbortDispatch != true else {
+                        if let parkedNote {
+                            var state = session.selfCompactState
+                            _ = state.noteDefinitivelyNotAttempted(parkedNote.dispatchID)
+                            session.selfCompactState = state
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
+                        throw CancellationError()
+                    }
                     releasedMonitoringClaim = released?.claim
                     let baseText = released?.text(text) ?? monitoring?.text ?? text
                     let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText

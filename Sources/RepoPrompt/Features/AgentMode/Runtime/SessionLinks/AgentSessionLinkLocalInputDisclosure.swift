@@ -109,6 +109,7 @@ struct AgentSessionLinkLocalInputDecoration: Hashable {
     }
 
     let fragment: String
+    /// Row markup only; the separately bounded guidance line is not charged here.
     let markupDeltaBytes: Int
     let requirements: [Requirement]
 }

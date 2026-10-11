@@ -4071,6 +4071,11 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
+            // Retire only the disclosure lease before durable settlement can suspend. A proof
+            // completed just before this known revocation must not survive its disk-write hop.
+            if let observer = notice.observerEndpoint {
+                passiveNoticesByObserver[observer]?.localInputFrontiers.removeValue(forKey: reference)
+            }
         }
         // Generation-qualified for the same reason, and released before anything republishes: a
         // queued message must never outlive the exact grant that admitted it.

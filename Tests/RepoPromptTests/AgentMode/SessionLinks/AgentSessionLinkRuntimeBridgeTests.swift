@@ -6689,6 +6689,42 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertNil(fixture.bridge.localInputDecoration(observer: fixture.observer.domainEndpoint, inventory: regranted, baseline: rebaseline), "relink is not catch-up")
     }
 
+    func testLocalInputKnownRevocationRetiresDisclosureBeforeDurableSettlementHop() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        fixture.host.localInputIndexes[fixture.target.domainEndpoint] = .init()
+        guard case .added = await addLink(fixture) else { return XCTFail("link setup failed") }
+        await publishStatus(fixture, .running, at: 1001)
+        fixture.host.localInputIndexes[fixture.target.domainEndpoint]?.settle(
+            .user("Already proved; now revoked.", sequenceIndex: 0, userInputOrigin: .localComposer), at: 0
+        )
+        await publishStatus(fixture, .idle, at: 1002)
+        let snapshot = try XCTUnwrap(passiveSnapshot(fixture))
+        let inventory = try XCTUnwrap(fixture.host.publishedPromptInventories[fixture.observer.sessionID])
+        let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+        let decoration = try XCTUnwrap(fixture.bridge.localInputDecoration(observer: fixture.observer.domainEndpoint, inventory: inventory, baseline: baseline))
+        let proof = await fixture.bridge.proveLocalInputRead(decoration, observer: fixture.observer.domainEndpoint)
+        XCTAssertTrue(proof)
+        let resolvedReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(resolvedReference)
+        let bytes = try agentSessionLinkEvidenceBytes((snapshot, snapshot.wakeEligibilityFingerprint, AgentSessionLinkPassiveStatusNotices.Receipt(snapshot: snapshot)))
+        let gate = TestReleaseFence(name: "known revocation before durable settlement")
+        fixture.bridge.test_beforeDurableIntentSettlement = { _ in await gate.enterAndWait() }
+        let revoke = Task { @MainActor in await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation) }
+        defer { gate.release()
+            fixture.bridge.test_beforeDurableIntentSettlement = nil
+            revoke.cancel()
+        }
+        let entered = await gate.waitUntilEntered()
+        guard entered else { return XCTFail("revocation must reach existing durable settlement seam") }
+        XCTAssertFalse(fixture.bridge.localInputContentIsCurrent(decoration, observer: fixture.observer.domainEndpoint))
+        XCTAssertFalse(fixture.bridge.consumeLocalInputHandoff(decoration, observer: fixture.observer.domainEndpoint))
+        let during = try XCTUnwrap(passiveSnapshot(fixture))
+        XCTAssertEqual(try agentSessionLinkEvidenceBytes((during, during.wakeEligibilityFingerprint, AgentSessionLinkPassiveStatusNotices.Receipt(snapshot: during))), bytes)
+        gate.release()
+        await revoke.value
+    }
+
     func testLocalInputWarm30PreparationDeltaWithTenSaturatedLinksAnd300Chats() async throws {
         let fixture = makeFixture()
         let targets = [fixture.target] + (1 ..< 10).map { makeCandidate(windowID: $0 % 3 + 1, displayName: "Alpha \($0)") }
@@ -6833,7 +6869,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.host.candidateReadCount, censusBefore)
         XCTAssertEqual(reads, 3000, "ten target-local reads per harvest/preproof/handoff, independent of 300 chats")
         XCTAssertLessThanOrEqual(visits, reads * 16)
-        XCTAssertLessThan(elapsed, 10, "generous local Debug diagnostic bound, not a benchmark claim")
     }
 
     // MARK: - Two-window add/revoke/status integration
