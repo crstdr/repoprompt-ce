@@ -1018,6 +1018,60 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
 
+    func testLocalInputCodexExpectedTurnRetryUsesBaselineWithoutHarvestingNewCorrection() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        fixture.session.beginRunAttempt(source: "test.codex.mismatch.prime")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "prime", attachments: [])
+        fixture.controller.markActiveTurn(id: "turn-1")
+        await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
+        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+        addTeardownBlock { @MainActor in await input.cleanup() }
+        await input.correction("FIRST-HANDOFF-CORRECTION")
+        var proofCalls = 0
+        var baselineFragment: String?
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+            proofCalls += 1
+            return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+        }
+        fixture.viewModel.test_agentSessionLinkLocalInputDecoration = { rendered in
+            baselineFragment = rendered.fragment
+            let inventory = input.host.publishedPromptInventories[input.observer.sessionID]!
+            return input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: rendered)
+        }
+        var attempts: [String] = []
+        fixture.controller.steerHandler = { @MainActor text, expectedTurnID in
+            attempts.append(text)
+            if attempts.count == 1 {
+                await input.correction("NEW-DURING-RETRY-CORRECTION")
+                throw CodexTurnSteerError.expectedTurnMismatch(
+                    expectedTurnID: expectedTurnID, actualTurnID: "turn-2",
+                    failure: .init(method: "turn/steer", code: nil, message: "expected turn mismatch", data: nil)
+                )
+            }
+            return CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
+        }
+        let outcome = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "existing steering", attachments: [])
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(attempts.count, 2)
+        XCTAssertTrue(try XCTUnwrap(attempts.first).contains("FIRST-HANDOFF-CORRECTION"))
+        let retry = try XCTUnwrap(attempts.last)
+        XCTAssertEqual(Array(retry.utf8), try Array(AgentSessionLinkPromptComposer.decorated("existing steering", fragment: XCTUnwrap(baselineFragment)).utf8))
+        XCTAssertFalse(retry.contains("<user_input"))
+        XCTAssertFalse(retry.contains("NEW-DURING-RETRY-CORRECTION"))
+        XCTAssertEqual(proofCalls, 1)
+        fixture.controller.steerHandler = nil
+        fixture.viewModel.test_agentSessionLinkLocalInputDecoration = nil
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "test.codex.mismatch.fresh")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "independently permitted fresh turn", attachments: [])
+        let fresh = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertTrue(fresh.contains("NEW-DURING-RETRY-CORRECTION"))
+        XCTAssertFalse(fresh.contains("FIRST-HANDOFF-CORRECTION"))
+        XCTAssertEqual(proofCalls, 2)
+        try input.assertConsumed()
+    }
+
     func testLocalInputRealAuthorityCodexFallbackHarvestsOnlyAtPhysicalDrain() async throws {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
@@ -1494,6 +1548,109 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
     }
 
+    func testAuthRecoveryAcceptedBaselineReplayLeavesNewCorrectionOwedForFreshTurn() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+        addTeardownBlock { @MainActor in await input.cleanup() }
+        var proofCalls = 0
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+            proofCalls += 1
+            return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+        }
+        fixture.session.beginRunAttempt(source: "test.auth.acceptedBaseline")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "BASELINE-ONLY", attachments: [])
+        let original = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertFalse(original.contains("<user_input"))
+        XCTAssertNil(fixture.session.codexPendingAuthRetryTurn?.monitoringClaim?.localInput)
+        let acceptedProofCalls = proofCalls
+
+        // This is new retained composer input AFTER acceptance, not the already-consumed offer.
+        await input.correction("FRESH-OWED-CORRECTION")
+        let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
+        let snapshot = try XCTUnwrap(input.host.publishedPassiveNoticesByEndpoint[input.observer])
+        let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+        let owed = try XCTUnwrap(input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: baseline))
+        let range = try XCTUnwrap(owed.requirements.first?.offer.range)
+        XCTAssertEqual(range.capturedFrontier, 0)
+        XCTAssertEqual(range.throughOrdinal, 1)
+
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .errorNotification(.init(message: "external auth is active", willRetry: false, threadID: nil, turnID: nil, itemID: nil)),
+            session: fixture.session, sourceController: fixture.controller
+        )
+        XCTAssertEqual(fixture.startedTurns.count, 2)
+        try assertReplayUsedFreshController(fixture)
+        let replay = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertEqual(Array(replay.utf8), Array(original.utf8), "accepted replay must use the original baseline bytes")
+        XCTAssertFalse(replay.contains("FRESH-OWED-CORRECTION"))
+        XCTAssertEqual(proofCalls, acceptedProofCalls, "accepted replay must not perform another Read proof")
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPromptClaimStore.test_pendingClaimCount(observerSessionID: fixture.sessionID), 0, "accepted replay must not mint a fresh claim")
+        let stillOwed = input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: baseline)
+        XCTAssertEqual(stillOwed?.requirements.first?.offer.range, range, "accepted replay must not advance the disclosure frontier")
+        let replayFrontier = stillOwed?.requirements.first?.offer.range.capturedFrontier
+        print("OVERSIGHT_ACCEPTED_REPLAY baselineBytes=\(original.utf8.count) replayBytes=\(replay.utf8.count) readProofs=\(acceptedProofCalls)->\(proofCalls) frontier=\(range.capturedFrontier)->\(String(describing: replayFrontier)) through=\(range.throughOrdinal)")
+
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "test.auth.independentFreshTurn")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "independently permitted fresh turn", attachments: [])
+        let fresh = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertTrue(fresh.contains("FRESH-OWED-CORRECTION"))
+        XCTAssertEqual(proofCalls, acceptedProofCalls + 1)
+        try input.assertConsumed()
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "test.auth.afterFreshTurn")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "later permitted turn", attachments: [])
+        XCTAssertFalse(try XCTUnwrap(fixture.startedTurns.last).contains("FRESH-OWED-CORRECTION"))
+        XCTAssertEqual(proofCalls, acceptedProofCalls + 1)
+    }
+
+    func testAuthRecoveryReplayDoesNotUpgradeFreshOwedLocalInput() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+        addTeardownBlock { @MainActor in await input.cleanup() }
+        var proofCalls = 0
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+            proofCalls += 1
+            return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+        }
+        await input.correction("ORIGINAL-ACCEPTED-CORRECTION")
+        fixture.session.beginRunAttempt(source: "test.codex.auth.freshLocalInput")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "auth turn", attachments: [])
+        let original = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertEqual(fixture.startedTurns.count, 1)
+        XCTAssertTrue(original.contains("ORIGINAL-ACCEPTED-CORRECTION"))
+        XCTAssertEqual(proofCalls, 1)
+        let accepted = try XCTUnwrap(fixture.session.codexPendingAuthRetryTurn?.monitoringClaim)
+        XCTAssertNil(accepted.localInput)
+        let baseline = AgentSessionLinkPromptComposer.decorated("auth turn", with: accepted)
+        try input.assertConsumed()
+        await input.correction("FRESH-OWED-CORRECTION")
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .errorNotification(.init(
+                message: "stream error: unexpected status 401 Unauthorized from api.openai.com/v1/responses",
+                willRetry: false,
+                threadID: nil,
+                turnID: nil,
+                itemID: nil
+            )),
+            session: fixture.session, sourceController: fixture.controller
+        )
+        let didRefresh = await fixture.authRecovery.didRefresh
+        XCTAssertTrue(didRefresh)
+        XCTAssertEqual(fixture.startedTurns.count, 2)
+        try assertReplayUsedFreshController(fixture)
+        let replay = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertEqual(replay, baseline, "accepted auth replay must retain its exact baseline only")
+        XCTAssertEqual(Array(replay.utf8), Array(baseline.utf8))
+        XCTAssertFalse(replay.contains("ORIGINAL-ACCEPTED-CORRECTION"))
+        XCTAssertFalse(replay.contains("FRESH-OWED-CORRECTION"))
+        XCTAssertEqual(proofCalls, 1, "accepted replay must not prove or upgrade a fresh optional offer")
+        MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
+        print("OVERSIGHT_VERA_REPLAY originalBytes=\(original.utf8.count) acceptedBaselineBytes=\(baseline.utf8.count) replayBytes=\(replay.utf8.count) readProofs=1->\(proofCalls)")
+    }
+
     func testAuthRecoveryReplayPreservesTheAlreadyAcknowledgedSupplement() async throws {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
@@ -1635,7 +1792,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
     }
 
-    func testAuthRecoveryReplayShipsCurrentMembershipWhenLinksChangedMidRecovery() async throws {
+    func testAuthRecoveryReplayLeavesChangedMembershipOwedForFreshTurn() async throws {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.auth.churn")
@@ -1663,10 +1820,12 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         XCTAssertEqual(fixture.startedTurns.count, 2)
         try assertReplayUsedFreshController(fixture)
         let replay = try XCTUnwrap(fixture.startedTurns.last)
-        MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(replay, userContent: "churn turn")
-        XCTAssertTrue(replay.contains("count=\"3\""), "the replay must ship the current membership")
+        XCTAssertEqual(replay, "churn turn", "changed authority must not resurrect the accepted fragment or mint a fresh claim")
+        MonitorSupplementAssertions.assertCarriesNoSupplement(replay)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPromptClaimStore.test_pendingClaimCount(observerSessionID: fixture.sessionID), 0)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPromptClaimStore.test_lastAcceptedRevision(observerSessionID: fixture.sessionID), 1)
 
-        // Revision 2 is now acknowledged, so an ordinary later turn is quiet.
+        // Recovery cannot acknowledge a new revision; a separately permitted fresh turn owns it.
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.auth.after")
         _ = await fixture.coordinator.sendCodexNativeMessage(
@@ -1674,9 +1833,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             text: "later turn",
             attachments: []
         )
-        try MonitorSupplementAssertions.assertCarriesNoSupplement(
-            XCTUnwrap(fixture.startedTurns.last)
-        )
+        let fresh = try XCTUnwrap(fixture.startedTurns.last)
+        MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(fresh, userContent: "later turn")
+        XCTAssertTrue(fresh.contains("count=\"3\""))
     }
 
     /// Regression: managed-auth replay classifies by reserved dispatch-ID *family*, never by a parsed
@@ -1684,8 +1843,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
     ///
     /// `lane.autowake:<UUID>:<epoch>` is the historical spelling: reserved family, no parseable wake.
     /// If this branch asked `autoWakeID != nil` instead of `isAutoWakeFamily`, that value would read
-    /// as an ordinary dispatch and fall into the ordinary replay — the one branch that may mint a
-    /// fresh lane claim or ship raw stored text. A settled wake is already spent; the only thing it
+    /// as an ordinary dispatch and fall into the ordinary replay branch that may ship raw stored text.
+    /// A settled wake is already spent; the only thing it
     /// may ever replay is the exact fragment that was accepted, and an identity that cannot be matched
     /// to that fragment must refuse instead of composing a new turn.
     ///
@@ -3269,6 +3428,8 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     /// When set, `steerUserTurn` throws it instead of accepting, which is how the runtime lands in
     /// the queued-fallback path.
     var steerFailure: CodexTurnSteerError?
+    /// Intercepts each physical steer attempt to drive the actual bounded transport retry.
+    var steerHandler: (@MainActor @Sendable (String, String) async throws -> CodexTurnSteerReceipt)?
     /// Runtime status the queued-fallback pump reads. Idle unless a test deliberately holds it.
     var threadRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus {
         get { lock.withLock { runtimeStatus } }
@@ -3364,6 +3525,9 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
         images _: [AgentImageAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
+        if let steerHandler {
+            return try await steerHandler(text, expectedTurnID)
+        }
         if let steerFailure {
             throw steerFailure
         }
