@@ -193,6 +193,10 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         isStillRetirable: @escaping @MainActor () -> Bool
     ) async -> Bool
 
+    /// The synchronous slice of retirement readiness run immediately before unlinking: endpoint
+    /// currentness, target quiescence, live subtree settlement, and save admission.
+    func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool
+
     func agentSessionLinkLaneProvenance(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UUID?
@@ -566,6 +570,10 @@ extension AgentSessionLinkEndpointHost {
         endpoint _: DomainAgentSessionLinkEndpointIdentity, commit _: Bool,
         isStillRetirable _: @escaping @MainActor () -> Bool
     ) async -> Bool {
+        false
+    }
+
+    func agentSessionLinkRetirementReadiness(endpoint _: DomainAgentSessionLinkEndpointIdentity) -> Bool {
         false
     }
 
@@ -8110,6 +8118,13 @@ final class AgentSessionLinkRuntimeBridge {
         if let refusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease) {
             return .notRetired(sessionID: targetSessionID, reason: refusal)
         }
+        // The fence's awaits kept the grant live, so revalidate synchronously before unlinking.
+        // The residual window inside stopMonitorLink stays covered by post-unlink revalidation.
+        guard !isFrozenForTermination else {
+            return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
+        }
+        guard stillRetirable(), host.agentSessionLinkRetirementReadiness(endpoint: endpoint)
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
         // Stop owns the pair-retirement lane. Wrapping it here would wait on our own barrier.
         let stop = await stopMonitorLink(
             observerEndpoint: observerEndpoint,
