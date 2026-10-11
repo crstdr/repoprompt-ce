@@ -1876,11 +1876,13 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         }
     }
 
-    /// A refusal raised only after the unlink is honest: the link is gone, the mutation could not
-    /// persist, and the outcome must still be `unlinked_not_stashed`.
-    func testWorkspaceSaveRefusalAfterUnlinkReportsUnlinkedNotStashed() async throws {
+    /// A workspace-save refusal raised after the stash has committed does not un-retire the lane:
+    /// the link is gone, the tab and its settled children already sit in `stashedTabs`, and the
+    /// outcome is `retired` — the normal save cadence persists the mutation later.
+    func testWorkspaceSaveRefusalAfterCommittedStashStillReportsRetired() async throws {
         try await withFixture(ephemeral: false) { fixture in
             let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
             let linked = try await makeLinkedOverseer(fixture: fixture)
             defer {
                 linked.bridge.freezeForTermination()
@@ -1888,14 +1890,25 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             }
             let lane = try await createLinkedLane(
                 fixture: fixture, overseer: linked,
-                name: "Post-unlink refusal lane", idempotencyKey: "post-unlink-refusal-retire"
+                name: "Post-stash save refusal lane", idempotencyKey: "post-stash-save-refusal"
             )
+            let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true,
+                sessionName: "Settled child", parentSessionID: lane.sessionID,
+                expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(target)
+            let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+            child.runState = .idle
+            child.isDirty = true
+            await viewModel.flushSave(for: target.tabID)
             // Arm the refusal inside the stop admission hook: the preflight probe has already
-            // passed, so the rejection can only land on the post-unlink workspace save.
+            // passed, so the rejection can only land on the post-unlink workspace save — which no
+            // longer gates the outcome once the stash has committed.
             linked.bridge.test_afterStopAdmission = {
                 linked.bridge.test_afterStopAdmission = nil
                 fixture.window.workspaceManager.setWorkspacePersistenceOutcomeOverrideForTesting(
-                    .rejected(reason: "injected post-unlink save refusal")
+                    .rejected(reason: "injected post-stash save refusal")
                 )
             }
             defer {
@@ -1904,12 +1917,53 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let outcome = await linked.bridge.retireLane(
                 observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
             )
-            XCTAssertEqual(outcome, .unlinkedNotStashed(sessionID: lane.sessionID))
+            XCTAssertEqual(outcome, .retired(sessionID: lane.sessionID))
             let inbound = await linked.authority.links(forTarget: lane.sessionID)
             XCTAssertTrue(inbound.items.isEmpty, "the link was honestly removed before the refusal")
             let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
             XCTAssertTrue(workspace.stashedTabs.contains { $0.tab.id == lane.tabID })
+            XCTAssertTrue(
+                workspace.stashedTabs.contains { $0.tab.id == target.tabID },
+                "the settled child must ride the same committed stash"
+            )
             XCTAssertFalse(workspace.composeTabs.contains { $0.id == lane.tabID })
+        }
+    }
+
+    /// `unlinked_not_stashed` is reserved for the genuine case: the link is gone but the stash
+    /// itself never committed. A quiescence flip injected after the unlink makes the commit-time
+    /// CAS refuse before any projection mutation, so the tab stays live and the outcome is honest.
+    func testPostUnlinkUncommittedStashStillReportsUnlinkedNotStashed() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Uncommitted stash lane", idempotencyKey: "uncommitted-stash-retire"
+            )
+            // Flip the lane's live session to active inside the stop admission hook: the commit-time
+            // revalidation then refuses before the stash mutates anything — the honest residual.
+            linked.bridge.test_afterStopAdmission = {
+                linked.bridge.test_afterStopAdmission = nil
+                viewModel.sessions[lane.tabID]?.runState = .running
+            }
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .unlinkedNotStashed(sessionID: lane.sessionID))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertTrue(inbound.items.isEmpty, "the link was honestly removed before the refusal")
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            XCTAssertFalse(
+                workspace.stashedTabs.contains { $0.tab.id == lane.tabID },
+                "an uncommitted stash must leave the tab live"
+            )
+            XCTAssertTrue(workspace.composeTabs.contains { $0.id == lane.tabID })
         }
     }
 
