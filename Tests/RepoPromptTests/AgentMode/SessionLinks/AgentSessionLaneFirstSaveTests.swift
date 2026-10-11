@@ -2075,6 +2075,31 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertEqual(merged.map(\.parentSessionID), [parentA])
             XCTAssertTrue(merged.allSatisfy(\.blocksRetirement))
         }
+        // A decoded disk header's nil is a complete-lineage "no parent" claim too: persisted-nil
+        // against any claimed edge is ambiguous and forces the block.
+        for persisted in [
+            [record(.persisted, parent: nil, blocks: true)],
+            [record(.persisted, parent: nil, blocks: false), record(.persisted, blocks: false)]
+        ] {
+            let merged = AgentSessionLaneChildRetirementRecord.merging(
+                sessionID: sessionID,
+                live: [record(.hydratedSession, blocks: false)],
+                persisted: persisted
+            )
+            XCTAssertEqual(merged.map(\.parentSessionID), [parentA])
+            XCTAssertTrue(merged.allSatisfy(\.blocksRetirement))
+        }
+        // Index and unhydrated nils stay non-authoritative: they can neither conflict nor erase.
+        let unknownNil = AgentSessionLaneChildRetirementRecord.merging(
+            sessionID: sessionID,
+            live: [
+                record(.unhydratedSession, parent: nil, blocks: false),
+                record(.sessionIndex, parent: nil, blocks: false)
+            ],
+            persisted: [blockingPersisted]
+        )
+        XCTAssertEqual(unknownNil.map(\.parentSessionID), [parentA])
+        XCTAssertTrue(unknownNil.allSatisfy(\.blocksRetirement))
         // Coherent lineage keeps the single agreed edge and the hydration gate on blocking.
         for live in [
             [record(.unhydratedSession, blocks: false)],
@@ -2098,14 +2123,21 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             )
             XCTAssertEqual(merged.map(\.blocksRetirement), [expectBlocks])
         }
-        // Nil-only evidence yields a single nil-parent record.
-        let topLevel = AgentSessionLaneChildRetirementRecord.merging(
-            sessionID: sessionID,
-            live: [record(.hydratedSession, parent: nil, blocks: false)],
-            persisted: []
-        )
-        XCTAssertEqual(topLevel.map(\.parentSessionID), [nil])
-        XCTAssertFalse(topLevel[0].blocksRetirement)
+        // Nil-only evidence yields a single nil-parent record — agreeing "no parent" votes are
+        // coherent, not a conflict.
+        for persisted in [
+            [record(.persisted, parent: nil, blocks: false)],
+            [record(.persisted, parent: nil, blocks: true)],
+            []
+        ] {
+            let topLevel = AgentSessionLaneChildRetirementRecord.merging(
+                sessionID: sessionID,
+                live: [record(.hydratedSession, parent: nil, blocks: false)],
+                persisted: persisted
+            )
+            XCTAssertEqual(topLevel.map(\.parentSessionID), [nil])
+            XCTAssertFalse(topLevel[0].blocksRetirement)
+        }
     }
 
     /// Persisted `X -> lane running` plus a hydrated `X -> otherParent idle` is ambiguous lineage:
@@ -2165,6 +2197,58 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
                 $0.id == target.tabID
             } == true, "the ambiguous-lineage child must not be stashed")
+        }
+    }
+
+    /// A persisted header's nil parent is a complete top-level lineage claim, so `X -> nil` active
+    /// on disk plus a hydrated `X -> lane idle` is ambiguous: the live edge survives and forces
+    /// the block, and retiring the lane refuses with link and child tab intact.
+    func testPersistedNilParentConflictKeepsLiveEdgeBlocking() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Persisted nil parent", idempotencyKey: "persisted-nil-conflict-blocks"
+            )
+            let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true,
+                sessionName: "Disk-orphaned child", parentSessionID: lane.sessionID,
+                expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(target)
+            let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+            let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
+            child.runState = .idle
+            child.isDirty = true
+            await viewModel.flushSave(for: target.tabID)
+            // The disk row disagrees completely: it claims no parent edge and still says running.
+            var persisted = AgentSession(id: childSessionID, name: "Disk-orphaned child", savedAt: Date())
+            persisted.parentSessionID = nil
+            persisted.lastRunState = AgentSessionRunState.running.rawValue
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
+            let blocked = await host.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: lane.sessionID
+            )
+            XCTAssertTrue(blocked, "a persisted no-parent claim must not erase the live lane edge")
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .notRetired(sessionID: lane.sessionID, reason: .laneInUseDiskChild))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a pre-unlink refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "a pre-unlink refusal must keep the tab")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == target.tabID
+            } == true, "the disk-orphaned child must not be stashed")
         }
     }
 

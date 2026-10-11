@@ -112,16 +112,19 @@ struct AgentSessionLaneChildRetirementRecord {
     }
 
     /// Merge all evidence for one session ID. Parent claims are tiered — session-derived, then
-    /// index, then persisted — but only a hydrated session's nil is an authoritative "no parent"
-    /// vote; every other nil is unknown. When the non-nil claims disagree across tiers, or a
-    /// hydrated nil conflicts with a claimed edge, the lineage is ambiguous: the merge keeps every
-    /// claimed edge and forces the block rather than guessing which subtree owns the session. Only
-    /// coherent lineage lets a hydrated session's quiescence shadow a stale disk or index block.
+    /// index, then persisted. A nil parent is a real "no parent" vote only where the source is
+    /// authoritative: a hydrated session knows its own lineage, and a decoded disk header is the
+    /// complete persisted lineage. Index and unhydrated nils stay "unknown" and never vote. When
+    /// the non-nil claims disagree across tiers, or an authoritative nil conflicts with a claimed
+    /// edge, the lineage is ambiguous: the merge keeps every claimed edge and forces the block
+    /// rather than guessing which subtree owns the session. Only coherent lineage lets a hydrated
+    /// session's quiescence shadow a stale disk or index block.
     static func merging(sessionID: UUID, live: [Self], persisted: [Self]) -> [Self] {
         var sessionParents = Set<UUID>()
         var indexParents = Set<UUID>()
         var persistedParents = Set<UUID>()
         var hydratedNilVote = false
+        var persistedNilVote = false
         for record in live {
             switch record.source {
             case .hydratedSession:
@@ -131,14 +134,23 @@ struct AgentSessionLaneChildRetirementRecord {
             case .sessionIndex:
                 if let parent = record.parentSessionID { indexParents.insert(parent) }
             case .persisted, .merged:
-                break
+                if record.source == .merged {
+                    assertionFailure("merged records must never re-enter merging")
+                }
+                if let parent = record.parentSessionID {
+                    persistedParents.insert(parent)
+                } else { persistedNilVote = true }
             }
         }
         for record in persisted {
-            if let parent = record.parentSessionID { persistedParents.insert(parent) }
+            if record.source == .merged {
+                assertionFailure("merged records must never re-enter merging")
+            }
+            if let parent = record.parentSessionID { persistedParents.insert(parent) } else { persistedNilVote = true }
         }
         let edges = sessionParents.union(indexParents).union(persistedParents)
-        let ambiguous = edges.count > 1 || (hydratedNilVote && !edges.isEmpty)
+        let authoritativeNilVote = hydratedNilVote || persistedNilVote
+        let ambiguous = edges.count > 1 || (authoritativeNilVote && !edges.isEmpty)
         let hydrated = live.contains { $0.source == .hydratedSession }
         let sessionBlocks = live.contains { $0.source.isSessionDerived && $0.blocksRetirement }
         let blocks = ambiguous || (
