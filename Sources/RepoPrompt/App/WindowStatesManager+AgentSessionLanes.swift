@@ -33,11 +33,34 @@ extension WindowStatesManager {
     func agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: UUID) async -> Bool {
         do {
             let records = try await agentSessionLinkPersistedChildRetirementRecords()
-                + agentSessionLinkLiveChildRetirementRecords()
             return isTerminating || AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(
-                of: parentSessionID, in: records
+                of: parentSessionID, in: agentSessionLinkMergedChildRetirementRecords(persisted: records)
             )
         } catch { return true }
+    }
+
+    /// A loaded session's live quiescence is newer than its unflushed disk header, so live records
+    /// shadow persisted rows for the same session ID. Parentage keeps the freshest non-nil value so
+    /// a stale header can neither block nor drop a descendant from the stash set.
+    private func agentSessionLinkMergedChildRetirementRecords(
+        persisted: [AgentSessionLaneChildRetirementRecord]
+    ) -> [AgentSessionLaneChildRetirementRecord] {
+        let live = agentSessionLinkLiveChildRetirementRecords()
+        var liveRecordsBySessionID: [UUID: [AgentSessionLaneChildRetirementRecord]] = [:]
+        for record in live {
+            liveRecordsBySessionID[record.sessionID, default: []].append(record)
+        }
+        let persistedSessionIDs = Set(persisted.map(\.sessionID))
+        var merged = persisted.map { record in
+            guard let liveRecords = liveRecordsBySessionID[record.sessionID] else { return record }
+            return AgentSessionLaneChildRetirementRecord(
+                sessionID: record.sessionID,
+                parentSessionID: liveRecords.compactMap(\.parentSessionID).first ?? record.parentSessionID,
+                blocksRetirement: liveRecords.contains { $0.blocksRetirement }
+            )
+        }
+        merged.append(contentsOf: live.filter { !persistedSessionIDs.contains($0.sessionID) })
+        return merged
     }
 
     private func agentSessionLinkPersistedChildRetirementRecords() async throws -> [AgentSessionLaneChildRetirementRecord] {
@@ -148,11 +171,11 @@ extension WindowStatesManager {
         do { persisted = try await agentSessionLinkPersistedChildRetirementRecords() }
         catch { return false }
         let descendants = AgentSessionLaneChildRetirementRecord.descendantIDs(
-            of: endpoint.sessionID, in: persisted + agentSessionLinkLiveChildRetirementRecords()
+            of: endpoint.sessionID, in: agentSessionLinkMergedChildRetirementRecords(persisted: persisted)
         )
         let subtreeIsRetirable: @MainActor () -> Bool = { [weak self, weak window] in
             guard let self, let window, !self.isTerminating, !window.isClosing, isStillRetirable() else { return false }
-            let records = persisted + agentSessionLinkLiveChildRetirementRecords()
+            let records = agentSessionLinkMergedChildRetirementRecords(persisted: persisted)
             guard !AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(of: endpoint.sessionID, in: records),
                   AgentSessionLaneChildRetirementRecord.descendantIDs(of: endpoint.sessionID, in: records) == descendants
             else { return false }

@@ -235,8 +235,9 @@ extension AgentModeViewModel {
             ?? AgentMonitorSessionIDFormatter.short(creatorID)
     }
 
-    /// Preflight or stash one exact inactive lane. Both removal CAS hooks repeat the check around
-    /// the required session flush; a prompt or run starting during that await keeps the tab open.
+    /// Preflight or stash one exact inactive lane. The commit:false phase runs the same required
+    /// flush, cascade, and post-preflight CAS checks as the stash, plus a non-mutating save-admission
+    /// probe — it only skips the projection mutation. Commit re-runs every check with fresh claims.
     func agentSessionLinkRetireLane(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         commit: Bool,
@@ -257,8 +258,7 @@ extension AgentModeViewModel {
             else { return false }
             return true
         }
-        guard canRetire(), let promptManager else { return false }
-        guard commit else { return true }
+        guard canRetire(), let promptManager, let workspaceManager else { return false }
         let subtreeTabIDs = Set(promptManager.currentComposeTabs.compactMap { tab in
             tab.activeAgentSessionID.map { descendantSessionIDs.contains($0) } == true ? tab.id : nil
         }).union([endpoint.tabID])
@@ -266,14 +266,17 @@ extension AgentModeViewModel {
             withIDs: subtreeTabIDs,
             isMutationContextCurrent: canRetire,
             postPreflightValidation: canRetire,
-            expandCascade: true
+            expandCascade: true,
+            validateOnly: !commit
         )
-        guard report.rejections.isEmpty,
-              report.removedComposeTabIDs.contains(endpoint.tabID),
-              workspaceManager?.activeWorkspace?.stashedTabs.contains(where: {
+        guard report.rejections.isEmpty else { return false }
+        guard commit else {
+            return workspaceManager.canAdmitLifecycleWorkspaceSave(workspaceID: endpoint.workspaceID)
+        }
+        guard report.removedComposeTabIDs.contains(endpoint.tabID),
+              workspaceManager.activeWorkspace?.stashedTabs.contains(where: {
                   $0.tab.id == endpoint.tabID
-              }) == true,
-              let workspaceManager
+              }) == true
         else { return false }
         didStash(report.removedComposeTabIDs)
         // The retirement activation claim stays held by the bridge until this canonical save
