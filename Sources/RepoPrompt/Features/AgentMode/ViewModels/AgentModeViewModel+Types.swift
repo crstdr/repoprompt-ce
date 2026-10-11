@@ -933,6 +933,7 @@ extension AgentModeViewModel {
     }
 
     struct BuiltTranscriptPresentation {
+        var localInputSeed = AgentSessionLinkRetainedLocalInputIndex.Seed()
         let transcript: AgentTranscript
         let baseProjection: AgentTranscriptProjection
         let fullProjection: AgentTranscriptProjection

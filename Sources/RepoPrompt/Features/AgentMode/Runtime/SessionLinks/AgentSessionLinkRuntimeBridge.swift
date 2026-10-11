@@ -31,6 +31,10 @@ enum AgentSessionLinkModelOutcome {
 }
 
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
+        nil
+    }
+
     func agentSessionLinkBootstrapState(for _: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
         nil
     }
@@ -132,6 +136,9 @@ struct AgentSessionLinkForkInheritanceSummary: Equatable {
 /// observing a target must never switch, activate, or focus its window.
 @MainActor
 protocol AgentSessionLinkEndpointHost: AnyObject {
+    /// Exact bounded retained-input lookup. Metadata-only lifecycle calls never copy text.
+    func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot?
+
     /// All live compose-tab/session bindings across every non-closing window.
     func agentSessionLinkCandidates(includeLocation: Bool) -> [AgentSessionLinkEndpointCandidate]
 
@@ -4492,7 +4499,15 @@ final class AgentSessionLinkRuntimeBridge {
             for: candidate,
             samples: monitor.statusSamples,
             linkSetRevision: inputs.outbound.linkSetRevision,
-            currentCandidate: currentCandidate
+            currentCandidate: currentCandidate,
+            localInputSources: inputs.outbound.items.compactMap { item in
+                guard item.capabilities.contains(.read),
+                      let target = inputs.outboundTargetEndpoints[item.linkID] else { return nil }
+                return AgentSessionLinkPassiveStatusNotices.LocalInputSource(
+                    reference: .init(linkID: item.linkID, generation: item.generation), target: target,
+                    snapshot: host.agentSessionLinkLocalInputSnapshot(for: target, includeRecords: false)
+                )
+            }
         )
         return EndpointProjection(
             props: monitor.props,
@@ -5614,12 +5629,67 @@ final class AgentSessionLinkRuntimeBridge {
         return .success(host)
     }
 
-    /// Applies one accepted provider receipt to the exact observer's queue.
-    ///
-    /// Synchronous because it runs at the provider's acceptance signal, on the same MainActor pass as
-    /// the dispatch it acknowledges. The reducer enforces epoch scoping, monotonicity, and
-    /// idempotence; the immediate republish is what stops a second natural dispatch from reclaiming a
-    /// batch that was already physically delivered.
+    /// Claim-time pull over baseline-selected status entries only. No transcript/global census.
+    func localInputDecoration(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        inventory: AgentSessionLinkPromptInventory,
+        baseline: AgentSessionLinkPromptRenderResult
+    ) -> AgentSessionLinkLocalInputDecoration? {
+        guard !isFrozenForTermination, let host,
+              let observerCandidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
+              Self.passiveDeliveryIsPermitted(for: observerCandidate),
+              var notices = passiveNoticesByObserver[observer],
+              let entries = baseline.passiveBatch?.entries else { return nil }
+        var offers: [AgentSessionLinkPassiveStatusNotices.LocalInputOffer] = []
+        for entry in entries {
+            guard inventory.items.contains(where: {
+                $0.reference == entry.reference && $0.targetSessionID == entry.targetSessionID && $0.capabilityNames.contains("read")
+            }) else { continue }
+            let source = AgentSessionLinkPassiveStatusNotices.LocalInputSource(
+                reference: entry.reference, target: entry.targetEndpoint,
+                snapshot: host.agentSessionLinkLocalInputSnapshot(for: entry.targetEndpoint, includeRecords: true)
+            )
+            if let offer = notices.localInputOffer(for: source) { offers.append(offer) }
+        }
+        passiveNoticesByObserver[observer] = notices
+        return AgentSessionLinkPrompts.decorateLocalInputs(baseline, offers: offers)
+    }
+
+    /// Exact endpoints, content and captured frontier. Safe both before and after authority await.
+    func localInputContentIsCurrent(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isFrozenForTermination, let host,
+              let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
+              Self.passiveDeliveryIsPermitted(for: candidate),
+              let notices = passiveNoticesByObserver[observer],
+              notices.canConsumeLocalInputs(decoration.requirements.map(\.offer.range)) else { return false }
+        return decoration.requirements.allSatisfy { requirement in
+            let range = requirement.offer.range
+            guard let snapshot = host.agentSessionLinkLocalInputSnapshot(for: range.target, includeRecords: true),
+                  snapshot.epoch == range.indexEpoch, snapshot.producedThrough >= range.throughOrdinal else { return false }
+            return requirement.renderedRecords.allSatisfy { frozen in
+                snapshot.records.contains(where: {
+                    $0.itemID == frozen.itemID && $0.ordinal == frozen.ordinal && $0.contentVersion == frozen.contentVersion && $0.content == frozen.content
+                })
+            }
+        }
+    }
+
+    func proveLocalInputRead(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
+        guard localInputContentIsCurrent(decoration, observer: observer) else { return false }
+        let requirements = decoration.requirements.map {
+            DomainAgentSessionReadDisclosureRequirement(observer: observer, target: $0.offer.range.target, reference: $0.offer.range.reference)
+        }
+        return await authority.validateReadDisclosures(requirements)
+    }
+
+    /// Synchronous final handoff consumption; no publication, acceptance or wake state mutation.
+    func consumeLocalInputHandoff(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard localInputContentIsCurrent(decoration, observer: observer), var notices = passiveNoticesByObserver[observer],
+              notices.consumeLocalInputs(decoration.requirements.map(\.offer.range)) else { return false }
+        passiveNoticesByObserver[observer] = notices
+        return true
+    }
+
     func applyPassiveMonitorNoticeReceipt(
         _ receipt: AgentSessionLinkPassiveStatusNotices.Receipt,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -5642,7 +5712,8 @@ final class AgentSessionLinkRuntimeBridge {
         for candidate: AgentSessionLinkEndpointCandidate,
         samples: [AgentSessionLinkPassiveStatusNotices.Sample],
         linkSetRevision: UInt64,
-        currentCandidate current: AgentSessionLinkEndpointCandidate?
+        currentCandidate current: AgentSessionLinkEndpointCandidate?,
+        localInputSources: [AgentSessionLinkPassiveStatusNotices.LocalInputSource]
     ) -> AgentSessionLinkPassiveStatusNotices.Snapshot? {
         let endpoint = candidate.domainEndpoint
         let existing = passiveNoticesByObserver[endpoint]
@@ -5681,6 +5752,7 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
         notices.setAutoWakeLanes(autoWakeLanes)
+        notices.reconcileLocalInputSources(localInputSources)
         let snapshot = notices.snapshot
         if samples.isEmpty {
             // The last direct link went away. Publish one terminal empty snapshot so the view model

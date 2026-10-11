@@ -234,6 +234,7 @@ extension AgentModeViewModel {
                 text: text,
                 tabID: destinationTabID,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
+                composerOrigin: .localComposer,
                 routerAudit: routedAudit
             )
             if result != .submitted {
@@ -267,6 +268,7 @@ extension AgentModeViewModel {
                 text: text,
                 tabID: destinationTabID,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
+                composerOrigin: .localComposer,
                 routerAudit: routerAudit
             )
         }
@@ -291,6 +293,7 @@ extension AgentModeViewModel {
             text: text,
             tabID: destinationTabID,
             rawDraftText: claim.attempt.rawDraftSnapshot,
+            composerOrigin: .localComposer,
             autoEffortSelection: selection,
             autoEffortAudit: choice.audit,
             routerAudit: routerAudit
