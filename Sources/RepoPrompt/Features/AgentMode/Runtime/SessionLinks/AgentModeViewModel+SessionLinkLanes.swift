@@ -283,13 +283,17 @@ extension AgentModeViewModel {
               }) == true
         else { return false }
         didStash(report.removedComposeTabIDs)
-        // The retirement activation claim stays held by the bridge until this canonical save
-        // settles, so another window cannot reload the pre-stash binding in the meantime.
-        let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
+        // The stash has committed in memory, so the lane is retired even when this canonical save
+        // is not admitted: the normal save cadence persists it later, and the accepted worst case
+        // is the tab returning unlinked after a crash. The save still runs — the retirement
+        // activation claim stays held by the bridge until it settles, so another window cannot
+        // reload the pre-stash binding in the meantime — but its admission no longer gates the
+        // outcome; only an uncommitted stash may report `unlinked_not_stashed`.
+        _ = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
             workspaceID: endpoint.workspaceID,
             source: WorkspaceSaveSource("oversightLaneRetirement")
         )
-        return persistence.acceptedForLifecycleAdmission
+        return true
     }
 
     /// The synchronous slice of the retire CAS run immediately before unlinking: endpoint
