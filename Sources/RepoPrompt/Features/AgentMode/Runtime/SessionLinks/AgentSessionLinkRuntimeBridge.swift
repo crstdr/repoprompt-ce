@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import OSLog
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -7997,10 +7998,15 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Fork-only diagnostic channel naming the post-unlink check that refused inside `retireLane`.
-    nonisolated static func logRetireLaneDebug(_ message: @autoclosure () -> String) {
+    private static let retireLaneLogger = Logger(
+        subsystem: "com.repoprompt.agents",
+        category: "AgentSessionLinkRetire"
+    )
+
+    private static func logRetireLaneDebug(_ message: @autoclosure () -> String) {
         #if DEBUG
             guard UserDefaults.standard.bool(forKey: "enableAgentSessionLinkDebugLogging") else { return }
-            print(message())
+            retireLaneLogger.debug("\(message(), privacy: .public)")
         #endif
     }
 
@@ -8126,7 +8132,7 @@ final class AgentSessionLinkRuntimeBridge {
         }
         if let postUnlinkRefusal {
             Self.logRetireLaneDebug(
-                "[AgentSessionLinkRuntimeBridge] retireLane post-unlink refusal=\(postUnlinkRefusal) target=\(targetSessionID)"
+                "retireLane post-unlink refusal=\(postUnlinkRefusal) target=\(AgentMonitorSessionIDFormatter.short(targetSessionID))"
             )
             return .unlinkedNotStashed(sessionID: targetSessionID)
         }
