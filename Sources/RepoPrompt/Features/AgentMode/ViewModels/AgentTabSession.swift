@@ -26,11 +26,72 @@ final class AgentTabSession: ObservableObject {
             guard !suppressSourceItemsChanged else { return }
             repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
             rebuildSourceItemDerivedState()
+            invalidateLocalInputStructure()
             onSourceItemsChanged?(self, .structural)
         }
     }
 
-    var transcript: AgentTranscript = .empty
+    var localInputIndex = AgentSessionLinkRetainedLocalInputIndex()
+    var localInputCanonicalCommitPending = false
+    private var localComposerCandidates: [UUID: LocalComposerCandidate] = [:]
+
+    struct LocalComposerCandidate {
+        let itemID: UUID
+        let fence: AgentRunStartStopFence
+        var position: Int
+    }
+
+    /// Identity-only ingress token. No raw draft or provider-formatted text is retained here.
+    func registerLocalComposerCandidate(itemID: UUID, at position: Int) -> UUID {
+        let token = UUID()
+        assert(items.indices.contains(position) && items[position].id == itemID)
+        localComposerCandidates[token] = LocalComposerCandidate(itemID: itemID, fence: AgentRunStartStopFence(session: self), position: position)
+        return token
+    }
+
+    enum LocalComposerDisposition { case retained, rolledBack }
+
+    @discardableResult
+    func settleLocalComposerOrigin(_ token: UUID?, disposition: LocalComposerDisposition) -> Bool {
+        guard let token, let candidate = localComposerCandidates.removeValue(forKey: token) else { return false }
+        guard disposition == .retained,
+              candidate.fence.binding == persistentSessionBindingIdentity,
+              items.indices.contains(candidate.position),
+              items[candidate.position].id == candidate.itemID,
+              items[candidate.position].kind == .user,
+              items[candidate.position].crossSessionAttribution == nil,
+              !items[candidate.position].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        // Ordinary source replacement notification, but no activity timestamp or tool-index rebuild:
+        // the only changed value is provenance, not a lifecycle or assistant observation.
+        suppressSourceItemsChanged = true
+        items[candidate.position].userInputOrigin = .localComposer
+        suppressSourceItemsChanged = false
+        localInputIndex.settle(items[candidate.position], at: candidate.position)
+        finishIncrementalSourceItemsMutation(.replace(index: candidate.position, previousKind: .user, currentKind: .user))
+        isDirty = true
+        return true
+    }
+
+    func installLocalInputSeed(_ seed: AgentSessionLinkRetainedLocalInputIndex.Seed) {
+        localInputIndex.install(seed)
+        localInputCanonicalCommitPending = false
+    }
+
+    #if DEBUG
+        var test_unsettledLocalComposerCandidateCount: Int {
+            localComposerCandidates.count
+        }
+    #endif
+
+    private func invalidateLocalInputStructure() {
+        localComposerCandidates.removeAll()
+        localInputIndex.invalidateStructure()
+    }
+
+    var transcript: AgentTranscript = .empty {
+        didSet { localInputCanonicalCommitPending = true }
+    }
+
     var baseTranscriptProjection: AgentTranscriptProjection = .empty
     var fullTranscriptProjection: AgentTranscriptProjection = .empty
     var workingTranscriptProjection: AgentTranscriptProjection = .empty
@@ -1565,6 +1626,7 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func beginPersistentBindingTransition() -> UInt64 {
+        invalidateLocalInputStructure()
         oversight.overseerActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
         // incoming incarnation.
@@ -1582,7 +1644,10 @@ final class AgentTabSession: ObservableObject {
 
     func installPersistentSessionBinding(_ binding: AgentPersistentSessionBindingIdentity?) {
         precondition(binding == nil || binding?.tabID == tabID)
-        if persistentSessionBindingIdentity != binding { oversight.overseerActivation = nil }
+        if persistentSessionBindingIdentity != binding {
+            invalidateLocalInputStructure()
+            oversight.overseerActivation = nil
+        }
         persistentSessionBindingIdentity = binding
         bindingTransitionInProgress = false
         restorationReadiness = currentRestorationBindingToken.map { .pending($0) } ?? .unbound
@@ -2014,6 +2079,7 @@ final class AgentTabSession: ObservableObject {
         payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource,
         diagnosticContext: String
     ) {
+        invalidateLocalInputStructure()
         let repairedItems = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
         suppressSourceItemsChanged = true
         items = repairedItems
@@ -2286,6 +2352,11 @@ final class AgentTabSession: ObservableObject {
     private func finishIncrementalSourceItemsMutation(
         _ mutation: AgentModeViewModel.SourceItemsMutation
     ) {
+        switch mutation {
+        case let .replace(index, _, _), let .mutate(index, _):
+            if items.indices.contains(index) { localInputIndex.replace(items[index], at: index) }
+        default: break
+        }
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
         onSourceItemsChanged?(self, mutation)
@@ -2614,6 +2685,15 @@ final class AgentTabSession: ObservableObject {
     func removeItem(at index: Int) -> AgentChatItem? {
         guard items.indices.contains(index) else { return nil }
         let removed = items[index]
+        localInputIndex.remove(at: index, itemID: removed.id)
+        for token in Array(localComposerCandidates.keys) {
+            guard var candidate = localComposerCandidates[token] else { continue }
+            if candidate.itemID == removed.id { localComposerCandidates.removeValue(forKey: token) }
+            else if candidate.position > index {
+                candidate.position -= 1
+                localComposerCandidates[token] = candidate
+            }
+        }
         suppressSourceItemsChanged = true
         items.remove(at: index)
         suppressSourceItemsChanged = false

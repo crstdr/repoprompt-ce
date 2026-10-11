@@ -2173,6 +2173,43 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(result.outcome, .changed(sessionID: target.sessionID))
     }
 
+    func testLocalInputReadDisclosureProofIsExactAtomicAndHasNoReadCursorSideEffects() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let first = makeEndpoint(windowID: 2)
+        let second = makeEndpoint(windowID: 3)
+        let a = try await activateLink(authority, observer: observer, target: first)
+        let b = try await activateLink(authority, observer: observer, target: second)
+        let requirements = [
+            DomainAgentSessionReadDisclosureRequirement(observer: observer, target: first, reference: .init(linkID: a.id, generation: a.generation)),
+            DomainAgentSessionReadDisclosureRequirement(observer: observer, target: second, reference: .init(linkID: b.id, generation: b.generation))
+        ]
+        let before = await authority.snapshot()
+        let allowed = await authority.validateReadDisclosures(requirements)
+        XCTAssertTrue(allowed)
+        let after = await authority.snapshot()
+        XCTAssertEqual(after, before, "batch proof mints neither public cursors nor observations")
+        let lease = try await authority.authorize(operation: .monitorRead, observerEndpoint: observer, targetSessionID: first.sessionID).get()
+        let leaseFailure = await authority.validate(lease: lease)
+        XCTAssertNil(leaseFailure)
+        _ = await authority.revoke(linkID: b.id, generation: b.generation, reason: .userRequested)
+        let partial = await authority.validateReadDisclosures(requirements)
+        XCTAssertFalse(partial, "one revoked requirement withholds the entire decoration")
+        let replaced = try await activateLink(authority, observer: observer, target: second)
+        let relink = await authority.validateReadDisclosures(requirements)
+        XCTAssertFalse(relink, "regrant is not equivalent to the captured reference")
+        let fresh = DomainAgentSessionReadDisclosureRequirement(observer: observer, target: second, reference: .init(linkID: replaced.id, generation: replaced.generation))
+        let rebound = DomainAgentSessionReadDisclosureRequirement(observer: makeEndpoint(sessionID: observer.sessionID), target: second, reference: fresh.reference)
+        let reboundAllowed = await authority.validateReadDisclosures([fresh, rebound])
+        XCTAssertFalse(reboundAllowed)
+        await authority.beginDrain()
+        let draining = await authority.validateReadDisclosures([fresh])
+        XCTAssertFalse(draining)
+        await authority.finishShutdown()
+        let shutdown = await authority.validateReadDisclosures([fresh])
+        XCTAssertFalse(shutdown)
+    }
+
     // MARK: - Read cursors
 
     func testReadCursorRoundTripEvictionAndCapabilityFencing() async throws {

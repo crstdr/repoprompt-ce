@@ -225,6 +225,9 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// True for local control-plane echoes that should display in chat but are not provider-backed user turns.
     public var isLocalControlPlaneEcho: Bool
 
+    /// Positive retained composer authorship; absent means other or unknown.
+    public var userInputOrigin: AgentUserInputOrigin?
+
     /// Set on attributed user deliveries and fixed-text system control rows.
     public var crossSessionAttribution: AgentCrossSessionAttribution?
 
@@ -257,6 +260,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
         isLocalControlPlaneEcho: Bool = false,
+        userInputOrigin: AgentUserInputOrigin? = nil,
         crossSessionAttribution: AgentCrossSessionAttribution? = nil,
         dispatchedProviderText: String? = nil,
         laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil
@@ -281,6 +285,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.workflow = workflow
         self.codexGoalMode = codexGoalMode
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
+        self.userInputOrigin = userInputOrigin
         self.crossSessionAttribution = crossSessionAttribution
         self.dispatchedProviderText = dispatchedProviderText
         self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
@@ -297,6 +302,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case id, timestamp, kind, text, attachments, taggedFileAttachments
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
         case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, isLocalControlPlaneEcho
+        case userInputOrigin
         case crossSessionAttribution
         case dispatchedProviderText
         case laneUpdateDisplayAttribution
@@ -324,6 +330,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         workflow = try c.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
+        userInputOrigin = AgentUserInputOrigin(rawValue: (try? c.decode(String.self, forKey: .userInputOrigin)) ?? "")
         crossSessionAttribution = try c.decodeIfPresent(
             AgentCrossSessionAttribution.self,
             forKey: .crossSessionAttribution
@@ -339,8 +346,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
 
     // MARK: - Factory Methods
 
-    public static func user(_ text: String, attachments: [AgentImageAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false, crossSessionAttribution: AgentCrossSessionAttribution? = nil, dispatchedProviderText: String? = nil) -> AgentChatItem {
-        AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho, crossSessionAttribution: crossSessionAttribution, dispatchedProviderText: dispatchedProviderText)
+    public static func user(_ text: String, attachments: [AgentImageAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false, userInputOrigin: AgentUserInputOrigin? = nil, crossSessionAttribution: AgentCrossSessionAttribution? = nil, dispatchedProviderText: String? = nil) -> AgentChatItem {
+        AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho, userInputOrigin: userInputOrigin, crossSessionAttribution: crossSessionAttribution, dispatchedProviderText: dispatchedProviderText)
     }
 
     public static func assistant(_ text: String, reasoning: String? = nil, sequenceIndex: Int = 0, isStreaming: Bool = false) -> AgentChatItem {
@@ -532,11 +539,17 @@ extension AgentChatItem {
             workflow: workflow,
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
+            userInputOrigin: userInputOrigin,
             crossSessionAttribution: crossSessionAttribution,
             dispatchedProviderText: dispatchedProviderText,
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution
         )
     }
+}
+
+/// A positive authorship mark on retained local rows, never an external MCP field.
+public enum AgentUserInputOrigin: String, Codable, Sendable, Equatable {
+    case localComposer
 }
 
 // MARK: - Persistence Model
@@ -577,6 +590,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var isLocalControlPlaneEcho: Bool
+    public var userInputOrigin: AgentUserInputOrigin?
     public var crossSessionAttribution: AgentCrossSessionAttribution?
     public var dispatchedProviderText: String?
     /// Local-display lane labels for an accepted lane-update row. Persisted with the session file
@@ -601,6 +615,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho
+        userInputOrigin = item.userInputOrigin
         crossSessionAttribution = item.crossSessionAttribution
         dispatchedProviderText = item.dispatchedProviderText
         laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
@@ -677,6 +692,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             workflow: workflow,
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
+            userInputOrigin: userInputOrigin,
             crossSessionAttribution: crossSessionAttribution,
             dispatchedProviderText: dispatchedProviderText,
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution
@@ -726,6 +742,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case workflow
         case codexGoalMode
         case isLocalControlPlaneEcho
+        case userInputOrigin
         case crossSessionAttribution
         case dispatchedProviderText
         case laneUpdateDisplayAttribution
@@ -753,6 +770,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         workflow = try container.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try container.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try container.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
+        userInputOrigin = AgentUserInputOrigin(rawValue: (try? container.decode(String.self, forKey: .userInputOrigin)) ?? "")
         crossSessionAttribution = try container.decodeIfPresent(
             AgentCrossSessionAttribution.self,
             forKey: .crossSessionAttribution

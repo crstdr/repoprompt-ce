@@ -439,8 +439,8 @@ enum AgentSessionLinkTranscriptSanitizer {
             case .user, .assistant, .summary, .tool:
                 AgentSessionLinkTranscriptBudget.narrativeItemMaxBytes
             }
-            let redacted = AgentSessionLinkTextRedactor.redact(row.text, homeDirectory: homeDirectory)
-            let text = AgentSessionLinkTranscriptBudget.truncatedRowText(redacted, maxBytes: cap)
+            let narrative = sanitizedNarrative(row.text, maxBytes: cap, homeDirectory: homeDirectory)
+            let text = narrative.readText
             return AgentSessionLinkTranscriptItem(
                 itemID: row.id.uuidString,
                 sequenceIndex: row.sequenceIndex,
@@ -454,6 +454,29 @@ enum AgentSessionLinkTranscriptSanitizer {
                 crossSessionOrigin: crossSessionOrigin(for: row, readerSessionID: readerSessionID)
             )
         }
+    }
+
+    struct SanitizedNarrative {
+        let readText: String
+        let boundedText: String
+        let fullCharacterCount: Int
+        let wasByteCapped: Bool
+    }
+
+    /// Shared Read redaction/byte-bound primitive. XML hygiene is deliberately not applied to Read.
+    static func sanitizedNarrative(
+        _ text: String,
+        maxBytes: Int = AgentSessionLinkTranscriptBudget.narrativeItemMaxBytes,
+        homeDirectory: String = NSHomeDirectory()
+    ) -> SanitizedNarrative {
+        let redacted = AgentSessionLinkTextRedactor.redact(text, homeDirectory: homeDirectory)
+        let bounded = AgentSessionLinkTranscriptBudget.truncatedUTF8(redacted, maxBytes: maxBytes)
+        return SanitizedNarrative(
+            readText: bounded.isEmpty && !redacted.isEmpty ? AgentSessionLinkTranscriptBudget.oversizedTextMarker : bounded,
+            boundedText: bounded,
+            fullCharacterCount: AgentSessionLinkMessageEnvelope.sanitizedBody(redacted).count,
+            wasByteCapped: bounded != redacted
+        )
     }
 
     /// Whether a row's observer-visible representation is final, i.e. whether a cursor may step past
