@@ -602,6 +602,35 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertEqual(viewModel.executableTarget(for: session), baseline)
     }
 
+    func testLocalInputOnlyComposerClaimGivesRetainedQueuedRowPositiveOrigin() async throws {
+        let (viewModel, _) = try await makeRoutingViewModel(backend: ComposerRoutingBackend(outcome: .abstain))
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
+        session.hasLoadedPersistedState = true
+        session.installLocalInputSeed(.init())
+        session.selectedAgent = .claudeCode
+        session.installRunID(UUID())
+        session.runState = .running
+        session.isMCPInstructionDispatchInProgress = true // fake retained interrupt owner, no transport
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Research only; do not edit.")
+        defer { viewModel.releaseComposerSubmitClaim(claim) }
+        let result = await viewModel.submitUserTurnAfterAutoEffort(text: "Research only; do not edit.", claim: claim, session: session, destinationTabID: tabID)
+        XCTAssertEqual(result, .submitted)
+        let composerRow = try XCTUnwrap(session.items.last(where: { $0.kind == .user }))
+        XCTAssertEqual(composerRow.userInputOrigin, .localComposer)
+        XCTAssertEqual(session.pendingClaudeSteeringInstructions.count, 1)
+        XCTAssertEqual(session.test_unsettledLocalComposerCandidateCount, 0)
+        // Legacy shared default is deliberately still true for unrelated admission policy. It is
+        // not proof of authorship: MCP/API callers never supply the positive composer token.
+        XCTAssertEqual(viewModel.submitUserTurn(text: "MCP-origin instruction", tabID: tabID), .submitted)
+        XCTAssertNil(session.items.last(where: { $0.kind == .user })?.userInputOrigin)
+        session.agentTask?.cancel()
+        session.saveDebounceTask?.cancel()
+        session.derivedTranscriptRefreshTask?.cancel()
+    }
+
     private func makeRoutingViewModel(
         backend: any AgentTaskRouterBackend
     ) async throws -> (AgentModeViewModel, GlobalSettingsStore) {
