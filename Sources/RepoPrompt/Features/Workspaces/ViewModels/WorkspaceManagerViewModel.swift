@@ -13989,6 +13989,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    /// The non-mutating half of `pollAndSaveStateWithOutcomeAsync`'s admission gates: every
+    /// deterministic refusal a caller can check before the real save re-fences it. A passing answer
+    /// is not a write guarantee; the write path still re-checks these conditions during capture.
+    func canAdmitLifecycleWorkspaceSave(workspaceID: UUID) -> Bool {
+        guard let workspace = workspace(withID: workspaceID) else { return false }
+        guard !workspace.isEphemeral else { return true }
+        guard !agentAdmissionRecoveryOwnsWorkspace(workspaceID) else { return false }
+        #if DEBUG
+            if let workspacePersistenceOutcomeOverrideForTesting {
+                return workspacePersistenceOutcomeOverrideForTesting.acceptedForLifecycleAdmission
+            }
+        #endif
+        return !pendingConsolidatedRestoreIDs.contains(workspaceID)
+    }
+
     func setWorkspaceHiddenFromSnapshot(_ workspace: WorkspaceModel, hidden: Bool) async throws -> WorkspaceModel {
         var current = self.workspace(withID: workspace.id)
         var isAuthorityIncompleteRestore = authorityIncompleteConsolidatedRestoreIDs.contains(workspace.id)
