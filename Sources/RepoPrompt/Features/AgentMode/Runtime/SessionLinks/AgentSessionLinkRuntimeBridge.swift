@@ -7996,6 +7996,14 @@ final class AgentSessionLinkRuntimeBridge {
         return await receipt(true, nil, firstTask, firstTaskReason)
     }
 
+    /// Fork-only diagnostic channel naming the post-unlink check that refused inside `retireLane`.
+    nonisolated static func logRetireLaneDebug(_ message: @autoclosure () -> String) {
+        #if DEBUG
+            guard UserDefaults.standard.bool(forKey: "enableAgentSessionLinkDebugLogging") else { return }
+            print(message())
+        #endif
+    }
+
     func retireLane(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID
@@ -8102,15 +8110,27 @@ final class AgentSessionLinkRuntimeBridge {
         case .stopped: break
         }
         let remaining = await authority.relationshipInventories(forSessionID: targetSessionID)
-        guard await !(host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID))
-        else { return .unlinkedNotStashed(sessionID: targetSessionID) }
-        guard !isFrozenForTermination, stillRetirable(),
-              remaining.inbound.items.isEmpty,
-              remaining.outbound.items.isEmpty
-        else { return .unlinkedNotStashed(sessionID: targetSessionID) }
-        return await host.agentSessionLinkRetireLane(
-            endpoint: endpoint, commit: true, isStillRetirable: stillRetirable
-        ) ? .retired(sessionID: targetSessionID) : .unlinkedNotStashed(sessionID: targetSessionID)
+        // Fork-only diagnostic: attribute a post-unlink refusal to the check that fired.
+        let postUnlinkRefusal: String? = if await host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID) {
+            "persisted-active-children"
+        } else if isFrozenForTermination {
+            "termination"
+        } else if !stillRetirable() {
+            "still-retirable"
+        } else if !remaining.inbound.items.isEmpty || !remaining.outbound.items.isEmpty {
+            "relationship-remnant"
+        } else {
+            await host.agentSessionLinkRetireLane(
+                endpoint: endpoint, commit: true, isStillRetirable: stillRetirable
+            ) ? nil : "commit"
+        }
+        if let postUnlinkRefusal {
+            Self.logRetireLaneDebug(
+                "[AgentSessionLinkRuntimeBridge] retireLane post-unlink refusal=\(postUnlinkRefusal) target=\(targetSessionID)"
+            )
+            return .unlinkedNotStashed(sessionID: targetSessionID)
+        }
+        return .retired(sessionID: targetSessionID)
     }
 
     // MARK: - Resolution preview
