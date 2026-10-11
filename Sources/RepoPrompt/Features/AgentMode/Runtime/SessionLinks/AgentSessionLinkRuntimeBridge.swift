@@ -186,12 +186,17 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         selection: AgentSessionLanePolicy.RoleSelection
     ) async throws -> AgentSessionLaneHostCreationOutcome
 
-    /// `commit: false` is an inactivity preflight; `true` stashes under the supplied CAS fence.
+    /// `commit: false` runs the full non-mutating retirement preflight (required flush, stash
+    /// cascade claims, save admission); `true` stashes under the supplied CAS fence.
     func agentSessionLinkRetireLane(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         commit: Bool,
         isStillRetirable: @escaping @MainActor () -> Bool
     ) async -> Bool
+
+    /// The synchronous slice of retirement readiness run immediately before unlinking: endpoint
+    /// currentness, target quiescence, live subtree settlement, and save admission.
+    func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool
 
     func agentSessionLinkLaneProvenance(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
@@ -566,6 +571,10 @@ extension AgentSessionLinkEndpointHost {
         endpoint _: DomainAgentSessionLinkEndpointIdentity, commit _: Bool,
         isStillRetirable _: @escaping @MainActor () -> Bool
     ) async -> Bool {
+        false
+    }
+
+    func agentSessionLinkRetirementReadiness(endpoint _: DomainAgentSessionLinkEndpointIdentity) -> Bool {
         false
     }
 
@@ -8006,8 +8015,26 @@ final class AgentSessionLinkRuntimeBridge {
     private static func logRetireLaneDebug(_ message: @autoclosure () -> String) {
         #if DEBUG
             guard UserDefaults.standard.bool(forKey: "enableAgentSessionLinkDebugLogging") else { return }
-            retireLaneLogger.debug("\(message(), privacy: .public)")
+            let rendered = message()
+            retireLaneLogger.debug("\(rendered, privacy: .public)")
         #endif
+    }
+
+    /// Exact-inventory proof that the granted link is still the target's only live relationship and
+    /// no send is in flight on it. Runs before preflight and again immediately before unlinking.
+    private func retireRelationshipFence(
+        targetSessionID: UUID,
+        lease: DomainAgentSessionLinkLease
+    ) async -> AgentSessionLaneRetireOutcome.Reason? {
+        let relationships = await authority.relationshipInventories(forSessionID: targetSessionID)
+        guard relationships.inbound.items.count == 1 else { return .laneInUseInboundCount }
+        guard relationships.inbound.items[0].linkID == lease.linkID else { return .laneInUseInboundLink }
+        guard relationships.inbound.items[0].generation == lease.linkGeneration else {
+            return .laneInUseInboundGeneration
+        }
+        guard relationships.outbound.items.isEmpty else { return .laneInUseOutbound }
+        guard pendingSendsByReference[lease.reference] == nil else { return .laneInUsePending }
+        return nil
     }
 
     func retireLane(
@@ -8067,21 +8094,8 @@ final class AgentSessionLinkRuntimeBridge {
         }
         retiringTargets.insert(endpoint)
         defer { retiringTargets.remove(endpoint) }
-        let relationships = await authority.relationshipInventories(forSessionID: targetSessionID)
-        guard relationships.inbound.items.count == 1 else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundCount)
-        }
-        guard relationships.inbound.items[0].linkID == target.lease.linkID else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundLink)
-        }
-        guard relationships.inbound.items[0].generation == target.lease.linkGeneration else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundGeneration)
-        }
-        guard relationships.outbound.items.isEmpty else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseOutbound)
-        }
-        guard pendingSendsByReference[target.lease.reference] == nil else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUsePending)
+        if let refusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease) {
+            return .notRetired(sessionID: targetSessionID, reason: refusal)
         }
         #if DEBUG
             await test_afterRetireRelationshipPrecheck?()
@@ -8101,9 +8115,31 @@ final class AgentSessionLinkRuntimeBridge {
             let live = host.agentSessionLinkCandidates().filter { $0.sessionID == targetSessionID }
             return live.count == 1 && live[0].domainEndpoint == endpoint
         }
+        // Preflight performs the required-session flush, the stash cascade's claim checks, and the
+        // workspace-save admission probe without mutating anything; a refusal leaves link and tab.
         guard await host.agentSessionLinkRetireLane(
             endpoint: endpoint, commit: false, isStillRetirable: stillRetirable
         ) else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
+        // The flush may have settled a stale persisted child header; rescan before unlinking.
+        guard await !(host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID))
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUseDiskChild) }
+        // Preflight's awaits kept the grant live: re-run the cheap fence immediately before unlink.
+        guard !isFrozenForTermination else {
+            return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
+        }
+        guard stillRetirable() else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneBusy)
+        }
+        if let refusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease) {
+            return .notRetired(sessionID: targetSessionID, reason: refusal)
+        }
+        // The fence's awaits kept the grant live, so revalidate synchronously before unlinking.
+        // The residual window inside stopMonitorLink stays covered by post-unlink revalidation.
+        guard !isFrozenForTermination else {
+            return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
+        }
+        guard stillRetirable(), host.agentSessionLinkRetirementReadiness(endpoint: endpoint)
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
         // Stop owns the pair-retirement lane. Wrapping it here would wait on our own barrier.
         let stop = await stopMonitorLink(
             observerEndpoint: observerEndpoint,
