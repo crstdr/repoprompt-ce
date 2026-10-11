@@ -45,16 +45,23 @@ package enum CLIExecutableDiscovery {
     /// real path, so a `codex` symlink and its target collapse to the first hit in search
     /// order. `excludingResolvedPaths` removes entries such as the bundled runtime, which
     /// callers resolve with `resolvedRealPath` for a symmetric comparison.
+    ///
+    /// Relative search directories (for example a `bin` PATH entry) are resolved against
+    /// `baseDirectoryPath`, defaulting to the process working directory, so reported paths
+    /// are always absolute; the candidate's symlink spelling is preserved in `path`.
     package static func detectExecutables(
         named executableName: String,
         inDirectories directories: [String],
         excludingResolvedPaths: Set<String> = [],
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        baseDirectoryPath: String? = nil
     ) -> [DetectedExecutable] {
+        let baseDirectoryPath = baseDirectoryPath ?? fileManager.currentDirectoryPath
         var detected: [DetectedExecutable] = []
         var seenResolvedPaths = Set<String>()
         for directory in directories where !directory.isEmpty {
-            let candidate = (directory as NSString).appendingPathComponent(executableName)
+            let absoluteDirectory = absoluteSearchDirectory(directory, baseDirectoryPath: baseDirectoryPath)
+            let candidate = (absoluteDirectory as NSString).appendingPathComponent(executableName)
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: candidate, isDirectory: &isDirectory),
                   !isDirectory.boolValue,
@@ -62,10 +69,11 @@ package enum CLIExecutableDiscovery {
             else { continue }
             let resolvedPath = resolvedRealPath(candidate)
             guard !excludingResolvedPaths.contains(resolvedPath),
+                  isRegularFile(atPath: resolvedPath),
                   seenResolvedPaths.insert(resolvedPath).inserted
             else { continue }
             detected.append(
-                DetectedExecutable(path: candidate, resolvedPath: resolvedPath, directory: directory)
+                DetectedExecutable(path: candidate, resolvedPath: resolvedPath, directory: absoluteDirectory)
             )
         }
         return detected
@@ -79,5 +87,18 @@ package enum CLIExecutableDiscovery {
             return String(cString: resolved)
         }
         return URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    private static func absoluteSearchDirectory(_ directory: String, baseDirectoryPath: String) -> String {
+        let path = (directory as NSString).isAbsolutePath
+            ? directory
+            : (baseDirectoryPath as NSString).appendingPathComponent(directory)
+        return URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    private static func isRegularFile(atPath path: String) -> Bool {
+        var info = stat()
+        guard stat(path, &info) == 0 else { return false }
+        return info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
     }
 }
