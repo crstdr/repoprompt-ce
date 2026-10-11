@@ -1809,7 +1809,6 @@ struct CLIProvidersSettingsView: View {
         isDetectingCodexExecutables = true
         defer { isDetectingCodexExecutables = false }
         let detected = await CodexExecutableDetection.detectOnSystem()
-        guard !Task.isCancelled else { return }
         detectedCodexExecutables = detected
     }
 
