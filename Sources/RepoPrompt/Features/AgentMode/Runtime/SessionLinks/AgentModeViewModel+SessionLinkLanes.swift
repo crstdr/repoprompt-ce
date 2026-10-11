@@ -23,7 +23,8 @@ extension AgentModeViewModel {
         var records = ownerValidatedSessionIndex.values.filter { !loadedSessionIDs.contains($0.id) }.map { entry in
             AgentSessionLaneChildRetirementRecord(
                 sessionID: entry.id, parentSessionID: entry.parentSessionID,
-                blocksRetirement: entry.lastRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))?.isActive ?? true
+                blocksRetirement: entry.lastRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))?.isActive ?? true,
+                source: .sessionIndex
             )
         }
         for session in sessions.values {
@@ -33,7 +34,8 @@ extension AgentModeViewModel {
                 sessionID: sessionID,
                 parentSessionID: session.hasLoadedPersistedState
                     ? session.parentSessionID : session.parentSessionID ?? indexed?.parentSessionID,
-                blocksRetirement: !agentSessionLinkLaneSessionIsQuiescent(session)
+                blocksRetirement: !agentSessionLinkLaneSessionIsQuiescent(session),
+                source: session.hasLoadedPersistedState ? .hydratedSession : .unhydratedSession
             ))
         }
         return records
@@ -286,5 +288,20 @@ extension AgentModeViewModel {
             source: WorkspaceSaveSource("oversightLaneRetirement")
         )
         return persistence.acceptedForLifecycleAdmission
+    }
+
+    /// The synchronous slice of the retire CAS run immediately before unlinking: endpoint
+    /// currentness, target quiescence, live subtree settlement, and the save-admission probe.
+    func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = session(for: endpoint.tabID, createIfNeeded: false),
+              session.activeAgentSessionID == endpoint.sessionID,
+              agentSessionLinkLaneSessionIsQuiescent(session),
+              !AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(
+                  of: endpoint.sessionID, in: agentSessionLinkChildRetirementRecords()
+              ),
+              let workspaceManager
+        else { return false }
+        return workspaceManager.canAdmitLifecycleWorkspaceSave(workspaceID: endpoint.workspaceID)
     }
 }

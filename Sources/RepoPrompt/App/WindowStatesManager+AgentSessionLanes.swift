@@ -39,25 +39,21 @@ extension WindowStatesManager {
         } catch { return true }
     }
 
-    /// A loaded session's live quiescence is newer than its unflushed disk header, so live records
-    /// shadow persisted rows for the same session ID. Parentage keeps the freshest non-nil value so
-    /// a stale header can neither block nor drop a descendant from the stash set.
+    /// A hydrated session's live quiescence is newer than its unflushed disk header, so hydrated
+    /// records shadow persisted rows for the same session ID; index and unhydrated records can only
+    /// add evidence. `AgentSessionLaneChildRetirementRecord.merging` owns the per-session verdict.
     private func agentSessionLinkMergedChildRetirementRecords(
         persisted: [AgentSessionLaneChildRetirementRecord]
     ) -> [AgentSessionLaneChildRetirementRecord] {
         let live = agentSessionLinkLiveChildRetirementRecords()
-        var liveRecordsBySessionID: [UUID: [AgentSessionLaneChildRetirementRecord]] = [:]
+        var liveBySessionID: [UUID: [AgentSessionLaneChildRetirementRecord]] = [:]
         for record in live {
-            liveRecordsBySessionID[record.sessionID, default: []].append(record)
+            liveBySessionID[record.sessionID, default: []].append(record)
         }
         let persistedSessionIDs = Set(persisted.map(\.sessionID))
-        var merged = persisted.map { record in
-            guard let liveRecords = liveRecordsBySessionID[record.sessionID] else { return record }
-            return AgentSessionLaneChildRetirementRecord(
-                sessionID: record.sessionID,
-                parentSessionID: liveRecords.compactMap(\.parentSessionID).first ?? record.parentSessionID,
-                blocksRetirement: liveRecords.contains { $0.blocksRetirement }
-            )
+        var merged = persisted.flatMap { record in
+            guard let liveRecords = liveBySessionID[record.sessionID] else { return [record] }
+            return AgentSessionLaneChildRetirementRecord.merging(live: liveRecords, over: record)
         }
         merged.append(contentsOf: live.filter { !persistedSessionIDs.contains($0.sessionID) })
         return merged
@@ -238,6 +234,14 @@ extension WindowStatesManager {
             if changed { manager.workspaces = projected }
         }
         return true
+    }
+
+    func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isTerminating,
+              let window = window(withID: endpoint.windowID),
+              !window.isClosing
+        else { return false }
+        return window.agentModeViewModel.agentSessionLinkRetirementReadiness(endpoint: endpoint)
     }
 
     func agentSessionLinkLaneProvenance(

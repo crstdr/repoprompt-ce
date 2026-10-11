@@ -327,6 +327,14 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             return true
         }
 
+        var retireReadinessAllowed = true
+
+        func agentSessionLinkRetirementReadiness(
+            endpoint: DomainAgentSessionLinkEndpointIdentity
+        ) -> Bool {
+            retireReadinessAllowed && candidates.contains { $0.domainEndpoint == endpoint }
+        }
+
         func agentSessionLinkLaneProvenance(
             for endpoint: DomainAgentSessionLinkEndpointIdentity
         ) -> UUID? {

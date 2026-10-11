@@ -83,9 +83,65 @@ struct AgentSessionLaneCreateReceipt: Equatable {
 
 /// Retirement may stash a settled subtree, but must preserve every descendant that still owns work.
 struct AgentSessionLaneChildRetirementRecord {
+    /// Which evidence produced the record. Only a hydrated session is newer than its unflushed disk
+    /// header, so only it may shadow persisted or index blocking state; the rest can add edges and
+    /// blocking evidence but never erase them.
+    enum Source {
+        case persisted
+        case sessionIndex
+        case unhydratedSession
+        case hydratedSession
+
+        var isSessionDerived: Bool {
+            self == .unhydratedSession || self == .hydratedSession
+        }
+    }
+
     let sessionID: UUID
     let parentSessionID: UUID?
     let blocksRetirement: Bool
+    let source: Source
+
+    init(sessionID: UUID, parentSessionID: UUID?, blocksRetirement: Bool, source: Source = .persisted) {
+        self.sessionID = sessionID
+        self.parentSessionID = parentSessionID
+        self.blocksRetirement = blocksRetirement
+        self.source = source
+    }
+
+    /// Merge every live record for `persisted.sessionID` over the persisted row. Blocking favors
+    /// fail-closed evidence: a hydrated session's quiescence clears stale disk/index rows, while an
+    /// unhydrated session's default state proves nothing and keeps the block. Parentage prefers
+    /// session-derived, then index, then persisted values, and conflicting live parents keep every
+    /// edge rather than dropping a descendant.
+    static func merging(live: [Self], over persisted: Self) -> [Self] {
+        let hydrated = live.contains { $0.source == .hydratedSession }
+        let sessionBlocks = live.contains { $0.source.isSessionDerived && $0.blocksRetirement }
+        let blocks = hydrated
+            ? sessionBlocks
+            : live.contains { $0.blocksRetirement } || persisted.blocksRetirement
+        var parents = Set(live.filter(\.source.isSessionDerived).compactMap(\.parentSessionID))
+        if parents.isEmpty {
+            parents = Set(live.filter { $0.source == .sessionIndex }.compactMap(\.parentSessionID))
+        }
+        if parents.isEmpty, let parent = persisted.parentSessionID { parents = [parent] }
+        guard !parents.isEmpty else {
+            return [Self(
+                sessionID: persisted.sessionID,
+                parentSessionID: nil,
+                blocksRetirement: blocks,
+                source: persisted.source
+            )]
+        }
+        return parents.sorted { $0.uuidString < $1.uuidString }.map {
+            Self(
+                sessionID: persisted.sessionID,
+                parentSessionID: $0,
+                blocksRetirement: blocks,
+                source: persisted.source
+            )
+        }
+    }
 
     static func hasBlockingDescendant(of parentSessionID: UUID, in records: [Self]) -> Bool {
         let descendants = descendantIDs(of: parentSessionID, in: records)

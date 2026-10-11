@@ -1912,4 +1912,171 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertFalse(workspace.composeTabs.contains { $0.id == lane.tabID })
         }
     }
+
+    /// A lazily-bound child whose state has not hydrated looks quiescent on defaults alone, so its
+    /// live record must never shadow the persisted header's fail-closed signal. The flushed index
+    /// stays non-blocking so only the merged disk scan can refuse.
+    private func seedUnhydratedBoundChild(
+        fixture: Fixture, viewModel: AgentModeViewModel, laneSessionID: UUID,
+        persistedRunState: String?
+    ) async throws -> (sessionID: UUID, tabID: UUID) {
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true,
+            sessionName: "Mid-hydration child", parentSessionID: laneSessionID,
+            expectedWorkspaceID: fixture.workspaceID
+        )
+        viewModel.mcpAcceptSessionTarget(target)
+        let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+        let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
+        child.runState = .idle
+        child.isDirty = true
+        await viewModel.flushSave(for: target.tabID)
+        child.hasLoadedPersistedState = false
+        var persisted = AgentSession(id: childSessionID, name: "Mid-hydration child", savedAt: Date())
+        persisted.parentSessionID = laneSessionID
+        persisted.lastRunState = persistedRunState
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
+        return (childSessionID, target.tabID)
+    }
+
+    /// A persisted `running` header plus an unhydrated idle-looking stub must still refuse the
+    /// unlink before it happens, keeping the link and the tab retryably intact.
+    func testUnhydratedChildStubKeepsPersistedActiveHeaderBlocking() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Unhydrated-stub parent", idempotencyKey: "unhydrated-stub-blocks"
+            )
+            let child = try await seedUnhydratedBoundChild(
+                fixture: fixture, viewModel: viewModel, laneSessionID: lane.sessionID,
+                persistedRunState: AgentSessionRunState.running.rawValue
+            )
+            let blocked = await host.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: lane.sessionID
+            )
+            XCTAssertTrue(blocked, "the unhydrated stub must not clear the persisted block")
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .notRetired(sessionID: lane.sessionID, reason: .laneInUseDiskChild))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a pre-unlink refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "a pre-unlink refusal must keep the tab")
+            XCTAssertFalse(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains {
+                $0.tab.id == lane.tabID || $0.tab.id == child.tabID
+            } == true)
+        }
+    }
+
+    /// A persisted header that decodes without a usable `lastRunState` fails closed; an unhydrated
+    /// stub must not clear that either.
+    func testUnhydratedChildStubKeepsMissingHeaderBlocking() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Unhydrated-stub parent", idempotencyKey: "unhydrated-missing-blocks"
+            )
+            let child = try await seedUnhydratedBoundChild(
+                fixture: fixture, viewModel: viewModel, laneSessionID: lane.sessionID,
+                persistedRunState: nil
+            )
+            let blocked = await host.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: lane.sessionID
+            )
+            XCTAssertTrue(blocked, "a missing header state must fail closed under an unhydrated stub")
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .notRetired(sessionID: lane.sessionID, reason: .laneInUseDiskChild))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a pre-unlink refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "a pre-unlink refusal must keep the tab")
+            XCTAssertFalse(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains {
+                $0.tab.id == lane.tabID || $0.tab.id == child.tabID
+            } == true)
+        }
+    }
+
+    /// Conflicting live parents keep every edge instead of dropping a descendant, and only a
+    /// hydrated session may clear a persisted block; index and unhydrated rows can only add
+    /// evidence.
+    func testChildRetirementMergeKeepsConflictingParentsAndHydrationGate() {
+        let sessionID = UUID()
+        let parentA = UUID()
+        let parentB = UUID()
+        let parentC = UUID()
+        func record(
+            _ source: AgentSessionLaneChildRetirementRecord.Source,
+            parent: UUID? = parentA, blocks: Bool
+        ) -> AgentSessionLaneChildRetirementRecord {
+            .init(sessionID: sessionID, parentSessionID: parent, blocksRetirement: blocks, source: source)
+        }
+        let persisted = AgentSessionLaneChildRetirementRecord(
+            sessionID: sessionID, parentSessionID: parentA, blocksRetirement: true, source: .persisted
+        )
+        let conflicted = AgentSessionLaneChildRetirementRecord.merging(
+            live: [
+                record(.hydratedSession, parent: parentA, blocks: true),
+                record(.hydratedSession, parent: parentB, blocks: true)
+            ],
+            over: persisted
+        )
+        XCTAssertEqual(Set(conflicted.map(\.parentSessionID)), [parentA, parentB])
+        XCTAssertTrue(conflicted.allSatisfy(\.blocksRetirement))
+        XCTAssertTrue(AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(of: parentA, in: conflicted))
+        XCTAssertTrue(AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(of: parentB, in: conflicted))
+        for live in [
+            [record(.unhydratedSession, blocks: false)],
+            [record(.sessionIndex, blocks: false)],
+            [record(.unhydratedSession, blocks: false), record(.sessionIndex, blocks: false)]
+        ] {
+            let merged = AgentSessionLaneChildRetirementRecord.merging(live: live, over: persisted)
+            XCTAssertEqual(merged.map(\.parentSessionID), [parentA])
+            XCTAssertTrue(merged.allSatisfy(\.blocksRetirement))
+        }
+        for (live, expectBlocks) in [
+            ([record(.hydratedSession, blocks: false)], false),
+            ([record(.hydratedSession, blocks: false), record(.sessionIndex, blocks: true)], false),
+            ([record(.hydratedSession, blocks: true)], true),
+            ([record(.hydratedSession, blocks: false), record(.unhydratedSession, blocks: true)], true)
+        ] {
+            let merged = AgentSessionLaneChildRetirementRecord.merging(live: live, over: persisted)
+            XCTAssertEqual(merged.map(\.blocksRetirement), [expectBlocks])
+        }
+        let sessionParentWins = AgentSessionLaneChildRetirementRecord.merging(
+            live: [
+                record(.unhydratedSession, parent: parentB, blocks: false),
+                record(.sessionIndex, parent: parentC, blocks: false)
+            ],
+            over: persisted
+        )
+        XCTAssertEqual(sessionParentWins.map(\.parentSessionID), [parentB])
+        let indexParentWins = AgentSessionLaneChildRetirementRecord.merging(
+            live: [record(.sessionIndex, parent: parentC, blocks: false)], over: persisted
+        )
+        XCTAssertEqual(indexParentWins.map(\.parentSessionID), [parentC])
+        let freshestNonNil = AgentSessionLaneChildRetirementRecord.merging(
+            live: [record(.hydratedSession, parent: nil, blocks: false)], over: persisted
+        )
+        XCTAssertEqual(freshestNonNil.map(\.parentSessionID), [parentA])
+    }
 }
