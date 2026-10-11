@@ -239,7 +239,9 @@ extension AgentModeViewModel {
 
     /// Preflight or stash one exact inactive lane. The commit:false phase runs the same required
     /// flush, cascade, and post-preflight CAS checks as the stash, plus a non-mutating save-admission
-    /// probe — it only skips the projection mutation. Commit re-runs every check with fresh claims.
+    /// probe — it only skips the projection mutation. The flush is deliberately effectful: real
+    /// save I/O is what freshens the stale child headers the post-preflight rescan relies on.
+    /// Commit re-runs every check with fresh claims.
     func agentSessionLinkRetireLane(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         commit: Bool,

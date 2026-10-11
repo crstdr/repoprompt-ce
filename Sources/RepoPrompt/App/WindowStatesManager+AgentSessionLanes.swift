@@ -40,22 +40,29 @@ extension WindowStatesManager {
     }
 
     /// A hydrated session's live quiescence is newer than its unflushed disk header, so hydrated
-    /// records shadow persisted rows for the same session ID; index and unhydrated records can only
-    /// add evidence. `AgentSessionLaneChildRetirementRecord.merging` owns the per-session verdict.
+    /// records may shadow persisted or index rows for the same session ID under coherent lineage;
+    /// index and unhydrated records can only add evidence.
+    /// `AgentSessionLaneChildRetirementRecord.merging` owns the per-session verdict, including
+    /// ambiguous-lineage fail-closed handling.
     private func agentSessionLinkMergedChildRetirementRecords(
         persisted: [AgentSessionLaneChildRetirementRecord]
     ) -> [AgentSessionLaneChildRetirementRecord] {
-        let live = agentSessionLinkLiveChildRetirementRecords()
+        var persistedBySessionID: [UUID: [AgentSessionLaneChildRetirementRecord]] = [:]
+        for record in persisted {
+            persistedBySessionID[record.sessionID, default: []].append(record)
+        }
         var liveBySessionID: [UUID: [AgentSessionLaneChildRetirementRecord]] = [:]
-        for record in live {
+        for record in agentSessionLinkLiveChildRetirementRecords() {
             liveBySessionID[record.sessionID, default: []].append(record)
         }
-        let persistedSessionIDs = Set(persisted.map(\.sessionID))
-        var merged = persisted.flatMap { record in
-            guard let liveRecords = liveBySessionID[record.sessionID] else { return [record] }
-            return AgentSessionLaneChildRetirementRecord.merging(live: liveRecords, over: record)
+        var merged: [AgentSessionLaneChildRetirementRecord] = []
+        for sessionID in Set(persistedBySessionID.keys).union(liveBySessionID.keys) {
+            merged += AgentSessionLaneChildRetirementRecord.merging(
+                sessionID: sessionID,
+                live: liveBySessionID[sessionID] ?? [],
+                persisted: persistedBySessionID[sessionID] ?? []
+            )
         }
-        merged.append(contentsOf: live.filter { !persistedSessionIDs.contains($0.sessionID) })
         return merged
     }
 
