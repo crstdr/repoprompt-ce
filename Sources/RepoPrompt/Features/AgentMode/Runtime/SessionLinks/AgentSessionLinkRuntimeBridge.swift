@@ -2553,6 +2553,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// least one outbound link. The same authority that projects the menu enforces the precondition
     /// again at reservation and activation, closing a stale-menu race without preventing other
     /// surfaces from creating an observer's first link.
+    ///
+    /// For "Link overseer" menu picks — that list only offers active observers.
     func addSidebarMonitorLink(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -8276,12 +8278,14 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Resolves a pasted Session ID for the *inbound* direction: the pasted session is the
-    /// prospective overseer of the row's target, and "Link overseer" only offers sessions that
-    /// already hold an outbound link. Returns user-facing message text on failure.
+    /// prospective overseer of the row's target. Unlike the "Link overseer" menu list — which only
+    /// offers sessions that already hold an outbound link — the pasted-ID path accepts any
+    /// eligible session, so a session can be linked as overseer before it holds its first link.
+    /// Returns user-facing message text on failure.
     ///
-    /// Observer eligibility reuses `addDisabledReason` (child/MCP-controlled/MCP-originated and
-    /// role-policy sessions can never observe), then `hasActiveOutboundLink` applies the same
-    /// existing-overseer precondition `addSidebarMonitorLink` enforces at reservation.
+    /// New links require observer eligibility via `addDisabledReason` (child/MCP-controlled/
+    /// MCP-originated sessions, and a role policy that denies outbound monitoring, can never
+    /// observe); an existing exact link resolves as `.alreadyLinked` before that check.
     func resolveSidebarOverseerCandidate(
         rawSessionID: String,
         excludingTargetSessionID: UUID
@@ -8322,11 +8326,6 @@ final class AgentSessionLinkRuntimeBridge {
             roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
         ) {
             return .failure(AgentOversightResolutionMessage(message: reason))
-        }
-        guard await authority.hasActiveOutboundLink(observerEndpoint: candidate.domainEndpoint) else {
-            return .failure(AgentOversightResolutionMessage(
-                message: Self.existingOverseerRequiredMessage
-            ))
         }
         return .success(.candidate(candidate))
     }

@@ -2838,6 +2838,121 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertFalse(remainsOverseer)
     }
 
+    /// The inbound `Session ID…` sheet resolves a session that is not an overseer yet and the
+    /// general establishment path accepts it — the same Add the observer-side "Oversee" menu
+    /// uses — so the new overseer's tools are advertised with the first link.
+    func testLinkOverseerBySessionIDAcceptsNonOverseerEligibleSession() async throws {
+        let fixture = makeFixture()
+
+        let resolution = await fixture.bridge.resolveSidebarOverseerCandidate(
+            rawSessionID: fixture.observer.sessionID.uuidString,
+            excludingTargetSessionID: fixture.target.sessionID
+        )
+        XCTAssertEqual(resolution, .success(.candidate(fixture.observer)))
+
+        // Bridge-level half of the sheet flow: the general exact-endpoint Add the sheet submit
+        // calls (VM `addAgentOversightLink`). Sheet→callback routing is covered separately.
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        ) else {
+            return XCTFail("general Add of a zero-link overseer should succeed")
+        }
+        await fixture.bridge.test_settleProjections()
+        let outbound = await fixture.authority.hasActiveOutboundLink(
+            observerEndpoint: fixture.observer.domainEndpoint
+        )
+        XCTAssertTrue(outbound)
+        try await AsyncTestWait.waitUntil("new overseer advertised") {
+            await fixture.advertisement.count(of: fixture.observer.sessionID) >= 1
+        }
+    }
+
+    func testLinkOverseerBySessionIDResolvesExistingOverseer() async throws {
+        let fixture = makeFixture()
+        let secondTarget = makeCandidate(windowID: 3, displayName: "Second target")
+        fixture.host.candidates = [fixture.observer, fixture.target, secondTarget]
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        ) else {
+            return XCTFail("setup link failed")
+        }
+
+        let resolution = await fixture.bridge.resolveSidebarOverseerCandidate(
+            rawSessionID: fixture.observer.sessionID.uuidString,
+            excludingTargetSessionID: secondTarget.sessionID
+        )
+        XCTAssertEqual(resolution, .success(.candidate(fixture.observer)))
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: secondTarget.domainEndpoint
+        ) else {
+            return XCTFail("existing overseer should accept another target")
+        }
+    }
+
+    func testLinkOverseerBySessionIDRefusesIneligibleSession() async throws {
+        let fixture = makeFixture()
+        let mcpControlled = makeCandidate(
+            windowID: 3, isMCPControlled: true, displayName: "Controlled"
+        )
+        let mcpOriginated = makeCandidate(
+            windowID: 4, isMCPOriginated: true, displayName: "MCP originated"
+        )
+        let roleDenied = makeCandidate(
+            windowID: 5, roleAllowsOutboundMonitoring: false, displayName: "Role denied"
+        )
+        let child = makeCandidate(
+            windowID: 6, isTopLevel: false, displayName: "Child"
+        )
+        fixture.host.candidates = [
+            fixture.observer, fixture.target, mcpControlled, mcpOriginated, roleDenied, child
+        ]
+
+        for session in [mcpControlled, mcpOriginated, roleDenied, child] {
+            let resolution = await fixture.bridge.resolveSidebarOverseerCandidate(
+                rawSessionID: session.sessionID.uuidString,
+                excludingTargetSessionID: fixture.target.sessionID
+            )
+            XCTAssertEqual(
+                resolution,
+                .failure(AgentOversightResolutionMessage(
+                    message: AgentSessionLinkEndpointEligibility.roleDeniedReason
+                )),
+                "\(session.displayName) must stay refused"
+            )
+            let outcome = await fixture.bridge.addMonitorLink(
+                observerEndpoint: session.domainEndpoint,
+                targetEndpoint: fixture.target.domainEndpoint
+            )
+            switch outcome {
+            case .added, .alreadyLinked:
+                return XCTFail("\(session.displayName) must stay refused at Add time")
+            case .failed, .rejected:
+                break
+            }
+        }
+        let snapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(snapshot.activeLinkCount, 0)
+    }
+
+    func testLinkOverseerBySessionIDAlreadyLinkedResolvesDone() async throws {
+        let fixture = makeFixture()
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint
+        ) else {
+            return XCTFail("setup link failed")
+        }
+
+        let resolution = await fixture.bridge.resolveSidebarOverseerCandidate(
+            rawSessionID: fixture.observer.sessionID.uuidString,
+            excludingTargetSessionID: fixture.target.sessionID
+        )
+        XCTAssertEqual(resolution, .success(.alreadyLinked))
+    }
+
     func testExactStopUnlinksOnlyTheSelectedObserverFromAMultiObserverTarget() async throws {
         let fixture = makeFixture()
         let secondObserver = makeCandidate(windowID: 3, displayName: "Docs")
