@@ -156,7 +156,8 @@ struct AgentSessionLinkRetainedLocalInputIndex {
         }
     }
 
-    mutating func settle(_ item: AgentChatItem, at sourcePosition: Int) {
+    /// Nil identifies an exact producer settlement retained only in the canonical transcript.
+    mutating func settle(_ item: AgentChatItem, at sourcePosition: Int?) {
         guard !needsStructuralSeed, let content = Content.project(item) else { return }
         if let index = records.firstIndex(where: { $0.itemID == item.id }) {
             guard !records[index].isDeleted else { return }
@@ -179,6 +180,14 @@ struct AgentSessionLinkRetainedLocalInputIndex {
         ))
         if records.count > Self.capacity { droppedThrough = records.removeFirst().ordinal }
         revision &+= 1
+    }
+
+    /// Mutable working-suffix pruning is not deletion from the canonical retained transcript.
+    /// Its seed already owns content/deletion reconciliation; only source positions change here.
+    mutating func reconcileWorkingPositions(_ positions: [UUID: Int]) {
+        for index in records.indices {
+            records[index].sourcePosition = records[index].isDeleted ? nil : positions[records[index].itemID]
+        }
     }
 
     mutating func replace(_ item: AgentChatItem, at position: Int) {
