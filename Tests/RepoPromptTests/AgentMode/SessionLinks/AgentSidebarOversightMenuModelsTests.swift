@@ -2790,6 +2790,21 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         return try XCTUnwrap(tracked, "Actual native opening must track a menu")
     }
 
+    /// Both Session-ID sheet directions submit through the shared general-Add callback, so the
+    /// direction's ordering is the only place observer → target can be inverted. Pin it.
+    func testOversightSessionIDSheetDirectionOrdersObserverAndTarget() {
+        let row = "row-party"
+        let peer = "peer-party"
+        let inbound = AgentSessionRow.OversightIDSheetRequest.Direction.chooseOverseer
+            .ordering(row: row, peer: peer)
+        XCTAssertEqual(inbound.observer, peer)
+        XCTAssertEqual(inbound.target, row)
+        let outbound = AgentSessionRow.OversightIDSheetRequest.Direction.chooseTarget
+            .ordering(row: row, peer: peer)
+        XCTAssertEqual(outbound.observer, row)
+        XCTAssertEqual(outbound.target, peer)
+    }
+
     private func mountedRegion(in fixture: Fixture) throws -> StableMenuContextView {
         fixture.host.layoutSubtreeIfNeeded()
         func regions(in view: NSView) -> [StableMenuContextView] {

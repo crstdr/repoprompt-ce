@@ -1206,8 +1206,9 @@ extension AgentModeViewModel {
     }
 
     /// Pasted-ID resolution for the sidebar's inbound `Session ID…` sheet (choose a prospective
-    /// overseer for this row). The bridge enforces the Oversee-by rule: the pasted session must
-    /// already hold an outbound link.
+    /// overseer for this row). The pasted session may be any eligible session — the menu list
+    /// still offers existing overseers only, but a pasted ID may name a session that has not
+    /// overseen anything yet.
     func resolveSidebarOverseerCandidate(
         rawSessionID: String,
         excludingTargetSessionID: UUID
