@@ -1161,7 +1161,7 @@ final class AgentOversightColourAssignmentTests: XCTestCase {
 
 // MARK: - Oversight mark rendering
 
-/// The interactive oversight mark must keep its palette colour. Wrapping the glyph in a macOS
+/// The interactive oversight mark must keep its role colour. Wrapping the glyph in a macOS
 /// `Menu` label template-renders it, flattening every `foregroundStyle` to the control tint —
 /// the fix keeps the glyph as ordinary content underneath a clear-label Menu hit target.
 /// These tests rasterize the row and sample pixels, because a structure check cannot see
@@ -1218,17 +1218,23 @@ final class AgentOversightMarkRenderTests: XCTestCase {
 
     /// Hosts a row in a real window so the Menu materializes its native control, then
     /// rasterizes it in dark appearance (the reported failure environment).
-    private func rasterize(_ view: some View) -> (rep: NSBitmapImageRep, window: NSWindow) {
-        let host = NSHostingView(rootView: AnyView(view.frame(width: 280)))
-        host.appearance = NSAppearance(named: .darkAqua)
+    private func rasterize(
+        _ view: some View,
+        appearance: NSAppearance.Name = .darkAqua,
+        size: NSSize = NSSize(width: 280, height: 60)
+    ) -> (rep: NSBitmapImageRep, window: NSWindow) {
+        let host = NSHostingView(rootView: AnyView(view.frame(width: size.width, height: size.height)))
+        host.appearance = NSAppearance(named: appearance)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: 60),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
         window.isReleasedWhenClosed = false
-        window.appearance = NSAppearance(named: .darkAqua)
+        // Keep capture independent of the attached display's colour profile.
+        window.colorSpace = .sRGB
+        window.appearance = NSAppearance(named: appearance)
         window.contentView = host
         host.layoutSubtreeIfNeeded()
         host.display()
@@ -1238,6 +1244,17 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         }
         host.cacheDisplay(in: host.bounds, to: rep)
         return (rep, window)
+    }
+
+    private func pixelColor(atX x: Int, y: Int, in rep: NSBitmapImageRep) -> NSColor? {
+        guard let sample = rep.colorAt(x: x, y: y) else { return nil }
+        // colorAt can label samples calibrated RGB even when the bitmap is sRGB. Interpret the
+        // components in the bitmap's profile before converting, not the sample's label.
+        return NSColor(
+            colorSpace: rep.colorSpace,
+            components: [sample.redComponent, sample.greenComponent, sample.blueComponent, sample.alphaComponent],
+            count: 4
+        ).usingColorSpace(.sRGB)
     }
 
     /// Pixels within `tolerance` (per sRGB channel) of `expected`. A template-rendered mark
@@ -1252,7 +1269,7 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         var count = 0
         for x in 0 ..< rep.pixelsWide {
             for y in 0 ..< rep.pixelsHigh {
-                guard let pixel = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                guard let pixel = pixelColor(atX: x, y: y, in: rep) else { continue }
                 if abs(pixel.redComponent - want.redComponent) < tolerance,
                    abs(pixel.greenComponent - want.greenComponent) < tolerance,
                    abs(pixel.blueComponent - want.blueComponent) < tolerance
@@ -1266,6 +1283,24 @@ final class AgentOversightMarkRenderTests: XCTestCase {
 
     /// A glyph-sized mark is far more than a stray matching pixel even at 1x backing.
     private let markPixelFloor = 8
+
+    /// The selected overseer hub keeps its own group colour in both appearances — the adaptive
+    /// palette slot, not the control tint the Menu label path template-renders to.
+    func testSelectedInteractiveOverseerKeepsPaletteColour() {
+        for (appearance, expected) in [
+            (NSAppearance.Name.darkAqua, AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true)),
+            (NSAppearance.Name.aqua, AgentOversightPalette.resolvedColor(for: 0, darkAppearance: false))
+        ] {
+            var selectedRow = row(role: role(own: 0, overseers: 0), interactive: true)
+            selectedRow.isSelected = true
+            let (rep, window) = rasterize(selectedRow, appearance: appearance)
+            XCTAssertGreaterThanOrEqual(
+                pixelCount(near: expected, in: rep), markPixelFloor,
+                "selected overseer mark lost its group colour in \(appearance)"
+            )
+            window.close()
+        }
+    }
 
     /// The failing case from Cristian's live check: an overseen row's interactive mark must
     /// paint the overseer's slot-0 group colour, not the control tint. The selected row
@@ -1350,6 +1385,87 @@ final class AgentOversightMarkRenderTests: XCTestCase {
             pixelCount(near: AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true), in: rep),
             0
         )
+    }
+
+    /// The shared vectors must paint with the caller's foreground at the intended 16px size.
+    func testRoleVectorsRespectForegroundAtSixteenPoints() {
+        let colours = [
+            NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1),
+            NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)
+        ]
+        for role in [AgentOversightRoleIcon.Role.overseer, .worker] {
+            for expected in colours {
+                let (rep, window) = rasterize(
+                    AgentOversightRoleIcon(role: role, size: 16).foregroundStyle(Color(nsColor: expected))
+                )
+                XCTAssertGreaterThanOrEqual(
+                    pixelCount(near: expected, in: rep), markPixelFloor,
+                    "\(role) lost caller foreground \(expected) at 16 points"
+                )
+                for other in colours where other != expected {
+                    XCTAssertEqual(
+                        pixelCount(near: other, in: rep), 0,
+                        "\(role) painted \(other) when styled \(expected) at 16 points"
+                    )
+                }
+                window.close()
+            }
+        }
+    }
+
+    func testToolbarRoleMapping() {
+        typealias Role = AgentOversightRoleIcon.Role
+        XCTAssertEqual(Role.toolbarRoles(isOverseer: false, hasInbound: false), [.overseer])
+        XCTAssertEqual(Role.toolbarRoles(isOverseer: false, hasInbound: true), [.worker])
+        XCTAssertEqual(Role.toolbarRoles(isOverseer: true, hasInbound: false), [.overseer])
+        XCTAssertEqual(Role.toolbarRoles(isOverseer: true, hasInbound: true), [.overseer, .worker])
+    }
+
+    func testRoleGeometryAndWorkerParentFade() throws {
+        for role in [AgentOversightRoleIcon.Role.overseer, .worker] {
+            let (rep, window) = rasterize(
+                AgentOversightRoleIcon(role: role, size: 24)
+                    .foregroundStyle(Color(nsColor: .red))
+                    .background(Color.black),
+                size: NSSize(width: 24, height: 24)
+            )
+            defer { window.close() }
+            func red(atX x: CGFloat, y: CGFloat) throws -> CGFloat {
+                let pixel = try XCTUnwrap(pixelColor(
+                    atX: Int(x * CGFloat(rep.pixelsWide) / 24),
+                    y: Int(y * CGFloat(rep.pixelsHigh) / 24),
+                    in: rep
+                ))
+                return pixel.redComponent
+            }
+            if role == .overseer {
+                XCTAssertGreaterThan(try red(atX: 12, y: 12), 0.9, "hub must be filled")
+                XCTAssertLessThan(try red(atX: 12, y: 17), 0.1, "hub must not use worker geometry")
+                XCTAssertLessThan(try red(atX: 12, y: 3.5), 0.1, "satellite must be hollow")
+            } else {
+                XCTAssertGreaterThan(try red(atX: 12, y: 17), 0.9, "worker must be filled")
+                XCTAssertLessThan(try red(atX: 12, y: 4.5), 0.1, "parent must be hollow")
+                XCTAssertEqual(try red(atX: 12, y: 9), 0.5, accuracy: 0.1, "parent link must be faded")
+                XCTAssertEqual(try red(atX: 12, y: 7), 0.5, accuracy: 0.1, "parent overlap must not darken")
+            }
+        }
+    }
+
+    func testOverseerAmberResolvesForBothAppearances() throws {
+        for (appearanceName, expected) in [
+            (NSAppearance.Name.darkAqua, NSColor(srgbRed: 1, green: 179 / 255, blue: 64 / 255, alpha: 1)),
+            (NSAppearance.Name.aqua, NSColor(srgbRed: 194 / 255, green: 106 / 255, blue: 0, alpha: 1))
+        ] {
+            let appearance = try XCTUnwrap(NSAppearance(named: appearanceName))
+            var resolved: NSColor?
+            appearance.performAsCurrentDrawingAppearance {
+                resolved = AgentOversightRoleStyle.overseerNSColor.usingColorSpace(.sRGB)
+            }
+            let actual = try XCTUnwrap(resolved)
+            XCTAssertEqual(actual.redComponent, expected.redComponent, accuracy: 0.001)
+            XCTAssertEqual(actual.greenComponent, expected.greenComponent, accuracy: 0.001)
+            XCTAssertEqual(actual.blueComponent, expected.blueComponent, accuracy: 0.001)
+        }
     }
 
     // MARK: - Passive-mark switch

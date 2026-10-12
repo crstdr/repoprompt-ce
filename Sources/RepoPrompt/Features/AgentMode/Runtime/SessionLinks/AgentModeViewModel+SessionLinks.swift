@@ -1329,6 +1329,7 @@ extension AgentModeViewModel {
             periodicIdleWakeEnabled: overlaid.periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: overlaid.periodicIdleWakeIntervalSeconds,
             pendingUpdates: overlaid.pendingUpdates,
+            overseerBootstrapState: overlaid.overseerBootstrapState,
             persistence: overlaid.persistence
         )
     }
@@ -1472,6 +1473,7 @@ extension AgentModeViewModel {
                 for: endpoint,
                 outbound: props.outbound
             )
+            props.overseerBootstrapState = agentSessionLinkBootstrapState(for: endpoint)
         }
         return props
     }
