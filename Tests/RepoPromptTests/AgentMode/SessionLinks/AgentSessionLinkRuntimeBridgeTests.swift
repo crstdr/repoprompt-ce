@@ -370,8 +370,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var localInputIndexes: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRetainedLocalInputIndex] = [:]
         var localInputSnapshotReads = 0
         var localInputRecordVisits = 0
+        // Real-target transport regressions forward the production view-model lookup rather than
+        // constructing an independent index that never encounters transcript retention.
+        var localInputSnapshotOverride: ((DomainAgentSessionLinkEndpointIdentity, Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot?)?
         func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
             localInputSnapshotReads += 1
+            if let localInputSnapshotOverride { return localInputSnapshotOverride(endpoint, includeRecords) }
             guard candidatesByEndpoint[endpoint] != nil, let snapshot = localInputIndexes[endpoint]?.snapshot else { return nil }
             if includeRecords { localInputRecordVisits += snapshot.records.count
                 return snapshot

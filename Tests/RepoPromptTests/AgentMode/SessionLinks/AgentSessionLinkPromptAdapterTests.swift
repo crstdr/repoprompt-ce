@@ -1953,6 +1953,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
     private func makeFixture(
         agent: AgentProviderKind,
         claudeController: MonitorFakeNativeController? = nil,
+        codexController: MonitorFakeCodexController? = nil,
         withMCPServer: Bool = false
     ) throws -> Fixture {
         let tabID = UUID()
@@ -2020,7 +2021,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
-                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                if let codexController { return codexController }
+                return LifecycleNoopCodexController(recorder: LifecycleRecorder())
             },
             // A session may recycle a pre-seeded fake when its launch metadata is absent.
             // Never let that replacement fall through to the real provider factory.
@@ -2161,30 +2163,313 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         }
     }
 
-    func testLocalInputRealAuthorityClaudeNativePhysicalSend() async throws {
+    func testLocalComposerCodexTargetRetentionCompactionReachesClaudeCodeObserverOnce() async throws {
         let controller = MonitorFakeNativeController()
-        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
-        fixture.inventory.publish(revision: 1, targetCount: 1)
-        let intent = try claudeRunIntent(for: fixture.session, source: "test.localInput.claude.native")
-        let startup = await fixture.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(session: fixture.session, intent: intent)
+        let observer = try makeFixture(agent: .claudeCode, claudeController: controller)
+        observer.session.oversight.autoWakeOnUpdates = false
+        observer.inventory.publish(revision: 1, targetCount: 1)
+        let intent = try claudeRunIntent(for: observer.session, source: "test.retention.claude.observer")
+        let startup = await observer.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(session: observer.session, intent: intent)
         XCTAssertEqual(startup, .ready)
-        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
-        addTeardownBlock { @MainActor in await input.cleanup() }
-        await input.correction("CLAUDE-AUTHORITY-CORRECTION")
-        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
-            session: fixture.session,
-            text: "existing Claude task",
-            attachments: [],
-            intent: intent,
+
+        let codex = MonitorFakeCodexController(dispatches: MonitorCodexDispatchRecorder())
+        let target = try makeFixture(agent: .codexExec, codexController: codex)
+        target.session.oversight.autoWakeOnUpdates = false
+        // A real long transcript, not a large independent retained-input index. Hydration is over
+        // before the grant baseline; validated composer refresh prunes the suffix during ingress.
+        let history = (0 ..< 500).flatMap { turn in
+            [
+                AgentChatItem.user("Historical request \(turn)", sequenceIndex: turn * 2),
+                AgentChatItem.assistant("Historical answer \(turn)", sequenceIndex: turn * 2 + 1)
+            ]
+        }
+        XCTAssertGreaterThanOrEqual(history.count, 900)
+        target.session.replaceItems(history)
+        target.viewModel.refreshDerivedTranscriptState(for: target.session, publishActivePresentation: false)
+        target.viewModel.refreshDerivedTranscriptState(for: target.session, publishActivePresentation: false)
+        XCTAssertEqual(target.session.transcript.turns.count, 500)
+        XCTAssertLessThan(target.session.items.count, history.count, "actual initial working-suffix pruning")
+        let targetEndpoint = try XCTUnwrap(target.viewModel.agentSessionLinkObserverEndpoint(tabID: target.tabID))
+        let observerEndpoint = try XCTUnwrap(observer.viewModel.agentSessionLinkObserverEndpoint(tabID: observer.tabID))
+        let host = AgentSessionLinkRuntimeBridgeTests.FakeEndpointHost()
+        func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, provider: String) -> AgentSessionLinkEndpointCandidate {
+            .init(
+                windowID: endpoint.windowID,
+                workspaceID: endpoint.workspaceID,
+                tabID: endpoint.tabID,
+                sessionID: endpoint.sessionID,
+                persistentBindingGeneration: endpoint.persistentBindingGeneration,
+                bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
+                isTopLevel: true,
+                hasLoadedPersistedState: true,
+                bindingTransitionInProgress: false,
+                isClosing: false,
+                isMCPControlled: false,
+                isMCPOriginated: false,
+                roleAllowsOutboundMonitoring: true,
+                displayName: provider,
+                providerDisplayName: provider,
+                locationLabel: nil
+            )
+        }
+        host.candidates = [candidate(observerEndpoint, provider: "Claude Code"), candidate(targetEndpoint, provider: "Codex CLI")]
+        host.promptViewModel = observer.viewModel
+        host.localInputSnapshotOverride = { endpoint, includeRecords in
+            guard endpoint == targetEndpoint else { return nil }
+            return target.viewModel.agentSessionLinkLocalInputSnapshot(for: endpoint, includeRecords: includeRecords)
+        }
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        addTeardownBlock { @MainActor in
+            let links = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.links(forObserver: observerEndpoint.sessionID)
+            for link in links.items {
+                await bridge.revokeLink(linkID: link.linkID, generation: link.generation)
+            }
+            target.session.agentTask?.cancel()
+            target.session.codexEventTask?.cancel()
+            await codex.shutdown()
+            WindowStatesManager.shared.attachAgentSessionLinkBridge()
+            await bridge.test_settleProjections()
+        }
+        var tick: TimeInterval = 1000
+        func status(_ value: DomainAgentSessionLinkStatus) async {
+            tick += 1
+            host.snapshotOverrides[target.sessionID] = .init(
+                sessionID: target.sessionID, displayName: "Codex target", providerDisplayName: "Codex CLI",
+                status: value, board: .empty, idleForSend: value == .idle, pendingInteractionKind: nil,
+                latestVisibleAssistantPreview: "Completed.", visibleRowCount: Int(tick), lastActivityAt: Date(timeIntervalSince1970: tick)
+            )
+            host.fireObservation(for: target.sessionID)
+            await bridge.test_settleProjections()
+        }
+        guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString)
+        else { return XCTFail("exact Read grant must precede local input") }
+        await status(.running)
+        let initialSnapshot = try XCTUnwrap(target.viewModel.agentSessionLinkLocalInputSnapshot(for: targetEndpoint, includeRecords: true))
+        XCTAssertEqual(initialSnapshot.producedThrough, 0)
+
+        let workingBefore = Set(target.session.items.map(\.id))
+        let marker = "LOCAL-COMPOSER-RETENTION-CORRECTION"
+        let submitTarget = try XCTUnwrap(target.viewModel.makeComposerSubmitTarget(tabID: target.tabID, session: target.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: submitTarget, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: marker)
+        guard case let .claimed(claim) = target.viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false)
+        else { return XCTFail("validated local composer must own ingress") }
+        let submitted = await target.viewModel.executeComposerSubmitAttempt(text: marker, claim: claim, createAndActivateSessionTab: { nil })
+        XCTAssertEqual(submitted, .submitted)
+        try await AsyncTestWait.waitUntil("authentic Codex producer retained origin", timeout: 5) {
+            target.session.items.contains { $0.text == marker && $0.userInputOrigin == .localComposer }
+        }
+        XCTAssertEqual(codex.startedTurns.count, 1, "actual native Codex physical start")
+        let row = try XCTUnwrap(target.session.items.first { $0.text == marker })
+        XCTAssertEqual(row.userInputOrigin, .localComposer)
+        let after = try XCTUnwrap(target.viewModel.agentSessionLinkLocalInputSnapshot(for: targetEndpoint, includeRecords: true))
+        let record = try XCTUnwrap(after.records.first { $0.itemID == row.id })
+        XCTAssertEqual(record.ordinal, 1)
+        let workingAfter = Set(target.session.items.map(\.id))
+        let pruned = workingBefore.subtracting(workingAfter)
+        XCTAssertFalse(pruned.isEmpty, "validated composer refresh must actually prune old mutable rows")
+        // Working-source pruning is not canonical deletion: the previous request survives, too.
+        let requests = target.session.transcript.turns.compactMap(\.request)
+        XCTAssertTrue(requests.contains { pruned.contains($0.id) })
+        let retained = try XCTUnwrap(requests.first { $0.id == row.id })
+        XCTAssertEqual(retained.userInputOrigin, .localComposer)
+        XCTAssertEqual(retained.text, marker)
+        XCTAssertEqual(after.epoch, initialSnapshot.epoch, "ordinary retention must preserve the grant's index incarnation")
+        XCTAssertEqual(after.producedThrough, initialSnapshot.producedThrough + 1)
+        await status(.idle)
+        let inventory = try XCTUnwrap(host.publishedPromptInventories[observer.sessionID])
+        let passive = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observerEndpoint])
+        let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: passive))
+        let offered = bridge.localInputDecoration(observer: observerEndpoint, inventory: inventory, baseline: baseline)
+        // Do not unwrap here: the known-bad retention reset loses the offer, but the regression
+        // must continue all the way through the actual Claude Code physical-send boundary.
+        XCTAssertEqual(offered?.requirements.first?.offer.range.indexEpoch, initialSnapshot.epoch)
+        XCTAssertEqual(offered?.requirements.first?.offer.range.capturedFrontier, 0)
+        XCTAssertEqual(offered?.requirements.first?.offer.range.throughOrdinal, 1)
+        XCTAssertEqual(offered?.requirements.first?.renderedRecords.first?.contentVersion, record.contentVersion)
+        print("LOCAL_INPUT_RETENTION history_rows=\(history.count) pruned_rows=\(pruned.count) canonical_origin=\(retained.userInputOrigin?.rawValue ?? "nil") epoch_preserved=\(after.epoch == initialSnapshot.epoch) produced_before=\(initialSnapshot.producedThrough) produced_after=\(after.producedThrough) offered_after=\(offered?.requirements.count ?? 0)")
+
+        var readCalls = 0
+        observer.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+            readCalls += 1
+            return await bridge.proveLocalInputRead(decoration, observer: observerEndpoint)
+        }
+        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: observer.session, text: "existing observer task", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false
         )
         let messages = await controller.sentMessages
         XCTAssertEqual(messages.count, 1)
         let sent = try XCTUnwrap(messages.first)
         XCTAssertTrue(sent.contains("<user_input at="))
-        XCTAssertTrue(sent.contains("CLAUDE-AUTHORITY-CORRECTION"))
-        try input.assertConsumed()
-        MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
+        XCTAssertTrue(sent.contains(marker))
+        XCTAssertFalse(sent.contains("user_inputs_omitted="))
+        XCTAssertEqual(readCalls, 1, "real exact Read proof at physical Claude Code boundary")
+        XCTAssertNil(bridge.localInputDecoration(observer: observerEndpoint, inventory: inventory, baseline: baseline), "frozen owed range consumed, not vacuous receipt removal")
+        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: observer.session, text: "next independent observer task", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        let later = await controller.sentMessages
+        XCTAssertEqual(later.count, 2)
+        XCTAssertFalse(try XCTUnwrap(later.last).contains(marker))
+        XCTAssertEqual(readCalls, 1)
+        MonitorSupplementAssertions.assertNotPersisted(in: observer.session)
+        print("LOCAL_INPUT_RETENTION_TRANSPORT sends=\(later.count) read_proofs=\(readCalls) first_contains_input=\(sent.contains(marker)) second_contains_input=\(later.last?.contains(marker) ?? false)")
+
+        // Genuine history replacement remains a new incarnation: a typed retained copy is not
+        // a new composer event and cannot be caught up through the still-live Read grant.
+        target.session.replaceItems([retained.toItem()])
+        target.viewModel.refreshDerivedTranscriptState(for: target.session, publishActivePresentation: false)
+        XCTAssertNotEqual(target.session.localInputIndex.epoch, after.epoch)
+        await status(.running)
+        await status(.idle)
+        let replacementPassive = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observerEndpoint])
+        let replacementBaseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: replacementPassive))
+        XCTAssertNil(bridge.localInputDecoration(observer: observerEndpoint, inventory: inventory, baseline: replacementBaseline))
+        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: observer.session, text: "after genuine history replacement", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        let replacementMessages = await controller.sentMessages
+        XCTAssertEqual(replacementMessages.count, 3)
+        XCTAssertFalse(try XCTUnwrap(replacementMessages.last).contains(marker))
+        XCTAssertEqual(readCalls, 1)
+    }
+
+    func testRetentionPreservesCanonicalOnlyRecordsAndExactPendingProducerTokens() throws {
+        let fixture = try makeFixture(agent: .codexExec)
+        let session = fixture.session
+        session.installLocalInputSeed(.init())
+        let history = (0 ..< 500).flatMap { turn in
+            [
+                AgentChatItem.user("Older request \(turn)", sequenceIndex: turn * 2),
+                AgentChatItem.assistant("Older answer \(turn)", sequenceIndex: turn * 2 + 1)
+            ]
+        }
+        let a = AgentChatItem.user("canonical retained A", sequenceIndex: 1000)
+        let b = AgentChatItem.user("pending retained B", sequenceIndex: 1001)
+        session.appendItem(a)
+        let tokenA = session.registerLocalComposerCandidate(itemID: a.id, at: 0)
+        XCTAssertTrue(session.settleLocalComposerOrigin(tokenA, disposition: .retained))
+        session.appendItem(b)
+        let tokenB = session.registerLocalComposerCandidate(itemID: b.id, at: 1)
+        session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+            existingTranscript: .empty, workingItems: history + session.items, terminalState: .idle,
+            nextSequenceIndex: session.nextSequenceIndex,
+            policy: .liveSession(hidePendingQuestionToolCall: false), protection: .none
+        )
+        var seed = AgentSessionLinkRetainedLocalInputIndex.Seed(trackedIDs: [a.id])
+        for request in session.transcript.turns.compactMap(\.request) {
+            seed.append(request.toItem())
+        }
+        session.installLocalInputSeed(seed)
+        let before = try XCTUnwrap(session.localInputIndex.snapshot)
+        let original = try XCTUnwrap(before.records.first)
+        session.setItemsSilentlyForRetentionCompaction([])
+        XCTAssertTrue(session.items.isEmpty)
+        XCTAssertTrue(Set(session.transcript.turns.compactMap(\.request).map(\.id)).isSuperset(of: [a.id, b.id]))
+        let after = try XCTUnwrap(session.localInputIndex.snapshot)
+        XCTAssertEqual(after.epoch, before.epoch)
+        XCTAssertEqual(after.producedThrough, before.producedThrough)
+        XCTAssertEqual(after.records.first?.ordinal, original.ordinal)
+        XCTAssertEqual(after.records.first?.contentVersion, original.contentVersion)
+        XCTAssertEqual(after.records.first?.content, original.content)
+        XCTAssertNil(after.records.first?.sourcePosition)
+        XCTAssertTrue(session.settleLocalComposerOrigin(tokenB, disposition: .retained))
+        XCTAssertEqual(session.transcript.turns.first { $0.request?.id == b.id }?.request?.userInputOrigin, .localComposer)
+        XCTAssertEqual(session.localInputIndex.producedThrough, 2)
+        XCTAssertEqual(session.localInputIndex.records.map(\.itemID), [a.id, b.id])
+        let settled = try XCTUnwrap(session.localInputIndex.snapshot)
+        // Follow the production structural notification through an actual canonical refresh:
+        // a genuinely compacted request must retain provenance and its original event identity.
+        fixture.viewModel.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        let compacted = try XCTUnwrap(session.transcript.turns.first { $0.request?.id == a.id })
+        XCTAssertNotEqual(compacted.retentionTier, .full)
+        XCTAssertEqual(compacted.request?.userInputOrigin, .localComposer)
+        XCTAssertEqual(session.transcript.turns.first { $0.request?.id == b.id }?.request?.userInputOrigin, .localComposer)
+        XCTAssertEqual(session.localInputIndex.epoch, settled.epoch)
+        XCTAssertEqual(session.localInputIndex.producedThrough, settled.producedThrough)
+        XCTAssertEqual(session.localInputIndex.records.map(\.ordinal), settled.records.map(\.ordinal))
+        XCTAssertEqual(session.localInputIndex.records.map(\.contentVersion), settled.records.map(\.contentVersion))
+        XCTAssertFalse(session.settleLocalComposerOrigin(tokenB, disposition: .retained))
+        XCTAssertEqual(session.test_unsettledLocalComposerCandidateCount, 0)
+    }
+
+    func testCanonicalOnlyProducerRefusalsRetireTokenWithoutProducingInput() {
+        for mode in ["pending", "missing", "rolledBack"] {
+            let session = AgentTabSession(tabID: UUID())
+            let item = AgentChatItem.user("exact pending producer", sequenceIndex: 0)
+            session.appendItem(item)
+            let token = session.registerLocalComposerCandidate(itemID: item.id, at: 0)
+            session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                existingTranscript: .empty, workingItems: session.items, terminalState: .idle,
+                nextSequenceIndex: session.nextSequenceIndex,
+                policy: .liveSession(hidePendingQuestionToolCall: false), protection: .none
+            )
+            session.installLocalInputSeed(.init())
+            session.setItemsSilentlyForRetentionCompaction([])
+            if mode == "pending" {
+                session.transcript.turns[0].request?.text = "uncommitted canonical edit"
+            } else if mode == "missing" {
+                session.transcript.turns.removeAll()
+                session.installLocalInputSeed(.init())
+            }
+            XCTAssertFalse(session.settleLocalComposerOrigin(token, disposition: mode == "rolledBack" ? .rolledBack : .retained), mode)
+            XCTAssertEqual(session.localInputIndex.producedThrough, 0, mode)
+            XCTAssertTrue(session.localInputIndex.records.isEmpty, mode)
+            XCTAssertNil(session.transcript.turns.first?.request?.userInputOrigin, mode)
+            session.installLocalInputSeed(.init())
+            XCTAssertFalse(session.settleLocalComposerOrigin(token, disposition: .retained), "refusal retires token: \(mode)")
+            XCTAssertEqual(session.test_unsettledLocalComposerCandidateCount, 0, mode)
+        }
+    }
+
+    func testCanonicalDeleteAndEditInvalidateRetainedContentWhileHydrationRetiresTokens() throws {
+        let session = AgentTabSession(tabID: UUID())
+        let a = AgentChatItem.user("delete A", sequenceIndex: 0)
+        let b = AgentChatItem.user("survive B", sequenceIndex: 1)
+        for item in [a, b] {
+            session.appendItem(item)
+            let token = session.registerLocalComposerCandidate(itemID: item.id, at: session.items.count - 1)
+            XCTAssertTrue(session.settleLocalComposerOrigin(token, disposition: .retained))
+        }
+        session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+            existingTranscript: .empty, workingItems: session.items, terminalState: .idle,
+            nextSequenceIndex: session.nextSequenceIndex,
+            policy: .liveSession(hidePendingQuestionToolCall: false), protection: .none
+        )
+        func installCanonicalSeed() {
+            var seed = AgentSessionLinkRetainedLocalInputIndex.Seed(trackedIDs: Set(session.localInputIndex.records.map(\.itemID)))
+            for request in session.transcript.turns.compactMap(\.request) {
+                seed.append(request.toItem())
+            }
+            session.installLocalInputSeed(seed)
+        }
+        installCanonicalSeed()
+        let before = try XCTUnwrap(session.localInputIndex.snapshot)
+        let survivor = try XCTUnwrap(before.records.first { $0.itemID == b.id })
+        session.setItemsSilentlyForRetentionCompaction([])
+        session.transcript.turns.removeAll { $0.request?.id == a.id }
+        installCanonicalSeed()
+        XCTAssertEqual(session.localInputIndex.epoch, before.epoch)
+        XCTAssertEqual(session.localInputIndex.producedThrough, 2)
+        XCTAssertNil(session.localInputIndex.records.first { $0.itemID == a.id }?.content, "only actual canonical absence invalidates retained disclosure")
+        XCTAssertEqual(session.localInputIndex.records.first { $0.itemID == b.id }?.contentVersion, survivor.contentVersion)
+        session.transcript.turns[0].request?.text = "edited B"
+        installCanonicalSeed()
+        let edited = try XCTUnwrap(session.localInputIndex.records.first { $0.itemID == b.id })
+        XCTAssertEqual(edited.ordinal, survivor.ordinal)
+        XCTAssertNotEqual(edited.contentVersion, survivor.contentVersion, "frozen content proof cannot release an edited row")
+        XCTAssertEqual(edited.content?.text, "edited B")
+        let c = AgentChatItem.user("pending before hydration", sequenceIndex: 2)
+        session.appendItem(c)
+        let stale = session.registerLocalComposerCandidate(itemID: c.id, at: 0)
+        session.setItemsSilently([c], reason: .persistedSessionHydration)
+        XCTAssertNotEqual(session.localInputIndex.epoch, before.epoch)
+        XCTAssertNil(session.localInputIndex.snapshot)
+        XCTAssertFalse(session.settleLocalComposerOrigin(stale, disposition: .retained))
+        XCTAssertNil(session.items[0].userInputOrigin)
     }
 
     func testClaudeNativeSendCarriesExactlyOneSupplementThenGoesQuiet() async throws {

@@ -38,7 +38,7 @@ final class AgentTabSession: ObservableObject {
     struct LocalComposerCandidate {
         let itemID: UUID
         let fence: AgentRunStartStopFence
-        var position: Int
+        var position: Int?
     }
 
     /// Identity-only ingress token. No raw draft or provider-formatted text is retained here.
@@ -53,23 +53,54 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func settleLocalComposerOrigin(_ token: UUID?, disposition: LocalComposerDisposition) -> Bool {
-        guard let token, let candidate = localComposerCandidates.removeValue(forKey: token) else { return false }
-        guard disposition == .retained,
-              candidate.fence.binding == persistentSessionBindingIdentity,
-              items.indices.contains(candidate.position),
-              items[candidate.position].id == candidate.itemID,
-              items[candidate.position].kind == .user,
-              items[candidate.position].crossSessionAttribution == nil,
-              !items[candidate.position].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        // Ordinary source replacement notification, but no activity timestamp or tool-index rebuild:
-        // the only changed value is provenance, not a lifecycle or assistant observation.
-        suppressSourceItemsChanged = true
-        items[candidate.position].userInputOrigin = .localComposer
-        suppressSourceItemsChanged = false
-        localInputIndex.settle(items[candidate.position], at: candidate.position)
-        finishIncrementalSourceItemsMutation(.replace(index: candidate.position, previousKind: .user, currentKind: .user))
+        guard let token, let candidate = localComposerCandidates.removeValue(forKey: token),
+              disposition == .retained,
+              candidate.fence.binding == persistentSessionBindingIdentity else { return false }
+        if let position = candidate.position {
+            guard items.indices.contains(position), items[position].id == candidate.itemID,
+                  items[position].kind == .user, items[position].crossSessionAttribution == nil,
+                  !items[position].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            // Provenance changes neither activity timestamps nor lifecycle observations.
+            suppressSourceItemsChanged = true
+            items[position].userInputOrigin = .localComposer
+            suppressSourceItemsChanged = false
+            localInputIndex.settle(items[position], at: position)
+            finishIncrementalSourceItemsMutation(.replace(index: position, previousKind: .user, currentKind: .user))
+        } else {
+            // Only a still-owned producer token may settle an exact canonical request that left
+            // the mutable suffix during retention. Typed history copies without a token cannot
+            // allocate an event. Genuine history replacement/binding changes retire these tokens.
+            guard !localInputCanonicalCommitPending,
+                  let turnIndex = transcript.turns.firstIndex(where: { $0.request?.id == candidate.itemID }),
+                  var request = transcript.turns[turnIndex].request,
+                  request.crossSessionAttribution == nil,
+                  !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            request.userInputOrigin = .localComposer
+            transcript.turns[turnIndex].request = request
+            localInputIndex.settle(request.toItem(), at: nil)
+            // Entry ruled out other pending work; the index has synchronously projected the
+            // exact provenance mutation that transcript.didSet just marked pending.
+            localInputCanonicalCommitPending = false
+            finishIncrementalSourceItemsMutation(.structural)
+        }
         isDirty = true
         return true
+    }
+
+    /// Preserve only exact identities through retention's working-list replacement. Content and
+    /// true canonical absence are reconciled by the existing canonical seed, not this suffix.
+    private func reconcileLocalInputWorkingPositions(_ newItems: [AgentChatItem]) {
+        let tracked = Set(localInputIndex.records.map(\.itemID)).union(localComposerCandidates.values.map(\.itemID))
+        var positions: [UUID: Int] = [:]
+        for (position, item) in newItems.enumerated() where tracked.contains(item.id) {
+            positions[item.id] = position
+        }
+        localInputIndex.reconcileWorkingPositions(positions)
+        for token in Array(localComposerCandidates.keys) {
+            guard var candidate = localComposerCandidates[token] else { continue }
+            candidate.position = positions[candidate.itemID]
+            localComposerCandidates[token] = candidate
+        }
     }
 
     func installLocalInputSeed(_ seed: AgentSessionLinkRetainedLocalInputIndex.Seed) {
@@ -2077,10 +2108,15 @@ final class AgentTabSession: ObservableObject {
         _ newItems: [AgentChatItem],
         dispatch: SourceItemsDispatch,
         payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource,
+        preservesLocalInputIdentity: Bool = false,
         diagnosticContext: String
     ) {
-        invalidateLocalInputStructure()
         let repairedItems = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
+        if preservesLocalInputIdentity {
+            reconcileLocalInputWorkingPositions(repairedItems)
+        } else {
+            invalidateLocalInputStructure()
+        }
         suppressSourceItemsChanged = true
         items = repairedItems
         suppressSourceItemsChanged = false
@@ -2458,6 +2494,7 @@ final class AgentTabSession: ObservableObject {
             items,
             dispatch: .silent,
             payloadUpdate: payloadUpdate,
+            preservesLocalInputIdentity: reason == .retentionCompaction,
             diagnosticContext: "setItemsSilently reason=\(reason.rawValue)"
         )
         pendingSourceItemsMutationSummary = nil
@@ -2689,8 +2726,8 @@ final class AgentTabSession: ObservableObject {
         for token in Array(localComposerCandidates.keys) {
             guard var candidate = localComposerCandidates[token] else { continue }
             if candidate.itemID == removed.id { localComposerCandidates.removeValue(forKey: token) }
-            else if candidate.position > index {
-                candidate.position -= 1
+            else if let position = candidate.position, position > index {
+                candidate.position = position - 1
                 localComposerCandidates[token] = candidate
             }
         }
