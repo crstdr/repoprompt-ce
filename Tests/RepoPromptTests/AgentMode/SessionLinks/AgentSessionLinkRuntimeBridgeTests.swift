@@ -2868,7 +2868,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
     }
 
-    func testLinkOverseerBySessionIDResolvesExistingOverseer() async throws {
+    func testLinkOverseerBySessionIDResolvesExistingOverseer() async {
         let fixture = makeFixture()
         let secondTarget = makeCandidate(windowID: 3, displayName: "Second target")
         fixture.host.candidates = [fixture.observer, fixture.target, secondTarget]
@@ -2892,7 +2892,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
     }
 
-    func testLinkOverseerBySessionIDRefusesIneligibleSession() async throws {
+    func testLinkOverseerBySessionIDRefusesIneligibleSession() async {
         let fixture = makeFixture()
         let mcpControlled = makeCandidate(
             windowID: 3, isMCPControlled: true, displayName: "Controlled"
@@ -2937,7 +2937,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(snapshot.activeLinkCount, 0)
     }
 
-    func testLinkOverseerBySessionIDAlreadyLinkedResolvesDone() async throws {
+    func testLinkOverseerBySessionIDAlreadyLinkedResolvesDone() async {
         let fixture = makeFixture()
         guard case .added = await fixture.bridge.addMonitorLink(
             observerEndpoint: fixture.observer.domainEndpoint,
