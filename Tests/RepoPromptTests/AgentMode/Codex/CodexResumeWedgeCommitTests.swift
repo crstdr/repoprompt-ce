@@ -1667,6 +1667,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         _ = try state.reserve(
             note: "continue on the original thread",
             idempotencyKey: "codex-wedge-self-compact",
+            maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes,
             owner: selfCompactOwner(for: fixture)
         )
         state.active?.admittedSupport = .codex
