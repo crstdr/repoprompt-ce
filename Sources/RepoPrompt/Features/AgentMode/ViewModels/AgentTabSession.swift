@@ -1284,11 +1284,13 @@ final class AgentTabSession: ObservableObject {
     var claudeController: (any NativeAgentRuntimeControlling)? {
         didSet {
             if let controller = claudeController,
-               oldValue.map { ObjectIdentifier($0) } != ObjectIdentifier(controller) {
+               oldValue.map { ObjectIdentifier($0) } != ObjectIdentifier(controller)
+            {
                 invalidatePassiveWakeEvidence()
             }
         }
     }
+
     var acpController: ACPAgentSessionController?
 
     var codexEventTask: Task<Void, Never>?

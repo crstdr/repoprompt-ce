@@ -549,7 +549,9 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
-    func agentSessionLinkPassiveWakeEvidence(for _: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence { .unknown }
+    func agentSessionLinkPassiveWakeEvidence(for _: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence {
+        .unknown
+    }
 
     func agentSessionLinkInstallObservation(
         for candidate: AgentSessionLinkEndpointCandidate,
@@ -4295,9 +4297,14 @@ final class AgentSessionLinkRuntimeBridge {
         guard lastPublishedSnapshotBySession[sessionID] != snapshot else {
             guard previousEvidence != evidence else { return }
             chain.capturedPassiveWakeEvidence = evidence
-            enqueuePassiveWakeEvidence(evidence, endpoint: endpoint, chain: chain,
+            enqueuePassiveWakeEvidence(
+                evidence,
+                endpoint: endpoint,
+                chain: chain,
                 sourceSequence: nextSourcePublicationSequenceBySession[sessionID] ?? 0,
-                sourceSnapshot: snapshot, isNewOccurrence: previousEvidence.ownership != evidence.ownership)
+                sourceSnapshot: snapshot,
+                isNewOccurrence: previousEvidence.ownership != evidence.ownership
+            )
             return
         }
         chain.capturedPassiveWakeEvidence = evidence
@@ -4343,8 +4350,12 @@ final class AgentSessionLinkRuntimeBridge {
         guard captured != evidence, captured.ownership != nil,
               evidence.ownership == captured.ownership || evidence == .unknown else { return }
         chain.capturedPassiveWakeEvidence = evidence
-        enqueuePassiveWakeEvidence(evidence, endpoint: endpoint, chain: chain,
-            sourceSequence: nextSourcePublicationSequenceBySession[endpoint.sessionID] ?? 0)
+        enqueuePassiveWakeEvidence(
+            evidence,
+            endpoint: endpoint,
+            chain: chain,
+            sourceSequence: nextSourcePublicationSequenceBySession[endpoint.sessionID] ?? 0
+        )
     }
 
     private func enqueuePassiveWakeEvidence(
@@ -4374,16 +4385,21 @@ final class AgentSessionLinkRuntimeBridge {
             // A bare private retirement is not a new public source occurrence. Preserve the
             // immutable settled sample's proof for unrelated projection rereads; otherwise they
             // would promote an old silent pin merely because its live source record retired.
-            let pairedEvidence: AgentSessionLinkPassiveWakeEvidence
-            if evidence == .unknown, sourceSnapshot == nil,
-               case let .silent(owner)? = chain.passiveWakePublication?.evidence {
-                pairedEvidence = .silent(owner)
+            let pairedEvidence: AgentSessionLinkPassiveWakeEvidence = if evidence == .unknown, sourceSnapshot == nil,
+                                                                         case let .silent(owner)? = chain.passiveWakePublication?.evidence
+            {
+                .silent(owner)
             } else {
-                pairedEvidence = evidence
+                evidence
             }
             chain.passiveWakePublication = .init(snapshot: canonical, evidence: pairedEvidence, sourceSequence: sourceSequence)
-            await resolvePassiveWakeEvidence(evidence, endpoint: endpoint, chain: chain,
-                sourceSequence: sourceSequence, isNewOccurrence: isNewOccurrence)
+            await resolvePassiveWakeEvidence(
+                evidence,
+                endpoint: endpoint,
+                chain: chain,
+                sourceSequence: sourceSequence,
+                isNewOccurrence: isNewOccurrence
+            )
         }
     }
 
@@ -4410,8 +4426,12 @@ final class AgentSessionLinkRuntimeBridge {
                   case let .success(lease) = authorization, lease.target == endpoint,
                   lease.linkID == item.linkID, lease.linkGeneration == item.generation,
                   var notices = passiveNoticesByObserver[observer] else { continue }
-            notices.resolvePassiveWakeEvidence(reference: .init(linkID: item.linkID, generation: item.generation),
-                targetEndpoint: endpoint, evidence: evidence, isNewOccurrence: isNewOccurrence)
+            notices.resolvePassiveWakeEvidence(
+                reference: .init(linkID: item.linkID, generation: item.generation),
+                targetEndpoint: endpoint,
+                evidence: evidence,
+                isNewOccurrence: isNewOccurrence
+            )
             passiveNoticesByObserver[observer] = notices
             publishPassiveNotices(notices.snapshot, to: observer)
         }
@@ -4844,9 +4864,10 @@ final class AgentSessionLinkRuntimeBridge {
                 let observation = await authority.observationSnapshot(forTargetEndpoint: targetEndpoint)
                 let paired = sourceChain?.passiveWakePublication
                 let evidence: AgentSessionLinkPassiveWakeEvidence = if let sourceChain,
-                    chains[targetEndpoint.sessionID] === sourceChain, sourceChain.endpoint == targetEndpoint,
-                    let paired, paired.snapshot == observation,
-                    Self.monitorStatus(.init(status: paired.snapshot.status, pendingInteractionKind: paired.snapshot.pendingInteractionKind)) == presentation.status {
+                                                                       chains[targetEndpoint.sessionID] === sourceChain, sourceChain.endpoint == targetEndpoint,
+                                                                       let paired, paired.snapshot == observation,
+                                                                       Self.monitorStatus(.init(status: paired.snapshot.status, pendingInteractionKind: paired.snapshot.pendingInteractionKind)) == presentation.status
+                {
                     paired.evidence
                 } else { .unknown }
                 statusSamples.append(AgentSessionLinkPassiveStatusNotices.Sample(

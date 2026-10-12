@@ -2146,7 +2146,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(plain, to: endpoint)
         let attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
         attempt.task?.cancel()
-        for rowCount in [100, 10_000] {
+        for rowCount in [100, 10000] {
             // Host history setup is outside the timing. A nondisplayable suffix would punish a scan.
             fixture.session.replaceItems((0 ..< rowCount).map { AgentChatItem.system("", sequenceIndex: $0) })
             var ordinaryTimes: [Double] = []
@@ -2170,7 +2170,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                     pairedDeltas.append(suppressed - ordinary)
                 }
             }
-            ordinaryTimes.sort(); quietTimes.sort(); pairedDeltas.sort()
+            ordinaryTimes.sort()
+            quietTimes.sort()
+            pairedDeltas.sort()
             print("SILENT_WAKE_ADMISSION retained_rows=\(rowCount) links=10 pairs=3000 ordinary_p95_ms=\(ordinaryTimes[2850]) ordinary_p99_ms=\(ordinaryTimes[2970]) quiet_p95_ms=\(quietTimes[2850]) quiet_p99_ms=\(quietTimes[2970]) delta_p95_ms=\(pairedDeltas[2850]) delta_p99_ms=\(pairedDeltas[2970]) max_ms=\(quietTimes.last!)")
         }
     }
@@ -2185,8 +2187,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
         func samples(_ status: AgentSessionLinkPassiveStatusNotices.Status) -> [AgentSessionLinkPassiveStatusNotices.Sample] {
             (0 ..< 18).map { index in
-                .init(reference: Self.laneReference(index), targetEndpoint: Self.laneTargetEndpoint(index), targetSessionID: Self.targetID(index), displayName: "Peer", status: status,
-                      passiveWakeEvidence: status == .running ? .open(owners[index]) : .silent(owners[index]))
+                .init(
+                    reference: Self.laneReference(index),
+                    targetEndpoint: Self.laneTargetEndpoint(index),
+                    targetSessionID: Self.targetID(index),
+                    displayName: "Peer",
+                    status: status,
+                    passiveWakeEvidence: status == .running ? .open(owners[index]) : .silent(owners[index])
+                )
             }
         }
         var reducer = AgentSessionLinkPassiveStatusNotices(observerEndpoint: endpoint)
@@ -5318,14 +5326,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         DomainAgentSessionLinkEndpointIdentity(
             windowID: 2,
             workspaceID: UUID(
-                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 10000000 + index)
+                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 10_000_000 + index)
             )!,
             tabID: UUID(
-                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 20000000 + index)
+                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 20_000_000 + index)
             )!,
             sessionID: targetID(index),
             persistentBindingGeneration: UUID(
-                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 30000000 + index)
+                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 30_000_000 + index)
             )!,
             bindingTransitionGeneration: 1
         )

@@ -424,7 +424,9 @@ extension AgentModeViewModel {
         let policy = session.passiveWakeEvidenceChanged.sink { _ in
             MainActor.assumeIsolated { onPassiveWakeChange() }
         }
-        return AgentSessionLinkObservationToken { normal.invalidate(); policy.cancel() }
+        return AgentSessionLinkObservationToken { normal.invalidate()
+            policy.cancel()
+        }
     }
 
     /// Refresh durable child metadata once for a poll/wait batch. The synchronous snapshot path

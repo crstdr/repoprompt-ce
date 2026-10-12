@@ -521,9 +521,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             passiveEvidenceBySession[candidate.sessionID] ?? observationViewModels[candidate.sessionID]?.agentSessionLinkPassiveWakeEvidence(for: candidate) ?? .unknown
         }
 
-        func agentSessionLinkInstallObservation(for candidate: AgentSessionLinkEndpointCandidate,
+        func agentSessionLinkInstallObservation(
+            for candidate: AgentSessionLinkEndpointCandidate,
             onChange: @escaping @MainActor () -> Void,
-            onPassiveWakeChange: @escaping @MainActor () -> Void) -> AgentSessionLinkObservationToken? {
+            onPassiveWakeChange: @escaping @MainActor () -> Void
+        ) -> AgentSessionLinkObservationToken? {
             if let vm = observationViewModels[candidate.sessionID] {
                 return vm.agentSessionLinkInstallObservation(for: candidate, onChange: onChange, onPassiveWakeChange: onPassiveWakeChange)
             }
@@ -998,12 +1000,25 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             let fixture = makeFixture()
             defer { fixture.bridge.freezeForTermination() }
             let target = fixture.target
-            let owner = AgentRunOwnership(binding: .init(tabID: target.tabID, persistentSessionID: target.sessionID,
-                persistentBindingGeneration: target.persistentBindingGeneration, bindingTransitionGeneration: target.bindingTransitionGeneration))
+            let owner = AgentRunOwnership(binding: .init(
+                tabID: target.tabID,
+                persistentSessionID: target.sessionID,
+                persistentBindingGeneration: target.persistentBindingGeneration,
+                bindingTransitionGeneration: target.bindingTransitionGeneration
+            ))
             func snapshot(_ status: DomainAgentSessionLinkStatus) -> DomainAgentSessionObservationSnapshot {
-                .init(sessionID: target.sessionID, displayName: target.displayName, providerDisplayName: target.providerDisplayName, status: status,
-                    board: .empty, idleForSend: status == .idle, pendingInteractionKind: nil, latestVisibleAssistantPreview: nil,
-                    visibleRowCount: 0, lastActivityAt: Date(timeIntervalSince1970: 100))
+                .init(
+                    sessionID: target.sessionID,
+                    displayName: target.displayName,
+                    providerDisplayName: target.providerDisplayName,
+                    status: status,
+                    board: .empty,
+                    idleForSend: status == .idle,
+                    pendingInteractionKind: nil,
+                    latestVisibleAssistantPreview: nil,
+                    visibleRowCount: 0,
+                    lastActivityAt: Date(timeIntervalSince1970: 100)
+                )
             }
             fixture.host.passiveEvidenceBySession[target.sessionID] = .open(owner)
             fixture.host.snapshotOverrides[target.sessionID] = snapshot(.running)
@@ -1032,6 +1047,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             XCTAssertEqual(retired.entries, pending.entries)
             XCTAssertEqual(retired.queueRevision, pending.queueRevision)
             XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: target.sessionID), sourceSequence)
+            fixture.host.liveObservations[target.sessionID]?()
+            await fixture.bridge.test_settleTargetPublications()
             await fixture.bridge.test_settleProjections()
             let reread = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
             XCTAssertEqual(reread.routineNonAdmittingReferences.isEmpty, !settled, "An unrelated projection reread is not a new source occurrence")
@@ -1048,7 +1065,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     }
 
     /// Timings are diagnostics, not CI thresholds. Structural work bounds are the regression gate.
-    func testPrivateWakeResolutionIsIndexedAtThirtyAndThreeHundredChats() async throws {
+    func testPrivateWakeResolutionIsIndexedAtThirtyAndThreeHundredChats() async {
         for chatCount in [30, 300] {
             let authority = makeAuthority()
             let host = FakeEndpointHost()
@@ -1063,15 +1080,28 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             }
             let seed = host.agentSessionLinkObservationSnapshot(for: target)
             func snapshot(_ status: DomainAgentSessionLinkStatus) -> DomainAgentSessionObservationSnapshot {
-                .init(sessionID: seed.sessionID, displayName: seed.displayName, providerDisplayName: seed.providerDisplayName, status: status,
-                      board: seed.board, idleForSend: status == .idle, pendingInteractionKind: nil,
-                      latestVisibleAssistantPreview: seed.latestVisibleAssistantPreview, visibleRowCount: seed.visibleRowCount, lastActivityAt: seed.lastActivityAt)
+                .init(
+                    sessionID: seed.sessionID,
+                    displayName: seed.displayName,
+                    providerDisplayName: seed.providerDisplayName,
+                    status: status,
+                    board: seed.board,
+                    idleForSend: status == .idle,
+                    pendingInteractionKind: nil,
+                    latestVisibleAssistantPreview: seed.latestVisibleAssistantPreview,
+                    visibleRowCount: seed.visibleRowCount,
+                    lastActivityAt: seed.lastActivityAt
+                )
             }
             var samples: [Double] = []
             for _ in 0 ..< 30 {
                 for _ in 0 ..< 100 {
-                    let owner = AgentRunOwnership(binding: .init(tabID: target.tabID, persistentSessionID: target.sessionID,
-                        persistentBindingGeneration: target.persistentBindingGeneration, bindingTransitionGeneration: target.bindingTransitionGeneration))
+                    let owner = AgentRunOwnership(binding: .init(
+                        tabID: target.tabID,
+                        persistentSessionID: target.sessionID,
+                        persistentBindingGeneration: target.persistentBindingGeneration,
+                        bindingTransitionGeneration: target.bindingTransitionGeneration
+                    ))
                     host.passiveEvidenceBySession[target.sessionID] = .open(owner)
                     host.snapshotOverrides[target.sessionID] = snapshot(.running)
                     host.liveObservations[target.sessionID]?()

@@ -498,11 +498,16 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// The latest sample time enriches a future attention occurrence but is not itself queue
         /// content. Re-observing byte-identical state must not advance the reducer revision.
         static func == (lhs: Observation, rhs: Observation) -> Bool {
-            lhs.sample == rhs.sample
+            // Admission evidence is not public baseline content, including while nondeliverable.
+            var comparable = lhs.sample
+            comparable.passiveWakeEvidence = rhs.sample.passiveWakeEvidence
+            return comparable == rhs.sample
         }
 
         func hash(into hasher: inout Hasher) {
-            hasher.combine(sample)
+            var publicSample = sample
+            publicSample.passiveWakeEvidence = .unknown
+            hasher.combine(publicSample)
         }
     }
 
@@ -771,8 +776,12 @@ struct AgentSessionLinkPassiveStatusNotices {
                     refreshRoutineDebt(from: sample, sequence: nextChangeSequence)
                     changed = true
                 } else if sample.passiveWakeEvidence != observation.sample.passiveWakeEvidence {
-                    resolvePassiveWakeEvidence(reference: sample.reference, targetEndpoint: sample.targetEndpoint,
-                        evidence: sample.passiveWakeEvidence, isNewOccurrence: sample.passiveWakeEvidence.ownership != observation.sample.passiveWakeEvidence.ownership)
+                    resolvePassiveWakeEvidence(
+                        reference: sample.reference,
+                        targetEndpoint: sample.targetEndpoint,
+                        evidence: sample.passiveWakeEvidence,
+                        isNewOccurrence: sample.passiveWakeEvidence.ownership != observation.sample.passiveWakeEvidence.ownership
+                    )
                 }
                 continue
             }
@@ -899,7 +908,8 @@ struct AgentSessionLinkPassiveStatusNotices {
         // Each receipt names only rendered rows; a newer partial receipt may omit these statuses.
         for delivered in receipt.deliveredStatuses {
             if var debt = routineDebtByReference[delivered.reference],
-               let through = debt.ordinaryThrough, delivered.changeSequence >= through {
+               let through = debt.ordinaryThrough, delivered.changeSequence >= through
+            {
                 debt.ordinaryThrough = nil
                 routineDebtByReference[delivered.reference] = debt
             }
@@ -939,7 +949,8 @@ struct AgentSessionLinkPassiveStatusNotices {
     private mutating func refreshRoutineDebt(from sample: Sample, sequence: UInt64) {
         var debt = routineDebtByReference[sample.reference] ?? RoutineDebt()
         if sample.status == .idle, sample.passiveWakeEvidence.isPassive,
-           debt.pin.ownership == sample.passiveWakeEvidence.ownership, debt.pin.isPassive {
+           debt.pin.ownership == sample.passiveWakeEvidence.ownership, debt.pin.isPassive
+        {
             debt.pin = sample.passiveWakeEvidence
         } else {
             debt.pin = .unknown
