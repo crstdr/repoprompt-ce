@@ -829,7 +829,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 acceptAgentSessionLinkPromptClaim: { _, _, _ in accepted += 1 }
             ), providerBindingService: AgentModeProviderBindingService())
             var state = session.selfCompactState
-            _ = state.reserve(note: "verified continuation", idempotencyKey: "native-wake")
+            _ = state.reserve(note: "verified continuation", idempotencyKey: "native-wake", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
             state.active?.phase = .parked
             state.active?.compactTurnSucceeded = true
             let requestID = try XCTUnwrap(state.active?.id)
