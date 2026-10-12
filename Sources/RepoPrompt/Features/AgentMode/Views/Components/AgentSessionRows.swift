@@ -155,8 +155,8 @@ struct AgentSessionRow: View {
             /// confirmation labels and the submitted endpoints cannot disagree.
             func ordering<Party>(row: Party, peer: Party) -> (observer: Party, target: Party) {
                 switch self {
-                case .chooseOverseer: return (observer: peer, target: row)
-                case .chooseTarget: return (observer: row, target: peer)
+                case .chooseOverseer: (observer: peer, target: row)
+                case .chooseTarget: (observer: row, target: peer)
                 }
             }
         }
