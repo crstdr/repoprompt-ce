@@ -211,7 +211,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     // MARK: - Fake host
 
-    private final class FakeEndpointHost: AgentSessionLinkEndpointHost {
+    final class FakeEndpointHost: AgentSessionLinkEndpointHost {
+        var passiveEvidenceBySession: [UUID: AgentSessionLinkPassiveWakeEvidence] = [:]
+        var livePassiveObservations: [UUID: @MainActor () -> Void] = [:]
+        var observationViewModels: [UUID: AgentModeViewModel] = [:]
+        var forwardsNativeQueues = false
         var beforeActivation: ((DomainAgentSessionLinkEndpointIdentity) async -> Void)?
         func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
             await beforeActivation?(endpoint)
@@ -447,6 +451,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         func agentSessionLinkObservationSnapshot(
             for candidate: AgentSessionLinkEndpointCandidate
         ) -> DomainAgentSessionObservationSnapshot {
+            if let viewModel = observationViewModels[candidate.sessionID] {
+                return viewModel.agentSessionLinkObservationSnapshot(for: candidate)
+            }
             observationSnapshotCalls[candidate.sessionID, default: 0] += 1
             return snapshotOverrides[candidate.sessionID] ?? DomainAgentSessionObservationSnapshot(
                 sessionID: candidate.sessionID,
@@ -489,6 +496,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         func agentSessionLinkStatusProjection(
             for candidate: AgentSessionLinkEndpointCandidate
         ) -> AgentSessionLinkStatusProjection? {
+            if let viewModel = observationViewModels[candidate.sessionID] { return viewModel.agentSessionLinkStatusProjection(for: candidate) }
             statusProjectionCalls[candidate.sessionID, default: 0] += 1
             let snapshot = snapshotOverrides[candidate.sessionID]
             return AgentSessionLinkStatusProjection(
@@ -509,10 +517,31 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             await duringSubagentCensus?()
         }
 
+        func agentSessionLinkPassiveWakeEvidence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence {
+            passiveEvidenceBySession[candidate.sessionID] ?? observationViewModels[candidate.sessionID]?.agentSessionLinkPassiveWakeEvidence(for: candidate) ?? .unknown
+        }
+
+        func agentSessionLinkInstallObservation(for candidate: AgentSessionLinkEndpointCandidate,
+            onChange: @escaping @MainActor () -> Void,
+            onPassiveWakeChange: @escaping @MainActor () -> Void) -> AgentSessionLinkObservationToken? {
+            if let vm = observationViewModels[candidate.sessionID] {
+                return vm.agentSessionLinkInstallObservation(for: candidate, onChange: onChange, onPassiveWakeChange: onPassiveWakeChange)
+            }
+            guard let token = agentSessionLinkInstallObservation(for: candidate, onChange: onChange) else { return nil }
+            livePassiveObservations[candidate.sessionID] = onPassiveWakeChange
+            return AgentSessionLinkObservationToken { [weak self] in
+                token.invalidate()
+                self?.livePassiveObservations.removeValue(forKey: candidate.sessionID)
+            }
+        }
+
         func agentSessionLinkInstallObservation(
             for candidate: AgentSessionLinkEndpointCandidate,
             onChange: @escaping @MainActor () -> Void
         ) -> AgentSessionLinkObservationToken? {
+            if let viewModel = observationViewModels[candidate.sessionID] {
+                return viewModel.agentSessionLinkInstallObservation(for: candidate, onChange: onChange)
+            }
             duringObservationInstall?(self)
             guard !failObservationInstall else { return nil }
             let sessionID = candidate.sessionID
@@ -544,6 +573,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             guard promptInventoryHoldsByEndpoint[endpoint] == nil else { return }
             publishedInventoriesByEndpoint[endpoint] = inventory
             publishedPromptInventories[endpoint.sessionID] = inventory
+            if forwardsNativeQueues { observationViewModels[endpoint.sessionID]?.agentSessionLinkPublishPromptInventory(inventory, to: endpoint) }
         }
 
         /// Passive queues recorded per exact endpoint, with a publication counter: a test has to be
@@ -559,6 +589,10 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         ) {
             passiveNoticePublicationCount += 1
             publishedPassiveNoticesByEndpoint[endpoint] = snapshot
+            if forwardsNativeQueues, let vm = observationViewModels[endpoint.sessionID] {
+                vm.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+                vm.sessions[endpoint.tabID]?.oversight.pendingAutoWake?.task?.cancel()
+            }
         }
 
         /// Mirrors the real store's fence, because the bridge's contract is that a publication
@@ -851,7 +885,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private func makeAuthority() -> DomainAgentSessionLinkAuthority {
+    func makeAuthority() -> DomainAgentSessionLinkAuthority {
         DomainAgentSessionLinkAuthority(
             identity: DomainRuntimeIdentity(
                 runtimeID: UUID(),
@@ -957,6 +991,63 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             $0.targetSessionID == (target ?? fixture.target.sessionID)
         }) else { return nil }
         return DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
+    }
+
+    /// Timings are diagnostics, not CI thresholds. Structural work bounds are the regression gate.
+    func testPrivateWakeResolutionIsIndexedAtThirtyAndThreeHundredChats() async throws {
+        for chatCount in [30, 300] {
+            let authority = makeAuthority()
+            let host = FakeEndpointHost()
+            let target = makeCandidate(windowID: 1)
+            let observers = (0 ..< 10).map { makeCandidate(windowID: $0 + 2) }
+            host.candidates = [target] + observers + (11 ..< chatCount).map { makeCandidate(windowID: $0 + 1) }
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+            defer { bridge.freezeForTermination() }
+            for observer in observers {
+                host.autoWakeTargetsByEndpoint[observer.domainEndpoint] = [target.sessionID]
+                guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else { return XCTFail("Scale grant setup") }
+            }
+            let seed = host.agentSessionLinkObservationSnapshot(for: target)
+            func snapshot(_ status: DomainAgentSessionLinkStatus) -> DomainAgentSessionObservationSnapshot {
+                .init(sessionID: seed.sessionID, displayName: seed.displayName, providerDisplayName: seed.providerDisplayName, status: status,
+                      board: seed.board, idleForSend: status == .idle, pendingInteractionKind: nil,
+                      latestVisibleAssistantPreview: seed.latestVisibleAssistantPreview, visibleRowCount: seed.visibleRowCount, lastActivityAt: seed.lastActivityAt)
+            }
+            var samples: [Double] = []
+            for _ in 0 ..< 30 {
+                for _ in 0 ..< 100 {
+                    let owner = AgentRunOwnership(binding: .init(tabID: target.tabID, persistentSessionID: target.sessionID,
+                        persistentBindingGeneration: target.persistentBindingGeneration, bindingTransitionGeneration: target.bindingTransitionGeneration))
+                    host.passiveEvidenceBySession[target.sessionID] = .open(owner)
+                    host.snapshotOverrides[target.sessionID] = snapshot(.running)
+                    host.liveObservations[target.sessionID]?()
+                    await bridge.test_settleTargetPublications()
+                    await bridge.test_refreshStatus(sessionIDs: [target.sessionID])
+                    host.snapshotOverrides[target.sessionID] = snapshot(.idle)
+                    host.liveObservations[target.sessionID]?()
+                    await bridge.test_settleTargetPublications()
+                    await bridge.test_refreshStatus(sessionIDs: [target.sessionID])
+                    let reads = host.candidateReadCount
+                    let previews = host.observationSnapshotCalls
+                    let visits = host.boundedCandidateVisits
+                    let sequence = bridge.test_sourcePublicationSequence(for: target.sessionID)
+                    host.passiveEvidenceBySession[target.sessionID] = .ordinary(owner)
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    host.livePassiveObservations[target.sessionID]?()
+                    await bridge.test_settleTargetPublications()
+                    samples.append(Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
+                    XCTAssertEqual(host.candidateReadCount, reads, "Private resolution must not discover unrelated chats")
+                    XCTAssertEqual(host.observationSnapshotCalls, previews, "Private resolution must not rebuild previews")
+                    XCTAssertEqual(bridge.test_sourcePublicationSequence(for: target.sessionID), sequence)
+                    XCTAssertLessThanOrEqual(host.boundedCandidateVisits - visits, 24, "Work follows ten inbound grants, not all chats")
+                    for observer in observers {
+                        XCTAssertTrue(host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint]?.routineNonAdmittingReferences.isEmpty == true)
+                    }
+                }
+            }
+            samples.sort()
+            print("SILENT_WAKE_PRIVATE_RESOLUTION chats=\(chatCount) inbound_links=10 samples=\(samples.count) p50_ms=\(samples[1500]) p95_ms=\(samples[2850]) p99_ms=\(samples[2970]) max_ms=\(samples.last!)")
+        }
     }
 
     func testOverseenProviderPermissionRemainsManualUntilExplicitResponse() async throws {

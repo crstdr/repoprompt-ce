@@ -7415,6 +7415,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let controllerGenerationAtStart = session.codexControllerGeneration
         guard await computerUseStartupIsCurrent(startController) else { return }
         do {
+            session.invalidatePassiveWakeEvidence()
             var startResult = try await startCodexNativeSession(
                 controller: startController,
                 existingRef: existingRef,
@@ -7503,6 +7504,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         return
                     }
                     do {
+                        session.invalidatePassiveWakeEvidence()
                         var recoveredStartResult = try await startCodexNativeSession(
                             controller: recoveredController,
                             existingRef: existingRef,
@@ -7596,6 +7598,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                       managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
                 else { return }
                 do {
+                    session.invalidatePassiveWakeEvidence()
                     var retryResult = try await startCodexNativeSession(
                         controller: freshController,
                         existingRef: nil,
@@ -8740,6 +8743,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         args: [String: Value]?,
         session: AgentTabSession
     ) {
+        session.notePassiveWakeActivity()
         guard isRepoPromptTrackerToolName(toolName) else { return }
         logCodexTranscriptOrdering(
             "tracker toolCall received",
@@ -8769,6 +8773,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         isError: Bool,
         session: AgentTabSession
     ) {
+        session.notePassiveWakeActivity()
         guard isRepoPromptTrackerToolName(toolName) else { return }
         logCodexTranscriptOrdering(
             "tracker toolResult received",
@@ -9719,18 +9724,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         switch event {
         case let .assistantDelta(delta):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeAssistantText(delta)
             guard !delta.isEmpty else { return }
             clearCodexPendingAuthRetryTurn(session)
             enqueueAssistantDelta(delta, session: session)
             return
         case let .canonicalAssistantDelta(text, scope):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeAssistantText(text)
             guard !text.isEmpty else { return }
             clearCodexPendingAuthRetryTurn(session)
             enqueueAssistantDelta(text, scope: scope, session: session)
             return
         case let .assistantCompleted(payload):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeAssistantText(payload.text)
             clearCodexPendingAuthRetryTurn(session)
             reconcileAssistantCompletion(payload, session: session)
             return
@@ -9855,6 +9863,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         case let .toolCall(toolName, invocationID, argsJSON):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
@@ -9896,6 +9905,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.requestUIRefresh(tabID: session.tabID)
         case let .toolResult(toolName, invocationID, argsJSON, resultJSON, isError):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
@@ -10058,6 +10068,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard session.runState.isActive
                 || shouldApplyCommandExecutionRunningUpdateToInactiveSession(runningUpdate, session: session)
             else { return }
+            session.notePassiveWakeActivity()
             clearCodexPendingAuthRetryTurn(session)
             if runningUpdate.sealsAssistantBoundary {
                 sealAssistantBoundary(session)
@@ -10197,6 +10208,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.setAgentRunActive(session.tabID, isActive: true)
             viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
         case let .errorNotification(notification):
+            session.notePassiveWakeActivity()
             let willRetry: Bool
             if let structuredWillRetry = notification.willRetry {
                 willRetry = structuredWillRetry
@@ -10232,6 +10244,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 sourceController: sourceController
             )
         case let .error(message):
+            session.notePassiveWakeActivity()
             let willRetry = Self.isRetriableStreamErrorMessage(message)
             recordCodexRetryHeuristicFallback(session: session, message: message)
             if willRetry, session.runState.isActive {
@@ -10262,6 +10275,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 sourceController: sourceController
             )
         case let .system(message):
+            session.notePassiveWakeAssistantText(message)
             let systemItem = AgentChatItem.system(message, sequenceIndex: session.nextSequenceIndex)
             session.appendItem(systemItem)
             viewModel?.requestUIRefresh(tabID: session.tabID)

@@ -17838,6 +17838,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             flushPendingAssistantDelta(session)
         }
 
+        session.notePassiveWakeInput()
         // An accepted local or managed steer owns the boundary before its user row is published.
         agentSelfCompactCancelForAcceptedLocalInput(session)
         let userItem = AgentChatItem.user(
@@ -19610,6 +19611,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return nil
             }
         }
+        if directStartOptions.laneUpdateWakeID == nil { session.notePassiveWakeInput() }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         guard periodicStartIsCurrent(), stopFence.permitsStart(of: session) else { return nil }
         await prepareMCPWaitTrackingForRunStart(session: session, stopFence: stopFence)
@@ -19666,7 +19668,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             providerControlCommand: directStartOptions.providerControlCommand,
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome,
-            stopFence: stopFence
+            stopFence: stopFence,
+            passiveWakeID: directStartOptions.laneUpdateWakeID
         )
     }
 
@@ -19957,6 +19960,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await MainActor.run {
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID else { return }
+            switch result.type {
+            case "content", "final_content": session.notePassiveWakeAssistantText(result.text)
+            case "tool_call", "tool_result", "tool_progress", "error": session.notePassiveWakeActivity()
+            case "event", "system": session.notePassiveWakeAssistantText(result.text)
+            default: break
+            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
@@ -21144,6 +21153,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let continuation = session.instructionContinuation else { return false }
         switch origin {
         case .user:
+            session.notePassiveWakeInput()
             // Estimated from the decorated text, not the augmented text: this is what the provider is
             // actually handed, and the supplement it may carry can run to the renderer's full byte
             // budget. Measuring the undecorated string would leave that entirely outside accounting.

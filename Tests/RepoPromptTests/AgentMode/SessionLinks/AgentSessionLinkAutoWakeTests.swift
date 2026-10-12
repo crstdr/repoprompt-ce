@@ -2140,6 +2140,96 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     /// Regression: "some lane is selected" was enough for overflow to reserve a wake, so dropped
     /// edges belonging to an excluded target started an autonomous turn — the selected lane's only
     /// contribution being that it existed.
+    /// Paired warm decision diagnostics only; correctness does not depend on machine timings.
+    func testQuietAdmissionCostIsIndependentOfRetainedTranscriptLength() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1, targetCount: 10)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        let plain = Self.laneSnapshot(observerEndpoint: endpoint, targetIndices: Array(0 ..< 10))
+        let quiet = Self.laneSnapshot(observerEndpoint: endpoint, targetIndices: Array(0 ..< 10), routineNonAdmittingReferences: Set(plain.entries.map(\.reference)))
+        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(plain, to: endpoint)
+        let attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        attempt.task?.cancel()
+        for rowCount in [100, 10_000] {
+            // Host history setup is outside the timing. A nondisplayable suffix would punish a scan.
+            fixture.session.replaceItems((0 ..< rowCount).map { AgentChatItem.system("", sequenceIndex: $0) })
+            var ordinaryTimes: [Double] = []
+            var quietTimes: [Double] = []
+            var pairedDeltas: [Double] = []
+            for round in 0 ..< 30 {
+                for index in 0 ..< 100 {
+                    var ordinary: Double = 0
+                    var suppressed: Double = 0
+                    for isQuiet in (round + index).isMultiple(of: 2) ? [false, true] : [true, false] {
+                        // Inject already-published state: neither publication nor history setup is measured.
+                        fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID] = isQuiet ? quiet : plain
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        let eligible = fixture.viewModel.agentSessionLinkAutoWakeAttemptIsStillEligible(attempt, session: fixture.session)
+                        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                        XCTAssertEqual(eligible, !isQuiet)
+                        if isQuiet { suppressed = elapsed } else { ordinary = elapsed }
+                    }
+                    ordinaryTimes.append(ordinary)
+                    quietTimes.append(suppressed)
+                    pairedDeltas.append(suppressed - ordinary)
+                }
+            }
+            ordinaryTimes.sort(); quietTimes.sort(); pairedDeltas.sort()
+            print("SILENT_WAKE_ADMISSION retained_rows=\(rowCount) links=10 pairs=3000 ordinary_p95_ms=\(ordinaryTimes[2850]) ordinary_p99_ms=\(ordinaryTimes[2970]) quiet_p95_ms=\(quietTimes[2850]) quiet_p99_ms=\(quietTimes[2970]) delta_p95_ms=\(pairedDeltas[2850]) delta_p99_ms=\(pairedDeltas[2970]) max_ms=\(quietTimes.last!)")
+        }
+    }
+
+    func testAllSilentBurstOverSixteenStillAdmitsUnattributedOverflow() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1, targetCount: 18)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        let owners = (0 ..< 18).map { index in
+            AgentRunOwnership(binding: .init(tabID: Self.laneTargetEndpoint(index).tabID, persistentSessionID: Self.targetID(index)))
+        }
+        func samples(_ status: AgentSessionLinkPassiveStatusNotices.Status) -> [AgentSessionLinkPassiveStatusNotices.Sample] {
+            (0 ..< 18).map { index in
+                .init(reference: Self.laneReference(index), targetEndpoint: Self.laneTargetEndpoint(index), targetSessionID: Self.targetID(index), displayName: "Peer", status: status,
+                      passiveWakeEvidence: status == .running ? .open(owners[index]) : .silent(owners[index]))
+            }
+        }
+        var reducer = AgentSessionLinkPassiveStatusNotices(observerEndpoint: endpoint)
+        reducer.enable(samples: samples(.running), linkSetRevision: 1)
+        reducer.setAutoWakeLanes((0 ..< 18).map { .init(reference: Self.laneReference($0), targetEndpoint: Self.laneTargetEndpoint($0), targetSessionID: Self.targetID($0), isEffectivelySelected: true) })
+        reducer.reconcile(samples: samples(.idle), linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.entries.count, 16)
+        XCTAssertEqual(reducer.snapshot.routineNonAdmittingReferences.count, 16)
+        XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 2)
+        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(reducer.snapshot, to: endpoint)
+        let wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        wake.task?.cancel()
+        _ = try XCTUnwrap(fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(wakeID: wake.wakeID, endpoint: endpoint))
+        _ = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(for: fixture.session, dispatchID: .autoWake(wakeID: wake.wakeID)))
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: .autoWake(wakeID: wake.wakeID)))
+    }
+
+    func testSilentAdmissionDoesNotChangePromptBytesReceiptOrSwitchOffQueue() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        let plain = Self.laneSnapshot(observerEndpoint: endpoint)
+        let quiet = Self.laneSnapshot(observerEndpoint: endpoint, routineNonAdmittingReferences: Set(plain.entries.map(\.reference)))
+        let inventory = Self.inventory(observerSessionID: fixture.sessionID, revision: 1)
+        let ordinary = AgentSessionLinkPrompts.rendered(.init(membershipKind: .inventory, inventory: inventory, passiveNotices: plain))
+        let suppressed = AgentSessionLinkPrompts.rendered(.init(membershipKind: .inventory, inventory: inventory, passiveNotices: quiet))
+        XCTAssertEqual(Array(ordinary.fragment.utf8), Array(suppressed.fragment.utf8))
+        XCTAssertEqual(ordinary.passiveBatch, suppressed.passiveBatch)
+        XCTAssertEqual(plain.wakeEligibilityFingerprint, quiet.wakeEligibilityFingerprint)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(quiet, to: endpoint)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(false, for: endpoint))
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]?.entries, quiet.entries)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(true, for: endpoint))
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake, "Switch cycling does not turn suppressed queued content into ordinary debt")
+    }
+
     func testOverflowFromAnUnselectedLaneCannotWakeMerelyBecauseAnotherLaneIsSelected() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
@@ -5178,7 +5268,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     // MARK: - Values
 
     private static func targetID(_ index: Int) -> UUID {
-        UUID(uuidString: String(format: "0000000%d-0000-0000-0000-000000005501", index))!
+        UUID(uuidString: String(format: "%08d-0000-0000-0000-000000005501", index))!
     }
 
     private static func inventory(
@@ -5228,14 +5318,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         DomainAgentSessionLinkEndpointIdentity(
             windowID: 2,
             workspaceID: UUID(
-                uuidString: String(format: "1000000%d-0000-0000-0000-000000005501", index)
+                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 10000000 + index)
             )!,
             tabID: UUID(
-                uuidString: String(format: "2000000%d-0000-0000-0000-000000005501", index)
+                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 20000000 + index)
             )!,
             sessionID: targetID(index),
             persistentBindingGeneration: UUID(
-                uuidString: String(format: "3000000%d-0000-0000-0000-000000005501", index)
+                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 30000000 + index)
             )!,
             bindingTransitionGeneration: 1
         )
@@ -5279,7 +5369,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         referenceGeneration: UInt64 = 1,
         queueEpoch: UUID = laneQueueEpoch,
         latestVisibleAssistantPreview: String = "Done.",
-        attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest] = []
+        attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest] = [],
+        routineNonAdmittingReferences: Set<DomainAgentSessionLinkReference> = []
     ) -> AgentSessionLinkPassiveStatusNotices.Snapshot {
         let entries = targetIndices.map { index in
             AgentSessionLinkPassiveStatusNotices.PendingEntry(
@@ -5314,7 +5405,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                     targetSessionID: targetID(index),
                     isEffectivelySelected: selectedTargetIndices?.contains(index) ?? true
                 )
-            }
+            },
+            routineNonAdmittingReferences: routineNonAdmittingReferences
         )
     }
 }

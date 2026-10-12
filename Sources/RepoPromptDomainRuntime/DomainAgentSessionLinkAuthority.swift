@@ -578,7 +578,10 @@ package actor DomainAgentSessionLinkAuthority {
         matching predicate: (LinkRecord) -> Bool
     ) -> DomainAgentSessionLinkInventory {
         var items: [DomainAgentSessionLinkInventoryItem] = []
-        for record in links.values where predicate(record) {
+        // The target owner already maintains this inverse index for lifecycle invalidation.
+        // Do not sweep unrelated grants for a target-local publication or policy resolution.
+        for id in targets[targetSessionID]?.inboundLinkIDs ?? [] {
+            guard let record = links[id], predicate(record) else { continue }
             items.append(inventoryItem(record, outbound: false))
         }
         items.sort(by: Self.orderedByObserver)

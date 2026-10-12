@@ -187,7 +187,8 @@ final class AgentModeRunService {
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        passiveWakeID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         guard stopFence?.permitsStart(of: session) ?? true else {
             startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
@@ -244,7 +245,8 @@ final class AgentModeRunService {
                 fallbackContext: codexFallbackContext,
                 autoEffortSelection: autoEffortSelection,
                 selfCompactDispatchID: selfCompactDispatchID,
-                stopFence: stopFence
+                stopFence: stopFence,
+                passiveWakeID: passiveWakeID
             )
             startOutcome?.record(codexOutcome: outcome)
             return outcome
@@ -293,7 +295,8 @@ final class AgentModeRunService {
                 autoEffortSelection: autoEffortSelection,
                 providerControlCommand: providerControlCommand,
                 selfCompactDispatchID: selfCompactDispatchID,
-                stopFence: stopFence
+                stopFence: stopFence,
+                passiveWakeID: passiveWakeID
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil

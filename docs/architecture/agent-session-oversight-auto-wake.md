@@ -1044,3 +1044,60 @@ This channel observes existing authority; it does not add a refresh receipt, ret
 state machine, or provider policy. Its purpose is to distinguish future failures where RepoPrompt never
 publishes the tool from failures where the server projection is ready but the provider/model catalog
 does not converge.
+
+
+## Silent routine check-ins (Codex and Claude Code)
+
+A positively identified routine status/overflow wake may finish without admitting another routine
+wake in its observers. This applies only to first-party Codex and Claude Code native turns with an
+accepted physical dispatch, a successfully settled terminal commit, no intervening user/task input,
+no visible assistant payload and no tool occurrence. Any tool call, result or progress counts before
+hiding or deduplication. There is no hidden no-op phrase: a provider that replies keeps ordinary
+wake behavior. Attention, questions, failures, manual wakes, periodic wakes and natural input remain
+ordinary. ACP/Devin, headless, cold/restored and uncertain runtime paths are not enabled.
+
+This changes admission, not delivery. The queued status row remains available to natural turns,
+manual wakes or a wake admitted by another lane. Prompt bytes, MCP schema, Read/frontiers, public
+sequences, fingerprints, receipts and host provenance are unchanged. Unattributed overflow deliberately
+fails open: an all-silent burst beyond the sixteen-row detail cap can still admit a wake when the
+existing selection/snooze rules permit it. Attributing overflow to silent sources is deferred unless
+measurement shows overflow-driven loops.
+
+The existing four oversight owners stay disjoint. Their private process-memory cooperation is bounded:
+
+- **Source (`AgentTabSession`)**: one current/recent segment (reserved wake ID, exact existing
+  `AgentRunOwnership`, acquired/accepted/vetoed bits). The explicit ID flows from direct start options
+  through the native run-start owner; it is bound before the first running publication, not during
+  preparation. Preparation retains the previous settled proof. Output, input and lifecycle mutation
+  owners irreversibly veto; host receipt/save/provenance/retention bookkeeping does not. The pure
+  classifier reuses the existing terminal revision, drain barrier and canonical publication result;
+  it never scans transcript history or infers origin from a system row.
+- **Bridge (`TargetPublicationChain`)**: one paired canonical public sample and private evidence,
+  plus the captured evidence needed to deduplicate source signals. Full source frames preserve the
+  existing serial publication order. Private-only settlement/veto uses that same chain without a
+  preview rebuild or authority publication. Existing inverse link membership and exact point
+  authorization restrict resolution to current observer references; cached addresses confer no authority.
+- **Queue (`AgentSessionLinkPassiveStatusNotices`)**: at most one debt/pin record per live observed
+  reference, pruned with existing lifecycle/eviction/rebaseline paths. `ordinaryThrough` uses the
+  existing change-sequence domain; an actual matching receipt can pay older useful debt even while a
+  silent successor runs. Exact opening/closing tokens are required for passive admission deferral.
+  Unknown/mixed public contributions and missing open resolution become ordinary. An unrelated
+  private retirement cannot bless an old pin. Net reversion still removes the rendered row.
+- **Wake coordinator**: reads the published admission-only non-admitting reference set before
+  routine interval and physical-fence evaluation. Manual bypass and exact attention remain independent;
+  unattributed overflow keeps its existing rules. No read mutates a source, queue or authority.
+
+An unresolved exact terminal contribution is temporarily non-admitting, not proven silent. Rejected,
+aborted or unknown settlement resolves ordinary without fabricating a public edge/revision; older
+unreceipted useful debt still admits immediately. Genuine settled process-run-ID teardown retains the
+exact proof, including truthful late native send acceptance. Restore, rebind, runtime replacement and
+bulk transcript replacement fail open. Actual Claude runtime-init events are unknown provenance;
+calling `startOrResume` on an initialized process is not itself activity. Inactive late Codex assistant
+and new-tool events are rejected by existing currency guards; accepted late command-output updates
+require an earlier tool/live/terminal identity, whose tool ingress already vetoed silence.
+
+None of this state is persisted, exposed in Domain models or transported on MCP. Restart therefore
+retains today's ordinary behavior. Additional provider families require their own native event,
+acceptance and terminal-drain proof before enablement. Local timing diagnostics exercise warm
+admission and indexed private resolution; CI asserts structural work bounds, not machine-specific
+latency thresholds.

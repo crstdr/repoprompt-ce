@@ -85,7 +85,8 @@ final class ClaudeIntegratedAgentModeRunner {
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        passiveWakeID: UUID? = nil
     ) async {
         let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
         var handedToRunTask = false
@@ -117,7 +118,7 @@ final class ClaudeIntegratedAgentModeRunner {
             Task { await lease.cancelAndCleanup() }
             return
         }
-        let ownership = session.beginRunAttempt(source: "claudeNative")
+        let ownership = session.beginRunAttempt(source: "claudeNative", passiveWakeID: passiveWakeID)
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak session] terminalState in
             {
                 switch terminalState {
@@ -374,6 +375,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
                 }
             case let .runtimeInit(status):
+                // Actual runtime initialization is unknown provenance. Warm startOrResume
+                // no-ops emit no init event; a restarted process must never inherit silence.
+                session.invalidatePassiveWakeEvidence()
                 // Persist provider session ID as soon as it becomes available from
                 // runtime init events (initialize response or system/init stream).
                 if let newSessionID = status.sessionID,
@@ -451,6 +455,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     return .failed(errorText: nil, shouldShutdownSession: false)
                 }
             case let .error(message):
+                session.notePassiveWakeActivity()
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                 session.setRunningStatus(nil, source: nil)
                 let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
