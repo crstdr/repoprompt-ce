@@ -236,14 +236,16 @@ struct AgentSelfCompactState: Codable, Equatable {
         guard AgentSessionSelfCompactNotePolicy.idempotencyKeyIsValid(idempotencyKey) else {
             return .invalidIdempotencyKey
         }
-        let digest = AgentSessionSelfCompactNotePolicy.digest(of: note)
         // Retained requests were already admitted. An identical retry is not a new admission,
-        // even if the window has since shrunk or become unknown.
+        // even if the window has since shrunk or become unknown. Only a retained-key match is
+        // worth hashing; a fresh key is size-checked before its note is digested.
         if let active, active.idempotencyKey == idempotencyKey {
-            return active.noteDigest == digest ? .duplicate(active.id) : .conflict
+            return active.noteDigest == AgentSessionSelfCompactNotePolicy.digest(of: note)
+                ? .duplicate(active.id) : .conflict
         }
         if active == nil, let latest, latest.idempotencyKey == idempotencyKey {
-            guard latest.noteDigest == digest, let requestID = latest.requestID else { return .conflict }
+            guard latest.noteDigest == AgentSessionSelfCompactNotePolicy.digest(of: note),
+                  let requestID = latest.requestID else { return .conflict }
             return .duplicate(requestID)
         }
         guard byteCount <= maximumNoteUTF8Bytes else {
