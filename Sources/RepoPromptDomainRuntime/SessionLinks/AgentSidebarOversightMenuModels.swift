@@ -101,7 +101,8 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     package let targetDisplayName: String
 
     /// Oversee-by list: linked observers retained for unlinking, plus available candidates
-    /// that already hold an outbound link (the existing-overseer rule, enforced again at Add).
+    /// that already hold an outbound link (the existing-overseer rule, re-checked when a pick
+    /// from this list is added).
     package let observerOptions: [PeerOption]
     /// Oversee list: linked targets retained for unlinking, plus eligible target candidates.
     /// Available choices are hidden when the row cannot currently observe.
