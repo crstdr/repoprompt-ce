@@ -2135,11 +2135,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
-    /// Overflow is a whole-queue count, never attributed to the lane that produced it.
-    ///
-    /// Regression: "some lane is selected" was enough for overflow to reserve a wake, so dropped
-    /// edges belonging to an excluded target started an autonomous turn — the selected lane's only
-    /// contribution being that it existed.
     /// Paired warm decision diagnostics only; correctness does not depend on machine timings.
     func testQuietAdmissionCostIsIndependentOfRetainedTranscriptLength() throws {
         let fixture = try makeFixture()
@@ -2230,6 +2225,11 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertNil(fixture.session.oversight.pendingAutoWake, "Switch cycling does not turn suppressed queued content into ordinary debt")
     }
 
+    /// Overflow is a whole-queue count, never attributed to the lane that produced it.
+    ///
+    /// Regression: "some lane is selected" was enough for overflow to reserve a wake, so dropped
+    /// edges belonging to an excluded target started an autonomous turn — the selected lane's only
+    /// contribution being that it existed.
     func testOverflowFromAnUnselectedLaneCannotWakeMerelyBecauseAnotherLaneIsSelected() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)

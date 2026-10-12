@@ -674,7 +674,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             isDeliverable = deliverable
             lastObservedStatus = newBaselines
             routineDebtByReference.removeAll()
-        pendingByReference.removeAll()
+            pendingByReference.removeAll()
             pendingAttentionByReference.removeAll()
             overflowAcknowledged = overflowProduced
             if changed {
@@ -928,7 +928,8 @@ struct AgentSessionLinkPassiveStatusNotices {
 
     private mutating func recordRoutineContribution(from sample: Sample, opening: Sample, sequence: UInt64) {
         var debt = routineDebtByReference[sample.reference] ?? RoutineDebt()
-        let exactPassiveClose = sample.status == .idle && sample.passiveWakeEvidence.isPassive
+        let exactPassiveClose = opening.status == .running && opening.passiveWakeEvidence.isPassive
+            && sample.status == .idle && sample.passiveWakeEvidence.isPassive
             && sample.passiveWakeEvidence.ownership == opening.passiveWakeEvidence.ownership
         debt.pin = exactPassiveClose ? sample.passiveWakeEvidence : .unknown
         if !exactPassiveClose { debt.ordinaryThrough = sequence }
