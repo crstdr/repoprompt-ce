@@ -1350,6 +1350,9 @@ extension AgentModeViewModel {
             .filter { tabID, session in sessions[tabID] == nil && session.activeAgentSessionID != nil }
             .map(\.key)
         guard !closedTabIDs.isEmpty else { return }
+        // sessions.removeValue/removeAll have already committed in this didSet. Retire the
+        // presentation census before pruning can repaint rows or bindingEnded can suspend.
+        AgentSessionLinkRuntimeBridge.shared.noteCandidateReadinessChanged()
         agentSessionLinkPruneProjections()
         for tabID in closedTabIDs {
             AgentSessionLinkInvalidationSink.bindingEnded(
