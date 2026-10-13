@@ -1284,74 +1284,77 @@ final class AgentOversightMarkRenderTests: XCTestCase {
     /// A glyph-sized mark is far more than a stray matching pixel even at 1x backing.
     private let markPixelFloor = 8
 
-    /// The selected overseer hub keeps its own group colour in both appearances — the adaptive
-    /// palette slot, not the control tint the Menu label path template-renders to.
-    func testSelectedInteractiveOverseerKeepsPaletteColour() {
+    func testSelectedInteractiveOverseerKeepsAmber() {
         for (appearance, expected) in [
-            (NSAppearance.Name.darkAqua, AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true)),
-            (NSAppearance.Name.aqua, AgentOversightPalette.resolvedColor(for: 0, darkAppearance: false))
+            (NSAppearance.Name.darkAqua, NSColor(srgbRed: 1, green: 179 / 255, blue: 64 / 255, alpha: 1)),
+            (NSAppearance.Name.aqua, NSColor(srgbRed: 194 / 255, green: 106 / 255, blue: 0, alpha: 1))
         ] {
             var selectedRow = row(role: role(own: 0, overseers: 0), interactive: true)
             selectedRow.isSelected = true
             let (rep, window) = rasterize(selectedRow, appearance: appearance)
             XCTAssertGreaterThanOrEqual(
                 pixelCount(near: expected, in: rep), markPixelFloor,
-                "selected overseer mark lost its group colour in \(appearance)"
+                "selected overseer mark lost adaptive amber in \(appearance)"
             )
             window.close()
         }
     }
 
-    /// The failing case from Cristian's live check: an overseen row's interactive mark must
-    /// paint the overseer's slot-0 group colour, not the control tint. The selected row
-    /// reported identical white pixels — same template path — so both states are asserted.
-    func testInteractiveOverseenMarkKeepsTheFirstOverseersPaletteColour() {
+    /// Worker grey must survive the native menu label path, including a selected row.
+    func testInteractiveOverseenMarkKeepsWorkerGrey() {
         let role = AgentSessionOversightRole(
             ownOverseerSlot: nil,
             overseers: [.init(sessionID: id(1), displayName: "Overseer", slot: 0)],
             overseeingNames: []
         )
-        let expected = AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true)
+        let expected = NSColor.systemGray
+        let (controlRep, controlWindow) = rasterize(row(role: .none, interactive: true))
+        defer { controlWindow.close() }
+        let workerPixelFloor = pixelCount(near: expected, in: controlRep) + markPixelFloor
 
         let (rep, window) = rasterize(row(role: role, interactive: true))
         defer { window.close() }
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: expected, in: rep), markPixelFloor,
-            "interactive overseen mark lost the overseer's palette colour (template-flattened)"
+            pixelCount(near: expected, in: rep), workerPixelFloor,
+            "interactive worker mark lost system grey (template-flattened)"
         )
 
         var selectedRow = row(role: role, interactive: true)
         selectedRow.isSelected = true
         let (selectedRep, selectedWindow) = rasterize(selectedRow)
         defer { selectedWindow.close() }
+        var selectedControl = row(role: .none, interactive: true)
+        selectedControl.isSelected = true
+        let (selectedControlRep, selectedControlWindow) = rasterize(selectedControl)
+        defer { selectedControlWindow.close() }
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: expected, in: selectedRep), markPixelFloor,
-            "interactive overseen mark lost the palette colour on the selected row"
+            pixelCount(near: expected, in: selectedRep),
+            pixelCount(near: expected, in: selectedControlRep) + markPixelFloor,
+            "interactive worker mark lost system grey on the selected row"
         )
     }
 
-    /// The non-interactive branch was already correct — the mark was only template-flattened
-    /// inside a Menu label — so a muted row keeps its colour too. Guards the two branches
-    /// staying visually identical.
-    func testNonInteractiveOverseenMarkKeepsTheSamePaletteColour() {
+    /// Passive role marks use the same vector and colour as interactive marks.
+    func testNonInteractiveOverseenMarkKeepsWorkerGrey() {
         let role = AgentSessionOversightRole(
             ownOverseerSlot: nil,
             overseers: [.init(sessionID: id(1), displayName: "Overseer", slot: 0)],
             overseeingNames: []
         )
-        let expected = AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true)
+        let expected = NSColor.systemGray
 
+        let (controlRep, controlWindow) = rasterize(row(role: .none, interactive: false))
+        defer { controlWindow.close() }
         let (rep, window) = rasterize(row(role: role, interactive: false))
         defer { window.close() }
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: expected, in: rep), markPixelFloor,
-            "non-interactive overseen mark lost the palette colour"
+            pixelCount(near: expected, in: rep), pixelCount(near: expected, in: controlRep) + markPixelFloor,
+            "non-interactive worker mark lost system grey"
         )
     }
 
-    /// A selected/active-looking row hits the same Menu label path — the palette survives
-    /// because the glyph is ordinary content, not a template image.
-    func testInteractiveBothRolesMarkKeepsBothPaletteColours() {
+    /// Dual-role rows retain both the amber hub and grey worker, plus the inbound count.
+    func testInteractiveBothRolesMarkKeepsBothRoleColours() {
         let role = AgentSessionOversightRole(
             ownOverseerSlot: 1,
             overseers: [
@@ -1360,29 +1363,36 @@ final class AgentOversightMarkRenderTests: XCTestCase {
             ],
             overseeingNames: ["Lane B"]
         )
-        let (rep, window) = rasterize(row(role: role, interactive: true))
+        // Keep the count out of this render assertion: it also paints grey pixels.
+        let singleInboundRole = AgentSessionOversightRole(
+            ownOverseerSlot: role.ownOverseerSlot,
+            overseers: Array(role.overseers.prefix(1)),
+            overseeingNames: role.overseeingNames
+        )
+        let (controlRep, controlWindow) = rasterize(row(role: self.role(own: 1, overseers: 0), interactive: true))
+        defer { controlWindow.close() }
+        let (rep, window) = rasterize(row(role: singleInboundRole, interactive: true))
         defer { window.close() }
 
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: AgentOversightPalette.resolvedColor(for: 1, darkAppearance: true), in: rep),
+            pixelCount(near: NSColor(srgbRed: 1, green: 179 / 255, blue: 64 / 255, alpha: 1), in: rep),
             markPixelFloor,
-            "dual-role mark lost the row's own group colour"
+            "dual-role mark lost the amber hub"
         )
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true), in: rep),
-            markPixelFloor,
-            "dual-role mark lost the first overseer's ring colour"
+            pixelCount(near: .systemGray, in: rep),
+            pixelCount(near: .systemGray, in: controlRep) + markPixelFloor,
+            "dual-role mark lost the grey worker"
         )
     }
 
-    /// Control: an inactive (no link) row draws no palette pixels at all, proving the colour
-    /// assertions above come from the mark rather than stray UI.
-    func testRowWithoutRolePaintsNoPalettePixels() {
+    /// Control: an inactive (no link) row draws no amber role pixels.
+    func testRowWithoutRolePaintsNoAmberPixels() {
         let (rep, window) = rasterize(row(role: .none, interactive: false))
         defer { window.close() }
         XCTAssertGreaterThan(rep.pixelsWide, 0, "raster produced an empty bitmap")
         XCTAssertEqual(
-            pixelCount(near: AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true), in: rep),
+            pixelCount(near: NSColor(srgbRed: 1, green: 179 / 255, blue: 64 / 255, alpha: 1), in: rep),
             0
         )
     }

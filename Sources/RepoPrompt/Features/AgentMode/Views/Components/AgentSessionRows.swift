@@ -993,9 +993,9 @@ struct AgentSessionRow: View {
         )
     }
 
-    /// The always-visible role mark, drawn inline just before the title: an overseer hub in the
-    /// row's own group colour, a worker in its first overseer's group colour, and both glyphs
-    /// when both roles apply. Several overseers retain a count superscript.
+    /// The always-visible role mark, drawn inline just before the title: an amber hub for an
+    /// overseer, a grey worker for an overseen session, and both glyphs when both roles apply.
+    /// Several overseers retain a count superscript.
     /// When mutations are allowed, clicking opens the Oversee-by lane menu — the same menu model
     /// as the hover affordance and the context submenu. Otherwise it stays a passive state marker
     /// so it can never offer a mutation the row forbids.
@@ -1039,25 +1039,20 @@ struct AgentSessionRow: View {
     }
 
     private var oversightMarkGlyph: some View {
-        // Upstream's role vectors carry the fork's group colours: an overseer's hub keeps the
-        // row's own palette slot, a worker keeps its first overseer's slot (link-creation order).
-        let ownColor = oversightRole.ownOverseerSlot.map { AgentOversightPalette.color(for: $0) }
-        let overseerColor = oversightRole.overseers.first
-            .map { AgentOversightPalette.color(for: $0.slot) }
-        return HStack(spacing: 1) {
+        HStack(spacing: 1) {
             if oversightRole.isOverseer {
                 AgentOversightRoleIcon(role: .overseer, size: oversightMarkSize)
-                    .foregroundStyle(ownColor ?? AgentOversightRoleStyle.overseer)
+                    .foregroundStyle(AgentOversightRoleStyle.overseer)
             }
             if oversightRole.isOverseen {
                 AgentOversightRoleIcon(role: .worker, size: oversightMarkSize)
-                    .foregroundStyle(overseerColor ?? AgentOversightRoleStyle.worker)
+                    .foregroundStyle(AgentOversightRoleStyle.worker)
             }
             if oversightRole.overseers.count > 1 {
                 Text("\(oversightRole.overseers.count)")
                     .font(.system(size: 7, weight: .bold))
                     .baselineOffset(4)
-                    .foregroundStyle(overseerColor ?? AgentOversightRoleStyle.worker)
+                    .foregroundStyle(AgentOversightRoleStyle.worker)
             }
         }
     }
