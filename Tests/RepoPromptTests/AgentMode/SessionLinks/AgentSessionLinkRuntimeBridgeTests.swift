@@ -1105,6 +1105,60 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         return DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
     }
 
+    func testPrivateMissingOpenResolutionAndSettledRetirementKeepExactOccurrencePolicy() async throws {
+        for settled in [false, true] {
+            let fixture = makeFixture()
+            defer { fixture.bridge.freezeForTermination() }
+            let target = fixture.target
+            let owner = AgentRunOwnership(binding: .init(tabID: target.tabID, persistentSessionID: target.sessionID,
+                persistentBindingGeneration: target.persistentBindingGeneration, bindingTransitionGeneration: target.bindingTransitionGeneration))
+            func snapshot(_ status: DomainAgentSessionLinkStatus) -> DomainAgentSessionObservationSnapshot {
+                .init(sessionID: target.sessionID, displayName: target.displayName, providerDisplayName: target.providerDisplayName, status: status,
+                    board: .empty, idleForSend: status == .idle, pendingInteractionKind: nil, latestVisibleAssistantPreview: nil,
+                    visibleRowCount: 0, lastActivityAt: Date(timeIntervalSince1970: 100))
+            }
+            fixture.host.passiveEvidenceBySession[target.sessionID] = .open(owner)
+            fixture.host.snapshotOverrides[target.sessionID] = snapshot(.running)
+            guard case .added = await addLink(fixture) else { return XCTFail("Retirement grant setup") }
+            // The fake install has no Combine replay. Capture its opening source frame explicitly.
+            fixture.host.liveObservations[target.sessionID]?()
+            await fixture.bridge.test_settleTargetPublications()
+            await fixture.bridge.test_settleProjections()
+            fixture.host.snapshotOverrides[target.sessionID] = snapshot(.idle)
+            fixture.host.liveObservations[target.sessionID]?()
+            await fixture.bridge.test_settleTargetPublications()
+            await fixture.bridge.test_settleProjections()
+            let pending = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+            XCTAssertEqual(pending.routineNonAdmittingReferences.count, 1)
+            let sourceSequence = fixture.bridge.test_sourcePublicationSequence(for: target.sessionID)
+            if settled {
+                fixture.host.passiveEvidenceBySession[target.sessionID] = .silent(owner)
+                fixture.host.livePassiveObservations[target.sessionID]?()
+                await fixture.bridge.test_settleTargetPublications()
+            }
+            fixture.host.passiveEvidenceBySession[target.sessionID] = .unknown
+            fixture.host.livePassiveObservations[target.sessionID]?()
+            await fixture.bridge.test_settleTargetPublications()
+            let retired = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+            XCTAssertEqual(retired.routineNonAdmittingReferences.isEmpty, !settled)
+            XCTAssertEqual(retired.entries, pending.entries)
+            XCTAssertEqual(retired.queueRevision, pending.queueRevision)
+            XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: target.sessionID), sourceSequence)
+            await fixture.bridge.test_settleProjections()
+            let reread = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+            XCTAssertEqual(reread.routineNonAdmittingReferences.isEmpty, !settled, "An unrelated projection reread is not a new source occurrence")
+            if settled {
+                // A new occurrence with identical public scalars must not inherit retired silence.
+                fixture.host.passiveEvidenceBySession[target.sessionID] = .ordinary(.init(binding: owner.binding))
+                fixture.host.liveObservations[target.sessionID]?()
+                await fixture.bridge.test_settleTargetPublications()
+                let successor = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+                XCTAssertTrue(successor.routineNonAdmittingReferences.isEmpty)
+                XCTAssertEqual(successor.entries, pending.entries)
+            }
+        }
+    }
+
     /// Timings are diagnostics, not CI thresholds. Structural work bounds are the regression gate.
     func testPrivateWakeResolutionIsIndexedAtThirtyAndThreeHundredChats() async throws {
         for chatCount in [30, 300] {

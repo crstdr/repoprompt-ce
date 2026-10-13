@@ -1063,7 +1063,9 @@ The existing four oversight owners stay disjoint. Their private process-memory c
   classifier reuses the existing terminal revision, drain barrier and canonical publication result;
   it never scans transcript history or infers origin from a system row.
 - **Bridge (`TargetPublicationChain`)**: one paired canonical public sample and private evidence,
-  plus the captured evidence needed to deduplicate source signals. Full source frames preserve the
+  plus the captured evidence needed to deduplicate source signals. Bare private retirement keeps
+  the immutable settled sample proof for unrelated projection rereads; a new full source occurrence
+  cannot inherit it. Full source frames preserve the
   existing serial publication order. Private-only settlement/veto uses that same chain without a
   preview rebuild or authority publication. Existing inverse link membership and exact point
   authorization restrict resolution to current observer references; cached addresses confer no authority.

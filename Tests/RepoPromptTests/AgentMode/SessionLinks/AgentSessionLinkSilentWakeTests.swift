@@ -59,6 +59,15 @@ extension AgentSessionLinkRuntimeBridgeTests {
         try await assertNativeWake(.rejectedPublication, expectedAdmission: true)
     }
 
+    func testNativeClaudeUnknownStreamFailsOpenButKnownTransientEventsStayQuiet() async throws {
+        try await assertNativeWake(.unknownStream, expectedAdmission: true, agent: .claudeCode)
+        try await assertNativeWake(.transientStreams, expectedAdmission: false, agent: .claudeCode)
+    }
+
+    func testNativeCanonicalPublicationHoldDoesNotReserveOrCrossObserverFence() async throws {
+        try await assertNativeWake(.acceptedPublication, expectedAdmission: false)
+    }
+
     private struct NativeRingPeer {
         let vm: AgentModeViewModel
         let session: AgentTabSession
@@ -196,10 +205,11 @@ extension AgentSessionLinkRuntimeBridgeTests {
     private enum NativeWakeScenario {
         case silent, toolOnly, human, visible, attention, failure, teardown, restore, terminalBeforeAcceptance
         case debtReceipt, debtReceiptOmitted, failureSuccessUnpaid, failureSuccessPaid, silentSuccessorPrepared
-        case rowlessInput, bulkReplacement, controllerReplacement, lateUnownedOutput, lateToolOutput, rejectedPublication
+        case rowlessInput, bulkReplacement, controllerReplacement, lateUnownedOutput, lateToolOutput, rejectedPublication, acceptedPublication, unknownStream, transientStreams
     }
 
     private func assertNativeWake(_ scenario: NativeWakeScenario, expectedAdmission: Bool, agent: AgentProviderKind = .codexExec) async throws {
+        let lateInvocation = UUID()
         let toolOnly = scenario == .toolOnly || scenario == .lateToolOutput
         let hasSuccessor = [NativeWakeScenario.debtReceipt, .debtReceiptOmitted, .failureSuccessUnpaid, .failureSuccessPaid, .silentSuccessorPrepared].contains(scenario)
         let failsFirst = [.failure, .failureSuccessUnpaid, .failureSuccessPaid].contains(scenario)
@@ -273,12 +283,14 @@ extension AgentSessionLinkRuntimeBridgeTests {
         let coordinator = vm.test_codexCoordinator
         let acceptanceGate = scenario == .terminalBeforeAcceptance ? TestReleaseFence(name: "native receipt") : nil
         defer { acceptanceGate?.release() }
-        let publicationGate = scenario == .rejectedPublication ? TestReleaseFence(name: "terminal publication") : nil
+        let publicationGate = scenario == .rejectedPublication || scenario == .acceptedPublication ? TestReleaseFence(name: "terminal publication") : nil
         defer { publicationGate?.release() }
         if let publicationGate {
-            vm.test_setTerminalPublicationOverride { _, _, _ in
+            vm.test_setTerminalPublicationOverride { revision, successorKind, targetSession in
                 await publicationGate.enterAndWait()
-                return .rejected(reason: "fixture rejection")
+                if scenario == .rejectedPublication { return .rejected(reason: "fixture rejection") }
+                vm.test_setTerminalPublicationOverride(nil)
+                return await vm.test_publishTerminalCommit(revision, successorKind: successorKind, for: targetSession)
             }
         }
         var send: Task<CodexAgentModeCoordinator.NativeSendOutcome, Never>?
@@ -316,10 +328,23 @@ extension AgentSessionLinkRuntimeBridgeTests {
         await bridge.test_settleProjections()
         if toolOnly {
             if agent == .codexExec {
-                await coordinator.test_handleCodexNativeEvent(.toolCall(name: "mcp__RepoPromptCE__poll", invocationID: UUID(), argsJSON: "{}"), session: session, sourceController: controller)
+                let tool = scenario == .lateToolOutput ? "bash" : "mcp__RepoPromptCE__poll"
+                await coordinator.test_handleCodexNativeEvent(.toolCall(name: tool, invocationID: lateInvocation, argsJSON: "{}"), session: session, sourceController: controller)
+                if scenario == .lateToolOutput {
+                    await coordinator.test_handleCodexNativeEvent(.toolResult(name: "bash", invocationID: lateInvocation, argsJSON: "{}", resultJSON: #"{"status":"failed","exit_code":1,"output":"Early"}"#, isError: true), session: session, sourceController: controller)
+                    XCTAssertTrue(session.items.contains { $0.toolInvocationID == lateInvocation && $0.kind == .toolResult })
+                    XCTAssertEqual(session.passiveWakeSegment?.vetoed, true, "Correlated identity was created during this exact segment")
+                }
             } else {
                 await claude.emit(.stream(.init(type: "tool_call", text: nil, toolName: "mcp__RepoPromptCE__poll", toolArgsJSON: "{}")))
             }
+        }
+        if scenario == .unknownStream { await claude.emit(.stream(.init(type: "unclassified-control", text: nil))) }
+        if scenario == .transientStreams {
+            for type in ["reasoning", "status", "usage", "session_state_changed", "task_progress", "message_stop", AIStreamResult.lifecycleType] {
+                await claude.emit(.stream(.init(type: type, text: nil)))
+            }
+            await claude.emit(.stream(.init(type: "system", text: "Agent completed")))
         }
         if scenario == .visible || scenario == .debtReceipt || scenario == .debtReceiptOmitted {
             await coordinator.test_handleCodexNativeEvent(.assistantDelta("Done"), session: session, sourceController: controller)
@@ -359,11 +384,23 @@ extension AgentSessionLinkRuntimeBridgeTests {
                 let pending = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint])
                 XCTAssertEqual(pending.routineNonAdmittingReferences.count, 1)
                 let edgeSequence = pending.entries.first?.edgeSequence
+                observerVM.agentSessionLinkPublishPromptInventory(try XCTUnwrap(host.publishedInventoriesByEndpoint[observer.domainEndpoint]), to: observer.domainEndpoint)
+                observerVM.agentSessionLinkPublishPassiveStatusNotices(pending, to: observer.domainEndpoint)
+                XCTAssertNil(observerSession.oversight.pendingAutoWake, "Canonical hold cannot reserve an observer")
+                // Model an already-preparing observer at the same public occurrence. The real
+                // physical fence must re-read the now-published pending passive contribution.
+                let witness = AgentSessionLinkAutoWakeAttempt(wakeID: UUID(), observerEndpoint: observer.domainEndpoint,
+                    queueEpoch: pending.queueEpoch, queueRevision: pending.queueRevision, wakeFingerprint: pending.wakeEligibilityFingerprint,
+                    admissionBasis: .routineStatusOrOverflow, attemptedFingerprint: nil, physicalOutcome: .notAttempted, phase: .preparingDispatch, task: nil)
+                observerSession.oversight.pendingAutoWake = witness
+                _ = try XCTUnwrap(observerVM.agentSessionLinkPromptClaim(for: observerSession, dispatchID: .autoWake(wakeID: witness.wakeID)))
+                XCTAssertFalse(observerVM.agentSessionLinkAcquirePhysicalDispatch(for: observerSession, dispatchID: .autoWake(wakeID: witness.wakeID)))
+                XCTAssertNil(observerSession.oversight.pendingAutoWake)
                 publicationGate.release()
                 await terminal.value
                 await settleNativeObservations(bridge)
                 let resolved = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint])
-                XCTAssertTrue(resolved.routineNonAdmittingReferences.isEmpty)
+                XCTAssertEqual(resolved.routineNonAdmittingReferences.isEmpty, scenario == .rejectedPublication)
                 XCTAssertEqual(resolved.entries.first?.edgeSequence, edgeSequence, "Settlement must not fabricate a status edge; ordinary readiness refresh keeps its existing revision behavior")
             } else {
                 await terminal.value
@@ -385,8 +422,15 @@ extension AgentSessionLinkRuntimeBridgeTests {
         }
         if scenario == .lateToolOutput {
             let evidence = session.passiveWakeEvidence
-            await coordinator.test_handleCodexNativeEvent(.commandExecutionRunning(.init(invocationID: nil, processID: "unknown", appendedOutput: "Late")), session: session, sourceController: controller)
-            XCTAssertEqual(session.passiveWakeEvidence, evidence, "A run with earlier tool ingress is already ordinary")
+            let revision = session.sourceItemsRevision
+            await coordinator.test_handleCodexNativeEvent(.commandExecutionRunning(.init(invocationID: lateInvocation, processID: nil, appendedOutput: "AcceptedLate")), session: session, sourceController: controller)
+            try await AsyncTestWait.waitUntil("correlated late command output materialized") {
+                session.items.contains { $0.toolInvocationID == lateInvocation
+                        && (($0.toolResultJSON?.contains("AcceptedLate") ?? false)
+                            || (session.ephemeralToolResultPayloadByItemID[$0.id]?.contains("AcceptedLate") ?? false)) }
+            }
+            XCTAssertGreaterThan(session.sourceItemsRevision, revision, "Late native update must actually be accepted, not merely attempted")
+            XCTAssertEqual(session.passiveWakeEvidence, evidence, "This exact segment's earlier tool ingress already vetoed silence")
         }
         if let acceptanceGate {
             observerVM.agentSessionLinkPublishPromptInventory(try XCTUnwrap(host.publishedInventoriesByEndpoint[observer.domainEndpoint]), to: observer.domainEndpoint)

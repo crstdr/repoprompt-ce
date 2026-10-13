@@ -4383,7 +4383,17 @@ final class AgentSessionLinkRuntimeBridge {
             }
             guard !isFrozenForTermination, chains[endpoint.sessionID] === chain, let canonical,
                   sourceSnapshot.map({ Self.sameSourcePayload($0, canonical) }) ?? true else { return }
-            chain.passiveWakePublication = .init(snapshot: canonical, evidence: evidence, sourceSequence: sourceSequence)
+            // A bare private retirement is not a new public source occurrence. Preserve the
+            // immutable settled sample's proof for unrelated projection rereads; otherwise they
+            // would promote an old silent pin merely because its live source record retired.
+            let pairedEvidence: AgentSessionLinkPassiveWakeEvidence
+            if evidence == .unknown, sourceSnapshot == nil,
+               case let .silent(owner)? = chain.passiveWakePublication?.evidence {
+                pairedEvidence = .silent(owner)
+            } else {
+                pairedEvidence = evidence
+            }
+            chain.passiveWakePublication = .init(snapshot: canonical, evidence: pairedEvidence, sourceSequence: sourceSequence)
             await resolvePassiveWakeEvidence(evidence, endpoint: endpoint, chain: chain,
                 sourceSequence: sourceSequence, isNewOccurrence: isNewOccurrence)
         }

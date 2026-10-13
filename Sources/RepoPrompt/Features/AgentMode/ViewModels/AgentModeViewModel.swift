@@ -20118,8 +20118,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             switch result.type {
             case "content", "final_content": session.notePassiveWakeAssistantText(result.text)
             case "tool_call", "tool_result", "tool_progress", "error": session.notePassiveWakeActivity()
-            case "event", "system": session.notePassiveWakeAssistantText(result.text)
-            default: break
+            case "event": session.notePassiveWakeActivity()
+            case "system":
+                if let text = result.text, ["Agent initialized", "Agent completed", "Agent cancelled"].contains(text) { break }
+                session.notePassiveWakeActivity()
+            case "auth_status": session.notePassiveWakeAssistantText(result.text)
+            case "reasoning", "status", "usage", "session_state_changed", "task_progress", AIStreamResult.lifecycleType: break
+            case "message_stop":
+                if let providerSessionID = result.providerSessionID, providerSessionID != session.providerSessionID {
+                    session.invalidatePassiveWakeEvidence()
+                }
+            default: session.invalidatePassiveWakeEvidence()
             }
             var shouldUpdateBindings = false
             switch result.type {

@@ -25,6 +25,31 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         XCTAssertEqual(reducer.snapshot.queueRevision, pending.queueRevision)
     }
 
+    func testSameOwnerOrdinaryOrWaitingOpeningCannotProvePassiveClose() {
+        let owner = passiveOwner(0)
+        for opening in [passiveSample(0, status: .running, evidence: .ordinary(owner)),
+                        passiveSample(0, status: .waiting, evidence: .open(owner))] {
+            var reducer = makeReducer()
+            reducer.enable(samples: [opening], linkSetRevision: 1)
+            reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .silent(owner))], linkSetRevision: 1, deliverable: true)
+            XCTAssertEqual(reducer.snapshot.entries.count, 1)
+            XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
+        }
+    }
+
+    func testSampleCarriedPrivateResolutionDoesNotRefreshPublicMetadata() {
+        let owner = passiveOwner(0)
+        var reducer = makeReducer()
+        reducer.enable(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1)
+        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .open(owner))], linkSetRevision: 1, deliverable: true)
+        let before = reducer.snapshot
+        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .ordinary(owner))], linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.entries, before.entries)
+        XCTAssertEqual(reducer.snapshot.queueRevision, before.queueRevision)
+        XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint, before.wakeEligibilityFingerprint)
+        XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
+    }
+
     func testUsefulPredecessorReceiptWhileSilentSuccessorRunsClearsDebtAcrossNetReversion() {
         for receiptIncludesRow in [false, true] {
             var reducer = makeReducer()
