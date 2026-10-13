@@ -3730,7 +3730,10 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private var startOrResumeHook: (@Sendable () async -> Void)?
     private var sendGate: TestReleaseFence?
 
-    func setSendGate(_ gate: TestReleaseFence?) { lock.withLock { sendGate = gate } }
+    func setSendGate(_ gate: TestReleaseFence?) {
+        lock.withLock { sendGate = gate }
+    }
+
     /// When set, `steerUserTurn` throws it instead of accepting, which is how the runtime lands in
     /// the queued-fallback path.
     var steerFailure: CodexTurnSteerError?

@@ -20115,12 +20115,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await MainActor.run {
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID else { return }
+            // Reuse the renderer's existing lifecycle filter, rather than maintaining a second
+            // phrase list that could drift and misclassify an otherwise silent native turn.
+            let isHiddenLifecycleSystemMessage = result.type == "system"
+                && ["Agent initialized", "Agent completed", "Agent cancelled"].contains(result.text ?? "")
             switch result.type {
             case "content", "final_content": session.notePassiveWakeAssistantText(result.text)
             case "tool_call", "tool_result", "tool_progress", "error": session.notePassiveWakeActivity()
             case "event": session.notePassiveWakeActivity()
             case "system":
-                if let text = result.text, ["Agent initialized", "Agent completed", "Agent cancelled"].contains(text) { break }
+                if isHiddenLifecycleSystemMessage { break }
                 session.notePassiveWakeActivity()
             case "auth_status": session.notePassiveWakeAssistantText(result.text)
             case "reasoning", "status", "usage", "session_state_changed", "task_progress", AIStreamResult.lifecycleType: break
@@ -20401,8 +20405,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     flushPendingAssistantDelta(session)
                     endActiveAssistantSegment(session)
                     // Filter out agent lifecycle messages that shouldn't appear in chat
-                    let skipMessages = ["Agent initialized", "Agent completed", "Agent cancelled"]
-                    guard !skipMessages.contains(text) else { break }
+                    guard !isHiddenLifecycleSystemMessage else { break }
                     let systemItem = AgentChatItem.system(text, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(systemItem)
                     shouldUpdateBindings = true

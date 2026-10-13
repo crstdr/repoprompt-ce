@@ -1,4 +1,5 @@
 import Foundation
+import os
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -38,6 +39,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
 
     func testNativeTwoAgentEchoRingStopsAtFirstSilentTurn() async throws {
         try await assertNativeRing(toolOnly: false, horizon: 7, expectedCalls: 5)
+        try await assertNativeRing(toolOnly: false, horizon: 6, expectedCalls: 4, usefulReplyCount: 3)
     }
 
     func testNativeTwoAgentToolOnlyRingKeepsAllSixCalls() async throws {
@@ -68,6 +70,10 @@ extension AgentSessionLinkRuntimeBridgeTests {
         try await assertNativeWake(.acceptedPublication, expectedAdmission: false)
     }
 
+    func testNativePriorRunCommandOutputVetoesAnOtherwiseSilentSuccessor() async throws {
+        try await assertNativeWake(.priorToolLateOutput, expectedAdmission: true)
+    }
+
     private struct NativeRingPeer {
         let vm: AgentModeViewModel
         let session: AgentTabSession
@@ -76,23 +82,46 @@ extension AgentSessionLinkRuntimeBridgeTests {
         let codex: MonitorFakeCodexController
         let codexDispatches: MonitorCodexDispatchRecorder
         let claude: MonitorFakeNativeController
+        let claudeParser: ClaudeNativeProcessSessionController?
+        let claudeWrites: OSAllocatedUnfairLock<Int>
         let harness: AgentSessionLinkRunnerHarness
     }
 
     private func makeNativeRingPeer(agent: AgentProviderKind, windowID: Int) async throws -> NativeRingPeer {
+        let tabID = UUID()
+        let runID = UUID()
+        let claudeWrites = OSAllocatedUnfairLock(initialState: 0)
+        let claudeParser: ClaudeNativeProcessSessionController? = agent == .claudeCode
+            ? .init(
+                runID: runID,
+                tabID: tabID,
+                windowID: windowID,
+                workspacePath: nil,
+                config: .discovery(commandName: "/usr/bin/false")
+            ) : nil
+        if let claudeParser {
+            await claudeParser.test_installConfigurationTransport { _ in claudeWrites.withLock { $0 += 1 } }
+        }
         let dispatches = MonitorCodexDispatchRecorder()
         let codex = MonitorFakeCodexController(dispatches: dispatches)
         let claude = MonitorFakeNativeController()
-        let vm = AgentModeViewModel(testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
-            shouldManageCodexTooling: false, codexControllerFactory: { _, _, _, _, _, _ in codex },
-            claudeControllerFactory: { _, _, _, _ in claude },
-            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, mcpServerEnabler: { true })
-        let tabID = UUID()
+        let vm = AgentModeViewModel(
+            testWindowID: windowID,
+            testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in codex },
+            claudeControllerFactory: { _, _, _, _ in
+                if let claudeParser { return claudeParser }
+                return claude
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
         let workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(on: vm, tabID: tabID, name: "Native ring")
         let session = vm.session(for: tabID)
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
-        session.installRunID(UUID())
+        session.installRunID(runID)
         let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
         let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(tabID: tabID, sessionID: sessionID, tabName: "Ring peer", isWindowClosing: false))
         vm.test_initializeRunService()
@@ -100,11 +129,11 @@ extension AgentSessionLinkRuntimeBridgeTests {
             await vm.test_codexCoordinator.ensureCodexNativeSession(session: session)
         } else {
             let warm = session.beginRunAttempt(source: "test.ring.warm")
-            let ready = await vm.test_claudeCoordinator.ensureClaudeNativeSession(session: session, intent: .runAttempt(ownership: warm, runID: try XCTUnwrap(session.runID)))
+            let ready = try await vm.test_claudeCoordinator.ensureClaudeNativeSession(session: session, intent: .runAttempt(ownership: warm, runID: XCTUnwrap(session.runID)))
             XCTAssertEqual(ready, .ready)
             _ = session.endRunAttempt(ifCurrent: warm, source: "test.ring.warm")
         }
-        let route = AgentSessionLinkRunCatalogRouteToken(runID: try XCTUnwrap(session.runID), observerEndpoint: candidate.domainEndpoint, connectionID: UUID(), routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1)
+        let route = try AgentSessionLinkRunCatalogRouteToken(runID: XCTUnwrap(session.runID), observerEndpoint: candidate.domainEndpoint, connectionID: UUID(), routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1)
         vm.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
         vm.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in route }
         vm.test_agentSessionLinkCurrentRunCatalogRouteToken = { _, _ in true }
@@ -115,7 +144,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         harness.onNativeStreamResult = { result, session, runID, attemptID in
             await vm.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
         }
-        return NativeRingPeer(vm: vm, session: session, candidate: candidate, workspace: workspace, codex: codex, codexDispatches: dispatches, claude: claude, harness: harness)
+        return NativeRingPeer(vm: vm, session: session, candidate: candidate, workspace: workspace, codex: codex, codexDispatches: dispatches, claude: claude, claudeParser: claudeParser, claudeWrites: claudeWrites, harness: harness)
     }
 
     private func settleNativeObservations(_ bridge: AgentSessionLinkRuntimeBridge) async {
@@ -124,7 +153,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         await bridge.test_settleProjections()
     }
 
-    private func assertNativeRing(toolOnly: Bool, horizon: Int, expectedCalls: Int) async throws {
+    private func assertNativeRing(toolOnly: Bool, horizon: Int, expectedCalls: Int, usefulReplyCount: Int = 4) async throws {
         let first = try await makeNativeRingPeer(agent: .codexExec, windowID: 1)
         let second = try await makeNativeRingPeer(agent: .claudeCode, windowID: 2)
         let host = FakeEndpointHost()
@@ -133,9 +162,12 @@ extension AgentSessionLinkRuntimeBridgeTests {
         host.forwardsNativeQueues = true
         host.autoWakeTargetsByEndpoint = [first.candidate.domainEndpoint: [second.candidate.sessionID], second.candidate.domainEndpoint: [first.candidate.sessionID]]
         let bridge = AgentSessionLinkRuntimeBridge(authority: makeAuthority(), host: host, toolAdvertisementInvalidator: { _ in })
-        defer { bridge.freezeForTermination(); withExtendedLifetime([first.workspace, second.workspace]) {} }
+        defer { bridge.freezeForTermination()
+            withExtendedLifetime([first.workspace, second.workspace]) {}
+        }
         guard case .added = await bridge.addMonitorLink(observerSessionID: first.candidate.sessionID, rawTargetSessionID: second.candidate.sessionID.uuidString),
-              case .added = await bridge.addMonitorLink(observerSessionID: second.candidate.sessionID, rawTargetSessionID: first.candidate.sessionID.uuidString) else {
+              case .added = await bridge.addMonitorLink(observerSessionID: second.candidate.sessionID, rawTargetSessionID: first.candidate.sessionID.uuidString)
+        else {
             return XCTFail("Two direct grants must establish the ring")
         }
         for index in 1 ... horizon {
@@ -165,25 +197,36 @@ extension AgentSessionLinkRuntimeBridgeTests {
             if session.selectedAgent == .codexExec {
                 if toolOnly {
                     await peer.vm.test_codexCoordinator.test_handleCodexNativeEvent(.toolCall(name: "mcp__RepoPromptCE__poll", invocationID: UUID(), argsJSON: "{}"), session: session, sourceController: peer.codex)
-                } else if index <= 4 {
+                } else if index <= usefulReplyCount {
                     await peer.vm.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("Useful \(index)"), session: session, sourceController: peer.codex)
                 }
                 await peer.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "ring-\(index)", status: .completed, failure: nil), session: session, sourceController: peer.codex)
             } else {
-                if toolOnly {
-                    await peer.claude.emit(.stream(.init(type: "tool_call", text: nil, toolName: "mcp__RepoPromptCE__poll", toolArgsJSON: "{}")))
-                } else if index <= 4 {
-                    await peer.claude.emit(.stream(.init(type: "content", text: "Useful \(index)")))
+                let parser = try XCTUnwrap(peer.claudeParser)
+                let providerSessionID = await parser.currentSessionRef().sessionID
+                if toolOnly || index <= usefulReplyCount {
+                    let content: [String: Any] = toolOnly
+                        ? ["type": "tool_use", "id": UUID().uuidString, "name": "mcp__RepoPromptCE__poll", "input": [:]]
+                        : ["type": "text", "text": "Useful \(index)"]
+                    let assistant: [String: Any] = [
+                        "type": "assistant",
+                        "session_id": providerSessionID ?? "application-proof-session",
+                        "message": ["role": "assistant", "content": [content]]
+                    ]
+                    try await parser.test_handleConfigurationStdoutChunk(JSONSerialization.data(withJSONObject: assistant) + Data([10]))
                 }
-                await peer.claude.emit(.turnCompleted(turnID: try XCTUnwrap(session.claudeExpectedTurnIDs.first), status: .completed))
+                // Empty successful result travels through the real controller decoder/translator,
+                // native turn FIFO and runner, not an invented terminal event.
+                let result: [String: Any] = ["type": "result", "subtype": "success", "session_id": providerSessionID ?? "application-proof-session", "result": "", "is_error": false]
+                try await parser.test_handleConfigurationStdoutChunk(JSONSerialization.data(withJSONObject: result) + Data([10]))
                 await session.agentTask?.value
             }
             XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
             await settleNativeObservations(bridge)
         }
-        let claudeCalls = await second.claude.sentCount
+        let claudeCalls = second.claudeWrites.withLock { $0 }
         XCTAssertEqual(first.codexDispatches.startedTurns.count + claudeCalls, expectedCalls, "Count physical native invocations, not admission/helper calls")
-        XCTAssertEqual(first.session.items.count(where: { $0.kind == .assistant }) + second.session.items.count(where: { $0.kind == .assistant }), toolOnly ? 0 : 4)
+        XCTAssertEqual(first.session.items.count(where: { $0.kind == .assistant }) + second.session.items.count(where: { $0.kind == .assistant }), toolOnly ? 0 : usefulReplyCount)
         await first.vm.test_codexCoordinator.shutdownCodexSession(first.session)
         await second.vm.test_claudeCoordinator.shutdownClaudeSession(second.session)
     }
@@ -205,13 +248,13 @@ extension AgentSessionLinkRuntimeBridgeTests {
     private enum NativeWakeScenario {
         case silent, toolOnly, human, visible, attention, failure, teardown, restore, terminalBeforeAcceptance
         case debtReceipt, debtReceiptOmitted, failureSuccessUnpaid, failureSuccessPaid, silentSuccessorPrepared
-        case rowlessInput, bulkReplacement, controllerReplacement, lateUnownedOutput, lateToolOutput, rejectedPublication, acceptedPublication, unknownStream, transientStreams
+        case rowlessInput, bulkReplacement, controllerReplacement, lateUnownedOutput, lateToolOutput, rejectedPublication, acceptedPublication, unknownStream, transientStreams, priorToolLateOutput
     }
 
     private func assertNativeWake(_ scenario: NativeWakeScenario, expectedAdmission: Bool, agent: AgentProviderKind = .codexExec) async throws {
         let lateInvocation = UUID()
-        let toolOnly = scenario == .toolOnly || scenario == .lateToolOutput
-        let hasSuccessor = [NativeWakeScenario.debtReceipt, .debtReceiptOmitted, .failureSuccessUnpaid, .failureSuccessPaid, .silentSuccessorPrepared].contains(scenario)
+        let toolOnly = scenario == .toolOnly || scenario == .lateToolOutput || scenario == .priorToolLateOutput
+        let hasSuccessor = [NativeWakeScenario.debtReceipt, .debtReceiptOmitted, .failureSuccessUnpaid, .failureSuccessPaid, .silentSuccessorPrepared, .priorToolLateOutput].contains(scenario)
         let failsFirst = [.failure, .failureSuccessUnpaid, .failureSuccessPaid].contains(scenario)
         let dispatches = MonitorCodexDispatchRecorder()
         let controller = MonitorFakeCodexController(dispatches: dispatches)
@@ -259,20 +302,29 @@ extension AgentSessionLinkRuntimeBridgeTests {
             await vm.test_codexCoordinator.ensureCodexNativeSession(session: session)
         } else {
             let warm = session.beginRunAttempt(source: "test.warm.native")
-            let ready = await vm.test_claudeCoordinator.ensureClaudeNativeSession(session: session, intent: .runAttempt(ownership: warm, runID: try XCTUnwrap(session.runID)))
+            let ready = try await vm.test_claudeCoordinator.ensureClaudeNativeSession(session: session, intent: .runAttempt(ownership: warm, runID: XCTUnwrap(session.runID)))
             XCTAssertEqual(ready, .ready)
             _ = session.endRunAttempt(ifCurrent: warm, source: "test.warm.native")
         }
-        let route = AgentSessionLinkRunCatalogRouteToken(runID: try XCTUnwrap(session.runID), observerEndpoint: endpoint, connectionID: UUID(), routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1)
+        let route = try AgentSessionLinkRunCatalogRouteToken(runID: XCTUnwrap(session.runID), observerEndpoint: endpoint, connectionID: UUID(), routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1)
         vm.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
         vm.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in route }
         vm.test_agentSessionLinkCurrentRunCatalogRouteToken = { _, _ in true }
         vm.agentSessionLinkPublishRunCatalogProjection(.init(runID: route.runID, routeToken: route, projectionRevision: 1, hasAgentSessionLink: true, hasAnyActiveLink: true), to: endpoint)
         vm.agentSessionLinkPublishPromptInventory(.init(observerSessionID: sessionID, linkSetRevision: 1, items: [.init(targetSessionID: observer.sessionID, displayName: "Peer", capabilityNames: ["poll", "read"])]), to: endpoint)
         let reference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
-        let queue = AgentSessionLinkPassiveStatusNotices.Snapshot(observerEndpoint: endpoint, queueEpoch: UUID(), queueRevision: 1, linkSetRevision: 1, isEnabled: true, isDeliverable: true,
-            entries: [.init(reference: reference, targetEndpoint: observer.domainEndpoint, targetSessionID: observer.sessionID, displayName: "Peer", fromStatus: .running, toStatus: .idle, changeSequence: 1)], unacknowledgedOverflowCount: 0, overflowProduced: 0,
-            autoWakeLanes: [.init(reference: reference, targetEndpoint: observer.domainEndpoint, targetSessionID: observer.sessionID, isEffectivelySelected: true)])
+        let queue = AgentSessionLinkPassiveStatusNotices.Snapshot(
+            observerEndpoint: endpoint,
+            queueEpoch: UUID(),
+            queueRevision: 1,
+            linkSetRevision: 1,
+            isEnabled: true,
+            isDeliverable: true,
+            entries: [.init(reference: reference, targetEndpoint: observer.domainEndpoint, targetSessionID: observer.sessionID, displayName: "Peer", fromStatus: .running, toStatus: .idle, changeSequence: 1)],
+            unacknowledgedOverflowCount: 0,
+            overflowProduced: 0,
+            autoWakeLanes: [.init(reference: reference, targetEndpoint: observer.domainEndpoint, targetSessionID: observer.sessionID, isEffectivelySelected: true)]
+        )
         session.oversight.autoWakeOnUpdates = true
         // Hold reservation until this test supplies the deterministic native transport.
         vm.agentSessionLinkPublishPassiveStatusNotices(queue, to: endpoint)
@@ -328,9 +380,9 @@ extension AgentSessionLinkRuntimeBridgeTests {
         await bridge.test_settleProjections()
         if toolOnly {
             if agent == .codexExec {
-                let tool = scenario == .lateToolOutput ? "bash" : "mcp__RepoPromptCE__poll"
+                let tool = [NativeWakeScenario.lateToolOutput, .priorToolLateOutput].contains(scenario) ? "bash" : "mcp__RepoPromptCE__poll"
                 await coordinator.test_handleCodexNativeEvent(.toolCall(name: tool, invocationID: lateInvocation, argsJSON: "{}"), session: session, sourceController: controller)
-                if scenario == .lateToolOutput {
+                if scenario == .lateToolOutput || scenario == .priorToolLateOutput {
                     await coordinator.test_handleCodexNativeEvent(.toolResult(name: "bash", invocationID: lateInvocation, argsJSON: "{}", resultJSON: #"{"status":"failed","exit_code":1,"output":"Early"}"#, isError: true), session: session, sourceController: controller)
                     XCTAssertTrue(session.items.contains { $0.toolInvocationID == lateInvocation && $0.kind == .toolResult })
                     XCTAssertEqual(session.passiveWakeSegment?.vetoed, true, "Correlated identity was created during this exact segment")
@@ -384,14 +436,23 @@ extension AgentSessionLinkRuntimeBridgeTests {
                 let pending = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint])
                 XCTAssertEqual(pending.routineNonAdmittingReferences.count, 1)
                 let edgeSequence = pending.entries.first?.edgeSequence
-                observerVM.agentSessionLinkPublishPromptInventory(try XCTUnwrap(host.publishedInventoriesByEndpoint[observer.domainEndpoint]), to: observer.domainEndpoint)
+                try observerVM.agentSessionLinkPublishPromptInventory(XCTUnwrap(host.publishedInventoriesByEndpoint[observer.domainEndpoint]), to: observer.domainEndpoint)
                 observerVM.agentSessionLinkPublishPassiveStatusNotices(pending, to: observer.domainEndpoint)
                 XCTAssertNil(observerSession.oversight.pendingAutoWake, "Canonical hold cannot reserve an observer")
                 // Model an already-preparing observer at the same public occurrence. The real
                 // physical fence must re-read the now-published pending passive contribution.
-                let witness = AgentSessionLinkAutoWakeAttempt(wakeID: UUID(), observerEndpoint: observer.domainEndpoint,
-                    queueEpoch: pending.queueEpoch, queueRevision: pending.queueRevision, wakeFingerprint: pending.wakeEligibilityFingerprint,
-                    admissionBasis: .routineStatusOrOverflow, attemptedFingerprint: nil, physicalOutcome: .notAttempted, phase: .preparingDispatch, task: nil)
+                let witness = AgentSessionLinkAutoWakeAttempt(
+                    wakeID: UUID(),
+                    observerEndpoint: observer.domainEndpoint,
+                    queueEpoch: pending.queueEpoch,
+                    queueRevision: pending.queueRevision,
+                    wakeFingerprint: pending.wakeEligibilityFingerprint,
+                    admissionBasis: .routineStatusOrOverflow,
+                    attemptedFingerprint: nil,
+                    physicalOutcome: .notAttempted,
+                    phase: .preparingDispatch,
+                    task: nil
+                )
                 observerSession.oversight.pendingAutoWake = witness
                 _ = try XCTUnwrap(observerVM.agentSessionLinkPromptClaim(for: observerSession, dispatchID: .autoWake(wakeID: witness.wakeID)))
                 XCTAssertFalse(observerVM.agentSessionLinkAcquirePhysicalDispatch(for: observerSession, dispatchID: .autoWake(wakeID: witness.wakeID)))
@@ -426,14 +487,17 @@ extension AgentSessionLinkRuntimeBridgeTests {
             await coordinator.test_handleCodexNativeEvent(.commandExecutionRunning(.init(invocationID: lateInvocation, processID: nil, appendedOutput: "AcceptedLate")), session: session, sourceController: controller)
             try await AsyncTestWait.waitUntil("correlated late command output materialized") {
                 session.items.contains { $0.toolInvocationID == lateInvocation
-                        && (($0.toolResultJSON?.contains("AcceptedLate") ?? false)
-                            || (session.ephemeralToolResultPayloadByItemID[$0.id]?.contains("AcceptedLate") ?? false)) }
+                    && (
+                        ($0.toolResultJSON?.contains("AcceptedLate") ?? false)
+                            || (session.ephemeralToolResultPayloadByItemID[$0.id]?.contains("AcceptedLate") ?? false)
+                    )
+                }
             }
             XCTAssertGreaterThan(session.sourceItemsRevision, revision, "Late native update must actually be accepted, not merely attempted")
             XCTAssertEqual(session.passiveWakeEvidence, evidence, "This exact segment's earlier tool ingress already vetoed silence")
         }
         if let acceptanceGate {
-            observerVM.agentSessionLinkPublishPromptInventory(try XCTUnwrap(host.publishedInventoriesByEndpoint[observer.domainEndpoint]), to: observer.domainEndpoint)
+            try observerVM.agentSessionLinkPublishPromptInventory(XCTUnwrap(host.publishedInventoriesByEndpoint[observer.domainEndpoint]), to: observer.domainEndpoint)
             await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
             await bridge.test_settleTargetPublications()
             await bridge.test_settleProjections()
@@ -446,12 +510,23 @@ extension AgentSessionLinkRuntimeBridgeTests {
             let outcome = await producer.value
             XCTAssertEqual(outcome, .sent)
         }
+        let firstOwner = session.lastTerminalCommitRevision?.ownership
         if hasSuccessor {
             await settleNativeObservations(bridge)
             let predecessor = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint])
             XCTAssertEqual(predecessor.entries.count, 1)
-            let successorQueue = AgentSessionLinkPassiveStatusNotices.Snapshot(observerEndpoint: endpoint, queueEpoch: queue.queueEpoch, queueRevision: 2, linkSetRevision: 1, isEnabled: true, isDeliverable: true,
-                entries: [.init(reference: reference, targetEndpoint: observer.domainEndpoint, targetSessionID: observer.sessionID, displayName: "Peer", fromStatus: .running, toStatus: .idle, changeSequence: 2)], unacknowledgedOverflowCount: 0, overflowProduced: 0, autoWakeLanes: queue.autoWakeLanes)
+            let successorQueue = AgentSessionLinkPassiveStatusNotices.Snapshot(
+                observerEndpoint: endpoint,
+                queueEpoch: queue.queueEpoch,
+                queueRevision: 2,
+                linkSetRevision: 1,
+                isEnabled: true,
+                isDeliverable: true,
+                entries: [.init(reference: reference, targetEndpoint: observer.domainEndpoint, targetSessionID: observer.sessionID, displayName: "Peer", fromStatus: .running, toStatus: .idle, changeSequence: 2)],
+                unacknowledgedOverflowCount: 0,
+                overflowProduced: 0,
+                autoWakeLanes: queue.autoWakeLanes
+            )
             vm.agentSessionLinkPublishPassiveStatusNotices(successorQueue, to: endpoint)
             let successorWake = try XCTUnwrap(session.oversight.pendingAutoWake)
             successorWake.task?.cancel()
@@ -468,17 +543,39 @@ extension AgentSessionLinkRuntimeBridgeTests {
             XCTAssertEqual(dispatches.startedTurns.count, 2)
             await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "silent-successor"), session: session, sourceController: controller)
             await settleNativeObservations(bridge)
-            if scenario != .failureSuccessUnpaid && scenario != .silentSuccessorPrepared {
+            if scenario != .failureSuccessUnpaid, scenario != .silentSuccessorPrepared {
                 bridge.applyPassiveMonitorNoticeReceipt(.init(snapshot: predecessor, deliveredEntries: scenario == .debtReceiptOmitted ? [] : nil), observerEndpoint: observer.domainEndpoint)
             }
             await coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "silent-successor", status: .completed, failure: nil), session: session, sourceController: controller)
             XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
             XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
         }
+        if scenario == .priorToolLateOutput {
+            await settleNativeObservations(bridge)
+            let successorOwner = try XCTUnwrap(session.lastTerminalCommitRevision?.ownership)
+            XCTAssertNotEqual(successorOwner, firstOwner)
+            XCTAssertEqual(session.passiveWakeEvidence, .silent(successorOwner))
+            let quiet = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint])
+            XCTAssertEqual(quiet.routineNonAdmittingReferences.count, 1, "Predecessor receipt leaves only silent successor")
+            let revision = session.sourceItemsRevision
+            await coordinator.test_handleCodexNativeEvent(.commandExecutionRunning(.init(invocationID: lateInvocation, processID: nil, appendedOutput: "PriorRunLate")), session: session, sourceController: controller)
+            try await AsyncTestWait.waitUntil("prior-run correlated output materialized") {
+                session.items.contains { $0.toolInvocationID == lateInvocation
+                    && (
+                        ($0.toolResultJSON?.contains("PriorRunLate") ?? false)
+                            || (session.ephemeralToolResultPayloadByItemID[$0.id]?.contains("PriorRunLate") ?? false)
+                    )
+                }
+            }
+            XCTAssertGreaterThan(session.sourceItemsRevision, revision)
+            XCTAssertEqual(session.passiveWakeEvidence, .ordinary(successorOwner), "Accepted inactive output vetoes the current segment even for an earlier identity")
+        }
         if scenario == .teardown || scenario == .restore {
             let runID = try XCTUnwrap(session.runID)
             XCTAssertTrue(session.clearRunID(ifCurrent: runID))
-            if scenario == .restore { session.installRunID(UUID()); session.replaceItems(session.items) }
+            if scenario == .restore { session.installRunID(UUID())
+                session.replaceItems(session.items)
+            }
             session.noteMonitorObservationInputsChanged()
         }
         // Drain @Published's scheduled observation before the serial authority chain.
@@ -487,11 +584,10 @@ extension AgentSessionLinkRuntimeBridgeTests {
         await bridge.test_settleProjections()
         let notices = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint])
         XCTAssertEqual(notices.entries.count, 1, "Suppression must not erase delivery")
-        observerVM.agentSessionLinkPublishPromptInventory(try XCTUnwrap(host.publishedInventoriesByEndpoint[observer.domainEndpoint]), to: observer.domainEndpoint)
+        try observerVM.agentSessionLinkPublishPromptInventory(XCTUnwrap(host.publishedInventoriesByEndpoint[observer.domainEndpoint]), to: observer.domainEndpoint)
         observerVM.agentSessionLinkPublishPassiveStatusNotices(notices, to: observer.domainEndpoint)
         observerSession.oversight.pendingAutoWake?.task?.cancel()
         XCTAssertEqual(observerSession.oversight.pendingAutoWake != nil, expectedAdmission, "Native scenario: \(scenario)")
         if agent == .codexExec { await coordinator.shutdownCodexSession(session) } else { await vm.test_claudeCoordinator.shutdownClaudeSession(session) }
     }
-
 }

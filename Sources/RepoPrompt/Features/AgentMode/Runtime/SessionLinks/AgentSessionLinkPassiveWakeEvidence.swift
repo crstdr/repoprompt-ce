@@ -72,7 +72,8 @@ extension AgentTabSession {
               passiveWakeSegment?.wakeID != wakeID,
               let wake = oversight.pendingAutoWake, wake.wakeID == wakeID,
               wake.admissionBasis == .routineStatusOrOverflow,
-              wake.phase == .preparingDispatch || wake.phase == .dispatching else {
+              wake.phase == .preparingDispatch || wake.phase == .dispatching
+        else {
             passiveWakeSegment = nil
             return
         }

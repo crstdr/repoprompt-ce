@@ -27,14 +27,26 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
 
     func testSameOwnerOrdinaryOrWaitingOpeningCannotProvePassiveClose() {
         let owner = passiveOwner(0)
-        for opening in [passiveSample(0, status: .running, evidence: .ordinary(owner)),
-                        passiveSample(0, status: .waiting, evidence: .open(owner))] {
+        for opening in [
+            passiveSample(0, status: .running, evidence: .ordinary(owner)),
+            passiveSample(0, status: .waiting, evidence: .open(owner))
+        ] {
             var reducer = makeReducer()
             reducer.enable(samples: [opening], linkSetRevision: 1)
             reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .silent(owner))], linkSetRevision: 1, deliverable: true)
             XCTAssertEqual(reducer.snapshot.entries.count, 1)
             XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
         }
+    }
+
+    func testNondeliverablePrivateOnlyRebaselineDoesNotAdvanceQueueRevision() {
+        let owner = passiveOwner(0)
+        var reducer = makeReducer()
+        reducer.enable(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1, deliverable: false)
+        let before = reducer.snapshot
+        reducer.reconcile(samples: [passiveSample(0, status: .running, evidence: .ordinary(owner))], linkSetRevision: 1, deliverable: false)
+        XCTAssertEqual(reducer.snapshot.queueRevision, before.queueRevision, "Private evidence is not public baseline content")
+        XCTAssertEqual(reducer.snapshot.entries, before.entries)
     }
 
     func testSampleCarriedPrivateResolutionDoesNotRefreshPublicMetadata() {
