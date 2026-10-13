@@ -384,6 +384,51 @@ The MCP `app_settings` surface remains global for model-related keys such as:
 
 Those keys write the global backing fields. Workspace-specific Agent Models overrides are not exposed through `app_settings`; they are selected by the active RepoPrompt workspace/window and resolved by runtime services.
 
+## Delegation scope intent
+
+Delegation scopes are not settings, but their durable intent lives beside the oversight-link file
+and follows the same preserve-first rules:
+
+```text
+~/Library/Application Support/RepoPrompt CE/delegationScopes.json
+```
+
+- Owner: `DelegationScopeStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
+  `WindowStatesManager` with the same `AgentSessionOversightPersistenceMode` as
+  `agentSessionOversightLinks.json`. Suppressed launches perform no file I/O.
+- Payload: a versioned document (`version`, `scopes`, optional `revoked_scope_ids`) holding only the
+  **active** grants: scope ID, grantee session, kind, capabilities, guardrails (including the
+  per-scope bulk confirmation threshold), origin (user or attenuated parent), and grant time.
+  Revoked and expired scopes are removed. `revoked_scope_ids` is a bounded (1,024, oldest dropped)
+  tombstone list: a tombstoned grant, or a child of one, is never reactivated even if a stale copy of
+  the file still lists it. Generations, leases, pending `request_scope` cards, and batch
+  confirmations are process-local and never written.
+- Writes are serialized write-through, retried once on failure, and surfaced in the "Active
+  delegations" list when they fail. `applicationWillTerminate` performs a bounded synchronous
+  flush so a revocation made just before quitting is durable.
+- Launch: the file is read once, and every grant is reactivated under a **fresh generation**.
+  Grants past their expiry, tombstoned grants, and attenuated grants whose parent is missing,
+  inactive, or no longer satisfies the attenuation invariants (tree rooted at the grantee,
+  capabilities a subset, guardrails no looser) are not reactivated, so a reload can never undo a
+  cascade or widen a child.
+- Recovery: a future `version` is preserved and blocks writes; malformed bytes are moved intact to
+  `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
+  and row counts are preserved and block writes. Nothing is ever partially salvaged or evicted.
+
+## Sidebar groups on compose tabs
+
+`ComposeTabState` (workspace files, not global settings) carries two optional, additive fields
+beside `pinnedOrder`:
+
+- `sidebarGroup`: the tab's sidebar group label (trimmed, at most 64 characters, one line); absent
+  means ungrouped.
+- `sidebarGroupOrder`: the group's position among the workspace's groups, mirrored on every tab in
+  that group (`reorder_groups` rewrites the mirror on each).
+
+Both are encoded only when present and decoded leniently: an absent or malformed value decodes as
+ungrouped, so older files load unchanged and no workspace schema bump or migration is needed. Older
+builds ignore the keys. Stashed (archived) tabs keep their group, so unarchiving restores it.
+
 ## Non-goals and migration notes
 
 - Do not resurrect the old Context Builder drift resolver. Agent Models and runtime code should use the effective Agent Models profile, not compare against legacy `ChatGlobalSettings.contextBuilder*` fields.

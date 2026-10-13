@@ -1160,6 +1160,36 @@ final class AgentSessionLinkRuntimeBridge {
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
     }
 
+    /// Delegation-scope state (an authority *input* to oversight; it owns none of the four owners'
+    /// responsibilities). Like `intentStore`, its durable store is installed by app composition.
+    let delegationScopes = DelegationScopeRuntime()
+    /// The single shared administration service behind `session_admin` and future UI dispatchers.
+    private(set) lazy var sessionAdministration = AgentSessionAdministrationCore(
+        scopes: delegationScopes,
+        projector: SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource())
+    )
+    /// `session_admin`'s entry point: filters, preview, idempotency, undo, and apply-on-approval over
+    /// `sessionAdministration`, which keeps the single authority check. Registers the organizing ops.
+    private(set) lazy var sessionAdministrationFrontDoor = AgentSessionAdministrationFrontDoor.production(
+        core: sessionAdministration,
+        scopes: delegationScopes
+    )
+
+    /// Read-only oversight inventory for `session_admin links`/`tree`: every live link plus every
+    /// durable intent. Authority over any of them is decided elsewhere; unlinking still goes through
+    /// `stopMonitorLink`, so the link authority stays the sole owner of link lifecycle.
+    func oversightInventory(includeLocation: Bool = true) async -> (
+        live: [DomainAgentSessionLinkInventoryItem],
+        persisted: [AgentSessionOversightIntent]
+    ) {
+        // Every live link's observer is a tracked observer endpoint or a current candidate.
+        let observers = Set(knownObserverEndpoints.map(\.sessionID))
+            .union(host?.agentSessionLinkCandidates(includeLocation: includeLocation).map(\.sessionID) ?? [])
+        let live = await authority.linkItems(forObservers: observers)
+        let persisted = await intentStore?.allIntents() ?? []
+        return (live, persisted)
+    }
+
     /// Durable oversight intent, installed by app composition.
     ///
     /// Deliberately not constructed here. The bridge is a process singleton, so a self-bootstrapping
@@ -2189,6 +2219,8 @@ final class AgentSessionLinkRuntimeBridge {
         creatorNames.remove(sessionID)
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
         await invalidateSession(sessionID, reason: .sessionDeleted)
+        // No scope may keep acting for, or over a tree rooted at, a session that no longer exists.
+        delegationScopes.revokeAll(involving: sessionID)
         guard !isFrozenForTermination, let intentStore else { return }
         // `removeAll` snapshots every attempted current token and assertion generation in the same
         // actor turn as the write. A separate read would leave a hop where an intervening row could be
