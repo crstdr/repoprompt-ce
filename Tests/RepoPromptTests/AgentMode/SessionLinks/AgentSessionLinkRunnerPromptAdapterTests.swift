@@ -1431,7 +1431,13 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         }
         let invalidateMilliseconds = Date().timeIntervalSince(invalidateStart) * 1000 / Double(iterations)
         print("LOCAL_INPUT_BATCH_COST items=\(committed.count) batch_ms=\(batchMilliseconds) invalidate_ms=\(invalidateMilliseconds)")
-        XCTAssertLessThan(batchMilliseconds, 10, "identity-preserving finalization stays bounded at scale")
+        // Relative budget: the identity-preserving path must stay within 2× the invalidate path
+        // on the same fixture in the same run, so slow runners cannot flake an absolute wall clock.
+        XCTAssertLessThanOrEqual(
+            batchMilliseconds,
+            invalidateMilliseconds * 2,
+            "identity-preserving finalization stays within 2x of the invalidate path at scale"
+        )
     }
 
     func testExactly600IsFullAnd601UsesExact400Plus200Graphemes() throws {
