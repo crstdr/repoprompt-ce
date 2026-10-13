@@ -188,7 +188,8 @@ final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         providerControlCommand: AgentProviderControlCommand? = nil,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        passiveWakeID: UUID? = nil
     ) async {
         guard stopFence?.permitsStart(of: session) ?? true else { return }
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
@@ -204,7 +205,7 @@ final class ACPIntegratedAgentModeRunner {
         session.codexReasoningSegmentsByKey.removeAll()
 
         guard stopFence?.permitsStart(of: session) ?? true else { return }
-        let ownership = session.beginRunAttempt(source: "acp")
+        let ownership = session.beginRunAttempt(source: "acp", passiveWakeID: passiveWakeID)
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runState = .running
@@ -1628,6 +1629,7 @@ final class ACPIntegratedAgentModeRunner {
             case let .approvalRequested(request):
                 session.pendingApproval = request
                 session.runState = .waitingForApproval
+                session.notePassiveWakeActivity()
                 setRunningStatus(nil, source: nil, session: session, urgent: true)
             case let .approvalCancelled(requestID):
                 if session.pendingApproval?.requestID == requestID {

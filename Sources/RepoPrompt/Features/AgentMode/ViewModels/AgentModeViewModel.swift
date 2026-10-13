@@ -19965,7 +19965,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let isHiddenLifecycleSystemMessage = result.type == "system"
                 && ["Agent initialized", "Agent completed", "Agent cancelled"].contains(result.text ?? "")
             switch result.type {
-            case "content", "final_content": session.notePassiveWakeAssistantText(result.text)
+            case "content": session.notePassiveWakeAssistantText(result.text)
+            case "final_content": session.notePassiveWakeAssistantText(result.text, authoritative: true)
             case "tool_call", "tool_result", "tool_progress", "error": session.notePassiveWakeActivity()
             case "event": session.notePassiveWakeActivity()
             case "system":

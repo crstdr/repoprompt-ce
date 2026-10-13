@@ -46,6 +46,16 @@ extension AgentSessionLinkRuntimeBridgeTests {
         try await assertNativeRing(toolOnly: true, horizon: 6, expectedCalls: 6)
     }
 
+    func testNativeTwoAgentEchoRingStopsAtAckTurn() async throws {
+        // A bare `ack` ends the ring whichever peer answers it.
+        try await assertNativeRing(toolOnly: false, horizon: 7, expectedCalls: 5, quietReply: "ack")
+        try await assertNativeRing(toolOnly: false, horizon: 7, expectedCalls: 6, usefulReplyCount: 5, quietReply: "ack")
+    }
+
+    func testNativeTwoAgentEchoRingTreatsNonExactAckAsOrdinary() async throws {
+        try await assertNativeRing(toolOnly: false, horizon: 6, expectedCalls: 6, quietReply: "ack, nothing needed")
+    }
+
     func testNativeRowlessUserInputAndBulkReplacementFailOpen() async throws {
         try await assertNativeWake(.rowlessInput, expectedAdmission: true)
         try await assertNativeWake(.bulkReplacement, expectedAdmission: true)
@@ -72,6 +82,171 @@ extension AgentSessionLinkRuntimeBridgeTests {
 
     func testNativePriorRunCommandOutputVetoesAnOtherwiseSilentSuccessor() async throws {
         try await assertNativeWake(.priorToolLateOutput, expectedAdmission: true)
+    }
+
+    func testNativeExactAckReplyFinishesQuietly() async throws {
+        try await assertNativeWake(.ack, expectedAdmission: false)
+        try await assertNativeWake(.ackPadded, expectedAdmission: false)
+        try await assertNativeWake(.ackFragmented, expectedAdmission: false)
+        try await assertNativeWake(.ackSettled, expectedAdmission: false)
+        // A blank completion after an exact `ack` seals the message and stays quiet.
+        try await assertNativeWake(.ackThenBlankCompletion, expectedAdmission: false)
+        try await assertNativeWake(.ack, expectedAdmission: false, agent: .claudeCode)
+        try await assertNativeWake(.ackSettled, expectedAdmission: false, agent: .claudeCode)
+    }
+
+    func testNativeNonExactAckRepliesKeepWaking() async throws {
+        try await assertNativeWake(.ackNonExact, expectedAdmission: true)
+        try await assertNativeWake(.ackWord, expectedAdmission: true)
+        try await assertNativeWake(.ackPrefix, expectedAdmission: true)
+        try await assertNativeWake(.ackThenTool, expectedAdmission: true)
+        // Whitespace is part of the reply: "a" + " " + "ck" renders "a ck", not `ack`.
+        try await assertNativeWake(.ackSpaced, expectedAdmission: true)
+        // An invisible format scalar is not whitespace: "ack\u{200B}" is not the exact token.
+        try await assertNativeWake(.ackInvisibleSuffix, expectedAdmission: true)
+        // A second completed message must not supersede the first: "ac" + "ack" is not `ack`.
+        try await assertNativeWake(.ackTwoCompletions, expectedAdmission: true)
+        // Message boundaries are real: two completions "a" + "ck" are two messages, not `ack`.
+        try await assertNativeWake(.ackSplitCompletions, expectedAdmission: true)
+        // A whitespace-only completion seals but does not erase: the streamed "ac" survives as its
+        // own message, so a later `ack` completion cannot fuse with it into the quiet token.
+        try await assertNativeWake(.ackBlankCompletion, expectedAdmission: true)
+        try await assertNativeWake(.ackBlankThenAck, expectedAdmission: true)
+        // A non-quiet streamed prefix vetoes once and stays vetoed even when the authoritative
+        // completion replaces it — an inconsistent stream fails loud rather than quiet.
+        try await assertNativeWake(.ackNoisyPrefix, expectedAdmission: true)
+        // An empty completion is still a message boundary: "ac" + "" + "ack" seals the prefix as
+        // its own message, so the turn's reply is "ac\nack", not `ack`.
+        try await assertNativeWake(.ackEmptyCompletionBoundary, expectedAdmission: true)
+        // The same boundary holds for an absent body (Claude `final_content` with nil text).
+        try await assertNativeWake(.ackNilCompletionBoundary, expectedAdmission: true, agent: .claudeCode)
+        // A delta after a sealed completion reopens pending text under the boundary: `ack` + ""
+        // + "." renders "ack\n." — one separator shy of the exact token, so it stays ordinary.
+        try await assertNativeWake(.ackEmptyCompletionTrailing, expectedAdmission: true)
+        // The 256-byte eligibility line is deliberate: a padded `ack` beyond it fails loud.
+        try await assertNativeWake(.ackOversized, expectedAdmission: true)
+        // The separator inserted when a delta reopens pending text counts against the line:
+        // `ack` + 252 trailing spaces is exactly 256 bytes and quiet; one more is ordinary.
+        try await assertNativeWake(.ackSealedPaddedAtCap, expectedAdmission: false)
+        try await assertNativeWake(.ackSealedPaddedOverCap, expectedAdmission: true)
+        // A surfaced question is a wake-worthy event on every provider: Codex `requestUserInput`
+        // (auto-approve skipped for a non-MCP question) and Claude `approvalRequest` veto alike.
+        try await assertNativeWake(.ackQuestion, expectedAdmission: true)
+        try await assertNativeWake(.ackQuestion, expectedAdmission: true, agent: .claudeCode)
+        try await assertNativeWake(.ackNonExact, expectedAdmission: true, agent: .claudeCode)
+        try await assertNativeWake(.ackTwoCompletions, expectedAdmission: true, agent: .claudeCode)
+        try await assertNativeWake(.ackSplitCompletions, expectedAdmission: true, agent: .claudeCode)
+        try await assertNativeWake(.ackEmptyCompletionBoundary, expectedAdmission: true, agent: .claudeCode)
+        try await assertNativeWake(.ackEmptyCompletionTrailing, expectedAdmission: true, agent: .claudeCode)
+        try await assertNativeWake(.ackOversized, expectedAdmission: true, agent: .claudeCode)
+    }
+
+    /// Periodic, attention, and manual wakes keep `ack` ordinary: they bind no evidence segment and
+    /// their dispatch never teaches the quiet reply, so the bare token still wakes the observer.
+    func testNativeAckOnNonRoutineWakesStaysOrdinary() async throws {
+        try await assertNonRoutineAckWake(name: "periodic") { fixture in
+            fixture.session.oversight.periodicIdleWakeEnabled = true
+            fixture.vm.agentSessionLinkPeriodicObserverIsLive = { _ in true }
+            return .periodic
+        }
+        try await assertNonRoutineAckWake(name: "attention") { fixture in
+            .purposefulAttention(.init(
+                queueEpoch: fixture.queue.queueEpoch,
+                reference: fixture.reference,
+                attentionSequence: 1
+            ))
+        }
+        try await assertNonRoutineAckWake(name: "manual") { _ in .manual }
+    }
+
+    /// Devin rides the ACP runner's existing shared seams — run-start binding, the physical-
+    /// acquisition fence, the shared stream switch, the accepted-send signal, and the shared
+    /// terminal barrier — so a bare `ack` finishes quietly with no Devin-specific evidence state.
+    func testDevinRoutineWakeAckTurnFinishesQuietlyThroughSharedSeams() async throws {
+        let fixture = try await makeNativeWakeFixture(agent: .devin)
+        defer {
+            fixture.bridge.freezeForTermination()
+            withExtendedLifetime((fixture.workspace, fixture.observerWorkspace)) {}
+        }
+        let session = fixture.session
+        let vm = fixture.vm
+        let wakeID = fixture.wake.wakeID
+        let claim = try XCTUnwrap(vm.agentSessionLinkPromptClaim(for: session, dispatchID: .autoWake(wakeID: wakeID)))
+        XCTAssertTrue(claim.fragment.contains("reply exactly `ack`"), "ACP routine wake teaches the quiet reply")
+        let ownership = session.beginRunAttempt(source: "acp", passiveWakeID: wakeID)
+        XCTAssertEqual(session.passiveWakeSegment?.wakeID, wakeID, "ACP run start binds the same evidence segment")
+        XCTAssertTrue(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: .autoWake(wakeID: wakeID)))
+        XCTAssertEqual(session.passiveWakeSegment?.acquired, true)
+        // Physical dispatch is what the runner reports as live; publish that running sample before
+        // the terminal seam so the observer queue records the running→idle edge like a real turn.
+        session.runState = .running
+        await settleNativeObservations(fixture.bridge)
+        let runID = try XCTUnwrap(session.runID)
+        await vm.test_handleStreamResult(.init(type: "content", text: "ack"), session: session, runID: runID, runAttemptID: ownership.attemptID)
+        vm.acceptAgentSessionLinkDispatch(session: session, context: .init(session: session, dispatchID: .autoWake(wakeID: wakeID)), claim: claim)
+        XCTAssertEqual(session.passiveWakeSegment?.accepted, true)
+        await vm.test_publishNaturalCompletion(session)
+        XCTAssertEqual(session.passiveWakeEvidence, .silent(ownership))
+        try await assertObserverAdmission(fixture, expectedAdmission: false)
+    }
+
+    /// The same seams veto a Devin turn that answers `ack` after a tool call — quiet requires no
+    /// tool activity, and a bare token riding one wakes the observer exactly like a real reply.
+    func testDevinRoutineWakeAckAfterToolCallStaysOrdinary() async throws {
+        let fixture = try await makeNativeWakeFixture(agent: .devin)
+        defer {
+            fixture.bridge.freezeForTermination()
+            withExtendedLifetime((fixture.workspace, fixture.observerWorkspace)) {}
+        }
+        let session = fixture.session
+        let vm = fixture.vm
+        let wakeID = fixture.wake.wakeID
+        let claim = try XCTUnwrap(vm.agentSessionLinkPromptClaim(for: session, dispatchID: .autoWake(wakeID: wakeID)))
+        let ownership = session.beginRunAttempt(source: "acp", passiveWakeID: wakeID)
+        XCTAssertTrue(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: .autoWake(wakeID: wakeID)))
+        session.runState = .running
+        await settleNativeObservations(fixture.bridge)
+        let runID = try XCTUnwrap(session.runID)
+        await vm.test_handleStreamResult(.init(type: "tool_call", text: nil, toolName: "poll", toolArgsJSON: "{}"), session: session, runID: runID, runAttemptID: ownership.attemptID)
+        await vm.test_handleStreamResult(.init(type: "content", text: "ack"), session: session, runID: runID, runAttemptID: ownership.attemptID)
+        vm.acceptAgentSessionLinkDispatch(session: session, context: .init(session: session, dispatchID: .autoWake(wakeID: wakeID)), claim: claim)
+        await vm.test_publishNaturalCompletion(session)
+        XCTAssertEqual(session.passiveWakeEvidence, .ordinary(ownership), "Tool activity vetoes quiet even when the reply is exact")
+        try await assertObserverAdmission(fixture, expectedAdmission: true)
+    }
+
+    private func assertNonRoutineAckWake(
+        name: String,
+        basis: (NativeWakeFixture) -> AgentSessionLinkWakeAdmissionDecision.Basis
+    ) async throws {
+        let fixture = try await makeNativeWakeFixture(agent: .codexExec)
+        defer {
+            fixture.bridge.freezeForTermination()
+            withExtendedLifetime((fixture.workspace, fixture.observerWorkspace)) {}
+        }
+        var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        attempt.admissionBasis = basis(fixture)
+        fixture.session.oversight.pendingAutoWake = attempt
+        let outcome = fixture.vm.agentSessionLinkPromptClaimOutcome(for: fixture.session, dispatchID: .autoWake(wakeID: attempt.wakeID))
+        XCTAssertFalse(
+            outcome.claim?.fragment.contains("reply exactly `ack`") ?? false,
+            "\(name) wake must not teach the quiet reply"
+        )
+        _ = fixture.session.beginRunAttempt(source: "test.ack.\(name)", passiveWakeID: attempt.wakeID)
+        XCTAssertNil(fixture.session.passiveWakeSegment, "\(name) wake binds no quiet-evidence segment")
+        let coordinator = fixture.vm.test_codexCoordinator
+        let sent = await coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+        XCTAssertEqual(sent, .sent)
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "nonroutine-\(name)"), session: fixture.session, sourceController: fixture.controller)
+        // Publish the mid-turn running sample before completion, or the observer's reducer only ever
+        // sees idle→idle and the edge the admission check needs is never recorded.
+        await settleNativeObservations(fixture.bridge)
+        await coordinator.test_handleCodexNativeEvent(.assistantDelta("ack"), session: fixture.session, sourceController: fixture.controller)
+        await coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "nonroutine-\(name)", status: .completed, failure: nil), session: fixture.session, sourceController: fixture.controller)
+        await fixture.session.agentTask?.value
+        XCTAssertEqual(fixture.session.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
+        XCTAssertFalse(fixture.session.passiveWakeEvidence.isPassive, "\(name) wake keeps `ack` ordinary")
+        try await assertObserverAdmission(fixture, expectedAdmission: true)
     }
 
     private struct NativeRingPeer {
@@ -153,7 +328,9 @@ extension AgentSessionLinkRuntimeBridgeTests {
         await bridge.test_settleProjections()
     }
 
-    private func assertNativeRing(toolOnly: Bool, horizon: Int, expectedCalls: Int, usefulReplyCount: Int = 4) async throws {
+    /// `quietReply` is what a turn past `usefulReplyCount` visibly answers — "ack" ends the ring
+    /// quietly, while a non-exact string keeps waking the peer exactly like a real reply.
+    private func assertNativeRing(toolOnly: Bool, horizon: Int, expectedCalls: Int, usefulReplyCount: Int = 4, quietReply: String? = nil) async throws {
         let first = try await makeNativeRingPeer(agent: .codexExec, windowID: 1)
         let second = try await makeNativeRingPeer(agent: .claudeCode, windowID: 2)
         let host = FakeEndpointHost()
@@ -199,15 +376,18 @@ extension AgentSessionLinkRuntimeBridgeTests {
                     await peer.vm.test_codexCoordinator.test_handleCodexNativeEvent(.toolCall(name: "mcp__RepoPromptCE__poll", invocationID: UUID(), argsJSON: "{}"), session: session, sourceController: peer.codex)
                 } else if index <= usefulReplyCount {
                     await peer.vm.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("Useful \(index)"), session: session, sourceController: peer.codex)
+                } else if let quietReply {
+                    await peer.vm.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta(quietReply), session: session, sourceController: peer.codex)
                 }
                 await peer.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "ring-\(index)", status: .completed, failure: nil), session: session, sourceController: peer.codex)
             } else {
                 let parser = try XCTUnwrap(peer.claudeParser)
                 let providerSessionID = await parser.currentSessionRef().sessionID
-                if toolOnly || index <= usefulReplyCount {
+                let replyText = index <= usefulReplyCount ? "Useful \(index)" : quietReply
+                if toolOnly || replyText != nil {
                     let content: [String: Any] = toolOnly
                         ? ["type": "tool_use", "id": UUID().uuidString, "name": "mcp__RepoPromptCE__poll", "input": [:]]
-                        : ["type": "text", "text": "Useful \(index)"]
+                        : ["type": "text", "text": replyText!]
                     let assistant: [String: Any] = [
                         "type": "assistant",
                         "session_id": providerSessionID ?? "application-proof-session",
@@ -226,7 +406,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         }
         let claudeCalls = second.claudeWrites.withLock { $0 }
         XCTAssertEqual(first.codexDispatches.startedTurns.count + claudeCalls, expectedCalls, "Count physical native invocations, not admission/helper calls")
-        XCTAssertEqual(first.session.items.count(where: { $0.kind == .assistant }) + second.session.items.count(where: { $0.kind == .assistant }), toolOnly ? 0 : usefulReplyCount)
+        XCTAssertEqual(first.session.items.count(where: { $0.kind == .assistant }) + second.session.items.count(where: { $0.kind == .assistant }), toolOnly ? 0 : (quietReply == nil ? usefulReplyCount : expectedCalls), "Visible quiet replies still produce assistant rows; silent turns do not")
         await first.vm.test_codexCoordinator.shutdownCodexSession(first.session)
         await second.vm.test_claudeCoordinator.shutdownClaudeSession(second.session)
     }
@@ -249,13 +429,89 @@ extension AgentSessionLinkRuntimeBridgeTests {
         case silent, toolOnly, human, visible, attention, failure, teardown, restore, terminalBeforeAcceptance
         case debtReceipt, debtReceiptOmitted, failureSuccessUnpaid, failureSuccessPaid, silentSuccessorPrepared
         case rowlessInput, bulkReplacement, controllerReplacement, lateUnownedOutput, lateToolOutput, rejectedPublication, acceptedPublication, unknownStream, transientStreams, priorToolLateOutput
+        case ack, ackPadded, ackFragmented, ackSettled, ackNonExact, ackWord, ackPrefix, ackThenTool
+        case ackSpaced, ackInvisibleSuffix, ackTwoCompletions, ackNoisyPrefix, ackSplitCompletions, ackBlankCompletion
+        case ackBlankThenAck, ackThenBlankCompletion
+        case ackEmptyCompletionBoundary, ackEmptyCompletionTrailing, ackNilCompletionBoundary
+        case ackOversized, ackSealedPaddedAtCap, ackSealedPaddedOverCap, ackQuestion
+
+        /// Visible reply fragments for the exact-`ack` family; nil for every earlier scenario.
+        var ackReplyFragments: [String]? {
+            switch self {
+            case .ack: ["ack"]
+            case .ackPadded: ["  ACK.  "]
+            case .ackFragmented: ["ac", "k"]
+            case .ackSettled, .ackBlankCompletion, .ackBlankThenAck: ["ac"] // a completion may supersede the prefix
+            case .ackEmptyCompletionBoundary, .ackNilCompletionBoundary: ["ac"]
+            case .ackThenBlankCompletion, .ackEmptyCompletionTrailing: ["ack"]
+            case .ackNonExact: ["ack, nothing needed"]
+            case .ackWord: ["acknowledged"]
+            case .ackPrefix: ["ac"]
+            case .ackThenTool: ["ack"]
+            case .ackSpaced: ["a", " ", "ck"]
+            case .ackInvisibleSuffix: ["ack\u{200B}"]
+            case .ackOversized: [String(repeating: " ", count: 260) + "ack"]
+            case .ackTwoCompletions, .ackSplitCompletions: nil
+            case .ackNoisyPrefix: ["hello"]
+            default: nil
+            }
+        }
+
+        /// Authoritative completions emitted after any fragments, in order; nil = none.
+        /// A nil element is only expressible for providers whose completion payload is
+        /// optional (Claude `final_content`); Codex substitutes "" — same blank-boundary path.
+        var ackCompletions: [String?]? {
+            switch self {
+            case .ackSettled, .ackNoisyPrefix: ["ack"]
+            case .ackTwoCompletions: ["ac", "ack"]
+            case .ackSplitCompletions: ["a", "ck"]
+            case .ackBlankCompletion: ["  "]
+            case .ackBlankThenAck: ["  ", "ack"]
+            case .ackThenBlankCompletion, .ackEmptyCompletionTrailing: [""]
+            case .ackEmptyCompletionBoundary: ["", "ack"]
+            case .ackNilCompletionBoundary: [nil, "ack"]
+            case .ackSealedPaddedAtCap, .ackSealedPaddedOverCap: ["ack"]
+            default: nil
+            }
+        }
+
+        /// Fragments streamed after the last completion — a delta reopens pending text under a
+        /// newline boundary, so `ack` + blank completion + `.` must classify as `ack\n.`, and the
+        /// separator counts against the 256-byte eligibility line: `ack` + 253 trailing spaces is
+        /// 257 bytes, over the line.
+        var ackTrailingFragments: [String]? {
+            switch self {
+            case .ackEmptyCompletionTrailing: ["."]
+            case .ackSealedPaddedAtCap: [String(repeating: " ", count: 252)]
+            case .ackSealedPaddedOverCap: [String(repeating: " ", count: 253)]
+            default: nil
+            }
+        }
     }
 
-    private func assertNativeWake(_ scenario: NativeWakeScenario, expectedAdmission: Bool, agent: AgentProviderKind = .codexExec) async throws {
-        let lateInvocation = UUID()
-        let toolOnly = scenario == .toolOnly || scenario == .lateToolOutput || scenario == .priorToolLateOutput
-        let hasSuccessor = [NativeWakeScenario.debtReceipt, .debtReceiptOmitted, .failureSuccessUnpaid, .failureSuccessPaid, .silentSuccessorPrepared, .priorToolLateOutput].contains(scenario)
-        let failsFirst = [.failure, .failureSuccessUnpaid, .failureSuccessPaid].contains(scenario)
+    /// Everything the wake suites share: one monitored session with a published status edge, an
+    /// observer behind a real bridge, and a routine wake already prepared for dispatch.
+    private struct NativeWakeFixture {
+        let vm: AgentModeViewModel
+        let tabID: UUID
+        let session: AgentTabSession
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let observerVM: AgentModeViewModel
+        let observerSession: AgentTabSession
+        let observer: AgentSessionLinkEndpointCandidate
+        let host: FakeEndpointHost
+        let bridge: AgentSessionLinkRuntimeBridge
+        let queue: AgentSessionLinkPassiveStatusNotices.Snapshot
+        let reference: DomainAgentSessionLinkReference
+        let controller: MonitorFakeCodexController
+        let claude: MonitorFakeNativeController
+        let dispatches: MonitorCodexDispatchRecorder
+        let wake: AgentSessionLinkAutoWakeAttempt
+        let workspace: WorkspaceManagerViewModel
+        let observerWorkspace: WorkspaceManagerViewModel
+    }
+
+    private func makeNativeWakeFixture(agent: AgentProviderKind) async throws -> NativeWakeFixture {
         let dispatches = MonitorCodexDispatchRecorder()
         let controller = MonitorFakeCodexController(dispatches: dispatches)
         let claude = MonitorFakeNativeController()
@@ -269,7 +525,6 @@ extension AgentSessionLinkRuntimeBridgeTests {
         )
         let tabID = UUID()
         let workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(on: vm, tabID: tabID, name: "Native wake")
-        defer { withExtendedLifetime(workspace) {} }
         let session = vm.session(for: tabID)
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
@@ -280,7 +535,6 @@ extension AgentSessionLinkRuntimeBridgeTests {
         let observerVM = AgentModeViewModel(testWindowID: 2, testWorkspacePath: FileManager.default.temporaryDirectory.path, shouldManageCodexTooling: false, codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) })
         let observerTab = UUID()
         let observerWorkspace = AgentSessionLinkEndpointTestSupport.installWorkspace(on: observerVM, tabID: observerTab, name: "Observer")
-        defer { withExtendedLifetime(observerWorkspace) {} }
         let observerSession = observerVM.session(for: observerTab)
         observerSession.selectedAgent = .openCode
         observerSession.hasLoadedPersistedState = true
@@ -291,16 +545,16 @@ extension AgentSessionLinkRuntimeBridgeTests {
         host.candidates = [observer, target]
         host.observationViewModels[sessionID] = vm
         let bridge = AgentSessionLinkRuntimeBridge(authority: makeAuthority(), host: host, toolAdvertisementInvalidator: { _ in })
-        defer { bridge.freezeForTermination() }
 
         guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: sessionID.uuidString) else {
-            return XCTFail("Reverse observation must be established")
+            XCTFail("Reverse observation must be established")
+            throw CancellationError()
         }
 
         vm.test_initializeRunService()
         if agent == .codexExec {
             await vm.test_codexCoordinator.ensureCodexNativeSession(session: session)
-        } else {
+        } else if agent == .claudeCode {
             let warm = session.beginRunAttempt(source: "test.warm.native")
             let ready = try await vm.test_claudeCoordinator.ensureClaudeNativeSession(session: session, intent: .runAttempt(ownership: warm, runID: XCTUnwrap(session.runID)))
             XCTAssertEqual(ready, .ready)
@@ -326,13 +580,68 @@ extension AgentSessionLinkRuntimeBridgeTests {
             autoWakeLanes: [.init(reference: reference, targetEndpoint: observer.domainEndpoint, targetSessionID: observer.sessionID, isEffectivelySelected: true)]
         )
         session.oversight.autoWakeOnUpdates = true
-        // Hold reservation until this test supplies the deterministic native transport.
+        // Hold reservation until the caller supplies the deterministic native transport.
         vm.agentSessionLinkPublishPassiveStatusNotices(queue, to: endpoint)
         let wake = try XCTUnwrap(session.oversight.pendingAutoWake)
         wake.task?.cancel()
         session.runState = .idle
         _ = try XCTUnwrap(vm.agentSessionLinkPrepareAutoWakeDispatch(wakeID: wake.wakeID, endpoint: endpoint))
+        return NativeWakeFixture(
+            vm: vm, tabID: tabID, session: session, endpoint: endpoint,
+            observerVM: observerVM, observerSession: observerSession, observer: observer,
+            host: host, bridge: bridge, queue: queue, reference: reference,
+            controller: controller, claude: claude, dispatches: dispatches, wake: wake,
+            workspace: workspace, observerWorkspace: observerWorkspace
+        )
+    }
+
+    /// The observer-side tail every wake fixture shares: settle the bridge, deliver the published
+    /// notices to the observer, and check whether it was actually reserved.
+    private func assertObserverAdmission(_ fixture: NativeWakeFixture, expectedAdmission: Bool) async throws {
+        // Drain @Published's scheduled observation before the serial authority chain.
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        await fixture.bridge.test_settleTargetPublications()
+        await fixture.bridge.test_settleProjections()
+        let notices = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+        XCTAssertEqual(notices.entries.count, 1, "Suppression must not erase delivery")
+        try fixture.observerVM.agentSessionLinkPublishPromptInventory(XCTUnwrap(fixture.host.publishedInventoriesByEndpoint[fixture.observer.domainEndpoint]), to: fixture.observer.domainEndpoint)
+        fixture.observerVM.agentSessionLinkPublishPassiveStatusNotices(notices, to: fixture.observer.domainEndpoint)
+        fixture.observerSession.oversight.pendingAutoWake?.task?.cancel()
+        XCTAssertEqual(fixture.observerSession.oversight.pendingAutoWake != nil, expectedAdmission)
+    }
+
+    private func assertNativeWake(_ scenario: NativeWakeScenario, expectedAdmission: Bool, agent: AgentProviderKind = .codexExec) async throws {
+        let lateInvocation = UUID()
+        let toolOnly = scenario == .toolOnly || scenario == .lateToolOutput || scenario == .priorToolLateOutput
+        let hasSuccessor = [NativeWakeScenario.debtReceipt, .debtReceiptOmitted, .failureSuccessUnpaid, .failureSuccessPaid, .silentSuccessorPrepared, .priorToolLateOutput].contains(scenario)
+        let failsFirst = [.failure, .failureSuccessUnpaid, .failureSuccessPaid].contains(scenario)
+        let fixture = try await makeNativeWakeFixture(agent: agent)
+        defer {
+            fixture.bridge.freezeForTermination()
+            withExtendedLifetime((fixture.workspace, fixture.observerWorkspace)) {}
+        }
+        let vm = fixture.vm
+        let tabID = fixture.tabID
+        let session = fixture.session
+        let endpoint = fixture.endpoint
+        let observerVM = fixture.observerVM
+        let observerSession = fixture.observerSession
+        let observer = fixture.observer
+        let host = fixture.host
+        let bridge = fixture.bridge
+        let queue = fixture.queue
+        let reference = fixture.reference
+        let controller = fixture.controller
+        let claude = fixture.claude
+        let dispatches = fixture.dispatches
+        let wake = fixture.wake
         let coordinator = vm.test_codexCoordinator
+        if scenario == .ack || scenario == .ackSettled {
+            // The routine wake's own dispatch teaches the one-token quiet reply; every other basis
+            // omits it (covered by testNativeAckOnNonRoutineWakesStaysOrdinary).
+            let routineClaim = try XCTUnwrap(vm.agentSessionLinkPromptClaim(for: session, dispatchID: .autoWake(wakeID: wake.wakeID)))
+            XCTAssertTrue(routineClaim.fragment.contains("reply exactly `ack`"), "Routine status wake teaches the exact quiet reply")
+        }
         let acceptanceGate = scenario == .terminalBeforeAcceptance ? TestReleaseFence(name: "native receipt") : nil
         defer { acceptanceGate?.release() }
         let publicationGate = scenario == .rejectedPublication || scenario == .acceptedPublication ? TestReleaseFence(name: "terminal publication") : nil
@@ -397,6 +706,65 @@ extension AgentSessionLinkRuntimeBridgeTests {
                 await claude.emit(.stream(.init(type: type, text: nil)))
             }
             await claude.emit(.stream(.init(type: "system", text: "Agent completed")))
+        }
+        if let replyFragments = scenario.ackReplyFragments {
+            for fragment in replyFragments {
+                if agent == .codexExec {
+                    await coordinator.test_handleCodexNativeEvent(.assistantDelta(fragment), session: session, sourceController: controller)
+                } else {
+                    await claude.emit(.stream(.init(type: "content", text: fragment)))
+                }
+            }
+        }
+        if let completions = scenario.ackCompletions {
+            for (index, text) in completions.enumerated() {
+                if agent == .codexExec {
+                    await coordinator.test_handleCodexNativeEvent(.assistantCompleted(.init(scope: .init(turnID: "native-turn", itemID: "m-\(index)"), text: text ?? "")), session: session, sourceController: controller)
+                } else {
+                    await claude.emit(.stream(.init(type: "final_content", text: text)))
+                }
+            }
+        }
+        if let trailing = scenario.ackTrailingFragments {
+            for fragment in trailing {
+                if agent == .codexExec {
+                    await coordinator.test_handleCodexNativeEvent(.assistantDelta(fragment), session: session, sourceController: controller)
+                } else {
+                    await claude.emit(.stream(.init(type: "content", text: fragment)))
+                }
+            }
+        }
+        if scenario == .ackQuestion {
+            if agent == .codexExec {
+                await coordinator.test_handleCodexNativeEvent(.requestUserInput(.init(
+                    requestID: .int(77),
+                    method: "item/tool/requestUserInput",
+                    threadID: "thread",
+                    turnID: "native-turn",
+                    itemID: "question-1",
+                    questions: [.init(
+                        id: "mode", header: "Mode", question: "Which mode?",
+                        isOther: true, isSecret: false,
+                        options: [.init(label: "Fast", description: ""), .init(label: "Safe", description: "")]
+                    )]
+                )), session: session, sourceController: controller)
+            } else {
+                await claude.emit(.approvalRequest(.init(
+                    requestID: .claudeControl("req-1"),
+                    method: "permission",
+                    kind: .commandExecution,
+                    threadID: "thread",
+                    turnID: "native-turn",
+                    itemID: "question-1"
+                )))
+            }
+        }
+        if scenario == .ackThenTool {
+            if agent == .codexExec {
+                await coordinator.test_handleCodexNativeEvent(.toolCall(name: "mcp__RepoPromptCE__poll", invocationID: UUID(), argsJSON: "{}"), session: session, sourceController: controller)
+            } else {
+                await claude.emit(.stream(.init(type: "tool_call", text: nil, toolName: "mcp__RepoPromptCE__poll", toolArgsJSON: "{}")))
+            }
         }
         if scenario == .visible || scenario == .debtReceipt || scenario == .debtReceiptOmitted {
             await coordinator.test_handleCodexNativeEvent(.assistantDelta("Done"), session: session, sourceController: controller)

@@ -311,7 +311,8 @@ final class AgentModeRunService {
                 runRequest: acpRunRequest,
                 providerControlCommand: providerControlCommand,
                 makeLease: makeLease,
-                stopFence: stopFence
+                stopFence: stopFence,
+                passiveWakeID: passiveWakeID
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil

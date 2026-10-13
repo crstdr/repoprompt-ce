@@ -1046,19 +1046,47 @@ publishes the tool from failures where the server projection is ready but the pr
 does not converge.
 
 
-## Silent routine check-ins (Codex and Claude Code)
+## Silent routine check-ins (Codex, Claude Code and Devin)
 
 A positively identified routine status/overflow wake may finish without admitting another routine
-wake in its observers. This applies only to first-party Codex and Claude Code native turns with an
-accepted physical dispatch, a successfully settled terminal commit, no intervening user/task input,
-no visible assistant payload and no tool occurrence. Any tool call, result or progress counts before
-hiding or deduplication. There is no hidden no-op phrase: a provider that replies keeps ordinary
-wake behavior. Attention, questions, failures, manual wakes, periodic wakes and natural input remain
-ordinary. ACP/Devin, headless, cold/restored and uncertain runtime paths are not enabled.
+wake in its observers. This applies only to first-party Codex and Claude Code native turns and to
+ACP/Devin turns routed through the shared runner, each with an accepted physical dispatch, a
+successfully settled terminal commit, no intervening user/task input, no tool occurrence, and no
+displayable assistant payload beyond the one exact quiet reply: `ack`, case-insensitive, permitting
+surrounding ASCII whitespace and at most one trailing full stop. Any other reply, any tool call,
+result or progress — counted before hiding or deduplication — keeps ordinary wake behavior.
+Attention, questions, failures, manual wakes, periodic wakes and natural input remain ordinary.
+Other ACP providers, headless, cold/restored and uncertain runtime paths are not enabled.
+
+Claude Code re-prompts a turn that ends without text, so `ack` is the dependable quiet form there.
+The routine wake's own guidance block teaches it — one line rendered only on routine status/overflow
+dispatches, never on periodic, attention, manual or piggybacked-batch turns — so a compacted context
+that has lost earlier guidance still relearns it just in time. Streamed deltas accumulate a bounded
+candidate verbatim — whitespace between visible runs is part of the reply, so `"a"+" "+"ck"`
+classifies as `a ck`, never `ack`. A provider's authoritative full message supersedes exactly the
+streamed prefix, then joins the completed-message text on a newline boundary: a turn's second
+completed `ack` cannot erase an earlier visible reply, and two completions `"a"` + `"ck"` classify
+as two messages rather than merging into `ack`. A completion carrying no displayable body —
+including an empty or absent one — supersedes nothing, but it still seals the streamed prefix as
+completed when there is one: a blank `final_content` must not leave `"ac"` fuseable with a later
+`ack` completion into the quiet token. Every event validates the post-update reply text exactly as
+the terminal classifier sees it, separator included, against the 256-byte eligibility line. Any
+merged text that can no longer resolve to the exact token vetoes
+immediately, and the veto latches — a non-quiet streamed prefix stays vetoed even if the
+authoritative completion replaces it. Approvals, permission prompts, elicitations and surfaced
+user-input requests veto on all three providers — a question raised mid-turn is exactly the kind
+of wake that must still reach observers. ACP update kinds that normalize to no events (`plan`,
+`user_message_chunk`, `available_commands_update`, unknown kinds) are invisible to the evidence
+layer exactly as they are invisible to the transcript; `user_message_chunk` in particular only
+echoes a client-issued prompt, whose input veto already fired on the send path. Reasoning content
+is likewise not reply
+text. Any future ACP subtype that does carry visible reply text must veto, which is why enablement
+stays scoped to Devin.
 
 This changes admission, not delivery. The queued status row remains available to natural turns,
-manual wakes or a wake admitted by another lane. Prompt bytes, MCP schema, Read/frontiers, public
-sequences, fingerprints, receipts and host provenance are unchanged. Unattributed overflow deliberately
+manual wakes or a wake admitted by another lane. MCP schema, Read/frontiers, public
+sequences, fingerprints, receipts and host provenance are unchanged; the only prompt-byte change is
+the routine-only guidance line above. Unattributed overflow deliberately
 fails open: an all-silent burst beyond the sixteen-row detail cap can still admit a wake when the
 existing selection/snooze rules permit it. Attributing overflow to silent sources is deferred unless
 measurement shows overflow-driven loops.
@@ -1066,7 +1094,8 @@ measurement shows overflow-driven loops.
 The existing four oversight owners stay disjoint. Their private process-memory cooperation is bounded:
 
 - **Source (`AgentTabSession`)**: one current/recent segment (reserved wake ID, exact existing
-  `AgentRunOwnership`, acquired/accepted/vetoed bits). The explicit ID flows from direct start options
+  `AgentRunOwnership`, acquired/accepted/vetoed bits, and a bounded merged reply candidate). The
+  explicit ID flows from direct start options
   through the native run-start owner; it is bound before the first running publication, not during
   preparation. Preparation retains the previous settled proof. Output, input and lifecycle mutation
   owners irreversibly veto; host receipt/save/provenance/retention bookkeeping does not. The pure
@@ -1100,6 +1129,8 @@ require an earlier tool/live/terminal identity, whose tool ingress already vetoe
 
 None of this state is persisted, exposed in Domain models or transported on MCP. Restart therefore
 retains today's ordinary behavior. Additional provider families require their own native event,
-acceptance and terminal-drain proof before enablement. Local timing diagnostics exercise warm
+acceptance and terminal-drain proof before enablement — Devin is enabled because the ACP runner
+reaches the same shared bind, acquisition, stream-veto, acceptance and terminal-drain seams with no
+further state. Local timing diagnostics exercise warm
 admission and indexed private resolution; CI asserts structural work bounds, not machine-specific
 latency thresholds.
