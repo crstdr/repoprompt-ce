@@ -946,7 +946,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 runID: XCTUnwrap(fixture.session.runID), runAttemptID: UUID()
             )
             var state = AgentSelfCompactState()
-            _ = state.reserve(note: "preserve parked continuation", idempotencyKey: "parked-read-cancellation", owner: owner)
+            _ = state.reserve(note: "preserve parked continuation", idempotencyKey: "parked-read-cancellation", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
             state.active?.compactTurnSucceeded = true
             state.active?.phase = .parked
             fixture.session.selfCompactState = state
