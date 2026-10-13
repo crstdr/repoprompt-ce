@@ -142,6 +142,11 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
     // 9 adds the granular observer-session Auto-wake target UUID set.
+    //
+    // Organizational placement (`organizationalParentID`, `delegationScopeID`) is additive and
+    // `decodeIfPresent` *without* a bump, matching the metadata index: a bump would make this build
+    // rewrite every older session file on load and would not stop an older build from dropping the
+    // fields on its own re-save. An older file decodes with no placement (spawn provenance applies).
     static let currentSerializationVersion = 9
     static let legacyUnversionedSerializationVersion = 0
 
@@ -232,6 +237,15 @@ struct AgentSession: Codable, Identifiable {
     /// Immutable creation provenance for an overseer-created top-level lane.
     var createdByOverseerSessionID: UUID?
 
+    /// Mutable organizational tree placement (delegation-scope `.tree` membership, re-parenting).
+    ///
+    /// Distinct from spawn provenance, which stays write-once: `nil` means "follow spawn provenance"
+    /// (`parentSessionID`, then `createdByOverseerSessionID`). Only scope administration writes it.
+    var organizationalParentID: UUID?
+
+    /// The delegation scope this session was created under, when one was live at creation.
+    var delegationScopeID: UUID?
+
     /// Whether this session was originally created by an MCP client (vs the user in the UI).
     /// Used to scope cleanup operations to MCP-originated sessions only.
     var isMCPOriginated: Bool
@@ -297,6 +311,8 @@ struct AgentSession: Codable, Identifiable {
         codexMcpSessionKey: String? = nil,
         parentSessionID: UUID? = nil,
         createdByOverseerSessionID: UUID? = nil,
+        organizationalParentID: UUID? = nil,
+        delegationScopeID: UUID? = nil,
         pendingHandoffPayload: String? = nil,
         pendingHandoffCreatedAt: Date? = nil,
         pendingHandoffSourceItemID: UUID? = nil,
@@ -344,6 +360,8 @@ struct AgentSession: Codable, Identifiable {
         self.codexMcpSessionKey = codexMcpSessionKey
         self.parentSessionID = parentSessionID
         self.createdByOverseerSessionID = createdByOverseerSessionID
+        self.organizationalParentID = organizationalParentID
+        self.delegationScopeID = delegationScopeID
         self.pendingHandoffPayload = pendingHandoffPayload
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
@@ -393,6 +411,8 @@ struct AgentSession: Codable, Identifiable {
         case codexMcpSessionKey
         case parentSessionID
         case createdByOverseerSessionID
+        case organizationalParentID
+        case delegationScopeID
         case pendingHandoffPayload
         case pendingHandoffCreatedAt
         case pendingHandoffSourceItemID
@@ -463,6 +483,8 @@ struct AgentSession: Codable, Identifiable {
         codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
+        organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)
+        delegationScopeID = try container.decodeIfPresent(UUID.self, forKey: .delegationScopeID)
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)

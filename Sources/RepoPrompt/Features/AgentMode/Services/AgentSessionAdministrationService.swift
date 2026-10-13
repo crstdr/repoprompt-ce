@@ -108,9 +108,17 @@ protocol AgentSessionAdministrationOperationHandler: AnyObject {
         scope: DomainDelegationScopeRecord
     ) -> [BatchConfirmationItem]
     func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value
+    /// Synchronous, operation-specific validation after the authority admitted the batch and
+    /// **before** any batch card is raised or the handler runs. A non-nil value is returned to the
+    /// caller as-is, so a structurally refused request never reaches the user's card.
+    func preflight(_ batch: AgentSessionAdministrationAuthorizedBatch) throws -> Value?
 }
 
 extension AgentSessionAdministrationOperationHandler {
+    func preflight(_: AgentSessionAdministrationAuthorizedBatch) -> Value? {
+        nil
+    }
+
     func confirmationItems(
         for request: AgentSessionAdministrationRequest,
         scope _: DomainDelegationScopeRecord
@@ -211,10 +219,11 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         var usage: [UUID: DomainDelegationScopeUsage] = [:]
         if request.operation.scopeGuardrailUse != nil {
             for record in chain {
-                usage[record.id] = projector.usage(
+                // In-flight creations (spawn, fork, worktree_create) count until they settle.
+                usage[record.id] = scopes.usageIncludingReservations(projector.usage(
                     of: record.grant,
                     spawnParentSessionID: request.targetSessionIDs.first
-                )
+                ))
             }
         }
         let confirmation = request.confirmationID.flatMap {
@@ -265,6 +274,7 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         case let .scopeSelectionRequired(scopeIDs):
             return .scopeSelectionRequired(scopeIDs: scopeIDs)
         case let .confirmationRequired(reason, pending):
+            if let refusal = try handler.preflight(pending) { return .completed(refusal) }
             // Lane B owns preview rendering; until then a preview reports the requirement only.
             guard !request.preview, let idempotencyKey = request.idempotencyKey else {
                 return .denied(.confirmationRequired(reason: reason), sessionID: nil)
@@ -289,15 +299,26 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         case let .denied(denial, sessionID):
             return .denied(denial, sessionID: sessionID)
         case let .authorized(batch):
+            // Structural refusals are decided before any card is claimed, exactly as before a card
+            // is raised in the branch above; nothing is applied, so the card stays approved.
+            if let refusal = try handler.preflight(batch) { return .completed(refusal) }
             // Every supplied approval is bound and claimed once, even if unticking items brought
             // the application below the threshold. No-card under-threshold calls remain allowed.
+            // The claim happens before the handler suspends (so a concurrent replay cannot
+            // double-apply); the handler re-checks `DelegationScopeRuntime.isCurrent(_:)` after its
+            // own suspensions.
             let claimedCard = batch.confirmation?.confirmationID
             if let claimedCard, !scopes.confirmations.beginApplying(confirmationID: claimedCard) {
                 return .denied(.confirmationMismatch, sessionID: nil)
             }
             do {
                 let value = try await handler.perform(batch)
-                if let claimedCard { scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: true) }
+                // A handler refusal after its own re-checks (state changed since the card) applied
+                // nothing: the card returns to `approved` rather than being consumed.
+                if let claimedCard {
+                    let applied = value.objectValue?["result"]?.stringValue != "denied"
+                    scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: applied)
+                }
                 return .completed(value)
             } catch {
                 if let claimedCard { scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: false) }

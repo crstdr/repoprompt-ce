@@ -669,9 +669,22 @@ struct AgentRunMCPToolService {
         let effectiveParentWorktreeInheritance = worktreeStartRequest.inheritParentWorktreeBindings
             && !worktreeStartRequest.hasExplicitWorktreeArgs
         let usesRoutedParentSource = parentSourceTabID != nil
+        // Main's resident activation fence is decided before any delegated spawn admission.
         if let residentActivationTarget {
             try agentModeVM.mcpRequireResidentActivationFence(residentActivationTarget)
         }
+        // Scope-only: when this start adds a member to a delegation scope (a new tab, an empty tab, or
+        // a `tab_id` whose session has no tree placement and will take this spawn parent), the scope's
+        // guardrails apply and the session auto-joins. An already-placed session (adopted, spawned, a
+        // lane) is never stamped, another overseer's lane is not moved between scopes, and a scope
+        // anchor is never grafted. `nil` for every other caller, whose start is unchanged.
+        let spawnAdmission = spawnParentSessionID == nil
+            ? nil
+            : try DelegationSpawnAdmission.admitOrThrow(
+                creatorSessionID: spawnParentSessionID,
+                target: agentModeVM.delegationSpawnTarget(tabID: resolvedTabID, creatorSessionID: spawnParentSessionID)
+            )
+        defer { DelegationSpawnAdmission.finish(spawnAdmission) }
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: resolvedTabID,
             sessionID: nil,
@@ -687,6 +700,9 @@ struct AgentRunMCPToolService {
             await discardStartTargetIfSafe(target, agentModeVM: agentModeVM, startScope: startScope)
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
         }
+        await DelegationSpawnAdmission.stamp(spawnAdmission, newSessionID: targetSessionID, viewModel: agentModeVM)
+        // The new member is visible to the projector now; the reservation is not held through the run.
+        DelegationSpawnAdmission.finish(spawnAdmission)
         #if DEBUG
             if worktreeStartupBenchmarkToken != nil {
                 do {

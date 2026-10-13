@@ -756,11 +756,15 @@ final class DelegationMembershipCensusTests: XCTestCase {
             )
         }
         let source = CountingSource(rows)
-        let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
+        var projector = SpawnProvenanceDelegationMembershipProjector(source: source)
+        projector.ownedUnreleasedWorktreeIDs = { members in
+            XCTAssertEqual(members, Set(rows.map(\.sessionID)))
+            return ["shared", "owned-unbound"]
+        }
         let scope = grant(.tree(rootSessionID: root), grantee: root)
         let usage = projector.usage(of: scope, spawnParentSessionID: rows.last?.sessionID)
         XCTAssertEqual(usage.liveSessionCount, 751)
-        XCTAssertEqual(usage.worktreeCount, 500)
+        XCTAssertEqual(usage.worktreeCount, 2)
         XCTAssertEqual(usage.spawnParentDepth, 1)
         XCTAssertEqual(source.censusReads, 1)
         XCTAssertEqual(source.individualReads, 0)
@@ -770,6 +774,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
 
         // A later synchronous call must see changed ownership/liveness, not a cached census.
         source.rows = [row(root, workspace: workspace, live: false)]
+        projector.ownedUnreleasedWorktreeIDs = { _ in [] }
         XCTAssertEqual(projector.usage(of: scope, spawnParentSessionID: nil).liveSessionCount, 0)
         XCTAssertEqual(source.censusReads, 3)
     }
@@ -927,9 +932,9 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 0, "Placement walks must not census liveness for each ancestor")
         XCTAssertEqual(projector.targetState(for: child), .running, "State-dependent authority still resolves real liveness")
         XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
-        entries[child]?.parentSessionID = UUID()
+        entries[child]?.organizationalParentID = UUID()
         window.agentModeViewModel.test_installSessionIndexSnapshot(entries, owner: owner, latestOwner: owner, activeWorkspace: workspace)
-        XCTAssertNil(projector.membershipProof(for: child, in: scope), "A same-turn parent change cannot ride the preceding placement proof")
+        XCTAssertNil(projector.membershipProof(for: child, in: scope), "A same-turn reparent cannot ride the preceding placement proof")
         XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
         window.agentModeViewModel.test_installSessionIndexSnapshot(entries, owner: owner, latestOwner: .init(workspaceID: UUID(), activationEpoch: 2), activeWorkspace: workspace)
         XCTAssertNil(projector.membershipProof(for: child, in: grant(.workspace(workspaceID: workspace.id), grantee: root)), "Stale-owner indexes remain unavailable")
@@ -1036,6 +1041,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
             createdByOverseerSessionID: nil,
             isLive: live,
             worktreeCount: worktrees.count,
+            boundWorktreeIDs: worktrees,
             runState: live ? .idle : .unknown
         )
     }

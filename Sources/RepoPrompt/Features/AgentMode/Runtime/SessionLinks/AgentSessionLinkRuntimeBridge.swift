@@ -860,6 +860,45 @@ enum AgentSessionLinkInvalidationSink {
     }
 }
 
+// MARK: - Delegated Add authority
+
+/// The live delegated-scope authority behind one `session_admin link` Add.
+///
+/// A caller-side check before `addMonitorLink` cannot cover the Add's own suspensions (persistence
+/// admission, the pair lanes, the durable insert, reservation, activation), so the predicate travels
+/// with the transaction and is re-proved synchronously at each commit point, after the preceding hop:
+/// before the durable insert, before and after reservation, immediately before `activateLink`, after
+/// activation, and in the caller-side completion fence. A failed proof fails closed through the
+/// transaction's existing rollback: an unactivated reservation is abandoned, only this transaction's
+/// own grant reference is revoked, and only a durable row this transaction freshly inserted is
+/// compensated (expected token and assertion generation). A pre-existing or concurrently reasserted
+/// row or grant is never removed. Ordinary user Add and launch restoration never carry one.
+///
+/// Compared by identity so a delegated Add never joins another caller's establishment.
+@MainActor
+final class AgentSessionLinkDelegatedAddAuthorization: Hashable {
+    private let isCurrentPredicate: @MainActor () -> Bool
+
+    init(isCurrent: @escaping @MainActor () -> Bool) {
+        isCurrentPredicate = isCurrent
+    }
+
+    var isCurrent: Bool {
+        isCurrentPredicate()
+    }
+
+    nonisolated static func == (
+        lhs: AgentSessionLinkDelegatedAddAuthorization,
+        rhs: AgentSessionLinkDelegatedAddAuthorization
+    ) -> Bool {
+        lhs === rhs
+    }
+
+    nonisolated func hash(into hasher: inout Hasher) {
+        hasher.combine(ObjectIdentifier(self))
+    }
+}
+
 // MARK: - Bridge
 
 /// MainActor bridge between live window/tab/session bindings and the process-wide
@@ -972,23 +1011,34 @@ final class AgentSessionLinkRuntimeBridge {
         /// Only lane creation needs an exact direct relationship, in either direction.
         let requiresExistingDirectLink: Bool
         let laneCreationActivation: LaneCreationActivationBasis?
+        /// Delegated (`session_admin`) Adds carry the caller's live scope authority through the
+        /// transaction; see `AgentSessionLinkDelegatedAddAuthorization`.
+        let delegatedAuthorization: AgentSessionLinkDelegatedAddAuthorization?
 
         init(
             observer: DomainAgentSessionLinkEndpointIdentity?,
             target: DomainAgentSessionLinkEndpointIdentity?,
             requiresExistingOutboundLink: Bool = false,
             requiresExistingDirectLink: Bool = false,
-            laneCreationActivation: LaneCreationActivationBasis? = nil
+            laneCreationActivation: LaneCreationActivationBasis? = nil,
+            delegatedAuthorization: AgentSessionLinkDelegatedAddAuthorization? = nil
         ) {
             self.observer = observer
             self.target = target
             self.requiresExistingOutboundLink = requiresExistingOutboundLink
             self.requiresExistingDirectLink = requiresExistingDirectLink
             self.laneCreationActivation = laneCreationActivation
+            self.delegatedAuthorization = delegatedAuthorization
         }
 
         var isEmpty: Bool {
             observer == nil && target == nil
+        }
+
+        /// Caller authority that can end while the transaction is suspended, and so is re-proved at
+        /// the durable insert, around reservation, and around activation — not only up front.
+        var requiresLiveRecheck: Bool {
+            laneCreationActivation != nil || delegatedAuthorization != nil
         }
 
         func matches(
@@ -1163,17 +1213,21 @@ final class AgentSessionLinkRuntimeBridge {
     /// Delegation-scope state (an authority *input* to oversight; it owns none of the four owners'
     /// responsibilities). Like `intentStore`, its durable store is installed by app composition.
     let delegationScopes = DelegationScopeRuntime()
+    /// Durable worktree ownership for delegated worktree creation/release; installed at launch.
+    let worktreeOwnership = WorktreeOwnershipStore()
     /// The single shared administration service behind `session_admin` and future UI dispatchers.
-    private(set) lazy var sessionAdministration = AgentSessionAdministrationCore(
+    private(set) lazy var sessionAdministration = AgentSessionAdministrationCore.makeProduction(
         scopes: delegationScopes,
-        projector: SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource())
+        worktreeOwnership: worktreeOwnership
     )
     /// `session_admin`'s entry point: filters, preview, idempotency, undo, and apply-on-approval over
-    /// `sessionAdministration`, which keeps the single authority check. Registers the organizing ops.
-    private(set) lazy var sessionAdministrationFrontDoor = AgentSessionAdministrationFrontDoor.production(
-        core: sessionAdministration,
-        scopes: delegationScopes
-    )
+    /// `sessionAdministration`, which keeps the single authority check. Registers the organizing ops
+    /// and the structure/lifecycle/worktree ops.
+    private(set) lazy var sessionAdministrationFrontDoor: AgentSessionAdministrationFrontDoor = {
+        let frontDoor = AgentSessionAdministrationFrontDoor.production(core: sessionAdministration, scopes: delegationScopes)
+        frontDoor.registerStructureHandlers(scopes: delegationScopes, worktreeOwnership: worktreeOwnership)
+        return frontDoor
+    }()
 
     /// Read-only oversight inventory for `session_admin links`/`tree`: every live link plus every
     /// durable intent. Authority over any of them is decided elsewhere; unlinking still goes through
@@ -1401,6 +1455,9 @@ final class AgentSessionLinkRuntimeBridge {
         /// Emulates scheduling delay at the final cap-admission caller authorization hop.
         var test_beforeLaneCapCallerValidation: (@MainActor () async -> Void)?
         var test_afterAddInsertionBeforeEstablishment: (@MainActor (AgentSessionOversightIntent) async -> Void)?
+        /// Deterministic interleaving seam inside the pair retirement lane, after persistence admission
+        /// and the Add's own precondition hops, immediately before the final pre-insert fence.
+        var test_beforeDurableAddInsert: (@MainActor (AgentSessionOversightIntent) async -> Void)?
         /// Parks the exact entry owner after its mutation, before outer compensation/cap release.
         var test_afterActivationBackedEstablishmentMutation: (@MainActor (AgentSessionOversightIntent, Bool) async -> Void)?
         /// Signals that an Add is waiting behind another complete establishment for the same
@@ -2646,6 +2703,31 @@ final class AgentSessionLinkRuntimeBridge {
         )
     }
 
+    /// Exact endpoint Add on behalf of a delegated `session_admin link`.
+    ///
+    /// Same shared durable core as every other Add; the delegated authority is re-proved at each of
+    /// its commit points (see `AgentSessionLinkDelegatedAddAuthorization`), so a scope revoked or a
+    /// membership lost while the transaction is suspended fails closed instead of leaving a durable
+    /// managed link behind.
+    func addDelegatedMonitorLink(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        authorization: AgentSessionLinkDelegatedAddAuthorization
+    ) async -> AgentMonitorAddOutcome {
+        await addMonitorLink(
+            pair: AgentSessionOversightIntent(
+                observerSessionID: observerEndpoint.sessionID,
+                targetSessionID: targetEndpoint.sessionID
+            ),
+            expectedEndpoints: AddEndpointExpectations(
+                observer: observerEndpoint,
+                target: targetEndpoint,
+                delegatedAuthorization: authorization
+            ),
+            proof: nil
+        )
+    }
+
     /// Complete durable Add transaction for one canonical pair.
     ///
     /// Passing neither exact endpoint preserves pasted-ID Add and launch-restoration behavior.
@@ -2758,7 +2840,11 @@ final class AgentSessionLinkRuntimeBridge {
                       await authority.hasActiveLink(endpoint: observerEndpoint)
                 else { return .refused(.failed(.closing)) }
             }
-            guard expectedEndpoints.laneCreationActivation == nil || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+            #if DEBUG
+                await test_beforeDurableAddInsert?(pair)
+            #endif
+            // Last fence before anything durable is written; no suspension follows it before the insert.
+            guard !expectedEndpoints.requiresLiveRecheck || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
                 return .refused(.failed(.rebinding))
             }
             guard let store else {
@@ -2781,18 +2867,29 @@ final class AgentSessionLinkRuntimeBridge {
                 #if DEBUG
                     if receipt.outcome == .unchanged { logPairLane(pair: pair, outcome: "reused") }
                 #endif
+                // A delegated Add reasserting a row that still owes a cleanup (the user stopped it but
+                // the removal failed to write) only counts as a reassertion once it is established:
+                // its scope authority can still end, and retiring the cleanup now would keep the row
+                // the user stopped. The bumped assertion generation already fences Retry out of this
+                // row until the outcome is settled below.
+                let defersCleanupReassertion = expectedEndpoints.delegatedAuthorization != nil
+                    && receipt.outcome == .unchanged
+                    && launchCoordinator?.pendingCleanupToken(for: pair) == token
                 // Retires any failed automatic cleanup for this pair, still holding the lane: the
                 // user has reasserted it, so neither a queued **Retry saving** nor a launch
                 // retirement may delete what they just recreated.
-                launchCoordinator?.noteInteractiveTokenChange(
-                    pair: pair,
-                    token: token,
-                    assertedAt: assertionGeneration
-                )
+                if !defersCleanupReassertion {
+                    launchCoordinator?.noteInteractiveTokenChange(
+                        pair: pair,
+                        token: token,
+                        assertedAt: assertionGeneration
+                    )
+                }
                 return .inserted(
                     token: token,
                     assertionGeneration: assertionGeneration,
-                    insertedDurableIntent: receipt.outcome == .applied
+                    insertedDurableIntent: receipt.outcome == .applied,
+                    defersCleanupReassertion: defersCleanupReassertion
                 )
             case .writeFailed:
                 return .refused(.rejected(message: AgentSessionOversightPersistenceCopy.addWriteFailed))
@@ -2803,13 +2900,15 @@ final class AgentSessionLinkRuntimeBridge {
         let token: AgentSessionOversightIntentToken?
         let assertionGeneration: UInt64?
         let insertedDurableIntent: Bool
+        let defersCleanupReassertion: Bool
         switch insertion {
         case let .refused(refusal):
             return refusal
-        case let .inserted(value, generation, inserted):
+        case let .inserted(value, generation, inserted, defers):
             token = value
             assertionGeneration = generation
             insertedDurableIntent = inserted
+            defersCleanupReassertion = defers
         }
 
         // The insert is committed. A freeze that lands now preserves the token for the next launch
@@ -2831,6 +2930,17 @@ final class AgentSessionLinkRuntimeBridge {
             expectedEndpoints: expectedEndpoints
         )
         let outcome = establishment.outcome
+        // Settles a deferred delegated reassertion: an established link retires the pending cleanup
+        // exactly as an interactive Add does; a failed one moves that cleanup onto the generation this
+        // insert asserted, so **Retry saving** still removes the row the user stopped.
+        if defersCleanupReassertion, let token {
+            if outcome.failureMessage == nil {
+                launchCoordinator?.noteInteractiveTokenChange(pair: pair, token: token, assertedAt: assertionGeneration)
+            } else {
+                launchCoordinator?.noteCleanupPending(pair: pair, token: token, assertedAt: assertionGeneration)
+            }
+            publishPersistencePresentation()
+        }
         guard !establishment.preservesDurableIntentOnFailure else { return outcome }
         // An idempotent `.unchanged` insertion reasserted a row that predates this attempt. A later
         // transient resolution failure must never compensate that existing durable relationship away.
@@ -3007,7 +3117,8 @@ final class AgentSessionLinkRuntimeBridge {
         case inserted(
             token: AgentSessionOversightIntentToken?,
             assertionGeneration: UInt64?,
-            insertedDurableIntent: Bool
+            insertedDurableIntent: Bool,
+            defersCleanupReassertion: Bool = false
         )
         case refused(AgentMonitorAddOutcome)
     }
@@ -3253,7 +3364,7 @@ final class AgentSessionLinkRuntimeBridge {
                 bookkeepingByReference.removeValue(forKey: Self.reference(for: pending))
                 return EstablishmentResult(outcome: .failed(.closing))
             }
-            guard expectedEndpoints.laneCreationActivation == nil || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+            guard !expectedEndpoints.requiresLiveRecheck || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
                 await authority.abandonReservation(pending)
                 bookkeepingByReference.removeValue(forKey: Self.reference(for: pending))
                 return EstablishmentResult(outcome: .failed(.rebinding))
@@ -3307,7 +3418,7 @@ final class AgentSessionLinkRuntimeBridge {
             if let proof, !liveCandidatesStillMatch(proof) {
                 return EstablishmentResult(outcome: .failed(.rebinding))
             }
-            guard expectedEndpoints.laneCreationActivation == nil || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+            guard !expectedEndpoints.requiresLiveRecheck || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
                 return EstablishmentResult(outcome: .failed(.rebinding), preservesDurableIntentOnFailure: true)
             }
             bookkeepingByReference[reference] = ReferenceBookkeeping(
@@ -3338,7 +3449,7 @@ final class AgentSessionLinkRuntimeBridge {
                     outcome: .failed(.closing), preservesDurableIntentOnFailure: true
                 )
             }
-            guard expectedEndpoints.laneCreationActivation == nil || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+            guard !expectedEndpoints.requiresLiveRecheck || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
                 return EstablishmentResult(outcome: .failed(.rebinding), preservesDurableIntentOnFailure: true)
             }
             return EstablishmentResult(
@@ -3438,10 +3549,12 @@ final class AgentSessionLinkRuntimeBridge {
             initialSnapshot: seed,
             sourcePublicationSequence: seedSequence
         )
-        /// The new first-lane exception must not publish inventory for a consumed activation.
-        /// Rollback remains in this transaction owner and compensates its own fresh durable insert.
+        /// The new first-lane exception, and a delegated Add whose scope authority ended during the
+        /// activation hop, must not publish inventory for a consumed activation. Rollback remains in
+        /// this transaction owner: it revokes only this activation's own grant and compensates only
+        /// its own fresh durable insert.
         func settleStaleLaneActivation(_ value: DomainAgentSessionLinkActivation) async -> EstablishmentResult? {
-            guard expectedEndpoints.laneCreationActivation != nil,
+            guard expectedEndpoints.requiresLiveRecheck,
                   !liveCandidatesStillMatch(expectedEndpoints, pair: pair) else { return nil }
             host.agentSessionLinkReleasePromptInventoryHold(hold, for: observerEndpoint, publishing: nil)
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
@@ -3654,6 +3767,9 @@ final class AgentSessionLinkRuntimeBridge {
         pair: AgentSessionOversightIntent,
         candidates: [AgentSessionLinkEndpointCandidate]
     ) -> Bool {
+        // Evaluated synchronously with the endpoint proof, so every commit point that re-proves the
+        // exact incarnations also re-proves the delegated scope authority behind the Add.
+        if let delegated = expectations.delegatedAuthorization, !delegated.isCurrent { return false }
         guard case let .success(observer) = resolveAddCandidate(
             sessionID: pair.observerSessionID,
             expectedEndpoint: expectations.observer,
@@ -6532,6 +6648,13 @@ final class AgentSessionLinkRuntimeBridge {
     /// paths above, and `request_attention` continues to authorize through its exact inverse proof.
     func hasActiveLink(endpoint: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
         await authority.hasActiveLink(endpoint: endpoint)
+    }
+
+    /// Exact-pair active link for delegation-scope `link` (report as-is, never upgrade) and `unlink`
+    /// (reference for the ordinary Stop). Bookkeeping only: the scope authority already authorized
+    /// the operation, and Add/Stop below remain the only mutation paths.
+    func delegationActiveLink(observerSessionID: UUID, targetSessionID: UUID) async -> DomainAgentSessionLinkInventoryItem? {
+        await authority.links(forObserver: observerSessionID).items.first { $0.targetSessionID == targetSessionID }
     }
 
     // MARK: - Sanitized read
