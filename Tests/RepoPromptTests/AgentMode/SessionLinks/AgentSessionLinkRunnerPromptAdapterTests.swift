@@ -1173,7 +1173,56 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         h.indexes[0] = session.localInputIndex
         h.edge()
         let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
-        XCTAssertNil(claim.localInput, "a removed row is deleted, never disclosed")
+        // The deleted record's ordinal was already allocated, so it surfaces only as an
+        // omission count — its content is never rendered or disclosed.
+        let rendered = claim.localInput?.requirements.flatMap(\.renderedRecords) ?? []
+        XCTAssertFalse(rendered.contains { $0.itemID == input.id })
+        XCTAssertTrue(claim.localInput?.fragment.contains("user_inputs_omitted=\"1\"") == true)
+    }
+
+    /// Removing two settled rows while a third survives must not tombstone the survivor:
+    /// batch deletions match by identity, never by (already-shifted) positions.
+    func testBatchRemovingTwoTrackedInputsPreservesSurvivor() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        _ = Self.settleQueuedInterruptInput("W1", on: session)
+        _ = Self.settleQueuedInterruptInput("W2", on: session)
+        let survivor = Self.settleQueuedInterruptInput("W3", on: session)
+        let epoch = session.localInputIndex.epoch
+
+        XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
+            items.removeAll { $0.text == "W1" || $0.text == "W2" }
+        })
+        XCTAssertEqual(session.localInputIndex.epoch, epoch)
+        let record = try XCTUnwrap(session.localInputIndex.records.first { $0.itemID == survivor.id })
+        XCTAssertFalse(record.isDeleted, "a surviving tracked row must not be tombstoned")
+
+        h.indexes[0] = session.localInputIndex
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        let decoration = try XCTUnwrap(claim.localInput, "the surviving record is still owed")
+        XCTAssertTrue(decoration.requirements.contains { $0.renderedRecords.contains { $0.itemID == survivor.id } })
+        XCTAssertTrue(decoration.fragment.contains("W3"))
+        XCTAssertTrue(decoration.fragment.contains("user_inputs_omitted=\"2\""))
+    }
+
+    /// A batch that removes an unsettled candidate's row retires the token: the producer's row
+    /// is gone, so a late settle must not allocate an ordinal through the canonical path.
+    func testBatchRemovalRetiresUnsettledCandidate() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let item = AgentChatItem.user("W1", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(item)
+        let position = try XCTUnwrap(session.items.firstIndex(where: { $0.id == item.id }))
+        let token = session.registerLocalComposerCandidate(itemID: item.id, at: position)
+
+        XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
+            items.removeAll { $0.id == item.id }
+        })
+        XCTAssertFalse(session.settleLocalComposerOrigin(token, disposition: .retained))
+        XCTAssertFalse(session.localInputIndex.records.contains { $0.itemID == item.id })
     }
 
     /// A genuine structural replacement still rotates the epoch: the reseeded record is baseline
