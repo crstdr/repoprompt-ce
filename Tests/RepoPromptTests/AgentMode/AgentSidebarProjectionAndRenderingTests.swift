@@ -396,8 +396,7 @@ final class AgentSidebarSearchFieldDeferralTests: XCTestCase {
         tabs.append(contentsOf: ordinary)
         let rows = AgentModeSidebarSessionBuilder(
             allTabs: tabs, rowTabs: tabs, sessions: sessions, authoritativeSessionIDByTabID: bindings,
-            sessionIndex: [:], sessionListSortDates: [:], sessionListCacheReady: true,
-            sidebarRestoreFrozenOrderByTabID: [:], mcpControlledTabIDs: []
+            sessionIndex: [:], sessionListSortDates: [:], restoreBaseline: nil, mcpControlledTabIDs: []
         ).build()
         XCTAssertEqual(rows.filter(\.isPinned).map(\.depth), Array(repeating: 2, count: threadCount))
         let paged = viewModel.pagedSidebarSessions(filteredSessions: rows, currentTabID: nil)
@@ -1526,8 +1525,7 @@ final class AgentSidebarHostedTapTests: XCTestCase {
             ),
             sessionIndex: Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),
             sessionListSortDates: [:],
-            sessionListCacheReady: true,
-            sidebarRestoreFrozenOrderByTabID: [:],
+            restoreBaseline: nil,
             mcpControlledTabIDs: []
         ).build()
     }
