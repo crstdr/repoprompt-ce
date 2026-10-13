@@ -1136,7 +1136,9 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         let epoch = session.localInputIndex.epoch
 
         XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
-            for index in items.indices where items[index].isStreaming { items[index].isStreaming = false }
+            for index in items.indices where items[index].isStreaming {
+                items[index].isStreaming = false
+            }
             items.insert(AgentChatItem.system("Turn boundary", sequenceIndex: -1), at: 0)
         })
         XCTAssertEqual(session.localInputIndex.epoch, epoch)
@@ -1265,8 +1267,10 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         let input = Self.settleQueuedInterruptInput("W1", on: session)
         let stampedRow = try XCTUnwrap(session.items.first { $0.id == input.id })
         XCTAssertEqual(stampedRow.userInputOrigin, .localComposer)
-        XCTAssertFalse(session.localInputIndex.records.contains { $0.itemID == input.id },
-                       "settle is dropped while the seed is pending")
+        XCTAssertFalse(
+            session.localInputIndex.records.contains { $0.itemID == input.id },
+            "settle is dropped while the seed is pending"
+        )
 
         var seed = Index.Seed()
         seed.append(stampedRow)
@@ -1276,6 +1280,50 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         h.edge()
         let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
         XCTAssertNil(claim.localInput, "the new epoch baselines the reseeded row — no disclosure")
+    }
+
+    /// A batch that edits a tracked row is a per-record replace: `contentVersion` bumps so a
+    /// proof taken pre-edit fails closed, and the next claim renders the edited text.
+    func testBatchEditingTrackedInputBumpsContentVersionAndRendersEdit() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        let epoch = session.localInputIndex.epoch
+        let originalVersion = try XCTUnwrap(
+            session.localInputIndex.records.first { $0.itemID == input.id }?.contentVersion
+        )
+
+        XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
+            guard let index = items.firstIndex(where: { $0.id == input.id }) else { return }
+            items[index].text = "W1 edited"
+        })
+        XCTAssertEqual(session.localInputIndex.epoch, epoch, "an in-place edit is not structural")
+        let record = try XCTUnwrap(session.localInputIndex.records.first { $0.itemID == input.id })
+        XCTAssertNotEqual(record.contentVersion, originalVersion, "edited content is a new version")
+
+        h.indexes[0] = session.localInputIndex
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        XCTAssertTrue(claim.localInput?.fragment.contains("W1 edited") == true)
+        XCTAssertFalse(claim.localInput?.fragment.contains(">W1<") == true)
+    }
+
+    /// A batch carrying a duplicate of a tracked ID is a genuine identity change: duplicate-ID
+    /// repair rekeys or drops the copy, `didRepair` routes the commit to structural invalidation.
+    func testBatchWithDuplicateIDRotatesEpoch() {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        let epoch = session.localInputIndex.epoch
+
+        var duplicate = input
+        duplicate.text = "W1 duplicate"
+        XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
+            items.append(duplicate)
+        })
+        XCTAssertNotEqual(session.localInputIndex.epoch, epoch, "rekeyed identity is structural")
     }
 
     /// Removing two settled rows while a third survives must not tombstone the survivor:
@@ -1356,7 +1404,7 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
 
     /// The batch reconciliation on the hot path is bounded by the tracked set: a flag-only
     /// finalization over a 1,200-row session stays within budget.
-    func testLocalInputBatchReconciliationCostAtScale() throws {
+    func testLocalInputBatchReconciliationCostAtScale() {
         let session = Self.makeRunningSession(agent: .claudeCode)
         let rows = (0 ..< 1200).map { AgentChatItem.assistant("history \($0)", sequenceIndex: $0) }
         session.replaceItems(rows)
