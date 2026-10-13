@@ -3582,6 +3582,11 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         finishEventsAfterSend = value
     }
 
+    func emit(_ event: NativeAgentRuntimeEvent) {
+        _ = events
+        continuation?.yield(event)
+    }
+
     func setTurnInFlight(_ value: Bool) {
         turnInFlight = value
     }
@@ -3723,6 +3728,12 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private var activeTurnID: String?
     private var threadStarted = false
     private var startOrResumeHook: (@Sendable () async -> Void)?
+    private var sendGate: TestReleaseFence?
+
+    func setSendGate(_ gate: TestReleaseFence?) {
+        lock.withLock { sendGate = gate }
+    }
+
     /// When set, `steerUserTurn` throws it instead of accepting, which is how the runtime lands in
     /// the queued-fallback path.
     var steerFailure: CodexTurnSteerError?
@@ -3815,6 +3826,8 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
         started.append(text)
         lock.unlock()
         let submissionNumber = dispatches.recordStart(text)
+        let gate = lock.withLock { sendGate }
+        await gate?.enterAndWait()
         return CodexTurnStartReceipt(provisionalSubmissionID: "sub-\(submissionNumber)")
     }
 

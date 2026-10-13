@@ -18031,6 +18031,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             flushPendingAssistantDelta(session)
         }
 
+        session.notePassiveWakeInput()
         // An accepted local or managed steer owns the boundary before its user row is published.
         agentSelfCompactCancelForAcceptedLocalInput(session)
         let userItem = AgentChatItem.user(
@@ -19833,6 +19834,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return nil
             }
         }
+        if directStartOptions.laneUpdateWakeID == nil { session.notePassiveWakeInput() }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         guard periodicStartIsCurrent(), stopFence.permitsStart(of: session) else { return nil }
         await prepareMCPWaitTrackingForRunStart(session: session, stopFence: stopFence)
@@ -19891,7 +19893,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome,
             stopFence: stopFence,
-            localComposerCandidate: directStartOptions.localComposerCandidate
+            localComposerCandidate: directStartOptions.localComposerCandidate,
+            passiveWakeID: directStartOptions.laneUpdateWakeID
         )
     }
 
@@ -20182,6 +20185,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await MainActor.run {
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID else { return }
+            // Reuse the renderer's existing lifecycle filter, rather than maintaining a second
+            // phrase list that could drift and misclassify an otherwise silent native turn.
+            let isHiddenLifecycleSystemMessage = result.type == "system"
+                && ["Agent initialized", "Agent completed", "Agent cancelled"].contains(result.text ?? "")
+            switch result.type {
+            case "content", "final_content": session.notePassiveWakeAssistantText(result.text)
+            case "tool_call", "tool_result", "tool_progress", "error": session.notePassiveWakeActivity()
+            case "event": session.notePassiveWakeActivity()
+            case "system":
+                if isHiddenLifecycleSystemMessage { break }
+                session.notePassiveWakeActivity()
+            case "auth_status": session.notePassiveWakeAssistantText(result.text)
+            case "reasoning", "status", "usage", "session_state_changed", "task_progress", AIStreamResult.lifecycleType: break
+            case "message_stop":
+                if let providerSessionID = result.providerSessionID, providerSessionID != session.providerSessionID {
+                    session.invalidatePassiveWakeEvidence()
+                }
+            default: session.invalidatePassiveWakeEvidence()
+            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
@@ -20453,8 +20475,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     flushPendingAssistantDelta(session)
                     endActiveAssistantSegment(session)
                     // Filter out agent lifecycle messages that shouldn't appear in chat
-                    let skipMessages = ["Agent initialized", "Agent completed", "Agent cancelled"]
-                    guard !skipMessages.contains(text) else { break }
+                    guard !isHiddenLifecycleSystemMessage else { break }
                     let systemItem = AgentChatItem.system(text, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(systemItem)
                     shouldUpdateBindings = true
@@ -21407,6 +21428,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let claim = released == nil ? claim : released?.claim
         switch origin {
         case .user:
+            session.notePassiveWakeInput()
             // Estimated from the decorated text, not the augmented text: this is what the provider is
             // actually handed, and the supplement it may carry can run to the renderer's full byte
             // budget. Measuring the undecorated string would leave that entirely outside accounting.

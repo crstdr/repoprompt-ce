@@ -36,6 +36,8 @@ final class AgentSessionLinkRunnerHarness {
     /// (buggy) composition point sat in. A test uses it to prove composition reads membership *after*
     /// that suspension.
     var onAttachmentsConsumed: (@MainActor () -> Void)?
+    var nativeTranscriptHost: AgentModeViewModel?
+    var onNativeStreamResult: (@MainActor (AIStreamResult, AgentTabSession, UUID, UUID) async -> Void)?
 
     /// Runs while the message is being built, i.e. the last synchronous MainActor point before the
     /// headless runner's lease `providerInitializationStarted` hop. A test uses it to enqueue a
@@ -169,11 +171,13 @@ final class AgentSessionLinkRunnerHarness {
                 scheduleSave: { _ in }
             ),
             transcript: .init(
-                handleHeadlessStreamResult: { _, _, _, _ in },
-                finalizeStreamingItems: { _ in },
+                handleHeadlessStreamResult: { result, session, runID, attemptID in
+                    await harnessBox?.onNativeStreamResult?(result, session, runID, attemptID)
+                },
+                finalizeStreamingItems: { session in harnessBox?.nativeTranscriptHost?.finalizeStreamingItems(in: session) },
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-                flushPendingAssistantDelta: { _ in },
+                flushPendingAssistantDelta: { session in harnessBox?.nativeTranscriptHost?.flushPendingAssistantDelta(session) },
                 clearPendingAssistantDelta: { _ in }
             ),
             providerInput: .init(

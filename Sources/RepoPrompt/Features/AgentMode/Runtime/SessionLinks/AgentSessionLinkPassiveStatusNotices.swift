@@ -58,6 +58,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         let idleSince: Date?
         let waitingOn: DomainAgentSessionWaitingOn?
         let latestVisibleAssistantPreview: String?
+        var passiveWakeEvidence: AgentSessionLinkPassiveWakeEvidence
 
         init(
             reference: DomainAgentSessionLinkReference,
@@ -68,8 +69,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             idleForSend: Bool = false,
             idleSince: Date? = nil,
             waitingOn: DomainAgentSessionWaitingOn? = nil,
-            latestVisibleAssistantPreview: String? = nil
+            latestVisibleAssistantPreview: String? = nil,
+            passiveWakeEvidence: AgentSessionLinkPassiveWakeEvidence = .unknown
         ) {
+            self.passiveWakeEvidence = passiveWakeEvidence
             self.reference = reference
             self.targetEndpoint = targetEndpoint
             self.targetSessionID = targetSessionID
@@ -344,6 +347,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// and safe to compare against overflow produced after the claim was reserved.
         let overflowProduced: UInt64
         let autoWakeLanes: [AutoWakeLane]
+        let routineNonAdmittingReferences: Set<DomainAgentSessionLinkReference>
 
         init(
             observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
@@ -356,8 +360,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             attentionRequests: [PendingAttentionRequest] = [],
             unacknowledgedOverflowCount: UInt64,
             overflowProduced: UInt64,
-            autoWakeLanes: [AutoWakeLane] = []
+            autoWakeLanes: [AutoWakeLane] = [],
+            routineNonAdmittingReferences: Set<DomainAgentSessionLinkReference> = []
         ) {
+            self.routineNonAdmittingReferences = routineNonAdmittingReferences
             self.observerEndpoint = observerEndpoint
             self.queueEpoch = queueEpoch
             self.queueRevision = queueRevision
@@ -492,11 +498,16 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// The latest sample time enriches a future attention occurrence but is not itself queue
         /// content. Re-observing byte-identical state must not advance the reducer revision.
         static func == (lhs: Observation, rhs: Observation) -> Bool {
-            lhs.sample == rhs.sample
+            // Admission evidence is not public baseline content, including while nondeliverable.
+            var comparable = lhs.sample
+            comparable.passiveWakeEvidence = rhs.sample.passiveWakeEvidence
+            return comparable == rhs.sample
         }
 
         func hash(into hasher: inout Hasher) {
-            hasher.combine(sample)
+            var publicSample = sample
+            publicSample.passiveWakeEvidence = .unknown
+            hasher.combine(publicSample)
         }
     }
 
@@ -522,6 +533,14 @@ struct AgentSessionLinkPassiveStatusNotices {
     /// Disclosure-only frontiers. Never included in snapshots, receipts, revisions or wake identity.
     var localInputFrontiers: [DomainAgentSessionLinkReference: LocalInputFrontier] = [:]
 
+    /// At most one record per current exact reference. Debt survives a net reversion, but is never
+    /// itself a rendered entry or a wake basis. Receipt coverage uses the existing sequence domain.
+    private struct RoutineDebt {
+        var ordinaryThrough: UInt64?
+        var pin: AgentSessionLinkPassiveWakeEvidence = .unknown
+    }
+
+    private var routineDebtByReference: [DomainAgentSessionLinkReference: RoutineDebt] = [:]
     private var nextChangeSequence: UInt64 = 0
     private var nextAttentionSequence: UInt64 = 0
     private var lastObservedStatus: [DomainAgentSessionLinkReference: Observation] = [:]
@@ -554,7 +573,12 @@ struct AgentSessionLinkPassiveStatusNotices {
             attentionRequests: orderedPendingAttentionRequests,
             unacknowledgedOverflowCount: overflowProduced - overflowAcknowledged,
             overflowProduced: overflowProduced,
-            autoWakeLanes: autoWakeLanes
+            autoWakeLanes: autoWakeLanes,
+            routineNonAdmittingReferences: Set(pendingByReference.values.compactMap { entry in
+                guard entry.toStatus == .idle, let debt = routineDebtByReference[entry.reference],
+                      debt.ordinaryThrough == nil, debt.pin.isPassive else { return nil }
+                return entry.reference
+            })
         )
     }
 
@@ -593,6 +617,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         isEnabled = true
         isDeliverable = deliverable
         self.linkSetRevision = linkSetRevision
+        routineDebtByReference.removeAll()
         pendingByReference.removeAll()
         pendingAttentionByReference.removeAll()
         lastObservedStatus = baselines(from: samples, observedAt: observedAt)
@@ -614,6 +639,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         isDeliverable = false
         self.linkSetRevision = linkSetRevision
         lastObservedStatus.removeAll()
+        routineDebtByReference.removeAll()
         pendingByReference.removeAll()
         pendingAttentionByReference.removeAll()
         overflowAcknowledged = overflowProduced
@@ -658,6 +684,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             localInputFrontiers.removeAll()
             isDeliverable = deliverable
             lastObservedStatus = newBaselines
+            routineDebtByReference.removeAll()
             pendingByReference.removeAll()
             pendingAttentionByReference.removeAll()
             overflowAcknowledged = overflowProduced
@@ -678,6 +705,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         if !removedReferences.isEmpty {
             changed = true
             for reference in removedReferences {
+                routineDebtByReference.removeValue(forKey: reference)
                 lastObservedStatus.removeValue(forKey: reference)
                 pendingByReference.removeValue(forKey: reference)
                 pendingAttentionByReference.removeValue(forKey: reference)
@@ -686,6 +714,7 @@ struct AgentSessionLinkPassiveStatusNotices {
 
         for sample in sortedSamples(currentByReference.values) {
             if sample.status == .unavailable {
+                routineDebtByReference.removeValue(forKey: sample.reference)
                 if lastObservedStatus.removeValue(forKey: sample.reference) != nil {
                     changed = true
                 }
@@ -714,6 +743,7 @@ struct AgentSessionLinkPassiveStatusNotices {
                     sample: sample,
                     observedAt: observedAt
                 )
+                routineDebtByReference.removeValue(forKey: sample.reference)
                 pendingByReference.removeValue(forKey: sample.reference)
                 pendingAttentionByReference.removeValue(forKey: sample.reference)
                 changed = true
@@ -749,7 +779,15 @@ struct AgentSessionLinkPassiveStatusNotices {
                         observedAt: observedAt,
                         changeSequence: nextChangeSequence
                     )
+                    refreshRoutineDebt(from: sample, sequence: nextChangeSequence)
                     changed = true
+                } else if sample.passiveWakeEvidence != observation.sample.passiveWakeEvidence {
+                    resolvePassiveWakeEvidence(
+                        reference: sample.reference,
+                        targetEndpoint: sample.targetEndpoint,
+                        evidence: sample.passiveWakeEvidence,
+                        isNewOccurrence: sample.passiveWakeEvidence.ownership != observation.sample.passiveWakeEvidence.ownership
+                    )
                 }
                 continue
             }
@@ -769,6 +807,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             }
 
             nextChangeSequence += 1
+            recordRoutineContribution(from: sample, opening: observation.sample, sequence: nextChangeSequence)
             pendingByReference[sample.reference] = PendingEntry(
                 reference: sample.reference,
                 targetEndpoint: sample.targetEndpoint,
@@ -874,6 +913,12 @@ struct AgentSessionLinkPassiveStatusNotices {
 
         // Each receipt names only rendered rows; a newer partial receipt may omit these statuses.
         for delivered in receipt.deliveredStatuses {
+            if var debt = routineDebtByReference[delivered.reference],
+               let through = debt.ordinaryThrough, delivered.changeSequence >= through
+            {
+                debt.ordinaryThrough = nil
+                routineDebtByReference[delivered.reference] = debt
+            }
             guard let current = pendingByReference[delivered.reference],
                   current.toStatus == delivered.toStatus,
                   current.changeSequence <= delivered.changeSequence
@@ -895,6 +940,56 @@ struct AgentSessionLinkPassiveStatusNotices {
         if changed {
             advanceQueueRevision()
         }
+    }
+
+    private mutating func recordRoutineContribution(from sample: Sample, opening: Sample, sequence: UInt64) {
+        var debt = routineDebtByReference[sample.reference] ?? RoutineDebt()
+        let exactPassiveClose = opening.status == .running && opening.passiveWakeEvidence.isPassive
+            && sample.status == .idle && sample.passiveWakeEvidence.isPassive
+            && sample.passiveWakeEvidence.ownership == opening.passiveWakeEvidence.ownership
+        debt.pin = exactPassiveClose ? sample.passiveWakeEvidence : .unknown
+        if !exactPassiveClose { debt.ordinaryThrough = sequence }
+        routineDebtByReference[sample.reference] = debt
+    }
+
+    private mutating func refreshRoutineDebt(from sample: Sample, sequence: UInt64) {
+        var debt = routineDebtByReference[sample.reference] ?? RoutineDebt()
+        if sample.status == .idle, sample.passiveWakeEvidence.isPassive,
+           debt.pin.ownership == sample.passiveWakeEvidence.ownership, debt.pin.isPassive
+        {
+            debt.pin = sample.passiveWakeEvidence
+        } else {
+            debt.pin = .unknown
+            debt.ordinaryThrough = sequence
+        }
+        routineDebtByReference[sample.reference] = debt
+    }
+
+    /// Resolves only an existing exact lane occurrence. No entry, public sequence, timestamp, or
+    /// fingerprint is created/changed. Callers republish the snapshot even at the same revision.
+    mutating func resolvePassiveWakeEvidence(
+        reference: DomainAgentSessionLinkReference,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        evidence: AgentSessionLinkPassiveWakeEvidence,
+        isNewOccurrence: Bool = false
+    ) {
+        guard let observation = lastObservedStatus[reference], observation.targetEndpoint == targetEndpoint else { return }
+        if evidence.ownership == observation.sample.passiveWakeEvidence.ownership || isNewOccurrence {
+            var sample = observation.sample
+            sample.passiveWakeEvidence = evidence
+            lastObservedStatus[reference] = Observation(sample: sample, observedAt: observation.observedAt)
+        }
+        guard let entry = pendingByReference[reference], var debt = routineDebtByReference[reference], debt.pin.isPassive else { return }
+        if evidence.ownership == debt.pin.ownership, evidence.isPassive {
+            debt.pin = evidence
+        } else if isNewOccurrence || evidence.ownership == debt.pin.ownership || {
+            if case .open = debt.pin { return true }
+            return false
+        }() {
+            debt.pin = .unknown
+            debt.ordinaryThrough = entry.changeSequence
+        }
+        routineDebtByReference[reference] = debt
     }
 
     private var orderedPendingEntries: [PendingEntry] {
@@ -963,6 +1058,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         let overflowCount = max(0, pendingByReference.count - Self.maximumPendingTargetCount)
         guard overflowCount > 0 else { return 0 }
         for entry in orderedPendingEntries.prefix(overflowCount) {
+            routineDebtByReference.removeValue(forKey: entry.reference)
             pendingByReference.removeValue(forKey: entry.reference)
         }
         return overflowCount
