@@ -534,6 +534,7 @@ final class ClaudeAgentToolTrackingHandler {
         args: [String: Value]?,
         session: AgentTabSession
     ) {
+        session.notePassiveWakeActivity()
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         // Flush buffered assistant content before inserting tool card to preserve interleaving order.
@@ -731,6 +732,7 @@ final class ClaudeAgentToolTrackingHandler {
         isError: Bool,
         session: AgentTabSession
     ) {
+        session.notePassiveWakeActivity()
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         // Flush buffered assistant content before inserting tool result to preserve interleaving order.

@@ -231,6 +231,14 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> DomainAgentSessionObservationSnapshot
 
+    func agentSessionLinkPassiveWakeEvidence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence
+
+    func agentSessionLinkInstallObservation(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        onChange: @escaping @MainActor () -> Void,
+        onPassiveWakeChange: @escaping @MainActor () -> Void
+    ) -> AgentSessionLinkObservationToken?
+
     /// Batch-refreshes durable child metadata without doing a registry scan for each target.
     func agentSessionLinkRefreshSubagentCensus(
         for candidates: [AgentSessionLinkEndpointCandidate]
@@ -553,6 +561,16 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkPassiveWakeEvidence(for _: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence { .unknown }
+
+    func agentSessionLinkInstallObservation(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        onChange: @escaping @MainActor () -> Void,
+        onPassiveWakeChange _: @escaping @MainActor () -> Void
+    ) -> AgentSessionLinkObservationToken? {
+        agentSessionLinkInstallObservation(for: candidate, onChange: onChange)
+    }
+
     /// Full choice discovery remains rich by default; cheap topology discovery is explicit.
     func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
         agentSessionLinkCandidates(includeLocation: true)
@@ -912,10 +930,19 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
+    private struct PassiveWakePublication {
+        let snapshot: DomainAgentSessionObservationSnapshot
+        let evidence: AgentSessionLinkPassiveWakeEvidence
+        let sourceSequence: UInt64
+    }
+
     private final class TargetPublicationChain {
         let endpoint: DomainAgentSessionLinkEndpointIdentity
         var token: AgentSessionLinkObservationToken?
         var tail: Task<Void, Never>?
+        /// One pending capture and one accepted pair per chain, never a publication history.
+        var capturedPassiveWakeEvidence: AgentSessionLinkPassiveWakeEvidence = .unknown
+        var passiveWakePublication: PassiveWakePublication?
         /// Monotonic canonical activity for this exact target incarnation.
         var activityHighWater: Date?
 
@@ -4196,10 +4223,13 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let chain = TargetPublicationChain(endpoint: endpoint, activityHighWater: initialActivity)
         chains[endpoint.sessionID] = chain
-        chain.token = host.agentSessionLinkInstallObservation(for: candidate) { [weak self, weak chain] in
+        chain.token = host.agentSessionLinkInstallObservation(for: candidate, onChange: { [weak self, weak chain] in
             guard let chain else { return }
             self?.publishTargetSnapshot(endpoint: endpoint, originatingChain: chain)
-        }
+        }, onPassiveWakeChange: { [weak self, weak chain] in
+            guard let chain else { return }
+            self?.publishPassiveWakeEvidence(endpoint: endpoint, chain: chain)
+        })
         guard chain.token != nil else {
             // The endpoint disappeared between activation and observation install. Fail closed.
             chains.removeValue(forKey: endpoint.sessionID)
@@ -4269,10 +4299,20 @@ final class AgentSessionLinkRuntimeBridge {
         }
 
         let snapshot = host.agentSessionLinkObservationSnapshot(for: candidate)
+        let evidence = host.agentSessionLinkPassiveWakeEvidence(for: candidate)
+        let previousEvidence = chain.capturedPassiveWakeEvidence
         observeActivity(snapshot.lastActivityAt, for: endpoint)
         // Drop no-op rebuilds (notably the replay burst every new `@Published` subscription emits) so
         // an unchanged target never advances `change_sequence` or wakes a parked waiter.
-        guard lastPublishedSnapshotBySession[sessionID] != snapshot else { return }
+        guard lastPublishedSnapshotBySession[sessionID] != snapshot else {
+            guard previousEvidence != evidence else { return }
+            chain.capturedPassiveWakeEvidence = evidence
+            enqueuePassiveWakeEvidence(evidence, endpoint: endpoint, chain: chain,
+                sourceSequence: nextSourcePublicationSequenceBySession[sessionID] ?? 0,
+                sourceSnapshot: snapshot, isNewOccurrence: previousEvidence.ownership != evidence.ownership)
+            return
+        }
+        chain.capturedPassiveWakeEvidence = evidence
         lastPublishedSnapshotBySession[sessionID] = snapshot
         // The one readiness trigger a queued send has. It hangs off an *accepted* publication, so an
         // unchanged target produces none at all and nothing ever polls for readiness.
@@ -4281,14 +4321,114 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let sequence = allocateSourcePublicationSequence(for: sessionID)
         let previous = chain.tail
-        chain.tail = Task { [authority] in
+        chain.tail = Task { [weak self, weak chain, authority] in
             await previous?.value
-            _ = await authority.publishTargetSnapshot(
+            let disposition = await authority.publishTargetSnapshot(
                 endpoint: endpoint,
                 snapshot: snapshot,
                 sourcePublicationSequence: sequence
             )
+            guard let self, let chain, !isFrozenForTermination, chains[sessionID] === chain else { return }
+            switch disposition {
+            case .accepted, .unchanged:
+                if evidence == .unknown {
+                    chain.passiveWakePublication = nil
+                } else {
+                    let canonical = await authority.observationSnapshot(forTargetEndpoint: endpoint)
+                    guard !isFrozenForTermination, chains[sessionID] === chain,
+                          let canonical, Self.sameSourcePayload(snapshot, canonical) else { return }
+                    chain.passiveWakePublication = .init(snapshot: canonical, evidence: evidence, sourceSequence: sequence)
+                }
+            case .stale, .unknownTarget, .shuttingDown:
+                chain.passiveWakePublication = nil
+            }
         }
+    }
+
+    /// Private resolution never rebuilds a preview or publishes through authority. A new attempt
+    /// needs the full source-frame path above; it cannot lend its proof to an older public sample.
+    private func publishPassiveWakeEvidence(endpoint: DomainAgentSessionLinkEndpointIdentity, chain: TargetPublicationChain) {
+        guard !isFrozenForTermination, chains[endpoint.sessionID] === chain, let host,
+              let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { return }
+        let evidence = host.agentSessionLinkPassiveWakeEvidence(for: candidate)
+        let captured = chain.capturedPassiveWakeEvidence
+        guard captured != evidence, captured.ownership != nil,
+              evidence.ownership == captured.ownership || evidence == .unknown else { return }
+        chain.capturedPassiveWakeEvidence = evidence
+        enqueuePassiveWakeEvidence(evidence, endpoint: endpoint, chain: chain,
+            sourceSequence: nextSourcePublicationSequenceBySession[endpoint.sessionID] ?? 0)
+    }
+
+    private func enqueuePassiveWakeEvidence(
+        _ evidence: AgentSessionLinkPassiveWakeEvidence,
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        chain: TargetPublicationChain,
+        sourceSequence: UInt64,
+        sourceSnapshot: DomainAgentSessionObservationSnapshot? = nil,
+        isNewOccurrence: Bool = false
+    ) {
+        let previous = chain.tail
+        chain.tail = Task { [weak self, weak chain, authority] in
+            await previous?.value
+            guard let self, let chain, !isFrozenForTermination, chains[endpoint.sessionID] === chain else { return }
+            let canonical: DomainAgentSessionObservationSnapshot?
+            if let paired = chain.passiveWakePublication, paired.sourceSequence == sourceSequence {
+                canonical = paired.snapshot
+            } else if sourceSnapshot != nil {
+                // Same-public source occurrence (including the activation seed). The full source
+                // frame is paired only if it still matches the canonical payload; no cursor moves.
+                canonical = await authority.observationSnapshot(forTargetEndpoint: endpoint)
+            } else {
+                return
+            }
+            guard !isFrozenForTermination, chains[endpoint.sessionID] === chain, let canonical,
+                  sourceSnapshot.map({ Self.sameSourcePayload($0, canonical) }) ?? true else { return }
+            chain.passiveWakePublication = .init(snapshot: canonical, evidence: evidence, sourceSequence: sourceSequence)
+            await resolvePassiveWakeEvidence(evidence, endpoint: endpoint, chain: chain,
+                sourceSequence: sourceSequence, isNewOccurrence: isNewOccurrence)
+        }
+    }
+
+    /// Indexed inverse membership plus point authorization; never a topology/reducer sweep. The
+    /// existing catalog supplies an address, not authority: a fresh exact grant must match it.
+    private func resolvePassiveWakeEvidence(
+        _ evidence: AgentSessionLinkPassiveWakeEvidence,
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        chain: TargetPublicationChain,
+        sourceSequence: UInt64,
+        isNewOccurrence: Bool
+    ) async {
+        let inbound = await authority.links(forTargetEndpoint: endpoint)
+        guard !isFrozenForTermination, chains[endpoint.sessionID] === chain,
+              chain.passiveWakePublication?.sourceSequence == sourceSequence,
+              host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil else { return }
+        for item in inbound.items {
+            guard let observer = menuCatalog?.inputs[endpoint]?.inboundObserverEndpoints[item.linkID] else { continue }
+            let authorization = await authority.authorize(operation: .monitorPoll, observerEndpoint: observer, targetSessionID: endpoint.sessionID)
+            guard !isFrozenForTermination, chains[endpoint.sessionID] === chain,
+                  chain.passiveWakePublication?.sourceSequence == sourceSequence,
+                  host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil,
+                  host?.agentSessionLinkCandidate(for: observer, includeLocation: false) != nil,
+                  case let .success(lease) = authorization, lease.target == endpoint,
+                  lease.linkID == item.linkID, lease.linkGeneration == item.generation,
+                  var notices = passiveNoticesByObserver[observer] else { continue }
+            notices.resolvePassiveWakeEvidence(reference: .init(linkID: item.linkID, generation: item.generation),
+                targetEndpoint: endpoint, evidence: evidence, isNewOccurrence: isNewOccurrence)
+            passiveNoticesByObserver[observer] = notices
+            publishPassiveNotices(notices.snapshot, to: observer)
+        }
+    }
+
+    /// Authority alone canonicalizes idleSince. Every other source field must match before private
+    /// proof is attached; a replacement/publication from another owner fails open.
+    private static func sameSourcePayload(_ lhs: DomainAgentSessionObservationSnapshot, _ rhs: DomainAgentSessionObservationSnapshot) -> Bool {
+        lhs.sessionID == rhs.sessionID && lhs.displayName == rhs.displayName
+            && lhs.providerDisplayName == rhs.providerDisplayName && lhs.status == rhs.status
+            && lhs.board == rhs.board && lhs.idleForSend == rhs.idleForSend
+            && lhs.waitingOn == rhs.waitingOn && lhs.pendingInteractionKind == rhs.pendingInteractionKind
+            && lhs.latestVisibleAssistantPreview == rhs.latestVisibleAssistantPreview
+            && lhs.visibleRowCount == rhs.visibleRowCount && lhs.lastActivityAt == rhs.lastActivityAt
+            && lhs.context == rhs.context
     }
 
     private func allocateSourcePublicationSequence(for sessionID: UUID) -> UInt64 {
@@ -4709,7 +4849,16 @@ final class AgentSessionLinkRuntimeBridge {
                 // may reach a queued notice. Materializing the redacted preview is why this runs only
                 // on the authoritative pass, never on a location, Seen, settings, sidebar-menu, or
                 // observer-role repaint.
+                let sourceChain = chains[targetEndpoint.sessionID]
+                await sourceChain?.tail?.value
                 let observation = await authority.observationSnapshot(forTargetEndpoint: targetEndpoint)
+                let paired = sourceChain?.passiveWakePublication
+                let evidence: AgentSessionLinkPassiveWakeEvidence = if let sourceChain,
+                    chains[targetEndpoint.sessionID] === sourceChain, sourceChain.endpoint == targetEndpoint,
+                    let paired, paired.snapshot == observation,
+                    Self.monitorStatus(.init(status: paired.snapshot.status, pendingInteractionKind: paired.snapshot.pendingInteractionKind)) == presentation.status {
+                    paired.evidence
+                } else { .unknown }
                 statusSamples.append(AgentSessionLinkPassiveStatusNotices.Sample(
                     reference: reference,
                     targetEndpoint: targetEndpoint,
@@ -4721,7 +4870,8 @@ final class AgentSessionLinkRuntimeBridge {
                     idleForSend: observation?.idleForSend ?? false,
                     idleSince: observation?.idleSince,
                     waitingOn: observation?.waitingOn,
-                    latestVisibleAssistantPreview: observation?.latestVisibleAssistantPreview
+                    latestVisibleAssistantPreview: observation?.latestVisibleAssistantPreview,
+                    passiveWakeEvidence: evidence
                 ))
             }
             outbound.append(AgentMonitorPillProps.Outbound(

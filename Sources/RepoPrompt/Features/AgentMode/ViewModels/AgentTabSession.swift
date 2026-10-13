@@ -17,6 +17,9 @@ final class AgentTabSession: ObservableObject {
     let tabID: UUID
     let perfRecorder: any AgentModePerfRecording
     private var suppressSourceItemsChanged = false
+    /// Bounded to one segment. Runtime-only; never serialized or inferred from transcript rows.
+    var passiveWakeSegment: AgentSessionLinkPassiveWakeSegment?
+    let passiveWakeEvidenceChanged = PassthroughSubject<Void, Never>()
 
     /// Canonical runtime source-item suffix. Coordinators and tests mutate this list,
     /// but it only retains the mutable full-detail working turns; older compacted
@@ -24,6 +27,7 @@ final class AgentTabSession: ObservableObject {
     @Published var items: [AgentChatItem] = [] {
         didSet {
             guard !suppressSourceItemsChanged else { return }
+            invalidatePassiveWakeEvidence()
             repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
             rebuildSourceItemDerivedState()
             invalidateLocalInputStructure()
@@ -159,6 +163,9 @@ final class AgentTabSession: ObservableObject {
     @Published var runState: AgentSessionRunState = .idle {
         didSet {
             guard runState != oldValue else { return }
+            if runState == .failed || runState == .cancelled || runState == .waitingForUser || runState == .waitingForQuestion || runState == .waitingForApproval {
+                notePassiveWakeActivity()
+            }
             noteMonitorObservationInputsChanged()
             onRunStateChanged?(self)
         }
@@ -865,6 +872,7 @@ final class AgentTabSession: ObservableObject {
     /// Installs the provider process run identity for a starting or resumed
     /// run. The installing path owns the identity until it is cleared.
     func installRunID(_ runID: UUID) {
+        if self.runID != runID { invalidatePassiveWakeEvidence() }
         runLifecycle.installRunID(runID)
     }
 
@@ -872,7 +880,10 @@ final class AgentTabSession: ObservableObject {
     /// stale cleanup cannot clear a successor run's identity.
     @discardableResult
     func clearRunID(ifCurrent runID: UUID) -> Bool {
-        runLifecycle.clearRunID(ifCurrent: runID)
+        if self.runID == runID, passiveWakeSegment != nil, !passiveWakeHasSettledTerminalProof {
+            invalidatePassiveWakeEvidence()
+        }
+        return runLifecycle.clearRunID(ifCurrent: runID)
     }
 
     var activeRunOwnership: AgentRunOwnership? {
@@ -929,6 +940,7 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
+                invalidatePassiveWakeEvidence()
                 selectedClaudeEffortRaw = nil
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
@@ -1303,6 +1315,7 @@ final class AgentTabSession: ObservableObject {
             let oldIdentity = oldValue.map { ObjectIdentifier($0) }
             let newIdentity = codexController.map { ObjectIdentifier($0) }
             guard oldIdentity != newIdentity else { return }
+            if newIdentity != nil { invalidatePassiveWakeEvidence() }
             resetCodexHookGateBinding()
             codexControllerGeneration = UUID()
             codexAuthoritativeActiveTurn = nil
@@ -1360,7 +1373,14 @@ final class AgentTabSession: ObservableObject {
         pendingCodexComputerUseActivation != nil
     }
 
-    var claudeController: (any NativeAgentRuntimeControlling)?
+    var claudeController: (any NativeAgentRuntimeControlling)? {
+        didSet {
+            if let controller = claudeController,
+               oldValue.map { ObjectIdentifier($0) } != ObjectIdentifier(controller) {
+                invalidatePassiveWakeEvidence()
+            }
+        }
+    }
     var acpController: ACPAgentSessionController?
 
     var codexEventTask: Task<Void, Never>?
@@ -1544,6 +1564,7 @@ final class AgentTabSession: ObservableObject {
         // oversight change channel from that authority.
         runLifecycle.onTerminalCommitPhaseChange = { [weak self] in
             self?.noteMonitorObservationInputsChanged()
+            if self?.passiveWakeSegment != nil { self?.passiveWakeEvidenceChanged.send(()) }
         }
     }
 
@@ -1677,6 +1698,7 @@ final class AgentTabSession: ObservableObject {
         // Terminal commit revisions are scoped to the binding captured by
         // their run ownership. A rebind must not carry that runtime-only
         // classification or publication result into another session.
+        invalidatePassiveWakeEvidence()
         runLifecycle.invalidateTerminalRevisionForBindingTransition()
         authoritativeHydratedBinding = nil
         authoritativeHydratedBindingTransitionGeneration = nil
@@ -1791,7 +1813,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     @discardableResult
-    func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+    func beginRunAttempt(source: String, attemptID: UUID = UUID(), passiveWakeID: UUID? = nil) -> AgentRunOwnership {
         // Host-specific responsibilities stay here: Codex routing resets and
         // exactly-once MCP prepared-epoch consumption. The neutral attempt
         // initialization (terminal-state reset + tracker begin) is delegated
@@ -1818,6 +1840,7 @@ final class AgentTabSession: ObservableObject {
             ),
             attemptID: attemptID
         )
+        bindPassiveWakeEvidence(to: ownership, wakeID: passiveWakeID)
         #if DEBUG
             perfRecorder.increment("run.lifecycle.attempt.started")
             perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")
@@ -1868,6 +1891,7 @@ final class AgentTabSession: ObservableObject {
             retryIntent: retryIntent,
             timestampUptimeNanoseconds: timestampUptimeNanoseconds
         )
+        if case .accepted = result, kind == .toolActivity || kind == .interaction { notePassiveWakeActivity() }
         recordRunProgressDiagnostic(result, kind: kind, stage: stage)
         return result
     }
@@ -1882,6 +1906,7 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func endRunAttempt(ifCurrent ownership: AgentRunOwnership, source: String) -> Bool {
         guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
+        if passiveWakeSegment != nil, !terminalCommitInProgress { passiveWakeEvidenceChanged.send(()) }
         recordRunAttemptEnded(ownership, source: source)
         return true
     }
@@ -2500,6 +2525,7 @@ final class AgentTabSession: ObservableObject {
                 ))
             }
         #endif
+        if reason != .retentionCompaction { invalidatePassiveWakeEvidence() }
         commitSourceItems(
             items,
             dispatch: .silent,
