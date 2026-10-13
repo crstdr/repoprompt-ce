@@ -320,7 +320,8 @@ final class AgentModeRunService {
                 providerControlCommand: providerControlCommand,
                 makeLease: makeLease,
                 stopFence: stopFence,
-                localComposerCandidate: localComposerCandidate
+                localComposerCandidate: localComposerCandidate,
+                passiveWakeID: passiveWakeID
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil

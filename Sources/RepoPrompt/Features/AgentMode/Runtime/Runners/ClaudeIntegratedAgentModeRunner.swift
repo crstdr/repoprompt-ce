@@ -409,6 +409,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
                     session.recordRunProgress(ownership: ownership, kind: .interaction, stage: .waitingForInteraction)
                 }
+                session.notePassiveWakeActivity()
                 session.pendingApproval = request
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                 session.setRunningStatus(nil, source: nil)

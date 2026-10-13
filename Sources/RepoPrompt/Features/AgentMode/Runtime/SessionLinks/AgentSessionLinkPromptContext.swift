@@ -547,19 +547,24 @@ struct AgentSessionLinkPromptRenderRequest {
     /// How much lane-update trust guidance this render owes, decided by the store from the last
     /// revision this observer physically accepted in this provider context.
     let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode
+    /// Whether this dispatch is itself a routine status/overflow Auto-wake. Only its lane batch may
+    /// teach the exact quiet `ack` reply; piggybacked batches on other dispatches must not.
+    let routineStatusWake: Bool
 
     init(
         membershipKind: AgentSessionLinkPromptSupplementKind?,
         inventory: AgentSessionLinkPromptInventory,
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?,
         toolReference: String = MCPWindowToolName.agentSessionLink,
-        laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode = .full
+        laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode = .full,
+        routineStatusWake: Bool = false
     ) {
         self.membershipKind = membershipKind
         self.inventory = inventory
         self.passiveNotices = passiveNotices
         self.toolReference = toolReference
         self.laneGuidanceMode = laneGuidanceMode
+        self.routineStatusWake = routineStatusWake
     }
 }
 
@@ -694,6 +699,10 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     /// Recorded even when the byte budget dropped the batch, for the same reason `passiveQueue` is:
     /// it is part of what decides whether a retry of the same dispatch may reuse this fragment.
     let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode?
+    /// Whether this fragment was rendered for a routine status/overflow wake dispatch. It is part
+    /// of what the fragment says, so it participates in the reuse fingerprint like the other
+    /// render inputs; `private(set)` because fingerprint identity must not mutate after minting.
+    private(set) var routineStatusWake: Bool = false
     /// Inventory wording actually rendered; nil for closing notices and passive-only claims.
     let inventoryGuidanceRevision: UInt64?
     let fragment: String
@@ -1019,6 +1028,9 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         /// Participates so a cached fragment rendered with the reminder cannot be reused after the
         /// guidance is re-owed in full, and vice versa.
         let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode?
+        /// A routine-wake fragment teaches the quiet reply; an otherwise identical non-routine one
+        /// does not, so the flag must be part of identity.
+        let routineStatusWake: Bool
         let inventoryGuidanceRevision: UInt64?
 
         init(
@@ -1026,6 +1038,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             inventory: AgentSessionLinkPromptInventory,
             passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?,
             laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode?,
+            routineStatusWake: Bool,
             inventoryGuidanceRevision: UInt64?
         ) {
             membershipRevision = membershipKind == nil ? nil : inventory.linkSetRevision
@@ -1037,6 +1050,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                 )
             }
             self.laneGuidanceMode = laneGuidanceMode
+            self.routineStatusWake = routineStatusWake
             self.inventoryGuidanceRevision = inventoryGuidanceRevision
         }
 
@@ -1045,6 +1059,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             membershipKind = claim.membership?.kind
             passiveQueue = claim.passiveQueue
             laneGuidanceMode = claim.laneGuidanceMode
+            routineStatusWake = claim.routineStatusWake
             inventoryGuidanceRevision = claim.inventoryGuidanceRevision
         }
     }
@@ -1091,6 +1106,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:],
         allowsClaimlessAutoWake: Bool = false,
         decorateLocalInputs: (AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration? = { _ in nil },
+        routineStatusWake: Bool = false,
         inventoryGuidanceRevision: UInt64 = AgentSessionLinkPrompts.currentInventoryGuidanceRevision,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkPromptClaimOutcome {
@@ -1156,6 +1172,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             inventory: inventory,
             passiveNotices: passiveBatch,
             laneGuidanceMode: laneGuidanceMode,
+            routineStatusWake: routineStatusWake,
             inventoryGuidanceRevision: membershipKind == .inventory ? inventoryGuidanceRevision : nil
         )
         if let existing = state.pending[dispatchID], ClaimFingerprint(existing) == fingerprint {
@@ -1175,7 +1192,8 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                 inventory: inventory,
                 passiveNotices: passiveBatch,
                 toolReference: epoch.toolReference,
-                laneGuidanceMode: laneGuidanceMode ?? .full
+                laneGuidanceMode: laneGuidanceMode ?? .full,
+                routineStatusWake: routineStatusWake
             ))
             state.renderedFingerprint = fingerprint
             state.renderedResult = rendered
@@ -1230,6 +1248,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             passiveQueue: fingerprint.passiveQueue,
             passive: passiveComponent,
             laneGuidanceMode: laneGuidanceMode,
+            routineStatusWake: routineStatusWake,
             inventoryGuidanceRevision: fingerprint.inventoryGuidanceRevision,
             fragment: rendered.fragment,
             observerEndpoint: epoch.endpoint

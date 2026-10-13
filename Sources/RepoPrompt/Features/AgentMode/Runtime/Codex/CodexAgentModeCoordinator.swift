@@ -9800,7 +9800,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         case let .assistantCompleted(payload):
             guard session.runState.isActive else { return }
-            session.notePassiveWakeAssistantText(payload.text)
+            session.notePassiveWakeAssistantText(payload.text, authoritative: true)
             clearCodexPendingAuthRetryTurn(session)
             reconcileAssistantCompletion(payload, session: session)
             return
@@ -9824,6 +9824,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.scheduleSaveForCommandOutput(tabID: session.tabID, minInterval: 2.0)
         case let .approvalRequest(request):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             CodexComputerUseWorkflow.logApprovalDecision(
                 path: .approval, server: nil, armed: session.codexControllerFeatureState?.computerUseEnabled == true,
                 approvalPolicy: session.permissionProfile.codexApprovalPolicy, sandboxMode: session.permissionProfile.codexSandboxMode, outcome: "surface"
@@ -9836,6 +9837,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.publishMCPStateChange(for: session)
         case let .permissionsRequest(request):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             session.pendingPermissionsRequest = request
@@ -9844,6 +9846,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.publishMCPStateChange(for: session)
         case let .mcpElicitationRequest(request):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             let alreadyPending = session.pendingMCPElicitationRequest?.requestID == request.requestID
@@ -9888,6 +9891,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return
             }
             let request = computerUseArmed ? request.computerUseReviewRequest : request
+            session.notePassiveWakeActivity()
             let alreadyPending = session.pendingUserInputRequest?.requestID == request.requestID
             let alreadyQueued = session.queuedUserInputRequests.contains { $0.requestID == request.requestID }
             guard !alreadyPending, !alreadyQueued else {
