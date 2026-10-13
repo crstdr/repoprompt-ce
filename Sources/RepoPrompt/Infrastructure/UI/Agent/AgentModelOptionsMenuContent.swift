@@ -23,7 +23,23 @@ enum AgentModelSelectionWarningVisuals {
     static let warningColor = Color.orange
 
     static func showsWarning(agent: AgentProviderKind, rawModel: String?) -> Bool {
-        agent == .codexExec && CodexServiceTierVariantCatalog.isFastVariant(rawModel: rawModel)
+        agent == .codexExec && (
+            CodexServiceTierVariantCatalog.isFastVariant(rawModel: rawModel)
+                || isUltrafast(agent: agent, rawModel: rawModel)
+        )
+    }
+
+    static func isUltrafast(agent: AgentProviderKind, rawModel: String?) -> Bool {
+        agent == .codexExec && CodexModelSpecifier(raw: rawModel).appServerServiceTierParam
+            == CodexServiceTierVariantCatalog.ultrafastServiceTier
+    }
+
+    static func color(agent: AgentProviderKind, rawModel: String?) -> Color {
+        isUltrafast(agent: agent, rawModel: rawModel) ? .purple : warningColor
+    }
+
+    static func tooltip(agent: AgentProviderKind, rawModel: String?) -> String {
+        isUltrafast(agent: agent, rawModel: rawModel) ? "Ultrafast Codex model selected." : warningTooltip
     }
 
     static func stableMenuImageSystemName(agent: AgentProviderKind, rawModel: String?) -> String? {
@@ -31,12 +47,26 @@ enum AgentModelSelectionWarningVisuals {
     }
 
     static func stableMenuStyle(agent: AgentProviderKind, rawModel: String?) -> StableMenuItemStyle {
-        showsWarning(agent: agent, rawModel: rawModel) ? .warning : .normal
+        if isUltrafast(agent: agent, rawModel: rawModel) { return .tinted(.systemPurple) }
+        return showsWarning(agent: agent, rawModel: rawModel) ? .warning : .normal
     }
 
     static func codexGroupShowsWarning(_ group: AgentModelCatalog.CodexMenuGroup) -> Bool {
         showsWarning(agent: .codexExec, rawModel: group.baseModelID) ||
             group.options.contains { showsWarning(agent: .codexExec, rawModel: $0.rawValue) }
+    }
+}
+
+struct AgentModelSpeedIcon: View {
+    let agent: AgentProviderKind
+    let rawModel: String
+    var font: Font = .caption
+
+    var body: some View {
+        Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
+            .font(font)
+            .foregroundStyle(AgentModelSelectionWarningVisuals.color(agent: agent, rawModel: rawModel))
+            .accessibilityHidden(true)
     }
 }
 
@@ -50,13 +80,11 @@ struct AgentModelSelectionSummaryLabel: View {
         let showsWarning = AgentModelSelectionWarningVisuals.showsWarning(agent: agentKind, rawModel: rawModel)
         HStack(spacing: 4) {
             if showsWarning {
-                Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
-                    .font(iconFont)
-                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                AgentModelSpeedIcon(agent: agentKind, rawModel: rawModel, font: iconFont)
             }
             if showsWarning {
                 Text(title)
-                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                    .foregroundStyle(AgentModelSelectionWarningVisuals.color(agent: agentKind, rawModel: rawModel))
             } else {
                 Text(title)
             }
@@ -87,7 +115,8 @@ struct AgentModelOptionsMenuContent: View {
                 } label: {
                     warningAwareMenuLabel(
                         title: group.displayName,
-                        showsWarning: AgentModelSelectionWarningVisuals.codexGroupShowsWarning(group)
+                        showsWarning: AgentModelSelectionWarningVisuals.codexGroupShowsWarning(group),
+                        rawModel: group.baseModelID
                     )
                 }
             }
@@ -181,7 +210,8 @@ struct AgentModelOptionsMenuContent: View {
             HStack {
                 warningAwareMenuLabel(
                     title: title ?? AgentModelMenuTitle.displayName(for: option, agentKind: agentKind),
-                    showsWarning: showsWarning
+                    showsWarning: showsWarning,
+                    rawModel: option.rawValue
                 )
                 if selectedAgent == agentKind, AgentModelCatalog.modelOptionIsSelected(
                     optionRaw: option.rawValue,
@@ -199,15 +229,14 @@ struct AgentModelOptionsMenuContent: View {
         ClaudeModelSpecifier(raw: option.rawValue).effortLevel?.displayName ?? option.displayName
     }
 
-    private func warningAwareMenuLabel(title: String, showsWarning: Bool) -> some View {
+    private func warningAwareMenuLabel(title: String, showsWarning: Bool, rawModel: String) -> some View {
         HStack(spacing: 4) {
             if showsWarning {
-                Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
-                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                AgentModelSpeedIcon(agent: agentKind, rawModel: rawModel)
             }
             if showsWarning {
                 Text(title)
-                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                    .foregroundStyle(AgentModelSelectionWarningVisuals.color(agent: agentKind, rawModel: rawModel))
             } else {
                 Text(title)
             }
@@ -424,7 +453,7 @@ enum AgentModelStableMenuItems {
             return StableMenuItem.submenu(
                 group.displayName,
                 imageSystemName: showsWarning ? AgentModelSelectionWarningVisuals.iconSystemName : nil,
-                style: showsWarning ? .warning : .normal,
+                style: AgentModelSelectionWarningVisuals.stableMenuStyle(agent: agentKind, rawModel: group.baseModelID),
                 items: group.options.map { option in
                     modelItem(
                         option,
