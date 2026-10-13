@@ -103,9 +103,10 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
-    /// A committed batch is not a structural rebuild: a tracked item the batch removed is a
-    /// per-record deletion, a still-present tracked item reconciles content and position, and an
-    /// unsettled composer candidate keeps its identity for the canonical-only settle.
+    /// A committed batch is not a structural rebuild: tracked items the batch removed are
+    /// per-record deletions by identity, still-present tracked items reconcile content and
+    /// position, and a candidate whose row the batch removed is retired so a later settle
+    /// cannot resurrect it through the canonical-only path.
     private func reconcileLocalInputBatchDiff(from previousItems: [AgentChatItem], to newItems: [AgentChatItem]) {
         let trackedIDs = Set(localInputIndex.records.map(\.itemID)).union(localComposerCandidates.values.map(\.itemID))
         guard !trackedIDs.isEmpty else { return }
@@ -113,12 +114,22 @@ final class AgentTabSession: ObservableObject {
         for item in newItems where trackedIDs.contains(item.id) {
             newItemsByID[item.id] = item
         }
-        for (index, item) in previousItems.enumerated() where trackedIDs.contains(item.id) && newItemsByID[item.id] == nil {
-            localInputIndex.remove(at: index, itemID: item.id)
+        var removedTrackedIDs: Set<UUID> = []
+        var previousItemsByID: [UUID: AgentChatItem] = [:]
+        for item in previousItems where trackedIDs.contains(item.id) {
+            previousItemsByID[item.id] = item
+            if newItemsByID[item.id] == nil { removedTrackedIDs.insert(item.id) }
+        }
+        if !removedTrackedIDs.isEmpty {
+            localInputIndex.markDeleted(removedTrackedIDs)
+            // A removed row also retires an unsettled candidate for it: the producer's row is
+            // gone, so a late settle must not allocate an ordinal through the canonical path.
+            localComposerCandidates = localComposerCandidates.filter { !removedTrackedIDs.contains($0.value.itemID) }
         }
         reconcileLocalInputWorkingPositions(newItems)
         for record in localInputIndex.records where !record.isDeleted {
             guard let position = record.sourcePosition, let item = newItemsByID[record.itemID] else { continue }
+            if previousItemsByID[record.itemID] == item { continue } // Unchanged: skip re-projection.
             localInputIndex.replace(item, at: position)
         }
     }
@@ -2164,7 +2175,12 @@ final class AgentTabSession: ObservableObject {
         case .invalidate:
             invalidateLocalInputStructure()
         case .positionsOnly:
-            reconcileLocalInputWorkingPositions(repairedItems)
+            if repair.didRepair {
+                // Rekeyed item IDs are a genuine identity change; positions cannot be trusted.
+                invalidateLocalInputStructure()
+            } else {
+                reconcileLocalInputWorkingPositions(repairedItems)
+            }
         case .batchDiff(let previousItems):
             if repair.didRepair {
                 // Rekeyed item IDs are a genuine identity change, not an in-place batch edit.
@@ -2547,11 +2563,22 @@ final class AgentTabSession: ObservableObject {
                 ))
             }
         #endif
+        // `pendingToolFinalizationRepair` and `codexCommandStatusReconciliation` commit a mutated
+        // copy of the working list — in-place repairs that must not cost tracked inputs their
+        // epoch. Hydration, activation, clears and test overrides stay structural.
+        let localInputIdentity: LocalInputIdentityDisposition = switch reason {
+        case .retentionCompaction:
+            .positionsOnly
+        case .pendingToolFinalizationRepair, .codexCommandStatusReconciliation:
+            .batchDiff(previousItems: self.items)
+        case .persistedSessionHydration, .routeActivation, .clearedChat, .stressHarnessReset, .testOverride:
+            .invalidate
+        }
         commitSourceItems(
             items,
             dispatch: .silent,
             payloadUpdate: payloadUpdate,
-            localInputIdentity: reason == .retentionCompaction ? .positionsOnly : .invalidate,
+            localInputIdentity: localInputIdentity,
             diagnosticContext: "setItemsSilently reason=\(reason.rawValue)"
         )
         pendingSourceItemsMutationSummary = nil

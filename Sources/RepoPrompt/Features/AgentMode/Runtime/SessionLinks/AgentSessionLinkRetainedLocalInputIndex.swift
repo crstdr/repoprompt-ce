@@ -212,6 +212,18 @@ struct AgentSessionLinkRetainedLocalInputIndex {
         }
     }
 
+    /// Tombstone tracked items a committed batch dropped, matched by identity only. Unlike
+    /// `remove(at:itemID:)`, no positions shift here — the batch reconciler recomputes every
+    /// surviving record's position immediately afterwards, so positional matching would only
+    /// risk deleting a survivor whose position had already moved.
+    mutating func markDeleted(_ itemIDs: Set<UUID>) {
+        for index in records.indices where !records[index].isDeleted && itemIDs.contains(records[index].itemID) {
+            records[index].sourcePosition = nil
+            records[index].isDeleted = true
+            updateContent(nil, at: index)
+        }
+    }
+
     private mutating func updateContent(_ content: Content?, at index: Int) {
         guard records[index].content != content else { return }
         records[index].content = content
