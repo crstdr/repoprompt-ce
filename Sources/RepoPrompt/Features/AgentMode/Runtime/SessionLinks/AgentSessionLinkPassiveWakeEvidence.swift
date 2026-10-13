@@ -21,6 +21,30 @@ enum AgentSessionLinkPassiveWakeEvidence: Hashable {
         case .unknown, .ordinary: false
         }
     }
+
+    /// Padding the contract actually permits: ASCII whitespace only. Foundation's broader
+    /// `whitespacesAndNewlines` trims invisible format scalars like U+200B, which would let
+    /// `ack\u{200B}` pass as the exact token — strict is safer.
+    private static let quietPadding = CharacterSet(charactersIn: " \t\n\r\u{0B}\u{0C}")
+
+    /// The one reply a routine wake may end with and still finish quietly: the token `ack`,
+    /// case-insensitive, permitting surrounding whitespace and at most one trailing full stop.
+    static func isQuietRoutineReply(_ text: String) -> Bool {
+        var token = text.trimmingCharacters(in: quietPadding)
+        if token.hasSuffix(".") { token.removeLast() }
+        return token.lowercased() == "ack"
+    }
+
+    /// Whether reply text observed so far can still resolve to the exact quiet form once the turn
+    /// settles: trimmed, it must be a prefix of `ack.`. Anything else is vetoed at once, just as it
+    /// was before the quiet reply existed — a visible non-`ack` reply never waits for settlement.
+    static func replyTextCanStillBecomeQuiet(_ merged: String) -> Bool {
+        "ack.".hasPrefix(merged.trimmingCharacters(in: quietPadding).lowercased())
+    }
+
+    /// Bound on retained reply text — a deliberate eligibility line, not just a memory bound:
+    /// a reply padded past this can spell the token yet still wakes observers.
+    static let maxQuietReplyUTF8 = 256
 }
 
 /// One current/recent segment per tab, owned solely by AgentTabSession. The native run-start
@@ -32,12 +56,34 @@ struct AgentSessionLinkPassiveWakeSegment {
     var acquired = false
     var accepted = false
     var vetoed = false
+    /// Reply fragments streamed since the last completed message; an authoritative full message
+    /// supersedes exactly this prefix, while a blank completion seals it into completed text.
+    var replyPendingText = ""
+    /// Authoritative complete reply texts joined in order (Claude `final_content`, Codex
+    /// `assistantCompleted`). A turn can hold several completed messages; the newline boundary
+    /// keeps `"a"` + `"ck"` classifying as two messages instead of merging into `ack`.
+    var replyCompletedText = ""
+
+    /// What this turn has visibly replied so far: every completed message plus fragments streamed
+    /// after the last one, or the accumulated stream when no authoritative text has arrived.
+    var replyText: String {
+        var text = replyCompletedText
+        if !replyPendingText.isEmpty, !text.isEmpty { text += "\n" }
+        return text + replyPendingText
+    }
+
+    /// Appends one authoritative complete reply, preserving the message boundary.
+    mutating func appendReplyCompletion(_ text: String) {
+        if !replyCompletedText.isEmpty { replyCompletedText += "\n" }
+        replyCompletedText += text
+        replyPendingText = ""
+    }
 }
 
 @MainActor
 extension AgentTabSession {
     var supportsPassiveWakeEvidence: Bool {
-        selectedAgent == .codexExec || selectedAgent == .claudeCode
+        selectedAgent == .codexExec || selectedAgent == .claudeCode || selectedAgent == .devin
     }
 
     /// Pure bounded classifier. The existing terminal barrier owns drain and publication facts.
@@ -54,6 +100,10 @@ extension AgentTabSession {
             guard revision.terminalState == .completed, runState == .completed, segment.acquired else { return .ordinary(owner) }
             if terminalCommitInProgress { return .open(owner) }
             guard case .accepted = lastTerminalPublicationResult else { return .ordinary(owner) }
+            let replyText = segment.replyText
+            guard !AgentDisplayableText.hasDisplayableBody(replyText)
+                || AgentSessionLinkPassiveWakeEvidence.isQuietRoutineReply(replyText)
+            else { return .ordinary(owner) }
             // Native completion may precede its truthful accepted-send receipt.
             return segment.accepted ? .silent(owner) : .open(owner)
         }
@@ -107,10 +157,43 @@ extension AgentTabSession {
         passiveWakeEvidenceChanged.send(())
     }
 
-    func notePassiveWakeAssistantText(_ text: String?) {
-        guard passiveWakeSegment?.vetoed == false,
-              let text, AgentDisplayableText.hasDisplayableBody(text) else { return }
-        notePassiveWakeActivity()
+    /// `authoritative` marks a provider's complete reply text (Claude `final_content`, Codex
+    /// `assistantCompleted`), which supersedes the streamed prefix rather than appending to it.
+    /// Anything already vetoed stays vetoed; text is kept only while it can still resolve to the
+    /// exact quiet reply and is classified once, from the merged text, at terminal settlement.
+    /// Every byte is accumulated — including whitespace between visible runs — so that `"a"+" "+"ck"`
+    /// classifies as `a ck`, never `ack`; a fragment that is nothing but invisible format/control
+    /// scalars still counts as no visible reply, matching `hasDisplayableBody` at classification.
+    /// Every authoritative completion event is a message boundary — including an empty or absent
+    /// body: a completion with no displayable body seals the streamed prefix into completed text
+    /// rather than erasing or ignoring it, so a blank `final_content` cannot leave `"ac"` fuseable
+    /// with a later `ack`. With nothing streamed since the last completion it is a no-op: the
+    /// blank message carries no bytes and needs no separator.
+    /// Validation always inspects the post-update `replyText` — the exact text the terminal
+    /// classifier sees — so the separator inserted when a delta reopens pending text, and growth
+    /// from sealing, both count against the eligibility limit.
+    func notePassiveWakeAssistantText(_ text: String?, authoritative: Bool = false) {
+        guard var segment = passiveWakeSegment, !segment.vetoed else { return }
+        if authoritative {
+            if let text, AgentDisplayableText.hasDisplayableBody(text) {
+                segment.appendReplyCompletion(text)
+            } else {
+                guard !segment.replyPendingText.isEmpty else { return }
+                segment.appendReplyCompletion(segment.replyPendingText)
+            }
+        } else {
+            guard let text, !text.isEmpty else { return }
+            segment.replyPendingText += text
+        }
+        let candidate = segment.replyText
+        guard candidate.utf8.count <= AgentSessionLinkPassiveWakeEvidence.maxQuietReplyUTF8,
+              !AgentDisplayableText.hasDisplayableBody(candidate)
+              || AgentSessionLinkPassiveWakeEvidence.replyTextCanStillBecomeQuiet(candidate)
+        else {
+            notePassiveWakeActivity()
+            return
+        }
+        passiveWakeSegment = segment
     }
 
     /// Genuine terminal teardown may clear the process ID before a late native acceptance.
