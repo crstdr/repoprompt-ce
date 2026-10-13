@@ -188,7 +188,8 @@ final class AgentModeRunService {
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         stopFence: AgentRunStartStopFence? = nil,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        passiveWakeID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         var candidateTransferred = false
         defer {
@@ -249,7 +250,8 @@ final class AgentModeRunService {
                 fallbackContext: codexFallbackContext,
                 autoEffortSelection: autoEffortSelection,
                 selfCompactDispatchID: selfCompactDispatchID,
-                stopFence: stopFence
+                stopFence: stopFence,
+                passiveWakeID: passiveWakeID
             )
             startOutcome?.record(codexOutcome: outcome)
             return outcome
@@ -300,7 +302,8 @@ final class AgentModeRunService {
                 providerControlCommand: providerControlCommand,
                 selfCompactDispatchID: selfCompactDispatchID,
                 stopFence: stopFence,
-                localComposerCandidate: localComposerCandidate
+                localComposerCandidate: localComposerCandidate,
+                passiveWakeID: passiveWakeID
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil

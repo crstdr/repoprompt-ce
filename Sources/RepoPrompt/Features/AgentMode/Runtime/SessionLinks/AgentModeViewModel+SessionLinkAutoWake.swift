@@ -836,6 +836,7 @@ extension AgentModeViewModel {
                 return false
             }
             guard let fingerprint = attempt.wakeFingerprint else { return false }
+            session.acquirePassiveWakeEvidence(wakeID: wakeID, hasAttention: !(claim.passive?.receipt.deliveredAttentionOccurrences.isEmpty ?? true))
             attempt.phase = .dispatching
             attempt.attemptedFingerprint = AgentSessionLinkPassiveStatusNotices
                 .WakeEligibilityFingerprint(
@@ -1065,6 +1066,7 @@ extension AgentModeViewModel {
         // Periodic producers may still enter the existing Codex fallback/auth recovery path.
         // Keep their identity until acceptance or proven producer settlement, without suppression.
         if attempt.isPeriodic { return }
+        if session.passiveWakeSegment?.wakeID == wakeID { session.notePassiveWakeActivity() }
         agentSessionLinkSettleAmbiguousAutoWake(attempt, session: session)
     }
 
@@ -1227,6 +1229,7 @@ extension AgentModeViewModel {
         else {
             return
         }
+        session.acceptPassiveWakeEvidence(wakeID: wakeID)
         // Matched by wake ID alone. A late acceptance that arrives after a local user submission is
         // still truthful — it appends its one provenance row — and there is no session state left
         // for it to overwrite.
@@ -2209,7 +2212,10 @@ extension AgentModeViewModel {
         let snoozedReferences = isManual
             ? []
             : session.oversight.activeSnoozedReferences(observerEndpoint: endpoint)
-        let routineLanes = selectedLanes.filter { !snoozedReferences.contains($0.key) }
+        let routineLanes = selectedLanes.filter {
+            !snoozedReferences.contains($0.key)
+                && (isManual || !snapshot.routineNonAdmittingReferences.contains($0.key))
+        }
         return AgentSessionLinkAutoWakeAdmission(
             routineLanesBeforeInterval: routineLanes,
             hasConcreteEntryBeforeInterval: snapshot.entries.contains {

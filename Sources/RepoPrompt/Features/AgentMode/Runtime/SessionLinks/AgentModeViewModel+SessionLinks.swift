@@ -407,6 +407,28 @@ extension AgentModeViewModel {
         )
     }
 
+    func agentSessionLinkPassiveWakeEvidence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence {
+        guard let session = sessions[candidate.tabID], session.activeAgentSessionID == candidate.sessionID,
+              session.persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration,
+              session.bindingTransitionGeneration == candidate.bindingTransitionGeneration else { return .unknown }
+        return session.passiveWakeEvidence
+    }
+
+    func agentSessionLinkInstallObservation(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        onChange: @escaping @MainActor () -> Void,
+        onPassiveWakeChange: @escaping @MainActor () -> Void
+    ) -> AgentSessionLinkObservationToken? {
+        guard let session = sessions[candidate.tabID],
+              let normal = agentSessionLinkInstallObservation(for: candidate, onChange: onChange) else { return nil }
+        let policy = session.passiveWakeEvidenceChanged.sink { _ in
+            MainActor.assumeIsolated { onPassiveWakeChange() }
+        }
+        return AgentSessionLinkObservationToken { normal.invalidate()
+            policy.cancel()
+        }
+    }
+
     /// Refresh durable child metadata once for a poll/wait batch. The synchronous snapshot path
     /// reads only the already-merged parent lookup and never scans the registry per target.
     ///
