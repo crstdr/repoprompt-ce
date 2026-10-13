@@ -1895,7 +1895,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             // A compact still in flight refuses without touching the link or the tab.
             var compact = AgentSelfCompactState()
             _ = compact.reserve(
-                note: "Continue after compaction.", idempotencyKey: "compact-\(lane.sessionID)"
+                note: "Continue after compaction.", idempotencyKey: "compact-\(lane.sessionID)",
+                maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes
             )
             compact.active?.phase = .acpSettling
             laneSession.selfCompactState = compact
