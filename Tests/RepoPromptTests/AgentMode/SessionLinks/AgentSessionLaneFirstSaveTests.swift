@@ -6,6 +6,15 @@ import XCTest
 
 @MainActor
 final class AgentSessionLaneFirstSaveTests: XCTestCase {
+    @MainActor
+    private final class AdvertisementRecorder {
+        var sessionIDs: [UUID] = []
+
+        func record(_ sessionID: UUID) {
+            sessionIDs.append(sessionID)
+        }
+    }
+
     private struct Fixture {
         let window: WindowState
         let root: URL
@@ -77,6 +86,15 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         )
     }
 
+    /// Routes activation retirement to a local recorder, so tests that drive activation without
+    /// attaching their own bridge never notify the shared production bridge. Install inside the
+    /// fixture body: window registration re-attaches the production bridge. Restore the result.
+    private func installLocalRetirementSink(_ recorder: AdvertisementRecorder) -> ((UUID) -> Void)? {
+        let previous = AgentSessionLinkInvalidationSink.overseerActivationRetired
+        AgentSessionLinkInvalidationSink.overseerActivationRetired = { recorder.record($0) }
+        return previous
+    }
+
     private func withSecondRegisteredWindow(_ body: (WindowState) async throws -> Void) async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -97,7 +115,15 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         WindowStatesManager.shared.unregisterWindowState(window)
     }
 
+    func testToolbarActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
+        try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: true)
+    }
+
     func testActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
+        try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: false)
+    }
+
+    private func exerciseActivatedFirstLaneFromAnotherWindow(toolbar: Bool) async throws {
         try await withFixture(ephemeral: false) { fixture in
             let host = WindowStatesManager.shared
             let creatorOutcome = try await host.agentSessionLinkCreateLane(destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID, creatorSessionID: UUID(), sessionName: "Ordinary creator", selection: fixture.selection)
@@ -108,8 +134,28 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()))
             let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
             bridge.installIntentStore(AgentSessionOversightIntentStore(fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename), backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled))
-            let activated = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
-            XCTAssertNotNil(activated)
+            let viewModel = fixture.window.agentModeViewModel
+            viewModel.test_setCurrentTabIDOverride(creatorTabID)
+            defer { viewModel.test_setCurrentTabIDOverride(nil) }
+            let before = viewModel.currentMonitorPillProps()
+            let expected = try XCTUnwrap(before.overseerBootstrapState)
+            XCTAssertNil(expected.activation)
+            let denied = await bridge.laneCreationCallerPreflight(endpoint)
+            XCTAssertEqual(denied, .denied, "zero links alone do not authorize creation")
+            let activated: Bool = if toolbar {
+                await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            } else {
+                await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() }) != nil
+            }
+            XCTAssertTrue(activated)
+            let enabled = viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertNotNil(enabled.overseerBootstrapState?.activation, "commit publishes the dashboard immediately")
+            XCTAssertFalse(enabled.isOverseer, "activation is not an outbound role badge")
+            XCTAssertNil(enabled.dashboardOutboundCount)
+            XCTAssertNil(enabled.dashboardInboundCount)
+            XCTAssertNil(creator.oversight.pendingAutoWake, "consent cannot start a turn")
+            let noLinks = await authority.links(forObserver: creatorID)
+            XCTAssertTrue(noLinks.items.isEmpty, "consent manufactures no grants")
             AgentAdvertisedModelCatalog.shared.record([
                 AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
             ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
@@ -137,6 +183,186 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 XCTAssertEqual(inventory.items.map(\.targetSessionID), [laneID])
                 XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, fixture.workspaceID, "creation never switches the creator workspace")
             }
+        }
+    }
+
+    func testFailedRouteRetiresZeroLinkActivationPresentationAndAdvertisement() async throws {
+        try await exerciseFailedRouteSettlement(activated: true)
+    }
+
+    func testFailedRouteRefreshesNeverActivatedZeroLinkPillEndpoint() async throws {
+        try await exerciseFailedRouteSettlement(activated: false)
+    }
+
+    private func exerciseFailedRouteSettlement(activated: Bool) async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let seed = try await host.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "Failed route consent", selection: fixture.selection
+            )
+            guard case let .created(sessionID, tabID, _) = seed else { return XCTFail("seed must save") }
+            let session = try XCTUnwrap(viewModel.sessions[tabID])
+            session.createdByOverseerSessionID = nil
+            viewModel.test_setCurrentTabIDOverride(tabID)
+            defer { viewModel.test_setCurrentTabIDOverride(nil) }
+            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let invalidated = AdvertisementRecorder()
+            let bridge = AgentSessionLinkRuntimeBridge(
+                authority: authority, host: host, toolAdvertisementInvalidator: { await invalidated.record($0) }
+            )
+            bridge.attach(host: host)
+            defer { host.attachAgentSessionLinkBridge() }
+            if activated {
+                let expected = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+                let enabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+                XCTAssertTrue(enabled)
+                XCTAssertNotNil(viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation)
+                invalidated.sessionIDs.removeAll()
+            } else {
+                viewModel.syncStatusPillsUIState()
+                XCTAssertEqual(viewModel.ui.statusPills.snapshot.monitor.endpoint, endpoint)
+            }
+            // Counted for this session only: the fresh authority holds no links, so no revocation or
+            // readiness reconciliation should notify anything else, but those are not under test here.
+            let retirements = { invalidated.sessionIDs.count { $0 == sessionID } }
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let result = await viewModel.activateRoutedAgentSession(tabID: tabID, sessionID: UUID(), workspace: workspace)
+            XCTAssertEqual(result, .sessionNotFound)
+            XCTAssertEqual(session.activeAgentSessionID, sessionID, "failed route leaves the same session on screen")
+            XCTAssertFalse(session.bindingTransitionInProgress)
+            XCTAssertNil(session.oversight.overseerActivation)
+            if activated {
+                try await AsyncTestWait.waitUntil("retired advertisement", timeout: 10) { retirements() == 1 }
+            }
+            let currentEndpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            XCTAssertNotEqual(currentEndpoint, endpoint)
+            let settledBootstrapState = AgentSessionOverseerBootstrapState(
+                sessionIdentity: ObjectIdentifier(session), provider: session.selectedAgent, activation: nil
+            )
+            // The settlement repaint is deferred past the enclosing mutation. A mid-transition
+            // repaint can already show the new endpoint without a bootstrap state, so wait for both.
+            try await AsyncTestWait.waitUntil("settled pill endpoint and bootstrap state", timeout: 10) {
+                let monitor = viewModel.ui.statusPills.snapshot.monitor
+                return monitor.endpoint == currentEndpoint && monitor.overseerBootstrapState == settledBootstrapState
+            }
+            XCTAssertEqual(retirements(), activated ? 1 : 0, "one retirement per activation, never a settlement replay")
+            let monitor = viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertFalse(monitor.isOverseer)
+            XCTAssertTrue(monitor.outbound.isEmpty)
+            XCTAssertNil(session.oversight.pendingAutoWake)
+            let inventory = await authority.links(forObserver: sessionID)
+            XCTAssertTrue(inventory.items.isEmpty)
+            let staleCall = await bridge.laneCreationCallerPreflight(endpoint)
+            let freshCall = await bridge.laneCreationCallerPreflight(currentEndpoint)
+            XCTAssertEqual(staleCall, .denied)
+            XCTAssertEqual(freshCall, .denied, "authority already failed closed before this publication repair")
+        }
+    }
+
+    func testToolbarActivationRejectsAlreadyLinkedIncarnationDespiteStaleDashboard() async throws {
+        for inbound in [false, true] {
+            try await withFixture(ephemeral: false) { fixture in
+                let host = WindowStatesManager.shared
+                let viewModel = fixture.window.agentModeViewModel
+                var seedIDs: [UUID] = []
+                for _ in 0 ..< 2 {
+                    let seed = try await host.agentSessionLinkCreateLane(
+                        destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                        creatorSessionID: UUID(), sessionName: "Linked consent", selection: fixture.selection
+                    )
+                    guard case let .created(sessionID, tabID, _) = seed else { return XCTFail("seed must save") }
+                    viewModel.sessions[tabID]?.createdByOverseerSessionID = nil
+                    seedIDs.append(sessionID)
+                }
+                let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == seedIDs[0] }).domainEndpoint
+                let expected = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+                let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                    runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+                ))
+                let invalidated = AdvertisementRecorder()
+                let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { await invalidated.record($0) })
+                bridge.installIntentStore(AgentSessionOversightIntentStore(
+                    fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+                    backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled
+                ))
+                let pair = AgentSessionOversightIntent(
+                    observerSessionID: seedIDs[inbound ? 1 : 0], targetSessionID: seedIDs[inbound ? 0 : 1]
+                )
+                guard case .added = await bridge.addMonitorLink(pair: pair) else { return XCTFail("real link must activate") }
+                invalidated.sessionIDs.removeAll()
+                let enabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+                XCTAssertFalse(enabled, "a lagging dashboard cannot opt in an already linked incarnation")
+                XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint)?.activation)
+                XCTAssertTrue(invalidated.sessionIDs.isEmpty)
+            }
+        }
+    }
+
+    func testToolbarActivationRejectsDisabledStaleAndIneligibleIncarnations() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let retired = AdvertisementRecorder()
+            let previousRetiredSink = self.installLocalRetirementSink(retired)
+            defer { AgentSessionLinkInvalidationSink.overseerActivationRetired = previousRetiredSink }
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let seed = try await host.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "Toolbar consent", selection: fixture.selection
+            )
+            guard case let .created(sessionID, tabID, _) = seed else { return XCTFail("seed must save") }
+            let session = try XCTUnwrap(viewModel.sessions[tabID])
+            session.createdByOverseerSessionID = nil
+            let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == sessionID }).domainEndpoint
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let invalidated = AdvertisementRecorder()
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { await invalidated.record($0) })
+            let expected = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+            let disabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { false })
+            XCTAssertFalse(disabled)
+            XCTAssertNil(session.oversight.overseerActivation)
+            XCTAssertTrue(invalidated.sessionIDs.isEmpty)
+            for exclusion in ["mcp-origin", "child", "lane", "mcp-control"] {
+                switch exclusion {
+                case "mcp-origin": session.isMCPOriginated = true
+                case "child": session.parentSessionID = UUID()
+                case "lane": session.createdByOverseerSessionID = UUID()
+                default: await self.installDeniedRoleControlFixture(on: session, sessionID: sessionID)
+                }
+                let refused = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+                XCTAssertFalse(refused, exclusion)
+                XCTAssertNil(session.oversight.overseerActivation, exclusion)
+                session.isMCPOriginated = false
+                session.parentSessionID = nil
+                session.createdByOverseerSessionID = nil
+                if session.mcpControlContext != nil {
+                    await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+                }
+            }
+            let enabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            XCTAssertTrue(enabled)
+            XCTAssertEqual(invalidated.sessionIDs, [sessionID])
+            let activation = try XCTUnwrap(session.oversight.overseerActivation)
+            let stale = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            XCTAssertFalse(stale, "displayed pre-activation state is a CAS, not reusable consent")
+            XCTAssertEqual(session.oversight.overseerActivation, activation)
+            XCTAssertEqual(invalidated.sessionIDs, [sessionID])
+            XCTAssertTrue(retired.sessionIDs.isEmpty, "refusals and a live activation retire nothing")
+            session.beginPersistentBindingTransition()
+            XCTAssertEqual(retired.sessionIDs, [sessionID], "rebind retires the activation once, synchronously")
+            let rebound = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            XCTAssertFalse(rebound)
+            XCTAssertNil(session.oversight.overseerActivation)
+            XCTAssertEqual(invalidated.sessionIDs, [sessionID])
+            XCTAssertEqual(retired.sessionIDs, [sessionID])
+            let inventory = await authority.links(forObserver: sessionID)
+            XCTAssertTrue(inventory.items.isEmpty)
         }
     }
 
@@ -736,6 +962,9 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
 
     func testOverseerActivationIsIncarnationLocalAndExcludedSessionsCannotBootstrap() async throws {
         try await withFixture(ephemeral: false) { fixture in
+            let retired = AdvertisementRecorder()
+            let previousRetiredSink = self.installLocalRetirementSink(retired)
+            defer { AgentSessionLinkInvalidationSink.overseerActivationRetired = previousRetiredSink }
             let viewModel = fixture.window.agentModeViewModel
             let host = WindowStatesManager.shared
             let outcome = try await host.agentSessionLinkCreateLane(destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID, creatorSessionID: UUID(), sessionName: "Activation state", selection: fixture.selection)
@@ -794,8 +1023,11 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let returnedToDirect = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
             XCTAssertNil(returnedToDirect.activation, "production role release must not resurrect the old opt-in")
             XCTAssertTrue(viewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: returnedToDirect), "direct requires a fresh opt-in")
+            let retiredBeforeRebind = retired.sessionIDs.count
             session.beginPersistentBindingTransition()
             XCTAssertNil(session.oversight.overseerActivation, "rebind consumes activation immediately")
+            XCTAssertEqual(retired.sessionIDs.count, retiredBeforeRebind + 1)
+            XCTAssertTrue(retired.sessionIDs.allSatisfy { $0 == sessionID }, "retirement names only this session")
             XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint), "suspended binding is ineligible")
             let restarted = AgentTabSession(tabID: tabID)
             XCTAssertNil(restarted.oversight.overseerActivation, "new object/restart never restores activation")
@@ -1552,6 +1784,803 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 throw error
             }
             await dataService.test_setWorkspaceRootOverride(nil)
+        }
+    }
+
+    // MARK: - retire_lane preflight ordering
+
+    /// The real-host wiring the MCP `retire_lane` call uses: a seeded overseer session, a real
+    /// authority, an attached bridge with a durable intent store, and an activated observer grant.
+    private struct LinkedOverseer {
+        let bridge: AgentSessionLinkRuntimeBridge
+        let authority: DomainAgentSessionLinkAuthority
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let sessionID: UUID
+    }
+
+    private func makeLinkedOverseer(fixture: Fixture) async throws -> LinkedOverseer {
+        let host = WindowStatesManager.shared
+        let viewModel = fixture.window.agentModeViewModel
+        let seed = try await host.agentSessionLinkCreateLane(
+            destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+            creatorSessionID: UUID(), sessionName: "Retire overseer", selection: fixture.selection
+        )
+        guard case let .created(overseerID, overseerTabID, _) = seed else {
+            XCTFail("overseer seed must save")
+            throw CancellationError()
+        }
+        let overseer = try XCTUnwrap(viewModel.sessions[overseerTabID])
+        overseer.createdByOverseerSessionID = nil
+        let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first {
+            $0.sessionID == overseerID
+        }).domainEndpoint
+        let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+            runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+        ))
+        let bridge = AgentSessionLinkRuntimeBridge(
+            authority: authority, host: host, toolAdvertisementInvalidator: { _ in }
+        )
+        bridge.attach(host: host)
+        bridge.installIntentStore(AgentSessionOversightIntentStore(
+            fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+            backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled
+        ))
+        let activated = await bridge.becomeOverseer(
+            endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true },
+            commitIfCurrent: { $0() }
+        )
+        XCTAssertNotNil(activated)
+        return LinkedOverseer(
+            bridge: bridge, authority: authority, endpoint: endpoint, sessionID: overseerID
+        )
+    }
+
+    /// Runs the real claimed-creation path — caller preflight, model resolution, durable publish —
+    /// and leaves the observer->lane link `retireLane` later consumes.
+    private func createLinkedLane(
+        fixture: Fixture,
+        overseer: LinkedOverseer,
+        name: String,
+        idempotencyKey: String
+    ) async throws -> (sessionID: UUID, tabID: UUID) {
+        let catalog = AgentAdvertisedModelCatalog.shared
+        catalog.record([
+            AgentModelOption(
+                rawValue: "sonnet:high", displayName: "Fixture model", description: nil,
+                isPlaceholderDefault: false, isProviderDefault: false
+            )
+        ], for: .claudeCode, generation: catalog.productionGeneration(for: .claudeCode))
+        defer { catalog.invalidate(.claudeCode) }
+        fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+        try await AsyncTestWait.waitUntil("retire fixture model availability") {
+            fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+        }
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let receipt = await overseer.bridge.createLane(
+            observerEndpoint: overseer.endpoint,
+            request: AgentSessionLaneCreateRequest(
+                idempotencyKey: idempotencyKey, role: nil, modelID: "claudeCode:sonnet:high",
+                sessionName: name, workspaceSelector: workspace.id.uuidString,
+                message: nil, workflowReference: nil
+            ),
+            resolveDestination: { (fixture.window.windowID, workspace.id, workspace.name) }
+        )
+        guard receipt.result == .created, receipt.linked, let sessionID = receipt.sessionID else {
+            XCTFail("linked lane creation refused: \(String(describing: receipt.reason))")
+            throw CancellationError()
+        }
+        let tabID = try XCTUnwrap(fixture.window.agentModeViewModel.sessions.first {
+            $0.value.activeAgentSessionID == sessionID
+        }?.key)
+        return (sessionID, tabID)
+    }
+
+    /// The settle save must land while the observer link is still live; only then may retire unlink.
+    func testCodexLaneRetiresAfterCompactSettleFlushBeforeUnlink() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Codex compact lane", idempotencyKey: "codex-compact-retire"
+            )
+            let laneSession = try XCTUnwrap(viewModel.sessions[lane.tabID])
+            laneSession.selectedAgent = .codexExec
+
+            // A compact still in flight refuses without touching the link or the tab.
+            var compact = AgentSelfCompactState()
+            _ = compact.reserve(
+                note: "Continue after compaction.", idempotencyKey: "compact-\(lane.sessionID)"
+            )
+            compact.active?.phase = .acpSettling
+            laneSession.selfCompactState = compact
+            laneSession.runState = .running
+            laneSession.isDirty = true
+            let midCompact = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(midCompact, .notRetired(sessionID: lane.sessionID, reason: .laneBusy))
+            var inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a mid-compact refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "a mid-compact refusal must keep the tab bound")
+
+            // The compact settled but the settle save has not landed; the required flush inside the
+            // preflight carries it. Parking the saver proves the write happens before unlinking.
+            compact.settle(.noteAccepted, noteDelivery: .accepted, completionVerified: true)
+            laneSession.selfCompactState = compact
+            laneSession.runState = .completed
+            laneSession.isDirty = true
+            let flushReached = expectation(description: "settle flush runs while the link is live")
+            var flushParked = false
+            var releaseFlush: CheckedContinuation<Void, Never>?
+            viewModel.test_setAgentSessionSaver { session, workspace, canonicalItemCount in
+                if session.id == lane.sessionID, !flushParked {
+                    flushParked = true
+                    flushReached.fulfill()
+                    await withCheckedContinuation { releaseFlush = $0 }
+                }
+                return try await AgentSessionDataService.shared.saveAgentSession(
+                    session, for: workspace,
+                    preparation: .alreadyCanonicalTranscript,
+                    trustedCanonicalItemCount: canonicalItemCount
+                )
+            }
+            defer {
+                viewModel.test_setAgentSessionSaver { session, workspace, canonicalItemCount in
+                    try await AgentSessionDataService.shared.saveAgentSession(
+                        session, for: workspace,
+                        preparation: .alreadyCanonicalTranscript,
+                        trustedCanonicalItemCount: canonicalItemCount
+                    )
+                }
+            }
+            let retireDone = expectation(description: "retire finishes after the gated flush")
+            var outcome: AgentSessionLaneRetireOutcome?
+            Task { @MainActor in
+                outcome = await linked.bridge.retireLane(
+                    observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+                )
+                retireDone.fulfill()
+            }
+            await fulfillment(of: [flushReached], timeout: 10)
+            inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "the settle save must land while the link is live")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "the lane tab must still be bound while the flush is parked")
+            releaseFlush?.resume()
+            await fulfillment(of: [retireDone], timeout: 10)
+            XCTAssertEqual(outcome, .retired(sessionID: lane.sessionID))
+            inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertTrue(inbound.items.isEmpty)
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            XCTAssertTrue(workspace.stashedTabs.contains { $0.tab.id == lane.tabID })
+            let savedRecord = try await AgentSessionDataService.shared.loadAgentSession(
+                id: lane.sessionID, for: workspace
+            )
+            let saved = try XCTUnwrap(savedRecord)
+            XCTAssertEqual(saved.lastRunState, AgentSessionRunState.completed.rawValue)
+            XCTAssertEqual(saved.selfCompactState?.latest?.outcome, .noteAccepted)
+        }
+    }
+
+    /// Stale persisted `running` headers must not survive the preflight flush: finished children
+    /// retire with the lane and their disk records show the settled state.
+    func testFinishedSubagentsRetireAfterPreflightFlushFreshensHeaders() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Retire parent", idempotencyKey: "finished-subagents-retire"
+            )
+            var children: [(sessionID: UUID, tabID: UUID)] = []
+            for index in 0 ..< 2 {
+                let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                    tabID: nil, sessionID: nil, createIfNeeded: true,
+                    sessionName: "Finished child \(index)", parentSessionID: lane.sessionID,
+                    expectedWorkspaceID: fixture.workspaceID
+                )
+                viewModel.mcpAcceptSessionTarget(target)
+                let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+                try children.append((XCTUnwrap(child.activeAgentSessionID), target.tabID))
+                child.runState = .running
+                child.isDirty = true
+                await viewModel.flushSave(for: target.tabID)
+                child.runState = .completed
+                child.isDirty = true
+            }
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            // The persisted-child scan reads raw headers; the loaded-session reader normalizes
+            // active states to idle, so staleness must be proven at the header layer.
+            let rawRecords = try await AgentSessionDataService.shared.persistedChildRetirementRecords(
+                workspace: workspace
+            )
+            for child in children {
+                let staleHeader = try XCTUnwrap(rawRecords.first { $0.sessionID == child.sessionID })
+                XCTAssertTrue(
+                    staleHeader.blocksRetirement,
+                    "precondition: the persisted header still reports an active run"
+                )
+            }
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .retired(sessionID: lane.sessionID))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertTrue(inbound.items.isEmpty)
+            let settledWorkspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            XCTAssertTrue(settledWorkspace.stashedTabs.contains { $0.tab.id == lane.tabID })
+            for child in children {
+                XCTAssertTrue(settledWorkspace.stashedTabs.contains { $0.tab.id == child.tabID })
+                let settledRecord = try await AgentSessionDataService.shared.loadAgentSession(
+                    id: child.sessionID, for: settledWorkspace
+                )
+                let settled = try XCTUnwrap(settledRecord)
+                XCTAssertEqual(settled.lastRunState, AgentSessionRunState.completed.rawValue)
+            }
+        }
+    }
+
+    /// A refusal raised inside the preflight leaves the grant and the tab retryably intact.
+    func testInjectedPreflightRefusalKeepsLinkAndTab() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let promptManager = try XCTUnwrap(viewModel.promptManager)
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Preflight refusal lane", idempotencyKey: "preflight-refusal-retire"
+            )
+
+            // The required-session flush refuses inside the validate-only pass.
+            let abortToken = promptManager.setComposeTabsRemovalPreflight { _, _, _ in
+                .abort(.init(
+                    stage: .requiredSessionFlush, tabID: nil,
+                    message: "injected retirement preflight refusal"
+                ))
+            }
+            let refused = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(refused, .notRetired(sessionID: lane.sessionID, reason: .laneBusy))
+            var inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a preflight refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "a preflight refusal must keep the tab bound")
+            XCTAssertFalse(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains {
+                $0.tab.id == lane.tabID
+            } == true)
+
+            // The save-admission probe refuses the same way, still without unlinking.
+            promptManager.removeComposeTabsRemovalPreflight(abortToken)
+            _ = promptManager.setComposeTabsRemovalPreflight { [weak viewModel] tabIDs, reason, workspaceID in
+                guard let viewModel else { return .proceed }
+                return await viewModel.preflightComposeTabsRemoval(
+                    tabIDs, reason: reason, workspaceID: workspaceID
+                )
+            }
+            fixture.window.workspaceManager.setWorkspacePersistenceOutcomeOverrideForTesting(
+                .rejected(reason: "injected workspace save refusal")
+            )
+            defer {
+                fixture.window.workspaceManager.setWorkspacePersistenceOutcomeOverrideForTesting(nil)
+            }
+            let saveRefused = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(saveRefused, .notRetired(sessionID: lane.sessionID, reason: .laneBusy))
+            inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a save-admission refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true)
+
+            // With the injection cleared, the identical call retires the lane.
+            fixture.window.workspaceManager.setWorkspacePersistenceOutcomeOverrideForTesting(nil)
+            let retired = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(retired, .retired(sessionID: lane.sessionID))
+            inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertTrue(inbound.items.isEmpty)
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains {
+                $0.tab.id == lane.tabID
+            } == true)
+        }
+    }
+
+    /// A workspace-save refusal raised after the stash has committed does not un-retire the lane:
+    /// the link is gone, the tab and its settled children already sit in `stashedTabs`, and the
+    /// outcome is `retired` — the normal save cadence persists the mutation later.
+    func testWorkspaceSaveRefusalAfterCommittedStashStillReportsRetired() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Post-stash save refusal lane", idempotencyKey: "post-stash-save-refusal"
+            )
+            let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true,
+                sessionName: "Settled child", parentSessionID: lane.sessionID,
+                expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(target)
+            let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+            child.runState = .idle
+            child.isDirty = true
+            await viewModel.flushSave(for: target.tabID)
+            // Arm the refusal inside the stop admission hook: the preflight probe has already
+            // passed, so the rejection can only land on the post-unlink workspace save — which no
+            // longer gates the outcome once the stash has committed.
+            linked.bridge.test_afterStopAdmission = {
+                linked.bridge.test_afterStopAdmission = nil
+                fixture.window.workspaceManager.setWorkspacePersistenceOutcomeOverrideForTesting(
+                    .rejected(reason: "injected post-stash save refusal")
+                )
+            }
+            defer {
+                fixture.window.workspaceManager.setWorkspacePersistenceOutcomeOverrideForTesting(nil)
+            }
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .retired(sessionID: lane.sessionID))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertTrue(inbound.items.isEmpty, "the link was honestly removed before the refusal")
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            XCTAssertTrue(workspace.stashedTabs.contains { $0.tab.id == lane.tabID })
+            XCTAssertTrue(
+                workspace.stashedTabs.contains { $0.tab.id == target.tabID },
+                "the settled child must ride the same committed stash"
+            )
+            XCTAssertFalse(workspace.composeTabs.contains { $0.id == lane.tabID })
+        }
+    }
+
+    /// `unlinked_not_stashed` is reserved for the genuine case: the link is gone but the stash
+    /// itself never committed. A quiescence flip injected after the unlink makes the commit-time
+    /// CAS refuse before any projection mutation, so the tab stays live and the outcome is honest.
+    func testPostUnlinkUncommittedStashStillReportsUnlinkedNotStashed() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Uncommitted stash lane", idempotencyKey: "uncommitted-stash-retire"
+            )
+            // Flip the lane's live session to active inside the stop admission hook: the commit-time
+            // revalidation then refuses before the stash mutates anything — the honest residual.
+            linked.bridge.test_afterStopAdmission = {
+                linked.bridge.test_afterStopAdmission = nil
+                viewModel.sessions[lane.tabID]?.runState = .running
+            }
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .unlinkedNotStashed(sessionID: lane.sessionID))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertTrue(inbound.items.isEmpty, "the link was honestly removed before the refusal")
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            XCTAssertFalse(
+                workspace.stashedTabs.contains { $0.tab.id == lane.tabID },
+                "an uncommitted stash must leave the tab live"
+            )
+            XCTAssertTrue(workspace.composeTabs.contains { $0.id == lane.tabID })
+        }
+    }
+
+    /// A lazily-bound child whose state has not hydrated looks quiescent on defaults alone, so its
+    /// live record must never shadow the persisted header's fail-closed signal. The flushed index
+    /// stays non-blocking so only the merged disk scan can refuse.
+    private func seedUnhydratedBoundChild(
+        fixture: Fixture, viewModel: AgentModeViewModel, laneSessionID: UUID,
+        persistedRunState: String?
+    ) async throws -> (sessionID: UUID, tabID: UUID) {
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true,
+            sessionName: "Mid-hydration child", parentSessionID: laneSessionID,
+            expectedWorkspaceID: fixture.workspaceID
+        )
+        viewModel.mcpAcceptSessionTarget(target)
+        let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+        let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
+        child.runState = .idle
+        child.isDirty = true
+        await viewModel.flushSave(for: target.tabID)
+        child.hasLoadedPersistedState = false
+        var persisted = AgentSession(id: childSessionID, name: "Mid-hydration child", savedAt: Date())
+        persisted.parentSessionID = laneSessionID
+        persisted.lastRunState = persistedRunState
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
+        return (childSessionID, target.tabID)
+    }
+
+    /// A persisted `running` header plus an unhydrated idle-looking stub must still refuse the
+    /// unlink before it happens, keeping the link and the tab retryably intact.
+    func testUnhydratedChildStubKeepsPersistedActiveHeaderBlocking() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Unhydrated-stub parent", idempotencyKey: "unhydrated-stub-blocks"
+            )
+            let child = try await seedUnhydratedBoundChild(
+                fixture: fixture, viewModel: viewModel, laneSessionID: lane.sessionID,
+                persistedRunState: AgentSessionRunState.running.rawValue
+            )
+            let blocked = await host.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: lane.sessionID
+            )
+            XCTAssertTrue(blocked, "the unhydrated stub must not clear the persisted block")
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .notRetired(sessionID: lane.sessionID, reason: .laneInUseDiskChild))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a pre-unlink refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "a pre-unlink refusal must keep the tab")
+            XCTAssertFalse(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains {
+                $0.tab.id == lane.tabID || $0.tab.id == child.tabID
+            } == true)
+        }
+    }
+
+    /// A persisted header that decodes without a usable `lastRunState` fails closed; an unhydrated
+    /// stub must not clear that either.
+    func testUnhydratedChildStubKeepsMissingHeaderBlocking() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Unhydrated-stub parent", idempotencyKey: "unhydrated-missing-blocks"
+            )
+            let child = try await seedUnhydratedBoundChild(
+                fixture: fixture, viewModel: viewModel, laneSessionID: lane.sessionID,
+                persistedRunState: nil
+            )
+            let blocked = await host.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: lane.sessionID
+            )
+            XCTAssertTrue(blocked, "a missing header state must fail closed under an unhydrated stub")
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .notRetired(sessionID: lane.sessionID, reason: .laneInUseDiskChild))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a pre-unlink refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "a pre-unlink refusal must keep the tab")
+            XCTAssertFalse(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains {
+                $0.tab.id == lane.tabID || $0.tab.id == child.tabID
+            } == true)
+        }
+    }
+
+    /// Ambiguous lineage across provenance tiers fails closed: conflicting non-nil parents, or a
+    /// hydrated "no parent" vote against a claimed edge, keep every edge and force the block. Only
+    /// coherent lineage lets hydrated quiescence shadow a stale persisted or index block.
+    func testChildRetirementMergeFailsClosedOnAmbiguousLineage() {
+        let sessionID = UUID()
+        let parentA = UUID()
+        let parentB = UUID()
+        let parentC = UUID()
+        func record(
+            _ source: AgentSessionLaneChildRetirementRecord.Source,
+            parent: UUID? = parentA, blocks: Bool
+        ) -> AgentSessionLaneChildRetirementRecord {
+            .init(sessionID: sessionID, parentSessionID: parent, blocksRetirement: blocks, source: source)
+        }
+        let blockingPersisted = record(.persisted, blocks: true)
+        // Conflicting session-derived parents keep both edges and force the block.
+        let conflicted = AgentSessionLaneChildRetirementRecord.merging(
+            sessionID: sessionID,
+            live: [
+                record(.hydratedSession, parent: parentA, blocks: true),
+                record(.hydratedSession, parent: parentB, blocks: true)
+            ],
+            persisted: [blockingPersisted]
+        )
+        XCTAssertEqual(Set(conflicted.map(\.parentSessionID)), [parentA, parentB])
+        XCTAssertTrue(conflicted.allSatisfy(\.blocksRetirement))
+        XCTAssertTrue(AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(of: parentA, in: conflicted))
+        XCTAssertTrue(AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(of: parentB, in: conflicted))
+        // Cross-tier disagreement keeps every claimed edge and blocks even with quiescent records.
+        let crossTier = AgentSessionLaneChildRetirementRecord.merging(
+            sessionID: sessionID,
+            live: [
+                record(.unhydratedSession, parent: parentB, blocks: false),
+                record(.sessionIndex, parent: parentC, blocks: false)
+            ],
+            persisted: [blockingPersisted]
+        )
+        XCTAssertEqual(Set(crossTier.map(\.parentSessionID)), [parentA, parentB, parentC])
+        XCTAssertTrue(crossTier.allSatisfy(\.blocksRetirement))
+        // Persisted rows that disagree with each other get the same ambiguous-lineage treatment.
+        let persistedConflict = AgentSessionLaneChildRetirementRecord.merging(
+            sessionID: sessionID,
+            live: [],
+            persisted: [blockingPersisted, record(.persisted, parent: parentB, blocks: false)]
+        )
+        XCTAssertEqual(Set(persistedConflict.map(\.parentSessionID)), [parentA, parentB])
+        XCTAssertTrue(persistedConflict.allSatisfy(\.blocksRetirement))
+        // A hydrated "no parent" vote against a claimed edge is a conflict, not absent evidence:
+        // the edge survives and blocks.
+        for live in [
+            [record(.hydratedSession, parent: nil, blocks: false)],
+            [record(.hydratedSession, parent: nil, blocks: false), record(.sessionIndex, blocks: false)]
+        ] {
+            let merged = AgentSessionLaneChildRetirementRecord.merging(
+                sessionID: sessionID, live: live, persisted: [blockingPersisted]
+            )
+            XCTAssertEqual(merged.map(\.parentSessionID), [parentA])
+            XCTAssertTrue(merged.allSatisfy(\.blocksRetirement))
+        }
+        // A decoded disk header's nil is a complete-lineage "no parent" claim too: persisted-nil
+        // against any claimed edge is ambiguous and forces the block.
+        for persisted in [
+            [record(.persisted, parent: nil, blocks: true)],
+            [record(.persisted, parent: nil, blocks: false), record(.persisted, blocks: false)]
+        ] {
+            let merged = AgentSessionLaneChildRetirementRecord.merging(
+                sessionID: sessionID,
+                live: [record(.hydratedSession, blocks: false)],
+                persisted: persisted
+            )
+            XCTAssertEqual(merged.map(\.parentSessionID), [parentA])
+            XCTAssertTrue(merged.allSatisfy(\.blocksRetirement))
+        }
+        // Index and unhydrated nils stay non-authoritative: they can neither conflict nor erase.
+        let unknownNil = AgentSessionLaneChildRetirementRecord.merging(
+            sessionID: sessionID,
+            live: [
+                record(.unhydratedSession, parent: nil, blocks: false),
+                record(.sessionIndex, parent: nil, blocks: false)
+            ],
+            persisted: [blockingPersisted]
+        )
+        XCTAssertEqual(unknownNil.map(\.parentSessionID), [parentA])
+        XCTAssertTrue(unknownNil.allSatisfy(\.blocksRetirement))
+        // Coherent lineage keeps the single agreed edge and the hydration gate on blocking.
+        for live in [
+            [record(.unhydratedSession, blocks: false)],
+            [record(.sessionIndex, blocks: false)],
+            [record(.unhydratedSession, blocks: false), record(.sessionIndex, blocks: false)]
+        ] {
+            let merged = AgentSessionLaneChildRetirementRecord.merging(
+                sessionID: sessionID, live: live, persisted: [blockingPersisted]
+            )
+            XCTAssertEqual(merged.map(\.parentSessionID), [parentA])
+            XCTAssertTrue(merged.allSatisfy(\.blocksRetirement))
+        }
+        for (live, expectBlocks) in [
+            ([record(.hydratedSession, blocks: false)], false),
+            ([record(.hydratedSession, blocks: false), record(.sessionIndex, blocks: true)], false),
+            ([record(.hydratedSession, blocks: true)], true),
+            ([record(.hydratedSession, blocks: false), record(.unhydratedSession, blocks: true)], true)
+        ] {
+            let merged = AgentSessionLaneChildRetirementRecord.merging(
+                sessionID: sessionID, live: live, persisted: [blockingPersisted]
+            )
+            XCTAssertEqual(merged.map(\.blocksRetirement), [expectBlocks])
+        }
+        // Nil-only evidence yields a single nil-parent record — agreeing "no parent" votes are
+        // coherent, not a conflict.
+        for persisted in [
+            [record(.persisted, parent: nil, blocks: false)],
+            [record(.persisted, parent: nil, blocks: true)],
+            []
+        ] {
+            let topLevel = AgentSessionLaneChildRetirementRecord.merging(
+                sessionID: sessionID,
+                live: [record(.hydratedSession, parent: nil, blocks: false)],
+                persisted: persisted
+            )
+            XCTAssertEqual(topLevel.map(\.parentSessionID), [nil])
+            XCTAssertFalse(topLevel[0].blocksRetirement)
+        }
+    }
+
+    /// Persisted `X -> lane running` plus a hydrated `X -> otherParent idle` is ambiguous lineage:
+    /// the persisted edge must survive and force the block, so retiring the lane refuses with the
+    /// link and both tabs intact.
+    func testCrossTierParentConflictKeepsPersistedEdgeBlocking() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Persisted parent", idempotencyKey: "cross-tier-conflict-blocks"
+            )
+            let otherTarget = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true,
+                sessionName: "Unrelated parent", parentSessionID: nil,
+                expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(otherTarget)
+            let otherParent = try XCTUnwrap(viewModel.sessions[otherTarget.tabID])
+            let otherParentSessionID = try XCTUnwrap(otherParent.activeAgentSessionID)
+            let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true,
+                sessionName: "Cross-tier child", parentSessionID: otherParentSessionID,
+                expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(target)
+            let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+            let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
+            child.runState = .idle
+            child.isDirty = true
+            await viewModel.flushSave(for: target.tabID)
+            // The disk row disagrees with live lineage: it claims the lane as parent and is active.
+            var persisted = AgentSession(id: childSessionID, name: "Cross-tier child", savedAt: Date())
+            persisted.parentSessionID = lane.sessionID
+            persisted.lastRunState = AgentSessionRunState.running.rawValue
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
+            let blocked = await host.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: lane.sessionID
+            )
+            XCTAssertTrue(blocked, "the dropped persisted edge must still reach the lane's subtree")
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .notRetired(sessionID: lane.sessionID, reason: .laneInUseDiskChild))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a pre-unlink refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "a pre-unlink refusal must keep the tab")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == target.tabID
+            } == true, "the ambiguous-lineage child must not be stashed")
+        }
+    }
+
+    /// A persisted header's nil parent is a complete top-level lineage claim, so `X -> nil` active
+    /// on disk plus a hydrated `X -> lane idle` is ambiguous: the live edge survives and forces
+    /// the block, and retiring the lane refuses with link and child tab intact.
+    func testPersistedNilParentConflictKeepsLiveEdgeBlocking() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Persisted nil parent", idempotencyKey: "persisted-nil-conflict-blocks"
+            )
+            let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true,
+                sessionName: "Disk-orphaned child", parentSessionID: lane.sessionID,
+                expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(target)
+            let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+            let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
+            child.runState = .idle
+            child.isDirty = true
+            await viewModel.flushSave(for: target.tabID)
+            // The disk row disagrees completely: it claims no parent edge and still says running.
+            var persisted = AgentSession(id: childSessionID, name: "Disk-orphaned child", savedAt: Date())
+            persisted.parentSessionID = nil
+            persisted.lastRunState = AgentSessionRunState.running.rawValue
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
+            let blocked = await host.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: lane.sessionID
+            )
+            XCTAssertTrue(blocked, "a persisted no-parent claim must not erase the live lane edge")
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .notRetired(sessionID: lane.sessionID, reason: .laneInUseDiskChild))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a pre-unlink refusal must keep the link")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == lane.tabID
+            } == true, "a pre-unlink refusal must keep the tab")
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains {
+                $0.id == target.tabID
+            } == true, "the disk-orphaned child must not be stashed")
+        }
+    }
+
+    /// A hydrated "no parent" vote against the persisted edge is a lineage conflict, not absent
+    /// evidence: the edge survives and forces the block, so the lane refuses and the child is
+    /// never stashed into it.
+    func testHydratedNilParentConflictKeepsPersistedEdgeBlocking() async throws {
+        try await withFixture { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer {
+                linked.bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked,
+                name: "Persisted parent", idempotencyKey: "hydrated-nil-conflict-blocks"
+            )
+            let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true,
+                sessionName: "Repudiated child", parentSessionID: lane.sessionID,
+                expectedWorkspaceID: fixture.workspaceID
+            )
+            viewModel.mcpAcceptSessionTarget(target)
+            let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+            child.runState = .idle
+            child.isDirty = true
+            await viewModel.flushSave(for: target.tabID)
+            // The loaded session now reports itself top-level while disk still claims the edge.
+            child.parentSessionID = nil
+            let blocked = await host.agentSessionLinkHasPersistedActiveChildSessions(
+                parentSessionID: lane.sessionID
+            )
+            XCTAssertTrue(blocked, "a hydrated no-parent vote must not silently erase the disk edge")
+            let outcome = await linked.bridge.retireLane(
+                observerEndpoint: linked.endpoint, targetSessionID: lane.sessionID
+            )
+            XCTAssertEqual(outcome, .notRetired(sessionID: lane.sessionID, reason: .laneInUseDiskChild))
+            let inbound = await linked.authority.links(forTarget: lane.sessionID)
+            XCTAssertEqual(inbound.items.count, 1, "a pre-unlink refusal must keep the link")
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            XCTAssertTrue(workspace.composeTabs.contains { $0.id == lane.tabID })
+            XCTAssertFalse(workspace.stashedTabs.contains {
+                $0.tab.id == lane.tabID || $0.tab.id == target.tabID
+            }, "the conflicted child must never be stashed into a disputed subtree")
         }
     }
 }

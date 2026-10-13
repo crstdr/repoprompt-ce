@@ -42,6 +42,7 @@ struct OracleExportRequest {
     let chatID: String?
     let response: String?
     let groupResult: OracleGroupResult?
+    let reconciliationGuidance: String?
     let destination: OracleExportDestination?
 
     init(
@@ -51,6 +52,7 @@ struct OracleExportRequest {
         chatID: String?,
         response: String?,
         groupResult: OracleGroupResult? = nil,
+        reconciliationGuidance: String? = nil,
         destination: OracleExportDestination? = nil
     ) {
         self.sourceTool = sourceTool
@@ -59,16 +61,21 @@ struct OracleExportRequest {
         self.chatID = chatID
         self.response = response
         self.groupResult = groupResult
+        self.reconciliationGuidance = reconciliationGuidance
         self.destination = destination
     }
 }
 
 enum AgentOracleExport {
-    static func instruction(path: String) -> String {
+    static func instruction(path: String, oracleLaneCount: Int? = nil) -> String {
         let pathLiteral = jsonStringLiteral(path)
-        return """
+        let base = """
         Read the Oracle export with `read_file` using `{"path": \(pathLiteral)}`. Use this exact absolute `path` value verbatim without shortening or rewriting it, and use the file as planning context for this task.
         """
+        guard let requirement = OracleGroupDeliveryContract.exportReadingRequirement(laneCount: oracleLaneCount ?? 0) else {
+            return base
+        }
+        return base + " " + requirement
     }
 
     private static func jsonStringLiteral(_ value: String) -> String {
@@ -90,7 +97,7 @@ enum AgentOracleExport {
             "# Oracle Response"
         }
         if let groupResult = request.groupResult {
-            return "\(title)\n\n\(groupMarkdown(groupResult))"
+            return "\(title)\n\n\(groupMarkdown(groupResult, reconciliationGuidance: request.reconciliationGuidance))"
         }
         let response: String = if let responseText = request.response,
                                   !responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -102,7 +109,8 @@ enum AgentOracleExport {
         return "\(title)\n\n\(response)"
     }
 
-    private static func groupMarkdown(_ result: OracleGroupResult) -> String {
+    private static func groupMarkdown(_ result: OracleGroupResult, reconciliationGuidance: String?) -> String {
+        let lanes = result.oracleResults.sorted { $0.laneIndex < $1.laneIndex }
         var sections = [
             """
             ## Oracle group
@@ -117,8 +125,23 @@ enum AgentOracleExport {
                     .joined(separator: "\n")
             )
         }
+        if let preamble = OracleGroupDeliveryContract.preamble(lanes: lanes.map { lane in
+            OracleGroupDeliveryContract.Lane(
+                laneIndex: lane.laneIndex,
+                modelID: lane.executionProfile?.modelID ?? lane.modelID,
+                chatID: lane.chatID,
+                status: lane.status.rawValue,
+                response: lane.response,
+                partialResponse: lane.error?.partialResponse
+            )
+        }, reconciliationGuidance: reconciliationGuidance) {
+            sections.append(preamble)
+        }
         sections.append("## Oracle results")
-        sections.append(contentsOf: result.oracleResults.map(laneMarkdown))
+        sections.append(contentsOf: lanes.map(laneMarkdown))
+        if let endMarker = OracleGroupDeliveryContract.endMarker(laneCount: lanes.count) {
+            sections.append(endMarker)
+        }
         return sections.joined(separator: "\n\n")
     }
 
@@ -631,9 +654,22 @@ struct AgentRunMCPToolService {
         let effectiveParentWorktreeInheritance = worktreeStartRequest.inheritParentWorktreeBindings
             && !worktreeStartRequest.hasExplicitWorktreeArgs
         let usesRoutedParentSource = parentSourceTabID != nil
+        // Main's resident activation fence is decided before any delegated spawn admission.
         if let residentActivationTarget {
             try agentModeVM.mcpRequireResidentActivationFence(residentActivationTarget)
         }
+        // Scope-only: when this start adds a member to a delegation scope (a new tab, an empty tab, or
+        // a `tab_id` whose session has no tree placement and will take this spawn parent), the scope's
+        // guardrails apply and the session auto-joins. An already-placed session (adopted, spawned, a
+        // lane) is never stamped, another overseer's lane is not moved between scopes, and a scope
+        // anchor is never grafted. `nil` for every other caller, whose start is unchanged.
+        let spawnAdmission = spawnParentSessionID == nil
+            ? nil
+            : try DelegationSpawnAdmission.admitOrThrow(
+                creatorSessionID: spawnParentSessionID,
+                target: agentModeVM.delegationSpawnTarget(tabID: resolvedTabID, creatorSessionID: spawnParentSessionID)
+            )
+        defer { DelegationSpawnAdmission.finish(spawnAdmission) }
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: resolvedTabID,
             sessionID: nil,
@@ -649,6 +685,9 @@ struct AgentRunMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
         }
+        await DelegationSpawnAdmission.stamp(spawnAdmission, newSessionID: targetSessionID, viewModel: agentModeVM)
+        // The new member is visible to the projector now; the reservation is not held through the run.
+        DelegationSpawnAdmission.finish(spawnAdmission)
         #if DEBUG
             if worktreeStartupBenchmarkToken != nil {
                 do {

@@ -1654,7 +1654,8 @@ class PromptViewModel: ObservableObject {
     /// and is safe to auto-upgrade to the current canonical version.
     private var previousCanonicalBuiltIns: [UUID: [StoredPrompt]] {
         [
-            architectPrompt.id: [previousArchitectPromptV1, previousArchitectPromptV2, previousArchitectPromptV3, previousArchitectPromptV4]
+            architectPrompt.id: [previousArchitectPromptV1, previousArchitectPromptV2, previousArchitectPromptV3, previousArchitectPromptV4],
+            reviewPrompt.id: [previousReviewPromptV2, previousReviewPromptV3]
         ]
     }
 
@@ -2213,7 +2214,8 @@ class PromptViewModel: ObservableObject {
         """
     )
 
-    private let reviewPrompt = StoredPrompt(
+    /// Review prompt v2, kept verbatim so unedited copies upgrade to the current version.
+    let previousReviewPromptV2 = StoredPrompt(
         id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
         title: "[Review]",
         content: """
@@ -2248,6 +2250,102 @@ class PromptViewModel: ObservableObject {
         1. One-paragraph summary of what the changes accomplish.
         2. Findings grouped by severity (P0 → P1 → P2), each with: file reference, what's wrong, and a concrete suggestion. Omit empty severity groups.
         3. If no issues found at a severity level, skip it — don't pad the review.
+        """
+    )
+
+    /// Exact pre-merge v3 prompt used by local debug builds; only unedited copies auto-upgrade.
+    let previousReviewPromptV3 = StoredPrompt(
+        id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
+        title: "[Review]",
+        content: """
+        You are reviewing code changes with git diffs included in the prompt. The git diff shows what changed; the file contents show full context. Use both.
+
+        Your review may be one of several independent reviews of the same change that another agent will reconcile, so make every finding self-contained and comparable.
+
+        **Review Criteria:**
+
+        1. **Correctness & Safety**:
+        \t- Do the changes achieve their intended purpose without regressions?
+        \t- Are edge cases and error paths handled?
+        \t- Any security vulnerabilities, race conditions, or resource leaks?
+        \t- Any breaking changes to APIs or contracts?
+
+        2. **Design & Complexity**:
+        \t- Do changes increase coupling or reduce separation of concerns?
+        \t- Is new complexity justified, or can the same result be achieved more simply?
+        \t- Are there DRY violations — duplicated logic that should be extracted?
+        \t- Do abstractions sit at the right level (not too early, not too late)?
+
+        3. **Intentionality**:
+        \t- Does every change have a clear purpose? Flag accidental modifications or dead code.
+        \t- Are the changes minimal and focused, or is scope creeping in?
+
+        **Severity Levels — be disciplined about classification:**
+        - **P0 (Must fix)**: Bugs, data loss, security holes, crashes — things that break correctness.
+        - **P1 (Should fix)**: Design issues that will compound — poor separation of concerns, growing complexity, DRY violations, missing error handling for reachable paths.
+        - **P2 (Consider)**: Style, naming, minor refactoring opportunities, test coverage gaps.
+
+        Most findings should be P1 or P2. Reserve P0 for genuinely broken behavior.
+
+        **Each finding must include:**
+        \t- **Location**: file and line or symbol.
+        \t- **Problem**: what is wrong and the condition that triggers it.
+        \t- **Evidence**: what in the diff or code shows it; say when it is inferred rather than shown.
+        \t- **Fix**: the smallest concrete correction.
+        \t- **Confidence**: Confirmed, Likely, or Speculative.
+
+        Merge findings that share a root cause. Do not claim tests or runtime checks you did not perform.
+
+        **Output Format:**
+        1. One-paragraph summary of what the changes accomplish.
+        2. Findings grouped by severity (P0 → P1 → P2), in the format above. Omit empty severity groups and don't pad the review; keep minor style notes brief and file them as P2.
+        3. End with a single line: `Verdict: <No findings | Approve with fixes | Request changes> — <one-sentence reason>`.
+        """
+    )
+
+    let reviewPrompt = StoredPrompt(
+        id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
+        title: "[Review]",
+        content: """
+        You are reviewing code changes with git diffs included in the prompt. The git diff shows what changed; the file contents show full context. Use both.
+
+        **Review Criteria:**
+
+        1. **Correctness & Safety**:
+        \t- Do the changes achieve their intended purpose without regressions?
+        \t- Are edge cases and error paths handled?
+        \t- Any security vulnerabilities, race conditions, or resource leaks?
+        \t- Any breaking changes to APIs or contracts?
+
+        2. **Design & Complexity**:
+        \t- Do changes increase coupling or reduce separation of concerns?
+        \t- Is new complexity justified, or can the same result be achieved more simply?
+        \t- Are there DRY violations — duplicated logic that should be extracted?
+        \t- Do abstractions sit at the right level (not too early, not too late)?
+
+        3. **Intentionality**:
+        \t- Does every change have a clear purpose? Flag accidental modifications or dead code.
+        \t- Are the changes minimal and focused, or is scope creeping in?
+
+        **Severity Levels — be disciplined about classification:**
+        - **P0 (Must fix)**: Bugs, data loss, security holes, crashes — things that break correctness.
+        - **P1 (Should fix)**: Design issues that will compound — poor separation of concerns, growing complexity, DRY violations, missing error handling for reachable paths.
+        - **P2 (Consider)**: Style, naming, minor refactoring opportunities, test coverage gaps.
+
+        Most findings should be P1 or P2. Reserve P0 for genuinely broken behavior.
+
+        **Each finding must include:**
+        \t- **Location**: file and line or symbol.
+        \t- **Problem**: what is wrong and the condition that triggers it.
+        \t- **Evidence**: what in the diff or code shows it; say when it is inferred rather than shown.
+        \t- **Fix**: the smallest concrete correction.
+
+        Merge findings that share a root cause. Do not claim tests or runtime checks you did not perform.
+
+        **Output Format:**
+        1. One-paragraph summary of what the changes accomplish.
+        2. Findings grouped by severity (P0 → P1 → P2), in the format above. Omit empty severity groups and don't pad the review; keep minor style notes brief and file them as P2.
+        3. End with a single line: `Verdict: <No findings | Approve with fixes | Request changes> — <one-sentence reason>`.
         """
     )
 
@@ -2898,6 +2996,19 @@ class PromptViewModel: ObservableObject {
             userInfo: ["windowID": windowID]
         )
         snapshotActiveComposeTabIfNeeded(in: manager, workspaceIndex: index)
+    }
+
+    /// Preserve the active editor before a sidebar mutation republishes workspace carriers without
+    /// selecting another tab. This is an in-memory boundary, independent of save eligibility.
+    @MainActor
+    func flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: UUID) -> Bool {
+        guard let manager = workspaceManager,
+              manager.activeWorkspaceID == workspaceID,
+              let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+              manager.workspaces[index].activeComposeTabID == activeComposeTabID
+        else { return false }
+        flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
+        return manager.activeWorkspaceID == workspaceID
     }
 
     @MainActor
@@ -3960,6 +4071,7 @@ class PromptViewModel: ObservableObject {
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
         postPreflightValidation: (@MainActor () -> Bool)? = nil,
         expandCascade: Bool = true,
+        validateOnly: Bool = false,
         onProjectionRemovalCommitted: ComposeTabsProjectionRemovalCallback? = nil
     ) async -> ComposeTabMutationReport {
         await removeComposeTabs(
@@ -3968,6 +4080,7 @@ class PromptViewModel: ObservableObject {
             expandCascade: expandCascade,
             isMutationContextCurrent: isMutationContextCurrent,
             postPreflightValidation: postPreflightValidation,
+            validateOnly: validateOnly,
             onProjectionRemovalCommitted: onProjectionRemovalCommitted
         )
     }
@@ -4022,6 +4135,7 @@ class PromptViewModel: ObservableObject {
         expandCascade: Bool = true,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
         postPreflightValidation: (@MainActor () -> Bool)? = nil,
+        validateOnly: Bool = false,
         onProjectionRemovalCommitted: ComposeTabsProjectionRemovalCallback? = nil
     ) async -> ComposeTabMutationReport {
         guard !ids.isEmpty else {
@@ -4180,6 +4294,9 @@ class PromptViewModel: ObservableObject {
                 message: "The active tab targets changed during preflight."
             )
         }
+        // Validation-only callers stop here: the required flush and every CAS re-check ran, but no
+        // tab, stashed-row, binding, or listener state has been touched.
+        if validateOnly { return report }
         let fallbackActiveID: UUID? = {
             guard let previousActiveID = manager.workspaces[index].activeComposeTabID,
                   tabsBeingClosed.contains(previousActiveID) else { return nil }
@@ -5842,7 +5959,7 @@ class PromptViewModel: ObservableObject {
 
     /// Checks if a persisted built-in prompt matches a known previous canonical version.
     /// Exact matches are preferred so we do not overwrite user-customized prompts.
-    private func isKnownPreviousCanonical(_ prompt: StoredPrompt) -> Bool {
+    func isKnownPreviousCanonical(_ prompt: StoredPrompt) -> Bool {
         if let previousVariants = previousCanonicalBuiltIns[prompt.id],
            previousVariants.contains(where: { $0.title == prompt.title && $0.content == prompt.content })
         {
@@ -6401,7 +6518,7 @@ class PromptViewModel: ObservableObject {
         selectionOverride: StoredSelection? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil
-    ) async -> AIMessage {
+    ) async throws -> AIMessage {
         let preset = oraclePromptConfiguration?.chatPreset ?? overrideChatPreset ?? currentChatPreset()
         var resolvedConfig: PromptContextResolved = {
             if let oraclePromptConfiguration {
@@ -6498,14 +6615,26 @@ class PromptViewModel: ObservableObject {
             }
         }
 
+        // Captured Oracle configuration is the authority for fail-closed packaging.
+        let requiresSelectedFileContent = oraclePromptConfiguration != nil
         let packaged: (message: AIMessage, preAssembly: PromptContextPreAssemblyResult)
         do {
+            if requiresSelectedFileContent, activeConfig.includeFiles {
+                try await PromptSelectedFileContentRequirement.awaitAppliedIngress(
+                    selection: logicalSelection,
+                    lookupContext: lookupContext,
+                    store: workspaceFileContextStore
+                )
+            }
             packaged = try await withPreassembledPromptContext(
                 cfg: activeConfig,
                 selection: logicalSelection,
                 lookupContext: lookupContext,
                 reviewGitContext: frozenReviewGitContext
             ) { preAssembly in
+                if requiresSelectedFileContent {
+                    try PromptSelectedFileContentRequirement.validate(preAssembly, config: activeConfig)
+                }
                 let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
                     preAssembly.entries
                 )
@@ -6536,6 +6665,7 @@ class PromptViewModel: ObservableObject {
                 return (message, preAssembly)
             }
         } catch {
+            if requiresSelectedFileContent { throw error }
             return AIMessage(systemPrompt: systemPrompt, userMessage: "")
         }
         #if DEBUG

@@ -3367,6 +3367,10 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private var workspaceDidSwitchListeners: [WorkspaceDidSwitchListener] = []
 
+    /// A settled authority selection needs numbering, but is not a completed workspace switch.
+    /// Delivered synchronously after installation to the registered window's numbering owner.
+    var onSettledProjectedWorkspaceSelection: ((WorkspaceModel?) -> Void)?
+
     /// Multiple callbacks that will be triggered before saving the active workspace.
     private var beforeSaveListeners: [BeforeSaveListener] = []
     private var composeTabApplyTask: Task<Void, Never>?
@@ -8806,6 +8810,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 canonicalSystemWorkspaceIDs: canonicalSystemWorkspaceIDs
             )
         }
+        if previousActiveWorkspaceID != activeWorkspaceID,
+           !isPreparingForWindowClose, !isSwitchingWorkspace, activeWorkspaceSwitch == nil
+        {
+            onSettledProjectedWorkspaceSelection?(activeWorkspace)
+        }
         if previousActiveWorkspaceID != activeWorkspaceID, let activeWorkspaceID {
             requestRootReconciliation(workspaceID: activeWorkspaceID)
         }
@@ -13987,6 +13996,22 @@ class WorkspaceManagerViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Workspace restoration state changed before its hidden state could be saved."]
             )
         }
+    }
+
+    /// The non-mutating half of `pollAndSaveStateWithOutcomeAsync`'s admission gates: every
+    /// deterministic refusal a caller can check before the real save re-fences it. A passing answer
+    /// is not a write guarantee; the write path still re-checks these conditions during capture.
+    /// Must stay in sync with the admission sequence inside `pollAndSaveStateWithOutcomeAsync`.
+    func canAdmitLifecycleWorkspaceSave(workspaceID: UUID) -> Bool {
+        guard let workspace = workspace(withID: workspaceID) else { return false }
+        guard !workspace.isEphemeral else { return true }
+        guard !agentAdmissionRecoveryOwnsWorkspace(workspaceID) else { return false }
+        #if DEBUG
+            if let workspacePersistenceOutcomeOverrideForTesting {
+                return workspacePersistenceOutcomeOverrideForTesting.acceptedForLifecycleAdmission
+            }
+        #endif
+        return !pendingConsolidatedRestoreIDs.contains(workspaceID)
     }
 
     func setWorkspaceHiddenFromSnapshot(_ workspace: WorkspaceModel, hidden: Bool) async throws -> WorkspaceModel {

@@ -394,6 +394,20 @@ struct AgentModeSessionsListView: View {
     @State private var showingClearArchivedConfirmation = false
     @State private var showingBulkDeleteConfirmation = false
     @State private var sessionLinkProjectionRevision: UInt64 = 0
+    private func groupSectionHeader(_ item: AgentSidebarRenderedActiveRow) -> AnyView? {
+        guard let name = item.groupName else { return nil }
+        return AnyView(
+            AgentSidebarGroupSectionHeader(
+                title: name,
+                rowCount: item.groupRowCount,
+                isCollapsed: item.isGroupCollapsed,
+                isFirst: item.isFirstHeader,
+                onToggle: { agentModeVM.toggleSidebarGroupCollapsed(name) }
+            )
+            .disabled(!sidebarUI.snapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        )
+    }
+
     @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
     private var showComposeTabsWithoutAgentSessions = false
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -480,7 +494,12 @@ struct AgentModeSessionsListView: View {
             renderedOrder: snapshot.renderedSelectionOrder
         )
         let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
-        let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions, perfRecorder: perfRecorder)
+        let renderedActiveRows = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
+            for: snapshot.pagedSessions,
+            collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
+            searchText: sidebarUI.snapshot.searchText,
+            perfRecorder: perfRecorder
+        )
         let selectionState = sidebarUI.selectionState
         let showsSelectionPresentation = selectionState.showsSelectionPresentation
         let isInteractionEnabled = !selectionState.isMutationInFlight
@@ -522,11 +541,27 @@ struct AgentModeSessionsListView: View {
             }
             ScrollView {
                 VStack(spacing: listRowSpacing) {
+                    if snapshot.isOwnerPending {
+                        // Owner adoption unresolved: no outgoing rows or target headings (§5.3).
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Restoring conversations\u{2026}")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, listHorizontalPadding)
+                        .padding(.vertical, 6)
+                        .accessibilityElement(children: .combine)
+                    }
                     AgentSidebarKeyedRowList(
-                        items: AgentSidebarDateSectionBuilder.renderedActiveRows(for: activeSections),
+                        items: renderedActiveRows,
                         showsHeader: \.showsHeader,
                         headerTitle: \.headerTitle,
-                        isFirstHeader: \.isFirstHeader
+                        isFirstHeader: \.isFirstHeader,
+                        customHeader: groupSectionHeader,
+                        showsRow: { !$0.hidesRow }
                     ) { item in
                         let session = item.session
                         let identity = AgentSidebarSelectionIdentity.active(tabID: session.tabID)
@@ -726,7 +761,7 @@ struct AgentModeSessionsListView: View {
                                     expectedReference: reference
                                 )
                             },
-                            onAddOutboundOversight: { observerEndpoint, targetEndpoint in
+                            onAddOversightLink: { observerEndpoint, targetEndpoint in
                                 await agentModeVM.addAgentOversightLink(
                                     observerEndpoint: observerEndpoint,
                                     targetEndpoint: targetEndpoint
@@ -1219,69 +1254,6 @@ private struct AgentSidebarDateSectionHeader: View {
     }
 }
 
-enum AgentSidebarDateSectionBucket: CaseIterable, Hashable, Identifiable {
-    case today
-    case yesterday
-    case previous
-
-    var id: Self {
-        self
-    }
-
-    var title: String {
-        switch self {
-        case .today:
-            "Today"
-        case .yesterday:
-            "Yesterday"
-        case .previous:
-            "Previous"
-        }
-    }
-
-    static func bucket(
-        for date: Date,
-        relativeTo now: Date = Date(),
-        calendar: Calendar = .current
-    ) -> AgentSidebarDateSectionBucket {
-        let clampedDate = min(date, now)
-        let todayStart = calendar.startOfDay(for: now)
-        let dateStart = calendar.startOfDay(for: clampedDate)
-        if dateStart == todayStart {
-            return .today
-        }
-        if let yesterdayStart = calendar.date(byAdding: .day, value: -1, to: todayStart),
-           calendar.isDate(dateStart, inSameDayAs: yesterdayStart)
-        {
-            return .yesterday
-        }
-        return .previous
-    }
-
-    /// Model identity for one contiguous run of this bucket.
-    ///
-    /// The sidebar list does not use this as a `ForEach` key. Each row is keyed
-    /// by its own id. `ordinal` keeps a second run of the same day (a pinned
-    /// group separated from later unpinned rows) distinct from the first.
-    func sectionID(ordinal: Int) -> UUID {
-        let bucketByte: UInt8 = switch self {
-        case .today:
-            1
-        case .yesterday:
-            2
-        case .previous:
-            3
-        }
-        return UUID(uuid: (
-            0xB7, 0xA1, 0xD0, bucketByte,
-            0x00, 0x00,
-            0x40, 0x00,
-            0x80, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, UInt8(clamping: ordinal)
-        ))
-    }
-}
-
 struct AgentSidebarActiveDateGroup: Identifiable {
     let id: UUID
     let bucket: AgentSidebarDateSectionBucket
@@ -1314,6 +1286,12 @@ struct AgentSidebarRenderedActiveRow: Identifiable {
     let showsHeader: Bool
     let isFirstHeader: Bool
     let headerTitle: String
+    /// Set on the first row of a sidebar group section; its header is collapsible.
+    var groupName: String?
+    var isGroupCollapsed = false
+    var groupRowCount = 0
+    /// A collapsed group's first row carries only the header.
+    var hidesRow = false
 
     var id: UUID {
         session.id
@@ -1344,17 +1322,24 @@ struct AgentSidebarKeyedRowList<Item: Identifiable, Row: View>: View {
     let showsHeader: (Item) -> Bool
     let headerTitle: (Item) -> String
     let isFirstHeader: (Item) -> Bool
+    /// Replaces the date header for an item (sidebar group sections).
+    var customHeader: ((Item) -> AnyView?)?
+    var showsRow: (Item) -> Bool = { _ in true }
     @ViewBuilder let row: (Item) -> Row
 
     var body: some View {
         ForEach(items) { item in
-            if showsHeader(item) {
+            if let header = customHeader?(item) {
+                header
+            } else if showsHeader(item) {
                 AgentSidebarDateSectionHeader(
                     title: headerTitle(item),
                     isFirst: isFirstHeader(item)
                 )
             }
-            row(item)
+            if showsRow(item) {
+                row(item)
+            }
         }
     }
 }
@@ -1419,11 +1404,18 @@ enum AgentSidebarDateSectionBuilder {
 
         func flushCurrentRows() {
             guard let firstRow = currentRows.first else { return }
-            let date = currentRows
-                .map { $0.threadActivityDate ?? $0.lastUserMessageAt ?? $0.activityDate }
-                .max() ?? firstRow.activityDate
-            let bucket = AgentSidebarDateSectionBucket.bucket(
-                for: date,
+            // Restoration rows carry captured buckets (freshest wins) so incremental live/index dates,
+            // or a midnight/calendar change, cannot relabel headings before release (§5.4).
+            let capturedBucket = currentRows
+                .compactMap(\.restorationDateBucket)
+                .min { lhs, rhs in
+                    let order = AgentSidebarDateSectionBucket.allCases
+                    return (order.firstIndex(of: lhs) ?? .max) < (order.firstIndex(of: rhs) ?? .max)
+                }
+            let bucket = capturedBucket ?? AgentSidebarDateSectionBucket.bucket(
+                for: currentRows
+                    .map { $0.threadActivityDate ?? $0.lastUserMessageAt ?? $0.activityDate }
+                    .max() ?? firstRow.activityDate,
                 relativeTo: now,
                 calendar: calendar
             )

@@ -1164,6 +1164,11 @@ extension ToolOutputFormatter {
     }
 
     private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
+        if object["scan_truncated"]?.boolValue == true
+            || object["skipped_workspaces"]?.arrayValue?.isEmpty == false
+        {
+            lines.append("- **Scan completeness**: Incomplete; totals are lower bounds. No matches does not establish that the workspace or matching set is empty.")
+        }
         if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
         let scanDiagnostics = object["scan_diagnostics"]?.arrayValue?.compactMap { value -> String? in
             guard let diagnostic = value.objectValue,
@@ -4570,6 +4575,19 @@ extension ToolOutputFormatter {
                 errorMessage: lane.error?.message
             )
         })
+        if let preamble = OracleGroupDeliveryContract.preamble(lanes: payload.lanes.map { lane in
+            OracleGroupDeliveryContract.Lane(
+                laneIndex: lane.laneIndex,
+                modelID: lane.modelID,
+                chatID: lane.chatID,
+                status: lane.status.rawValue,
+                response: lane.response,
+                partialResponse: lane.partialResponse
+            )
+        }, reconciliationGuidance: dto.oracleReconciliationGuidance) {
+            lines.append("")
+            lines.append(preamble)
+        }
         let laneMarkdown = OracleLaneMarkdownFormatter.format(payload)
         if !laneMarkdown.isEmpty {
             lines.append("")
@@ -4581,7 +4599,13 @@ extension ToolOutputFormatter {
                 lines.append("Warning [\(warning.code)]: \(warning.message)")
             }
         }
-        return lines.joined(separator: "\n")
+        if let endMarker = OracleGroupDeliveryContract.endMarker(laneCount: ordered.count) {
+            lines.append("")
+            lines.append(endMarker)
+        }
+        // MCP clients may concatenate adjacent text blocks with no separator;
+        // end with a line break so the end marker stays on its own line.
+        return lines.joined(separator: "\n") + "\n"
     }
 
     static func formatFileAction(value: Value) -> [MCP.Tool.Content] {
@@ -6421,6 +6445,12 @@ extension ToolOutputFormatter {
             }
         }
         if let sessions = object["sessions"]?.arrayValue {
+            if let scope = object["scope"]?.stringValue {
+                lines.append("- Scope: `\(scope)` (not a workspace inventory)")
+            }
+            if let note = object["note"]?.stringValue {
+                lines.append("- Note: \(note)")
+            }
             lines.append("- Sessions: **\(sessions.count)**")
             for entry in sessions {
                 guard let session = entry.objectValue else { continue }

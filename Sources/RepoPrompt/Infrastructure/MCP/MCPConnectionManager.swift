@@ -3124,12 +3124,17 @@ actor ServerNetworkManager {
         let hasAnyActiveLink: Bool
         /// Kept separate for observer prompt/catalog readiness and outbound operations.
         let hasActiveOutboundLink: Bool
+        /// Catalog reachability only; every scope operation re-authorizes at execution.
+        var isSessionAdminEligible = false
         let canBecomeOverseer: Bool
         let hasActivatedOverseer: Bool
 
         var additionalGrants: Set<String> {
-            if hasAnyActiveLink || hasActivatedOverseer { return [MCPWindowToolName.agentSessionLink] }
-            return canBecomeOverseer ? [MCPWindowToolName.becomeOverseer] : []
+            var grants: Set<String> = []
+            if hasAnyActiveLink || hasActivatedOverseer { grants.insert(MCPWindowToolName.agentSessionLink) }
+            else if canBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
+            if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
+            return grants
         }
 
         var toolSurface: AgentSessionLinkToolSurface {
@@ -3201,15 +3206,36 @@ actor ServerNetworkManager {
         await AgentSessionLinkRuntimeBridge.shared.overseerBootstrapState(for: routeToken.observerEndpoint) == bootstrapState else {
             return nil
         }
+        // Scopes bind durable session identity; routing still binds the exact run endpoint.
+        let callerSessionID = routeToken.observerEndpoint.sessionID
+        let holdsLiveScope = await MainActor.run {
+            AgentSessionLinkRuntimeBridge.shared.delegationScopes.hasLiveScope(grantedTo: callerSessionID)
+        }
+        // Scope lookup suspends too: a tab rebind must not publish the old run's grants.
+        guard let scopeRevalidatedRouteToken = await (
+            modelOnly
+                ? cachedModelCatalogRouteToken(connectionID: connectionID)
+                : authoritativeRunCatalogRouteToken(runID: routeToken.runID, windowID: runState.windowID, tabID: tabID)
+        ), scopeRevalidatedRouteToken == routeToken,
+        await AgentSessionLinkRuntimeBridge.shared.overseerBootstrapState(for: routeToken.observerEndpoint) == bootstrapState else {
+            return nil
+        }
         let eligible = runState.taskLabelKind != .explore && bootstrapState != nil
         let activated = eligible && bootstrapState?.activation != nil
-        return LiveSessionLinkGrantSnapshot(
+        var snapshot = LiveSessionLinkGrantSnapshot(
             routeToken: routeToken,
             hasAnyActiveLink: hasAnyActiveLink,
             hasActiveOutboundLink: hasActiveOutboundLink,
             canBecomeOverseer: isEnabledState && oversightEnabled && eligible && !activated && !hasAnyActiveLink,
             hasActivatedOverseer: activated
         )
+        // Explicit incarnation-local overseer opt-in can request a scope, but grants no scope
+        // authority. Keep durable scope eligibility independent of activation retirement.
+        snapshot.isSessionAdminEligible = holdsLiveScope
+            || runState.allowsAgentExternalControlTools
+            || hasActiveOutboundLink
+            || (activated && oversightEnabled)
+        return snapshot
     }
 
     func isBecomeOverseerAvailable(connectionID: UUID, endpoint: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
@@ -3685,7 +3711,10 @@ actor ServerNetworkManager {
     /// at session UUID scope because one UUID can own several live runs, but every candidate connection
     /// recomputes against its full routed endpoint before a notification is emitted. A duplicate
     /// incarnation therefore receives no catalog grant from the incarnation the user linked.
-    func notifyToolListChangedForAgentSession(_ sessionID: UUID) async {
+    ///
+    /// - Parameter forceRelist: relist even when every link fact is unchanged. Delegation-scope
+    ///   changes alter `session_admin` eligibility without touching any link fact.
+    func notifyToolListChangedForAgentSession(_ sessionID: UUID, forceRelist: Bool = false) async {
         let candidateRunIDs = runPolicyStateByRunID.compactMap { runID, state -> (UUID, Int, UUID)? in
             guard state.purpose == .agentModeRun, let tabID = state.tabID else { return nil }
             return (runID, state.windowID, tabID)
@@ -3721,7 +3750,8 @@ actor ServerNetworkManager {
             let expectedSurface = computedSurface
             let hasAnyActiveLink = snapshot?.hasAnyActiveLink
             let hasActiveOutboundLink = snapshot?.hasActiveOutboundLink
-            if observation?.routeToken == routeToken,
+            if !forceRelist,
+               observation?.routeToken == routeToken,
                observation?.expectedSurface == expectedSurface,
                observation?.returnedSurface == expectedSurface,
                observation?.hasAnyActiveLink == hasAnyActiveLink,
@@ -9858,7 +9888,9 @@ actor ServerNetworkManager {
                         } else {
                             workspace?.name ?? NSNull()
                         }
-                        let workspaceInstanceNumber: Any = window.workspaceInstanceNumber ?? NSNull()
+                        let workspaceInstanceNumber: Any = workspace.flatMap {
+                            window.workspaceInstanceNumber(for: $0.id)
+                        } ?? NSNull()
                         let activeContextID: Any = activeTabID?.uuidString ?? NSNull()
                         let activeContextName: Any = activeTabID.flatMap { window.workspaceManager.composeTabName(with: $0) } ?? NSNull()
                         let repoPaths: [String] = workspace.map { WorkspaceManagerViewModel.loadableRepoPaths(for: $0) } ?? []
@@ -13502,9 +13534,11 @@ actor ServerNetworkManager {
                 let effectivePolicy = await effectivePolicyState(for: connectionID)
                 // Recomputed live rather than read from the installed policy: a `list_changed`
                 // notification can lag a grant change in either direction, so stale advertisement
-                // must never decide execution. Scoped to the only tool whose grant is live link
-                // state, so no other tool call pays for the lookup or its actor hop.
-                let liveSessionLinkGrant = (toolName == MCPWindowToolName.agentSessionLink || toolName == MCPWindowToolName.becomeOverseer)
+                let liveSessionLinkGrant = (
+                    toolName == MCPWindowToolName.agentSessionLink
+                        || toolName == MCPWindowToolName.becomeOverseer
+                        || toolName == MCPWindowToolName.sessionAdmin
+                )
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 let liveAdditional = effectivePolicy.additional.union(
@@ -13526,6 +13560,8 @@ actor ServerNetworkManager {
                     )
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant
                     where toolName == MCPWindowToolName.agentSessionLink
+                    || toolName == MCPWindowToolName.becomeOverseer
+                    || toolName == MCPWindowToolName.sessionAdmin
                 {
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
@@ -13601,7 +13637,11 @@ actor ServerNetworkManager {
                 // Rebuild with a fresh exact link fact. The early grant check and this role/profile
                 // gate are separated by routing work, so carrying the earlier answer would let a
                 // revocation stale-authorize this exception.
-                let liveSessionLinkGrant = (toolName == MCPWindowToolName.agentSessionLink || toolName == MCPWindowToolName.becomeOverseer)
+                let liveSessionLinkGrant = (
+                    toolName == MCPWindowToolName.agentSessionLink
+                        || toolName == MCPWindowToolName.becomeOverseer
+                        || toolName == MCPWindowToolName.sessionAdmin
+                )
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
@@ -13622,6 +13662,9 @@ actor ServerNetworkManager {
             } catch MCPDomainCallPolicyDenial.restricted {
                 log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
                 return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
+            } catch MCPDomainCallPolicyDenial.roleUnavailable where toolName == MCPWindowToolName.sessionAdmin {
+                // Same uniform text as an ungranted call, so the role gate reveals nothing more.
+                return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is not available for this session.")
             } catch MCPDomainCallPolicyDenial.roleUnavailable {
                 return Self.toolErrorResult(
                     rawJSON: capturedRawJSON,
@@ -16403,11 +16446,12 @@ actor ServerNetworkManager {
             }
         #endif
         return await MainActor.run {
-            WindowStatesManager.shared.allWindows.map {
-                MCPRoutingWindowSnapshot(
-                    workspaceID: $0.workspaceManager.activeWorkspace?.id,
-                    instanceNumber: $0.workspaceInstanceNumber,
-                    windowID: $0.windowID
+            WindowStatesManager.shared.allWindows.map { window in
+                let workspaceID = window.workspaceManager.activeWorkspace?.id
+                return MCPRoutingWindowSnapshot(
+                    workspaceID: workspaceID,
+                    instanceNumber: workspaceID.flatMap { window.workspaceInstanceNumber(for: $0) },
+                    windowID: window.windowID
                 )
             }
         }
@@ -16612,7 +16656,9 @@ actor ServerNetworkManager {
                 let windowID,
                 let win = WindowStatesManager.shared.window(withID: windowID)
             else { return (nil, nil) }
-            return (win.workspaceManager.activeWorkspace?.id, win.workspaceInstanceNumber)
+            // Pair the number with the same workspace ID; a pending assignment records nil.
+            let workspaceID = win.workspaceManager.activeWorkspace?.id
+            return (workspaceID, workspaceID.flatMap { win.workspaceInstanceNumber(for: $0) })
         }
 
         await pruneRoutingRecords()

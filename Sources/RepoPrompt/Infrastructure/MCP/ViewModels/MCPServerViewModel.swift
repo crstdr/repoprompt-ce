@@ -1416,6 +1416,14 @@ final class MCPServerViewModel: ObservableObject {
             }
             return try await agentSelfToolService.execute(args: args)
         },
+        executeSessionAdmin: { [weak self] args in
+            guard let self else { throw MCPError.internalError("Window deallocated while executing session_admin") }
+            return try await sessionAdminToolService(requireTargetWindow: { [weak self] in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
+                return try requireTargetWindow()
+            })
+            .execute(args: args)
+        },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
             return try requireTargetWindow()
@@ -2174,6 +2182,7 @@ final class MCPServerViewModel: ObservableObject {
             ),
             MCPAskUserToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
             MCPAgentControlToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
+            MCPSessionAdminToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
             MCPAgentSessionControlToolProvider(
                 runtime: windowToolRuntime,
                 execution: windowToolExecutionCapabilities
@@ -4555,30 +4564,20 @@ final class MCPServerViewModel: ObservableObject {
             return try await operation()
         }
 
-        return try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask {
-                try await MCPInvocationContextBridge.withInvocation(invocationContext) {
-                    try await operation()
-                }
+        return try await MCPToolHeartbeat.run(interval: interval) {
+            await MCPInvocationContextBridge.withInvocation(invocationContext) {
+                await ServerNetworkManager.shared.sendProgress(
+                    for: connectionID,
+                    tool: tool,
+                    kind: .heartbeat,
+                    stage: stage,
+                    message: message
+                )
             }
-            group.addTask {
-                try await MCPInvocationContextBridge.withInvocation(invocationContext) {
-                    while !Task.isCancelled {
-                        try await Task.sleep(for: interval)
-                        await ServerNetworkManager.shared.sendProgress(
-                            for: connectionID,
-                            tool: tool,
-                            kind: .heartbeat,
-                            stage: stage,
-                            message: message
-                        )
-                    }
-                    throw CancellationError()
-                }
+        } operation: {
+            try await MCPInvocationContextBridge.withInvocation(invocationContext) {
+                try await operation()
             }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
         }
     }
 
@@ -7106,7 +7105,10 @@ final class MCPServerViewModel: ObservableObject {
         )
         return OracleExportFile(
             path: resolvedPath,
-            instruction: AgentOracleExport.instruction(path: resolvedPath)
+            instruction: AgentOracleExport.instruction(
+                path: resolvedPath,
+                oracleLaneCount: request.groupResult?.oracleResults.count
+            )
         )
     }
 
