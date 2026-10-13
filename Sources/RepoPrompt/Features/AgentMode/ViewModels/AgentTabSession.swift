@@ -129,7 +129,9 @@ final class AgentTabSession: ObservableObject {
         reconcileLocalInputWorkingPositions(newItems)
         for record in localInputIndex.records where !record.isDeleted {
             guard let position = record.sourcePosition, let item = newItemsByID[record.itemID] else { continue }
-            if previousItemsByID[record.itemID] == item { continue } // Unchanged: skip re-projection.
+            // Unchanged rows skip re-projection: relies on `AgentChatItem.==` covering every
+            // field `Content.project` reads (kind, userInputOrigin, crossSessionAttribution, text).
+            if previousItemsByID[record.itemID] == item { continue }
             localInputIndex.replace(item, at: position)
         }
     }
@@ -2157,9 +2159,11 @@ final class AgentTabSession: ObservableObject {
         /// Working-suffix pruning is not canonical deletion: tracked identities survive and only
         /// their positions reconcile.
         case positionsOnly
-        /// A bounded working-list batch: tracked items the batch removed mark their record
-        /// deleted, still-present tracked items reconcile content and position per record.
-        case batchDiff(previousItems: [AgentChatItem])
+        /// A bounded working-list batch, diffed against the current `items` (the pre-commit
+        /// array): tracked items the batch removed mark their record deleted and retire any
+        /// unsettled candidate, still-present tracked items reconcile content and position.
+        /// Both reconciling dispositions invalidate instead when source-ID repair rekeys.
+        case batchDiff
     }
 
     private func commitSourceItems(
@@ -2181,12 +2185,12 @@ final class AgentTabSession: ObservableObject {
             } else {
                 reconcileLocalInputWorkingPositions(repairedItems)
             }
-        case .batchDiff(let previousItems):
+        case .batchDiff:
             if repair.didRepair {
                 // Rekeyed item IDs are a genuine identity change, not an in-place batch edit.
                 invalidateLocalInputStructure()
             } else {
-                reconcileLocalInputBatchDiff(from: previousItems, to: repairedItems)
+                reconcileLocalInputBatchDiff(from: items, to: repairedItems)
             }
         }
         suppressSourceItemsChanged = true
@@ -2205,6 +2209,7 @@ final class AgentTabSession: ObservableObject {
         diagnosticContext: String
     ) -> AgentSourceItemIDRepair.Result {
         let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
+        assert(repair.didRepair == (repair.items != candidateItems))
         if repair.didRepair {
             AgentSourceItemIDRepair.logDiagnostics(
                 repair.diagnostics,
@@ -2514,7 +2519,7 @@ final class AgentTabSession: ObservableObject {
         commitSourceItems(
             updatedItems,
             dispatch: .notify(mutation),
-            localInputIdentity: .batchDiff(previousItems: previousItems),
+            localInputIdentity: .batchDiff,
             diagnosticContext: "mutateItemsBatch"
         )
         if touchActivity {
@@ -2570,7 +2575,7 @@ final class AgentTabSession: ObservableObject {
         case .retentionCompaction:
             .positionsOnly
         case .pendingToolFinalizationRepair, .codexCommandStatusReconciliation:
-            .batchDiff(previousItems: self.items)
+            .batchDiff
         case .persistedSessionHydration, .routeActivation, .clearedChat, .stressHarnessReset, .testOverride:
             .invalidate
         }
