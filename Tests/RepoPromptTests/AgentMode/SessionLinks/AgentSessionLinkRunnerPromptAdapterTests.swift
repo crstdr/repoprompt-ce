@@ -1054,6 +1054,187 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         XCTAssertNil(restarted.localInputOffer(for: seeded))
     }
 
+    /// A real running producer session whose retained local-input index has its baseline seed.
+    private static func makeRunningSession(agent: AgentProviderKind) -> AgentModeViewModel.TabSession {
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = agent
+        session.hasLoadedPersistedState = true
+        session.installLocalInputSeed(.init())
+        session.installRunID(UUID())
+        session.runState = .running
+        return session
+    }
+
+    /// The queued-interrupt producer order: append the composer row, register the identity token,
+    /// then settle synchronously — the same sequence `submitActiveProviderSteering` uses.
+    @discardableResult
+    private static func settleQueuedInterruptInput(
+        _ text: String,
+        on session: AgentModeViewModel.TabSession,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> AgentChatItem {
+        let item = AgentChatItem.user(text, sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(item)
+        guard let position = session.items.firstIndex(where: { $0.id == item.id }) else {
+            XCTFail("composer row must be appended", file: file, line: line)
+            return item
+        }
+        let token = session.registerLocalComposerCandidate(itemID: item.id, at: position)
+        XCTAssertTrue(session.settleLocalComposerOrigin(token, disposition: .retained), file: file, line: line)
+        return item
+    }
+
+    /// The settled input that used to be swallowed: reply finalization flips only `isStreaming`,
+    /// which must not rotate the index epoch, so the observer's next claim still carries it.
+    func testQueuedInterruptSettledInputSurvivesFlagOnlyReplyFinalization() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        // The observer baselines its frontier on the target's pre-input epoch, as earlier
+        // reconciliations already did.
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        var streamingReply = AgentChatItem.assistant("Working on it", sequenceIndex: 0)
+        streamingReply.isStreaming = true
+        session.appendItem(streamingReply)
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        let epoch = session.localInputIndex.epoch
+
+        // `endActiveAssistantSegment`'s shape: a batch that changes no tracked membership or
+        // content, only an unrelated row's flag.
+        XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
+            for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
+                items[index].isStreaming = false
+            }
+        })
+        XCTAssertEqual(session.localInputIndex.epoch, epoch, "a flag-only batch must not rotate the epoch")
+        XCTAssertEqual(session.localInputIndex.producedThrough, 1)
+
+        h.indexes[0] = session.localInputIndex
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        let decoration = try XCTUnwrap(claim.localInput, "the settled record is still owed")
+        XCTAssertTrue(decoration.requirements.contains { requirement in
+            requirement.renderedRecords.contains { $0.itemID == input.id }
+        })
+        XCTAssertTrue(decoration.fragment.contains("W1"))
+    }
+
+    /// The Codex terminal-cleanup shape: streaming flags clear and a late transcript row inserts
+    /// ahead of the settled composer row inside one batch. Positions reconcile without rotation.
+    func testQueuedInterruptSettledInputSurvivesCodexStreamingCleanupBatch() throws {
+        let session = Self.makeRunningSession(agent: .codexExec)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        var streamingReply = AgentChatItem.assistant("Working on it", sequenceIndex: 0)
+        streamingReply.isStreaming = true
+        session.appendItem(streamingReply)
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        let epoch = session.localInputIndex.epoch
+
+        XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
+            for index in items.indices where items[index].isStreaming { items[index].isStreaming = false }
+            items.insert(AgentChatItem.system("Turn boundary", sequenceIndex: -1), at: 0)
+        })
+        XCTAssertEqual(session.localInputIndex.epoch, epoch)
+        XCTAssertEqual(
+            session.localInputIndex.records.first { $0.itemID == input.id }?.sourcePosition,
+            2,
+            "the shifted row keeps its tracked identity at its new position"
+        )
+
+        h.indexes[0] = session.localInputIndex
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        let decoration = try XCTUnwrap(claim.localInput)
+        XCTAssertTrue(decoration.requirements.contains { $0.renderedRecords.contains { $0.itemID == input.id } })
+    }
+
+    /// A batch that removes the tracked row is a per-record deletion in the same epoch — never an
+    /// epoch rotation — and the deleted record is not disclosed.
+    func testBatchRemovalDeletesTrackedRecordWithoutEpochRotation() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        let epoch = session.localInputIndex.epoch
+
+        XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
+            items.removeAll { $0.id == input.id }
+        })
+        XCTAssertEqual(session.localInputIndex.epoch, epoch, "a batch removal is not structural")
+        XCTAssertEqual(session.localInputIndex.records.first { $0.itemID == input.id }?.isDeleted, true)
+
+        h.indexes[0] = session.localInputIndex
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        XCTAssertNil(claim.localInput, "a removed row is deleted, never disclosed")
+    }
+
+    /// A genuine structural replacement still rotates the epoch: the reseeded record is baseline
+    /// history in the new epoch and is never re-disclosed.
+    func testStructuralReplacementRebaselinesSettledInputWithoutRedisclosure() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        let stampedRow = try XCTUnwrap(session.items.first { $0.id == input.id })
+        XCTAssertEqual(stampedRow.userInputOrigin, .localComposer)
+        let epoch = session.localInputIndex.epoch
+
+        session.replaceItems([AgentChatItem.user("fresh start", sequenceIndex: 0)])
+        XCTAssertNotEqual(session.localInputIndex.epoch, epoch)
+
+        var seed = Index.Seed()
+        seed.append(stampedRow)
+        session.installLocalInputSeed(seed)
+        XCTAssertEqual(session.localInputIndex.producedThrough, 1)
+
+        h.indexes[0] = session.localInputIndex
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        XCTAssertNil(claim.localInput, "a new epoch baselines retained history; it is never re-disclosed")
+    }
+
+    /// The batch reconciliation on the hot path is bounded by the tracked set: a flag-only
+    /// finalization over a 1,200-row session stays within budget.
+    func testLocalInputBatchReconciliationCostAtScale() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let rows = (0 ..< 1200).map { AgentChatItem.assistant("history \($0)", sequenceIndex: $0) }
+        session.replaceItems(rows)
+        session.installLocalInputSeed(.init())
+        _ = Self.settleQueuedInterruptInput("W1", on: session)
+        let committed = session.items
+        XCTAssertGreaterThanOrEqual(committed.count, 1000)
+
+        let iterations = 200
+        var flag = false
+        let batchStart = Date()
+        for _ in 0 ..< iterations {
+            flag.toggle()
+            session.mutateItemsBatch(touchActivity: false) { items in
+                items[0].isStreaming = flag
+            }
+        }
+        let batchMilliseconds = Date().timeIntervalSince(batchStart) * 1000 / Double(iterations)
+
+        let invalidateStart = Date()
+        for _ in 0 ..< iterations {
+            session.replaceItems(committed)
+            session.installLocalInputSeed(.init())
+        }
+        let invalidateMilliseconds = Date().timeIntervalSince(invalidateStart) * 1000 / Double(iterations)
+        print("LOCAL_INPUT_BATCH_COST items=\(committed.count) batch_ms=\(batchMilliseconds) invalidate_ms=\(invalidateMilliseconds)")
+        XCTAssertLessThan(batchMilliseconds, 10, "identity-preserving finalization stays bounded at scale")
+    }
+
     func testExactly600IsFullAnd601UsesExact400Plus200Graphemes() throws {
         let cluster = "e\u{301}"
         for count in [600, 601] {
