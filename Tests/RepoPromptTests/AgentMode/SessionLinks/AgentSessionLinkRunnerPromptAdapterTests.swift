@@ -1180,8 +1180,108 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         XCTAssertTrue(claim.localInput?.fragment.contains("user_inputs_omitted=\"1\"") == true)
     }
 
+    /// The save-time silent repairs ride the same identity-preserving batch path: a pending-tool
+    /// finalization commit must not cost a settled input its epoch either.
+    func testPendingToolFinalizationRepairPreservesSettledInput() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        var streamingReply = AgentChatItem.assistant("Working on it", sequenceIndex: 0)
+        streamingReply.isStreaming = true
+        session.appendItem(streamingReply)
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        let epoch = session.localInputIndex.epoch
+
+        var repaired = session.items
+        repaired[0].isStreaming = false
+        session.setItemsSilently(repaired, reason: .pendingToolFinalizationRepair)
+        XCTAssertEqual(session.localInputIndex.epoch, epoch)
+
+        h.indexes[0] = session.localInputIndex
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        XCTAssertTrue(claim.localInput?.requirements.contains {
+            $0.renderedRecords.contains { $0.itemID == input.id }
+        } == true)
+    }
+
+    /// Hydration-class silent replacement stays structural: the epoch rotates and the reseeded
+    /// row is baseline history, never re-disclosed.
+    func testHydrationReplacementRotatesEpochWithoutRedisclosure() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        let stampedRow = try XCTUnwrap(session.items.first { $0.id == input.id })
+        let epoch = session.localInputIndex.epoch
+
+        session.setItemsSilently([AgentChatItem.user("hydrated", sequenceIndex: 0)], reason: .persistedSessionHydration)
+        XCTAssertNotEqual(session.localInputIndex.epoch, epoch)
+
+        var seed = Index.Seed()
+        seed.append(stampedRow)
+        session.installLocalInputSeed(seed)
+        h.indexes[0] = session.localInputIndex
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        XCTAssertNil(claim.localInput)
+    }
+
+    /// A batch that inserts ahead of an unsettled candidate row reconciles its position:
+    /// the producer token still settles at the new index.
+    func testBatchInsertBeforeUnsettledCandidateSettlesAtNewPosition() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let item = AgentChatItem.user("W1", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(item)
+        let position = try XCTUnwrap(session.items.firstIndex(where: { $0.id == item.id }))
+        let token = session.registerLocalComposerCandidate(itemID: item.id, at: position)
+
+        XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
+            items.insert(AgentChatItem.system("boundary", sequenceIndex: -1), at: 0)
+        })
+        XCTAssertTrue(session.settleLocalComposerOrigin(token, disposition: .retained))
+        let record = try XCTUnwrap(session.localInputIndex.records.first { $0.itemID == item.id })
+        XCTAssertEqual(record.sourcePosition, 1)
+        XCTAssertEqual(record.ordinal, 1)
+    }
+
+    /// Pin for the recorded limitation: a settle landing while a structural seed is pending is
+    /// dropped — the row is stamped and `settleLocalComposerOrigin` reports success, but no
+    /// ordinal is allocated — and the reseeded row is baseline history, never re-disclosed.
+    func testSettleDuringPendingSeedIsDroppedAndBaselined() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        // Structural replacement leaves the index pending a canonical seed.
+        session.replaceItems([AgentChatItem.assistant("reset", sequenceIndex: 0)])
+        XCTAssertTrue(session.localInputIndex.needsStructuralSeed)
+
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        let stampedRow = try XCTUnwrap(session.items.first { $0.id == input.id })
+        XCTAssertEqual(stampedRow.userInputOrigin, .localComposer)
+        XCTAssertFalse(session.localInputIndex.records.contains { $0.itemID == input.id },
+                       "settle is dropped while the seed is pending")
+
+        var seed = Index.Seed()
+        seed.append(stampedRow)
+        session.installLocalInputSeed(seed)
+
+        h.indexes[0] = session.localInputIndex
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        XCTAssertNil(claim.localInput, "the new epoch baselines the reseeded row — no disclosure")
+    }
+
     /// Removing two settled rows while a third survives must not tombstone the survivor:
     /// batch deletions match by identity, never by (already-shifted) positions.
+    /// The rows stay contiguous — an assistant row between W2 and W3 would hide the old
+    /// position-shift hazard.
     func testBatchRemovingTwoTrackedInputsPreservesSurvivor() throws {
         let session = Self.makeRunningSession(agent: .claudeCode)
         let h = Harness()
@@ -1217,10 +1317,12 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         session.appendItem(item)
         let position = try XCTUnwrap(session.items.firstIndex(where: { $0.id == item.id }))
         let token = session.registerLocalComposerCandidate(itemID: item.id, at: position)
+        XCTAssertEqual(session.test_unsettledLocalComposerCandidateCount, 1)
 
         XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
             items.removeAll { $0.id == item.id }
         })
+        XCTAssertEqual(session.test_unsettledLocalComposerCandidateCount, 0, "the batch retired the token")
         XCTAssertFalse(session.settleLocalComposerOrigin(token, disposition: .retained))
         XCTAssertFalse(session.localInputIndex.records.contains { $0.itemID == item.id })
     }
