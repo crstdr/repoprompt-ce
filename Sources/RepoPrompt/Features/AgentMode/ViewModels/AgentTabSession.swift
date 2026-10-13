@@ -103,6 +103,26 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// A committed batch is not a structural rebuild: a tracked item the batch removed is a
+    /// per-record deletion, a still-present tracked item reconciles content and position, and an
+    /// unsettled composer candidate keeps its identity for the canonical-only settle.
+    private func reconcileLocalInputBatchDiff(from previousItems: [AgentChatItem], to newItems: [AgentChatItem]) {
+        let trackedIDs = Set(localInputIndex.records.map(\.itemID)).union(localComposerCandidates.values.map(\.itemID))
+        guard !trackedIDs.isEmpty else { return }
+        var newItemsByID: [UUID: AgentChatItem] = [:]
+        for item in newItems where trackedIDs.contains(item.id) {
+            newItemsByID[item.id] = item
+        }
+        for (index, item) in previousItems.enumerated() where trackedIDs.contains(item.id) && newItemsByID[item.id] == nil {
+            localInputIndex.remove(at: index, itemID: item.id)
+        }
+        reconcileLocalInputWorkingPositions(newItems)
+        for record in localInputIndex.records where !record.isDeleted {
+            guard let position = record.sourcePosition, let item = newItemsByID[record.itemID] else { continue }
+            localInputIndex.replace(item, at: position)
+        }
+    }
+
     func installLocalInputSeed(_ seed: AgentSessionLinkRetainedLocalInputIndex.Seed) {
         localInputIndex.install(seed)
         localInputCanonicalCommitPending = false
@@ -2118,18 +2138,40 @@ final class AgentTabSession: ObservableObject {
         case preserveForRetentionCompaction
     }
 
+    /// How a committed source-items change treats the retained local-input index's identity.
+    private enum LocalInputIdentityDisposition {
+        /// A genuine structural replacement: rotate the epoch; the canonical reseed owns all
+        /// reconciliation and observers re-baseline rather than re-disclose history.
+        case invalidate
+        /// Working-suffix pruning is not canonical deletion: tracked identities survive and only
+        /// their positions reconcile.
+        case positionsOnly
+        /// A bounded working-list batch: tracked items the batch removed mark their record
+        /// deleted, still-present tracked items reconcile content and position per record.
+        case batchDiff(previousItems: [AgentChatItem])
+    }
+
     private func commitSourceItems(
         _ newItems: [AgentChatItem],
         dispatch: SourceItemsDispatch,
         payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource,
-        preservesLocalInputIdentity: Bool = false,
+        localInputIdentity: LocalInputIdentityDisposition = .invalidate,
         diagnosticContext: String
     ) {
-        let repairedItems = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
-        if preservesLocalInputIdentity {
-            reconcileLocalInputWorkingPositions(repairedItems)
-        } else {
+        let repair = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
+        let repairedItems = repair.items
+        switch localInputIdentity {
+        case .invalidate:
             invalidateLocalInputStructure()
+        case .positionsOnly:
+            reconcileLocalInputWorkingPositions(repairedItems)
+        case .batchDiff(let previousItems):
+            if repair.didRepair {
+                // Rekeyed item IDs are a genuine identity change, not an in-place batch edit.
+                invalidateLocalInputStructure()
+            } else {
+                reconcileLocalInputBatchDiff(from: previousItems, to: repairedItems)
+            }
         }
         suppressSourceItemsChanged = true
         items = repairedItems
@@ -2145,7 +2187,7 @@ final class AgentTabSession: ObservableObject {
     private func repairedSourceItems(
         _ candidateItems: [AgentChatItem],
         diagnosticContext: String
-    ) -> [AgentChatItem] {
+    ) -> AgentSourceItemIDRepair.Result {
         let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
         if repair.didRepair {
             AgentSourceItemIDRepair.logDiagnostics(
@@ -2153,15 +2195,15 @@ final class AgentTabSession: ObservableObject {
                 context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
             )
         }
-        return repair.items
+        return repair
     }
 
     @discardableResult
     private func repairStoredSourceItemsIfNeeded(diagnosticContext: String) -> Bool {
-        let repairedItems = repairedSourceItems(items, diagnosticContext: diagnosticContext)
-        guard repairedItems != items else { return false }
+        let repair = repairedSourceItems(items, diagnosticContext: diagnosticContext)
+        guard repair.didRepair else { return false }
         suppressSourceItemsChanged = true
-        items = repairedItems
+        items = repair.items
         suppressSourceItemsChanged = false
         return true
     }
@@ -2456,6 +2498,7 @@ final class AgentTabSession: ObservableObject {
         commitSourceItems(
             updatedItems,
             dispatch: .notify(mutation),
+            localInputIdentity: .batchDiff(previousItems: previousItems),
             diagnosticContext: "mutateItemsBatch"
         )
         if touchActivity {
@@ -2508,7 +2551,7 @@ final class AgentTabSession: ObservableObject {
             items,
             dispatch: .silent,
             payloadUpdate: payloadUpdate,
-            preservesLocalInputIdentity: reason == .retentionCompaction,
+            localInputIdentity: reason == .retentionCompaction ? .positionsOnly : .invalidate,
             diagnosticContext: "setItemsSilently reason=\(reason.rawValue)"
         )
         pendingSourceItemsMutationSummary = nil
