@@ -1309,3 +1309,6 @@ supplied by these owning writer or neutral container suites. The historical
 final-materialization and graph authority failures remain unattributed; subsequent
 GREEN execution is not causal explanation. No typed-path claimed source or
 separately owned reliability source was modified.
+
+
+**2026-10-13 upstream validation reconciliation.** Unmodified upstream `39b496ab26a39002cdabe90fce8794d9c2355107` contains 333 files with the exact App-test import counted by the ratchet, against a recorded limit of 332. The Ultrafast contribution adds coverage to existing suites and introduces no new App-importing test file. Align only `tests_testable_import_app_files` to the existing 333-file tree; counts above 333 still fail, and every other baseline and policy stays unchanged. Update the stale sidebar builder and self-compact reservation test calls to the current interfaces without removing assertions. These prerequisite repairs are kept separate from the Ultrafast implementation for review.
