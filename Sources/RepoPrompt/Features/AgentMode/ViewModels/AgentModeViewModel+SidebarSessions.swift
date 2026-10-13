@@ -106,6 +106,8 @@ extension AgentModeViewModel {
             sessionID: stashedTab.tab.activeAgentSessionID ?? entry?.id,
             tabID: stashedTab.tab.id
         )
+        // Archived tabs keep their pin and group, so `is:pinned` / `group:` match them too.
+        .withFacets(isPinned: stashedTab.tab.isPinned, group: stashedTab.tab.sidebarGroup)
     }
 
     private func shouldFreezeSidebarOrdering(for tabs: [ComposeTabState]) -> Bool {
@@ -615,10 +617,12 @@ extension AgentModeViewModel {
             currentTabID: currentTabID,
             visibleSessionCount: sidebarSnapshot.visibleSessionCount
         )
+        // Paging takes the *requested* count: the effective count already includes pinned rows,
+        // which are exempt from the page cap, and must not be widened twice.
         let pagedSessions = pagedSidebarSessions(
             filteredSessions: filteredSessions,
             currentTabID: currentTabID,
-            visibleSessionCount: effectiveVisibleSessionCount
+            visibleSessionCount: sidebarSnapshot.visibleSessionCount
         )
         let archivedSessionTabs = archivedSessionTabsForSidebarSnapshot(
             stashedTabs,
@@ -629,7 +633,14 @@ extension AgentModeViewModel {
         let pagedArchivedTabs = searchActive
             ? archivedSessionTabs.sortedTabs
             : Array(archivedSessionTabs.sortedTabs.prefix(sidebarSnapshot.archivedVisibleSessionCount))
-        let renderedSelectionOrder = pagedSessions.map {
+        // Selection (shift-range, Cmd-A, bulk targets) follows the displayed order: group sections
+        // first, and rows hidden inside a collapsed group are not selectable.
+        let displayedActiveRows = Self.sidebarDisplayOrder(
+            pagedSessions,
+            collapsedGroups: sidebarSnapshot.collapsedSidebarGroups,
+            searchText: sidebarSnapshot.searchText
+        )
+        let renderedSelectionOrder = displayedActiveRows.map {
             AgentSidebarSelectionIdentity.active(tabID: $0.tabID)
         } + pagedArchivedTabs.map {
             AgentSidebarSelectionIdentity.archived(stashedTabID: $0.id, tabID: $0.tab.id)
@@ -1037,18 +1048,17 @@ extension AgentModeViewModel {
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
-        let requestedVisibleCount = max(0, visibleSessionCount ?? sessionSidebarVisibleSessionCount)
-        let activeIndex: Int?
-        let result: Int
-        if let currentTabID,
-           let foundActiveIndex = filteredSessions.firstIndex(where: { $0.tabID == currentTabID })
-        {
-            activeIndex = foundActiveIndex
-            result = min(filteredSessions.count, max(requestedVisibleCount, foundActiveIndex + 1))
-        } else {
-            activeIndex = nil
-            result = min(filteredSessions.count, requestedVisibleCount)
-        }
+        let requestedUnpinnedCount = max(0, visibleSessionCount ?? sessionSidebarVisibleSessionCount)
+        // Pins and their required visible ancestors are exempt from the ordinary-row page cap.
+        #if DEBUG
+            let requestedVisibleCount = Self.sidebarPageRows(
+                containingUnpinned: requestedUnpinnedCount, in: filteredSessions
+            ).count
+        #endif
+        let activeIndex = currentTabID.flatMap { tabID in filteredSessions.firstIndex { $0.tabID == tabID } }
+        let result = Self.sidebarPageRows(
+            containingUnpinned: requestedUnpinnedCount, in: filteredSessions, throughIndex: activeIndex
+        ).count
         #if DEBUG
             perfRecorder.durationEvent(
                 "sidebar.visibleCount.effective",
@@ -1064,6 +1074,40 @@ extension AgentModeViewModel {
             )
         #endif
         return result
+    }
+
+    /// Page ordinary rows independently from pins and their required visible ancestors. A prefix
+    /// cannot do this: ordinary siblings can exhaust it before the next pin-bearing thread.
+    /// Flattened depths already account for missing parents and cycles promoted to roots.
+    private static func sidebarPageRows(
+        containingUnpinned unpinnedLimit: Int,
+        in rows: [SidebarSession],
+        throughIndex: Int? = nil
+    ) -> [SidebarSession] {
+        var parentIndexByIndex = [Int?](repeating: nil, count: rows.count)
+        var stack: [Int] = []
+        for index in rows.indices {
+            while let parent = stack.last, rows[parent].depth >= rows[index].depth {
+                stack.removeLast()
+            }
+            parentIndexByIndex[index] = stack.last
+            stack.append(index)
+        }
+        var pinBearing = rows.map(\.isPinned)
+        for index in rows.indices.reversed() where pinBearing[index] {
+            if let parent = parentIndexByIndex[index] {
+                pinBearing[parent] = true
+            }
+        }
+
+        var unpinnedSeen = 0
+        return rows.indices.compactMap { index in
+            if !pinBearing[index] {
+                guard unpinnedSeen < unpinnedLimit || index <= (throughIndex ?? -1) else { return nil }
+                unpinnedSeen += 1
+            }
+            return rows[index]
+        }
     }
 
     func effectiveSidebarVisibleSessionCount(
@@ -1089,12 +1133,11 @@ extension AgentModeViewModel {
         currentTabID: UUID?,
         visibleSessionCount: Int? = nil
     ) -> [SidebarSession] {
-        let limit = effectiveSidebarVisibleSessionCount(
-            filteredSessions: filteredSessions,
-            currentTabID: currentTabID,
-            visibleSessionCount: visibleSessionCount
+        let activeIndex = currentTabID.flatMap { tabID in filteredSessions.firstIndex { $0.tabID == tabID } }
+        return Self.sidebarPageRows(
+            containingUnpinned: max(0, visibleSessionCount ?? sessionSidebarVisibleSessionCount),
+            in: filteredSessions, throughIndex: activeIndex
         )
-        return Array(filteredSessions.prefix(limit))
     }
 
     func pagedSidebarSessions(
@@ -1136,11 +1179,15 @@ extension AgentModeViewModel {
         searchText: String? = nil,
         visibleSessionCount: Int? = nil
     ) -> UUID? {
-        let orderedTabIDs = pagedSidebarSessions(
-            for: tabs,
-            currentTabID: currentTabID,
-            searchText: searchText,
-            visibleSessionCount: visibleSessionCount
+        let orderedTabIDs = Self.sidebarDisplayOrder(
+            pagedSidebarSessions(
+                for: tabs,
+                currentTabID: currentTabID,
+                searchText: searchText,
+                visibleSessionCount: visibleSessionCount
+            ),
+            collapsedGroups: ui.sessionSidebar.snapshot.collapsedSidebarGroups,
+            searchText: searchText ?? sessionSidebarSearchText
         )
         .map(\.tabID)
         guard !orderedTabIDs.isEmpty else { return nil }
@@ -1163,14 +1210,38 @@ extension AgentModeViewModel {
         visibleSessionCount: Int? = nil
     ) -> UUID? {
         guard index >= 0 else { return nil }
-        let pagedSessions = pagedSidebarSessions(
-            for: tabs,
-            currentTabID: currentTabID,
-            searchText: searchText,
-            visibleSessionCount: visibleSessionCount
+        let pagedSessions = Self.sidebarDisplayOrder(
+            pagedSidebarSessions(
+                for: tabs,
+                currentTabID: currentTabID,
+                searchText: searchText,
+                visibleSessionCount: visibleSessionCount
+            ),
+            collapsedGroups: ui.sessionSidebar.snapshot.collapsedSidebarGroups,
+            searchText: searchText ?? sessionSidebarSearchText
         )
         guard index < pagedSessions.count else { return nil }
         return pagedSessions[index].tabID
+    }
+
+    /// Active rows in displayed order: sidebar group sections first (rows of a collapsed group
+    /// omitted), then everything else. Row order never depends on the date sections.
+    static func sidebarDisplayOrder(
+        _ rows: [SidebarSession],
+        collapsedGroups: Set<String>,
+        searchText: String = ""
+    ) -> [SidebarSession] {
+        AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
+            for: rows, collapsedGroups: collapsedGroups, searchText: searchText
+        )
+        .filter { !$0.hidesRow }
+        .map(\.session)
+    }
+
+    func toggleSidebarGroupCollapsed(_ group: String) {
+        // Groups are temporarily expanded during search; do not invert a hidden saved preference.
+        guard ui.sessionSidebar.snapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        ui.sessionSidebar.toggleGroupCollapsed(group)
     }
 
     func adjacentParentSidebarSessionTabID(

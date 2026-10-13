@@ -55,6 +55,168 @@ MCP schemas/results, public observations/cursors, guidance revisions, settings, 
 compaction, echo policy, and all wake admission decisions remain unchanged. Alpha/Delta dogfood is
 a separate user-performed gate, not an automated launch or readiness claim.
 
+## Delegation scopes (amendment)
+
+A **delegation scope** is durable, user-granted authority for one overseer session to act on many
+sessions without per-item prompts (the agent-only `session_admin` tool). It sits **beside** links,
+not in place of them: links remain the per-pair transport for cursors, passive notices, and
+Auto-wake; a scope is the authority to act across its members.
+
+| Invariant | With scopes |
+| --- | --- |
+| Grants are created only by explicit user action | Still true for scopes: a scope is created only by the user's approval card (`request_scope`) or by attenuation of a scope the user granted. Links may additionally be created **inside** a user-granted scope by its grantee. |
+| Management never chains (A→B→C gives A nothing over C) | Still true for links. Authority over C comes only from C being a member of A's scope, never from chaining links. |
+| Restricted grants are never upgraded | Still true. A scope neither mutates nor upgrades a link's capabilities; a link created under a scope carries capabilities within the scope. |
+| Four disjoint owners | Unchanged. The **scope authority** (`DomainDelegationScopeAuthority`, held by `DelegationScopeRuntime`) is an authority *input*, not a fifth owner of link state, notices, claims, or wake policy. Any future descendant-prompt notice enters only through the passive reducer; any wake-policy change lives only in the wake coordinator. No transport-level dampers. |
+| Snooze suppresses admission, never delivery | Unchanged. Scope approval cards and batch confirmation cards never pass through the oversight transport. |
+
+Rules that hold the scope design together:
+
+- **Membership is projected, never argued.** `DelegationMembershipProjector` computes membership
+  proofs from persisted provenance (`parentSessionID`, `createdByOverseerSessionID`, and the
+  mutable `organizationalParentID`, which wins when set) and presents them to the authority, the
+  same way link leases are presented. Tool arguments only name targets.
+- **One authority check.** `DomainDelegationScopeAuthority.authorize` runs, in order: scope live
+  (grantee, active, unexpired, generation), capability held (target-independent, so checked first
+  and it cannot probe membership), membership proofs valid for the scope *and every ancestor* (an
+  attenuated scope never reaches beyond its parents), guardrails (whole-subtree counts across the
+  scope chain), batch confirmation (an approved card authorizes one application). Each target lease is then
+  re-bound by `DomainAgentSessionOperationAuthorizer` to the exact operation, caller, and target
+  under the `.delegationScope(scopeID, generation, capability)` basis.
+- **Uniform denials.** Only `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`,
+  `scope_revoked`, `confirmation_required`, `confirmation_mismatch` (with the approved item IDs),
+  and the per-item `requires_control` are caller-visible, and each only after the caller is known
+  to be the scope's grantee. Unknown scopes, non-grantees, non-members, and unresolved callers all
+  receive the existing uniform "not available / not found" text.
+- **Cards bind arguments.** A batch card is bound to the scope generation, operation, item set,
+  idempotency key, and a canonical digest of the call's other arguments. Changed arguments under
+  the same key conflict instead of riding the approval, and an approval applies once.
+- **Scopes are keyed by session, not by incarnation.** Unlike link grants, a scope is durable and is
+  granted to a session UUID, so every live incarnation of that session (for example the same session
+  open in two windows) holds it. The caller is still resolved only from exact server-owned run
+  routing, and the grant card is bound to the requesting tab *and* session (a session change
+  cancels it).
+- **The user can always revoke.** The oversight popover lists every active delegation with a Revoke
+  control; revocation is immediate (generation bump), cascades, and is durable through a tombstone.
+  Deleting a session revokes every scope granted to or rooted at it.
+- **`.allSessions` scopes** hold only `observe`, `organize`, and `restructure`. They can `retire`
+  (stop + release + archive) idle or finished members, which needs `organize` + `restructure`;
+  stopping a running (or unknown-state) member additionally needs `control`, so such members are
+  reported per item as `requires_control` and never stopped. The requirement depends on the target's
+  app-presented run state and is never granted implicitly.
+- **`destructive` is a reserved flag.** No operation requires it. `retire` and `worktree_release`
+  (unbind + mark stale, needs `worktree`) always raise a batch card regardless of the threshold.
+- **Human-only stays human-only.** Deleting sessions, removing or pruning worktrees, keys and
+  providers, permission modes, MCP approvals and server control, settings writes, app quit/update,
+  and handoff instructions are not capabilities. `agent_manage.cleanup_sessions` refuses the scope
+  basis outright.
+- **Revocation is a generation bump.** Revoking, releasing, or expiring a scope cascades to every
+  attenuated descendant and stops authority immediately. Sessions keep running and links stay until
+  released.
+- **External MCP is untouched.** `session_admin` is policy-gated (`agent_session_admin`), granted by
+  no static profile, recomputed live per `tools/list` and `tools/call` only for an exactly routed
+  Agent Mode run (live scope, or orchestrator/overseer for `request_scope`), never advertised or
+  admitted for administrative principals, and fails closed in direct-headless. Explicit zero-link
+  overseer opt-in (toolbar or `become_overseer`) enables scope requests without creating a scope or
+  link. Retiring that incarnation-local opt-in or disabling the oversight tool family removes this
+  opt-in-only discovery eligibility; an independently user-approved durable scope, bare orchestrator
+  policy, or exact outbound link keeps its own eligibility.
+
+- **Archive is state-dependent, like retire.** Archiving stashes the session's tab, which cancels a
+  live run and its pending prompts, so an idle target needs `organize` while a non-idle (running,
+  waiting, or unknown-state) target needs `organize` + `control`; without `control` it is reported
+  as `requires_control` and left alone. Undo of `unarchive` is authorized as `archive`. Run state is
+  aggregated across every window and re-checked at commit time: each target is stashed separately
+  with `lease current && (idle || scope chain holds control)` folded into that stash's
+  mutation-context check, which the stash evaluates after its own preflight suspension and
+  immediately before it commits. `retire` re-checks the same condition after its inventory read,
+  before each unlink, and at stash commit; a target that fails it is neither unlinked further nor
+  archived.
+- **Release goes through the link owner.** `session_admin release`/`retire` unlink only links whose
+  other endpoint is also a scope member, and only through the bridge's `stopMonitorLink`, so the link
+  authority keeps sole ownership: durable-intent removal and Auto-wake target cleanup happen inside
+  that path. Durable intents with no live link are reported (`dormant_intents`), never removed by a
+  scope. Inventory reads links through `oversightInventory()` (live links plus durable intents) and
+  grants nothing.
+- **Batch cards apply on approval.** `AgentSessionAdministrationFrontDoor` keeps the exact request
+  behind each card and, when the user approves, applies it with identical arguments narrowed to the
+  ticked items (so the arguments digest the card is bound to matches); the outcome is reported by
+  `confirmation_status` (`applied_result`). The core is the only claimant: every supplied card is
+  claimed with `beginApplying` and settled with `finishApplying`, including when unticking brought
+  the batch to or below the threshold, so a successful application always ends `applied` and a
+  failed one (a thrown error, or a handler result that refuses the whole batch with a top-level
+  `denied`) returns the card to `approved`. Per-item refusals inside an applied batch consume it. Undo tokens are
+  re-authorized as the original operation over the original targets at redemption.
+
+Structural operations (Milestone 1, Lane C) keep those rules. They register through the same front
+door, so their cards apply on approval too; each handler's `preflight` runs before a card is raised,
+before an approved card is claimed, and in `preview`, so a structurally refused call never reaches
+the user's card.
+
+- **Links under a scope.** `link`/`unlink` go through the bridge's ordinary durable Add/Stop, so
+  link authority stays the sole owner. A scope only mints links its own grantee observes
+  (`observer_must_be_caller`); `unlink` needs both endpoints to be members (management never chains).
+  A new link's capabilities must be within the scope's ceiling (`poll`/`wait`/`read` need
+  `observe`; `send_when_idle`/`manage` need `control`). The bridge mints only the default managed set
+  and durable intent restores it as such, so a scope without `observe` + `control` cannot create a
+  link at all. An existing link is reported as-is and never upgraded.
+- **Delegated Add re-proves its scope inside the link owner.** A caller-side check before
+  `addMonitorLink` cannot cover the Add's own suspensions, so `link` calls
+  `addDelegatedMonitorLink` with exact endpoints and an `AgentSessionLinkDelegatedAddAuthorization`
+  (lease current, target and observer still chain members). The shared durable Add re-proves it
+  synchronously at each commit point, after the preceding hop: inside the pair lane before the
+  durable insert, before and after reservation, immediately before `activateLink`, after
+  activation, and in the caller-side completion fence. A failed proof uses the transaction's existing
+  rollback only: an unactivated reservation is abandoned, only this activation's own grant is
+  revoked, and only a row this insert freshly created is compensated (expected token and assertion
+  generation); a pre-existing or concurrently reasserted row or grant is never removed. A delegated
+  Add that reasserts a row still owing a cleanup (a Stop whose removal failed to write) settles that
+  cleanup only after the outcome: an established link retires it like an interactive Add, a failed
+  one moves it to the new assertion generation so **Retry saving** still removes the row. The
+  `activateLink` hop itself is not divisible from the MainActor: a revocation landing inside it is
+  linearized after the activation and settled by revoking that grant before inventory is published,
+  the same contract the lane-creation fence has. Ordinary user Add and launch restoration carry no
+  delegated authorization and are unchanged.
+- **Placement never moves membership elsewhere.** `reparent` needs the source and destination both
+  in the caller's scope chain; `adopt` needs a user card and a user-granted (not nested) scope. Both
+  are refused (`placement_affects_other_scopes`, with a count, never other scopes' IDs) if the move
+  would make the moved subtree join or leave any live scope outside the caller's own chain. A chain
+  that runs into a session whose provenance is not loaded is `placement_unresolved` unless both
+  chains stop at the same unknown session. `adopt` lists every session that moves (the adoptee's
+  whole subtree) on its card, never adopts a scope's grantee or root, and checks `maxLiveSessions`,
+  `maxWorktrees`, and `maxDepth` against post-adopt membership before the card and again at apply
+  (each adoption is reserved from that final check until its in-memory placement lands);
+  `reparent` enforces `maxDepth` on the moved subtree. Only `organizationalParentID` changes; spawn
+  provenance is immutable. Each item's final re-validation and its in-memory placement write (index
+  entry and live tab) run in one synchronous region, and only the disk rewrite is queued, so
+  concurrent placement changes are decided one after the other (a cross re-parent is refused as a
+  cycle; a second adopt at a limit is refused).
+- **Spawn under scope.** `agent_run start` (including an empty `tab_id`, or one whose session has
+  no tree placement at all), `agent_manage create_session`, and `create_lane` evaluate the
+  guardrails of every live tree scope the creator is a member of, and of a workspace scope only
+  for delegated work (the creator is its grantee or stamped with it, or descends organizationally
+  from one), each with its ancestors, because the new session joins them; an unrelated session that
+  merely lives in a delegated workspace is never limited. `fork` and `worktree_create` evaluate the same scopes for the caller. In-flight spawns,
+  forks, adoptions, and worktree creations are reserved so concurrent calls cannot overshoot; a
+  spawn's reservation ends once the new session is stamped, not when its run settles. An
+  already-placed `tab_id` session (adopted, spawned, or a lane) is never re-stamped, a stamp never
+  overwrites an existing placement or scope, another overseer's lane is refused when the start's
+  spawn-parent write would move it between live scopes (`placement_affects_other_scopes`), and a
+  scoped creator cannot graft a session whose subtree holds or roots a live scope
+  (`spawn_target_anchors_scope`); an unplaced target's whole subtree counts against the limits. Auto-join stamping
+  happens for a creator holding a live `spawn` scope. A session in no scope is unchanged. A scope
+  `fork` never inherits oversight links.
+- **Leases are re-checked after every suspension** before the next mutation; a revocation that
+  lands mid-batch stops the remaining items (`scope_revoked`). An unlink re-checks the lease and
+  both endpoints' membership right before the bridge's Stop. Worktree binds and unbinds re-check the
+  lease and the target's membership right before the binding transition and again at its
+  `beforeCommit` fence; as with `manage_worktree`, the transition can still await recovery handoff
+  and provider-context invalidation after that fence, before it publishes.
+- **`worktree_inventory` drops `unbound`/`released` flags while any session binds the worktree**, even one outside the scope; this is a deliberate safety property, and nothing names or counts the outside binder.
+
+Scope intent persistence is described in
+[`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).
+
 ## Same-process window reopen
 
 Window close still revokes live authority, leases, queues, and wakes. Before teardown, the runtime

@@ -2413,6 +2413,12 @@ struct AgentModeChatDetailView: View {
             transcriptBlockRows(blocks: visibleTranscriptBlocks)
         }
         runningIndicatorSlot
+        DelegationApprovalSlot(
+            windowID: windowID,
+            tabID: currentTabID,
+            sessionID: currentTabID.flatMap { agentModeVM.sessions[$0]?.activeAgentSessionID },
+            runtime: AgentSessionLinkRuntimeBridge.shared.delegationScopes
+        )
         if let request = runInteractionSnapshot.pendingCodexHookReview {
             CodexHookReviewCard(
                 request: request,

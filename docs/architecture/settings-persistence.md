@@ -384,6 +384,82 @@ The MCP `app_settings` surface remains global for model-related keys such as:
 
 Those keys write the global backing fields. Workspace-specific Agent Models overrides are not exposed through `app_settings`; they are selected by the active RepoPrompt workspace/window and resolved by runtime services.
 
+## Delegation scope intent
+
+Delegation scopes are not settings, but their durable intent lives beside the oversight-link file
+and follows the same preserve-first rules:
+
+```text
+~/Library/Application Support/RepoPrompt CE/delegationScopes.json
+```
+
+- Owner: `DelegationScopeStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
+  `WindowStatesManager` with the same `AgentSessionOversightPersistenceMode` as
+  `agentSessionOversightLinks.json`. Suppressed launches perform no file I/O.
+- Payload: a versioned document (`version`, `scopes`, optional `revoked_scope_ids`) holding only the
+  **active** grants: scope ID, grantee session, kind, capabilities, guardrails (including the
+  per-scope bulk confirmation threshold), origin (user or attenuated parent), and grant time.
+  Revoked and expired scopes are removed. `revoked_scope_ids` is a bounded (1,024, oldest dropped)
+  tombstone list: a tombstoned grant, or a child of one, is never reactivated even if a stale copy of
+  the file still lists it. Generations, leases, pending `request_scope` cards, and batch
+  confirmations are process-local and never written.
+- Writes are serialized write-through, retried once on failure, and surfaced in the "Active
+  delegations" list when they fail. `applicationWillTerminate` performs a bounded synchronous
+  flush so a revocation made just before quitting is durable.
+- Launch: the file is read once, and every grant is reactivated under a **fresh generation**.
+  Grants past their expiry, tombstoned grants, and attenuated grants whose parent is missing,
+  inactive, or no longer satisfies the attenuation invariants (tree rooted at the grantee,
+  capabilities a subset, guardrails no looser) are not reactivated, so a reload can never undo a
+  cascade or widen a child.
+- Recovery: a future `version` is preserved and blocks writes; malformed bytes are moved intact to
+  `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
+  and row counts are preserved and block writes. Nothing is ever partially salvaged or evicted.
+
+### Organizational placement and delegated worktree ownership
+
+- **Session placement.** `AgentSession` carries `organizationalParentID` and `delegationScopeID`,
+  additive and decoded with `decodeIfPresent`, **without** a serialization-version bump (still 9): a
+  bump would make this build rewrite every older session file on load and would not stop an older
+  build from dropping the fields on its own re-save. An older file decodes with no explicit
+  placement and falls back to spawn provenance (`parentSessionID`, then
+  `createdByOverseerSessionID`), which stays write-once. Only delegation-scope administration
+  (`reparent`, `adopt`, scoped creation, `fork`) writes placement. The index entry and live tab are
+  updated synchronously; only the placement-only file rewrite of a session with no live tab is
+  queued, serialized per session in the order placements were applied. A hydrate prefers the
+  index's placement over the file's so it cannot revert.
+- **Index mirror.** `AgentSessionMetadataRecord` / `AgentSessionIndexEntry` carry the same two
+  fields additively **without** bumping `AgentSessionMetadataIndex.currentSchemaVersion` (still 8):
+  a bump would make every not-yet-reopened workspace's index unreadable to the cross-workspace
+  `history` scan until rebuilt, changing external `history` output. A record missing the fields
+  falls back to spawn provenance, and placement only exists after this build writes it.
+- **Worktree ownership.**
+
+  ```text
+  ~/Library/Application Support/RepoPrompt CE/delegationWorktreeOwnership.json
+  ```
+
+  Owner: `WorktreeOwnershipStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
+  `WindowStatesManager` with the oversight persistence mode (suppressed launches stay in memory).
+  A versioned document (`version`, `worktrees`) recording, per worktree created under a scope,
+  `created_by_session_id`, `delegation_scope_id`, `created_at`, and, after `worktree_release`,
+  `released_at` / `released_by_session_id` (the stale mark). It never authorizes and never removes a
+  worktree; removing or pruning worktrees stays human-only. A future `version` is preserved and
+  blocks writes; malformed bytes move to `Backups/delegationWorktreeOwnership.corrupt.<uuid>.json`.
+
+## Sidebar groups on compose tabs
+
+`ComposeTabState` (workspace files, not global settings) carries two optional, additive fields
+beside `pinnedOrder`:
+
+- `sidebarGroup`: the tab's sidebar group label (trimmed, at most 64 characters, one line); absent
+  means ungrouped.
+- `sidebarGroupOrder`: the group's position among the workspace's groups, mirrored on every tab in
+  that group (`reorder_groups` rewrites the mirror on each).
+
+Both are encoded only when present and decoded leniently: an absent or malformed value decodes as
+ungrouped, so older files load unchanged and no workspace schema bump or migration is needed. Older
+builds ignore the keys. Stashed (archived) tabs keep their group, so unarchiving restores it.
+
 ## Non-goals and migration notes
 
 - Do not resurrect the old Context Builder drift resolver. Agent Models and runtime code should use the effective Agent Models profile, not compare against legacy `ChatGlobalSettings.contextBuilder*` fields.
