@@ -224,3 +224,110 @@ final class JevRoutingResponseInterpreterTests: XCTestCase {
         )
     }
 }
+
+final class OpenAIDecisionsRoutingResponseInterpreterTests: XCTestCase {
+    func testAcceptsExactChoiceAndProjectsCompleteProbabilityMap() throws {
+        let result = try OpenAIDecisionsRoutingResponseInterpreter().interpret(
+            response(answer: #"{"type":"choice","name":"model","choice":"candidate-b","probabilities":[{"value":"candidate-a","probability":0.25},{"value":"candidate-b","probability":0.75}],"confidence":0.8}"#),
+            expectedQuestionName: "model",
+            submittedChoices: ["candidate-a", "candidate-b"]
+        )
+        XCTAssertEqual(result, .choice(key: "candidate-b", scores: ["candidate-a": 0.25, "candidate-b": 0.75], confidence: 0.8))
+    }
+
+    func testRejectsNonNormalizedProbabilityDistributions() {
+        let distributions = [(0.0, 0.0), (0.8, 0.8), (0.5, 0.5002)]
+        for (first, second) in distributions {
+            let answer = """
+            {"type":"choice","name":"model","choice":"a","probabilities":[{"value":"a","probability":\(first)},{"value":"b","probability":\(second)}],"confidence":0.8}
+            """
+            XCTAssertThrowsError(try OpenAIDecisionsRoutingResponseInterpreter().interpret(
+                response(answer: answer), expectedQuestionName: "model", submittedChoices: ["a", "b"]
+            )) { error in
+                XCTAssertEqual(error as? OpenAIDecisionsRoutingResponseInterpreter.ValidationError, .invalidProbabilities)
+            }
+        }
+        let rounded = """
+        {"type":"choice","name":"model","choice":"a","probabilities":[{"value":"a","probability":0.5},{"value":"b","probability":0.50009}],"confidence":0.8}
+        """
+        XCTAssertNoThrow(try OpenAIDecisionsRoutingResponseInterpreter().interpret(
+            response(answer: rounded), expectedQuestionName: "model", submittedChoices: ["a", "b"]
+        ))
+    }
+
+    func testAcceptsOnlyCorrectlyNamedTypedRefusal() throws {
+        let result = try OpenAIDecisionsRoutingResponseInterpreter().interpret(
+            response(answer: #"{"type":"refusal","name":"model"}"#),
+            expectedQuestionName: "model",
+            submittedChoices: ["a", "b"]
+        )
+        XCTAssertEqual(result, .refusal)
+    }
+
+    func testRejectsWrongModelQuestionAndAnswerCount() {
+        XCTAssertThrowsError(try OpenAIDecisionsRoutingResponseInterpreter().interpret(
+            response(model: "other", answer: choiceAnswer), expectedQuestionName: "model", submittedChoices: ["a", "b"]
+        ))
+        XCTAssertThrowsError(try OpenAIDecisionsRoutingResponseInterpreter().interpret(
+            response(answer: choiceAnswer.replacingOccurrences(of: "model", with: "renamed")), expectedQuestionName: "model", submittedChoices: ["a", "b"]
+        ))
+        XCTAssertThrowsError(try OpenAIDecisionsRoutingResponseInterpreter().interpret(
+            response(answers: "[]"), expectedQuestionName: "model", submittedChoices: ["a", "b"]
+        ))
+    }
+
+    func testRejectsUnknownDuplicateMissingAndInvalidProbabilityEntries() {
+        let invalidAnswers = [
+            #"{"type":"choice","name":"model","choice":"unknown","probabilities":[{"value":"a","probability":0.5},{"value":"b","probability":0.5}],"confidence":0.5}"#,
+            #"{"type":"choice","name":"model","choice":"a","probabilities":[{"value":"a","probability":0.5},{"value":"a","probability":0.5}],"confidence":0.5}"#,
+            #"{"type":"choice","name":"model","choice":"a","probabilities":[{"value":"a","probability":0.5}],"confidence":0.5}"#,
+            #"{"type":"choice","name":"model","choice":"a","probabilities":[{"value":"a","probability":1.5},{"value":"b","probability":0.5}],"confidence":0.5}"#
+        ]
+        for answer in invalidAnswers {
+            XCTAssertThrowsError(try OpenAIDecisionsRoutingResponseInterpreter().interpret(
+                response(answer: answer), expectedQuestionName: "model", submittedChoices: ["a", "b"]
+            ))
+        }
+    }
+
+    func testRequiresAllUsageFieldsAndRejectsNegativeCounts() {
+        let missing = response(model: "gpt-6-luna", answerJSON: choiceAnswer, answersJSON: nil).replacingOccurrences(of: #""input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}"#, with: "")
+        XCTAssertThrowsError(try JSONDecoder().decode(OpenAIDecisionsWireResponse.self, from: Data(missing.utf8)))
+        let negative = response(model: "gpt-6-luna", answerJSON: choiceAnswer, answersJSON: nil).replacingOccurrences(of: #""input_tokens":10"#, with: #""input_tokens":-1"#)
+        XCTAssertThrowsError(try OpenAIDecisionsRoutingResponseInterpreter().interpret(
+            JSONDecoder().decode(OpenAIDecisionsWireResponse.self, from: Data(negative.utf8)),
+            expectedQuestionName: "model", submittedChoices: ["a", "b"]
+        ))
+    }
+
+    func testUnknownAnswerDiscriminatorFailsDecoding() {
+        let json = response(
+            model: "gpt-6-luna",
+            answerJSON: choiceAnswer.replacingOccurrences(of: "choice", with: "score"),
+            answersJSON: nil
+        )
+        XCTAssertThrowsError(try JSONDecoder().decode(OpenAIDecisionsWireResponse.self, from: Data(json.utf8)))
+    }
+
+    private var choiceAnswer: String {
+        #"{"type":"choice","name":"model","choice":"a","probabilities":[{"value":"a","probability":0.6},{"value":"b","probability":0.4}],"confidence":0.9}"#
+    }
+
+    private func response(model: String = "gpt-6-luna", answer: String? = nil, answers: String? = nil) -> OpenAIDecisionsWireResponse {
+        // The encoded fixture is decoded through the real wire DTO, preserving strict JSON typing.
+        let json = response(model: model, answerJSON: answer ?? choiceAnswer, answersJSON: answers)
+        // swiftlint:disable:next force_try
+        return try! JSONDecoder().decode(OpenAIDecisionsWireResponse.self, from: Data(json.utf8))
+    }
+
+    private func response(answer: String) -> OpenAIDecisionsWireResponse {
+        response(answer: Optional(answer))
+    }
+
+    private func response(model: String, answerJSON: String, answersJSON: String?) -> String {
+        let answers = answersJSON ?? "[\(answerJSON)]"
+        return """
+        {"model":"\(model)","answers":\(answers),"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":10}}
+        """
+    }
+}

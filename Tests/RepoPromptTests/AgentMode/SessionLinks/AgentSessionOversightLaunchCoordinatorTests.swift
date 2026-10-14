@@ -265,12 +265,13 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         windowID: Int, sessionID: UUID, workspaceID: UUID = UUID()
     ) -> AgentSessionLinkEndpointCandidate {
         let tabID = UUID()
+        let binding = AgentPersistentSessionBindingIdentity(tabID: tabID, sessionID: sessionID)
         return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: workspaceID,
             tabID: tabID,
             sessionID: sessionID,
-            persistentBindingGeneration: UUID(),
+            persistentBindingGeneration: binding.generation,
             bindingTransitionGeneration: 1,
             isTopLevel: true,
             hasLoadedPersistedState: true,
@@ -284,10 +285,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             locationLabel: "worktree/main",
             restorationReadiness: .authoritative(
                 AgentSessionRestorationBindingToken(
-                    bindingIdentity: AgentPersistentSessionBindingIdentity(
-                        tabID: tabID,
-                        sessionID: sessionID
-                    ),
+                    bindingIdentity: binding,
                     bindingTransitionGeneration: 1
                 ),
                 .persistedPayloadApplied
@@ -297,8 +295,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
     /// The same live incarnation with a different hydration proof.
     ///
-    /// Byte-for-byte identical endpoint identity is the whole point: the resolver cannot tell these
-    /// apart, because it gates on the legacy `hasLoadedPersistedState` latch, which stays `true`.
+    /// The endpoint identity and legacy loaded flag stay unchanged. Readiness must still refuse
+    /// an operation or restoration against a pending or terminal payload proof.
     private func withReadiness(
         _ candidate: AgentSessionLinkEndpointCandidate,
         _ readiness: AgentSessionRestorationReadiness
@@ -712,6 +710,33 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             XCTAssertEqual(repeated, replacement, "An ordinary event must not reserve again.")
             XCTAssertEqual(fixture.host.providerTaskRequests, 0)
         }
+    }
+
+    func testDelegatedUnlinkRechecksAuthorityInsideOwningPairLane() async throws {
+        let (fixture, _, _) = try await makeRestoredFixture()
+        let original = await liveReference(fixture)
+        let reference = try XCTUnwrap(original)
+        let originalToken = await fixture.store.token(for: pair)
+        let fence = TestReleaseFence(name: "Delegated unlink after admission")
+        var authorized = true
+        fixture.bridge.test_afterStopAdmission = { await fence.enterAndWait() }
+        let stop = Task { @MainActor in
+            await fixture.bridge.stopMonitorLink(
+                observerSessionID: self.observerSessionID, targetSessionID: self.targetSessionID,
+                linkID: reference.linkID, generation: reference.generation,
+                isStillAuthorized: { authorized }
+            )
+        }
+        await fence.waitUntilEntered()
+        authorized = false
+        fixture.bridge.test_afterStopAdmission = nil
+        fence.release()
+        let outcome = await stop.value
+        XCTAssertNotNil(outcome.failureMessage)
+        let remainingToken = await fixture.store.token(for: pair)
+        let remainingGrant = await fixture.authority.activeGrant(for: reference)
+        XCTAssertEqual(remainingToken, originalToken, "expired authority must not remove the durable intent")
+        XCTAssertNotNil(remainingGrant, "the uncommitted Stop must not retire the live grant")
     }
 
     func testReferenceBackedInteractivePairEnrollsWithItsActualAssertionOnClose() async {
@@ -1153,7 +1178,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
             await fixture.bridge.test_settleLaunchReconciliation()
             fixture.gate.failsNextWrites = failsWrite
-            let deletion = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: targetSessionID)
+            let deletion = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: targetSessionID)
             await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(deletion)
             replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
             fixture.bridge.noteTopologyMayHaveChanged()
@@ -1633,7 +1658,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let fixture = makeFixture()
         let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
         var target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
-        let attempt = AgentSessionDeletionRegistry.shared
+        let attempt = try AgentSessionDeletionRegistry.shared
             .beginDurableDeletion(sessionID: targetSessionID)
         target.isDeletionInProgress = true
         fixture.host.candidates = [observer, target]
@@ -1908,7 +1933,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     }
 
     func testSupersessionDuringEstablishmentKeepsIntentWithoutGranting() async throws {
-        for bothEndpoints in [false, true] {
+        for (supersedeObserver, supersedeTarget) in [(false, true), (true, false), (true, true)] {
             try seedSavedPair()
             let fixture = makeFixture()
             let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
@@ -1918,13 +1943,16 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             else {
                 return XCTFail("Expected authoritative fixtures")
             }
-            let superseded = withReadiness(target, .terminal(targetToken, .sourceRevisionSuperseded))
-            let currentObserver = bothEndpoints
+            let currentTarget = supersedeTarget
+                ? withReadiness(target, .terminal(targetToken, .sourceRevisionSuperseded)) : target
+            let currentObserver = supersedeObserver
                 ? withReadiness(observer, .terminal(observerToken, .loadFailed)) : observer
             fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
             // Classification sees completed payloads; the shared path sees their supersession.
             fixture.host.candidates = [observer, target]
-            fixture.host.candidatesAfterClassification = [currentObserver, superseded]
+            fixture.host.beforeUUIDCensus = {
+                fixture.host.candidates = [currentObserver, currentTarget]
+            }
 
             await fixture.bridge.bootstrapIntentStore(fixture.store)
             await fixture.bridge.test_settleLaunchReconciliation()
@@ -1932,7 +1960,6 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             let restored = await isRestored(fixture)
             let token = await fixture.store.token(for: pair)
             XCTAssertFalse(restored)
-            XCTAssertEqual(fixture.host.classificationHandoffCount, 1)
             XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
             XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
             XCTAssertNotNil(token)

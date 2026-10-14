@@ -345,7 +345,16 @@ final class AgentSessionLinkRunnerHarness {
         let session = host.session(for: tabID)
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
-        _ = try XCTUnwrap(host.test_ensureSessionBoundToTab(session))
+        // This harness supplies an existing payload; allocation alone owns unfinished creation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(host.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The bound transport fixture must be restored before provider dispatch."
+        )
         return session
     }
 

@@ -35,6 +35,12 @@ struct CodexModelSpecifier: Equatable {
             return (nil, nil, nil)
         }
 
+        // A provider-advertised exact ID is a model, even when its name ends in a
+        // familiar effort token. Only synthesized variants may be decomposed.
+        if discoveredRecords().contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(raw) }) {
+            return (raw, nil, nil)
+        }
+
         // First strip any reasoning effort suffix. Legacy efforts remain broadly decoded for
         // stored selections such as `gpt-5.5-xhigh` and `gpt-5.1-codex-max-low`.
         // Extended efforts require discovery metadata or a known legacy family, so a

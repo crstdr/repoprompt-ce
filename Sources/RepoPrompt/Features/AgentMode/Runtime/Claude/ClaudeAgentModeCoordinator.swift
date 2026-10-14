@@ -212,7 +212,7 @@ final class ClaudeAgentModeCoordinator {
     private let hasActiveMCPTools: MCPActiveToolQuery
     private let hasActiveChildAgentRunWaits: ActiveAgentRunWaitQuery
     private let steeringInterruptSafePointTimeoutSeconds: TimeInterval
-    private let autoEffortEnabledProvider: @MainActor () -> Bool
+    private let autoEffortConfigurationProvider: @MainActor () -> AutoEffortConfiguration
 
     /// Per-tab tool tracking handler for Claude sessions.
     /// Each tab gets its own handler instance to isolate correlation state across concurrent sessions.
@@ -242,7 +242,7 @@ final class ClaudeAgentModeCoordinator {
         hasActiveMCPTools: @escaping MCPActiveToolQuery = { _ in false },
         hasActiveChildAgentRunWaits: @escaping ActiveAgentRunWaitQuery = { _ in false },
         steeringInterruptSafePointTimeoutSeconds: TimeInterval = 2.0,
-        autoEffortEnabledProvider: @escaping @MainActor () -> Bool = { GlobalSettingsStore.shared.autoEffortEnabled() }
+        autoEffortConfigurationProvider: @escaping @MainActor () -> AutoEffortConfiguration = { GlobalSettingsStore.shared.autoEffortConfiguration() }
     ) {
         self.windowID = windowID
         self.workspacePathProvider = workspacePathProvider
@@ -252,7 +252,7 @@ final class ClaudeAgentModeCoordinator {
         self.hasActiveMCPTools = hasActiveMCPTools
         self.hasActiveChildAgentRunWaits = hasActiveChildAgentRunWaits
         self.steeringInterruptSafePointTimeoutSeconds = steeringInterruptSafePointTimeoutSeconds
-        self.autoEffortEnabledProvider = autoEffortEnabledProvider
+        self.autoEffortConfigurationProvider = autoEffortConfigurationProvider
     }
 
     private static func makeDefaultController(
@@ -413,7 +413,9 @@ final class ClaudeAgentModeCoordinator {
         _ intent: NativeSessionIntent,
         for session: AgentTabSession
     ) -> Bool {
-        hostCapabilities.isSessionCurrent(session) && intent.isCurrent(for: session)
+        hostCapabilities.isSessionCurrent(session)
+            && session.operationAdmissionFailureMessage == nil
+            && intent.isCurrent(for: session)
     }
 
     func runAttemptIsCurrent(
@@ -431,6 +433,9 @@ final class ClaudeAgentModeCoordinator {
         session: AgentTabSession,
         intent: NativeSessionIntent
     ) async -> EnsureSessionOutcome {
+        if let message = session.operationAdmissionFailureMessage {
+            return intent.allowsFreshStartRecovery ? .superseded : .failed(message: message)
+        }
         guard session.selectedAgent.usesClaudeNativeRuntime,
               intentIsCurrent(intent, for: session)
         else {
@@ -1318,7 +1323,7 @@ final class ClaudeAgentModeCoordinator {
                           provider: session.selectedAgent,
                           selectedModelRaw: session.selectedModelRaw,
                           manualEffortRaw: manualEffort.rawValue,
-                          enabled: autoEffortEnabledProvider()
+                          configuration: autoEffortConfigurationProvider()
                       ),
                       AutoEffortModelPolicy.claudeEfforts(
                           modelRaw: session.selectedModelRaw,
@@ -1398,7 +1403,7 @@ final class ClaudeAgentModeCoordinator {
                     provider: session.selectedAgent,
                     selectedModelRaw: session.selectedModelRaw,
                     manualEffortRaw: manualEffort.rawValue,
-                    enabled: autoEffortEnabledProvider()
+                    configuration: autoEffortConfigurationProvider()
                 ) == true
                 else {
                     return recordSendFailure(
@@ -2226,7 +2231,7 @@ final class ClaudeAgentModeCoordinator {
 
     private func retainClaudeEffort(_ effort: ClaudeCodeEffortLevel, for session: AgentTabSession) {
         // A cold persisted session is only an index projection, not a saveable payload.
-        guard session.activeAgentSessionID == nil || session.hasLoadedPersistedState else { return }
+        guard session.operationAdmissionFailureMessage == nil else { return }
         guard session.selectedClaudeEffortRaw != effort.rawValue else { return }
         session.selectedClaudeEffortRaw = effort.rawValue
         session.isDirty = true

@@ -200,9 +200,8 @@ extension AgentModeViewModel {
     }
 
     /// Immutable authority inputs shared by a batch of persistent-session lookups.
-    /// Building these maps is the expensive part: it walks every live, compose, and
-    /// stashed tab. Individual resolutions remain session-specific and preserve the
-    /// same ambiguity and indexed-fallback rules as the scalar lookup.
+    /// Point callers include only requested identities and their conflicting carriers; whole-scope
+    /// callers can still supply a full census. Both use identical ambiguity and indexed-fallback rules.
     struct PersistentBindingResolutionSnapshot {
         let liveClaimsByTabID: [UUID: UUID]
         let workspaceClaimsByTabID: [UUID: Set<UUID>]
@@ -583,6 +582,7 @@ extension AgentModeViewModel {
         let recoveryClaim: AgentProvisionalAdmissionClaim?
         let discardAuthorityID: UUID?
         let discardRestoreIndexEntry: AgentSessionIndexEntry?
+        let creationHandle: AgentSessionCreationHandle?
 
         init(
             tabID: UUID,
@@ -591,7 +591,8 @@ extension AgentModeViewModel {
             lifecycleIdentity: AgentSessionLifecycleAuthority.Identity? = nil,
             recoveryClaim: AgentProvisionalAdmissionClaim? = nil,
             discardAuthorityID: UUID? = nil,
-            discardRestoreIndexEntry: AgentSessionIndexEntry? = nil
+            discardRestoreIndexEntry: AgentSessionIndexEntry? = nil,
+            creationHandle: AgentSessionCreationHandle? = nil
         ) {
             self.tabID = tabID
             self.sessionID = sessionID
@@ -600,6 +601,7 @@ extension AgentModeViewModel {
             self.recoveryClaim = recoveryClaim
             self.discardAuthorityID = discardAuthorityID
             self.discardRestoreIndexEntry = discardRestoreIndexEntry
+            self.creationHandle = creationHandle
         }
 
         func withDiscardAuthorityID(_ discardAuthorityID: UUID) -> MCPSessionTarget {
@@ -610,7 +612,8 @@ extension AgentModeViewModel {
                 lifecycleIdentity: lifecycleIdentity,
                 recoveryClaim: recoveryClaim,
                 discardAuthorityID: discardAuthorityID,
-                discardRestoreIndexEntry: discardRestoreIndexEntry
+                discardRestoreIndexEntry: discardRestoreIndexEntry,
+                creationHandle: creationHandle
             )
         }
     }
@@ -682,6 +685,8 @@ extension AgentModeViewModel {
         /// until the destination tab successfully sends its first real user turn.
         var defersProviderLockUntilSend: Bool = false
         var isStagedForSend: Bool = false
+        /// Durable failure/preparation marker; ordinary send cleanup must never clear it.
+        var executionLocationFailure: String?
 
         var hasPayload: Bool {
             guard let payload else { return false }

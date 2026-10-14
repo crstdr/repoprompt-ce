@@ -145,7 +145,7 @@ final class AntigravityHeadlessBoundaryTests: XCTestCase {
             _ = try await provider.streamAgentMessage(AgentMessage(userMessage: "test"), runID: UUID())
             XCTFail("Expected unsupported headless execution to fail closed")
         } catch let AIProviderError.invalidConfiguration(detail) {
-            XCTAssertTrue(detail.contains("interactive Agent Mode"))
+            XCTAssertEqual(detail, "Headless execution is not supported for this provider.")
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
