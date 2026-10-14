@@ -1036,8 +1036,10 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         restarted.reconcileLocalInputSources([source])
         XCTAssertNil(restarted.localInputOffer(for: source))
         h.retain("while target was unresolved")
+        // A nil snapshot is transient unavailability: nothing is offered and the frontier is
+        // not moved — so a same-epoch recovery still owes what the gap produced.
         XCTAssertNil(restarted.localInputOffer(for: .init(reference: source.reference, target: source.target, snapshot: nil)))
-        XCTAssertNil(restarted.localInputOffer(for: h.sources()[0]), "claim-time unavailability also rebaselines without replay")
+        XCTAssertNotNil(restarted.localInputOffer(for: h.sources()[0]), "a same-epoch gap keeps the frontier — the record was owed")
         restarted.reconcileLocalInputSources([]) // Read lost
         h.retain("while Read was absent")
         restarted.reconcileLocalInputSources(h.sources()) // Read gained
@@ -1280,6 +1282,243 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
         h.edge()
         let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
         XCTAssertNil(claim.localInput, "the new epoch baselines the reseeded row — no disclosure")
+    }
+
+    /// The W1-R2 regression shape: an idle-arriving composer input settles and the reply turn
+    /// commits cleanly, but the terminal commit barrier's `retainProcessRunID` span annotation
+    /// mutates `session.transcript` directly — raising `localInputCanonicalCommitPending` with
+    /// no paired seed install. Every local-input snapshot read inside that window (the
+    /// running→idle publication's reconcile, or the wake claim's offer) reads nil, and
+    /// `localInputOffer` treats nil as authoritative unavailability: the frontier resets, so
+    /// the first post-window reconcile baselines `consumedThrough` past the owed record. The
+    /// wake ships its status row with no `user_input` and no omission count, and the settled
+    /// input is never disclosed.
+    func testIdleArrivalInputSurvivesTerminalCommitPendingWindow() async throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        // The preceding quiet `ack` routine turn: its running→idle edge is claimed, handed
+        // off, and its receipt applied — the lane state before the W1-R2 turn.
+        h.edge()
+        let ackClaim = try XCTUnwrap(h.claim(.autoWake(wakeID: UUID())).claim)
+        let ackProof = await AgentSessionLinkProviderInputRelease.prove(ackClaim) { _ in true }
+        _ = h.release(ackClaim, proof: ackProof)
+        if let receipt = ackClaim.passive?.receipt { h.notices.apply(receipt) }
+        h.store.accept(ackClaim)
+
+        // The target goes running for the next turn; the observer reconciles that edge too.
+        h.notices.reconcile(samples: h.samples(.running), linkSetRevision: 1, deliverable: true, observedAt: Self.at)
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        // Composer input arrives while the session is idle, then the run starts and its
+        // working-list settle allocates the producer-event ordinal at send time.
+        session.runState = .idle
+        let input = Self.settleQueuedInterruptInput("ECHO W1-R2. Marker: cedar-731.", on: session)
+        session.runState = .running
+
+        // The reply streams and finalizes through the identity-preserving batch path.
+        var streamingReply = AgentChatItem.assistant("W1-R2 sent", sequenceIndex: 0)
+        streamingReply.isStreaming = true
+        session.appendItem(streamingReply)
+        XCTAssertTrue(session.mutateItemsBatch(touchActivity: false) { items in
+            for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
+                items[index].isStreaming = false
+            }
+        })
+
+        // The canonical commit applies: transcript write and seed install are paired, so the
+        // commit gate drops with it.
+        let stamped = try XCTUnwrap(session.items.first { $0.id == input.id })
+        var commitSeed = Index.Seed(trackedIDs: [input.id])
+        commitSeed.append(stamped)
+        session.transcript = AgentTranscript(turns: [
+            AgentTranscriptTurn(
+                id: input.id,
+                request: AgentTranscriptRequestAnchor(from: stamped),
+                responseSpans: [.init(startedAt: Self.at)],
+                startedAt: Self.at
+            )
+        ])
+        session.installLocalInputSeed(commitSeed)
+        XCTAssertFalse(session.localInputCanonicalCommitPending)
+        XCTAssertEqual(session.localInputIndex.producedThrough, 1)
+
+        // Terminal commit barrier: `finishActiveState` has already published running→idle
+        // when `retainProcessRunIdentity` stamps the span's runID — a `transcript.didSet`
+        // write that must restore the gate to its prior value, not report a pending commit.
+        XCTAssertTrue(AgentModeProcessRunIdentity.retainProcessRunID(
+            UUID(), inTranscriptTurnID: input.id, for: session
+        ))
+        XCTAssertFalse(
+            session.localInputCanonicalCommitPending,
+            "the span annotation must not masquerade as a pending canonical commit"
+        )
+
+        // The running→idle publication reconciles at the exact point where the leaked gate
+        // once fed nil. With the gate preserved the real snapshot flows — and even a
+        // transient nil here must never move the established frontier.
+        h.notices.reconcile(samples: h.samples(.idle), linkSetRevision: 1, deliverable: true, observedAt: Self.at)
+        h.notices.reconcileLocalInputSources([
+            Notices.LocalInputSource(
+                reference: h.references[0],
+                target: h.targets[0],
+                snapshot: session.localInputCanonicalCommitPending ? nil : session.localInputIndex.snapshot
+            )
+        ])
+
+        // The wake minted at publication — live wake 53's position — already carries the
+        // excerpt: the frontier survives and the record is owed at claim time.
+        h.indexes[0] = session.localInputIndex
+        let inWindowClaim = try XCTUnwrap(h.claim(.autoWake(wakeID: UUID())).claim)
+        let inWindowDecoration = try XCTUnwrap(
+            inWindowClaim.localInput,
+            "the running→idle wake minted at publication owes the excerpt — the live loss point"
+        )
+        XCTAssertTrue(inWindowDecoration.fragment.contains("ECHO W1-R2"))
+
+        // The deferred presentation applies; the record is still in the index and the
+        // frontier was never moved, so a later recovery also leaves it owed.
+        session.installLocalInputSeed(commitSeed)
+        XCTAssertFalse(session.localInputCanonicalCommitPending)
+        XCTAssertTrue(
+            session.localInputIndex.records.contains { $0.itemID == input.id },
+            "the record itself survives the commit; only the consumed frontier lost it"
+        )
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        let claim = try XCTUnwrap(h.claim(.autoWake(wakeID: UUID())).claim)
+        let decoration = try XCTUnwrap(
+            claim.localInput,
+            "the settled composer input is still owed to the running→idle wake"
+        )
+        XCTAssertTrue(decoration.fragment.contains("ECHO W1-R2"))
+    }
+
+    /// A transiently nil snapshot (a canonical commit pending, an unreadable index) must never
+    /// move an established frontier: the owed record stays owed through the gap and rides the
+    /// next claim. A target with no frontier yet still gets the unresolved baseline.
+    func testNilSnapshotKeepsFrontierAndRecoveryStillOffers() throws {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let h = Harness()
+        h.indexes[0] = session.localInputIndex
+        h.notices.reconcileLocalInputSources(h.sources())
+
+        let input = Self.settleQueuedInterruptInput("W1", on: session)
+        h.indexes[0] = session.localInputIndex
+
+        // The gap: reconcile and offer both read a nil snapshot — neither may move the frontier.
+        let nilSource = Notices.LocalInputSource(reference: h.references[0], target: h.targets[0], snapshot: nil)
+        h.notices.reconcileLocalInputSources([nilSource])
+        XCTAssertNil(h.notices.localInputOffer(for: nilSource))
+
+        // Recovery: the epoch still matches, so the record is still owed, not baselined past.
+        h.notices.reconcileLocalInputSources(h.sources())
+        h.edge()
+        let claim = try XCTUnwrap(h.claim(.headlessRun(runID: UUID())).claim)
+        let decoration = try XCTUnwrap(claim.localInput)
+        XCTAssertTrue(decoration.fragment.contains("W1"))
+
+        // Kept behaviour: a target with no frontier at all still baselines on the first real
+        // snapshot — its history is never retro-disclosed.
+        let cold = Harness()
+        cold.notices.reconcileLocalInputSources([])
+        cold.indexes[0] = session.localInputIndex
+        cold.notices.reconcileLocalInputSources([
+            .init(reference: cold.references[0], target: cold.targets[0], snapshot: nil)
+        ])
+        cold.notices.reconcileLocalInputSources(cold.sources())
+        cold.edge()
+        let coldClaim = try XCTUnwrap(cold.claim(.headlessRun(runID: UUID())).claim)
+        XCTAssertNil(coldClaim.localInput, "a fresh target still baselines instead of disclosing history")
+
+        // A rebound target still resets even through a nil snapshot: a range minted for the
+        // old target stops satisfying the frontier immediately, and a same-epoch return must
+        // not re-offer the owed record. Covers the reconcile nil branch.
+        let rebound = Harness()
+        rebound.indexes[0] = session.localInputIndex
+        rebound.notices.reconcileLocalInputSources(rebound.sources())
+        rebound.indexes[0].settle(Self.user("owed at rebind", sequence: 2), at: 2)
+        let mintedForOldTarget = try XCTUnwrap(rebound.notices.localInputOffer(for: rebound.sources()[0]))
+
+        let otherTarget = Self.endpoint(7)
+        rebound.notices.reconcileLocalInputSources([
+            .init(reference: rebound.references[0], target: otherTarget, snapshot: nil)
+        ])
+        XCTAssertFalse(
+            rebound.notices.canConsumeLocalInputs([mintedForOldTarget.range]),
+            "a nil-time rebind resets the frontier — old-target ranges no longer satisfy it"
+        )
+        let backToOld = Notices.LocalInputSource(
+            reference: rebound.references[0], target: rebound.targets[0], snapshot: rebound.indexes[0].snapshot
+        )
+        rebound.notices.reconcileLocalInputSources([backToOld])
+        XCTAssertNil(
+            rebound.notices.localInputOffer(for: backToOld),
+            "a same-epoch return to the old target rebaselines instead of re-offering"
+        )
+
+        // Same reset when the rebind surfaces through the offer nil branch instead.
+        let reboundOffer = Harness()
+        reboundOffer.indexes[0] = session.localInputIndex
+        reboundOffer.notices.reconcileLocalInputSources(reboundOffer.sources())
+        reboundOffer.indexes[0].settle(Self.user("owed at rebind", sequence: 2), at: 2)
+        let mintedOffer = try XCTUnwrap(reboundOffer.notices.localInputOffer(for: reboundOffer.sources()[0]))
+        XCTAssertNil(reboundOffer.notices.localInputOffer(for: .init(
+            reference: reboundOffer.references[0], target: otherTarget, snapshot: nil
+        )))
+        XCTAssertFalse(
+            reboundOffer.notices.canConsumeLocalInputs([mintedOffer.range]),
+            "the offer nil branch resets a rebound frontier identically"
+        )
+    }
+
+    /// The process-run span annotation is not a canonical commit: it restores the gate to its
+    /// prior value — a clean gate stays clean, and a genuinely pending commit is never wiped.
+    func testRunIDRetentionRestoresCanonicalCommitGate() {
+        let session = Self.makeRunningSession(agent: .claudeCode)
+        let firstItem = AgentChatItem.user("W1", sequenceIndex: 0)
+        let firstTurn = AgentTranscriptTurn(
+            id: firstItem.id,
+            request: AgentTranscriptRequestAnchor(from: firstItem),
+            responseSpans: [.init(startedAt: Self.at)],
+            startedAt: Self.at
+        )
+        session.transcript = AgentTranscript(turns: [firstTurn])
+        session.installLocalInputSeed(.init())
+        XCTAssertFalse(session.localInputCanonicalCommitPending)
+        XCTAssertNil(session.transcript.turns[0].responseSpans[0].runID)
+
+        let firstRunID = UUID()
+        XCTAssertTrue(AgentModeProcessRunIdentity.retainProcessRunID(
+            firstRunID, inTranscriptTurnID: firstItem.id, for: session
+        ))
+        XCTAssertEqual(session.transcript.turns[0].responseSpans[0].runID, firstRunID)
+        XCTAssertFalse(session.localInputCanonicalCommitPending, "a clean gate stays clean")
+        XCTAssertNotNil(session.localInputIndex.snapshot, "the index stays readable through the annotation")
+
+        // A transcript write with no seed install models a real pending commit; the span
+        // annotation must leave it raised. A fresh span keeps the write on the mutating path.
+        let secondItem = AgentChatItem.user("W2", sequenceIndex: 1)
+        session.transcript = AgentTranscript(turns: [
+            firstTurn,
+            AgentTranscriptTurn(
+                id: secondItem.id,
+                request: AgentTranscriptRequestAnchor(from: secondItem),
+                responseSpans: [.init(startedAt: Self.at)],
+                startedAt: Self.at
+            )
+        ])
+        XCTAssertTrue(session.localInputCanonicalCommitPending)
+        XCTAssertNil(session.transcript.turns[1].responseSpans[0].runID)
+        let secondRunID = UUID()
+        XCTAssertTrue(AgentModeProcessRunIdentity.retainProcessRunID(
+            secondRunID, inTranscriptTurnID: secondItem.id, for: session
+        ))
+        XCTAssertEqual(session.transcript.turns[1].responseSpans[0].runID, secondRunID)
+        XCTAssertTrue(session.localInputCanonicalCommitPending, "a pending commit survives the annotation")
     }
 
     /// A batch that edits a tracked row is a per-record replace: `contentVersion` bumps so a
