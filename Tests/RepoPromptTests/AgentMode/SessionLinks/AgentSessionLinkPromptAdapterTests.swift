@@ -3619,8 +3619,17 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         sentMessages.count
     }
 
+    private var activeReadGate: TestReleaseFence?
+
+    func setActiveReadGate(_ gate: TestReleaseFence?) {
+        activeReadGate = gate
+    }
+
     var hasActiveSession: Bool {
-        true
+        get async {
+            if let activeReadGate { await activeReadGate.enterAndWait() }
+            return true
+        }
     }
 
     var hasTurnInFlight: Bool {
@@ -3688,9 +3697,16 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         return configuration.apply()
     }
 
+    private var sendCompletionGate: TestReleaseFence?
+
+    func setSendCompletionGate(_ gate: TestReleaseFence?) {
+        sendCompletionGate = gate
+    }
+
     func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
         try configuration.validate(proof)
         sentMessages.append(text)
+        if let sendCompletionGate { await sendCompletionGate.enterAndWait() }
         if failSendAfterRecord {
             throw NativeAgentRuntimeControllerError.processNotRunning
         }

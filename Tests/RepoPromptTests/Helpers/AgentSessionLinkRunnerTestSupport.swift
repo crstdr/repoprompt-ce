@@ -84,7 +84,8 @@ final class AgentSessionLinkRunnerHarness {
         headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
         acpProviderFactory: @escaping AgentModeViewModel.ACPProviderFactory = { _, _ in nil },
         workspacePath: String = FileManager.default.currentDirectoryPath,
-        sessionLinkHost: AgentModeViewModel? = nil
+        sessionLinkHost: AgentModeViewModel? = nil,
+        awaitNoActiveMCPTools: @escaping (UUID) async throws -> Void = { _ in }
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         self.headlessProviderFactory = headlessProviderFactory
@@ -133,7 +134,7 @@ final class AgentSessionLinkRunnerHarness {
             },
             bindPendingOracleReviewContext: { _, _ in },
             cancelMCPToolsForRun: { _, _ in },
-            awaitNoActiveMCPTools: { _ in },
+            awaitNoActiveMCPTools: awaitNoActiveMCPTools,
             activeAgentRunWaitQuery: { _ in false },
             childAgentRunWaitDrainTimeoutSeconds: 0.01
         )

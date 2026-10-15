@@ -66,6 +66,8 @@ final class ClaudeAgentModeCoordinator {
         case sent
         case failed(message: String, providerWriteAttempted: Bool = false)
         case superseded
+        /// Currency was lost after crossing a provider write boundary; never definite no-write.
+        case supersededAfterWriteAttempt
     }
 
     struct HostCapabilities {
@@ -1502,7 +1504,7 @@ final class ClaudeAgentModeCoordinator {
                         if !sessionOwnsClaudeController(controller, for: session) {
                             await controller.shutdown()
                         }
-                        return .superseded
+                        return .supersededAfterWriteAttempt
                     }
                     session.claudeExpectedTurnIDs.insert(turnID)
                     return .sent
@@ -1513,7 +1515,7 @@ final class ClaudeAgentModeCoordinator {
                         if !sessionOwnsClaudeController(controller, for: session) {
                             await controller.shutdown()
                         }
-                        return .superseded
+                        return .supersededAfterWriteAttempt
                     }
                     return recordSendFailure(
                         "Claude native command failed: \(error.localizedDescription)",
@@ -1551,7 +1553,7 @@ final class ClaudeAgentModeCoordinator {
                     hostCapabilities.scheduleSave(session)
                     guard intentIsCurrent(intent, for: session),
                           sessionOwnsClaudeController(controller, for: session)
-                    else { return .superseded }
+                    else { return .supersededAfterWriteAttempt }
                     session.claudeExpectedTurnIDs.insert(turnID)
                     return .sent
                 } catch {
@@ -1667,7 +1669,7 @@ final class ClaudeAgentModeCoordinator {
                     if !sessionOwnsClaudeController(controller, for: session) {
                         await controller.shutdown()
                     }
-                    return .superseded
+                    return .supersededAfterWriteAttempt
                 }
                 session.claudeExpectedTurnIDs.insert(turnID)
                 return .sent
@@ -1707,7 +1709,7 @@ final class ClaudeAgentModeCoordinator {
                     if !sessionOwnsClaudeController(controller, for: session) {
                         await controller.shutdown()
                     }
-                    return .superseded
+                    return .supersededAfterWriteAttempt
                 }
                 return recordSendFailure(
                     "Claude native send failed: \(error.localizedDescription)",
@@ -1755,7 +1757,7 @@ final class ClaudeAgentModeCoordinator {
         intent: NativeSessionIntent,
         providerWriteAttempted: Bool
     ) -> NativeSendOutcome {
-        guard intentIsCurrent(intent, for: session) else { return .superseded }
+        guard intentIsCurrent(intent, for: session) else { return providerWriteAttempted ? .supersededAfterWriteAttempt : .superseded }
         if session.items.last?.kind != .error || session.items.last?.text != message {
             session.appendItem(
                 AgentChatItem.error(
