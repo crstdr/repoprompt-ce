@@ -840,8 +840,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             }
             let coalescedEdge = PendingEntry.isStatusEdge(from: origin, to: sample.status)
             let retainsCoverage = oldEntry != nil && owesCoverage
+            // A quiet successor may be the first observed close after ordinary coverage was
+            // sampled only while running. Quiet proof cannot suppress that still-unpaid coverage.
             let shouldRepresent = retainsCoverage || recoverDebt || (oldEntry != nil && !statusChanged)
-                || (statusChanged && coalescedEdge && !quietClose)
+                || (statusChanged && coalescedEdge && (!quietClose || owesCoverage))
             if !shouldRepresent {
                 if statusChanged, oldEntry != nil {
                     pendingByReference.removeValue(forKey: reference)

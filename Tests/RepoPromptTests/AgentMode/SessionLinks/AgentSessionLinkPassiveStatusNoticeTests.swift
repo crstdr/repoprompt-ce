@@ -1082,6 +1082,40 @@ extension AgentSessionLinkPassiveStatusNoticeTests {
         XCTAssertEqual(reducer.snapshot.entries.count, 16)
     }
 
+    func testQuietSuccessorCloseRepresentsOrdinaryFirstSampledWhileRunningAndPaysFrozenReceipt() throws {
+        var reducer = makeReducer()
+        let reference = sample(0, status: .idle).reference
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        // The ordinary close at 9 was missed; its first sample is the successor's running frame.
+        observe(&reducer, .running, facts(9, 9))
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 8)
+
+        // Quiet successor 10 cannot suppress the still-unrepresented ordinary settlement 9.
+        observe(&reducer, .idle, facts(10, 9))
+        XCTAssertEqual(reducer.snapshot.entries.count, 1, "unpaid ordinary 9 must be represented at the quiet close")
+        XCTAssertEqual(reducer.snapshot.entries.first?.toStatus, .idle)
+        XCTAssertEqual(reducer.snapshot.entries.first?.ordinaryThrough, 9)
+        XCTAssertEqual(reducer.snapshot.entries.first?.receiptSettledThrough, 10)
+        XCTAssertEqual(reducer.snapshot.entries.first?.isRoutineWakeEligible, true, "ordinary 9 must independently admit")
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 8, "representation is not payment")
+        let entry = try XCTUnwrap(reducer.snapshot.entries.first)
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+
+        // Unchanged idle cannot churn the row; later quiet facts cannot enlarge this receipt.
+        observe(&reducer, .idle, facts(10, 9))
+        XCTAssertEqual(reducer.snapshot.entries.first, entry)
+        observe(&reducer, .idle, facts(11, 9))
+        reducer.apply(receipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 10, "acceptance pays only frozen settled cutoff 10")
+        XCTAssertFalse(reducer.snapshot.entries.contains(where: \.isRoutineWakeEligible))
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 11)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        observe(&reducer, .idle, facts(12, 9))
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty, "paid ordinary coverage cannot echo on quiet settlement")
+    }
+
     func testOrdinaryFirstSampledWhileRunningStillRepresentsAtIdle() throws {
         var reducer = makeReducer()
         reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
