@@ -873,6 +873,7 @@ final class CodexNativeSessionController {
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
     private let requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])?
+    private let serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)?
     private let hookTrustFaultInjection: HookTrustFaultInjection
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
@@ -1492,6 +1493,7 @@ final class CodexNativeSessionController {
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
         requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil,
+        serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)? = nil,
         hookTrustFaultInjection: HookTrustFaultInjection = .init(),
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
@@ -1504,6 +1506,7 @@ final class CodexNativeSessionController {
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
         self.requestExecutor = requestExecutor
+        self.serverRequestResponseExecutor = serverRequestResponseExecutor
         self.hookTrustFaultInjection = hookTrustFaultInjection
         self.perfRecorder = perfRecorder
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
@@ -4862,6 +4865,7 @@ final class CodexNativeSessionController {
             let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
             if autoApproveHost || autoApproveCompanion {
                 logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(
                     id: request.id,
                     result: [
@@ -4903,6 +4907,7 @@ final class CodexNativeSessionController {
                )
             {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(id: request.id, result: [
                     "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
                 ])
@@ -4910,6 +4915,7 @@ final class CodexNativeSessionController {
             }
             if let approvalResult = hostApprovalResult {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(id: request.id, result: approvalResult)
                 return
             }
@@ -4951,6 +4957,16 @@ final class CodexNativeSessionController {
         }
     }
 
+    private func emitAutoApprovedServerRequestActivity(method: String, params: [String: Any]) async {
+        // Automatic consent is still interaction, even with no surfaced request or later tool.
+        // Reuse raw scope parsing; the coordinator owns current-controller/turn acceptance.
+        await emit(.livenessActivity(.init(
+            kind: .warning, method: method,
+            threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params),
+            itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
+        )))
+    }
+
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
         #if DEBUG
             writeRawEventLogRecord(
@@ -4962,7 +4978,11 @@ final class CodexNativeSessionController {
             )
         #endif
         do {
-            try await client.respondToServerRequest(id: id, result: result)
+            if let serverRequestResponseExecutor {
+                try await serverRequestResponseExecutor(id, result)
+            } else {
+                try await client.respondToServerRequest(id: id, result: result)
+            }
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
         }

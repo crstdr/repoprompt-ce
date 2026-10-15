@@ -2404,3 +2404,134 @@ extension CodexResumeWedgeCommitTests {
         }
     }
 }
+
+private actor QuietAutoapprovalResponseRecorder {
+    private var frames: [Data] = []
+    func record(_ frame: Data) {
+        frames.append(frame)
+    }
+
+    func recorded() -> [Data] {
+        frames
+    }
+}
+
+extension CodexResumeWedgeCommitTests {
+    func testQuietAutoapprovedNativeServerRequestsRemainOrdinaryAndScoped() async throws {
+        for method in ["mcpServer/elicitation/request", "item/permissions/requestApproval"] {
+            for ack in [false, true] {
+                for scope in ["current", "foreign-thread", "foreign-turn", "stale-controller", "no-request"] {
+                    let label = "\(method) ack=\(ack) scope=\(scope)"
+                    let f = makeFixture([])
+                    f.viewModel.test_initializeRunService()
+                    let runID = UUID()
+                    f.session.installRunID(runID)
+                    let responses = QuietAutoapprovalResponseRecorder()
+                    var warningMethods: [String] = []
+                    func verifyRequestEvent(_ event: CodexNativeSessionController.Event) {
+                        switch event {
+                        case let .livenessActivity(activity):
+                            XCTAssertNotEqual(activity.kind, .serverRequestResolved, label)
+                            if activity.method == method {
+                                XCTAssertEqual(activity.kind, .warning, label)
+                                XCTAssertEqual(activity.threadID, scope == "foreign-thread" ? "other-thread" : Self.oldThreadID, label)
+                                XCTAssertEqual(activity.turnID, scope == "foreign-turn" ? "other-turn" : "request-turn", label)
+                                warningMethods.append(activity.method)
+                            }
+                        case .error, .serverRequestIssue, .approvalRequest, .permissionsRequest, .mcpElicitationRequest, .toolCall, .toolResult:
+                            XCTFail("No error, surfaced interaction or later tool may supply the missing evidence: \(label)")
+                        default: break
+                        }
+                    }
+                    func controller() -> CodexNativeSessionController {
+                        CodexNativeSessionController(
+                            client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID,
+                            windowID: -1, workspacePaths: .uniform(nil),
+                            serverRequestResponseExecutor: { id, result in
+                                let frame = try JSONSerialization.data(withJSONObject: ["id": id.jsonValue, "result": result])
+                                await responses.record(frame)
+                            }
+                        )
+                    }
+                    let current = controller()
+                    let source = scope == "stale-controller" ? controller() : current
+                    f.session.codexController = current
+                    f.session.codexConversationID = Self.oldThreadID
+                    let owner = try XCTUnwrap(f.session.activeRunOwnership)
+                    f.session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+                    await current.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "request-turn", routingTurnID: "request-turn")
+                    await source.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "request-turn", routingTurnID: "request-turn")
+                    await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "request-turn"), session: f.session, sourceController: current)
+                    if scope != "no-request" {
+                        await source.test_handleServerRequest(method: method, params: [
+                            "serverName": .string("RepoPromptCE"), "toolName": .string("apply_edits"),
+                            "threadId": .string(scope == "foreign-thread" ? "other-thread" : Self.oldThreadID),
+                            "turnId": .string(scope == "foreign-turn" ? "other-turn" : "request-turn"),
+                            "itemId": .string("permission-item"), "cwd": .string("/tmp"),
+                            "message": .string("Approve app tool call?"),
+                            "permissions": .object(["network": .object(["enabled": .bool(true)])]),
+                            "requestedSchema": .object(["type": .string("object"), "properties": .object([:])])
+                        ])
+                    }
+                    if source !== current {
+                        await source.shutdown()
+                        for await event in source.events {
+                            verifyRequestEvent(event)
+                            await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: source)
+                        }
+                    }
+                    if ack {
+                        await current.test_handleNotification(method: "item/completed", params: [
+                            "threadId": .string(Self.oldThreadID), "turnId": .string("request-turn"),
+                            "item": .object(["id": .string("answer"), "type": .string("agentMessage"), "text": .string("[ack]")])
+                        ])
+                    }
+                    await current.test_handleNotification(method: "turn/completed", params: [
+                        "threadId": .string(Self.oldThreadID), "turn": .object(["id": .string("request-turn"), "status": .string("completed")])
+                    ])
+                    await current.shutdown()
+                    for await event in current.events {
+                        verifyRequestEvent(event)
+                        await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: current)
+                    }
+                    XCTAssertEqual(warningMethods, scope == "no-request" ? [] : [method], label)
+                    let frames = await responses.recorded()
+                    XCTAssertEqual(frames.count, scope == "no-request" ? 0 : 1, label)
+                    for frame in frames {
+                        let response = try XCTUnwrap(JSONSerialization.jsonObject(with: frame) as? [String: Any])
+                        XCTAssertEqual(response["id"] as? Int, 42, label)
+                        XCTAssertEqual((response["result"] as? [String: Any])?["action"] as? String, "accept", label)
+                    }
+                    let ordinary = scope == "current"
+                    XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0), label)
+                    XCTAssertEqual(f.session.runState, .completed, label)
+                    if ordinary {
+                        XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
+                    } else if ack {
+                        XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
+                    }
+                    let target = DomainAgentSessionLinkEndpointIdentity(
+                        windowID: 2, workspaceID: UUID(), tabID: f.session.tabID, sessionID: UUID(),
+                        persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+                    )
+                    let reference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
+                    var notices = AgentSessionLinkPassiveStatusNotices(observerEndpoint: target)
+                    func sample(_ facts: AgentRunQuietFacts?) -> AgentSessionLinkPassiveStatusNotices.Sample {
+                        .init(
+                            reference: reference,
+                            targetEndpoint: target,
+                            targetSessionID: target.sessionID,
+                            displayName: "Codex target",
+                            status: .idle,
+                            runFacts: facts
+                        )
+                    }
+                    notices.enable(samples: [sample(.zero)], linkSetRevision: 1)
+                    notices.reconcile(samples: [sample(f.session.quietLedger.facts)], linkSetRevision: 1, deliverable: true)
+                    XCTAssertEqual(notices.snapshot.entries.first?.isRoutineWakeEligible ?? false, ordinary, label)
+                    f.session.saveDebounceTask?.cancel()
+                }
+            }
+        }
+    }
+}
