@@ -562,9 +562,10 @@ final class AgentTabSession: ObservableObject {
     /// Claude turn IDs whose terminal events should be treated as superseded by accepted steering.
     var claudeSupersedingProtectedTurnIDs: Set<UUID> = []
     /// Task that drains `pendingClaudeSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
+    var claudeSteeringFlushID: UUID?
     var claudeSteeringFlushTask: Task<Void, Never>?
     /// Runner-owned, attempt-scoped notification; never a synthetic provider terminal.
-    var claudeSteeringAbandonment: (attemptID: UUID, notify: (Set<UUID>) -> Void, probe: () -> Void)?
+    var claudeSteeringAbandonment: (attemptID: UUID, notify: (Set<UUID>) -> Void, probe: () -> Void, uncertainWrite: () -> Void)?
 
     /// ACP steering queue — carries text accepted for serialized live steering.
     struct ACPSteeringManagedContext {
@@ -1642,6 +1643,7 @@ final class AgentTabSession: ObservableObject {
         pendingCommandRunningByKey.removeAll()
         claudeSteeringFlushTask?.cancel()
         claudeSteeringFlushTask = nil
+        claudeSteeringFlushID = nil
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
         acpSteeringFlushID = nil

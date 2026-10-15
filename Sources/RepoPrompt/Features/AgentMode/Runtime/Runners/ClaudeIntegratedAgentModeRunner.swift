@@ -403,15 +403,20 @@ final class ClaudeIntegratedAgentModeRunner {
         }
         let subscribedController = session.claudeController
         var probePending = false
+        var uncertainSuccessorWrite = false
+        var settlementRecheck: Task<Void, Never>?
         session.claudeSteeringAbandonment = (runAttemptID, { ids in
             inbox.continuation.yield(.steeringAbandoned(ids))
         }, {
             guard !probePending else { return }
             probePending = true
             inbox.continuation.yield(.staleActiveProbe)
+        }, {
+            uncertainSuccessorWrite = true
         })
         defer {
             forwarding.cancel()
+            settlementRecheck?.cancel()
             inbox.continuation.finish()
             if session.claudeSteeringAbandonment?.attemptID == runAttemptID {
                 session.claudeSteeringAbandonment = nil
@@ -451,14 +456,38 @@ final class ClaudeIntegratedAgentModeRunner {
                       session.claudeController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
                       Self.staleActiveRecoveryFencesAreClear(session: session, coordinator: claudeCoordinator, ownership: ownership, runID: runID)
                 else { continue eventLoop }
+                if !uncertainSuccessorWrite, let terminal = protectedTerminal,
+                   abandonedProtectedTurns.contains(terminal.turnID)
+                {
+                    return Self.terminalOutcome(terminal.status)
+                }
                 recovery.accepted = true
                 NSLog("[ClaudeRunRecovery] reason=idle_provider_no_expected_completion")
                 return .failed(errorText: "Claude Code stopped reporting this run's outcome, so RepoPrompt closed it as failed. The conversation is intact; send a message to continue.", shouldShutdownSession: false)
             case let .steeringAbandoned(ids):
                 // A delayed refusal cannot retire a later dequeued/preparing successor.
                 // Keep the obligation until the flush publishes its quiescent boundary.
-                abandonedProtectedTurns.formUnion(ids)
-                if let terminal = protectedTerminal, abandonedProtectedTurns.contains(terminal.turnID),
+                if let terminal = protectedTerminal, ids.contains(terminal.turnID) {
+                    abandonedProtectedTurns.insert(terminal.turnID)
+                }
+                if !uncertainSuccessorWrite, let terminal = protectedTerminal,
+                   abandonedProtectedTurns.contains(terminal.turnID), settlementRecheck == nil,
+                   claudeCoordinator.hasNativeSendOrToolWork(session: session, runID: runID)
+                {
+                    settlementRecheck = Task { [weak session] in
+                        defer { settlementRecheck = nil }
+                        guard let session else { return }
+                        // Match the existing child-wait drain cadence; this waits only on
+                        // actual work, not elapsed provider-idle time or an invented result.
+                        while claudeCoordinator.hasNativeSendOrToolWork(session: session, runID: runID) {
+                            guard !Task.isCancelled, session.activeRunAttemptID == runAttemptID else { return }
+                            do { try await Task.sleep(nanoseconds: 25_000_000) } catch { return }
+                        }
+                        guard !Task.isCancelled, session.activeRunAttemptID == runAttemptID else { return }
+                        inbox.continuation.yield(.steeringAbandoned([]))
+                    }
+                }
+                if !uncertainSuccessorWrite, let terminal = protectedTerminal, abandonedProtectedTurns.contains(terminal.turnID),
                    !Task.isCancelled,
                    let ownership = session.activeRunOwnership,
                    claudeCoordinator.runAttemptIsCurrent(ownership, runID: runID, for: session),
