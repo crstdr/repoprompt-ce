@@ -2078,7 +2078,8 @@ actor ACPAgentSessionController {
         // Administrative metadata has its own session/retirement fences and may arrive while
         // bootstrap has not installed sessionID yet. Quiet semantic ingress must not discard it.
         if provider.providerID == .devin,
-           let incomingSession = params["sessionId"] as? String, incomingSession != self.sessionID { return }
+           let currentSession = self.sessionID,
+           let incomingSession = params["sessionId"] as? String, incomingSession != currentSession { return }
 
         if shouldSuppressSessionLoadReplayUpdate(update) {
             #if DEBUG
