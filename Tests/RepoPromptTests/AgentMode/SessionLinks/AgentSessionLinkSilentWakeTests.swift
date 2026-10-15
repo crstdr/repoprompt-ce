@@ -32,12 +32,267 @@ extension AgentSessionLinkRuntimeBridgeTests {
         try await assertNativeWake(.terminalBeforeAcceptance, expectedAdmission: false)
     }
 
+    func testNativeClaudeDelayedAbandonmentDoesNotEndPreparingSuccessor() async throws {
+        try await assertDelayedClaudeAbandonment(successorRefuses: false)
+    }
+
+    func testNativeClaudeDelayedAbandonmentSettlesAfterSuccessorRefuses() async throws {
+        try await assertDelayedClaudeAbandonment(successorRefuses: true)
+    }
+
+    func testNativeClaudeDelayedAbandonmentDoesNotSettleUncertainSuccessor() async throws {
+        try await assertDelayedClaudeAbandonment(successorRefuses: false, successorUncertain: true)
+    }
+
+    func testNativeClaudeRetainedCompletionRechecksAfterNonFlushSendDrains() async throws {
+        try await assertDelayedClaudeAbandonment(successorRefuses: false, nonFlushSend: true)
+    }
+
+    func testNativeClaudeLaterAcceptedCompletionOutlivesEarlierUncertainty() async throws {
+        try await assertDelayedClaudeAbandonment(successorRefuses: false, successorUncertain: true, laterAcceptedCompletion: true)
+    }
+
+    private func assertDelayedClaudeAbandonment(successorRefuses: Bool, successorUncertain: Bool = false, nonFlushSend: Bool = false, laterAcceptedCompletion: Bool = false) async throws {
+        let fixture = try await makeNativeWakeFixture(agent: .claudeCode)
+        let session = fixture.session
+        let runnerGate = TestReleaseFence(name: "runner held before abandonment")
+        let bGate = TestReleaseFence(name: "B definitive refusal")
+        let cGate = TestReleaseFence(name: "C preparing")
+        defer {
+            runnerGate.release()
+            bGate.release()
+            cGate.release()
+            session.agentTask?.cancel()
+            session.claudeSteeringFlushTask?.cancel()
+            fixture.bridge.freezeForTermination()
+            withExtendedLifetime((fixture.workspace, fixture.observerWorkspace)) {}
+        }
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: fixture.vm)
+        var sentinel = false
+        harness.onNativeStreamResult = { result, _, _, _ in
+            if result.text == "hold" { await runnerGate.enterAndWait() }
+            if result.text == "sentinel" { sentinel = true }
+        }
+        let runner = ClaudeIntegratedAgentModeRunner(claudeCoordinator: fixture.vm.test_claudeCoordinator, hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier())
+        await runner.startRun(tabID: fixture.tabID, session: session, initialUserMessage: "", initialMessageForRun: "", attachments: [], makeLease: { harness.makeLease(runID: $0, tabID: fixture.tabID) })
+        try await AsyncTestWait.waitUntil("A accepted") { !session.claudeExpectedTurnIDs.isEmpty }
+        let turnA = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        await fixture.claude.setSteeringConfigurationGate(bGate, fail: true)
+        XCTAssertEqual(fixture.vm.submitUserTurn(text: "B unsent", tabID: fixture.tabID), .submitted)
+        let bEntered = await bGate.waitUntilEntered(timeout: 3)
+        XCTAssertTrue(bEntered)
+        await fixture.claude.emit(.turnCompleted(turnID: turnA, status: .completed))
+        try await AsyncTestWait.waitUntil("A consumed") { session.claudeExpectedTurnIDs.isEmpty }
+        await fixture.claude.emit(.stream(.init(type: "status", text: "hold")))
+        let held = await runnerGate.waitUntilEntered(timeout: 3)
+        XCTAssertTrue(held)
+        bGate.release()
+        try await AsyncTestWait.waitUntil("B restored and flush released") { session.claudeSteeringFlushTask == nil }
+        XCTAssertEqual(fixture.vm.retrieveDraftText(for: fixture.tabID), "B unsent")
+        await fixture.claude.setSteeringConfigurationGate(cGate, fail: successorRefuses || nonFlushSend)
+        var externalSend: Task<ClaudeAgentModeCoordinator.NativeSendOutcome, Never>?
+        if nonFlushSend {
+            let owner = try XCTUnwrap(session.activeRunOwnership)
+            let runID = try XCTUnwrap(session.runID)
+            externalSend = Task {
+                await fixture.vm.test_claudeCoordinator.sendClaudeNativeMessage(session: session, text: "Other send", attachments: [], intent: .runAttempt(ownership: owner, runID: runID), allowsCatalogRouteControllerRecovery: false)
+            }
+        } else {
+            XCTAssertEqual(fixture.vm.submitUserTurn(text: "C successor", tabID: fixture.tabID), .submitted)
+        }
+        let cEntered = await cGate.waitUntilEntered(timeout: 3)
+        XCTAssertTrue(cEntered)
+        XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+        XCTAssertTrue(session.claudeExpectedTurnIDs.isEmpty)
+        await fixture.claude.emit(.stream(.init(type: "status", text: "sentinel")))
+        runnerGate.release()
+        try await AsyncTestWait.waitUntil("abandonment processed") { sentinel || !session.runState.isActive }
+        XCTAssertEqual(session.runState, .running, "B's stale abandonment must not terminalize C during preparation")
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        await fixture.claude.setFailSendAfterRecord(successorUncertain)
+        cGate.release()
+        guard session.runState == .running else { return }
+        if nonFlushSend {
+            _ = await externalSend?.value
+            try await AsyncTestWait.waitUntil("non-flush work drains and retained A settles") { !session.runState.isActive }
+            XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+            return
+        }
+        if successorUncertain {
+            try await AsyncTestWait.waitUntil("C uncertain send released") { session.claudeSteeringFlushTask == nil }
+            sentinel = false
+            await fixture.claude.emit(.stream(.init(type: "status", text: "sentinel")))
+            try await AsyncTestWait.waitUntil("quiescent notification consumed") { sentinel || !session.runState.isActive }
+            XCTAssertEqual(session.runState, .running, "An older no-write cannot prove a later send was unwritten")
+            XCTAssertNil(session.lastTerminalCommitRevision)
+            if laterAcceptedCompletion {
+                await fixture.claude.setFailSendAfterRecord(false)
+                XCTAssertEqual(fixture.vm.submitUserTurn(text: "Later accepted turn", tabID: fixture.tabID), .submitted)
+                try await AsyncTestWait.waitUntil("later turn accepted") { !session.claudeExpectedTurnIDs.isEmpty && session.claudeSteeringFlushTask == nil }
+                let laterTurn = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+                let refused = TestReleaseFence(name: "later definitive refusal")
+                defer { refused.release() }
+                await fixture.claude.setSteeringConfigurationGate(refused, fail: true)
+                XCTAssertEqual(fixture.vm.submitUserTurn(text: "Later refused steer", tabID: fixture.tabID), .submitted)
+                let entered = await refused.waitUntilEntered(timeout: 3)
+                XCTAssertTrue(entered)
+                await fixture.claude.emit(.turnCompleted(turnID: laterTurn, status: .completed))
+                try await AsyncTestWait.waitUntil("later authoritative terminal consumed") { session.claudeExpectedTurnIDs.isEmpty }
+                refused.release()
+                do {
+                    try await AsyncTestWait.waitUntil("later known completion commits", timeout: 2) { !session.runState.isActive }
+                } catch { XCTFail("Earlier uncertainty stranded a later authoritative completion") }
+                XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+            }
+            return
+        }
+        if successorRefuses {
+            try await AsyncTestWait.waitUntil("C refusal releases retained A") { !session.runState.isActive }
+            XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+            let sends = await fixture.claude.sentCount
+            XCTAssertEqual(sends, 1)
+            XCTAssertEqual(fixture.vm.retrieveDraftText(for: fixture.tabID).components(separatedBy: "C successor").count - 1, 1)
+            return
+        }
+        try await AsyncTestWait.waitUntil("C accepted") { !session.claudeExpectedTurnIDs.isEmpty }
+        let turnC = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        await fixture.claude.emit(.turnCompleted(turnID: turnC, status: .failed))
+        try await AsyncTestWait.waitUntil("C settles") { !session.runState.isActive }
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .failed)
+    }
+
+    func testNativeClaudePostWriteBindingSupersessionDoesNotRestoreOrAbandon() async throws {
+        let fixture = try await makeNativeWakeFixture(agent: .claudeCode)
+        let session = fixture.session
+        let preparing = TestReleaseFence(name: "B preparation")
+        let written = TestReleaseFence(name: "B written before receipt")
+        defer {
+            preparing.release()
+            written.release()
+            session.agentTask?.cancel()
+            session.claudeSteeringFlushTask?.cancel()
+            fixture.bridge.freezeForTermination()
+            withExtendedLifetime((fixture.workspace, fixture.observerWorkspace)) {}
+        }
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: fixture.vm)
+        let runner = ClaudeIntegratedAgentModeRunner(claudeCoordinator: fixture.vm.test_claudeCoordinator, hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier())
+        await runner.startRun(tabID: fixture.tabID, session: session, initialUserMessage: "", initialMessageForRun: "", attachments: [], makeLease: { harness.makeLease(runID: $0, tabID: fixture.tabID) })
+        try await AsyncTestWait.waitUntil("A accepted") { !session.claudeExpectedTurnIDs.isEmpty }
+        let turnA = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        let runID = try XCTUnwrap(session.runID)
+        await fixture.claude.setSteeringConfigurationGate(preparing, fail: false)
+        await fixture.claude.setSendCompletionGate(written)
+        XCTAssertEqual(fixture.vm.submitUserTurn(text: "B already written", tabID: fixture.tabID), .submitted)
+        let preparingEntered = await preparing.waitUntilEntered(timeout: 3)
+        XCTAssertTrue(preparingEntered)
+        await fixture.claude.emit(.turnCompleted(turnID: turnA, status: .completed))
+        try await AsyncTestWait.waitUntil("A consumed") { session.claudeExpectedTurnIDs.isEmpty }
+        var abandonedIDs: Set<UUID> = []
+        let sink = try XCTUnwrap(session.claudeSteeringAbandonment)
+        session.claudeSteeringAbandonment = (sink.attemptID, { ids in abandonedIDs.formUnion(ids)
+            sink.notify(ids) }, sink.probe, sink.uncertainWrite)
+        preparing.release()
+        let writeEntered = await written.waitUntilEntered(timeout: 3)
+        XCTAssertTrue(writeEntered)
+        let sends = await fixture.claude.sentCount
+        XCTAssertEqual(sends, 2, "B crossed the provider write boundary")
+        _ = session.beginPersistentBindingTransition()
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        XCTAssertEqual(session.runID, runID)
+        XCTAssertTrue(session.claudeController === fixture.claude)
+        XCTAssertFalse(fixture.vm.test_claudeCoordinator.runAttemptIsCurrent(ownership, runID: runID, for: session))
+        written.release()
+        try await AsyncTestWait.waitUntil("superseded send disposition") { session.claudeSteeringFlushTask == nil }
+        XCTAssertTrue(abandonedIDs.isEmpty, "A post-write supersession cannot publish definitive no-write")
+        XCTAssertEqual(fixture.vm.retrieveDraftText(for: fixture.tabID), "", "Do not restore a written turn into a changed binding")
+    }
+
+    func testNativeClaudePostWriteSupersessionReportsWriteDisposition() async throws {
+        for throwsAfterWrite in [false, true] {
+            let fixture = try await makeNativeWakeFixture(agent: .claudeCode)
+            let session = fixture.session
+            let written = TestReleaseFence(name: "post-write disposition")
+            defer { written.release()
+                fixture.bridge.freezeForTermination()
+                withExtendedLifetime((fixture.workspace, fixture.observerWorkspace)) {}
+            }
+            session.runState = .running
+            let owner = session.beginRunAttempt(source: "test.post-write-disposition")
+            let runID = try XCTUnwrap(session.runID)
+            await fixture.claude.setSendCompletionGate(written)
+            await fixture.claude.setFailSendAfterRecord(throwsAfterWrite)
+            let sending = Task {
+                await fixture.vm.test_claudeCoordinator.sendClaudeNativeMessage(session: session, text: "Written", attachments: [], intent: .runAttempt(ownership: owner, runID: runID), allowsCatalogRouteControllerRecovery: false)
+            }
+            let entered = await written.waitUntilEntered(timeout: 3)
+            XCTAssertTrue(entered)
+            _ = session.beginPersistentBindingTransition()
+            written.release()
+            let outcome = await sending.value
+            XCTAssertEqual(outcome, .supersededAfterWriteAttempt)
+            let count = await fixture.claude.sentCount
+            XCTAssertEqual(count, 1)
+            await fixture.vm.test_claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
+    func testNativeClaudeCancelledOldMCPWaitCannotRestoreReplacementQueue() async throws {
+        var releaseOld: CheckedContinuation<Void, Never>?
+        let newWait = TestReleaseFence(name: "replacement MCP wait")
+        var calls = 0
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, awaitNoActiveMCPTools: { _ in
+            calls += 1
+            if calls == 1 {
+                // Model an asynchronous dependency that acknowledges cancellation late.
+                await withCheckedContinuation { releaseOld = $0 }
+            } else { await newWait.enterAndWait() }
+            throw CancellationError()
+        })
+        let session = harness.host.session(for: UUID())
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        session.installRunID(UUID())
+        session.runState = .running
+        let oldOwner = session.beginRunAttempt(source: "test.old-flush")
+        func instruction(_ text: String, owner: AgentRunOwnership) -> AgentTabSession.ClaudeSteeringInstruction {
+            .init(id: UUID(), targetRunID: session.runID, targetRunAttemptID: owner.attemptID, providerText: text, attachments: [], taggedFileAttachments: [], draftText: text, optimisticUserItemID: nil, createdAt: Date())
+        }
+        defer { releaseOld?.resume()
+            newWait.release()
+            session.claudeSteeringFlushTask?.cancel()
+        }
+        session.pendingClaudeSteeringInstructions = [instruction("Old unsent", owner: oldOwner)]
+        _ = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        try await AsyncTestWait.waitUntil("old MCP wait entered") { releaseOld != nil }
+        let oldTask = try XCTUnwrap(session.claudeSteeringFlushTask)
+        harness.service.withdrawQueuedWorkForManagedStop(tabID: session.tabID, session: session)
+        _ = session.endRunAttempt(ifCurrent: oldOwner, source: "test.replaced")
+        let newOwner = session.beginRunAttempt(source: "test.new-flush")
+        let replacement = instruction("Replacement unsent", owner: newOwner)
+        session.pendingClaudeSteeringInstructions = [replacement]
+        _ = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        let newEntered = await newWait.waitUntilEntered(timeout: 3)
+        XCTAssertTrue(newEntered)
+        let newFlush = try XCTUnwrap(session.claudeSteeringFlushID)
+        releaseOld?.resume()
+        releaseOld = nil
+        await oldTask.value
+        XCTAssertEqual(session.pendingClaudeSteeringInstructions.map(\.id), [replacement.id], "Old cancelled wait cannot remove a replacement attempt's draft")
+        XCTAssertEqual(session.claudeSteeringFlushID, newFlush)
+        XCTAssertNotNil(session.claudeSteeringFlushTask)
+    }
+
     func testNativeClaudeFailedUnsentSteerSettlesConsumedCompletionAndAdmitsWake() async throws {
         try await assertClaudeSteeringSettlement(failsBeforeWrite: true)
     }
 
     func testNativeClaudeSuccessfulSteerKeepsSuccessorUntilItsOwnResult() async throws {
         try await assertClaudeSteeringSettlement(failsBeforeWrite: false)
+    }
+
+    func testNativeClaudeRecoveryDrainsEventsReceivedDuringIdleRead() async throws {
+        try await assertClaudeSteeringSettlement(failsBeforeWrite: false, uncertainWrite: true, probeIngress: true)
     }
 
     func testNativeClaudeUncertainUnsentSuccessorRecoversOnWakeRefusal() async throws {
@@ -81,12 +336,15 @@ extension AgentSessionLinkRuntimeBridgeTests {
         }
     }
 
-    private func assertClaudeSteeringSettlement(failsBeforeWrite: Bool, uncertainWrite: Bool = false, recoveryBlocker: ClaudeRecoveryBlocker? = nil, completionAfterFailure: Bool = false, supersededBeforeWrite: Bool = false) async throws {
+    private func assertClaudeSteeringSettlement(failsBeforeWrite: Bool, uncertainWrite: Bool = false, recoveryBlocker: ClaudeRecoveryBlocker? = nil, completionAfterFailure: Bool = false, supersededBeforeWrite: Bool = false, probeIngress: Bool = false) async throws {
         let fixture = try await makeNativeWakeFixture(agent: .claudeCode)
         let vm = fixture.vm
         let session = fixture.session
         let gate = TestReleaseFence(name: "steering pre-write configuration")
+        let idleRead = TestReleaseFence(name: "provider idle read")
+        var ingressHandled = false
         defer {
+            idleRead.release()
             gate.release()
             session.agentTask?.cancel()
             session.claudeSteeringFlushTask?.cancel()
@@ -164,12 +422,30 @@ extension AgentSessionLinkRuntimeBridgeTests {
                 // Observe recovery without starting an uncontrolled VM-owned successor run.
                 targetSession.oversight.pendingAutoWake?.task?.cancel()
             }
+            if probeIngress {
+                harness.onNativeStreamResult = { result, _, _, _ in
+                    if result.text == "final provider output" { ingressHandled = true }
+                }
+                await fixture.claude.setActiveReadGate(idleRead)
+                vm.requestClaudeStaleActiveProbe(for: session)
+                let entered = await idleRead.waitUntilEntered(timeout: 3)
+                XCTAssertTrue(entered)
+                await fixture.claude.emit(.stream(.init(type: "text", text: "final provider output")))
+                await fixture.claude.emit(.error("final provider error"))
+                // Let the production forwarder enqueue both values while the probe is suspended.
+                await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+                idleRead.release()
+            }
             publishClaudeSuccessorWake(fixture)
         }
         do {
             try await AsyncTestWait.waitUntil("consumed terminal settles after definitive no-write", timeout: 2) { !session.runState.isActive }
         } catch {
             XCTFail("Known A completion was lost after B failed before write: \(error)")
+        }
+        if probeIngress {
+            XCTAssertTrue(ingressHandled, "Recovery must not discard already-received output")
+            XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text == "final provider error" }, "Buffered provider errors must reach the runner")
         }
         XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership)
         XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, uncertainWrite ? .failed : .completed)

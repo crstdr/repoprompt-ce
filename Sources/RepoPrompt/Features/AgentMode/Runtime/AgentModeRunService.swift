@@ -1042,17 +1042,26 @@ final class AgentModeRunService {
 
         let tabID = session.tabID
         steeringDebugLog("[AgentRunSteeringWake] Claude flush start tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
+        let flushID = UUID()
+        session.claudeSteeringFlushID = flushID
         session.claudeSteeringFlushTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
             defer {
-                session.claudeSteeringFlushTask = nil
-                if session.runState == .running,
-                   session.selectedAgent.usesClaudeNativeRuntime,
-                   !session.pendingClaudeSteeringInstructions.isEmpty
-                {
-                    Task { @MainActor [weak self, weak session] in
-                        guard let self, let session else { return }
-                        _ = await self.submitQueuedClaudeSteeringIfSupported(session: session)
+                if session.claudeSteeringFlushID == flushID {
+                    session.claudeSteeringFlushTask = nil
+                    session.claudeSteeringFlushID = nil
+                    // Reevaluate retained terminal obligations only after dequeued work releases.
+                    if session.claudeSteeringAbandonment?.attemptID == runAttemptID {
+                        session.claudeSteeringAbandonment?.notify([])
+                    }
+                    if session.runState == .running,
+                       session.selectedAgent.usesClaudeNativeRuntime,
+                       !session.pendingClaudeSteeringInstructions.isEmpty
+                    {
+                        Task { @MainActor [weak self, weak session] in
+                            guard let self, let session else { return }
+                            _ = await self.submitQueuedClaudeSteeringIfSupported(session: session)
+                        }
                     }
                 }
             }
@@ -1096,8 +1105,16 @@ final class AgentModeRunService {
                     steeringDebugLog("[AgentRunSteeringWake] Claude flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 } catch {
                     steeringDebugLog("[AgentRunSteeringWake] Claude flush MCP idle cancelled tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) error=\(error)")
-                    // Task cancelled (user cancelled the run) — restore all remaining drafts.
-                    restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+                    // Stop withdraws the old queue synchronously; a late cancelled waiter
+                    // must not restore or remove a replacement flush's instructions.
+                    guard session.claudeSteeringFlushID == flushID,
+                          isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID)
+                    else { return }
+                    restoreQueuedClaudeSteeringDrafts(
+                        tabID: tabID, session: session, strategy: .prependAlways,
+                        definitiveNoWrite: !Task.isCancelled,
+                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
+                    )
                     return
                 }
 
@@ -1166,6 +1183,9 @@ final class AgentModeRunService {
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
                     await hooks.continuation.signalMCPInstructionDelivered(session)
                 case let .failed(_, providerWriteAttempted):
+                    if providerWriteAttempted, session.claudeSteeringAbandonment?.attemptID == runAttemptID {
+                        session.claudeSteeringAbandonment?.uncertainWrite()
+                    }
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
                     // Re-insert the failed instruction so it's included in the restore.
                     // Only a definitive no-write may settle a previously consumed terminal.
@@ -1176,11 +1196,17 @@ final class AgentModeRunService {
                     }
                     restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways, definitiveNoWrite: !providerWriteAttempted)
                     return
+                case .supersededAfterWriteAttempt:
+                    if session.claudeSteeringAbandonment?.attemptID == runAttemptID {
+                        session.claudeSteeringAbandonment?.uncertainWrite()
+                    }
+                    // The provider may own this turn even though local currency was lost.
+                    // Do not restore it or publish a no-write abandonment.
+                    return
                 case .superseded:
-                    // A same-owner refusal on the same controller cannot be a post-write return:
-                    // those returns fail the coordinator's intent/controller fence.
                     guard !Task.isCancelled,
                           isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID),
+                          dependencies.claudeCoordinator.runAttemptIsCurrent(ownership, runID: runID, for: session),
                           let sendingController,
                           session.claudeController.map(ObjectIdentifier.init) == ObjectIdentifier(sendingController)
                     else { return }
@@ -1313,6 +1339,7 @@ final class AgentModeRunService {
     func withdrawQueuedWorkForManagedStop(tabID: UUID, session: AgentTabSession) {
         session.claudeSteeringFlushTask?.cancel()
         session.claudeSteeringFlushTask = nil
+        session.claudeSteeringFlushID = nil
         session.acpSteeringFlushTask?.cancel()
         session.acpSteeringFlushTask = nil
         session.acpSteeringFlushID = nil
@@ -1408,6 +1435,7 @@ final class AgentModeRunService {
         // Cancel steering flush tasks first so they don't race with cleanup.
         session.claudeSteeringFlushTask?.cancel()
         session.claudeSteeringFlushTask = nil
+        session.claudeSteeringFlushID = nil
         session.acpSteeringFlushTask?.cancel()
         session.acpSteeringFlushTask = nil
         session.acpSteeringFlushID = nil
