@@ -4032,7 +4032,9 @@ final class CodexNativeSessionController {
 
     private func hasUnrepresentedQuietActivity(method: String, params: [String: Any]) -> Bool {
         if Self.isItemLifecycleNotificationMethod(method) {
-            guard let item = Self.canonicalItem(from: params) else { return true }
+            guard let item = Self.canonicalItem(from: params),
+                  Self.canonicalItemScope(from: params, item: item) != nil
+            else { return true }
             return !["agentmessage", "agent_message", "reasoning"].contains(normalizedTypeString(from: item))
         }
         switch method {

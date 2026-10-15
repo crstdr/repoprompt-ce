@@ -2319,7 +2319,7 @@ extension CodexResumeWedgeCommitTests {
 
 extension CodexResumeWedgeCommitTests {
     func testQuietRawNativeIngressCurrentForeignUnknownAndFinishedAck() async throws {
-        for variant in 0 ..< 9 {
+        for variant in 0 ..< 18 {
             let f = makeFixture([])
             f.viewModel.test_initializeRunService()
             let runID = UUID()
@@ -2351,6 +2351,20 @@ extension CodexResumeWedgeCommitTests {
                     "item": .object(["id": .string("earlier"), "type": .string("agentMessage"), "text": .string("separate completed prose")])
                 ])
             }
+            if variant >= 9 {
+                var item: [String: CodexJSONValue] = [
+                    "type": .string("agentMessage"), "text": .string("unrepresented completed prose")
+                ]
+                switch (variant - 9) % 3 {
+                case 1: item["id"] = .string("")
+                case 2: item["id"] = .string(" \t\n")
+                default: break // Missing identity, not a separate valid completed message.
+                }
+                await controller.test_handleNotification(method: "item/completed", params: [
+                    "threadId": .string((12 ... 14).contains(variant) ? "foreign-thread" : Self.oldThreadID),
+                    "turnId": .string(variant >= 15 ? "foreign-turn" : "raw-turn"), "item": .object(item)
+                ])
+            }
             if variant != 7 { // Actual raw native silence has no assistant row at all.
                 await controller.test_handleNotification(method: "item/completed", params: [
                     "threadId": .string(Self.oldThreadID), "turnId": .string("raw-turn"),
@@ -2364,11 +2378,28 @@ extension CodexResumeWedgeCommitTests {
             // Route the actual translated stream through the production current-controller gate.
             // Start is coordinator-owned separately so the routine mark precedes all tested ingress.
             await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "raw-turn"), session: f.session, sourceController: controller)
+            var ingressOrder: [String] = []
             for await event in stream {
+                switch event {
+                case let .livenessActivity(activity) where activity.method == "item/completed":
+                    XCTAssertEqual(activity.turnID, variant >= 15 ? "foreign-turn" : "raw-turn")
+                    if activity.turnID == "raw-turn" { ingressOrder.append("uncertainty") }
+                case let .assistantCompleted(completion) where completion.scope.itemID == "answer":
+                    ingressOrder.append("ack")
+                default: break
+                }
                 await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
             }
-            XCTAssertEqual(f.session.quietLedger.facts?.ordinaryThrough, variant == 0 || variant == 2 || variant == 6 || variant == 7 ? 0 : 1, "variant \(variant)")
+            let expectsQuiet = [0, 2, 6, 7].contains(variant) || variant >= 12
+            XCTAssertEqual(f.session.quietLedger.facts?.ordinaryThrough, expectsQuiet ? 0 : 1, "variant \(variant)")
             XCTAssertEqual(f.session.quietLedger.facts?.settledThrough, 1)
+            if (9 ... 11).contains(variant) {
+                XCTAssertEqual(ingressOrder, ["uncertainty", "ack"], "variant \(variant): uncertainty must precede the valid completion")
+                XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, "variant \(variant): missing identity cannot hide the ACK")
+            } else if variant >= 12 || variant == 0 {
+                XCTAssertEqual(ingressOrder, ["ack"], "variant \(variant): foreign activity and valid same-item replacement remain quiet")
+                XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.isEmpty, "variant \(variant): valid ACK remains quiet-masked")
+            }
             f.session.saveDebounceTask?.cancel()
         }
     }
