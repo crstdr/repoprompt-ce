@@ -24,7 +24,8 @@ final class CodexIntegratedAgentModeRunner {
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        passiveWakeID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
         var handedToRunTask = false
@@ -43,7 +44,7 @@ final class CodexIntegratedAgentModeRunner {
             createdOwnership = false
         } else {
             guard stopFence?.permitsStart(of: session) ?? true else { return .cancelled }
-            ownership = session.beginRunAttempt(source: "codex")
+            ownership = session.beginRunAttempt(source: "codex", passiveWakeID: passiveWakeID)
             createdOwnership = true
             session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         }

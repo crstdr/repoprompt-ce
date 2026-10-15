@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 @MainActor
 enum AgentExternalMCPRunStarter {
@@ -149,10 +150,12 @@ enum AgentExternalMCPRunStarter {
                 "workflowName": workflow?.displayName ?? "nil"
             ])
         #endif
+        let startScope = MCPAgentRunStartExecutionScope.current
         // A fresh target remains creation-owned through control, model and request setup.
         // Only the complete initial configuration may cross the first durable-save boundary.
         let ownedActivation: AgentModeViewModel.AgentMCPControlContext
         do {
+            try startScope?.checkAdmission()
             ownedActivation = try await agentModeVM.mcpActivateControlContext(
                 forTabID: target.tabID,
                 sessionID: sessionID,
@@ -164,16 +167,20 @@ enum AgentExternalMCPRunStarter {
         } catch {
             // Activation owns rollback of its registration. Do not tear down a different
             // context if this attempt failed before returning an owned activation.
-            agentModeVM.failSessionCreation(
-                target.creationHandle,
-                message: "This session did not finish preparing its first run. Create a new session."
-            )
+            try? startScope?.enterReturn()
+            if startScope?.allowsFailureCleanup != false {
+                agentModeVM.failSessionCreation(
+                    target.creationHandle,
+                    message: "This session did not finish preparing its first run. Create a new session."
+                )
+            }
             throw error
         }
 
         // All failures after activation may clean up only this exact inactive producer.
         let activatedSession = agentModeVM.session(for: target.tabID, createIfNeeded: false)
         do {
+            try startScope?.checkAdmission()
             guard let activatedSession,
                   activatedSession.activeAgentSessionID == sessionID,
                   activatedSession.mcpControlContext == ownedActivation,
@@ -183,6 +190,7 @@ enum AgentExternalMCPRunStarter {
             }
             let pendingStartFence = AgentRunStartStopFence(session: activatedSession)
             func requirePendingStart() throws {
+                try startScope?.checkAdmission()
                 guard agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession,
                       activatedSession.activeAgentSessionID == sessionID,
                       activatedSession.mcpControlContext == ownedActivation,
@@ -199,13 +207,16 @@ enum AgentExternalMCPRunStarter {
                     expectedParentSessionID: expectedParentSessionID
                 )
             }
+            try startScope?.checkAdmission()
             try await agentModeVM.mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: agentRaw,
                 modelRaw: resolvedModel,
                 reasoningEffortRaw: resolvedEffort,
+                expectedControlContext: ownedActivation,
                 creationHandle: target.creationHandle
             )
+            try startScope?.checkAdmission()
             switch bindingDisposition {
             case .preserveCallerBinding:
                 #if DEBUG
@@ -234,15 +245,21 @@ enum AgentExternalMCPRunStarter {
             try Task.checkCancellation()
             try requirePendingStart()
 
-            let delivery: AgentModeViewModel.MCPInstructionDispatch = if let dispatchInstruction {
-                try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)
+            try startScope?.checkAdmission()
+            try agentModeVM.requireMCPControlOwnership(sessionID: sessionID, expectedContext: ownedActivation)
+            let delivery: AgentModeViewModel.MCPInstructionDispatch
+            if let dispatchInstruction {
+                try startScope?.beginDispatch()
+                delivery = try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)
+                startScope?.recordDispatch(accepted: true)
             } else {
-                try await agentModeVM.mcpDispatchInstruction(
+                delivery = try await agentModeVM.mcpDispatchInstruction(
                     sessionID: sessionID,
                     text: message,
                     allowStartingRun: true,
                     workflow: workflow,
                     preserveRoutedInitialEffort: preserveRoutedInitialEffort,
+                    expectedControlContext: ownedActivation,
                     validateInitialStart: requirePendingStart
                 )
             }
@@ -257,18 +274,21 @@ enum AgentExternalMCPRunStarter {
             #endif
             return StartOutcome(snapshot: snapshot, delivery: delivery)
         } catch {
-            agentModeVM.failSessionCreation(
-                target.creationHandle,
-                message: "This session did not finish preparing its first run. Create a new session."
-            )
-            if let activatedSession,
-               agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession,
-               activatedSession.mcpControlContext == ownedActivation
-            {
-                _ = await agentModeVM.mcpDeactivateOwnedControlContext(
-                    sessionID: sessionID,
-                    expectedContext: ownedActivation
+            try? startScope?.enterReturn()
+            if startScope?.allowsFailureCleanup != false {
+                agentModeVM.failSessionCreation(
+                    target.creationHandle,
+                    message: "This session did not finish preparing its first run. Create a new session."
                 )
+                if let activatedSession,
+                   agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession,
+                   activatedSession.mcpControlContext == ownedActivation
+                {
+                    _ = await agentModeVM.mcpDeactivateOwnedControlContext(
+                        sessionID: sessionID,
+                        expectedContext: ownedActivation
+                    )
+                }
             }
             throw error
         }

@@ -2686,6 +2686,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard isStillAdmissible(),
               session.codexConversationID == expectedThreadID,
               nativeSlashCommandAvailabilityMessage(.compact, session: session) == nil,
+              !hasCodexStartupClaim(for: session),
               let controller = session.codexController,
               controller.hasActiveThread
         else {
@@ -3637,6 +3638,25 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             await failCodexFallbackDispatch(session: session, entry: head, message: nil)
             return false
         }
+        let inputProof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+        if monitoring?.claim?.localInput != nil {
+            guard session.codexFallbackDispatchInFlight?.id == head.id,
+                  session.activeRunAttemptID == dispatchAttemptID, session.runID == head.originRunID,
+                  session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID,
+                  session.codexControllerGeneration == head.originControllerGeneration,
+                  session.codexConversationID == head.originThreadID
+            else {
+                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+                return false
+            }
+            guard !Task.isCancelled, head.stopFence?.permitsStart(of: session) ?? true,
+                  viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
+            else {
+                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+                await failCodexFallbackDispatch(session: session, entry: head, message: nil)
+                return false
+            }
+        }
         let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
             for: session,
             dispatchID: promptDispatchID
@@ -3659,8 +3679,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.fallbackStart) }
                 viewModel?.scheduleSave(for: session.tabID)
             }
+            let released = inputProof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
+            guard released?.mustAbortDispatch != true else { throw CancellationError() }
             _ = try await controller.startUserTurn(
-                text: monitoring?.text ?? head.providerText,
+                text: released?.text(head.providerText) ?? monitoring?.text ?? head.providerText,
                 images: head.images,
                 model: head.model,
                 reasoningEffort: head.reasoningEffort,
@@ -3677,7 +3699,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 viewModel?.scheduleSave(for: session.tabID)
             }
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: released == nil ? monitoring?.claim : released?.claim)
             guard var inFlight = session.codexFallbackDispatchInFlight,
                   inFlight.id == head.id,
                   session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID
@@ -5956,15 +5978,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
                 return false
             }
-            // This replay bypasses `sendCodexNativeMessage`, so it must reproduce that path's
-            // oversight composition after both readiness gates and against the original logical
-            // dispatch ID. An accepted Auto-wake is already settled: it may replay only its exact
-            // accepted fragment, never raw text or a newly minted lane claim. Ordinary turns keep
-            // the current-claim, exact-accepted-claim, then raw-text ordering.
+            // This replay bypasses `sendCodexNativeMessage`, so it must preserve accepted input
+            // after both readiness gates and against the original logical dispatch ID.
+            // Recovery follows possible handoff: reuse only the stored accepted baseline, never
+            // harvest a fresh claim or optional input. New updates remain owed to a fresh turn.
+            // An accepted Auto-wake must still refuse if its exact accepted authority is gone.
             //
             // Classified by reserved dispatch-ID family rather than by a parsed wake ID, so a
             // malformed Auto-wake identity takes the restrictive branch and is refused instead of
-            // falling through to the ordinary replay that may mint a fresh claim or send raw text.
+            // falling through to the ordinary replay that may send raw stored text.
             let originalMonitoringDispatchID = replayTurn.monitoringDispatchID
                 ?? replayTurn.monitoringClaim?.dispatchID
             let monitoring: AgentSessionLinkDecoratedProviderText?
@@ -6010,16 +6032,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 monitoring = nil
                 replayText = AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: acknowledged)
             } else {
-                monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
-                    replayTurn.text,
-                    session: session,
-                    dispatchID: replayDispatchID
-                )
-                let requiredLaneUnavailable = monitoring?.mustAbortDispatch == true
-                    || (
-                        monitoring == nil
-                            && AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID)
-                    )
+                monitoring = nil
+                let requiredLaneUnavailable = AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID)
                 guard !requiredLaneUnavailable else {
                     viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                         for: session,
@@ -6027,14 +6041,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     )
                     return false
                 }
-                replayText = if let monitoring, monitoring.claim != nil {
-                    monitoring.text
-                } else if let acknowledged = replayTurn.monitoringClaim,
-                          viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
-                              acknowledged,
-                              for: session,
-                              dispatchID: replayDispatchID
-                          ) == true
+                replayText = if let acknowledged = replayTurn.monitoringClaim,
+                                viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                                    acknowledged,
+                                    for: session,
+                                    dispatchID: replayDispatchID
+                                ) == true
                 {
                     AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: acknowledged)
                 } else {
@@ -6092,7 +6104,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return receipt
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: nil)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -7423,9 +7435,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         let existingRef = shouldSkipTimedOutResumeTarget ? nil : resumeCandidate
         guard let startController = session.codexController else { return }
-        let controllerGenerationAtStart = session.codexControllerGeneration
         guard await computerUseStartupIsCurrent(startController) else { return }
+        let controllerGenerationAtStart = session.codexControllerGeneration
         do {
+            session.invalidatePassiveWakeEvidence()
             var startResult = try await startCodexNativeSession(
                 controller: startController,
                 existingRef: existingRef,
@@ -7474,17 +7487,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
             }
         } catch {
+            if computerUseActivationID != nil {
+                guard session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
+                      session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
+                      session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(startController) else { return }
+            }
             if forIdleNativeCompact {
                 guard session.runID == runID,
                       session.activeRunAttemptID == runAttemptIDAtEntry,
                       session.codexControllerGeneration == controllerGenerationAtStart,
                       session.codexController.map({ Self.sameCodexControllerInstance($0, startController) }) == true
                 else { return }
-            }
-            if computerUseActivationID != nil {
-                guard session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
-                      session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
-                      session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(startController) else { return }
             }
             var effectiveError: Error = error
             if session.runState.isActive,
@@ -7514,6 +7527,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         return
                     }
                     do {
+                        session.invalidatePassiveWakeEvidence()
                         var recoveredStartResult = try await startCodexNativeSession(
                             controller: recoveredController,
                             existingRef: existingRef,
@@ -7607,6 +7621,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                       managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
                 else { return }
                 do {
+                    session.invalidatePassiveWakeEvidence()
                     var retryResult = try await startCodexNativeSession(
                         controller: freshController,
                         existingRef: nil,
@@ -8146,6 +8161,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // prepares only after that gate settles; steering prepares immediately. Both the initial
         // steer and its bounded expected-turn retry send the same rendered string.
         var monitoring: AgentSessionLinkDecoratedProviderText?
+        var releasedMonitoringClaim: AgentSessionLinkOutboundPromptClaim?
         var acquiredAgentSessionLinkPhysicalDispatch = false
         let prepareAgentSessionLinkPhysicalDispatch: () async -> NativeSendOutcome? = {
             if isSelfNote {
@@ -8310,8 +8326,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     }
                     let parkedNote = isSelfNote ? nil : parkedNoteForCurrentBinding()
                     let noteDispatchID = selfCompactDispatchID ?? parkedNote?.dispatchID
-                    let baseText = monitoring?.text ?? text
-                    let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                     beginTrackedCodexUserTurn(session)
                     updateCodexStallWatchdogState(for: session)
                     logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.startUserTurn")
@@ -8336,6 +8350,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             }
                             viewModel?.scheduleSave(for: session.tabID)
                         }
+                        guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
+                        let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+                        if monitoring?.claim?.localInput != nil {
+                            guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
+                                  session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
+                                  session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
+                                  session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
+                                  computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
+                                  computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
+                                  isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                            else { throw CancellationError() }
+                        }
+                        // A parked note remains unattempted throughout optional Read proof.
+                        // Claim it before synchronous frontier consumption, with no intervening await.
                         if let noteDispatchID {
                             guard session.selfCompactNoteDispatchIsCurrent(noteDispatchID) else {
                                 throw CancellationError()
@@ -8349,7 +8377,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         }
                         let receipt: CodexTurnStartReceipt
                         do {
-                            guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
+                            let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
+                            guard released?.mustAbortDispatch != true else {
+                                if let noteDispatchID {
+                                    var state = session.selfCompactState
+                                    _ = state.noteDefinitivelyNotAttempted(noteDispatchID)
+                                    session.selfCompactState = state
+                                    viewModel?.scheduleSave(for: session.tabID)
+                                }
+                                throw CancellationError()
+                            }
+                            releasedMonitoringClaim = released?.claim
+                            let baseText = released?.text(text) ?? monitoring?.text ?? text
+                            let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                             receipt = try await controller.startUserTurn(
                                 text: dispatchText,
                                 images: attachments,
@@ -8396,8 +8436,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     return .preDispatchRejected(message: CodexComputerUseWorkflow.ineligibleMessage)
                 }
                 let parkedNote = parkedNoteForCurrentBinding()
-                let baseText = monitoring?.text ?? text
-                let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 if let auditTurnID {
                     session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.steer) }
@@ -8409,6 +8447,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     viewModel?.scheduleSave(for: session.tabID)
                 }
                 do {
+                    let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+                    if monitoring?.claim?.localInput != nil {
+                        guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
+                              session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
+                              session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
+                              session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
+                              computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
+                              computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
+                              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                        else { throw CancellationError() }
+                    }
                     if let parkedNote {
                         guard session.selfCompactNoteDispatchIsCurrent(parkedNote.dispatchID) else {
                             return .cancelled
@@ -8418,6 +8467,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         session.selfCompactState = state
                         viewModel?.scheduleSave(for: session.tabID)
                     }
+                    let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
+                    guard released?.mustAbortDispatch != true else {
+                        if let parkedNote {
+                            var state = session.selfCompactState
+                            _ = state.noteDefinitivelyNotAttempted(parkedNote.dispatchID)
+                            session.selfCompactState = state
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
+                        throw CancellationError()
+                    }
+                    releasedMonitoringClaim = released?.claim
+                    let baseText = released?.text(text) ?? monitoring?.text ?? text
+                    let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                     let receipt = try await controller.steerUserTurn(
                         text: dispatchText,
                         images: attachments,
@@ -8477,8 +8539,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         guard await computerUsePhysicalDispatchIsCurrent() else {
                             return .preDispatchRejected(message: CodexComputerUseWorkflow.ineligibleMessage)
                         }
+                        // This logical input already crossed handoff. A bounded transport retry
+                        // reuses only its exact baseline; optional inputs never replay.
+                        let retryText = releasedMonitoringClaim.map { AgentSessionLinkPromptComposer.decorated(text, with: $0) } ?? text
                         let receipt = try await controller.steerUserTurn(
-                            text: dispatchText,
+                            text: retryText,
                             images: attachments,
                             expectedTurnID: actualTurnID
                         )
@@ -8531,16 +8596,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // `startUserTurn`, or a `steerUserTurn` receipt carrying an accepted turn ID. Acknowledge
             // before the staleness guard below, because a dispatch the provider accepted after the
             // local run changed still delivered the supplement exactly once.
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: releasedMonitoringClaim)
             // Managed-auth recovery can still replay this exact turn after acceptance. Hand it the
             // acknowledged claim so the replay can re-attach the identical fragment instead of
             // shipping the bare stored text and silently dropping the revision forever.
-            if let acceptedClaim = monitoring?.claim,
+            if let acceptedClaim = releasedMonitoringClaim,
                var pendingAuthTurn = session.codexPendingAuthRetryTurn
             {
                 pendingAuthTurn.monitoringDispatchID = pendingAuthTurn.monitoringDispatchID
                     ?? acceptedClaim.dispatchID
-                pendingAuthTurn.monitoringClaim = acceptedClaim
+                pendingAuthTurn.monitoringClaim = acceptedClaim.baselineOnly
                 session.codexPendingAuthRetryTurn = pendingAuthTurn
             }
             guard session.runID == sendRunID,
@@ -8754,6 +8819,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         args: [String: Value]?,
         session: AgentTabSession
     ) {
+        session.notePassiveWakeActivity()
         guard isRepoPromptTrackerToolName(toolName) else { return }
         logCodexTranscriptOrdering(
             "tracker toolCall received",
@@ -8783,6 +8849,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         isError: Bool,
         session: AgentTabSession
     ) {
+        session.notePassiveWakeActivity()
         guard isRepoPromptTrackerToolName(toolName) else { return }
         logCodexTranscriptOrdering(
             "tracker toolResult received",
@@ -9733,18 +9800,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         switch event {
         case let .assistantDelta(delta):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeAssistantText(delta)
             guard !delta.isEmpty else { return }
             clearCodexPendingAuthRetryTurn(session)
             enqueueAssistantDelta(delta, session: session)
             return
         case let .canonicalAssistantDelta(text, scope):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeAssistantText(text)
             guard !text.isEmpty else { return }
             clearCodexPendingAuthRetryTurn(session)
             enqueueAssistantDelta(text, scope: scope, session: session)
             return
         case let .assistantCompleted(payload):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeAssistantText(payload.text, authoritative: true)
             clearCodexPendingAuthRetryTurn(session)
             reconcileAssistantCompletion(payload, session: session)
             return
@@ -9768,6 +9838,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.scheduleSaveForCommandOutput(tabID: session.tabID, minInterval: 2.0)
         case let .approvalRequest(request):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             CodexComputerUseWorkflow.logApprovalDecision(
                 path: .approval, server: nil, armed: session.codexControllerFeatureState?.computerUseEnabled == true,
                 approvalPolicy: session.permissionProfile.codexApprovalPolicy, sandboxMode: session.permissionProfile.codexSandboxMode, outcome: "surface"
@@ -9780,6 +9851,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.publishMCPStateChange(for: session)
         case let .permissionsRequest(request):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             session.pendingPermissionsRequest = request
@@ -9788,6 +9860,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.publishMCPStateChange(for: session)
         case let .mcpElicitationRequest(request):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             let alreadyPending = session.pendingMCPElicitationRequest?.requestID == request.requestID
@@ -9832,6 +9905,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return
             }
             let request = computerUseArmed ? request.computerUseReviewRequest : request
+            session.notePassiveWakeActivity()
             let alreadyPending = session.pendingUserInputRequest?.requestID == request.requestID
             let alreadyQueued = session.queuedUserInputRequests.contains { $0.requestID == request.requestID }
             guard !alreadyPending, !alreadyQueued else {
@@ -9869,6 +9943,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         case let .toolCall(toolName, invocationID, argsJSON):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
@@ -9910,6 +9985,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.requestUIRefresh(tabID: session.tabID)
         case let .toolResult(toolName, invocationID, argsJSON, resultJSON, isError):
             guard session.runState.isActive else { return }
+            session.notePassiveWakeActivity()
             let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
@@ -10072,6 +10148,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard session.runState.isActive
                 || shouldApplyCommandExecutionRunningUpdateToInactiveSession(runningUpdate, session: session)
             else { return }
+            session.notePassiveWakeActivity()
             clearCodexPendingAuthRetryTurn(session)
             if runningUpdate.sealsAssistantBoundary {
                 sealAssistantBoundary(session)
@@ -10211,6 +10288,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.setAgentRunActive(session.tabID, isActive: true)
             viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
         case let .errorNotification(notification):
+            session.notePassiveWakeActivity()
             let willRetry: Bool
             if let structuredWillRetry = notification.willRetry {
                 willRetry = structuredWillRetry
@@ -10246,6 +10324,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 sourceController: sourceController
             )
         case let .error(message):
+            session.notePassiveWakeActivity()
             let willRetry = Self.isRetriableStreamErrorMessage(message)
             recordCodexRetryHeuristicFallback(session: session, message: message)
             if willRetry, session.runState.isActive {
@@ -10276,6 +10355,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 sourceController: sourceController
             )
         case let .system(message):
+            session.notePassiveWakeAssistantText(message)
             let systemItem = AgentChatItem.system(message, sequenceIndex: session.nextSequenceIndex)
             session.appendItem(systemItem)
             viewModel?.requestUIRefresh(tabID: session.tabID)

@@ -166,6 +166,8 @@ final class AgentSessionLinkTranscriptSanitizerTests: XCTestCase {
     // MARK: - Redaction
 
     func testRedactsCredentialShapesAndNormalizesHomePaths() {
+        let keyType = "PRIVATE " + "KEY"
+        let completePEM = "-----BEGIN \(keyType)-----\nconfidential\n-----END \(keyType)-----"
         let cases: [(String, [String])] = [
             ("Authorization: Bearer abc123def456ghi", ["abc123def456ghi"]),
             (#"{"api_key": "sk-abcdefghijklmnopqrstuvwx"}"#, ["sk-abcdefghijklmnopqrstuvwx"]),
@@ -174,7 +176,8 @@ final class AgentSessionLinkTranscriptSanitizerTests: XCTestCase {
             (#"{"gh_api_key_v2": "ghs_zzzzzzzzzzzzzzzzzzzz"}"#, ["ghs_zzzzzzzzzzzzzzzzzzzz"]),
             ("password: hunter2swordfish", ["hunter2swordfish"]),
             ("token ghp_abcdefghijklmnopqrstuvwxyz012345", ["ghp_abcdefghijklmnopqrstuvwxyz012345"]),
-            ("key AKIAIOSFODNN7EXAMPLE here", ["AKIAIOSFODNN7EXAMPLE"])
+            ("key AKIAIOSFODNN7EXAMPLE here", ["AKIAIOSFODNN7EXAMPLE"]),
+            (completePEM, ["confidential"])
         ]
         for (input, secrets) in cases {
             let redacted = AgentSessionLinkTextRedactor.redact(input, homeDirectory: home)

@@ -578,7 +578,10 @@ package actor DomainAgentSessionLinkAuthority {
         matching predicate: (LinkRecord) -> Bool
     ) -> DomainAgentSessionLinkInventory {
         var items: [DomainAgentSessionLinkInventoryItem] = []
-        for record in links.values where predicate(record) {
+        // The target owner already maintains this inverse index for lifecycle invalidation.
+        // Do not sweep unrelated grants for a target-local publication or policy resolution.
+        for id in targets[targetSessionID]?.inboundLinkIDs ?? [] {
+            guard let record = links[id], predicate(record) else { continue }
             items.append(inventoryItem(record, outbound: false))
         }
         items.sort(by: Self.orderedByObserver)
@@ -973,6 +976,23 @@ package actor DomainAgentSessionLinkAuthority {
         }
         guard record.grant.capabilities.contains(lease.capability) else { return .capabilityDenied }
         return nil
+    }
+
+    /// One all-or-none actor transition at optional provider disclosure. Reuses the exact operation
+    /// authorizer and Read-cursor lease validator; allocates no cursor and mutates no authority state.
+    package func validateReadDisclosures(_ requirements: [DomainAgentSessionReadDisclosureRequirement]) -> Bool {
+        guard !isDraining, !isShutDown else { return false }
+        return requirements.allSatisfy { requirement in
+            guard case let .success(lease) = authorize(
+                operation: .monitorRead, observerEndpoint: requirement.observer,
+                targetSessionID: requirement.target.sessionID
+            ), lease.linkID == requirement.reference.linkID,
+            lease.linkGeneration == requirement.reference.generation,
+            lease.target == requirement.target,
+            lease.capability == .read,
+            validate(lease: lease) == nil else { return false }
+            return true
+        }
     }
 
     /// Fences an observer-local batch before pending prompt disclosure. Every observation lease

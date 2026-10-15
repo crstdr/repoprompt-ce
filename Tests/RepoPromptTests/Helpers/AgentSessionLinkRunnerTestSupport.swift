@@ -36,6 +36,9 @@ final class AgentSessionLinkRunnerHarness {
     /// (buggy) composition point sat in. A test uses it to prove composition reads membership *after*
     /// that suspension.
     var onAttachmentsConsumed: (@MainActor () -> Void)?
+    var nativeTranscriptHost: AgentModeViewModel?
+    var onTerminalPublication: (@MainActor (AgentRunTerminalCommitRevision, AgentTabSession) -> Void)?
+    var onNativeStreamResult: (@MainActor (AIStreamResult, AgentTabSession, UUID, UUID) async -> Void)?
 
     /// Runs while the message is being built, i.e. the last synchronous MainActor point before the
     /// headless runner's lease `providerInitializationStarted` hop. A test uses it to enqueue a
@@ -73,13 +76,16 @@ final class AgentSessionLinkRunnerHarness {
     /// view-model seam does. This lets adapter tests exercise required-claim refusal at the physical
     /// provider boundary without duplicating runner logic.
     var forcedAutoWakeID: UUID?
+    var localInputFixture: AgentSessionLinkTransportLocalInputFixture?
+    private var workspaces: [WorkspaceManagerViewModel] = []
 
     init(
         stubSystemPrompt: String = "BASE INSTRUCTIONS",
         headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
         acpProviderFactory: @escaping AgentModeViewModel.ACPProviderFactory = { _, _ in nil },
         workspacePath: String = FileManager.default.currentDirectoryPath,
-        sessionLinkHost: AgentModeViewModel? = nil
+        sessionLinkHost: AgentModeViewModel? = nil,
+        awaitNoActiveMCPTools: @escaping (UUID) async throws -> Void = { _ in }
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         self.headlessProviderFactory = headlessProviderFactory
@@ -128,7 +134,7 @@ final class AgentSessionLinkRunnerHarness {
             },
             bindPendingOracleReviewContext: { _, _ in },
             cancelMCPToolsForRun: { _, _ in },
-            awaitNoActiveMCPTools: { _ in },
+            awaitNoActiveMCPTools: awaitNoActiveMCPTools,
             activeAgentRunWaitQuery: { _ in false },
             childAgentRunWaitDrainTimeoutSeconds: 0.01
         )
@@ -167,11 +173,13 @@ final class AgentSessionLinkRunnerHarness {
                 scheduleSave: { _ in }
             ),
             transcript: .init(
-                handleHeadlessStreamResult: { _, _, _, _ in },
-                finalizeStreamingItems: { _ in },
+                handleHeadlessStreamResult: { result, session, runID, attemptID in
+                    await harnessBox?.onNativeStreamResult?(result, session, runID, attemptID)
+                },
+                finalizeStreamingItems: { session in harnessBox?.nativeTranscriptHost?.finalizeStreamingItems(in: session) },
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-                flushPendingAssistantDelta: { _ in },
+                flushPendingAssistantDelta: { session in harnessBox?.nativeTranscriptHost?.flushPendingAssistantDelta(session) },
                 clearPendingAssistantDelta: { _ in }
             ),
             providerInput: .init(
@@ -192,7 +200,7 @@ final class AgentSessionLinkRunnerHarness {
                 recordPendingHandoffSendOutcome: { _, _ in },
                 claimAgentSessionLinkPrompt: { session, dispatchID in
                     MainActor.assumeIsolated {
-                        if let sessionLinkHost {
+                        if let sessionLinkHost = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
                             return sessionLinkHost.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
                         }
                         guard let harnessBox else {
@@ -227,11 +235,29 @@ final class AgentSessionLinkRunnerHarness {
                 acceptAgentSessionLinkPrompt: { session, context, claim in
                     MainActor.assumeIsolated {
                         harnessBox?.acceptedDispatchCount += 1
-                        sessionLinkHost?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
+                        (harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost)?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
                         guard let claim else { return }
                         harnessBox?.claimStore.accept(claim)
                         harnessBox?.acceptedClaims.append(claim)
                     }
+                },
+                proveAgentSessionLinkProviderInput: { session, claim in
+                    if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
+                        return await host.agentSessionLinkProveProviderInput(for: session, claim: claim)
+                    }
+                    return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
+                },
+                handoffAgentSessionLinkProviderInput: { session, dispatchID, claim, proof in
+                    if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
+                        return host.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
+                    }
+                    return AgentSessionLinkProviderInputRelease.handoff(
+                        original: claim,
+                        proof: proof,
+                        current: { claim.map(AgentSessionLinkPromptClaimOutcome.claimed) ?? .nothingOwed },
+                        isPending: { _ in true },
+                        consume: { _ in false }
+                    )
                 }
             ),
             interactions: .init(
@@ -243,7 +269,10 @@ final class AgentSessionLinkRunnerHarness {
             terminalSettlement: .init(
                 prepareTerminalPublication: { _ in },
                 makeTerminalPublicationEnvelope: { _, _, _, _, _ in nil },
-                publishTerminalCommit: { _, _, _ in .accepted(successorEpoch: nil) }
+                publishTerminalCommit: { session, revision, _ in
+                    harnessBox?.onTerminalPublication?(revision, session)
+                    return .accepted(successorEpoch: nil)
+                }
             ),
             continuation: .init(
                 startFollowUpRun: { _, _ in },
@@ -313,6 +342,25 @@ final class AgentSessionLinkRunnerHarness {
                 )
             }
         )
+    }
+
+    func makeBoundSession(agent: AgentProviderKind) throws -> AgentModeViewModel.TabSession {
+        let tabID = UUID()
+        workspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(on: host, tabID: tabID, name: "Positive runner authority"))
+        let session = host.session(for: tabID)
+        session.selectedAgent = agent
+        session.hasLoadedPersistedState = true
+        // This harness supplies an existing payload; allocation alone owns unfinished creation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(host.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The bound transport fixture must be restored before provider dispatch."
+        )
+        return session
     }
 
     func makeSession(agent: AgentProviderKind) -> AgentModeViewModel.TabSession {

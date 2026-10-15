@@ -5,10 +5,10 @@ import RepoPromptInstrumentation
 /// Window-local seam between the authoritative link inventory and the provider dispatch adapters.
 ///
 /// The adapters (Codex start/steer/fallback, Claude native, Claude/generic headless, ACP prompt and
-/// active steering, waiting-instruction continuation) all reduce to two synchronous MainActor calls:
-/// compose immediately before the physical dispatch, acknowledge at the provider's acceptance
-/// signal. Keeping the actor hop out of the dispatch path matters — every one of those sites runs
-/// while a user turn is already committed, and none of them may block on the domain actor.
+/// active steering, waiting-instruction continuation) preserve synchronous baseline composition and
+/// acceptance. Optional user-input disclosure adds an exact Read proof after all other preparation
+/// awaits, followed by synchronous MainActor revalidation/consumption at the final provider handoff.
+/// A failed optional proof falls back to the unchanged baseline; it never creates a dispatch.
 /// The authoritative outbound inventory published to one exact incarnation.
 ///
 /// The endpoint is stored alongside the value rather than implied by the map key: an in-place rebind
@@ -709,6 +709,21 @@ extension AgentModeViewModel {
         let periodicAttempt = session.oversight.pendingAutoWake.flatMap { attempt in
             attempt.isPeriodic && attempt.wakeID == effectiveID.autoWakeID ? attempt : nil
         }
+        // The quiet-reply line belongs only to a routine status/overflow wake's own dispatch —
+        // never to a periodic, manual, or attention turn, nor to a piggybacked batch on an
+        // ordinary one. Any live phase qualifies: a claim may be minted while the attempt is
+        // still scheduled and must fingerprint identically at physical acquisition. The phase
+        // list is positive on purpose — a future dead phase must default to not teaching.
+        // Providers without passive-wake evidence can never finish quietly, so they are not
+        // taught the token at all.
+        let routineStatusWake = session.supportsPassiveWakeEvidence && (session.oversight.pendingAutoWake.map { attempt in
+            guard attempt.wakeID == effectiveID.autoWakeID,
+                  attempt.admissionBasis == .routineStatusOrOverflow else { return false }
+            switch attempt.phase {
+            case .scheduled, .awaitingSettlement, .preparingDispatch, .dispatching: return true
+            case .cancelledBeforeDispatch: return false
+            }
+        } ?? false)
         if let periodicAttempt {
             guard periodicAttempt.phase != .cancelledBeforeDispatch,
                   agentSessionLinkPeriodicWakeIsEligible(session, endpoint: periodicAttempt.observerEndpoint)
@@ -749,6 +764,15 @@ extension AgentModeViewModel {
             passiveNotices: context.passiveNotices,
             locationLabelsByReference: locationLabelsByReference,
             allowsClaimlessAutoWake: periodicAttempt != nil,
+            decorateLocalInputs: { baseline in
+                #if DEBUG
+                    if let decorate = self.test_agentSessionLinkLocalInputDecoration { return decorate(baseline) }
+                #endif
+                return AgentSessionLinkRuntimeBridge.shared.localInputDecoration(
+                    observer: context.epoch.endpoint, inventory: context.inventory, baseline: baseline
+                )
+            },
+            routineStatusWake: routineStatusWake,
             render: AgentSessionLinkPrompts.rendered
         )
     }
@@ -850,6 +874,34 @@ extension AgentModeViewModel {
             text: AgentSessionLinkPromptComposer.decorated(providerText, with: claim),
             claim: claim,
             mustAbortDispatch: false
+        )
+    }
+
+    func agentSessionLinkProveProviderInput(
+        for session: TabSession, claim: AgentSessionLinkOutboundPromptClaim?
+    ) async -> AgentSessionLinkProviderInputRelease.Proof {
+        await AgentSessionLinkProviderInputRelease.prove(claim) { decoration in
+            guard let observer = claim?.observerEndpoint,
+                  self.sessions[session.tabID] === session else { return false }
+            #if DEBUG
+                if let readProof = self.test_agentSessionLinkLocalInputReadProof { return await readProof(decoration) }
+            #endif
+            return await AgentSessionLinkRuntimeBridge.shared.proveLocalInputRead(decoration, observer: observer)
+        }
+    }
+
+    func agentSessionLinkHandoffProviderInput(
+        for session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID,
+        claim: AgentSessionLinkOutboundPromptClaim?, proof: AgentSessionLinkProviderInputRelease.Proof
+    ) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext {
+        AgentSessionLinkProviderInputRelease.handoff(
+            original: claim, proof: proof,
+            current: { self.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID) },
+            isPending: { self.agentSessionLinkPromptClaimStore.isPending($0) },
+            consume: { decoration in
+                guard let observer = claim?.observerEndpoint, self.sessions[session.tabID] === session else { return false }
+                return AgentSessionLinkRuntimeBridge.shared.consumeLocalInputHandoff(decoration, observer: observer)
+            }
         )
     }
 

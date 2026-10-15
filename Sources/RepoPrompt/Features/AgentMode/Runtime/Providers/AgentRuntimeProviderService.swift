@@ -328,7 +328,7 @@ final class AgentRuntimeProviderService {
                 modelString: modelString,
                 includeRepoPromptMCPServer: true,
                 cleanupProjectMCPApproval: true,
-                modelOverrides: modelParameterSelections.map { .init(configID: $0.configID, valueRaw: $0.valueRaw) }
+                modelParameterSelections: modelParameterSelections
             )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")
@@ -353,7 +353,9 @@ final class AgentRuntimeProviderService {
                 config: DevinAgentConfig(
                     enableDebugLogging: Self.enableDebugLogging,
                     includeRepoPromptMCPServer: true,
-                    modelString: modelString
+                    modelString: modelString,
+                    useAutoPermissionModeAtLaunch: true,
+                    modelParameterSelections: modelParameterSelections
                 ),
                 workspacePath: workspacePath
             )

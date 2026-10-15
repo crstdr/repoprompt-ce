@@ -31,6 +31,10 @@ enum AgentSessionLinkModelOutcome {
 }
 
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
+        nil
+    }
+
     func agentSessionLinkBootstrapState(for _: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
         nil
     }
@@ -132,6 +136,9 @@ struct AgentSessionLinkForkInheritanceSummary: Equatable {
 /// observing a target must never switch, activate, or focus its window.
 @MainActor
 protocol AgentSessionLinkEndpointHost: AnyObject {
+    /// Exact bounded retained-input lookup. Metadata-only lifecycle calls never copy text.
+    func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot?
+
     /// All live compose-tab/session bindings across every non-closing window.
     func agentSessionLinkCandidates(includeLocation: Bool) -> [AgentSessionLinkEndpointCandidate]
 
@@ -223,6 +230,14 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     func agentSessionLinkObservationSnapshot(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> DomainAgentSessionObservationSnapshot
+
+    func agentSessionLinkPassiveWakeEvidence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence
+
+    func agentSessionLinkInstallObservation(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        onChange: @escaping @MainActor () -> Void,
+        onPassiveWakeChange: @escaping @MainActor () -> Void
+    ) -> AgentSessionLinkObservationToken?
 
     /// Batch-refreshes durable child metadata without doing a registry scan for each target.
     func agentSessionLinkRefreshSubagentCensus(
@@ -546,12 +561,24 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
-    func agentSessionLinkWillActivate(_: DomainAgentSessionLinkEndpointIdentity) async {}
+    func agentSessionLinkPassiveWakeEvidence(for _: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence {
+        .unknown
+    }
+
+    func agentSessionLinkInstallObservation(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        onChange: @escaping @MainActor () -> Void,
+        onPassiveWakeChange _: @escaping @MainActor () -> Void
+    ) -> AgentSessionLinkObservationToken? {
+        agentSessionLinkInstallObservation(for: candidate, onChange: onChange)
+    }
 
     /// Full choice discovery remains rich by default; cheap topology discovery is explicit.
     func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
         agentSessionLinkCandidates(includeLocation: true)
     }
+
+    func agentSessionLinkWillActivate(_: DomainAgentSessionLinkEndpointIdentity) async {}
 
     func agentSessionLinkClaimLaneRetirement(endpoint _: DomainAgentSessionLinkEndpointIdentity) -> UUID? {
         nil
@@ -944,10 +971,19 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
+    private struct PassiveWakePublication {
+        let snapshot: DomainAgentSessionObservationSnapshot
+        let evidence: AgentSessionLinkPassiveWakeEvidence
+        let sourceSequence: UInt64
+    }
+
     private final class TargetPublicationChain {
         let endpoint: DomainAgentSessionLinkEndpointIdentity
         var token: AgentSessionLinkObservationToken?
         var tail: Task<Void, Never>?
+        /// One pending capture and one accepted pair per chain, never a publication history.
+        var capturedPassiveWakeEvidence: AgentSessionLinkPassiveWakeEvidence = .unknown
+        var passiveWakePublication: PassiveWakePublication?
         /// Monotonic canonical activity for this exact target incarnation.
         var activityHighWater: Date?
 
@@ -1870,6 +1906,10 @@ final class AgentSessionLinkRuntimeBridge {
 
         func test_launchReservationStartCount() -> Int {
             launchCoordinator?.reservationStartCount ?? 0
+        }
+
+        func test_launchRefusedEstablishmentCount(for pair: AgentSessionOversightIntent) -> Int {
+            launchCoordinator?.refusedEstablishmentCount(for: pair) ?? 0
         }
 
         /// Test seam: runs the eager observer-eligibility audit synchronously.
@@ -4305,6 +4345,11 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
+            // Retire only the disclosure lease before durable settlement can suspend. A proof
+            // completed just before this known revocation must not survive its disk-write hop.
+            if let observer = notice.observerEndpoint {
+                passiveNoticesByObserver[observer]?.localInputFrontiers.removeValue(forKey: reference)
+            }
         }
         // Generation-qualified for the same reason, and released before anything republishes: a
         // queued message must never outlive the exact grant that admitted it.
@@ -4379,10 +4424,13 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let chain = TargetPublicationChain(endpoint: endpoint, activityHighWater: initialActivity)
         chains[endpoint.sessionID] = chain
-        chain.token = host.agentSessionLinkInstallObservation(for: candidate) { [weak self, weak chain] in
+        chain.token = host.agentSessionLinkInstallObservation(for: candidate, onChange: { [weak self, weak chain] in
             guard let chain else { return }
             self?.publishTargetSnapshot(endpoint: endpoint, originatingChain: chain)
-        }
+        }, onPassiveWakeChange: { [weak self, weak chain] in
+            guard let chain else { return }
+            self?.publishPassiveWakeEvidence(endpoint: endpoint, chain: chain)
+        })
         guard chain.token != nil else {
             // The endpoint disappeared between activation and observation install. Fail closed.
             chains.removeValue(forKey: endpoint.sessionID)
@@ -4452,10 +4500,25 @@ final class AgentSessionLinkRuntimeBridge {
         }
 
         let snapshot = host.agentSessionLinkObservationSnapshot(for: candidate)
+        let evidence = host.agentSessionLinkPassiveWakeEvidence(for: candidate)
+        let previousEvidence = chain.capturedPassiveWakeEvidence
         observeActivity(snapshot.lastActivityAt, for: endpoint)
         // Drop no-op rebuilds (notably the replay burst every new `@Published` subscription emits) so
         // an unchanged target never advances `change_sequence` or wakes a parked waiter.
-        guard lastPublishedSnapshotBySession[sessionID] != snapshot else { return }
+        guard lastPublishedSnapshotBySession[sessionID] != snapshot else {
+            guard previousEvidence != evidence else { return }
+            chain.capturedPassiveWakeEvidence = evidence
+            enqueuePassiveWakeEvidence(
+                evidence,
+                endpoint: endpoint,
+                chain: chain,
+                sourceSequence: nextSourcePublicationSequenceBySession[sessionID] ?? 0,
+                sourceSnapshot: snapshot,
+                isNewOccurrence: previousEvidence.ownership != evidence.ownership
+            )
+            return
+        }
+        chain.capturedPassiveWakeEvidence = evidence
         lastPublishedSnapshotBySession[sessionID] = snapshot
         // The one readiness trigger a queued send has. It hangs off an *accepted* publication, so an
         // unchanged target produces none at all and nothing ever polls for readiness.
@@ -4464,14 +4527,137 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let sequence = allocateSourcePublicationSequence(for: sessionID)
         let previous = chain.tail
-        chain.tail = Task { [authority] in
+        chain.tail = Task { [weak self, weak chain, authority] in
             await previous?.value
-            _ = await authority.publishTargetSnapshot(
+            let disposition = await authority.publishTargetSnapshot(
                 endpoint: endpoint,
                 snapshot: snapshot,
                 sourcePublicationSequence: sequence
             )
+            guard let self, let chain, !isFrozenForTermination, chains[sessionID] === chain else { return }
+            switch disposition {
+            case .accepted, .unchanged:
+                if evidence == .unknown {
+                    chain.passiveWakePublication = nil
+                } else {
+                    let canonical = await authority.observationSnapshot(forTargetEndpoint: endpoint)
+                    guard !isFrozenForTermination, chains[sessionID] === chain,
+                          let canonical, Self.sameSourcePayload(snapshot, canonical) else { return }
+                    chain.passiveWakePublication = .init(snapshot: canonical, evidence: evidence, sourceSequence: sequence)
+                }
+            case .stale, .unknownTarget, .shuttingDown:
+                chain.passiveWakePublication = nil
+            }
         }
+    }
+
+    /// Private resolution never rebuilds a preview or publishes through authority. A new attempt
+    /// needs the full source-frame path above; it cannot lend its proof to an older public sample.
+    private func publishPassiveWakeEvidence(endpoint: DomainAgentSessionLinkEndpointIdentity, chain: TargetPublicationChain) {
+        guard !isFrozenForTermination, chains[endpoint.sessionID] === chain, let host,
+              let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { return }
+        let evidence = host.agentSessionLinkPassiveWakeEvidence(for: candidate)
+        let captured = chain.capturedPassiveWakeEvidence
+        guard captured != evidence, captured.ownership != nil,
+              evidence.ownership == captured.ownership || evidence == .unknown else { return }
+        chain.capturedPassiveWakeEvidence = evidence
+        enqueuePassiveWakeEvidence(
+            evidence,
+            endpoint: endpoint,
+            chain: chain,
+            sourceSequence: nextSourcePublicationSequenceBySession[endpoint.sessionID] ?? 0
+        )
+    }
+
+    private func enqueuePassiveWakeEvidence(
+        _ evidence: AgentSessionLinkPassiveWakeEvidence,
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        chain: TargetPublicationChain,
+        sourceSequence: UInt64,
+        sourceSnapshot: DomainAgentSessionObservationSnapshot? = nil,
+        isNewOccurrence: Bool = false
+    ) {
+        let previous = chain.tail
+        chain.tail = Task { [weak self, weak chain, authority] in
+            await previous?.value
+            guard let self, let chain, !isFrozenForTermination, chains[endpoint.sessionID] === chain else { return }
+            let canonical: DomainAgentSessionObservationSnapshot?
+            if let paired = chain.passiveWakePublication, paired.sourceSequence == sourceSequence {
+                canonical = paired.snapshot
+            } else if sourceSnapshot != nil {
+                // Same-public source occurrence (including the activation seed). The full source
+                // frame is paired only if it still matches the canonical payload; no cursor moves.
+                canonical = await authority.observationSnapshot(forTargetEndpoint: endpoint)
+            } else {
+                return
+            }
+            guard !isFrozenForTermination, chains[endpoint.sessionID] === chain, let canonical,
+                  sourceSnapshot.map({ Self.sameSourcePayload($0, canonical) }) ?? true else { return }
+            // A bare private retirement is not a new public source occurrence. Preserve the
+            // immutable settled sample's proof for unrelated projection rereads; otherwise they
+            // would promote an old silent pin merely because its live source record retired.
+            let pairedEvidence: AgentSessionLinkPassiveWakeEvidence = if evidence == .unknown, sourceSnapshot == nil,
+                                                                         case let .silent(owner)? = chain.passiveWakePublication?.evidence
+            {
+                .silent(owner)
+            } else {
+                evidence
+            }
+            chain.passiveWakePublication = .init(snapshot: canonical, evidence: pairedEvidence, sourceSequence: sourceSequence)
+            await resolvePassiveWakeEvidence(
+                evidence,
+                endpoint: endpoint,
+                chain: chain,
+                sourceSequence: sourceSequence,
+                isNewOccurrence: isNewOccurrence
+            )
+        }
+    }
+
+    /// Indexed inverse membership plus point authorization; never a topology/reducer sweep. The
+    /// existing catalog supplies an address, not authority: a fresh exact grant must match it.
+    private func resolvePassiveWakeEvidence(
+        _ evidence: AgentSessionLinkPassiveWakeEvidence,
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        chain: TargetPublicationChain,
+        sourceSequence: UInt64,
+        isNewOccurrence: Bool
+    ) async {
+        let inbound = await authority.links(forTargetEndpoint: endpoint)
+        guard !isFrozenForTermination, chains[endpoint.sessionID] === chain,
+              chain.passiveWakePublication?.sourceSequence == sourceSequence,
+              host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil else { return }
+        for item in inbound.items {
+            guard let observer = menuCatalog?.inputs[endpoint]?.inboundObserverEndpoints[item.linkID] else { continue }
+            let authorization = await authority.authorize(operation: .monitorPoll, observerEndpoint: observer, targetSessionID: endpoint.sessionID)
+            guard !isFrozenForTermination, chains[endpoint.sessionID] === chain,
+                  chain.passiveWakePublication?.sourceSequence == sourceSequence,
+                  host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil,
+                  host?.agentSessionLinkCandidate(for: observer, includeLocation: false) != nil,
+                  case let .success(lease) = authorization, lease.target == endpoint,
+                  lease.linkID == item.linkID, lease.linkGeneration == item.generation,
+                  var notices = passiveNoticesByObserver[observer] else { continue }
+            notices.resolvePassiveWakeEvidence(
+                reference: .init(linkID: item.linkID, generation: item.generation),
+                targetEndpoint: endpoint,
+                evidence: evidence,
+                isNewOccurrence: isNewOccurrence
+            )
+            passiveNoticesByObserver[observer] = notices
+            publishPassiveNotices(notices.snapshot, to: observer)
+        }
+    }
+
+    /// Authority alone canonicalizes idleSince. Every other source field must match before private
+    /// proof is attached; a replacement/publication from another owner fails open.
+    private static func sameSourcePayload(_ lhs: DomainAgentSessionObservationSnapshot, _ rhs: DomainAgentSessionObservationSnapshot) -> Bool {
+        lhs.sessionID == rhs.sessionID && lhs.displayName == rhs.displayName
+            && lhs.providerDisplayName == rhs.providerDisplayName && lhs.status == rhs.status
+            && lhs.board == rhs.board && lhs.idleForSend == rhs.idleForSend
+            && lhs.waitingOn == rhs.waitingOn && lhs.pendingInteractionKind == rhs.pendingInteractionKind
+            && lhs.latestVisibleAssistantPreview == rhs.latestVisibleAssistantPreview
+            && lhs.visibleRowCount == rhs.visibleRowCount && lhs.lastActivityAt == rhs.lastActivityAt
+            && lhs.context == rhs.context
     }
 
     private func allocateSourcePublicationSequence(for sessionID: UUID) -> UInt64 {
@@ -4763,7 +4949,15 @@ final class AgentSessionLinkRuntimeBridge {
             for: candidate,
             samples: monitor.statusSamples,
             linkSetRevision: inputs.outbound.linkSetRevision,
-            currentCandidate: currentCandidate
+            currentCandidate: currentCandidate,
+            localInputSources: inputs.outbound.items.compactMap { item in
+                guard item.capabilities.contains(.read),
+                      let target = inputs.outboundTargetEndpoints[item.linkID] else { return nil }
+                return AgentSessionLinkPassiveStatusNotices.LocalInputSource(
+                    reference: .init(linkID: item.linkID, generation: item.generation), target: target,
+                    snapshot: host.agentSessionLinkLocalInputSnapshot(for: target, includeRecords: false)
+                )
+            }
         )
         return EndpointProjection(
             props: monitor.props,
@@ -4884,7 +5078,17 @@ final class AgentSessionLinkRuntimeBridge {
                 // may reach a queued notice. Materializing the redacted preview is why this runs only
                 // on the authoritative pass, never on a location, Seen, settings, sidebar-menu, or
                 // observer-role repaint.
+                let sourceChain = chains[targetEndpoint.sessionID]
+                await sourceChain?.tail?.value
                 let observation = await authority.observationSnapshot(forTargetEndpoint: targetEndpoint)
+                let paired = sourceChain?.passiveWakePublication
+                let evidence: AgentSessionLinkPassiveWakeEvidence = if let sourceChain,
+                                                                       chains[targetEndpoint.sessionID] === sourceChain, sourceChain.endpoint == targetEndpoint,
+                                                                       let paired, paired.snapshot == observation,
+                                                                       Self.monitorStatus(.init(status: paired.snapshot.status, pendingInteractionKind: paired.snapshot.pendingInteractionKind)) == presentation.status
+                {
+                    paired.evidence
+                } else { .unknown }
                 statusSamples.append(AgentSessionLinkPassiveStatusNotices.Sample(
                     reference: reference,
                     targetEndpoint: targetEndpoint,
@@ -4896,7 +5100,8 @@ final class AgentSessionLinkRuntimeBridge {
                     idleForSend: observation?.idleForSend ?? false,
                     idleSince: observation?.idleSince,
                     waitingOn: observation?.waitingOn,
-                    latestVisibleAssistantPreview: observation?.latestVisibleAssistantPreview
+                    latestVisibleAssistantPreview: observation?.latestVisibleAssistantPreview,
+                    passiveWakeEvidence: evidence
                 ))
             }
             outbound.append(AgentMonitorPillProps.Outbound(
@@ -5654,7 +5859,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// whole batch would discard the healthy siblings' cursors. Instead each target is re-fenced on
     /// its own, like `terminalWaitSurvivingStates`: survivors keep their rows and prompts, and a
     /// target that fails its own fence releases nothing. Returns `nil` only when no target survives
-    /// (or for a single target that fails), so the caller denies exactly as before.
+    /// (or for a single target that fails), or when the final survivor batch changes again.
     func pendingInteractionsForWaitObservation(
         leases: [DomainAgentSessionLinkLease]
     ) async -> (
@@ -5901,12 +6106,67 @@ final class AgentSessionLinkRuntimeBridge {
         return .success(host)
     }
 
-    /// Applies one accepted provider receipt to the exact observer's queue.
-    ///
-    /// Synchronous because it runs at the provider's acceptance signal, on the same MainActor pass as
-    /// the dispatch it acknowledges. The reducer enforces epoch scoping, monotonicity, and
-    /// idempotence; the immediate republish is what stops a second natural dispatch from reclaiming a
-    /// batch that was already physically delivered.
+    /// Claim-time pull over baseline-selected status entries only. No transcript/global census.
+    func localInputDecoration(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        inventory: AgentSessionLinkPromptInventory,
+        baseline: AgentSessionLinkPromptRenderResult
+    ) -> AgentSessionLinkLocalInputDecoration? {
+        guard !isFrozenForTermination, let host,
+              let observerCandidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
+              Self.passiveDeliveryIsPermitted(for: observerCandidate),
+              var notices = passiveNoticesByObserver[observer],
+              let entries = baseline.passiveBatch?.entries else { return nil }
+        var offers: [AgentSessionLinkPassiveStatusNotices.LocalInputOffer] = []
+        for entry in entries {
+            guard inventory.items.contains(where: {
+                $0.reference == entry.reference && $0.targetSessionID == entry.targetSessionID && $0.capabilityNames.contains("read")
+            }) else { continue }
+            let source = AgentSessionLinkPassiveStatusNotices.LocalInputSource(
+                reference: entry.reference, target: entry.targetEndpoint,
+                snapshot: host.agentSessionLinkLocalInputSnapshot(for: entry.targetEndpoint, includeRecords: true)
+            )
+            if let offer = notices.localInputOffer(for: source) { offers.append(offer) }
+        }
+        passiveNoticesByObserver[observer] = notices
+        return AgentSessionLinkPrompts.decorateLocalInputs(baseline, offers: offers)
+    }
+
+    /// Exact endpoints, content and captured frontier. Safe both before and after authority await.
+    func localInputContentIsCurrent(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isFrozenForTermination, let host,
+              let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
+              Self.passiveDeliveryIsPermitted(for: candidate),
+              let notices = passiveNoticesByObserver[observer],
+              notices.canConsumeLocalInputs(decoration.requirements.map(\.offer.range)) else { return false }
+        return decoration.requirements.allSatisfy { requirement in
+            let range = requirement.offer.range
+            guard let snapshot = host.agentSessionLinkLocalInputSnapshot(for: range.target, includeRecords: true),
+                  snapshot.epoch == range.indexEpoch, snapshot.producedThrough >= range.throughOrdinal else { return false }
+            return requirement.renderedRecords.allSatisfy { frozen in
+                snapshot.records.contains(where: {
+                    $0.itemID == frozen.itemID && $0.ordinal == frozen.ordinal && $0.contentVersion == frozen.contentVersion && $0.content == frozen.content
+                })
+            }
+        }
+    }
+
+    func proveLocalInputRead(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
+        guard localInputContentIsCurrent(decoration, observer: observer) else { return false }
+        let requirements = decoration.requirements.map {
+            DomainAgentSessionReadDisclosureRequirement(observer: observer, target: $0.offer.range.target, reference: $0.offer.range.reference)
+        }
+        return await authority.validateReadDisclosures(requirements)
+    }
+
+    /// Synchronous final handoff consumption; no publication, acceptance or wake state mutation.
+    func consumeLocalInputHandoff(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard localInputContentIsCurrent(decoration, observer: observer), var notices = passiveNoticesByObserver[observer],
+              notices.consumeLocalInputs(decoration.requirements.map(\.offer.range)) else { return false }
+        passiveNoticesByObserver[observer] = notices
+        return true
+    }
+
     func applyPassiveMonitorNoticeReceipt(
         _ receipt: AgentSessionLinkPassiveStatusNotices.Receipt,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -5929,7 +6189,8 @@ final class AgentSessionLinkRuntimeBridge {
         for candidate: AgentSessionLinkEndpointCandidate,
         samples: [AgentSessionLinkPassiveStatusNotices.Sample],
         linkSetRevision: UInt64,
-        currentCandidate current: AgentSessionLinkEndpointCandidate?
+        currentCandidate current: AgentSessionLinkEndpointCandidate?,
+        localInputSources: [AgentSessionLinkPassiveStatusNotices.LocalInputSource]
     ) -> AgentSessionLinkPassiveStatusNotices.Snapshot? {
         let endpoint = candidate.domainEndpoint
         let existing = passiveNoticesByObserver[endpoint]
@@ -5968,6 +6229,7 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
         notices.setAutoWakeLanes(autoWakeLanes)
+        notices.reconcileLocalInputSources(localInputSources)
         let snapshot = notices.snapshot
         if samples.isEmpty {
             // The last direct link went away. Publish one terminal empty snapshot so the view model

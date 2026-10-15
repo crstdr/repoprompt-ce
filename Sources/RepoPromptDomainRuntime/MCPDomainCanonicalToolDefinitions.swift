@@ -1432,10 +1432,16 @@ package enum MCPDomainCanonicalToolDefinitions {
                     of: oldWaitDescription,
                     with: currentWaitDescription
                 )
+            let oldStartDescription = "Pass `detach: true` to return immediately."
+            let currentStartDescription = oldStartDescription
+                + " Start: setup ≤900s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
+            let startDescription = description.contains(currentStartDescription)
+                ? description
+                : description.replacingOccurrences(of: oldStartDescription, with: currentStartDescription)
             return canonicalizeAgentControlWaitSemantics(
                 MCPDomainToolDefinition(
                     name: definition.name,
-                    description: description,
+                    description: startDescription,
                     inputSchema: definition.inputSchema,
                     annotations: definition.annotations,
                     isEnabledByDefault: definition.isEnabledByDefault
@@ -2848,55 +2854,61 @@ package enum MCPDomainCanonicalToolDefinitions {
     }
 
     #if DEBUG
-        package static func test_agentSessionLinkAutonomyContractState(
-            _ definition: MCPDomainToolDefinition
-        ) -> String {
-            autonomyContractState(definition).rawValue
-        }
+    package static func test_agentSessionLinkAutonomyContractState(
+        _ definition: MCPDomainToolDefinition
+    ) -> String {
+        autonomyContractState(definition).rawValue
+    }
 
-        package static func test_applyAgentSessionLinkAutonomyContract(
-            _ definition: MCPDomainToolDefinition
-        ) -> MCPDomainToolDefinition {
-            applyAgentSessionLinkAutonomyContract(definition)
-        }
+    package static func test_applyAgentSessionLinkAutonomyContract(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        applyAgentSessionLinkAutonomyContract(definition)
+    }
 
-        /// The complete pipeline, so convergence can be tested by literally feeding a result back in.
-        ///
-        /// Canonicalizing twice through `definition(named:)` proves nothing: each call re-runs the same
-        /// passes over the same vendored blob and can agree while the pipeline is unable to read its own
-        /// output at all.
-        package static func test_canonicalizeAgentSessionLink(
-            _ definition: MCPDomainToolDefinition
-        ) -> MCPDomainToolDefinition {
-            canonicalizeAgentSessionLink(definition)
-        }
+    /// The complete pipeline, so convergence can be tested by literally feeding a result back in.
+    ///
+    /// Canonicalizing twice through `definition(named:)` proves nothing: each call re-runs the same
+    /// passes over the same vendored blob and can agree while the pipeline is unable to read its own
+    /// output at all.
+    package static func test_canonicalizeAgentSessionLink(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        canonicalizeAgentSessionLink(definition)
+    }
 
-        package static func test_agentSessionLinkPreviousStopDefinition() -> MCPDomainToolDefinition {
-            canonicalizeAgentSessionLinkBeforeModelSelection(test_agentSessionLinkLegacyCurrentDefinition())
-        }
+    package static func test_agentSessionLinkPreviousStopDefinition() -> MCPDomainToolDefinition {
+        canonicalizeAgentSessionLinkBeforeModelSelection(test_agentSessionLinkLegacyCurrentDefinition())
+    }
 
-        package static func test_agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-            agentSessionLinkModelSelectionIsPartial(definition)
-        }
+    package static func test_agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
+        agentSessionLinkModelSelectionIsPartial(definition)
+    }
 
-        package static func test_agentSessionLinkPreviousCompactDefinition() -> MCPDomainToolDefinition {
-            applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())
-        }
+    package static func test_agentSessionLinkPreviousCompactDefinition() -> MCPDomainToolDefinition {
+        applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())
+    }
 
-        package static func test_canonicalizeAgentControlWaitSemantics(
-            _ definition: MCPDomainToolDefinition
-        ) -> MCPDomainToolDefinition {
-            canonicalizeAgentControlWaitSemantics(definition)
-        }
+    package static func test_canonicalizeGlobalSemantics(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        canonicalizeGlobalSemantics(definition)
+    }
 
-        package static func test_agentSessionLinkLegacyCurrentDefinition() -> MCPDomainToolDefinition {
-            guard let vendored = decodeDefinitions(canonicalize: false).first(where: {
-                $0.name == MCPWindowToolName.agentSessionLink
-            }) else {
-                preconditionFailure("Missing vendored agent_session_link definition")
-            }
-            return canonicalizeAgentSessionLinkBeforeTokenEfficiency(vendored)
+    package static func test_canonicalizeAgentControlWaitSemantics(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        canonicalizeAgentControlWaitSemantics(definition)
+    }
+
+    package static func test_agentSessionLinkLegacyCurrentDefinition() -> MCPDomainToolDefinition {
+        guard let vendored = decodeDefinitions(canonicalize: false).first(where: {
+            $0.name == MCPWindowToolName.agentSessionLink
+        }) else {
+            preconditionFailure("Missing vendored agent_session_link definition")
         }
+        return canonicalizeAgentSessionLinkBeforeTokenEfficiency(vendored)
+    }
     #endif
 
     /// Removes the historical dashboard-completion operation after every additive migration has

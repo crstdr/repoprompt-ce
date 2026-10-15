@@ -6,6 +6,12 @@ import RepoPromptSettingsCore
 
 @MainActor
 final class ClaudeIntegratedAgentModeRunner {
+    private enum RunnerEvent {
+        case native(NativeAgentRuntimeEvent)
+        case steeringAbandoned(Set<UUID>)
+        case staleActiveProbe
+    }
+
     private enum ConsumeEventsOutcome {
         case completed
         case cancelled
@@ -17,6 +23,33 @@ final class ClaudeIntegratedAgentModeRunner {
     /// thrown errors. This marker is intentionally runner-local: the coordinator
     /// and native controller remain the authorities for the underlying terminal
     /// event and its provider-specific metadata.
+    private final class RecoveryMark {
+        var accepted = false
+    }
+
+    static func staleActiveRecoveryFencesAreClear(session: AgentTabSession, coordinator: ClaudeAgentModeCoordinator, ownership: AgentRunOwnership, runID: UUID) -> Bool {
+        session.selectedAgent == .claudeCode
+            && session.runState == .running
+            && coordinator.runAttemptIsCurrent(ownership, runID: runID, for: session)
+            && !session.terminalCommitInProgress
+            && session.claudeExpectedTurnIDs.isEmpty
+            && session.claudeSupersedingProtectedTurnIDs.isEmpty
+            && session.pendingSupersedingTurnCompletions == 0
+            && session.pendingClaudeSteeringInstructions.isEmpty
+            && session.claudeSteeringFlushTask == nil
+            && session.pendingInstructions.isEmpty
+            && !coordinator.hasNativeSendOrToolWork(session: session, runID: runID)
+            && !session.hasBindingBlockingInteraction
+            && session.selfCompactState.active == nil
+            && session.selfCompactAdmissionPendingID == nil
+            && session.nativeControlProgressID == nil
+            && !session.isComposerSubmissionInFlight
+            && !session.isMCPInstructionDispatchInProgress
+            && !session.isPreparingInitialWorktree
+            && !session.isChangingExecutionLocation
+            && !session.mcpFollowUpRunPending
+    }
+
     private struct NativeTerminalFailure: Error {}
 
     private let claudeCoordinator: ClaudeAgentModeCoordinator
@@ -85,11 +118,14 @@ final class ClaudeIntegratedAgentModeRunner {
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        localComposerCandidate: UUID? = nil,
+        passiveWakeID: UUID? = nil
     ) async {
         let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
         var handedToRunTask = false
         defer {
+            if !handedToRunTask { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
             if let dedicatedNoteID, !handedToRunTask {
                 AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                     hooks.persistence.scheduleSave(session)
@@ -117,12 +153,13 @@ final class ClaudeIntegratedAgentModeRunner {
             Task { await lease.cancelAndCleanup() }
             return
         }
-        let ownership = session.beginRunAttempt(source: "claudeNative")
+        let ownership = session.beginRunAttempt(source: "claudeNative", passiveWakeID: passiveWakeID)
+        let recovery = RecoveryMark()
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak session] terminalState in
             {
                 switch terminalState {
                 case .failed:
-                    await lease.failAndRelease()
+                    if !recovery.accepted { await lease.failAndRelease() }
                 case .cancelled:
                     await Self.cancelAttemptLease(lease, session: session, runID: runID)
                 default:
@@ -161,6 +198,7 @@ final class ClaudeIntegratedAgentModeRunner {
         session.agentTask = Task { [weak self, weak session, hooks] in
             guard let session else { return }
             defer {
+                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
                 if let dedicatedNoteID {
                     AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                         hooks.persistence.scheduleSave(session)
@@ -205,6 +243,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         providerControlCommand: providerControlCommand,
                         selfCompactDispatchID: selfCompactDispatchID
                     )
+                    if sendOutcome == .sent { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
                     if let dedicatedNoteID, sendOutcome != .sent {
                         AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                             self.hooks.persistence.scheduleSave(session)
@@ -215,7 +254,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         "ready"
                     case .failed:
                         Task.isCancelled ? "cancelled" : "failed"
-                    case .superseded:
+                    case .superseded, .supersededAfterWriteAttempt:
                         "superseded"
                     }
                     await lease.providerInitializationCompleted(
@@ -230,7 +269,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     case .failed:
                         nativeFailureMetadata = (errorText: nil, shouldShutdownSession: false)
                         throw NativeTerminalFailure()
-                    case .superseded:
+                    case .superseded, .supersededAfterWriteAttempt:
                         return .superseded
                     }
 
@@ -251,7 +290,8 @@ final class ClaudeIntegratedAgentModeRunner {
                         events,
                         session: session,
                         runID: runID,
-                        runAttemptID: runAttemptID
+                        runAttemptID: runAttemptID,
+                        recovery: recovery
                     ) {
                     case .completed:
                         return .completed(assistantText: nil)
@@ -304,7 +344,8 @@ final class ClaudeIntegratedAgentModeRunner {
                         errorText: outcome.kind == .failed ? nativeFailureMetadata?.errorText : nil,
                         notifyTurnComplete: outcome.kind == .completed,
                         shouldShutdownSession: outcome.kind == .failed
-                            && nativeFailureMetadata?.shouldShutdownSession == true
+                            && nativeFailureMetadata?.shouldShutdownSession == true,
+                        source: recovery.accepted ? "claudeNative.staleActiveRecovery" : "claudeNative.finalize"
                     )
                 }
             } onCancel: {}
@@ -324,7 +365,8 @@ final class ClaudeIntegratedAgentModeRunner {
         _ events: AsyncStream<NativeAgentRuntimeEvent>,
         session: AgentTabSession,
         runID: UUID,
-        runAttemptID: UUID
+        runAttemptID: UUID,
+        recovery: RecoveryMark
     ) async -> ConsumeEventsOutcome {
         var exitedDueToAttemptMismatch = false
         // Only first-party Claude owns this subscription telemetry. No extra request or
@@ -348,7 +390,44 @@ final class ClaudeIntegratedAgentModeRunner {
             }
         }
 
-        eventLoop: for await event in events {
+        // Keep consuming provider events while a promised successor is waiting for MCP idle.
+        // The local settlement signal wakes this loop even when the provider stream stays open.
+        let inbox = AsyncStream<RunnerEvent>.makeStream()
+        var queuedNativeEvents = 0
+        let forwarding = Task {
+            for await event in events {
+                queuedNativeEvents += 1
+                inbox.continuation.yield(.native(event))
+            }
+            inbox.continuation.finish()
+        }
+        let subscribedController = session.claudeController
+        var probePending = false
+        var uncertainTerminalIDs: Set<UUID> = []
+        var protectedTerminal: (turnID: UUID, status: NativeAgentRuntimeTurnStatus)?
+        var settlementRecheck: Task<Void, Never>?
+        session.claudeSteeringAbandonment = (runAttemptID, { ids in
+            inbox.continuation.yield(.steeringAbandoned(ids))
+        }, {
+            guard !probePending else { return }
+            probePending = true
+            inbox.continuation.yield(.staleActiveProbe)
+        }, {
+            // Only outcomes already outstanding at this write boundary are superseded.
+            // A later accepted turn can establish its own authoritative completion.
+            uncertainTerminalIDs.formUnion(session.claudeExpectedTurnIDs)
+            if let terminal = protectedTerminal { uncertainTerminalIDs.insert(terminal.turnID) }
+        })
+        defer {
+            forwarding.cancel()
+            settlementRecheck?.cancel()
+            inbox.continuation.finish()
+            if session.claudeSteeringAbandonment?.attemptID == runAttemptID {
+                session.claudeSteeringAbandonment = nil
+            }
+        }
+        var abandonedProtectedTurns: Set<UUID> = []
+        eventLoop: for await input in inbox.stream {
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID
             else {
@@ -356,6 +435,75 @@ final class ClaudeIntegratedAgentModeRunner {
                 break eventLoop
             }
 
+            let event: NativeAgentRuntimeEvent
+            switch input {
+            case let .native(native):
+                queuedNativeEvents -= 1
+                event = native
+            case .staleActiveProbe:
+                probePending = false
+                guard let ownership = session.activeRunOwnership,
+                      let controller = subscribedController,
+                      session.claudeController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
+                      Self.staleActiveRecoveryFencesAreClear(session: session, coordinator: claudeCoordinator, ownership: ownership, runID: runID)
+                else { continue eventLoop }
+                let active = await controller.hasActiveSession
+                let busy = await controller.hasTurnInFlight
+                // Reads suspend this consumer. Native output already forwarded behind the
+                // probe must be applied before any out-of-band terminal decision.
+                if queuedNativeEvents > 0 {
+                    session.claudeSteeringAbandonment?.probe()
+                    continue eventLoop
+                }
+                guard active, !busy, !Task.isCancelled,
+                      session.claudeController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
+                      Self.staleActiveRecoveryFencesAreClear(session: session, coordinator: claudeCoordinator, ownership: ownership, runID: runID)
+                else { continue eventLoop }
+                if let terminal = protectedTerminal, !uncertainTerminalIDs.contains(terminal.turnID),
+                   abandonedProtectedTurns.contains(terminal.turnID)
+                {
+                    return Self.terminalOutcome(terminal.status)
+                }
+                recovery.accepted = true
+                NSLog("[ClaudeRunRecovery] reason=idle_provider_no_expected_completion")
+                return .failed(errorText: "Claude Code stopped reporting this run's outcome, so RepoPrompt closed it as failed. The conversation is intact; send a message to continue.", shouldShutdownSession: false)
+            case let .steeringAbandoned(ids):
+                // A delayed refusal cannot retire a later dequeued/preparing successor.
+                // Keep the obligation until the flush publishes its quiescent boundary.
+                if let terminal = protectedTerminal, ids.contains(terminal.turnID) {
+                    abandonedProtectedTurns.insert(terminal.turnID)
+                }
+                if let terminal = protectedTerminal, !uncertainTerminalIDs.contains(terminal.turnID),
+                   abandonedProtectedTurns.contains(terminal.turnID), settlementRecheck == nil,
+                   claudeCoordinator.hasNativeSendOrToolWork(session: session, runID: runID)
+                {
+                    settlementRecheck = Task { [weak session] in
+                        defer { settlementRecheck = nil }
+                        guard let session else { return }
+                        // Match the existing child-wait drain cadence; this waits only on
+                        // actual work, not elapsed provider-idle time or an invented result.
+                        while claudeCoordinator.hasNativeSendOrToolWork(session: session, runID: runID) {
+                            guard !Task.isCancelled, session.activeRunAttemptID == runAttemptID else { return }
+                            do { try await Task.sleep(nanoseconds: 25_000_000) } catch { return }
+                        }
+                        guard !Task.isCancelled, session.activeRunAttemptID == runAttemptID else { return }
+                        inbox.continuation.yield(.steeringAbandoned([]))
+                    }
+                }
+                if let terminal = protectedTerminal, !uncertainTerminalIDs.contains(terminal.turnID), abandonedProtectedTurns.contains(terminal.turnID),
+                   !Task.isCancelled,
+                   let ownership = session.activeRunOwnership,
+                   claudeCoordinator.runAttemptIsCurrent(ownership, runID: runID, for: session),
+                   session.claudeController.map(ObjectIdentifier.init) == subscribedController.map(ObjectIdentifier.init),
+                   session.claudeSteeringFlushTask == nil,
+                   !claudeCoordinator.hasNativeSendOrToolWork(session: session, runID: runID),
+                   session.claudeExpectedTurnIDs.isEmpty,
+                   !session.pendingClaudeSteeringInstructions.contains(where: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID })
+                {
+                    return Self.terminalOutcome(terminal.status)
+                }
+                continue eventLoop
+            }
             if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
                 session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
             }
@@ -374,6 +522,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
                 }
             case let .runtimeInit(status):
+                // Actual runtime initialization is unknown provenance. Warm startOrResume
+                // no-ops emit no init event; a restarted process must never inherit silence.
+                session.invalidatePassiveWakeEvidence()
                 // Persist provider session ID as soon as it becomes available from
                 // runtime init events (initialize response or system/init stream).
                 if let newSessionID = status.sessionID,
@@ -401,6 +552,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
                     session.recordRunProgress(ownership: ownership, kind: .interaction, stage: .waitingForInteraction)
                 }
+                session.notePassiveWakeActivity()
                 session.pendingApproval = request
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                 session.setRunningStatus(nil, source: nil)
@@ -427,6 +579,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 let hasLegacyUnscopedProtection = session.claudeSupersedingProtectedTurnIDs.isEmpty
                     && session.pendingSupersedingTurnCompletions > 0
                 if wasProtectedClaudeTurn || hasLegacyUnscopedProtection {
+                    if wasProtectedClaudeTurn { protectedTerminal = (turnID, turnStatus) }
                     session.pendingSupersedingTurnCompletions = max(0, session.pendingSupersedingTurnCompletions - 1)
                     // Keep run alive for the next (superseding) turn regardless of the
                     // stale turn's reported terminal status. Old interrupted turns can land
@@ -442,15 +595,9 @@ final class ClaudeIntegratedAgentModeRunner {
                 // No superseding turn expected — terminal for this run.
                 session.pendingSupersedingTurnCompletions = 0
                 session.claudeSupersedingProtectedTurnIDs.removeAll()
-                switch turnStatus {
-                case .completed:
-                    return .completed
-                case .cancelled:
-                    return .cancelled
-                case .failed:
-                    return .failed(errorText: nil, shouldShutdownSession: false)
-                }
+                return Self.terminalOutcome(turnStatus)
             case let .error(message):
+                session.notePassiveWakeActivity()
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                 session.setRunningStatus(nil, source: nil)
                 let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -481,6 +628,14 @@ final class ClaudeIntegratedAgentModeRunner {
             errorText: "Claude events stream ended unexpectedly. The run may need to be restarted.",
             shouldShutdownSession: false
         )
+    }
+
+    private static func terminalOutcome(_ status: NativeAgentRuntimeTurnStatus) -> ConsumeEventsOutcome {
+        switch status {
+        case .completed: .completed
+        case .cancelled: .cancelled
+        case .failed: .failed(errorText: nil, shouldShutdownSession: false)
+        }
     }
 
     private func handleAcquireFailure(
@@ -514,14 +669,15 @@ final class ClaudeIntegratedAgentModeRunner {
         terminalState: AgentSessionRunState,
         errorText: String?,
         notifyTurnComplete: Bool,
-        shouldShutdownSession: Bool = false
+        shouldShutdownSession: Bool = false,
+        source: String = "claudeNative.finalize"
     ) async -> AgentRunTerminalCommitRevision? {
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: terminalState,
-            source: "claudeNative.finalize",
+            source: source,
             errorText: errorText,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,

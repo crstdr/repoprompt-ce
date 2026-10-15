@@ -1,5 +1,5 @@
 import MCP
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
@@ -478,7 +478,19 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
-    func testCursorKnownModelPassesReleaseCatalogValidationBeforePrompt() throws {
+    func testCursorDiscoveredModelPassesCatalogValidationBeforePrompt() throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(rawValue: "grok-4.6", displayName: "Cursor Grok 4.6", description: nil, isDefault: false)
+                ],
+                currentModelRaw: "grok-4.6"
+            ),
+            for: .cursor
+        ))
+
         let model = try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,
             modelString: "grok-4.6"
@@ -487,7 +499,10 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         XCTAssertEqual(model, "grok-4.6")
     }
 
-    func testCursorAutoAliasPassesReleaseCatalogValidationBeforePrompt() throws {
+    func testCursorAutoAliasPassesCatalogValidationWithoutDiscovery() throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+
         let model = try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,
             modelString: AgentModel.cursorAuto.rawValue
@@ -496,15 +511,39 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         XCTAssertEqual(model, AgentModel.cursorAuto.rawValue)
     }
 
-    func testCursorNewConcreteModelReachesRuntimeValidationWithoutReleaseGate() throws {
-        XCTAssertEqual(try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
+    func testCursorUndiscoveredConcreteModelFailsClosedBeforePrompt() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+
+        XCTAssertThrowsError(try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,
-            modelString: "grok-4.7"
-        ), "grok-4.7")
+            modelString: "cursor-future-model"
+        )) { error in
+            guard case let AIProviderError.invalidConfiguration(detail) = error else {
+                return XCTFail("Expected invalid Cursor model configuration, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("cursor-future-model"))
+            XCTAssertTrue(detail.contains("last known model catalog"))
+        }
     }
 }
 
 final class AgentToolResultPayloadRetentionTests: XCTestCase {
+    /// Passive-wake evidence counts only what the transcript renders: update kinds that normalize
+    /// to no stream events must keep producing nothing for Devin. `user_message_chunk` in
+    /// particular only echoes a client-issued prompt — the input veto already fired on the send
+    /// path — so it stays invisible rather than becoming reply text. If a future kind starts
+    /// producing events here, the evidence layer needs a matching visible-text or veto decision.
+    func testDevinInvisibleUpdateKindsNormalizeToNoEvents() {
+        for kind in ["user_message_chunk", "plan", "available_commands_update", "unrecognized_future_kind"] {
+            let events = ACPDefaultSessionUpdateNormalizer.normalize(
+                ["sessionUpdate": kind, "content": ["type": "text", "text": "visible words"]],
+                providerID: .devin
+            )
+            XCTAssertTrue(events.isEmpty, "\(kind) must stay invisible to transcript and evidence")
+        }
+    }
+
     func testNormalizedEmptyTerminalUpdatesFinishStreamedLifecycleWithoutErasingContent() throws {
         let running = #"{"status":"running","content":"streamed result"}"#
         for output in ["", " \n", "[]", "{}", "null", "\"\""] {

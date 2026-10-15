@@ -24,6 +24,37 @@ defect in this subsystem.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
+## Passive retained user-input excerpts
+
+Optional excerpts decorate only the status `<change>` rows already selected by the baseline
+renderer. They do not create status edges, attention, wakes, or a second passive queue. The target's
+bounded sixteen-record index is a retained-data projection, not a fifth oversight owner. Only an
+exact, positively identified local-composer row receives the optional persisted `localComposer`
+origin after its retained-versus-rollback decision; legacy, API, and text-only reconstructed rows
+remain unknown. Typed retained copies preserve provenance but are not fresh input events.
+
+The existing passive reducer owns process-local exact-link/index-epoch frontiers. New, restored,
+relinked, newly Read-authorized, or temporarily unavailable lanes baseline at the current high-water;
+there is no historical catch-up. Claims harvest only baseline-selected targets, freeze the newest
+four candidates per session, and retain both unchanged baseline and optional decorated fragments.
+The escaped markup delta, including truthful omission counts, is at most 4,096 bytes per dispatch;
+the conditional guidance is separately bounded to 50 repository-estimator tokens. Full sanitized
+messages at or below 600 Swift Characters use `user_input`; longer ones use `user_input_excerpt`
+with exact first-400/last-200 graphemes and true kept/full counts. Both slices intersect the existing
+Read byte-bounded prefix; no tail beyond Read is disclosed.
+
+Read authorization is batched at the final provider-input boundary, without minting a public cursor.
+After the authority await, existing route/Stop/ownership fences and synchronous claim, content, and
+captured-frontier checks must still pass. Missing or stale optional proof selects only the unchanged
+baseline, never a new wake refusal. Authorized handoff consumes the range synchronously immediately
+before provider invocation; ordinary membership/status/attention receipts still wait for their
+existing provider-acceptance signal. A transport failure after possible handoff deliberately loses
+optional input rather than exposing it twice. Accepted/auth/transport retry is baseline-only. This
+is at-most-once exposure within an observer incarnation, not durable or exactly-once delivery.
+MCP schemas/results, public observations/cursors, guidance revisions, settings, UI, attention,
+compaction, echo policy, and all wake admission decisions remain unchanged. Alpha/Delta dogfood is
+a separate user-performed gate, not an automated launch or readiness claim.
+
 ## Delegation scopes (amendment)
 
 A **delegation scope** is durable, user-granted authority for one overseer session to act on many
@@ -200,6 +231,23 @@ Hydration need is derived from current readiness on existing reconciliation even
 loaded/in-flight deduplication. Queued passive work must still match its complete discovery owner and
 persisted descriptor before admission, so an abandoned request cannot suppress successor recovery.
 
+Launch restoration never deletes saved intent because an establishment was refused. A refusal grants
+nothing, but at launch it is routinely transient (an endpoint still hydrating or rebinding, a
+superseded hydration proof, a closing or retiring endpoint). The entry returns to waiting with a small
+per-launch retry budget (`AgentSessionOversightLaunchCoordinator.maxAutomaticEstablishmentAttempts`);
+the next pass reclassifies first, so only a fact `classify` proves (deleted, missing under a fully
+observed topology, duplicate, ineligible, terminal hydration) removes the durable row. An exhausted
+budget leaves the intent dormant for the next launch.
+
+**No data loss across restart or crash.** Oversight intent (`agentSessionOversightLinks.json`),
+delegation scopes (`delegationScopes.json`), and delegated worktree ownership are written atomically
+and durably at the moment of change (`DurableAtomicFileWriter`), so launch simply loads what is on
+disk; nothing depends on a graceful quit. Launch restoration may end an entry for this launch for any
+reason, but it removes the saved row only for a committed session deletion
+(`AgentSessionOversightLaunchTerminalReason.removesDurableIntent`); every other reason keeps the intent
+dormant for the next launch. Explicit user or agent actions (Unlink, revoke, release) still remove
+state, recording tombstones where the store has them.
+
 ## Route authority is independent of tool discovery
 
 A provider input never waits for a returned tool catalog. For native Claude/Codex runs with exact
@@ -217,6 +265,20 @@ claims/receipts; catalog refresh cannot acknowledge them. ACP's existing route/s
 fences remain in place without importing a native pre-discovery requirement into deferred clients.
 Catalog observations and `tools/list_changed` remain discovery/usability signals, not authority.
 Role-sized advertisement and explicit session-local activation change discovery, not target grants.
+
+## Same-process window reopen
+
+Window close still revokes live authority, leases, queues, and wakes. Before teardown, the runtime
+bridge captures only reference-backed saved pairs in the existing launch coordinator. Its current
+parked reference owns restoration or an already-admitted Unlink; historical closed references only
+fence late cleanup. Exact endpoints, durable token, and assertion generation fence both paths.
+Parking survives transient hydration and sequential closes until a valid restoration proof enters
+the ordinary establishment path. Unlink and committed deletion forget intent; failed removal uses
+the existing cleanup warning/retry. Parking is process-local, preserves no capabilities, and adds no
+UI or MCP state; cold launch keeps its existing restoration policy.
+Hydration need is derived from current readiness on existing reconciliation events; the loader owns
+loaded/in-flight deduplication. Queued passive work must still match its complete discovery owner and
+persisted descriptor before admission, so an abandoned request cannot suppress successor recovery.
 
 ## Configuration-only model selection
 
@@ -372,6 +434,31 @@ selection state and the exact lane's snooze without mutating any of them. Select
 may retract a routine pre-dispatch attempt, but not an exact live attention-backed attempt. Unlink,
 revocation, and every other hard gate still retract either kind. No control claims to cancel a
 physical provider call already in flight.
+
+## Sidebar creator names are UI-only settled presentation
+
+Active and archived creator rows use settled UI names plus known-tab/session provenance reads and
+the owner-valid index, without walking the target menu's lifecycle identity. A hydrated live nil
+creator suppresses stale indexed provenance, while a fresh unhydrated creator remains readable before
+index publication. Neither row discovers candidates or searches unrelated live sessions.
+
+The bridge derives live display names on binding/readiness/topology changes. The workspace array's
+mutation owner compares the active cohort's tab/session/name tuples, including reload/sync replacements;
+name-only changes update that UI snapshot synchronously without reconstructing provider/location
+candidates. Effective name changes also schedule a coalesced presentation-only repaint for live menus,
+whose linked/available peers and inbound labels use those names. Publication uses the existing
+exact-projection storage transaction, including a changed name signal for archived/unlinked consumers
+when exact props are equal. Late monitor publication
+re-resolves creator provenance and names against the current settled source. This changes no grants,
+prompt inventory, passive delivery, or Auto-wake policy.
+
+Live first-match `resolvedDisplayName` wins for duplicate session UUIDs; descriptive UUID lookup never
+selects an action endpoint. Up to 4,096 last-known display names are retained in launch-local memory,
+including a rename immediately followed by source removal/close. A later settled non-live source
+rename/reload updates only already-known retained names, never overriding a live first match or
+creating membership. Committed deletion prunes them.
+There is no new persisted state: after restart (or retention eviction), a non-live creator falls back
+to the requesting workspace's valid indexed name, then its compact UUID.
 
 ## Exact projection is presentation truth
 
@@ -1111,3 +1198,108 @@ This channel observes existing authority; it does not add a refresh receipt, ret
 state machine, or provider policy. Its purpose is to distinguish future failures where RepoPrompt never
 publishes the tool from failures where the server projection is ready but the provider/model catalog
 does not converge.
+
+### Bounded start requests and child lifetime
+
+`agent_run start` supervises setup for 150 seconds, including detached and zero-timeout
+starts. An attached start begins its caller-selected wait only after wait registration;
+return processing has 25 seconds, never beyond that wait's fixed deadline plus 25 seconds.
+The existing watchdog allows at most five further seconds for request settlement, then
+detaches noncooperative work. It does not stop a submitted child.
+
+Cancellation closes the invocation's in-memory mutation admission before cancelling its
+operation task. Owners record reserved session/worktree identity and submitted dispatch
+before suspended acknowledgement. Timeout recovery in `_meta.start` reports known identity,
+phase, dispatch certainty and settlement without awaiting another snapshot or host cleanup.
+Inspect that existing identity; never blindly repeat `start` after a timeout. Accepted or
+uncertain submission is not discarded/deactivated by start failure. Standalone wait/poll,
+steer, filesystem leases and transport cancellation retain their existing contracts.
+
+## Silent routine check-ins (Codex, Claude Code and Devin)
+
+A positively identified routine status/overflow wake may finish without admitting another routine
+wake in its observers. This applies only to first-party Codex and Claude Code native turns and to
+ACP/Devin turns routed through the shared runner, each with an accepted physical dispatch, a
+successfully settled terminal commit, no intervening user/task input, no tool occurrence, and no
+displayable assistant payload beyond the one exact quiet reply: `ack`, case-insensitive, permitting
+surrounding ASCII whitespace and at most one trailing full stop. Any other reply, any tool call,
+result or progress — counted before hiding or deduplication — keeps ordinary wake behavior.
+Attention, questions, failures, manual wakes, periodic wakes and natural input remain ordinary.
+Other ACP providers, headless, cold/restored and uncertain runtime paths are not enabled.
+
+Claude Code re-prompts a turn that ends without text, so `ack` is the dependable quiet form there.
+The routine wake's own guidance block teaches it — one line rendered only on routine status/overflow
+dispatches, never on periodic, attention, manual or piggybacked-batch turns — so a compacted context
+that has lost earlier guidance still relearns it just in time. Streamed deltas accumulate a bounded
+candidate verbatim — whitespace between visible runs is part of the reply, so `"a"+" "+"ck"`
+classifies as `a ck`, never `ack`. A provider's authoritative full message supersedes exactly the
+streamed prefix, then joins the completed-message text on a newline boundary: a turn's second
+completed `ack` cannot erase an earlier visible reply, and two completions `"a"` + `"ck"` classify
+as two messages rather than merging into `ack`. A completion carrying no displayable body —
+including an empty or absent one — supersedes nothing, but it still seals the streamed prefix as
+completed when there is one: a blank `final_content` must not leave `"ac"` fuseable with a later
+`ack` completion into the quiet token. Every event validates the post-update reply text exactly as
+the terminal classifier sees it, separator included, against the 256-byte eligibility line. Any
+merged text that can no longer resolve to the exact token vetoes
+immediately, and the veto latches — a non-quiet streamed prefix stays vetoed even if the
+authoritative completion replaces it. Approvals, permission prompts, elicitations and surfaced
+user-input requests veto on all three providers — a question raised mid-turn is exactly the kind
+of wake that must still reach observers. ACP update kinds that normalize to no events (`plan`,
+`user_message_chunk`, `available_commands_update`, unknown kinds) are invisible to the evidence
+layer exactly as they are invisible to the transcript; `user_message_chunk` in particular only
+echoes a client-issued prompt, whose input veto already fired on the send path. Reasoning content
+is likewise not reply
+text. Any future ACP subtype that does carry visible reply text must veto, which is why enablement
+stays scoped to Devin.
+
+This changes admission, not delivery. The queued status row remains available to natural turns,
+manual wakes or a wake admitted by another lane. MCP schema, Read/frontiers, public
+sequences, fingerprints, receipts and host provenance are unchanged; the only prompt-byte change is
+the routine-only guidance line above. Unattributed overflow deliberately
+fails open: an all-silent burst beyond the sixteen-row detail cap can still admit a wake when the
+existing selection/snooze rules permit it. Attributing overflow to silent sources is deferred unless
+measurement shows overflow-driven loops.
+
+The existing four oversight owners stay disjoint. Their private process-memory cooperation is bounded:
+
+- **Source (`AgentTabSession`)**: one current/recent segment (reserved wake ID, exact existing
+  `AgentRunOwnership`, acquired/accepted/vetoed bits, and a bounded merged reply candidate). The
+  explicit ID flows from direct start options
+  through the native run-start owner; it is bound before the first running publication, not during
+  preparation. Preparation retains the previous settled proof. Output, input and lifecycle mutation
+  owners irreversibly veto; host receipt/save/provenance/retention bookkeeping does not. The pure
+  classifier reuses the existing terminal revision, drain barrier and canonical publication result;
+  it never scans transcript history or infers origin from a system row.
+- **Bridge (`TargetPublicationChain`)**: one paired canonical public sample and private evidence,
+  plus the captured evidence needed to deduplicate source signals. Bare private retirement keeps
+  the immutable settled sample proof for unrelated projection rereads; a new full source occurrence
+  cannot inherit it. Full source frames preserve the
+  existing serial publication order. Private-only settlement/veto uses that same chain without a
+  preview rebuild or authority publication. Existing inverse link membership and exact point
+  authorization restrict resolution to current observer references; cached addresses confer no authority.
+- **Queue (`AgentSessionLinkPassiveStatusNotices`)**: at most one debt/pin record per live observed
+  reference, pruned with existing lifecycle/eviction/rebaseline paths. `ordinaryThrough` uses the
+  existing change-sequence domain; an actual matching receipt can pay older useful debt even while a
+  silent successor runs. Exact opening/closing tokens are required for passive admission deferral.
+  Unknown/mixed public contributions and missing open resolution become ordinary. An unrelated
+  private retirement cannot bless an old pin. Net reversion still removes the rendered row.
+- **Wake coordinator**: reads the published admission-only non-admitting reference set before
+  routine interval and physical-fence evaluation. Manual bypass and exact attention remain independent;
+  unattributed overflow keeps its existing rules. No read mutates a source, queue or authority.
+
+An unresolved exact terminal contribution is temporarily non-admitting, not proven silent. Rejected,
+aborted or unknown settlement resolves ordinary without fabricating a public edge/revision; older
+unreceipted useful debt still admits immediately. Genuine settled process-run-ID teardown retains the
+exact proof, including truthful late native send acceptance. Restore, rebind, runtime replacement and
+bulk transcript replacement fail open. Actual Claude runtime-init events are unknown provenance;
+calling `startOrResume` on an initialized process is not itself activity. Inactive late Codex assistant
+and new-tool events are rejected by existing currency guards; accepted late command-output updates
+require an earlier tool/live/terminal identity, whose tool ingress already vetoed silence.
+
+None of this state is persisted, exposed in Domain models or transported on MCP. Restart therefore
+retains today's ordinary behavior. Additional provider families require their own native event,
+acceptance and terminal-drain proof before enablement — Devin is enabled because the ACP runner
+reaches the same shared bind, acquisition, stream-veto, acceptance and terminal-drain seams with no
+further state. Local timing diagnostics exercise warm
+admission and indexed private resolution; CI asserts structural work bounds, not machine-specific
+latency thresholds.

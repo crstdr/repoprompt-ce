@@ -645,7 +645,7 @@ extension AgentModeViewModel {
                     return
                 }
             case .waitingContinuation:
-                agentSessionLinkResumeWaitingContinuationForAutoWake(
+                await agentSessionLinkResumeWaitingContinuationForAutoWake(
                     claim: reservedClaim,
                     wakeID: wakeID,
                     endpoint: endpoint
@@ -836,6 +836,7 @@ extension AgentModeViewModel {
                 return false
             }
             guard let fingerprint = attempt.wakeFingerprint else { return false }
+            session.acquirePassiveWakeEvidence(wakeID: wakeID, hasAttention: !(claim.passive?.receipt.deliveredAttentionOccurrences.isEmpty ?? true))
             attempt.phase = .dispatching
             attempt.attemptedFingerprint = AgentSessionLinkPassiveStatusNotices
                 .WakeEligibilityFingerprint(
@@ -1065,6 +1066,7 @@ extension AgentModeViewModel {
         // Periodic producers may still enter the existing Codex fallback/auth recovery path.
         // Keep their identity until acceptance or proven producer settlement, without suppression.
         if attempt.isPeriodic { return }
+        if session.passiveWakeSegment?.wakeID == wakeID { session.notePassiveWakeActivity() }
         agentSessionLinkSettleAmbiguousAutoWake(attempt, session: session)
     }
 
@@ -1228,6 +1230,7 @@ extension AgentModeViewModel {
         else {
             return
         }
+        session.acceptPassiveWakeEvidence(wakeID: wakeID)
         // Matched by wake ID alone. A late acceptance that arrives after a local user submission is
         // still truthful — it appends its one provenance row — and there is no session state left
         // for it to overwrite.
@@ -1272,12 +1275,24 @@ extension AgentModeViewModel {
         claim: AgentSessionLinkOutboundPromptClaim,
         wakeID: UUID,
         endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) {
+    ) async {
         guard let session = agentSessionLinkAutoWakeSession(for: endpoint),
               session.oversight.pendingAutoWake?.wakeID == wakeID,
               agentSessionLinkAutoWakeRoute(session) == .waitingContinuation
         else {
             return
+        }
+        let proof = await agentSessionLinkProveProviderInput(for: session, claim: claim)
+        if claim.localInput != nil {
+            guard agentSessionLinkAutoWakeSession(for: endpoint) === session,
+                  session.oversight.pendingAutoWake?.wakeID == wakeID,
+                  agentSessionLinkAutoWakeRoute(session) == .waitingContinuation else { return }
+            guard !Task.isCancelled else {
+                // Retire preparation through its existing owner. A bare return leaves the
+                // cancelled task waiting for a physical attempt that must never happen.
+                cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+                return
+            }
         }
         guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
             return
@@ -1285,6 +1300,8 @@ extension AgentModeViewModel {
         // The continuation is also a physical acceptance boundary. Carry the note first, just as
         // native/ACP provider sends do; never consume either receipt before the resume succeeds.
         let carry = AgentSelfCompactParkedPrefix.prepare(claim.fragment, session: session) {}
+        // markAttempted moves the note out of parked state; freeze its existing prefix first.
+        let undecoratedPrefix = carry.dispatchID.flatMap { _ in session.selfCompactState.parkedNote?.frame } ?? ""
         if let noteID = carry.dispatchID {
             guard AgentSelfCompactParkedPrefix.markAttempted(noteID, session: session) else { return }
         }
@@ -1292,7 +1309,9 @@ extension AgentModeViewModel {
             session: session,
             providerText: carry.text,
             claim: claim,
-            origin: .laneUpdateAutoWake(wakeID: wakeID)
+            origin: .laneUpdateAutoWake(wakeID: wakeID),
+            inputProof: proof,
+            undecoratedProviderText: undecoratedPrefix
         )
         if let noteID = carry.dispatchID {
             if accepted {
@@ -1838,7 +1857,10 @@ extension AgentModeViewModel {
         if let predicate = agentSessionLinkAutoWakeRouteRefusal(session) {
             if let refusalPhase {
                 // Closed predicate vocabulary and the existing phase only: no endpoint or content.
-                AgentSessionLinkAutoWakeDiagnostics.routeRefused(predicate: predicate, phase: refusalPhase)
+                AgentSessionLinkAutoWakeDiagnostics.routeRefused(observer: session.oversight.wakeDiagnosticObserver, predicate: predicate, phase: refusalPhase)
+                if predicate == .runStateIsActive {
+                    requestClaudeStaleActiveProbe(for: session)
+                }
             }
             return nil
         }
@@ -2194,7 +2216,10 @@ extension AgentModeViewModel {
         let snoozedReferences = isManual
             ? []
             : session.oversight.activeSnoozedReferences(observerEndpoint: endpoint)
-        let routineLanes = selectedLanes.filter { !snoozedReferences.contains($0.key) }
+        let routineLanes = selectedLanes.filter {
+            !snoozedReferences.contains($0.key)
+                && (isManual || !snapshot.routineNonAdmittingReferences.contains($0.key))
+        }
         return AgentSessionLinkAutoWakeAdmission(
             routineLanesBeforeInterval: routineLanes,
             hasConcreteEntryBeforeInterval: snapshot.entries.contains {

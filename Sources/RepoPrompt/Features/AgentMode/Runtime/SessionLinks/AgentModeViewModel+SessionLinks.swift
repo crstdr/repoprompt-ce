@@ -410,6 +410,28 @@ extension AgentModeViewModel {
         )
     }
 
+    func agentSessionLinkPassiveWakeEvidence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence {
+        guard let session = sessions[candidate.tabID], session.activeAgentSessionID == candidate.sessionID,
+              session.persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration,
+              session.bindingTransitionGeneration == candidate.bindingTransitionGeneration else { return .unknown }
+        return session.passiveWakeEvidence
+    }
+
+    func agentSessionLinkInstallObservation(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        onChange: @escaping @MainActor () -> Void,
+        onPassiveWakeChange: @escaping @MainActor () -> Void
+    ) -> AgentSessionLinkObservationToken? {
+        guard let session = sessions[candidate.tabID],
+              let normal = agentSessionLinkInstallObservation(for: candidate, onChange: onChange) else { return nil }
+        let policy = session.passiveWakeEvidenceChanged.sink { _ in
+            MainActor.assumeIsolated { onPassiveWakeChange() }
+        }
+        return AgentSessionLinkObservationToken { normal.invalidate()
+            policy.cancel()
+        }
+    }
+
     /// Refresh durable child metadata once for a poll/wait batch. The synchronous snapshot path
     /// reads only the already-merged parent lookup and never scans the registry per target.
     ///
@@ -909,7 +931,7 @@ extension AgentModeViewModel {
     ///
     /// This is the sole mutation boundary for `monitorPillPropsByEndpoint`. The status-pill snapshot
     /// is synchronized before the notification so every consumer can immediately re-read the same
-    /// completed state. Equal replacements are true no-ops and publish nothing.
+    /// completed state. Equal props and equal creator names are true no-ops and publish nothing.
     ///
     /// The snapshot's only storage-derived field is `monitor`. The full snapshot (Model Router
     /// availability, execution location, ...) is rebuilt only when the published `monitor` differs
@@ -1084,19 +1106,44 @@ extension AgentModeViewModel {
     /// an in-place rebind from inheriting either the enclosing projection or its target menu.
     func agentSidebarOversightMenuProps(
         tabID: UUID,
-        expectedSessionID: UUID?
+        expectedSessionID: UUID?,
+        diagnoseUnavailable: Bool = false
     ) -> AgentSidebarOversightMenuProps? {
-        guard let expectedSessionID,
-              let endpoint = agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: expectedSessionID),
-              var menu = AgentSessionLinkRuntimeBridge.shared.sidebarOversightMenu(for: endpoint),
-              menu.targetEndpoint == endpoint, menu.targetSessionID == expectedSessionID
-        else { return nil }
+        let session = sessions[tabID]
+        let currentSessionID = session?.activeAgentSessionID
+        func unavailable(_ reason: AgentSessionLinkMenuGuard) -> AgentSidebarOversightMenuProps? {
+            if diagnoseUnavailable {
+                let now = ProcessInfo.processInfo.systemUptime
+                sidebarOversightMenuDiagnosticTimes = sidebarOversightMenuDiagnosticTimes.filter { now - $0.value < 60 }
+                if sidebarOversightMenuDiagnosticTimes[tabID] == nil {
+                    sidebarOversightMenuDiagnosticTimes[tabID] = now
+                    catalogDiagnosticsSink.record(.sidebarMenuUnavailable(
+                        reason: reason, windowID: windowID, tabID: tabID,
+                        expectedSessionID: expectedSessionID, currentSessionID: currentSessionID,
+                        tabPresent: session != nil,
+                        bindingNil: session != nil && session?.persistentSessionBindingIdentity == nil,
+                        rowIsCurrentTab: currentTabID == tabID,
+                        vmIsRegisteredWindowVM: sidebarMenuIsRegisteredWindowVM(),
+                        runtimeEntryEverRemoved: sidebarRemovedRuntimeTabIDs.contains(tabID)
+                            ? true : (sidebarRuntimeRemovalHistoryOverflowed ? nil : false)
+                    ))
+                }
+            }
+            return nil
+        }
+        guard let expectedID = expectedSessionID, currentSessionID != nil else { return unavailable(.sessionUUIDMissing) }
+        guard let endpoint = agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: expectedID)
+        else { return unavailable(.endpointMissing) }
+        guard var menu = AgentSessionLinkRuntimeBridge.shared.sidebarOversightMenu(for: endpoint) else { return unavailable(.projectionMissing) }
+        guard menu.targetEndpoint == endpoint, menu.targetSessionID == expectedID else { return unavailable(.targetMismatch) }
         let creatorID = agentSessionLinkLaneCreatorSessionID(tabID: endpoint.tabID, expectedSessionID: endpoint.sessionID)
         menu.creatorSessionID = creatorID
         menu.createdByLabel = creatorID.map { sidebarCreatorDisplayNames[$0] ?? agentSessionLinkLocalCreatorLabel(creatorID: $0) }
-        // Match the pill's persistence blocker without changing lifecycle eligibility.
+        // The stored projection carries lifecycle-only eligibility; overlay the shared
+        // persistence blocker so the inverse menu's greyed reason matches the pill's Add reason.
         return menu.withObserverIneligibleReason(
-            agentSessionLinkPersistencePresentation.addBlockerMessage ?? menu.observerIneligibleReason
+            agentSessionLinkPersistencePresentation.addBlockerMessage
+                ?? menu.observerIneligibleReason
         )
     }
 

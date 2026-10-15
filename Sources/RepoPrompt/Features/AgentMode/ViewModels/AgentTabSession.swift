@@ -17,6 +17,9 @@ final class AgentTabSession: ObservableObject {
     let tabID: UUID
     let perfRecorder: any AgentModePerfRecording
     private var suppressSourceItemsChanged = false
+    /// Bounded to one segment. Runtime-only; never serialized or inferred from transcript rows.
+    var passiveWakeSegment: AgentSessionLinkPassiveWakeSegment?
+    let passiveWakeEvidenceChanged = PassthroughSubject<Void, Never>()
 
     /// Canonical runtime source-item suffix. Coordinators and tests mutate this list,
     /// but it only retains the mutable full-detail working turns; older compacted
@@ -24,13 +27,139 @@ final class AgentTabSession: ObservableObject {
     @Published var items: [AgentChatItem] = [] {
         didSet {
             guard !suppressSourceItemsChanged else { return }
+            invalidatePassiveWakeEvidence()
             repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
             rebuildSourceItemDerivedState()
+            invalidateLocalInputStructure()
             onSourceItemsChanged?(self, .structural)
         }
     }
 
-    var transcript: AgentTranscript = .empty
+    var localInputIndex = AgentSessionLinkRetainedLocalInputIndex()
+    var localInputCanonicalCommitPending = false
+    private var localComposerCandidates: [UUID: LocalComposerCandidate] = [:]
+
+    struct LocalComposerCandidate {
+        let itemID: UUID
+        let fence: AgentRunStartStopFence
+        var position: Int?
+    }
+
+    /// Identity-only ingress token. No raw draft or provider-formatted text is retained here.
+    func registerLocalComposerCandidate(itemID: UUID, at position: Int) -> UUID {
+        let token = UUID()
+        assert(items.indices.contains(position) && items[position].id == itemID)
+        localComposerCandidates[token] = LocalComposerCandidate(itemID: itemID, fence: AgentRunStartStopFence(session: self), position: position)
+        return token
+    }
+
+    enum LocalComposerDisposition { case retained, rolledBack }
+
+    @discardableResult
+    func settleLocalComposerOrigin(_ token: UUID?, disposition: LocalComposerDisposition) -> Bool {
+        guard let token, let candidate = localComposerCandidates.removeValue(forKey: token),
+              disposition == .retained,
+              candidate.fence.binding == persistentSessionBindingIdentity else { return false }
+        if let position = candidate.position {
+            guard items.indices.contains(position), items[position].id == candidate.itemID,
+                  items[position].kind == .user, items[position].crossSessionAttribution == nil,
+                  !items[position].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            // Provenance changes neither activity timestamps nor lifecycle observations.
+            suppressSourceItemsChanged = true
+            items[position].userInputOrigin = .localComposer
+            suppressSourceItemsChanged = false
+            localInputIndex.settle(items[position], at: position)
+            finishIncrementalSourceItemsMutation(.replace(index: position, previousKind: .user, currentKind: .user))
+        } else {
+            // Only a still-owned producer token may settle an exact canonical request that left
+            // the mutable suffix during retention. Typed history copies without a token cannot
+            // allocate an event. Genuine history replacement/binding changes retire these tokens.
+            guard !localInputCanonicalCommitPending,
+                  let turnIndex = transcript.turns.firstIndex(where: { $0.request?.id == candidate.itemID }),
+                  var request = transcript.turns[turnIndex].request,
+                  request.crossSessionAttribution == nil,
+                  !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            request.userInputOrigin = .localComposer
+            transcript.turns[turnIndex].request = request
+            localInputIndex.settle(request.toItem(), at: nil)
+            // Entry ruled out other pending work; the index has synchronously projected the
+            // exact provenance mutation that transcript.didSet just marked pending.
+            localInputCanonicalCommitPending = false
+            finishIncrementalSourceItemsMutation(.structural)
+        }
+        isDirty = true
+        return true
+    }
+
+    /// Preserve only exact identities through retention's working-list replacement. Content and
+    /// true canonical absence are reconciled by the existing canonical seed, not this suffix.
+    private func reconcileLocalInputWorkingPositions(_ newItems: [AgentChatItem]) {
+        let tracked = Set(localInputIndex.records.map(\.itemID)).union(localComposerCandidates.values.map(\.itemID))
+        var positions: [UUID: Int] = [:]
+        for (position, item) in newItems.enumerated() where tracked.contains(item.id) {
+            positions[item.id] = position
+        }
+        localInputIndex.reconcileWorkingPositions(positions)
+        for token in Array(localComposerCandidates.keys) {
+            guard var candidate = localComposerCandidates[token] else { continue }
+            candidate.position = positions[candidate.itemID]
+            localComposerCandidates[token] = candidate
+        }
+    }
+
+    /// A committed batch is not a structural rebuild: tracked items the batch removed are
+    /// per-record deletions by identity, still-present tracked items reconcile content and
+    /// position, and a candidate whose row the batch removed is retired so a later settle
+    /// cannot resurrect it through the canonical-only path.
+    private func reconcileLocalInputBatchDiff(from previousItems: [AgentChatItem], to newItems: [AgentChatItem]) {
+        let trackedIDs = Set(localInputIndex.records.map(\.itemID)).union(localComposerCandidates.values.map(\.itemID))
+        guard !trackedIDs.isEmpty else { return }
+        var newItemsByID: [UUID: AgentChatItem] = [:]
+        for item in newItems where trackedIDs.contains(item.id) {
+            newItemsByID[item.id] = item
+        }
+        var removedTrackedIDs: Set<UUID> = []
+        var previousItemsByID: [UUID: AgentChatItem] = [:]
+        for item in previousItems where trackedIDs.contains(item.id) {
+            previousItemsByID[item.id] = item
+            if newItemsByID[item.id] == nil { removedTrackedIDs.insert(item.id) }
+        }
+        if !removedTrackedIDs.isEmpty {
+            localInputIndex.markDeleted(removedTrackedIDs)
+            // A removed row also retires an unsettled candidate for it: the producer's row is
+            // gone, so a late settle must not allocate an ordinal through the canonical path.
+            localComposerCandidates = localComposerCandidates.filter { !removedTrackedIDs.contains($0.value.itemID) }
+        }
+        reconcileLocalInputWorkingPositions(newItems)
+        for record in localInputIndex.records where !record.isDeleted {
+            guard let position = record.sourcePosition, let item = newItemsByID[record.itemID] else { continue }
+            // Unchanged rows skip re-projection: relies on `AgentChatItem.==` covering every
+            // field `Content.project` reads (kind, userInputOrigin, crossSessionAttribution, text).
+            if previousItemsByID[record.itemID] == item { continue }
+            localInputIndex.replace(item, at: position)
+        }
+    }
+
+    func installLocalInputSeed(_ seed: AgentSessionLinkRetainedLocalInputIndex.Seed) {
+        localInputIndex.install(seed)
+        localInputCanonicalCommitPending = false
+    }
+
+    #if DEBUG
+        var test_unsettledLocalComposerCandidateCount: Int {
+            localComposerCandidates.count
+        }
+    #endif
+
+    private func invalidateLocalInputStructure() {
+        localComposerCandidates.removeAll()
+        localInputIndex.invalidateStructure()
+    }
+
+    var transcript: AgentTranscript = .empty {
+        didSet { localInputCanonicalCommitPending = true }
+    }
+
     var baseTranscriptProjection: AgentTranscriptProjection = .empty
     var fullTranscriptProjection: AgentTranscriptProjection = .empty
     var workingTranscriptProjection: AgentTranscriptProjection = .empty
@@ -67,6 +196,9 @@ final class AgentTabSession: ObservableObject {
     @Published var runState: AgentSessionRunState = .idle {
         didSet {
             guard runState != oldValue else { return }
+            if runState == .failed || runState == .cancelled || runState == .waitingForUser || runState == .waitingForQuestion || runState == .waitingForApproval {
+                notePassiveWakeActivity()
+            }
             noteMonitorObservationInputsChanged()
             onRunStateChanged?(self)
         }
@@ -434,7 +566,10 @@ final class AgentTabSession: ObservableObject {
     /// Claude turn IDs whose terminal events should be treated as superseded by accepted steering.
     var claudeSupersedingProtectedTurnIDs: Set<UUID> = []
     /// Task that drains `pendingClaudeSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
+    var claudeSteeringFlushID: UUID?
     var claudeSteeringFlushTask: Task<Void, Never>?
+    /// Runner-owned, attempt-scoped notification; never a synthetic provider terminal.
+    var claudeSteeringAbandonment: (attemptID: UUID, notify: (Set<UUID>) -> Void, probe: () -> Void, uncertainWrite: () -> Void)?
 
     /// ACP steering queue — carries text accepted for serialized live steering.
     struct ACPSteeringManagedContext {
@@ -777,6 +912,7 @@ final class AgentTabSession: ObservableObject {
     /// Installs the provider process run identity for a starting or resumed
     /// run. The installing path owns the identity until it is cleared.
     func installRunID(_ runID: UUID) {
+        if self.runID != runID { invalidatePassiveWakeEvidence() }
         runLifecycle.installRunID(runID)
     }
 
@@ -784,7 +920,10 @@ final class AgentTabSession: ObservableObject {
     /// stale cleanup cannot clear a successor run's identity.
     @discardableResult
     func clearRunID(ifCurrent runID: UUID) -> Bool {
-        runLifecycle.clearRunID(ifCurrent: runID)
+        if self.runID == runID, passiveWakeSegment != nil, !passiveWakeHasSettledTerminalProof {
+            invalidatePassiveWakeEvidence()
+        }
+        return runLifecycle.clearRunID(ifCurrent: runID)
     }
 
     var activeRunOwnership: AgentRunOwnership? {
@@ -841,6 +980,7 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
+                invalidatePassiveWakeEvidence()
                 selectedClaudeEffortRaw = nil
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
@@ -1215,6 +1355,7 @@ final class AgentTabSession: ObservableObject {
             let oldIdentity = oldValue.map { ObjectIdentifier($0) }
             let newIdentity = codexController.map { ObjectIdentifier($0) }
             guard oldIdentity != newIdentity else { return }
+            if newIdentity != nil { invalidatePassiveWakeEvidence() }
             resetCodexHookGateBinding()
             codexControllerGeneration = UUID()
             codexAuthoritativeActiveTurn = nil
@@ -1272,7 +1413,16 @@ final class AgentTabSession: ObservableObject {
         pendingCodexComputerUseActivation != nil
     }
 
-    var claudeController: (any NativeAgentRuntimeControlling)?
+    var claudeController: (any NativeAgentRuntimeControlling)? {
+        didSet {
+            if let controller = claudeController,
+               oldValue.map { ObjectIdentifier($0) } != ObjectIdentifier(controller)
+            {
+                invalidatePassiveWakeEvidence()
+            }
+        }
+    }
+
     var acpController: ACPAgentSessionController?
 
     var codexEventTask: Task<Void, Never>?
@@ -1479,6 +1629,7 @@ final class AgentTabSession: ObservableObject {
         // oversight change channel from that authority.
         runLifecycle.onTerminalCommitPhaseChange = { [weak self] in
             self?.noteMonitorObservationInputsChanged()
+            if self?.passiveWakeSegment != nil { self?.passiveWakeEvidenceChanged.send(()) }
         }
     }
 
@@ -1515,6 +1666,7 @@ final class AgentTabSession: ObservableObject {
         pendingCommandRunningByKey.removeAll()
         claudeSteeringFlushTask?.cancel()
         claudeSteeringFlushTask = nil
+        claudeSteeringFlushID = nil
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
         acpSteeringFlushID = nil
@@ -1602,6 +1754,7 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func beginPersistentBindingTransition() -> UInt64 {
+        invalidateLocalInputStructure()
         oversight.overseerActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
         // incoming incarnation.
@@ -1611,6 +1764,7 @@ final class AgentTabSession: ObservableObject {
         // Terminal commit revisions are scoped to the binding captured by
         // their run ownership. A rebind must not carry that runtime-only
         // classification or publication result into another session.
+        invalidatePassiveWakeEvidence()
         runLifecycle.invalidateTerminalRevisionForBindingTransition()
         authoritativeHydratedBinding = nil
         authoritativeHydratedBindingTransitionGeneration = nil
@@ -1619,7 +1773,10 @@ final class AgentTabSession: ObservableObject {
 
     func installPersistentSessionBinding(_ binding: AgentPersistentSessionBindingIdentity?) {
         precondition(binding == nil || binding?.tabID == tabID)
-        if persistentSessionBindingIdentity != binding { oversight.overseerActivation = nil }
+        if persistentSessionBindingIdentity != binding {
+            invalidateLocalInputStructure()
+            oversight.overseerActivation = nil
+        }
         persistentSessionBindingIdentity = binding
         persistentSessionBindingDidChange?()
         bindingTransitionInProgress = false
@@ -1845,7 +2002,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     @discardableResult
-    func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+    func beginRunAttempt(source: String, attemptID: UUID = UUID(), passiveWakeID: UUID? = nil) -> AgentRunOwnership {
         // Host-specific responsibilities stay here: Codex routing resets and
         // exactly-once MCP prepared-epoch consumption. The neutral attempt
         // initialization (terminal-state reset + tracker begin) is delegated
@@ -1872,6 +2029,7 @@ final class AgentTabSession: ObservableObject {
             ),
             attemptID: attemptID
         )
+        bindPassiveWakeEvidence(to: ownership, wakeID: passiveWakeID)
         #if DEBUG
             perfRecorder.increment("run.lifecycle.attempt.started")
             perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")
@@ -1922,6 +2080,7 @@ final class AgentTabSession: ObservableObject {
             retryIntent: retryIntent,
             timestampUptimeNanoseconds: timestampUptimeNanoseconds
         )
+        if case .accepted = result, kind == .toolActivity || kind == .interaction { notePassiveWakeActivity() }
         recordRunProgressDiagnostic(result, kind: kind, stage: stage)
         return result
     }
@@ -1936,6 +2095,7 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func endRunAttempt(ifCurrent ownership: AgentRunOwnership, source: String) -> Bool {
         guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
+        if passiveWakeSegment != nil, !terminalCommitInProgress { passiveWakeEvidenceChanged.send(()) }
         recordRunAttemptEnded(ownership, source: source)
         return true
     }
@@ -2168,13 +2328,48 @@ final class AgentTabSession: ObservableObject {
         case preserveForRetentionCompaction
     }
 
+    /// How a committed source-items change treats the retained local-input index's identity.
+    private enum LocalInputIdentityDisposition {
+        /// A genuine structural replacement: rotate the epoch; the canonical reseed owns all
+        /// reconciliation and observers re-baseline rather than re-disclose history.
+        case invalidate
+        /// Working-suffix pruning is not canonical deletion: tracked identities survive and only
+        /// their positions reconcile.
+        case positionsOnly
+        /// A bounded working-list batch, diffed against the current `items` (the pre-commit
+        /// array): tracked items the batch removed mark their record deleted and retire any
+        /// unsettled candidate, still-present tracked items reconcile content and position.
+        /// Both reconciling dispositions invalidate instead when source-ID repair rekeys.
+        case batchDiff
+    }
+
     private func commitSourceItems(
         _ newItems: [AgentChatItem],
         dispatch: SourceItemsDispatch,
         payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource,
+        localInputIdentity: LocalInputIdentityDisposition = .invalidate,
         diagnosticContext: String
     ) {
-        let repairedItems = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
+        let repair = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
+        let repairedItems = repair.items
+        switch localInputIdentity {
+        case .invalidate:
+            invalidateLocalInputStructure()
+        case .positionsOnly:
+            if repair.didRepair {
+                // Rekeyed item IDs are a genuine identity change; positions cannot be trusted.
+                invalidateLocalInputStructure()
+            } else {
+                reconcileLocalInputWorkingPositions(repairedItems)
+            }
+        case .batchDiff:
+            if repair.didRepair {
+                // Rekeyed item IDs are a genuine identity change, not an in-place batch edit.
+                invalidateLocalInputStructure()
+            } else {
+                reconcileLocalInputBatchDiff(from: items, to: repairedItems)
+            }
+        }
         suppressSourceItemsChanged = true
         items = repairedItems
         suppressSourceItemsChanged = false
@@ -2189,23 +2384,24 @@ final class AgentTabSession: ObservableObject {
     private func repairedSourceItems(
         _ candidateItems: [AgentChatItem],
         diagnosticContext: String
-    ) -> [AgentChatItem] {
+    ) -> AgentSourceItemIDRepair.Result {
         let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
+        assert(repair.didRepair == (repair.items != candidateItems))
         if repair.didRepair {
             AgentSourceItemIDRepair.logDiagnostics(
                 repair.diagnostics,
                 context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
             )
         }
-        return repair.items
+        return repair
     }
 
     @discardableResult
     private func repairStoredSourceItemsIfNeeded(diagnosticContext: String) -> Bool {
-        let repairedItems = repairedSourceItems(items, diagnosticContext: diagnosticContext)
-        guard repairedItems != items else { return false }
+        let repair = repairedSourceItems(items, diagnosticContext: diagnosticContext)
+        guard repair.didRepair else { return false }
         suppressSourceItemsChanged = true
-        items = repairedItems
+        items = repair.items
         suppressSourceItemsChanged = false
         return true
     }
@@ -2446,6 +2642,11 @@ final class AgentTabSession: ObservableObject {
     private func finishIncrementalSourceItemsMutation(
         _ mutation: AgentModeViewModel.SourceItemsMutation
     ) {
+        switch mutation {
+        case let .replace(index, _, _), let .mutate(index, _):
+            if items.indices.contains(index) { localInputIndex.replace(items[index], at: index) }
+        default: break
+        }
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
         onSourceItemsChanged?(self, mutation)
@@ -2495,6 +2696,7 @@ final class AgentTabSession: ObservableObject {
         commitSourceItems(
             updatedItems,
             dispatch: .notify(mutation),
+            localInputIdentity: .batchDiff,
             diagnosticContext: "mutateItemsBatch"
         )
         if touchActivity {
@@ -2543,10 +2745,23 @@ final class AgentTabSession: ObservableObject {
                 ))
             }
         #endif
+        if reason != .retentionCompaction { invalidatePassiveWakeEvidence() }
+        // `pendingToolFinalizationRepair` and `codexCommandStatusReconciliation` commit a mutated
+        // copy of the working list — in-place repairs that must not cost tracked inputs their
+        // epoch. Hydration, activation, clears and test overrides stay structural.
+        let localInputIdentity: LocalInputIdentityDisposition = switch reason {
+        case .retentionCompaction:
+            .positionsOnly
+        case .pendingToolFinalizationRepair, .codexCommandStatusReconciliation:
+            .batchDiff
+        case .persistedSessionHydration, .routeActivation, .clearedChat, .stressHarnessReset, .testOverride:
+            .invalidate
+        }
         commitSourceItems(
             items,
             dispatch: .silent,
             payloadUpdate: payloadUpdate,
+            localInputIdentity: localInputIdentity,
             diagnosticContext: "setItemsSilently reason=\(reason.rawValue)"
         )
         pendingSourceItemsMutationSummary = nil
@@ -2774,6 +2989,15 @@ final class AgentTabSession: ObservableObject {
     func removeItem(at index: Int) -> AgentChatItem? {
         guard items.indices.contains(index) else { return nil }
         let removed = items[index]
+        localInputIndex.remove(at: index, itemID: removed.id)
+        for token in Array(localComposerCandidates.keys) {
+            guard var candidate = localComposerCandidates[token] else { continue }
+            if candidate.itemID == removed.id { localComposerCandidates.removeValue(forKey: token) }
+            else if let position = candidate.position, position > index {
+                candidate.position = position - 1
+                localComposerCandidates[token] = candidate
+            }
+        }
         suppressSourceItemsChanged = true
         items.remove(at: index)
         suppressSourceItemsChanged = false

@@ -390,6 +390,45 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertFalse(rendered.fragment.contains("effective deselection or unlink admits no exception"))
     }
 
+    /// The quiet-reply line belongs to a routine status/overflow wake's own dispatch only.
+    func testQuietReplySentenceRendersOnlyOnRoutineWakes() {
+        let snapshot = passiveSnapshot(entries: [passiveEntry("8B91C0E0-0000-0000-0000-00000000E572", from: .running, to: .idle)])
+        let routine = AgentSessionLinkPrompts.rendered(
+            AgentSessionLinkPromptRenderRequest(
+                membershipKind: nil,
+                inventory: inventory(items: []),
+                passiveNotices: snapshot,
+                toolReference: "agent_session_link",
+                routineStatusWake: true
+            )
+        )
+        XCTAssertTrue(routine.fragment.contains("reply exactly `ack`"))
+        // The same batch on any other dispatch — periodic, manual, attention, or piggybacked on an
+        // ordinary turn — never teaches it.
+        let ordinary = AgentSessionLinkPrompts.rendered(
+            AgentSessionLinkPromptRenderRequest(
+                membershipKind: nil,
+                inventory: inventory(items: []),
+                passiveNotices: snapshot,
+                toolReference: "agent_session_link"
+            )
+        )
+        XCTAssertFalse(ordinary.fragment.contains("reply exactly `ack`"))
+        // A reminder-mode routine wake still carries it: a compacted context forgets the contract.
+        let reminder = AgentSessionLinkPrompts.rendered(
+            AgentSessionLinkPromptRenderRequest(
+                membershipKind: nil,
+                inventory: inventory(items: []),
+                passiveNotices: snapshot,
+                toolReference: "agent_session_link",
+                laneGuidanceMode: .reminder,
+                routineStatusWake: true
+            )
+        )
+        XCTAssertTrue(reminder.fragment.contains("reply exactly `ack`"))
+        XCTAssertTrue(reminder.fragment.contains(AgentSessionLinkMessageEnvelope.escaped(AgentSessionLinkPrompts.laneGuidanceReminder)))
+    }
+
     func testAttentionOnlyReminderRetainsCompactTrustAndActionBounds() {
         let queueEpoch = UUID()
         let rendered = AgentSessionLinkPrompts.rendered(

@@ -280,6 +280,20 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         )
     }
 
+    func agentSessionLinkPassiveWakeEvidence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkPassiveWakeEvidence {
+        guard let window = window(withID: candidate.windowID), !window.isClosing else { return .unknown }
+        return window.agentModeViewModel.agentSessionLinkPassiveWakeEvidence(for: candidate)
+    }
+
+    func agentSessionLinkInstallObservation(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        onChange: @escaping @MainActor () -> Void,
+        onPassiveWakeChange: @escaping @MainActor () -> Void
+    ) -> AgentSessionLinkObservationToken? {
+        guard let window = window(withID: candidate.windowID), !window.isClosing else { return nil }
+        return window.agentModeViewModel.agentSessionLinkInstallObservation(for: candidate, onChange: onChange, onPassiveWakeChange: onPassiveWakeChange)
+    }
+
     func agentSessionLinkInstallObservation(
         for candidate: AgentSessionLinkEndpointCandidate,
         onChange: @escaping @MainActor () -> Void
@@ -462,6 +476,11 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         #endif
         guard let window = modelRoutingWindow(withID: windowID) else { return .none }
         return window.apiSettingsViewModel.agentAvailability
+    }
+
+    func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
+        guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return nil }
+        return window.agentModeViewModel.agentSessionLinkLocalInputSnapshot(for: endpoint, includeRecords: includeRecords)
     }
 
     func agentSessionLinkModelCandidate(
