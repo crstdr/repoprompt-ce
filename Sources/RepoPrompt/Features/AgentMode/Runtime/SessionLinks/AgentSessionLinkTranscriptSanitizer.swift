@@ -119,11 +119,18 @@ struct AgentSessionLinkTranscriptItem: Equatable {
     /// observer can never request again. The residual overshoot is therefore bounded by a small
     /// constant instead of by `narrativeItemMaxBytes`, and a grapheme too wide to clip becomes an
     /// explicit marker rather than an empty string.
-    func withTextTruncated(toRemainingBudget remainingBudget: Int, minimumTextBytes: Int) -> Self {
+    func withTextTruncated(
+        toRemainingBudget remainingBudget: Int,
+        minimumTextBytes: Int,
+        wasByteCapped: Bool = false
+    ) -> Self {
         guard let text else { return self }
         let allowance = max(minimumTextBytes, remainingBudget - nonTextUTF8Cost)
-        guard text.utf8.count > allowance else { return self }
-        let clipped = AgentSessionLinkTranscriptBudget.truncatedRowText(text, maxBytes: allowance)
+        guard wasByteCapped || text.utf8.count > allowance else { return self }
+        let marker = AgentSessionLinkTranscriptBudget.clippedRowMarker
+        let clipped = AgentSessionLinkTranscriptBudget.truncatedRowText(
+            text, maxBytes: allowance - marker.utf8.count
+        ) + marker
         return AgentSessionLinkTranscriptItem(
             itemID: itemID,
             sequenceIndex: sequenceIndex,
@@ -232,6 +239,7 @@ enum AgentSessionLinkTranscriptBudget {
     /// cursor past it, making the content permanently unrequestable. The marker keeps forward
     /// progress while stating, visibly, that something was dropped.
     static let oversizedTextMarker = "[text omitted: exceeds byte budget]"
+    static let clippedRowMarker = "\n[row clipped; re-read with max_items: 1 and larger max_output_bytes]"
 
     static func clampedMaxItems(_ requested: Int?) -> Int {
         guard let requested else { return defaultMaxItems }
@@ -413,6 +421,20 @@ enum AgentSessionLinkTranscriptSanitizer {
         readerSessionID: UUID? = nil,
         homeDirectory: String = NSHomeDirectory()
     ) -> AgentSessionLinkTranscriptItem? {
+        sanitizeBounded(
+            row: row, isSummaryRow: isSummaryRow, readerSessionID: readerSessionID,
+            homeDirectory: homeDirectory,
+            narrativeMaxBytes: AgentSessionLinkTranscriptBudget.narrativeItemMaxBytes
+        )?.item
+    }
+
+    private static func sanitizeBounded(
+        row: AgentChatItem,
+        isSummaryRow: Bool,
+        readerSessionID: UUID?,
+        homeDirectory: String,
+        narrativeMaxBytes: Int
+    ) -> (item: AgentSessionLinkTranscriptItem, wasByteCapped: Bool)? {
         switch row.kind {
         case .thinking:
             // Omitted entirely; the page reports `omitted_thinking_count`.
@@ -421,7 +443,7 @@ enum AgentSessionLinkTranscriptSanitizer {
             // Structural: no text, no arguments, no result, no invocation identifier. This also
             // overrides the normal persistence exception that preserves raw `ask_user` payloads —
             // an observer sees only that `ask_user` ran and how it ended.
-            return AgentSessionLinkTranscriptItem(
+            return (AgentSessionLinkTranscriptItem(
                 itemID: row.id.uuidString,
                 sequenceIndex: row.sequenceIndex,
                 role: .tool,
@@ -430,18 +452,18 @@ enum AgentSessionLinkTranscriptSanitizer {
                 toolStatus: statusWord(for: row),
                 attachmentNote: nil,
                 timestamp: row.timestamp
-            )
+            ), false)
         case .user, .assistant, .assistantInline, .system, .error:
             let role = role(for: row.kind, isSummaryRow: isSummaryRow)
             let cap = switch role {
             case .system, .error:
                 AgentSessionLinkTranscriptBudget.diagnosticItemMaxBytes
             case .user, .assistant, .summary, .tool:
-                AgentSessionLinkTranscriptBudget.narrativeItemMaxBytes
+                narrativeMaxBytes
             }
             let redacted = AgentSessionLinkTextRedactor.redact(row.text, homeDirectory: homeDirectory)
             let text = AgentSessionLinkTranscriptBudget.truncatedRowText(redacted, maxBytes: cap)
-            return AgentSessionLinkTranscriptItem(
+            return (AgentSessionLinkTranscriptItem(
                 itemID: row.id.uuidString,
                 sequenceIndex: row.sequenceIndex,
                 role: role,
@@ -452,7 +474,7 @@ enum AgentSessionLinkTranscriptSanitizer {
                 attachmentNote: attachmentNote(for: row),
                 timestamp: row.timestamp,
                 crossSessionOrigin: crossSessionOrigin(for: row, readerSessionID: readerSessionID)
-            )
+            ), role != .system && role != .error && redacted.utf8.count > cap)
         }
     }
 
@@ -701,12 +723,17 @@ enum AgentSessionLinkTranscriptSanitizer {
             // it is what makes the park harmless: nothing exists after the newest row, so parking
             // there withholds nothing, and the next appended row ends the park automatically.
             let isLiveEdge = index == rows.count - 1
-            if let item = sanitize(
+            if let sanitized = sanitizeBounded(
                 row: row,
                 isSummaryRow: summaryRowIDs.contains(row.id),
                 readerSessionID: readerSessionID,
-                homeDirectory: homeDirectory
+                homeDirectory: homeDirectory,
+                narrativeMaxBytes: max(
+                    AgentSessionLinkTranscriptBudget.firstItemMinimumTextBytes,
+                    maxOutputBytes - usedBytes
+                )
             ) {
+                let item = sanitized.item
                 if selected.count >= maxItems {
                     truncated = true
                     // A tail page is newest-anchored by construction, so a budget stop leaves only
@@ -716,19 +743,20 @@ enum AgentSessionLinkTranscriptSanitizer {
                 }
                 var emitted = item
                 var cost = item.utf8Cost
-                if usedBytes + cost > maxOutputBytes {
+                if sanitized.wasByteCapped || usedBytes + cost > maxOutputBytes {
                     guard selected.isEmpty else {
                         truncated = true
                         hasMore = !fillsFromEnd
                         break walk
                     }
                     // The first row is budgeted, not exempted. Skipping the check for it would let a
-                    // caller that asked for a few hundred bytes receive a full `narrativeItemMaxBytes`
-                    // row; refusing it outright would stall the cursor on that row forever. Shrink its
+                    // caller that asked for a few hundred bytes receive a whole narrative row;
+                    // refusing it outright would stall the cursor on that row forever. Shrink its
                     // text into the remaining page budget instead, and say the page was truncated.
                     emitted = item.withTextTruncated(
                         toRemainingBudget: maxOutputBytes - usedBytes,
-                        minimumTextBytes: AgentSessionLinkTranscriptBudget.firstItemMinimumTextBytes
+                        minimumTextBytes: AgentSessionLinkTranscriptBudget.firstItemMinimumTextBytes,
+                        wasByteCapped: sanitized.wasByteCapped
                     )
                     cost = emitted.utf8Cost
                     truncated = true
